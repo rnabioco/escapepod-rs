@@ -100,8 +100,9 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     let mut sample_rate: u16 = 0;
     let mut warnings = Vec::new();
 
-    // Track corrupted files
+    // Track corrupted files and old version files for summary
     let mut corrupted_files = Vec::new();
+    let mut old_version_files: HashMap<String, usize> = HashMap::new();
 
     // Process each file
     for path in &files {
@@ -119,15 +120,10 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
             }
         };
 
-        // Check version
+        // Track old version files for summary
         let version = reader.pod5_version();
         if !version.starts_with(CURRENT_POD5_VERSION) && !version.is_empty() {
-            warnings.push(format!(
-                "Old POD5 version: {} uses v{} (current: {})",
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                version,
-                CURRENT_POD5_VERSION
-            ));
+            *old_version_files.entry(version.to_string()).or_insert(0) += 1;
         }
 
         // Get file size
@@ -209,6 +205,14 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
             0,
             format!("{} file(s) could not be read", corrupted_files.len()),
         );
+    }
+
+    // Add summary of old version files
+    for (version, count) in &old_version_files {
+        warnings.push(format!(
+            "{} file(s) using old POD5 version v{} (current: {})",
+            count, version, CURRENT_POD5_VERSION
+        ));
     }
 
     // Compute statistics
@@ -391,8 +395,10 @@ fn print_summary(
         format!("POD5 Summary: {}", input.display())
     };
 
-    println!("┌{}┐", border);
-    println!("│ {:<width$} │", title.bold().cyan(), width = width - 1);
+    println!("╭{}╮", border);
+    // Pad before applying colors to avoid ANSI escape code length issues
+    let padded_title = format!("{:<width$}", title, width = width - 1);
+    println!("│ {}│", padded_title.bold().cyan());
     println!("├{}┤", border);
 
     // File info row
@@ -449,12 +455,8 @@ fn print_summary(
 
     // Read length statistics
     println!("├{}┤", border);
-    println!(
-        "│ {} {:width$} │",
-        "READ LENGTH (samples)".cyan(),
-        "",
-        width = width - 23
-    );
+    let header = format!("{:<width$}", "READ LENGTH (samples)", width = width - 1);
+    println!("│ {}│", header.cyan());
 
     let s = &summary.statistics;
     println!(
@@ -476,39 +478,37 @@ fn print_summary(
 
     // Add sparkline for length distribution
     if !lengths.is_empty() {
-        let spark = sparkline(lengths, 40);
+        let spark_width = 40;
+        let spark = sparkline(lengths, spark_width);
         let label = "length distribution";
-        let padding = width.saturating_sub(spark.len() + label.len() + 6);
-        println!(
-            "│   {} {}{:padding$} │",
-            spark,
-            label.dimmed(),
-            "",
-            padding = padding
-        );
+        // Use known spark_width (not .len() which counts bytes, not chars)
+        let label_width = width - 4 - spark_width - 1;
+        let padded_label = format!("{:<width$}", label, width = label_width);
+        println!("│   {} {}│", spark, padded_label.dimmed());
     }
 
     // Channel usage
     println!("├{}┤", border);
     let channel_pct = s.active_channels as f64 / s.total_channels as f64 * 100.0;
+    let channel_info = format!(
+        "{}/{} active ({:.1}%)",
+        s.active_channels, s.total_channels, channel_pct
+    );
+    // "CHANNELS   " is 11 chars, calculate padding for remaining content
+    let content_len = 11 + channel_info.len();
+    let padding = width.saturating_sub(content_len + 1);
     println!(
-        "│ {:10} {}/{} active ({:.1}%) {:width$} │",
+        "│ {}   {}{:padding$}│",
         "CHANNELS".cyan(),
-        s.active_channels.to_string().bold(),
-        s.total_channels,
-        channel_pct,
+        channel_info,
         "",
-        width = width - 42
+        padding = padding
     );
 
     // End reasons
     println!("├{}┤", border);
-    println!(
-        "│ {} {:width$} │",
-        "END REASONS".cyan(),
-        "",
-        width = width - 13
-    );
+    let end_header = format!("{:<width$}", "END REASONS", width = width - 1);
+    println!("│ {}│", end_header.cyan());
 
     let total_reads_f = total_reads as f64;
     let mut reasons: Vec<_> = summary.end_reasons.iter().collect();
@@ -516,38 +516,39 @@ fn print_summary(
 
     for (reason, count) in reasons.iter().take(4) {
         let pct = **count as f64 / total_reads_f * 100.0;
-        let bar = progress_bar(pct, 20);
+        let bar_width = 20;
+        let bar = progress_bar(pct, bar_width);
+        let count_str = format_number(**count);
+        // Pad reason before applying bold, then calculate remaining padding
+        // Use bar_width (not .len() which counts bytes for Unicode chars)
+        let padded_reason = format!("{:24}", reason);
+        let rest_text = format!("{:>5.1}%  ({:>7})", pct, count_str);
+        let rest_padding = width - 4 - 24 - bar_width - 1 - rest_text.len();
         println!(
-            "│   {:24} {} {:>5.1}%  ({:>7}) {:width$} │",
-            reason.bold(),
+            "│   {} {} {}{:padding$}│",
+            padded_reason.bold(),
             bar,
-            pct,
-            format_number(**count),
+            rest_text,
             "",
-            width = width - 60
+            padding = rest_padding
         );
     }
 
     // Warnings
     if !summary.warnings.is_empty() {
         println!("├{}┤", border);
-        println!(
-            "│ {} {:width$} │",
-            "⚠ WARNINGS".yellow().bold(),
-            "",
-            width = width - 12
-        );
+        // Pad before applying colors
+        let warn_header = format!("{:<width$}", "⚠ WARNINGS", width = width - 1);
+        println!("│ {}│", warn_header.yellow().bold());
         for warning in &summary.warnings {
-            println!(
-                "│   {} {:width$} │",
-                warning.yellow(),
-                "",
-                width = width - warning.len() - 4
-            );
+            let warn_text = truncate(warning, width - 6);
+            // Pad before applying color
+            let padded_warn = format!("{:<width$}", warn_text, width = width - 4);
+            println!("│   {}│", padded_warn.yellow());
         }
     }
 
-    println!("└{}┘", border);
+    println!("╰{}╯", border);
 }
 
 /// Truncate a string to a maximum length.
