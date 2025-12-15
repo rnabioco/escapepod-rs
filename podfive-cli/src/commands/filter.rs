@@ -2,12 +2,13 @@
 //!
 //! Filters reads from a POD5 file based on a list of read IDs.
 
-use crate::util::resolve_pod5_inputs;
-use podfive_core::{ReadData, Reader, Uuid, Writer, WriterOptions};
+use crate::util::{parse_uuid_flexible, resolve_pod5_inputs};
+use podfive_core::{Reader, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     // Resolve input to list of POD5 files (supports directories)
@@ -43,6 +44,8 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     // Filter reads from all files
     let mut matched = 0u64;
     let mut total = 0u64;
+    let mut read_errors = 0u64;
+    let mut signal_errors = 0u64;
 
     for file_path in &files {
         let reader = match Reader::open(file_path) {
@@ -88,7 +91,13 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         for read_result in reads_iter {
             let read = match read_result {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    read_errors += 1;
+                    if read_errors <= 3 {
+                        eprintln!("Warning: error reading read record: {}", e);
+                    }
+                    continue;
+                }
             };
             total += 1;
 
@@ -97,7 +106,16 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
                 // Get signal for this read
                 let signal = match reader.get_signal(&read.signal_rows) {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(e) => {
+                        signal_errors += 1;
+                        if signal_errors <= 3 {
+                            eprintln!(
+                                "Warning: error reading signal for read {}: {}",
+                                read.read_id, e
+                            );
+                        }
+                        continue;
+                    }
                 };
 
                 // Map run_info index
@@ -111,25 +129,8 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
                     0
                 };
 
-                // Create new read data
-                let new_read = ReadData {
-                    read_id: read.read_id,
-                    read_number: read.read_number,
-                    start_sample: read.start_sample,
-                    channel: read.channel,
-                    well: read.well,
-                    pore_type: read.pore_type.clone(),
-                    calibration_offset: read.calibration_offset,
-                    calibration_scale: read.calibration_scale,
-                    median_before: read.median_before,
-                    end_reason: read.end_reason,
-                    end_reason_forced: read.end_reason_forced,
-                    run_info_index: new_run_info_idx,
-                    num_minknow_events: read.num_minknow_events,
-                    num_samples: read.num_samples,
-                    open_pore_level: read.open_pore_level,
-                    signal_rows: Vec::new(),
-                };
+                // Create new read data for writing
+                let new_read = read.for_writing(new_run_info_idx);
 
                 writer.add_read(new_read, &signal)?;
                 matched += 1;
@@ -144,7 +145,11 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         "Filtered {} reads from {} total ({:.1}%)",
         matched,
         total,
-        if total > 0 { (matched as f64 / total as f64) * 100.0 } else { 0.0 }
+        if total > 0 {
+            (matched as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        }
     );
 
     let not_found = (ids.len() as u64).saturating_sub(matched);
@@ -158,6 +163,14 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         println!(
             "Note: {} duplicate reads matched across multiple files",
             matched - ids.len() as u64
+        );
+    }
+
+    // Report any errors encountered
+    if read_errors > 0 || signal_errors > 0 {
+        eprintln!(
+            "Warning: encountered {} read error(s) and {} signal error(s)",
+            read_errors, signal_errors
         );
     }
 
@@ -183,8 +196,8 @@ fn read_ids_from_file(path: &PathBuf) -> anyhow::Result<HashSet<Uuid>> {
             continue;
         }
 
-        // Try to parse as UUID
-        match Uuid::parse_str(line) {
+        // Try to parse as UUID (supports both standard and compact formats)
+        match parse_uuid_flexible(line) {
             Ok(uuid) => {
                 ids.insert(uuid);
             }

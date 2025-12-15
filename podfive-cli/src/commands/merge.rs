@@ -41,7 +41,11 @@ pub fn run(
 
     let inputs = all_files;
 
-    let num_threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4));
+    let num_threads = threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+    });
 
     // Build tokio runtime
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -93,14 +97,15 @@ async fn async_merge(
         let bar = overall_bar.clone();
 
         let handle = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("Semaphore acquire failed: {}", e))?;
 
             // Run blocking file I/O in spawn_blocking
-            let result = tokio::task::spawn_blocking(move || {
-                read_file_contents(input_path, tx)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?;
+            let result = tokio::task::spawn_blocking(move || read_file_contents(input_path, tx))
+                .await
+                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?;
 
             bar.inc(1);
             result
@@ -114,9 +119,8 @@ async fn async_merge(
 
     // Writer task - runs in spawn_blocking since Writer is synchronous
     let output_clone = output.clone();
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        write_merged_file(output_clone, &mut rx, duplicate_ok)
-    });
+    let writer_handle =
+        tokio::task::spawn_blocking(move || write_merged_file(output_clone, &mut rx, duplicate_ok));
 
     // Wait for all readers to complete
     let mut read_errors = Vec::new();
@@ -141,10 +145,7 @@ async fn async_merge(
     write_result
 }
 
-fn read_file_contents(
-    input_path: PathBuf,
-    tx: mpsc::Sender<ReadMessage>,
-) -> anyhow::Result<u64> {
+fn read_file_contents(input_path: PathBuf, tx: mpsc::Sender<ReadMessage>) -> anyhow::Result<u64> {
     let reader = Reader::open(&input_path)?;
     let mut count = 0u64;
 
@@ -224,24 +225,7 @@ fn write_merged_file(
         };
 
         // Create new read with correct run_info index
-        let new_read = ReadData {
-            read_id: msg.read.read_id,
-            read_number: msg.read.read_number,
-            start_sample: msg.read.start_sample,
-            channel: msg.read.channel,
-            well: msg.read.well,
-            pore_type: msg.read.pore_type,
-            calibration_offset: msg.read.calibration_offset,
-            calibration_scale: msg.read.calibration_scale,
-            median_before: msg.read.median_before,
-            end_reason: msg.read.end_reason,
-            end_reason_forced: msg.read.end_reason_forced,
-            run_info_index: run_info_idx,
-            num_minknow_events: msg.read.num_minknow_events,
-            num_samples: msg.read.num_samples,
-            open_pore_level: msg.read.open_pore_level,
-            signal_rows: Vec::new(), // Writer will populate
-        };
+        let new_read = msg.read.for_writing(run_info_idx);
 
         writer.add_read(new_read, &msg.signal)?;
         total_reads += 1;
@@ -262,4 +246,3 @@ fn write_merged_file(
 
     Ok(())
 }
-

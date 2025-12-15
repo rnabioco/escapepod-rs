@@ -2,8 +2,9 @@
 //!
 //! Splits reads into multiple output files based on a CSV mapping.
 
+use crate::util::parse_uuid_flexible;
 use indicatif::{ProgressBar, ProgressStyle};
-use podfive_core::{ReadData, Reader, RunInfoData, Writer, WriterOptions};
+use podfive_core::{Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -24,7 +25,11 @@ pub fn run(
     }
 
     // Get unique output files
-    let output_files: Vec<&String> = mapping.values().collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let output_files: Vec<&String> = mapping
+        .values()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
     println!(
         "Subsetting {} reads into {} output file(s)",
         mapping.len(),
@@ -89,24 +94,7 @@ pub fn run(
         if let Some(output_name) = mapping.get(&read.read_id) {
             let signal = reader.get_signal(&read.signal_rows)?;
 
-            let new_read = ReadData {
-                read_id: read.read_id,
-                read_number: read.read_number,
-                start_sample: read.start_sample,
-                channel: read.channel,
-                well: read.well,
-                pore_type: read.pore_type,
-                calibration_offset: read.calibration_offset,
-                calibration_scale: read.calibration_scale,
-                median_before: read.median_before,
-                end_reason: read.end_reason,
-                end_reason_forced: read.end_reason_forced,
-                run_info_index: read.run_info_index,
-                num_minknow_events: read.num_minknow_events,
-                num_samples: read.num_samples,
-                open_pore_level: read.open_pore_level,
-                signal_rows: Vec::new(),
-            };
+            let new_read = read.for_writing_same_run();
 
             if let Some(writer) = writers.get_mut(output_name) {
                 writer.add_read(new_read, &signal)?;
@@ -179,36 +167,19 @@ fn parse_csv_mapping(csv_file: &PathBuf) -> anyhow::Result<HashMap<Uuid, String>
         }
 
         // Parse UUID (handle both with and without dashes)
-        let uuid = parse_uuid(read_id_str).map_err(|e| {
-            anyhow::anyhow!("Invalid UUID '{}' on line {}: {}", read_id_str, line_num + 2, e)
+        let uuid = parse_uuid_flexible(read_id_str).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid UUID '{}' on line {}: {}",
+                read_id_str,
+                line_num + 2,
+                e
+            )
         })?;
 
         mapping.insert(uuid, output_file.to_string());
     }
 
     Ok(mapping)
-}
-
-fn parse_uuid(s: &str) -> anyhow::Result<Uuid> {
-    // Try standard format first
-    if let Ok(uuid) = Uuid::parse_str(s) {
-        return Ok(uuid);
-    }
-
-    // Try without dashes
-    if s.len() == 32 {
-        let with_dashes = format!(
-            "{}-{}-{}-{}-{}",
-            &s[0..8],
-            &s[8..12],
-            &s[12..16],
-            &s[16..20],
-            &s[20..32]
-        );
-        return Uuid::parse_str(&with_dashes).map_err(|e| anyhow::anyhow!("{}", e));
-    }
-
-    anyhow::bail!("Invalid UUID format")
 }
 
 #[cfg(test)]
@@ -219,35 +190,43 @@ mod tests {
 
     #[test]
     fn test_parse_uuid_standard_format() {
-        let uuid = parse_uuid("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
+        let uuid = parse_uuid_flexible("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
         assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
     }
 
     #[test]
     fn test_parse_uuid_no_dashes() {
-        let uuid = parse_uuid("a1b2c3d4e5f67890abcdef1234567890").unwrap();
+        let uuid = parse_uuid_flexible("a1b2c3d4e5f67890abcdef1234567890").unwrap();
         assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
     }
 
     #[test]
     fn test_parse_uuid_uppercase() {
-        let uuid = parse_uuid("A1B2C3D4-E5F6-7890-ABCD-EF1234567890").unwrap();
+        let uuid = parse_uuid_flexible("A1B2C3D4-E5F6-7890-ABCD-EF1234567890").unwrap();
         assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
     }
 
     #[test]
     fn test_parse_uuid_invalid() {
-        assert!(parse_uuid("not-a-uuid").is_err());
-        assert!(parse_uuid("").is_err());
-        assert!(parse_uuid("a1b2c3d4").is_err());
+        assert!(parse_uuid_flexible("not-a-uuid").is_err());
+        assert!(parse_uuid_flexible("").is_err());
+        assert!(parse_uuid_flexible("a1b2c3d4").is_err());
     }
 
     #[test]
     fn test_parse_csv_mapping_valid() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "read_id,output").unwrap();
-        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5").unwrap();
-        writeln!(temp_file, "b2c3d4e5-f6a7-8901-bcde-f12345678901,sample2.pod5").unwrap();
+        writeln!(
+            temp_file,
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5"
+        )
+        .unwrap();
+        writeln!(
+            temp_file,
+            "b2c3d4e5-f6a7-8901-bcde-f12345678901,sample2.pod5"
+        )
+        .unwrap();
         temp_file.flush().unwrap();
 
         let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();
@@ -275,10 +254,18 @@ mod tests {
     fn test_parse_csv_mapping_empty_lines() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "read_id,output").unwrap();
-        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5").unwrap();
+        writeln!(
+            temp_file,
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5"
+        )
+        .unwrap();
         writeln!(temp_file, "").unwrap(); // Empty line
         writeln!(temp_file, ",").unwrap(); // Empty fields
-        writeln!(temp_file, "b2c3d4e5-f6a7-8901-bcde-f12345678901,sample2.pod5").unwrap();
+        writeln!(
+            temp_file,
+            "b2c3d4e5-f6a7-8901-bcde-f12345678901,sample2.pod5"
+        )
+        .unwrap();
         temp_file.flush().unwrap();
 
         let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();
@@ -289,7 +276,11 @@ mod tests {
     fn test_parse_csv_mapping_missing_header() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "uuid,file").unwrap(); // Wrong headers
-        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5").unwrap();
+        writeln!(
+            temp_file,
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5"
+        )
+        .unwrap();
         temp_file.flush().unwrap();
 
         let result = parse_csv_mapping(&temp_file.path().to_path_buf());
@@ -301,7 +292,11 @@ mod tests {
     fn test_parse_csv_mapping_whitespace_trimmed() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "read_id , output").unwrap();
-        writeln!(temp_file, " a1b2c3d4-e5f6-7890-abcd-ef1234567890 , sample1.pod5 ").unwrap();
+        writeln!(
+            temp_file,
+            " a1b2c3d4-e5f6-7890-abcd-ef1234567890 , sample1.pod5 "
+        )
+        .unwrap();
         temp_file.flush().unwrap();
 
         let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();

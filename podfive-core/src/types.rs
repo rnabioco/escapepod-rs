@@ -18,9 +18,10 @@ pub const POD5_VERSION: &str = "1.0.0";
 pub const SECTION_MARKER_LENGTH: usize = 16;
 
 /// Reason why a read ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum EndReason {
+    #[default]
     Unknown = 0,
     MuxChange = 1,
     UnblockMuxChange = 2,
@@ -34,23 +35,6 @@ pub enum EndReason {
 }
 
 impl EndReason {
-    /// Convert from string representation.
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "unknown" => Self::Unknown,
-            "mux_change" => Self::MuxChange,
-            "unblock_mux_change" => Self::UnblockMuxChange,
-            "data_service_unblock_mux_change" => Self::DataServiceUnblockMuxChange,
-            "signal_positive" => Self::SignalPositive,
-            "signal_negative" => Self::SignalNegative,
-            "api_request" => Self::ApiRequest,
-            "device_data_error" => Self::DeviceDataError,
-            "analysis_config_change" => Self::AnalysisConfigChange,
-            "paused" => Self::Paused,
-            _ => Self::Unknown,
-        }
-    }
-
     /// Convert to string representation.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -68,15 +52,59 @@ impl EndReason {
     }
 }
 
-impl Default for EndReason {
-    fn default() -> Self {
-        Self::Unknown
+impl std::str::FromStr for EndReason {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s {
+            "unknown" => Self::Unknown,
+            "mux_change" => Self::MuxChange,
+            "unblock_mux_change" => Self::UnblockMuxChange,
+            "data_service_unblock_mux_change" => Self::DataServiceUnblockMuxChange,
+            "signal_positive" => Self::SignalPositive,
+            "signal_negative" => Self::SignalNegative,
+            "api_request" => Self::ApiRequest,
+            "device_data_error" => Self::DeviceDataError,
+            "analysis_config_change" => Self::AnalysisConfigChange,
+            "paused" => Self::Paused,
+            _ => Self::Unknown,
+        })
     }
 }
 
 impl std::fmt::Display for EndReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<&str> for EndReason {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap()
+    }
+}
+
+impl From<u8> for EndReason {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Unknown,
+            1 => Self::MuxChange,
+            2 => Self::UnblockMuxChange,
+            3 => Self::DataServiceUnblockMuxChange,
+            4 => Self::SignalPositive,
+            5 => Self::SignalNegative,
+            6 => Self::ApiRequest,
+            7 => Self::DeviceDataError,
+            8 => Self::AnalysisConfigChange,
+            9 => Self::Paused,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<EndReason> for u8 {
+    fn from(reason: EndReason) -> Self {
+        reason as u8
     }
 }
 
@@ -140,8 +168,42 @@ impl Default for ReadData {
     }
 }
 
+impl ReadData {
+    /// Create a copy of this ReadData suitable for writing to a new file.
+    ///
+    /// The signal_rows are cleared as they will be populated by the writer.
+    /// Use this when copying reads between files with a different run_info mapping.
+    pub fn for_writing(&self, new_run_info_index: u32) -> Self {
+        Self {
+            read_id: self.read_id,
+            read_number: self.read_number,
+            start_sample: self.start_sample,
+            channel: self.channel,
+            well: self.well,
+            pore_type: self.pore_type.clone(),
+            calibration_offset: self.calibration_offset,
+            calibration_scale: self.calibration_scale,
+            median_before: self.median_before,
+            end_reason: self.end_reason,
+            end_reason_forced: self.end_reason_forced,
+            run_info_index: new_run_info_index,
+            num_minknow_events: self.num_minknow_events,
+            num_samples: self.num_samples,
+            open_pore_level: self.open_pore_level,
+            signal_rows: Vec::new(),
+        }
+    }
+
+    /// Create a copy preserving the original run_info_index.
+    ///
+    /// Equivalent to `for_writing(self.run_info_index)`.
+    pub fn for_writing_same_run(&self) -> Self {
+        self.for_writing(self.run_info_index)
+    }
+}
+
 /// Run information metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunInfoData {
     /// Unique acquisition identifier.
     pub acquisition_id: String,
@@ -185,46 +247,34 @@ pub struct RunInfoData {
     pub tracking_id: HashMap<String, String>,
 }
 
-impl Default for RunInfoData {
-    fn default() -> Self {
-        Self {
-            acquisition_id: String::new(),
-            acquisition_start_time: 0,
-            adc_max: 0,
-            adc_min: 0,
-            context_tags: HashMap::new(),
-            experiment_name: String::new(),
-            flow_cell_id: String::new(),
-            flow_cell_product_code: String::new(),
-            protocol_name: String::new(),
-            protocol_run_id: String::new(),
-            protocol_start_time: 0,
-            sample_id: String::new(),
-            sample_rate: 0,
-            sequencing_kit: String::new(),
-            sequencer_position: String::new(),
-            sequencer_position_type: String::new(),
-            software: String::new(),
-            system_name: String::new(),
-            system_type: String::new(),
-            tracking_id: HashMap::new(),
-        }
+impl std::fmt::Display for ReadData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Read {} (ch:{}, well:{}, samples:{}, end:{})",
+            self.read_id, self.channel, self.well, self.num_samples, self.end_reason
+        )
+    }
+}
+
+impl std::fmt::Display for RunInfoData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RunInfo {} (flow_cell:{}, sample:{}, rate:{}Hz)",
+            self.acquisition_id, self.flow_cell_id, self.sample_id, self.sample_rate
+        )
     }
 }
 
 /// Signal data type in the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignalType {
     /// Uncompressed int16 samples.
     Uncompressed,
     /// VBZ compressed (SVB16 + ZSTD).
+    #[default]
     Vbz,
-}
-
-impl Default for SignalType {
-    fn default() -> Self {
-        Self::Vbz
-    }
 }
 
 /// A chunk of signal data from the signal table.

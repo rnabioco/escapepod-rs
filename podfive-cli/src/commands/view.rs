@@ -110,7 +110,8 @@ pub fn run(
             if ids_only {
                 writeln!(writer, "{}", read.read_id)?;
             } else {
-                let values: Vec<String> = fields.iter().map(|f| get_field_value(&read, f)).collect();
+                let values: Vec<String> =
+                    fields.iter().map(|f| get_field_value(&read, f)).collect();
                 writeln!(writer, "{}", values.join(&separator))?;
             }
         }
@@ -204,7 +205,13 @@ mod tests {
     #[test]
     fn test_determine_fields_default() {
         let fields = determine_fields(None, None, false).unwrap();
-        assert_eq!(fields, DEFAULT_FIELDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            fields,
+            DEFAULT_FIELDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -240,7 +247,8 @@ mod tests {
             Some("read_id,channel,well,num_samples"),
             Some("channel"),
             false,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(fields, vec!["read_id", "well", "num_samples"]);
     }
 
@@ -264,7 +272,10 @@ mod tests {
         let exclude = DEFAULT_FIELDS.join(",");
         let result = determine_fields(None, Some(&exclude), false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No fields selected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No fields selected"));
     }
 
     #[test]

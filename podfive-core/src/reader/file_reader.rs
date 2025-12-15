@@ -3,7 +3,7 @@
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
-use crate::types::{EndReason, ReadData, RunInfoData, Uuid, POD5_SIGNATURE};
+use crate::types::{ReadData, RunInfoData, Uuid, POD5_SIGNATURE};
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
@@ -161,7 +161,7 @@ impl Reader {
             .signal_table()
             .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
 
-        let mut reader = self.create_arrow_reader(embedded)?;
+        let reader = self.create_arrow_reader(embedded)?;
         let mut all_samples = Vec::new();
 
         // For now, we'll do a simple implementation that reads all batches
@@ -191,7 +191,7 @@ impl Reader {
 
     /// Extract signal samples from a signal table batch row.
     fn extract_signal_from_batch(&self, batch: &RecordBatch, row: usize) -> Result<Vec<i16>> {
-        use arrow::array::{Array, BinaryArray, LargeBinaryArray, UInt32Array};
+        use arrow::array::{Array, LargeBinaryArray, UInt32Array};
 
         // Get signal column (LargeBinary with VBZ data)
         let signal_col = batch
@@ -284,7 +284,7 @@ impl Reader {
     /// Extract RunInfoData from a batch row.
     fn run_info_from_batch(batch: &RecordBatch, row: usize) -> Result<RunInfoData> {
         use arrow::array::{
-            Array, Int16Array, MapArray, StringArray, TimestampMillisecondArray, UInt16Array,
+            Array, Int16Array, StringArray, TimestampMillisecondArray, UInt16Array,
         };
 
         let get_string = |name: &str| -> Result<String> {
@@ -370,6 +370,7 @@ impl Reader {
 
 /// Iterator over reads in a POD5 file.
 pub struct ReadIterator<'a> {
+    #[allow(dead_code)]
     pod5_reader: &'a Reader,
     arrow_reader: ArrowFileReader<Cursor<&'a [u8]>>,
     current_batch: Option<RecordBatch>,
@@ -578,7 +579,10 @@ impl<'a> ReadIterator<'a> {
             calibration_offset: get_f32("calibration_offset")?,
             calibration_scale: get_f32("calibration_scale")?,
             median_before: get_f32("median_before")?,
-            end_reason: EndReason::from_str(&get_dict_string("end_reason").unwrap_or_default()),
+            end_reason: get_dict_string("end_reason")
+                .unwrap_or_default()
+                .parse()
+                .unwrap(),
             end_reason_forced: get_bool("end_reason_forced")?,
             run_info_index: 0, // TODO: parse from dictionary
             num_minknow_events: get_u64("num_minknow_events")?,

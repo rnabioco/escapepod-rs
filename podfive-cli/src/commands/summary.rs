@@ -9,7 +9,7 @@ use podfive_core::{Reader, RunInfoData};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Arguments for the summary command.
 #[derive(Debug, clap::Args)]
@@ -245,7 +245,13 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        print_summary(&summary, &args.input, is_directory, sample_rate, &stats.lengths);
+        print_summary(
+            &summary,
+            &args.input,
+            is_directory,
+            sample_rate,
+            &stats.lengths,
+        );
     }
 
     Ok(())
@@ -364,7 +370,13 @@ fn progress_bar(pct: f64, width: usize) -> String {
 }
 
 /// Print the formatted summary.
-fn print_summary(summary: &Summary, input: &PathBuf, is_directory: bool, sample_rate: u16, lengths: &[u64]) {
+fn print_summary(
+    summary: &Summary,
+    input: &Path,
+    is_directory: bool,
+    sample_rate: u16,
+    lengths: &[u64],
+) {
     let width = 77;
     let border = "─".repeat(width);
 
@@ -454,7 +466,12 @@ fn print_summary(summary: &Summary, input: &PathBuf, is_directory: bool, sample_
         "Median".dimmed(),
         format_number(s.length_median).bold(),
         "Range".dimmed(),
-        format!("{}-{}", format_compact(s.length_min), format_compact(s.length_max)).bold(),
+        format!(
+            "{}-{}",
+            format_compact(s.length_min),
+            format_compact(s.length_max)
+        )
+        .bold(),
     );
 
     // Add sparkline for length distribution

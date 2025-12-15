@@ -3,14 +3,10 @@
 //! Repacks POD5 files to optimize storage and apply current compression settings.
 
 use indicatif::{ProgressBar, ProgressStyle};
-use podfive_core::{ReadData, Reader, Writer, WriterOptions};
+use podfive_core::{Reader, Writer, WriterOptions};
 use std::path::PathBuf;
 
-pub fn run(
-    inputs: Vec<PathBuf>,
-    output_dir: PathBuf,
-    force: bool,
-) -> anyhow::Result<()> {
+pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Result<()> {
     if inputs.is_empty() {
         anyhow::bail!("No input files specified");
     }
@@ -86,24 +82,7 @@ fn repack_file(input: &PathBuf, output: &PathBuf) -> anyhow::Result<u64> {
         let read = read_result?;
         let signal = reader.get_signal(&read.signal_rows)?;
 
-        let new_read = ReadData {
-            read_id: read.read_id,
-            read_number: read.read_number,
-            start_sample: read.start_sample,
-            channel: read.channel,
-            well: read.well,
-            pore_type: read.pore_type,
-            calibration_offset: read.calibration_offset,
-            calibration_scale: read.calibration_scale,
-            median_before: read.median_before,
-            end_reason: read.end_reason,
-            end_reason_forced: read.end_reason_forced,
-            run_info_index: read.run_info_index,
-            num_minknow_events: read.num_minknow_events,
-            num_samples: read.num_samples,
-            open_pore_level: read.open_pore_level,
-            signal_rows: Vec::new(),
-        };
+        let new_read = read.for_writing_same_run();
 
         writer.add_read(new_read, &signal)?;
         count += 1;

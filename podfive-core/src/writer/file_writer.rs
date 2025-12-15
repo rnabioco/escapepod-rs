@@ -471,7 +471,7 @@ impl Writer {
     }
 
     /// Build the FlatBuffer footer.
-    fn build_flatbuffer_footer(&self, embedded_files: &[EmbeddedFileInfo]) -> Vec<u8> {
+    fn build_flatbuffer_footer(&self, embedded_files: &[EmbeddedFileInfo]) -> Result<Vec<u8>> {
         // Simple FlatBuffer construction
         // We'll build this manually since the schema is simple
 
@@ -481,7 +481,7 @@ impl Writer {
 
         // Calculate sizes and build the buffer
         // FlatBuffer format: strings, vectors, tables, then root
-        let mut buffer: Vec<u8> = Vec::new();
+        let mut _buffer: Vec<u8> = Vec::new();
 
         // We need to build from the end backwards, so let's use a simpler approach
         // Just create a minimal valid FlatBuffer
@@ -509,7 +509,7 @@ impl Writer {
         }
 
         // Write embedded files vector
-        let files_vec_offset = data.len();
+        let _files_vec_offset = data.len();
         data.extend_from_slice(&(embedded_files.len() as u32).to_le_bytes());
 
         // Placeholder for file offsets (will be filled in)
@@ -566,7 +566,7 @@ impl Writer {
         }
 
         // vtable for Footer
-        let footer_vtable_start = data.len();
+        let _footer_vtable_start = data.len();
         data.extend_from_slice(&12u16.to_le_bytes()); // vtable size
         data.extend_from_slice(&16u16.to_le_bytes()); // table size
         data.extend_from_slice(&4u16.to_le_bytes()); // file_identifier at +4
@@ -577,7 +577,7 @@ impl Writer {
         // Hmm, the FlatBuffer format is getting complex. Let me simplify.
         // Actually, let's just output a valid minimal structure.
 
-        buffer = Vec::new();
+        _buffer = Vec::new();
 
         // Build a simple footer using flatbuffers crate approach
         // Root offset will be at the start
@@ -587,11 +587,26 @@ impl Writer {
         self.build_simple_footer(embedded_files)
     }
 
+    /// Helper function to write a string to a cursor with FlatBuffer format.
+    fn write_flatbuffer_string(data: &mut std::io::Cursor<Vec<u8>>, s: &str) -> Result<usize> {
+        // Align to 4
+        while data.position() % 4 != 0 {
+            data.write_all(&[0u8])?;
+        }
+        let pos = data.position() as usize;
+        data.write_all(&(s.len() as u32).to_le_bytes())?;
+        data.write_all(s.as_bytes())?;
+        // Pad
+        while data.position() % 4 != 0 {
+            data.write_all(&[0u8])?;
+        }
+        Ok(pos)
+    }
+
     /// Build a simple footer structure.
-    fn build_simple_footer(&self, embedded_files: &[EmbeddedFileInfo]) -> Vec<u8> {
+    fn build_simple_footer(&self, embedded_files: &[EmbeddedFileInfo]) -> Result<Vec<u8>> {
         use std::io::Cursor;
 
-        let mut buf: Vec<u8> = Vec::new();
         let file_id = self.file_id.to_string();
         let software = &self.options.software;
         let version = POD5_VERSION;
@@ -603,92 +618,75 @@ impl Writer {
         let mut data = Cursor::new(Vec::<u8>::new());
 
         // Skip 4 bytes for root offset
-        data.write_all(&[0u8; 4]).unwrap();
+        data.write_all(&[0u8; 4])?;
 
         // Write vtable for Footer table
         let vtable_pos = data.position() as usize;
-        data.write_all(&12u16.to_le_bytes()).unwrap(); // vtable size (6 entries * 2 = 12, + 4 header = 16... let's try 12)
-        data.write_all(&20u16.to_le_bytes()).unwrap(); // table size
-        data.write_all(&4u16.to_le_bytes()).unwrap(); // field 0 (file_identifier) offset
-        data.write_all(&8u16.to_le_bytes()).unwrap(); // field 1 (software) offset
-        data.write_all(&12u16.to_le_bytes()).unwrap(); // field 2 (pod5_version) offset
-        data.write_all(&16u16.to_le_bytes()).unwrap(); // field 3 (contents) offset
+        data.write_all(&12u16.to_le_bytes())?; // vtable size (6 entries * 2 = 12, + 4 header = 16... let's try 12)
+        data.write_all(&20u16.to_le_bytes())?; // table size
+        data.write_all(&4u16.to_le_bytes())?; // field 0 (file_identifier) offset
+        data.write_all(&8u16.to_le_bytes())?; // field 1 (software) offset
+        data.write_all(&12u16.to_le_bytes())?; // field 2 (pod5_version) offset
+        data.write_all(&16u16.to_le_bytes())?; // field 3 (contents) offset
 
         // Write table
         let table_pos = data.position() as usize;
         let soffset = (table_pos - vtable_pos) as i32;
-        data.write_all(&soffset.to_le_bytes()).unwrap(); // soffset to vtable
+        data.write_all(&soffset.to_le_bytes())?; // soffset to vtable
 
         // Placeholder offsets for strings and vector
         let field0_pos = data.position() as usize;
-        data.write_all(&[0u8; 4]).unwrap(); // file_identifier offset placeholder
+        data.write_all(&[0u8; 4])?; // file_identifier offset placeholder
         let field1_pos = data.position() as usize;
-        data.write_all(&[0u8; 4]).unwrap(); // software offset placeholder
+        data.write_all(&[0u8; 4])?; // software offset placeholder
         let field2_pos = data.position() as usize;
-        data.write_all(&[0u8; 4]).unwrap(); // pod5_version offset placeholder
+        data.write_all(&[0u8; 4])?; // pod5_version offset placeholder
         let field3_pos = data.position() as usize;
-        data.write_all(&[0u8; 4]).unwrap(); // contents offset placeholder
+        data.write_all(&[0u8; 4])?; // contents offset placeholder
 
-        // Write strings
-        fn write_string(data: &mut Cursor<Vec<u8>>, s: &str) -> usize {
-            // Align to 4
-            while data.position() % 4 != 0 {
-                data.write_all(&[0u8]).unwrap();
-            }
-            let pos = data.position() as usize;
-            data.write_all(&(s.len() as u32).to_le_bytes()).unwrap();
-            data.write_all(s.as_bytes()).unwrap();
-            // Pad
-            while data.position() % 4 != 0 {
-                data.write_all(&[0u8]).unwrap();
-            }
-            pos
-        }
-
-        let str0_pos = write_string(&mut data, &file_id);
-        let str1_pos = write_string(&mut data, software);
-        let str2_pos = write_string(&mut data, version);
+        // Write strings using the helper function
+        let str0_pos = Self::write_flatbuffer_string(&mut data, &file_id)?;
+        let str1_pos = Self::write_flatbuffer_string(&mut data, software)?;
+        let str2_pos = Self::write_flatbuffer_string(&mut data, version)?;
 
         // Write contents vector (embedded files)
         while data.position() % 4 != 0 {
-            data.write_all(&[0u8]).unwrap();
+            data.write_all(&[0u8])?;
         }
         let vec_pos = data.position() as usize;
-        data.write_all(&(embedded_files.len() as u32).to_le_bytes())
-            .unwrap();
+        data.write_all(&(embedded_files.len() as u32).to_le_bytes())?;
 
         // Write offsets to each embedded file table
         let offsets_start = data.position() as usize;
         for _ in embedded_files {
-            data.write_all(&[0u8; 4]).unwrap(); // placeholder
+            data.write_all(&[0u8; 4])?; // placeholder
         }
 
         // Write embedded file tables
         let mut file_positions = Vec::new();
         for file in embedded_files {
             while data.position() % 4 != 0 {
-                data.write_all(&[0u8]).unwrap();
+                data.write_all(&[0u8])?;
             }
 
             // vtable for EmbeddedFile
             let ef_vtable_pos = data.position() as usize;
-            data.write_all(&14u16.to_le_bytes()).unwrap(); // vtable size
-            data.write_all(&24u16.to_le_bytes()).unwrap(); // table size
-            data.write_all(&4u16.to_le_bytes()).unwrap(); // offset at +4
-            data.write_all(&12u16.to_le_bytes()).unwrap(); // length at +12
-            data.write_all(&20u16.to_le_bytes()).unwrap(); // format at +20
-            data.write_all(&22u16.to_le_bytes()).unwrap(); // content_type at +22
+            data.write_all(&14u16.to_le_bytes())?; // vtable size
+            data.write_all(&24u16.to_le_bytes())?; // table size
+            data.write_all(&4u16.to_le_bytes())?; // offset at +4
+            data.write_all(&12u16.to_le_bytes())?; // length at +12
+            data.write_all(&20u16.to_le_bytes())?; // format at +20
+            data.write_all(&22u16.to_le_bytes())?; // content_type at +22
 
             // table
             let ef_table_pos = data.position() as usize;
             file_positions.push(ef_table_pos);
             let ef_soffset = (ef_table_pos - ef_vtable_pos) as i32;
-            data.write_all(&ef_soffset.to_le_bytes()).unwrap();
-            data.write_all(&file.offset.to_le_bytes()).unwrap();
-            data.write_all(&file.length.to_le_bytes()).unwrap();
-            data.write_all(&0i16.to_le_bytes()).unwrap(); // format = FeatherV2
-            data.write_all(&(file.content_type as i16).to_le_bytes())
-                .unwrap();
+            data.write_all(&ef_soffset.to_le_bytes())?;
+            data.write_all(&file.offset.to_le_bytes())?;
+            data.write_all(&file.length.to_le_bytes())?;
+            data.write_all(&0i16.to_le_bytes())?; // format = FeatherV2
+            data.write_all(&(file.content_type as i16).to_le_bytes())?;
         }
 
         // Fill in the offsets
@@ -712,10 +710,10 @@ impl Writer {
         }
 
         // Fill root offset
-        let root_rel = (table_pos - 0) as u32;
+        let root_rel = table_pos as u32;
         result[0..4].copy_from_slice(&root_rel.to_le_bytes());
 
-        result
+        Ok(result)
     }
 
     /// Write a section marker.
@@ -798,7 +796,7 @@ impl Writer {
         self.file.write_all(&FOOTER_MAGIC)?;
 
         // Build and write footer
-        let footer_data = self.build_flatbuffer_footer(&embedded_files);
+        let footer_data = self.build_flatbuffer_footer(&embedded_files)?;
         self.file.write_all(&footer_data)?;
 
         // Write footer length
@@ -831,7 +829,10 @@ mod tests {
             acquisition_start_time: 1609459200000,
             adc_max: 2047,
             adc_min: -2048,
-            context_tags: HashMap::from([("experiment_type".to_string(), "genomic_dna".to_string())]),
+            context_tags: HashMap::from([(
+                "experiment_type".to_string(),
+                "genomic_dna".to_string(),
+            )]),
             experiment_name: "test_experiment".to_string(),
             flow_cell_id: "FAK12345".to_string(),
             flow_cell_product_code: "FLO-MIN106".to_string(),
@@ -1073,7 +1074,9 @@ mod tests {
         let read_count = reader.read_count()?;
         assert_eq!(read_count, 1);
 
-        let mut reads: Vec<_> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(reads.len(), 1);
 
         let read_back = reads.pop().unwrap();
@@ -1119,7 +1122,9 @@ mod tests {
         let read_count = reader.read_count()?;
         assert_eq!(read_count, num_reads as usize);
 
-        let reads: Vec<_> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(reads.len(), num_reads as usize);
 
         // Verify all read IDs are present
@@ -1160,7 +1165,10 @@ mod tests {
         assert_eq!(reader.run_info_count(), 2);
 
         let run_infos = reader.run_infos();
-        let acq_ids: Vec<_> = run_infos.iter().map(|r| r.acquisition_id.as_str()).collect();
+        let acq_ids: Vec<_> = run_infos
+            .iter()
+            .map(|r| r.acquisition_id.as_str())
+            .collect();
         assert!(acq_ids.contains(&"run_1"));
         assert!(acq_ids.contains(&"run_2"));
 
@@ -1192,11 +1200,16 @@ mod tests {
         // Read back
         let reader = Reader::open(path)?;
 
-        let reads: Vec<_> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(reads.len(), 1);
 
         let read_back = &reads[0];
-        assert!(read_back.signal_rows.len() > 1, "Should have multiple signal chunks");
+        assert!(
+            read_back.signal_rows.len() > 1,
+            "Should have multiple signal chunks"
+        );
 
         let signal_back = reader.get_signal(&read_back.signal_rows)?;
         assert_eq!(signal_back.len(), 50000);
@@ -1227,7 +1240,9 @@ mod tests {
         // Read back
         let reader = Reader::open(path)?;
 
-        let reads: Vec<_> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let read_back = &reads[0];
 
         // Check calibration values are preserved (within float precision)
@@ -1269,7 +1284,9 @@ mod tests {
         // Read back
         let reader = Reader::open(path)?;
 
-        let reads: Vec<_> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(reads.len(), end_reasons.len());
 
         // Verify end reasons are preserved
@@ -1301,7 +1318,9 @@ mod tests {
         // Read back
         let reader = Reader::open(path)?;
 
-        let reads: Vec<_> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].num_samples, 0);
 

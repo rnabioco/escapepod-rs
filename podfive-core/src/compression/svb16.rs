@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 /// Keys use 1 bit per sample, packed into bytes.
 #[inline]
 pub fn key_length(sample_count: usize) -> usize {
-    (sample_count + 7) / 8
+    sample_count.div_ceil(8)
 }
 
 /// Calculate the maximum encoded size for a given sample count.
