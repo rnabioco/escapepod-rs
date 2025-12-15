@@ -26,3 +26,6 @@ flamegraph.svg
 # Test artifacts
 *.bak
 *.tmp
+
+# Benchmark temp files
+benchmarks/
