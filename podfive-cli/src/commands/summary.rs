@@ -10,6 +10,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tabled::builder::Builder;
+use tabled::settings::{Style, Width};
 
 /// Arguments for the summary command.
 #[derive(Debug, clap::Args)]
@@ -373,7 +375,7 @@ fn progress_bar(pct: f64, width: usize) -> String {
     )
 }
 
-/// Print the formatted summary.
+/// Print the formatted summary using tabled for automatic alignment.
 fn print_summary(
     summary: &Summary,
     input: &Path,
@@ -381,134 +383,124 @@ fn print_summary(
     sample_rate: u16,
     lengths: &[u64],
 ) {
-    let width = 77;
-    let border = "─".repeat(width);
+    let mut builder = Builder::default();
 
-    // Title
+    // Title row
     let title = if is_directory {
         format!(
-            "POD5 Summary: {} ({} files)",
-            input.display(),
+            "{}: {} ({} files)",
+            "POD5 Summary".bold().cyan(),
+            input.display().to_string().bold(),
             summary.files.len()
         )
     } else {
-        format!("POD5 Summary: {}", input.display())
+        format!(
+            "{}: {}",
+            "POD5 Summary".bold().cyan(),
+            input.display().to_string().bold()
+        )
     };
+    builder.push_record([title]);
 
-    println!("╭{}╮", border);
-    // Pad before applying colors to avoid ANSI escape code length issues
-    let padded_title = format!("{:<width$}", title, width = width - 1);
-    println!("│ {}│", padded_title.bold().cyan());
-    println!("├{}┤", border);
-
-    // File info row
+    // File info row - pad BEFORE coloring
     let total_size: u64 = summary.files.iter().map(|f| f.size_bytes).sum();
     let total_reads: u64 = summary.files.iter().map(|f| f.read_count).sum();
     let duration = format_duration_hours(summary.statistics.total_samples, sample_rate);
+    let size_val = format!("{:>8}", format_bytes(total_size));
+    let reads_val = format!("{:>8}", format_number(total_reads));
+    let rate_val = format!("{:>6}", format!("{} kHz", sample_rate / 1000));
+    let dur_val = format!("{:>8}", duration);
 
-    println!(
-        "│ {:>6} {} │ {:>7} {} │ {:>6} {} │ {:>8} {} │",
-        format_bytes(total_size).bold(),
-        "Size".dimmed(),
-        format_number(total_reads).bold(),
-        "Reads".dimmed(),
-        format!("{} kHz", sample_rate / 1000).bold(),
-        "Rate".dimmed(),
-        duration.bold(),
-        "Duration".dimmed(),
-    );
+    builder.push_record([format!(
+        "{} {} {} {} {} {} {} {} {} {} {}",
+        size_val.bold(), "Size".dimmed(), "│".dimmed(),
+        reads_val.bold(), "Reads".dimmed(), "│".dimmed(),
+        rate_val.bold(), "Rate".dimmed(), "│".dimmed(),
+        dur_val.bold(), "Duration".dimmed()
+    )]);
 
-    // Run info
+    // Run info rows - pad values BEFORE coloring
     if let Some(ri) = &summary.run_info {
-        println!("├{}┤", border);
-
         let flow_cell = if ri.flow_cell_product_code.is_empty() {
             ri.flow_cell_id.clone()
         } else {
             format!("{} ({})", ri.flow_cell_id, ri.flow_cell_product_code)
         };
 
-        println!(
-            "│ {:12} {:<26} │ {:12} {:<20} │",
-            "Flow Cell".dimmed(),
-            truncate(&flow_cell, 26).bold(),
-            "Kit".dimmed(),
-            truncate(&ri.sequencing_kit, 20).bold(),
-        );
-        println!(
-            "│ {:12} {:<26} │ {:12} {:<20} │",
-            "Sample".dimmed(),
-            truncate(&ri.sample_id, 26).bold(),
-            "Protocol".dimmed(),
-            truncate(&ri.protocol_name, 20).bold(),
-        );
+        // Pad to fixed widths first, then color
+        let fc_label = format!("{:10}", "Flow Cell");
+        let fc_val = format!("{:28}", truncate(&flow_cell, 28));
+        let kit_label = format!("{:10}", "Kit");
+        let kit_val = format!("{:20}", truncate(&ri.sequencing_kit, 20));
+        builder.push_record([format!(
+            "{} {} {} {} {}",
+            fc_label.dimmed(), fc_val.bold(), "│".dimmed(),
+            kit_label.dimmed(), kit_val.bold()
+        )]);
+
+        let sample_label = format!("{:10}", "Sample");
+        let sample_val = format!("{:28}", truncate(&ri.sample_id, 28));
+        let proto_label = format!("{:10}", "Protocol");
+        let proto_val = format!("{:20}", truncate(&ri.protocol_name, 20));
+        builder.push_record([format!(
+            "{} {} {} {} {}",
+            sample_label.dimmed(), sample_val.bold(), "│".dimmed(),
+            proto_label.dimmed(), proto_val.bold()
+        )]);
+
         if let Some(start) = &ri.acquisition_start_time {
-            println!(
-                "│ {:12} {:<26} │ {:12} {:<20} │",
-                "Started".dimmed(),
-                start.bold(),
-                "Software".dimmed(),
-                truncate(&ri.software, 20).bold(),
-            );
+            let start_label = format!("{:10}", "Started");
+            let start_val = format!("{:28}", start);
+            let sw_label = format!("{:10}", "Software");
+            let sw_val = format!("{:20}", truncate(&ri.software, 20));
+            builder.push_record([format!(
+                "{} {} {} {} {}",
+                start_label.dimmed(), start_val.bold(), "│".dimmed(),
+                sw_label.dimmed(), sw_val.bold()
+            )]);
         }
     }
 
-    // Read length statistics
-    println!("├{}┤", border);
-    let header = format!("{:<width$}", "READ LENGTH (samples)", width = width - 1);
-    println!("│ {}│", header.cyan());
+    // Read length statistics header
+    builder.push_record([format!("{}", "READ LENGTH (samples)".cyan())]);
 
     let s = &summary.statistics;
-    println!(
-        "│   {:6} {:>10} │ {:6} {:>10} │ {:6} {:>10} │ {:6} {:>12} │",
-        "N50".dimmed(),
-        format_number(s.length_n50).bold(),
-        "Mean".dimmed(),
-        format_number(s.length_mean as u64).bold(),
-        "Median".dimmed(),
-        format_number(s.length_median).bold(),
-        "Range".dimmed(),
-        format!(
-            "{}-{}",
-            format_compact(s.length_min),
-            format_compact(s.length_max)
-        )
-        .bold(),
-    );
+    // Pad values BEFORE coloring
+    let n50_label = format!("{:6}", "N50");
+    let n50_val = format!("{:>9}", format_number(s.length_n50));
+    let mean_label = format!("{:6}", "Mean");
+    let mean_val = format!("{:>9}", format_number(s.length_mean as u64));
+    let median_label = format!("{:6}", "Median");
+    let median_val = format!("{:>9}", format_number(s.length_median));
+    let range_label = format!("{:6}", "Range");
+    let range_val = format!("{:>9}", format!("{}-{}", format_compact(s.length_min), format_compact(s.length_max)));
 
-    // Add sparkline for length distribution
+    builder.push_record([format!(
+        "{} {} {} {} {} {} {} {} {} {} {}",
+        n50_label.dimmed(), n50_val.bold(), "│".dimmed(),
+        mean_label.dimmed(), mean_val.bold(), "│".dimmed(),
+        median_label.dimmed(), median_val.bold(), "│".dimmed(),
+        range_label.dimmed(), range_val.bold()
+    )]);
+
+    // Sparkline
     if !lengths.is_empty() {
-        let spark_width = 40;
-        let spark = sparkline(lengths, spark_width);
-        let label = "length distribution";
-        // Use known spark_width (not .len() which counts bytes, not chars)
-        let label_width = width - 4 - spark_width - 1;
-        let padded_label = format!("{:<width$}", label, width = label_width);
-        println!("│   {} {}│", spark, padded_label.dimmed());
+        let spark = sparkline(lengths, 40);
+        builder.push_record([format!("{} {}", spark, "length distribution".dimmed())]);
     }
 
     // Channel usage
-    println!("├{}┤", border);
     let channel_pct = s.active_channels as f64 / s.total_channels as f64 * 100.0;
-    let channel_info = format!(
-        "{}/{} active ({:.1}%)",
-        s.active_channels, s.total_channels, channel_pct
-    );
-    // "CHANNELS   " is 11 chars, calculate padding for remaining content
-    let content_len = 11 + channel_info.len();
-    let padding = width.saturating_sub(content_len + 1);
-    println!(
-        "│ {}   {}{:padding$}│",
+    builder.push_record([format!(
+        "{}  {}/{} active ({:.1}%)",
         "CHANNELS".cyan(),
-        channel_info,
-        "",
-        padding = padding
-    );
+        s.active_channels,
+        s.total_channels,
+        channel_pct
+    )]);
 
     // End reasons
-    println!("├{}┤", border);
-    let end_header = format!("{:<width$}", "END REASONS", width = width - 1);
-    println!("│ {}│", end_header.cyan());
+    builder.push_record([format!("{}", "END REASONS".cyan())]);
 
     let total_reads_f = total_reads as f64;
     let mut reasons: Vec<_> = summary.end_reasons.iter().collect();
@@ -516,47 +508,42 @@ fn print_summary(
 
     for (reason, count) in reasons.iter().take(4) {
         let pct = **count as f64 / total_reads_f * 100.0;
-        let bar_width = 20;
-        let bar = progress_bar(pct, bar_width);
+        let bar = progress_bar(pct, 20);
         let count_str = format_number(**count);
-        // Pad reason before applying bold, then calculate remaining padding
-        // Use bar_width (not .len() which counts bytes for Unicode chars)
-        let padded_reason = format!("{:24}", reason);
-        let rest_text = format!("{:>5.1}%  ({:>7})", pct, count_str);
-        let rest_padding = width - 4 - 24 - bar_width - 1 - rest_text.len();
-        println!(
-            "│   {} {} {}{:padding$}│",
-            padded_reason.bold(),
-            bar,
-            rest_text,
-            "",
-            padding = rest_padding
-        );
+        // Pad reason before coloring
+        let reason_pad = format!("{:20}", reason);
+        builder.push_record([format!(
+            "{}  {}  {:>5.1}%  ({:>8})",
+            reason_pad.bold(), bar, pct, count_str
+        )]);
     }
 
     // Warnings
     if !summary.warnings.is_empty() {
-        println!("├{}┤", border);
-        // Pad before applying colors
-        let warn_header = format!("{:<width$}", "⚠ WARNINGS", width = width - 1);
-        println!("│ {}│", warn_header.yellow().bold());
+        builder.push_record([format!("{}", "⚠ WARNINGS".yellow().bold())]);
         for warning in &summary.warnings {
-            let warn_text = truncate(warning, width - 6);
-            // Pad before applying color
-            let padded_warn = format!("{:<width$}", warn_text, width = width - 4);
-            println!("│   {}│", padded_warn.yellow());
+            builder.push_record([format!("{}", truncate(warning, 70).yellow())]);
         }
     }
 
-    println!("╰{}╯", border);
+    // Build and print the table
+    let table = builder
+        .build()
+        .with(Style::rounded())
+        .with(Width::wrap(79))
+        .to_string();
+
+    println!("{}", table);
 }
 
-/// Truncate a string to a maximum length.
+/// Truncate a string to a maximum length (character-aware).
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else {
-        format!("{}…", &s[..max_len - 1])
+        let truncated: String = s.chars().take(max_len - 1).collect();
+        format!("{}…", truncated)
     }
 }
 
