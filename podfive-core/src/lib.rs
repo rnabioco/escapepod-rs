@@ -30,3 +30,17 @@ pub use error::{Error, Result};
 pub use reader::Reader;
 pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{Writer, WriterOptions};
+
+use std::sync::Arc;
+
+/// A compressed signal chunk for block-level copying.
+/// Uses Arc to avoid expensive clones during signal lookups.
+#[derive(Debug, Clone)]
+pub struct CompressedSignalChunk {
+    /// The read ID this chunk belongs to.
+    pub read_id: Uuid,
+    /// Number of samples in this chunk.
+    pub samples: u32,
+    /// Compressed signal data (VBZ format).
+    pub data: Arc<[u8]>,
+}

@@ -4,6 +4,7 @@ use crate::compression;
 use crate::error::{Error, Result};
 use crate::schema::{reads_schema, run_info_schema, signal_schema};
 use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION};
+use crate::CompressedSignalChunk;
 use arrow::array::{
     ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder,
     LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder,
@@ -13,10 +14,14 @@ use arrow::array::{
 use arrow::datatypes::Int16Type;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;
 use arrow::record_batch::RecordBatch;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
+
+/// Write buffer size (2MB for efficient I/O)
+const WRITE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 /// Options for writing POD5 files.
 #[derive(Debug, Clone)]
@@ -55,7 +60,7 @@ struct PendingRead {
 struct SignalChunk {
     read_id: Uuid,
     samples: u32,
-    data: Vec<u8>,
+    data: Arc<[u8]>,
 }
 
 /// Tracks an embedded file's location.
@@ -68,24 +73,30 @@ struct EmbeddedFileInfo {
 
 /// A writer for POD5 files.
 pub struct Writer {
-    file: BufWriter<File>,
+    // File ownership - either direct access or owned by signal writer
+    file: Option<BufWriter<File>>,
     options: WriterOptions,
     file_id: Uuid,
 
-    // Dictionary tracking
+    // Dictionary tracking with O(1) lookup
     pore_types: Vec<String>,
+    pore_type_index: HashMap<String, i16>,
     end_reasons: Vec<String>,
+    end_reason_index: HashMap<String, i16>,
 
     // Run info
     run_infos: Vec<RunInfoData>,
 
-    // Pending data
+    // Pending data (pre-allocated with capacity)
     pending_reads: Vec<PendingRead>,
     pending_signal: Vec<SignalChunk>,
 
-    // Written batches
-    signal_batches: Vec<Vec<u8>>,
-    reads_batches: Vec<Vec<u8>>,
+    // Signal writes directly to file for performance
+    signal_writer: Option<ArrowFileWriter<BufWriter<File>>>,
+    signal_offset: i64,
+
+    // Reads buffered in memory (small compared to signal)
+    reads_writer: Option<ArrowFileWriter<Cursor<Vec<u8>>>>,
 
     // Signal row counter
     current_signal_row: u64,
@@ -101,7 +112,8 @@ impl Writer {
     /// Create a new POD5 file for writing.
     pub fn create<P: AsRef<Path>>(path: P, options: WriterOptions) -> Result<Self> {
         let file = File::create(path)?;
-        let mut file = BufWriter::new(file);
+        // Use 2MB buffer for efficient I/O
+        let mut file = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
 
         // Write signature
         file.write_all(&POD5_SIGNATURE)?;
@@ -110,20 +122,30 @@ impl Writer {
         let section_marker = Uuid::new_v4();
         file.write_all(section_marker.as_bytes())?;
 
+        // Record signal table offset (after header)
+        let signal_offset = file.stream_position()? as i64;
+
         Ok(Self {
-            file,
-            options,
+            file: Some(file),
             file_id: Uuid::new_v4(),
-            pore_types: Vec::new(),
-            end_reasons: Vec::new(),
-            run_infos: Vec::new(),
-            pending_reads: Vec::new(),
-            pending_signal: Vec::new(),
-            signal_batches: Vec::new(),
-            reads_batches: Vec::new(),
+            // Dictionary tracking with O(1) lookup
+            pore_types: Vec::with_capacity(16),
+            pore_type_index: HashMap::with_capacity(16),
+            end_reasons: Vec::with_capacity(16),
+            end_reason_index: HashMap::with_capacity(16),
+            run_infos: Vec::with_capacity(4),
+            // Pre-allocate pending buffers based on batch sizes
+            pending_reads: Vec::with_capacity(options.read_batch_size as usize),
+            pending_signal: Vec::with_capacity(options.signal_batch_size as usize),
+            // Signal writes directly to file
+            signal_writer: None,
+            signal_offset,
+            // Reads buffered in memory
+            reads_writer: None,
             current_signal_row: 0,
             section_marker,
             finalized: false,
+            options,
         })
     }
 
@@ -139,23 +161,27 @@ impl Writer {
     }
 
     /// Get or add a pore type to the dictionary, returning its index.
+    /// Uses O(1) HashMap lookup instead of O(n) linear search.
     fn get_or_add_pore_type(&mut self, pore_type: &str) -> i16 {
-        if let Some(idx) = self.pore_types.iter().position(|p| p == pore_type) {
-            idx as i16
+        if let Some(&idx) = self.pore_type_index.get(pore_type) {
+            idx
         } else {
             let idx = self.pore_types.len() as i16;
             self.pore_types.push(pore_type.to_string());
+            self.pore_type_index.insert(pore_type.to_string(), idx);
             idx
         }
     }
 
     /// Get or add an end reason to the dictionary, returning its index.
+    /// Uses O(1) HashMap lookup instead of O(n) linear search.
     fn get_or_add_end_reason(&mut self, end_reason: &str) -> i16 {
-        if let Some(idx) = self.end_reasons.iter().position(|e| e == end_reason) {
-            idx as i16
+        if let Some(&idx) = self.end_reason_index.get(end_reason) {
+            idx
         } else {
             let idx = self.end_reasons.len() as i16;
             self.end_reasons.push(end_reason.to_string());
+            self.end_reason_index.insert(end_reason.to_string(), idx);
             idx
         }
     }
@@ -169,10 +195,10 @@ impl Writer {
         // Chunk and compress signal
         let mut signal_row_indices = Vec::new();
         for chunk in signal.chunks(self.options.max_signal_chunk_size as usize) {
-            let data = if self.options.compress_signal {
-                compression::compress_signal(chunk)?
+            let data: Arc<[u8]> = if self.options.compress_signal {
+                Arc::from(compression::compress_signal(chunk)?)
             } else {
-                chunk.iter().flat_map(|&s| s.to_le_bytes()).collect()
+                Arc::from(chunk.iter().flat_map(|&s| s.to_le_bytes()).collect::<Vec<u8>>())
             };
 
             signal_row_indices.push(self.current_signal_row);
@@ -206,24 +232,67 @@ impl Writer {
         Ok(())
     }
 
-    /// Flush pending signal data to a batch.
+    /// Add a read with pre-compressed signal data (for block-level copying).
+    /// This is much faster than add_read() when signal is already compressed.
+    pub fn add_read_with_compressed_signal(
+        &mut self,
+        read: ReadData,
+        compressed_chunks: &[CompressedSignalChunk],
+    ) -> Result<()> {
+        if self.finalized {
+            return Err(Error::WriterFinalized);
+        }
+
+        // Add signal chunks directly without compression
+        let mut signal_row_indices = Vec::with_capacity(compressed_chunks.len());
+        for chunk in compressed_chunks {
+            signal_row_indices.push(self.current_signal_row);
+            self.current_signal_row += 1;
+
+            self.pending_signal.push(SignalChunk {
+                read_id: chunk.read_id,
+                samples: chunk.samples,
+                data: chunk.data.clone(), // Arc clone is cheap
+            });
+        }
+
+        // Track dictionary entries
+        self.get_or_add_pore_type(&read.pore_type);
+        self.get_or_add_end_reason(read.end_reason.as_str());
+
+        self.pending_reads.push(PendingRead {
+            data: read,
+            signal_row_indices,
+        });
+
+        // Flush batches if needed
+        if self.pending_signal.len() >= self.options.signal_batch_size as usize {
+            self.flush_signal_batch()?;
+        }
+
+        if self.pending_reads.len() >= self.options.read_batch_size as usize {
+            self.flush_read_batch()?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush pending signal data to a batch - writes directly to file.
     fn flush_signal_batch(&mut self) -> Result<()> {
         if self.pending_signal.is_empty() {
             return Ok(());
         }
 
         let schema = Arc::new(signal_schema());
-        let chunks: Vec<_> = self.pending_signal.drain(..).collect();
+        let num_chunks = self.pending_signal.len();
+        let total_signal_bytes: usize = self.pending_signal.iter().map(|c| c.data.len()).sum();
 
-        // Build arrays
-        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(chunks.len(), 16);
-        let mut signal_builder = LargeBinaryBuilder::with_capacity(
-            chunks.len(),
-            chunks.iter().map(|c| c.data.len()).sum(),
-        );
-        let mut samples_builder = UInt32Builder::with_capacity(chunks.len());
+        // Build arrays - iterate directly without collecting to intermediate Vec
+        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_chunks, 16);
+        let mut signal_builder = LargeBinaryBuilder::with_capacity(num_chunks, total_signal_bytes);
+        let mut samples_builder = UInt32Builder::with_capacity(num_chunks);
 
-        for chunk in chunks {
+        for chunk in self.pending_signal.drain(..) {
             read_id_builder.append_value(chunk.read_id.as_bytes())?;
             signal_builder.append_value(&chunk.data);
             samples_builder.append_value(chunk.samples);
@@ -238,15 +307,14 @@ impl Writer {
             ],
         )?;
 
-        // Write to memory buffer
-        let mut buffer = Vec::new();
-        {
-            let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
-            writer.write(&batch)?;
-            writer.finish()?;
+        // Write directly to file (create writer on first batch, taking ownership of file)
+        // Use try_new since file is already buffered (BufWriter)
+        if self.signal_writer.is_none() {
+            let file = self.file.take().ok_or(Error::WriterFinalized)?;
+            self.signal_writer = Some(ArrowFileWriter::try_new(file, &schema)?);
         }
+        self.signal_writer.as_mut().unwrap().write(&batch)?;
 
-        self.signal_batches.push(buffer);
         Ok(())
     }
 
@@ -257,35 +325,35 @@ impl Writer {
         }
 
         let schema = Arc::new(reads_schema());
-        let reads: Vec<_> = self.pending_reads.drain(..).collect();
+        let num_reads = self.pending_reads.len();
 
-        // Build arrays
-        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(reads.len(), 16);
+        // Build arrays - iterate directly without collecting to intermediate Vec
+        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
         let signal_field = Arc::new(arrow::datatypes::Field::new(
             "item",
             arrow::datatypes::DataType::UInt64,
             false,
         ));
         let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
-        let mut channel_builder = UInt16Builder::with_capacity(reads.len());
-        let mut well_builder = UInt8Builder::with_capacity(reads.len());
+        let mut channel_builder = UInt16Builder::with_capacity(num_reads);
+        let mut well_builder = UInt8Builder::with_capacity(num_reads);
         let mut pore_type_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new();
-        let mut calibration_offset_builder = Float32Builder::with_capacity(reads.len());
-        let mut calibration_scale_builder = Float32Builder::with_capacity(reads.len());
-        let mut read_number_builder = UInt32Builder::with_capacity(reads.len());
-        let mut start_builder = UInt64Builder::with_capacity(reads.len());
-        let mut median_before_builder = Float32Builder::with_capacity(reads.len());
+        let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
+        let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
+        let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
+        let mut start_builder = UInt64Builder::with_capacity(num_reads);
+        let mut median_before_builder = Float32Builder::with_capacity(num_reads);
         let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new();
-        let mut end_reason_forced_builder = BooleanBuilder::with_capacity(reads.len());
+        let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
         let mut run_info_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new();
-        let mut num_minknow_events_builder = UInt64Builder::with_capacity(reads.len());
-        let mut num_samples_builder = UInt64Builder::with_capacity(reads.len());
-        let mut open_pore_level_builder = Float32Builder::with_capacity(reads.len());
+        let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
+        let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
+        let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
 
-        for pending in reads {
+        for pending in self.pending_reads.drain(..) {
             let read = &pending.data;
 
             read_id_builder.append_value(read.read_id.as_bytes())?;
@@ -341,15 +409,13 @@ impl Writer {
 
         let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
-        // Write to memory buffer
-        let mut buffer = Vec::new();
-        {
-            let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
-            writer.write(&batch)?;
-            writer.finish()?;
+        // Write to single IPC file (create writer on first batch)
+        if self.reads_writer.is_none() {
+            let cursor = Cursor::new(Vec::new());
+            self.reads_writer = Some(ArrowFileWriter::try_new(cursor, &schema)?);
         }
+        self.reads_writer.as_mut().unwrap().write(&batch)?;
 
-        self.reads_batches.push(buffer);
         Ok(())
     }
 
@@ -716,13 +782,6 @@ impl Writer {
         Ok(result)
     }
 
-    /// Write a section marker.
-    fn write_section_marker(&mut self) -> Result<()> {
-        self.section_marker = Uuid::new_v4();
-        self.file.write_all(self.section_marker.as_bytes())?;
-        Ok(())
-    }
-
     /// Finalize the file and write the footer.
     pub fn finish(mut self) -> Result<()> {
         if self.finalized {
@@ -735,30 +794,35 @@ impl Writer {
 
         let mut embedded_files = Vec::new();
 
-        // Write signal table
-        let signal_offset = self.file.stream_position()? as i64;
-        for batch in &self.signal_batches {
-            self.file.write_all(batch)?;
-        }
-        let signal_length = self.file.stream_position()? as i64 - signal_offset;
+        // Finalize signal writer and get file back
+        let mut file = if let Some(mut writer) = self.signal_writer.take() {
+            writer.finish()?;
+            writer.into_inner()?
+        } else {
+            // No signal was written, file should still be in self.file
+            self.file.take().ok_or(Error::WriterFinalized)?
+        };
+
+        // Record signal table info
+        let signal_length = file.stream_position()? as i64 - self.signal_offset;
         if signal_length > 0 {
             embedded_files.push(EmbeddedFileInfo {
-                offset: signal_offset,
+                offset: self.signal_offset,
                 length: signal_length,
                 content_type: 1, // SignalTable
             });
         }
 
         // Pad to 8-byte alignment
-        while self.file.stream_position()? % 8 != 0 {
-            self.file.write_all(&[0u8])?;
+        while file.stream_position()? % 8 != 0 {
+            file.write_all(&[0u8])?;
         }
-        self.write_section_marker()?;
+        file.write_all(self.section_marker.as_bytes())?;
 
         // Write run info table
         let run_info_data = self.build_run_info_table()?;
-        let run_info_offset = self.file.stream_position()? as i64;
-        self.file.write_all(&run_info_data)?;
+        let run_info_offset = file.stream_position()? as i64;
+        file.write_all(&run_info_data)?;
         let run_info_length = run_info_data.len() as i64;
         embedded_files.push(EmbeddedFileInfo {
             offset: run_info_offset,
@@ -767,17 +831,20 @@ impl Writer {
         });
 
         // Pad and section marker
-        while self.file.stream_position()? % 8 != 0 {
-            self.file.write_all(&[0u8])?;
+        while file.stream_position()? % 8 != 0 {
+            file.write_all(&[0u8])?;
         }
-        self.write_section_marker()?;
+        self.section_marker = Uuid::new_v4();
+        file.write_all(self.section_marker.as_bytes())?;
 
-        // Write reads table
-        let reads_offset = self.file.stream_position()? as i64;
-        for batch in &self.reads_batches {
-            self.file.write_all(batch)?;
+        // Write reads table from memory buffer
+        let reads_offset = file.stream_position()? as i64;
+        if let Some(mut writer) = self.reads_writer.take() {
+            writer.finish()?;
+            let cursor = writer.into_inner()?;
+            file.write_all(cursor.get_ref())?;
         }
-        let reads_length = self.file.stream_position()? as i64 - reads_offset;
+        let reads_length = file.stream_position()? as i64 - reads_offset;
         if reads_length > 0 {
             embedded_files.push(EmbeddedFileInfo {
                 offset: reads_offset,
@@ -787,29 +854,31 @@ impl Writer {
         }
 
         // Pad and section marker
-        while self.file.stream_position()? % 8 != 0 {
-            self.file.write_all(&[0u8])?;
+        while file.stream_position()? % 8 != 0 {
+            file.write_all(&[0u8])?;
         }
-        self.write_section_marker()?;
+        self.section_marker = Uuid::new_v4();
+        file.write_all(self.section_marker.as_bytes())?;
 
         // Write FOOTER magic
-        self.file.write_all(&FOOTER_MAGIC)?;
+        file.write_all(&FOOTER_MAGIC)?;
 
         // Build and write footer
         let footer_data = self.build_flatbuffer_footer(&embedded_files)?;
-        self.file.write_all(&footer_data)?;
+        file.write_all(&footer_data)?;
 
         // Write footer length
         let footer_len = footer_data.len() as i64;
-        self.file.write_all(&footer_len.to_le_bytes())?;
+        file.write_all(&footer_len.to_le_bytes())?;
 
         // Write final section marker
-        self.write_section_marker()?;
+        self.section_marker = Uuid::new_v4();
+        file.write_all(self.section_marker.as_bytes())?;
 
         // Write signature
-        self.file.write_all(&POD5_SIGNATURE)?;
+        file.write_all(&POD5_SIGNATURE)?;
 
-        self.file.flush()?;
+        file.flush()?;
         self.finalized = true;
         Ok(())
     }

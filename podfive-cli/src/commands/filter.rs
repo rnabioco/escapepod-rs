@@ -1,9 +1,10 @@
 //! Filter command implementation.
 //!
 //! Filters reads from a POD5 file based on a list of read IDs.
+//! Uses block-level copying of compressed signal data for maximum performance.
 
 use crate::util::{parse_uuid_flexible, resolve_pod5_inputs};
-use podfive_core::{Reader, Writer, WriterOptions};
+use podfive_core::{CompressedSignalChunk, Reader, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -34,12 +35,19 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         anyhow::bail!("No read IDs found in {}", ids_file.display());
     }
 
-    // Create writer
-    let options = WriterOptions::default();
+    // Create writer with optimized batch sizes
+    // Signal batches can be smaller for frequent direct file writes
+    // Read batch must hold all reads to avoid dictionary replacement in Arrow IPC
+    let mut options = WriterOptions::default();
+    options.signal_batch_size = 1_000;
+    options.read_batch_size = 500_000;
     let mut writer = Writer::create(&output, options)?;
 
     // Track run infos across all files
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
+
+    // Reusable buffer for signal chunks
+    let mut compressed_signal: Vec<CompressedSignalChunk> = Vec::with_capacity(64);
 
     // Filter reads from all files
     let mut matched = 0u64;
@@ -72,6 +80,23 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
             }
         }
 
+        // Load all compressed signal data once for efficient filtering
+        let all_signal = match reader.get_all_signal_compressed() {
+            Ok(s) => s,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: cannot read signal from {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
         let reads_iter = match reader.reads() {
             Ok(iter) => iter,
             Err(e) => {
@@ -103,20 +128,28 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
 
             // Check if this read's ID is in the filter list
             if ids.contains(&read.read_id) {
-                // Get signal for this read
-                let signal = match reader.get_signal(&read.signal_rows) {
-                    Ok(s) => s,
-                    Err(e) => {
+                // Get compressed signal by looking up row indices
+                compressed_signal.clear();
+                let mut signal_ok = true;
+                for &idx in &read.signal_rows {
+                    if let Some(chunk) = all_signal.get(idx as usize) {
+                        compressed_signal.push(chunk.clone());
+                    } else {
                         signal_errors += 1;
                         if signal_errors <= 3 {
                             eprintln!(
-                                "Warning: error reading signal for read {}: {}",
-                                read.read_id, e
+                                "Warning: missing signal chunk {} for read {}",
+                                idx, read.read_id
                             );
                         }
-                        continue;
+                        signal_ok = false;
+                        break;
                     }
-                };
+                }
+
+                if !signal_ok {
+                    continue;
+                }
 
                 // Map run_info index
                 let new_run_info_idx = if let Some(original_run_info) =
@@ -132,7 +165,7 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
                 // Create new read data for writing
                 let new_read = read.for_writing(new_run_info_idx);
 
-                writer.add_read(new_read, &signal)?;
+                writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
                 matched += 1;
             }
         }

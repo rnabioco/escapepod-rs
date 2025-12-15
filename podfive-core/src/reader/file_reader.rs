@@ -4,6 +4,7 @@ use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
 use crate::types::{ReadData, RunInfoData, Uuid, POD5_SIGNATURE};
+use crate::CompressedSignalChunk;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 
 /// A reader for POD5 files.
 pub struct Reader {
@@ -187,6 +189,84 @@ impl Reader {
         }
 
         Ok(all_samples)
+    }
+
+    /// Get all compressed signal chunks without decompressing.
+    /// This is efficient for block-level copying during merge/filter operations.
+    pub fn get_all_signal_compressed(&self) -> Result<Vec<CompressedSignalChunk>> {
+        let embedded = self
+            .footer
+            .signal_table()
+            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
+
+        let reader = self.create_arrow_reader(embedded)?;
+        let mut all_chunks = Vec::new();
+
+        for batch_result in reader {
+            let batch = batch_result?;
+            self.extract_compressed_signal_from_batch(&batch, &mut all_chunks)?;
+        }
+
+        Ok(all_chunks)
+    }
+
+    /// Extract compressed signal chunks from a batch.
+    fn extract_compressed_signal_from_batch(
+        &self,
+        batch: &RecordBatch,
+        chunks: &mut Vec<CompressedSignalChunk>,
+    ) -> Result<()> {
+        use arrow::array::{Array, FixedSizeBinaryArray, LargeBinaryArray, UInt32Array};
+
+        let read_id_col = batch
+            .column_by_name("read_id")
+            .ok_or_else(|| Error::MissingField("read_id column".to_string()))?;
+        let signal_col = batch
+            .column_by_name("signal")
+            .ok_or_else(|| Error::MissingField("signal column".to_string()))?;
+        let samples_col = batch
+            .column_by_name("samples")
+            .ok_or_else(|| Error::MissingField("samples column".to_string()))?;
+
+        let read_id_array = read_id_col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "read_id".to_string(),
+                message: "Expected FixedSizeBinaryArray".to_string(),
+            })?;
+
+        let signal_array = signal_col
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "signal".to_string(),
+                message: "Expected LargeBinaryArray".to_string(),
+            })?;
+
+        let samples_array = samples_col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "samples".to_string(),
+                message: "Expected UInt32Array".to_string(),
+            })?;
+
+        for row in 0..batch.num_rows() {
+            let read_id_bytes = read_id_array.value(row);
+            let read_id = Uuid::from_slice(read_id_bytes)
+                .map_err(|e| Error::InvalidUuid(e.to_string()))?;
+            let compressed_data = signal_array.value(row);
+            let samples = samples_array.value(row);
+
+            chunks.push(CompressedSignalChunk {
+                read_id,
+                samples,
+                data: Arc::from(compressed_data),
+            });
+        }
+
+        Ok(())
     }
 
     /// Extract signal samples from a signal table batch row.
