@@ -2,6 +2,7 @@
 //!
 //! Merges multiple POD5 files into a single output file using parallel I/O.
 
+use crate::util::resolve_pod5_inputs;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use podfive_core::{ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
@@ -26,6 +27,19 @@ pub fn run(
     if inputs.is_empty() {
         anyhow::bail!("No input files specified");
     }
+
+    // Expand any directories to individual POD5 files
+    let mut all_files = Vec::new();
+    for input in &inputs {
+        let files = resolve_pod5_inputs(input)?;
+        all_files.extend(files);
+    }
+
+    if all_files.is_empty() {
+        anyhow::bail!("No POD5 files found in specified inputs");
+    }
+
+    let inputs = all_files;
 
     let num_threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4));
 

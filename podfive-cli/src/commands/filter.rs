@@ -2,6 +2,7 @@
 //!
 //! Filters reads from a POD5 file based on a list of read IDs.
 
+use crate::util::resolve_pod5_inputs;
 use podfive_core::{ReadData, Reader, Uuid, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -9,9 +10,17 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result<()> {
+    // Resolve input to list of POD5 files (supports directories)
+    let files = resolve_pod5_inputs(&input)?;
+    let is_directory = files.len() > 1;
+
     println!(
         "Filtering {} using IDs from {}",
-        input.display(),
+        if is_directory {
+            format!("{} ({} files)", input.display(), files.len())
+        } else {
+            input.display().to_string()
+        },
         ids_file.display()
     );
     println!("Output: {}", output.display());
@@ -24,66 +33,71 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         anyhow::bail!("No read IDs found in {}", ids_file.display());
     }
 
-    // Open input file
-    let reader = Reader::open(&input)?;
-
     // Create writer
     let options = WriterOptions::default();
     let mut writer = Writer::create(&output, options)?;
 
-    // Copy run infos
+    // Track run infos across all files
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
-    for run_info in reader.run_infos() {
-        let idx = writer.add_run_info(run_info.clone())?;
-        run_info_map.insert(run_info.acquisition_id.clone(), idx);
-    }
 
-    // Filter reads
+    // Filter reads from all files
     let mut matched = 0u64;
     let mut total = 0u64;
 
-    for read_result in reader.reads()? {
-        let read = read_result?;
-        total += 1;
+    for file_path in &files {
+        let reader = Reader::open(file_path)?;
 
-        // Check if this read's ID is in the filter list
-        if ids.contains(&read.read_id) {
-            // Get signal for this read
-            let signal = reader.get_signal(&read.signal_rows)?;
+        // Add run infos (deduplicated by acquisition_id)
+        for run_info in reader.run_infos() {
+            if !run_info_map.contains_key(&run_info.acquisition_id) {
+                let idx = writer.add_run_info(run_info.clone())?;
+                run_info_map.insert(run_info.acquisition_id.clone(), idx);
+            }
+        }
 
-            // Map run_info index
-            let new_run_info_idx = if let Some(original_run_info) =
-                reader.get_run_info(read.run_info_index as usize)
-            {
-                *run_info_map
-                    .get(&original_run_info.acquisition_id)
-                    .unwrap_or(&0)
-            } else {
-                0
-            };
+        for read_result in reader.reads()? {
+            let read = read_result?;
+            total += 1;
 
-            // Create new read data
-            let new_read = ReadData {
-                read_id: read.read_id,
-                read_number: read.read_number,
-                start_sample: read.start_sample,
-                channel: read.channel,
-                well: read.well,
-                pore_type: read.pore_type.clone(),
-                calibration_offset: read.calibration_offset,
-                calibration_scale: read.calibration_scale,
-                median_before: read.median_before,
-                end_reason: read.end_reason,
-                end_reason_forced: read.end_reason_forced,
-                run_info_index: new_run_info_idx,
-                num_minknow_events: read.num_minknow_events,
-                num_samples: read.num_samples,
-                open_pore_level: read.open_pore_level,
-                signal_rows: Vec::new(),
-            };
+            // Check if this read's ID is in the filter list
+            if ids.contains(&read.read_id) {
+                // Get signal for this read
+                let signal = reader.get_signal(&read.signal_rows)?;
 
-            writer.add_read(new_read, &signal)?;
-            matched += 1;
+                // Map run_info index
+                let new_run_info_idx = if let Some(original_run_info) =
+                    reader.get_run_info(read.run_info_index as usize)
+                {
+                    *run_info_map
+                        .get(&original_run_info.acquisition_id)
+                        .unwrap_or(&0)
+                } else {
+                    0
+                };
+
+                // Create new read data
+                let new_read = ReadData {
+                    read_id: read.read_id,
+                    read_number: read.read_number,
+                    start_sample: read.start_sample,
+                    channel: read.channel,
+                    well: read.well,
+                    pore_type: read.pore_type.clone(),
+                    calibration_offset: read.calibration_offset,
+                    calibration_scale: read.calibration_scale,
+                    median_before: read.median_before,
+                    end_reason: read.end_reason,
+                    end_reason_forced: read.end_reason_forced,
+                    run_info_index: new_run_info_idx,
+                    num_minknow_events: read.num_minknow_events,
+                    num_samples: read.num_samples,
+                    open_pore_level: read.open_pore_level,
+                    signal_rows: Vec::new(),
+                };
+
+                writer.add_read(new_read, &signal)?;
+                matched += 1;
+            }
         }
     }
 
@@ -94,13 +108,13 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         "Filtered {} reads from {} total ({:.1}%)",
         matched,
         total,
-        (matched as f64 / total as f64) * 100.0
+        if total > 0 { (matched as f64 / total as f64) * 100.0 } else { 0.0 }
     );
 
     let not_found = ids.len() as u64 - matched;
     if not_found > 0 {
         println!(
-            "Warning: {} requested IDs were not found in the input file",
+            "Warning: {} requested IDs were not found in the input",
             not_found
         );
     }

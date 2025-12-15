@@ -2,6 +2,7 @@
 //!
 //! Produces a tabular summary of reads from POD5 files.
 
+use crate::util::resolve_pod5_inputs;
 use podfive_core::{ReadData, Reader};
 use std::collections::HashSet;
 use std::fs::File;
@@ -47,7 +48,8 @@ pub fn run(
     separator: String,
     no_header: bool,
 ) -> anyhow::Result<()> {
-    let reader = Reader::open(&input)?;
+    // Resolve input to list of POD5 files (supports directories)
+    let files = resolve_pod5_inputs(&input)?;
 
     // Determine which fields to output
     let fields = determine_fields(include.as_deref(), exclude.as_deref(), ids_only)?;
@@ -58,20 +60,25 @@ pub fn run(
         None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    // Write header
+    // Write header (only once for all files)
     if !no_header && !ids_only {
         writeln!(writer, "{}", fields.join(&separator))?;
     }
 
-    // Write reads
-    for read_result in reader.reads()? {
-        let read = read_result?;
+    // Process all files
+    for file_path in &files {
+        let reader = Reader::open(file_path)?;
 
-        if ids_only {
-            writeln!(writer, "{}", read.read_id)?;
-        } else {
-            let values: Vec<String> = fields.iter().map(|f| get_field_value(&read, f)).collect();
-            writeln!(writer, "{}", values.join(&separator))?;
+        // Write reads
+        for read_result in reader.reads()? {
+            let read = read_result?;
+
+            if ids_only {
+                writeln!(writer, "{}", read.read_id)?;
+            } else {
+                let values: Vec<String> = fields.iter().map(|f| get_field_value(&read, f)).collect();
+                writeln!(writer, "{}", values.join(&separator))?;
+            }
         }
     }
 
