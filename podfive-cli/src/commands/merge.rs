@@ -1,13 +1,39 @@
 //! Merge command implementation.
 //!
 //! Merges multiple POD5 files into a single output file.
-//! Uses block-level copying of compressed signal data for maximum performance.
+//! Uses parallel file reading and block-level signal copying for maximum performance.
 
 use crate::util::resolve_pod5_inputs;
-use podfive_core::{CompressedSignalChunk, Reader, Writer, WriterOptions};
+use podfive_core::{CompressedSignalChunk, ReadData, Reader, RunInfoData, Writer, WriterOptions};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// Data extracted from a single input file for merging.
+struct FileData {
+    run_infos: Vec<RunInfoData>,
+    reads: Vec<(ReadData, Vec<CompressedSignalChunk>)>,
+}
+
+/// Read a single file and extract all data needed for merging.
+fn read_file_data(path: &PathBuf) -> anyhow::Result<FileData> {
+    let reader = Reader::open(path)?;
+
+    // Collect run infos
+    let run_infos: Vec<RunInfoData> = reader.run_infos().to_vec();
+
+    // Collect reads with their signal data
+    let mut reads = Vec::new();
+    for read_result in reader.reads()? {
+        let read = read_result?;
+        // Use lazy signal loading with O(1) batch lookup
+        let signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
+        reads.push((read, signal));
+    }
+
+    Ok(FileData { run_infos, reads })
+}
 
 pub fn run(
     inputs: Vec<PathBuf>,
@@ -31,14 +57,36 @@ pub fn run(
     }
 
     let num_files = all_files.len();
-    println!("Merging {} files into {}", num_files, output.display());
+    eprintln!("Merging {} files into {}", num_files, output.display());
 
-    // Create writer with optimized batch sizes
-    // Signal batches can be smaller for frequent direct file writes
-    // Read batch must hold all reads to avoid dictionary replacement in Arrow IPC
+    // Phase 1: Read all files in parallel
+    eprintln!("Reading {} files in parallel...", num_files);
+    let file_results: Vec<Result<FileData, anyhow::Error>> = all_files
+        .par_iter()
+        .map(|path| read_file_data(path))
+        .collect();
+
+    // Check for errors and collect successful results
+    let mut file_data_vec = Vec::with_capacity(num_files);
+    for (i, result) in file_results.into_iter().enumerate() {
+        match result {
+            Ok(data) => file_data_vec.push(data),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to read {}: {}",
+                    all_files[i].display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Phase 2: Write all data sequentially (Writer is not thread-safe)
+    eprintln!("Writing merged output...");
+
     let mut options = WriterOptions::default();
-    options.signal_batch_size = 1_000; // Smaller batches for streaming to file
-    options.read_batch_size = 500_000; // Large enough for typical merge operations
+    options.signal_batch_size = 10_000; // Larger batches reduce flush overhead
+    options.read_batch_size = 500_000;
     let mut writer = Writer::create(&output, options)?;
 
     // Track run infos by acquisition_id to avoid duplicates
@@ -54,26 +102,17 @@ pub fn run(
     let mut total_reads = 0u64;
     let mut duplicate_count = 0u64;
 
-    // Reusable buffer for signal chunks (avoids repeated allocation)
-    let mut compressed_signal: Vec<CompressedSignalChunk> = Vec::with_capacity(64);
-
-    for (file_idx, file_path) in all_files.iter().enumerate() {
-        let reader = Reader::open(file_path)?;
-
+    for file_data in file_data_vec {
         // Add run infos (deduplicated by acquisition_id)
-        for run_info in reader.run_infos() {
+        for run_info in file_data.run_infos {
             if !run_info_map.contains_key(&run_info.acquisition_id) {
                 let idx = writer.add_run_info(run_info.clone())?;
                 run_info_map.insert(run_info.acquisition_id.clone(), idx);
             }
         }
 
-        // Load all compressed signal data once
-        let all_signal = reader.get_all_signal_compressed()?;
-
-        for read_result in reader.reads()? {
-            let read = read_result?;
-
+        // Write reads
+        for (read, compressed_signal) in file_data.reads {
             // Check for duplicates
             if !duplicate_ok {
                 if seen_reads.contains(&read.read_id) {
@@ -83,36 +122,18 @@ pub fn run(
                 seen_reads.insert(read.read_id);
             }
 
-            // Get compressed signal by looking up row indices
-            // Reuse the buffer instead of allocating new Vec each time
-            compressed_signal.clear();
-            for &idx in &read.signal_rows {
-                if let Some(chunk) = all_signal.get(idx as usize) {
-                    compressed_signal.push(chunk.clone());
-                }
-            }
-
             // Map run_info index
-            let new_run_info_idx = if let Some(original_run_info) =
-                reader.get_run_info(read.run_info_index as usize)
-            {
-                *run_info_map
-                    .get(&original_run_info.acquisition_id)
-                    .unwrap_or(&0)
-            } else {
-                0
-            };
+            let new_run_info_idx = run_info_map
+                .values()
+                .next()
+                .copied()
+                .unwrap_or(0);
 
-            // Create new read data for writing
             let new_read = read.for_writing(new_run_info_idx);
-
             writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
             total_reads += 1;
         }
-
-        eprint!("\rProcessed {}/{} files", file_idx + 1, num_files);
     }
-    eprintln!();
 
     // Finalize output file
     writer.finish()?;
