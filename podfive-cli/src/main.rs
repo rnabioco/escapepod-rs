@@ -187,5 +187,7 @@ fn main() -> anyhow::Result<()> {
             output_dir,
             force,
         } => commands::subset::run(input, csv, output_dir, force),
+
+        Commands::Summary(args) => commands::summary::run(args),
     }
 }

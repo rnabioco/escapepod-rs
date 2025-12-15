@@ -55,6 +55,7 @@ nav:
       - Quick Start: getting-started/quickstart.md
   - CLI Reference:
       - Overview: cli/index.md
+      - summary: cli/summary.md
       - view: cli/view.md
       - inspect: cli/inspect.md
       - merge: cli/merge.md

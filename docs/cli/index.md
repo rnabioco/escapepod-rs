@@ -12,6 +12,7 @@ podfive <COMMAND> [OPTIONS]
 
 | Command | Description |
 |---------|-------------|
+| [summary](summary.md) | Comprehensive file summary with QC metrics |
 | [view](view.md) | Display reads as a table |
 | [inspect](inspect.md) | Inspect file metadata and contents |
 | [merge](merge.md) | Combine multiple POD5 files |

@@ -3,9 +3,9 @@
 //! Generates a comprehensive summary of POD5 file(s) with statistics and QC metrics.
 
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use owo_colors::OwoColorize;
-use podfive_core::{EndReason, Reader, RunInfoData};
+use podfive_core::{Reader, RunInfoData};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -245,7 +245,7 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        print_summary(&summary, &args.input, is_directory, sample_rate);
+        print_summary(&summary, &args.input, is_directory, sample_rate, &stats.lengths);
     }
 
     Ok(())
@@ -364,7 +364,7 @@ fn progress_bar(pct: f64, width: usize) -> String {
 }
 
 /// Print the formatted summary.
-fn print_summary(summary: &Summary, input: &PathBuf, is_directory: bool, sample_rate: u16) {
+fn print_summary(summary: &Summary, input: &PathBuf, is_directory: bool, sample_rate: u16, lengths: &[u64]) {
     let width = 77;
     let border = "─".repeat(width);
 
@@ -408,12 +408,6 @@ fn print_summary(summary: &Summary, input: &PathBuf, is_directory: bool, sample_
             ri.flow_cell_id.clone()
         } else {
             format!("{} ({})", ri.flow_cell_id, ri.flow_cell_product_code)
-        };
-
-        let system = if ri.system_type.is_empty() {
-            ri.system_name.clone()
-        } else {
-            format!("{} ({})", ri.system_name, ri.system_type)
         };
 
         println!(
@@ -462,6 +456,20 @@ fn print_summary(summary: &Summary, input: &PathBuf, is_directory: bool, sample_
         "Range".dimmed(),
         format!("{}-{}", format_compact(s.length_min), format_compact(s.length_max)).bold(),
     );
+
+    // Add sparkline for length distribution
+    if !lengths.is_empty() {
+        let spark = sparkline(lengths, 40);
+        let label = "length distribution";
+        let padding = width.saturating_sub(spark.len() + label.len() + 6);
+        println!(
+            "│   {} {}{:padding$} │",
+            spark,
+            label.dimmed(),
+            "",
+            padding = padding
+        );
+    }
 
     // Channel usage
     println!("├{}┤", border);
