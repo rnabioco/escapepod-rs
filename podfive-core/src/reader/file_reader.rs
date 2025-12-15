@@ -437,6 +437,130 @@ impl Reader {
         Ok(all_chunks)
     }
 
+    /// Get compressed signal chunks for specific row indices only.
+    /// This is more efficient than get_all_signal_compressed() when only a subset
+    /// of reads are needed (e.g., for filter operations).
+    /// Uses O(1) batch lookup and LRU caching for repeated access.
+    pub fn get_compressed_signal_for_rows(
+        &self,
+        signal_rows: &[u64],
+    ) -> Result<Vec<CompressedSignalChunk>> {
+        // Use optimized path if we have signal metadata
+        if let Some(ref metadata) = self.signal_metadata {
+            return self.get_compressed_signal_optimized(signal_rows, metadata);
+        }
+
+        // Fallback: load all and filter (less efficient)
+        let all_signal = self.get_all_signal_compressed()?;
+        let mut result = Vec::with_capacity(signal_rows.len());
+        for &idx in signal_rows {
+            if let Some(chunk) = all_signal.get(idx as usize) {
+                result.push(chunk.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Optimized compressed signal retrieval using O(1) batch lookup and LRU cache.
+    fn get_compressed_signal_optimized(
+        &self,
+        signal_rows: &[u64],
+        metadata: &SignalBatchMetadata,
+    ) -> Result<Vec<CompressedSignalChunk>> {
+        let embedded = self
+            .footer
+            .signal_table()
+            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
+
+        let mut result = Vec::with_capacity(signal_rows.len());
+
+        for &row_idx in signal_rows {
+            // O(1) batch lookup
+            let batch_idx = (row_idx as usize) / metadata.batch_size;
+            let local_row = (row_idx as usize) % metadata.batch_size;
+
+            if batch_idx >= metadata.num_batches {
+                return Err(Error::BatchIndexOutOfBounds {
+                    index: batch_idx,
+                    max: metadata.num_batches,
+                });
+            }
+
+            // Try to get from cache first
+            let chunk = {
+                let mut cache = self.signal_cache.borrow_mut();
+                if let Some(batch) = cache.get(batch_idx) {
+                    self.extract_single_compressed_chunk(batch, local_row)?
+                } else {
+                    drop(cache);
+                    let batch = self.load_signal_batch(embedded, batch_idx)?;
+                    let chunk = self.extract_single_compressed_chunk(&batch, local_row)?;
+                    self.signal_cache.borrow_mut().insert(batch_idx, batch);
+                    chunk
+                }
+            };
+
+            result.push(chunk);
+        }
+
+        Ok(result)
+    }
+
+    /// Extract a single compressed signal chunk from a batch row.
+    fn extract_single_compressed_chunk(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> Result<CompressedSignalChunk> {
+        use arrow::array::{Array, FixedSizeBinaryArray, LargeBinaryArray, UInt32Array};
+
+        let read_id_col = batch
+            .column_by_name("read_id")
+            .ok_or_else(|| Error::MissingField("read_id column".to_string()))?;
+        let signal_col = batch
+            .column_by_name("signal")
+            .ok_or_else(|| Error::MissingField("signal column".to_string()))?;
+        let samples_col = batch
+            .column_by_name("samples")
+            .ok_or_else(|| Error::MissingField("samples column".to_string()))?;
+
+        let read_id_array = read_id_col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "read_id".to_string(),
+                message: "Expected FixedSizeBinaryArray".to_string(),
+            })?;
+
+        let signal_array = signal_col
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "signal".to_string(),
+                message: "Expected LargeBinaryArray".to_string(),
+            })?;
+
+        let samples_array = samples_col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "samples".to_string(),
+                message: "Expected UInt32Array".to_string(),
+            })?;
+
+        let read_id_bytes = read_id_array.value(row);
+        let read_id =
+            Uuid::from_slice(read_id_bytes).map_err(|e| Error::InvalidUuid(e.to_string()))?;
+        let compressed_data = signal_array.value(row);
+        let samples = samples_array.value(row);
+
+        Ok(CompressedSignalChunk {
+            read_id,
+            samples,
+            data: Arc::from(compressed_data),
+        })
+    }
+
     /// Extract compressed signal chunks from a batch.
     fn extract_compressed_signal_from_batch(
         &self,
