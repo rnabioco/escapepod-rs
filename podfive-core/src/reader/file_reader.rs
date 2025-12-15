@@ -8,11 +8,101 @@ use crate::CompressedSignalChunk;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Default maximum number of signal batches to cache.
+const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
+
+/// Metadata about signal table batches for efficient lookup.
+#[derive(Debug, Clone)]
+struct SignalBatchMetadata {
+    /// Number of rows per batch (assumed uniform, determined from batch 0).
+    batch_size: usize,
+    /// Total number of signal batches.
+    num_batches: usize,
+}
+
+/// A cached signal batch with access tracking for LRU eviction.
+struct CachedSignalBatch {
+    batch: RecordBatch,
+    last_access: u64,
+}
+
+/// LRU cache for signal batches.
+struct SignalBatchCache {
+    /// Cached batches indexed by batch number.
+    batches: HashMap<usize, CachedSignalBatch>,
+    /// Maximum number of batches to cache.
+    max_size: usize,
+    /// Access counter for LRU tracking.
+    access_counter: u64,
+}
+
+impl SignalBatchCache {
+    /// Create a new signal batch cache with the given maximum size.
+    fn new(max_size: usize) -> Self {
+        Self {
+            batches: HashMap::with_capacity(max_size),
+            max_size,
+            access_counter: 0,
+        }
+    }
+
+    /// Get a batch from the cache, updating access time.
+    fn get(&mut self, batch_idx: usize) -> Option<&RecordBatch> {
+        if let Some(cached) = self.batches.get_mut(&batch_idx) {
+            self.access_counter += 1;
+            cached.last_access = self.access_counter;
+            Some(&cached.batch)
+        } else {
+            None
+        }
+    }
+
+    /// Insert a batch into the cache, evicting old entries if necessary.
+    fn insert(&mut self, batch_idx: usize, batch: RecordBatch) {
+        // Evict if at capacity
+        if self.batches.len() >= self.max_size && !self.batches.contains_key(&batch_idx) {
+            self.evict_oldest();
+        }
+
+        self.access_counter += 1;
+        self.batches.insert(
+            batch_idx,
+            CachedSignalBatch {
+                batch,
+                last_access: self.access_counter,
+            },
+        );
+    }
+
+    /// Evict approximately 20% of the oldest entries (like C++ implementation).
+    fn evict_oldest(&mut self) {
+        if self.batches.is_empty() {
+            return;
+        }
+
+        let to_evict = std::cmp::max(1, self.batches.len() / 5);
+
+        // Collect entries sorted by access time
+        let mut entries: Vec<_> = self
+            .batches
+            .iter()
+            .map(|(&idx, cached)| (idx, cached.last_access))
+            .collect();
+        entries.sort_by_key(|&(_, access)| access);
+
+        // Remove oldest entries
+        for (idx, _) in entries.into_iter().take(to_evict) {
+            self.batches.remove(&idx);
+        }
+    }
+}
 
 /// A reader for POD5 files.
 pub struct Reader {
@@ -22,11 +112,20 @@ pub struct Reader {
     footer: Footer,
     /// Cached run info data.
     run_info_cache: Vec<RunInfoData>,
+    /// Signal batch metadata for O(1) batch lookup.
+    signal_metadata: Option<SignalBatchMetadata>,
+    /// LRU cache for signal batches (interior mutability for read operations).
+    signal_cache: RefCell<SignalBatchCache>,
 }
 
 impl Reader {
     /// Open a POD5 file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_cache_size(path, DEFAULT_MAX_CACHED_BATCHES)
+    }
+
+    /// Open a POD5 file with a custom signal batch cache size.
+    pub fn open_with_cache_size<P: AsRef<Path>>(path: P, cache_size: usize) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
 
@@ -41,11 +140,55 @@ impl Reader {
         // Load run info eagerly (it's usually small)
         let run_info_cache = Self::load_run_info(&mmap, &footer)?;
 
+        // Load signal batch metadata (batch size from batch 0, like C++ implementation)
+        let signal_metadata = Self::load_signal_metadata(&mmap, &footer)?;
+
         Ok(Self {
             mmap,
             footer,
             run_info_cache,
+            signal_metadata,
+            signal_cache: RefCell::new(SignalBatchCache::new(cache_size)),
         })
+    }
+
+    /// Load signal batch metadata for O(1) batch lookup.
+    fn load_signal_metadata(mmap: &Mmap, footer: &Footer) -> Result<Option<SignalBatchMetadata>> {
+        let embedded = match footer.signal_table() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let start = embedded.offset as usize;
+        let end = start + embedded.length as usize;
+
+        if end > mmap.len() {
+            return Err(Error::InvalidFooter(
+                "Signal table extends beyond file".to_string(),
+            ));
+        }
+
+        let slice = &mmap[start..end];
+        let cursor = Cursor::new(slice);
+        let reader = ArrowFileReader::try_new(cursor, None)?;
+
+        let num_batches = reader.num_batches();
+        if num_batches == 0 {
+            return Ok(None);
+        }
+
+        // Read batch 0 to determine batch size (like C++ implementation)
+        let mut reader_iter = reader.into_iter();
+        let batch_size = match reader_iter.next() {
+            Some(Ok(batch)) => batch.num_rows(),
+            Some(Err(e)) => return Err(Error::from(e)),
+            None => return Ok(None),
+        };
+
+        Ok(Some(SignalBatchMetadata {
+            batch_size,
+            num_batches,
+        }))
     }
 
     /// Get the file identifier (UUID).
@@ -157,7 +300,92 @@ impl Reader {
     /// Get signal data for a read.
     ///
     /// The `signal_rows` parameter should be the signal row indices from the read record.
+    /// Uses O(1) batch lookup and LRU caching for efficient repeated access.
     pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
+        // Use optimized path if we have signal metadata
+        if let Some(ref metadata) = self.signal_metadata {
+            return self.get_signal_optimized(signal_rows, metadata);
+        }
+
+        // Fallback to original implementation for files without signal table
+        self.get_signal_fallback(signal_rows)
+    }
+
+    /// Optimized signal retrieval using O(1) batch lookup and LRU cache.
+    fn get_signal_optimized(
+        &self,
+        signal_rows: &[u64],
+        metadata: &SignalBatchMetadata,
+    ) -> Result<Vec<i16>> {
+        let embedded = self
+            .footer
+            .signal_table()
+            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
+
+        let mut all_samples = Vec::new();
+
+        for &row_idx in signal_rows {
+            // O(1) batch lookup: batch_idx = row / batch_size
+            let batch_idx = (row_idx as usize) / metadata.batch_size;
+            let local_row = (row_idx as usize) % metadata.batch_size;
+
+            if batch_idx >= metadata.num_batches {
+                return Err(Error::BatchIndexOutOfBounds {
+                    index: batch_idx,
+                    max: metadata.num_batches,
+                });
+            }
+
+            // Try to get from cache first
+            let samples = {
+                let mut cache = self.signal_cache.borrow_mut();
+                if let Some(batch) = cache.get(batch_idx) {
+                    // Cache hit - extract signal directly
+                    self.extract_signal_from_batch(batch, local_row)?
+                } else {
+                    // Cache miss - need to load the batch
+                    drop(cache); // Release borrow before loading
+
+                    let batch = self.load_signal_batch(embedded, batch_idx)?;
+                    let samples = self.extract_signal_from_batch(&batch, local_row)?;
+
+                    // Insert into cache
+                    self.signal_cache.borrow_mut().insert(batch_idx, batch);
+
+                    samples
+                }
+            };
+
+            all_samples.extend(samples);
+        }
+
+        Ok(all_samples)
+    }
+
+    /// Load a specific signal batch by index.
+    fn load_signal_batch(
+        &self,
+        embedded: &crate::footer::EmbeddedFile,
+        batch_idx: usize,
+    ) -> Result<RecordBatch> {
+        let mut reader = self.create_arrow_reader(embedded)?;
+
+        // Skip to the desired batch
+        for _ in 0..batch_idx {
+            reader.next();
+        }
+
+        reader
+            .next()
+            .ok_or_else(|| Error::BatchIndexOutOfBounds {
+                index: batch_idx,
+                max: reader.num_batches(),
+            })?
+            .map_err(Error::from)
+    }
+
+    /// Fallback signal retrieval for edge cases (no signal metadata).
+    fn get_signal_fallback(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
         let embedded = self
             .footer
             .signal_table()
@@ -166,8 +394,7 @@ impl Reader {
         let reader = self.create_arrow_reader(embedded)?;
         let mut all_samples = Vec::new();
 
-        // For now, we'll do a simple implementation that reads all batches
-        // A more efficient implementation would use batch indices
+        // Load all batches (original behavior)
         let mut signal_batches: Vec<RecordBatch> = Vec::new();
         for batch_result in reader {
             signal_batches.push(batch_result?);
