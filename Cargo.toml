@@ -6,7 +6,7 @@ members = ["podfive-core", "podfive-cli"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rnabioco/podfive-rs"
+repository = "https://github.com/jayhesselberth/podfive-rs"
 rust-version = "1.75"
 
 [workspace.dependencies]
