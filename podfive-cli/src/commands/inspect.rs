@@ -21,7 +21,21 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     let mut total_batches = 0usize;
 
     for file_path in &files {
-        let reader = Reader::open(file_path)?;
+        let reader = match Reader::open(file_path) {
+            Ok(r) => r,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "  Warning: skipping {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
 
         if !is_directory {
             println!("File: {}", file_path.display());
@@ -31,8 +45,8 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
             println!();
         }
 
-        let read_count = reader.read_count()?;
-        let batch_count = reader.read_batch_count()?;
+        let read_count = reader.read_count().unwrap_or(0);
+        let batch_count = reader.read_batch_count().unwrap_or(0);
         total_reads += read_count;
         total_batches += batch_count;
 
@@ -68,6 +82,7 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
 
 pub fn reads(input: PathBuf) -> anyhow::Result<()> {
     let files = resolve_pod5_inputs(&input)?;
+    let is_directory = files.len() > 1;
 
     println!(
         "{:<36} {:>8} {:>4} {:>10} {:>12}",
@@ -76,10 +91,43 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
     println!("{}", "-".repeat(76));
 
     for file_path in &files {
-        let reader = Reader::open(file_path)?;
+        let reader = match Reader::open(file_path) {
+            Ok(r) => r,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: skipping {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
 
-        for read_result in reader.reads()? {
-            let read = read_result?;
+        let reads_iter = match reader.reads() {
+            Ok(iter) => iter,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: cannot read {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        for read_result in reads_iter {
+            let read = match read_result {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             println!(
                 "{:<36} {:>8} {:>4} {:>10} {:>12}",
                 read.read_id, read.channel, read.well, read.num_samples, read.end_reason
@@ -92,18 +140,32 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
 
 pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
     let files = resolve_pod5_inputs(&input)?;
+    let is_directory = files.len() > 1;
     let target_id: uuid::Uuid = read_id.parse()?;
 
     for file_path in &files {
-        let reader = Reader::open(file_path)?;
+        let reader = match Reader::open(file_path) {
+            Ok(r) => r,
+            Err(_) if is_directory => continue,
+            Err(e) => return Err(e.into()),
+        };
 
-        for read_result in reader.reads()? {
-            let read = read_result?;
+        let reads_iter = match reader.reads() {
+            Ok(iter) => iter,
+            Err(_) if is_directory => continue,
+            Err(e) => return Err(e.into()),
+        };
+
+        for read_result in reads_iter {
+            let read = match read_result {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             if read.read_id == target_id {
                 println!("Read Details");
                 println!("============");
                 println!();
-                if files.len() > 1 {
+                if is_directory {
                     println!("file: {}", file_path.display());
                 }
                 println!("read_id: {}", read.read_id);

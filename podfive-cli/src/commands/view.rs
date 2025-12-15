@@ -66,12 +66,46 @@ pub fn run(
     }
 
     // Process all files
+    let is_directory = files.len() > 1;
     for file_path in &files {
-        let reader = Reader::open(file_path)?;
+        let reader = match Reader::open(file_path) {
+            Ok(r) => r,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: skipping {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
 
         // Write reads
-        for read_result in reader.reads()? {
-            let read = read_result?;
+        let reads_iter = match reader.reads() {
+            Ok(iter) => iter,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: cannot read {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        for read_result in reads_iter {
+            let read = match read_result {
+                Ok(r) => r,
+                Err(_) => continue, // Skip individual read errors silently
+            };
 
             if ids_only {
                 writeln!(writer, "{}", read.read_id)?;

@@ -45,7 +45,21 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let mut total = 0u64;
 
     for file_path in &files {
-        let reader = Reader::open(file_path)?;
+        let reader = match Reader::open(file_path) {
+            Ok(r) => r,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: skipping {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
 
         // Add run infos (deduplicated by acquisition_id)
         for run_info in reader.run_infos() {
@@ -55,14 +69,36 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
             }
         }
 
-        for read_result in reader.reads()? {
-            let read = read_result?;
+        let reads_iter = match reader.reads() {
+            Ok(iter) => iter,
+            Err(e) => {
+                if is_directory {
+                    eprintln!(
+                        "Warning: cannot read {} ({})",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        for read_result in reads_iter {
+            let read = match read_result {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             total += 1;
 
             // Check if this read's ID is in the filter list
             if ids.contains(&read.read_id) {
                 // Get signal for this read
-                let signal = reader.get_signal(&read.signal_rows)?;
+                let signal = match reader.get_signal(&read.signal_rows) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
 
                 // Map run_info index
                 let new_run_info_idx = if let Some(original_run_info) =
@@ -111,11 +147,17 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         if total > 0 { (matched as f64 / total as f64) * 100.0 } else { 0.0 }
     );
 
-    let not_found = ids.len() as u64 - matched;
+    let not_found = (ids.len() as u64).saturating_sub(matched);
     if not_found > 0 {
         println!(
             "Warning: {} requested IDs were not found in the input",
             not_found
+        );
+    }
+    if matched > ids.len() as u64 {
+        println!(
+            "Note: {} duplicate reads matched across multiple files",
+            matched - ids.len() as u64
         );
     }
 
