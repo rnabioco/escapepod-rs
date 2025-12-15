@@ -437,6 +437,41 @@ impl Reader {
         Ok(all_chunks)
     }
 
+    /// Get signal batches as Arrow RecordBatches for direct batch-level copying.
+    /// This is the fastest method for merge operations - copies batches without unpacking.
+    pub fn signal_batches(&self) -> Result<Vec<RecordBatch>> {
+        let embedded = self
+            .footer
+            .signal_table()
+            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
+
+        let reader = self.create_arrow_reader(embedded)?;
+        let mut batches = Vec::new();
+
+        for batch_result in reader {
+            batches.push(batch_result?);
+        }
+
+        Ok(batches)
+    }
+
+    /// Get the total number of signal rows across all batches.
+    pub fn signal_row_count(&self) -> Result<u64> {
+        let embedded = match self.footer.signal_table() {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        let reader = self.create_arrow_reader(embedded)?;
+        let mut count = 0u64;
+
+        for batch_result in reader {
+            count += batch_result?.num_rows() as u64;
+        }
+
+        Ok(count)
+    }
+
     /// Get compressed signal chunks for specific row indices only.
     /// This is more efficient than get_all_signal_compressed() when only a subset
     /// of reads are needed (e.g., for filter operations).

@@ -1,7 +1,7 @@
 //! Merge command implementation.
 //!
 //! Merges multiple POD5 files into a single output file.
-//! Uses parallel file reading and block-level signal copying for maximum performance.
+//! Uses parallel file reading and block-level signal copying for performance.
 
 use crate::util::resolve_pod5_inputs;
 use podfive_core::{CompressedSignalChunk, ReadData, Reader, RunInfoData, Writer, WriterOptions};
@@ -13,6 +13,7 @@ use uuid::Uuid;
 /// Data extracted from a single input file for merging.
 struct FileData {
     run_infos: Vec<RunInfoData>,
+    /// Reads with their compressed signal chunks
     reads: Vec<(ReadData, Vec<CompressedSignalChunk>)>,
 }
 
@@ -23,13 +24,23 @@ fn read_file_data(path: &PathBuf) -> anyhow::Result<FileData> {
     // Collect run infos
     let run_infos: Vec<RunInfoData> = reader.run_infos().to_vec();
 
-    // Collect reads with their signal data
+    // Get all compressed signal for efficient lookup
+    let all_signal = reader.get_all_signal_compressed()?;
+
+    // Collect reads with their signal chunks
     let mut reads = Vec::new();
     for read_result in reader.reads()? {
         let read = read_result?;
-        // Use lazy signal loading with O(1) batch lookup
-        let signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
-        reads.push((read, signal));
+
+        // Collect signal chunks for this read
+        let mut signal_chunks = Vec::with_capacity(read.signal_rows.len());
+        for &idx in &read.signal_rows {
+            if let Some(chunk) = all_signal.get(idx as usize) {
+                signal_chunks.push(chunk.clone());
+            }
+        }
+
+        reads.push((read, signal_chunks));
     }
 
     Ok(FileData { run_infos, reads })
@@ -85,8 +96,10 @@ pub fn run(
     eprintln!("Writing merged output...");
 
     let mut options = WriterOptions::default();
-    options.signal_batch_size = 10_000; // Larger batches reduce flush overhead
-    options.read_batch_size = 500_000;
+    options.signal_batch_size = 100;
+    // Use large batch size to avoid Arrow IPC dictionary replacement issues
+    // (all reads should fit in a single batch for typical merge operations)
+    options.read_batch_size = 1_000_000;
     let mut writer = Writer::create(&output, options)?;
 
     // Track run infos by acquisition_id to avoid duplicates
@@ -104,7 +117,7 @@ pub fn run(
 
     for file_data in file_data_vec {
         // Add run infos (deduplicated by acquisition_id)
-        for run_info in file_data.run_infos {
+        for run_info in &file_data.run_infos {
             if !run_info_map.contains_key(&run_info.acquisition_id) {
                 let idx = writer.add_run_info(run_info.clone())?;
                 run_info_map.insert(run_info.acquisition_id.clone(), idx);
@@ -123,11 +136,12 @@ pub fn run(
             }
 
             // Map run_info index
-            let new_run_info_idx = run_info_map
-                .values()
-                .next()
-                .copied()
-                .unwrap_or(0);
+            let original_run_info = file_data.run_infos.get(read.run_info_index as usize);
+            let new_run_info_idx = if let Some(ri) = original_run_info {
+                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
+            } else {
+                0
+            };
 
             let new_read = read.for_writing(new_run_info_idx);
             writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;

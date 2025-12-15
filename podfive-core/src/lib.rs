@@ -31,6 +31,9 @@ pub use reader::Reader;
 pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{Writer, WriterOptions};
 
+// Re-export Arrow types needed for batch-level operations
+pub use arrow::record_batch::RecordBatch;
+
 use std::sync::Arc;
 
 /// A compressed signal chunk for block-level copying.

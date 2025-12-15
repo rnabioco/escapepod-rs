@@ -149,6 +149,11 @@ impl Writer {
         })
     }
 
+    /// Get the current signal row count (for tracking offsets during batch-level copying).
+    pub fn current_signal_row(&self) -> u64 {
+        self.current_signal_row
+    }
+
     /// Add run info and return its index.
     pub fn add_run_info(&mut self, info: RunInfoData) -> Result<u32> {
         if self.finalized {
@@ -270,6 +275,69 @@ impl Writer {
             self.flush_signal_batch()?;
         }
 
+        if self.pending_reads.len() >= self.options.read_batch_size as usize {
+            self.flush_read_batch()?;
+        }
+
+        Ok(())
+    }
+
+    /// Write a signal batch directly (for batch-level copying).
+    /// This is the fastest method - copies Arrow RecordBatch directly without unpacking.
+    /// Returns (first_row_index, row_count) for the written batch.
+    pub fn write_signal_batch(&mut self, batch: &RecordBatch) -> Result<(u64, usize)> {
+        if self.finalized {
+            return Err(Error::WriterFinalized);
+        }
+
+        // Flush any pending signal first
+        self.flush_signal_batch()?;
+
+        let schema = Arc::new(signal_schema());
+        let row_count = batch.num_rows();
+        let first_row = self.current_signal_row;
+
+        // Initialize signal writer if needed
+        if self.signal_writer.is_none() {
+            let file = self.file.take().ok_or(Error::WriterFinalized)?;
+            self.signal_writer = Some(ArrowFileWriter::try_new(file, &schema)?);
+        }
+
+        // Create a new batch with our schema to ensure consistency
+        // (input batches may have different metadata)
+        let normalized_batch = RecordBatch::try_new(
+            schema,
+            batch.columns().to_vec(),
+        )?;
+
+        // Write batch directly
+        self.signal_writer.as_mut().unwrap().write(&normalized_batch)?;
+        self.current_signal_row += row_count as u64;
+
+        Ok((first_row, row_count))
+    }
+
+    /// Add a read with pre-computed signal row indices (for batch-level copying).
+    /// Use this after write_signal_batch() to add reads that reference the written signal.
+    pub fn add_read_with_signal_rows(
+        &mut self,
+        read: ReadData,
+        signal_row_indices: Vec<u64>,
+    ) -> Result<()> {
+        if self.finalized {
+            return Err(Error::WriterFinalized);
+        }
+
+        // Track dictionary entries
+        self.get_or_add_pore_type(&read.pore_type);
+        self.get_or_add_end_reason(read.end_reason.as_str());
+
+        self.pending_reads.push(PendingRead {
+            data: read,
+            signal_row_indices,
+        });
+
+        // Flush reads if needed
         if self.pending_reads.len() >= self.options.read_batch_size as usize {
             self.flush_read_batch()?;
         }
