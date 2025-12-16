@@ -1,11 +1,12 @@
 //! Merge command implementation.
 //!
 //! Merges multiple POD5 files into a single output file.
-//! Uses single-pass batch-level signal copying for maximum performance.
+//! Uses raw byte copying for maximum performance - bypasses Arrow deserialization.
 
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{batch_sizes, resolve_pod5_inputs};
+use podfive_core::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use podfive_core::{ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -65,6 +66,11 @@ pub fn run(
     let mut file_contexts: Vec<FileContext> = Vec::with_capacity(num_files);
     let mut total_read_count = 0u64;
 
+    // Track all batches for building combined footer
+    let mut all_batches: Vec<BatchBlock> = Vec::new();
+    let mut current_offset: usize = 0;
+    let mut header_written = false;
+
     for (file_idx, path) in all_files.iter().enumerate() {
         let reader = match Reader::open(path) {
             Ok(r) => r,
@@ -84,10 +90,37 @@ pub fn run(
         // Record where this file's signal rows start
         let signal_offset = writer.current_signal_row();
 
-        // Copy signal batches directly (zero-copy from mmap)
-        for batch in reader.signal_batches()? {
-            writer.write_signal_batch(&batch)?;
+        // Get raw signal table bytes and parse footer only (no deserialization!)
+        let signal_bytes = reader.signal_table_bytes()?;
+        let ipc_footer = ArrowIpcFooter::parse(signal_bytes)?;
+
+        // Write header from first file only
+        if !header_written {
+            let header_bytes = ipc_footer.header_bytes(signal_bytes);
+            current_offset = writer.write_raw_signal_header(header_bytes)?;
+            header_written = true;
         }
+
+        // Copy batch bytes directly
+        let batches_bytes = ipc_footer.batches_bytes(signal_bytes);
+        writer.write_raw_signal_batches(batches_bytes, ipc_footer.total_rows)?;
+
+        // Adjust batch offsets for the combined output
+        for batch in &ipc_footer.record_batches {
+            // New offset = current position + (batch offset - first batch offset)
+            let relative_offset = batch.offset as usize - ipc_footer.batches_start_offset;
+            let new_offset = current_offset + relative_offset;
+
+            all_batches.push(BatchBlock {
+                offset: new_offset as i64,
+                metadata_length: batch.metadata_length,
+                body_length: batch.body_length,
+                row_count: batch.row_count,
+            });
+        }
+
+        // Update current offset for next file's batches
+        current_offset += batches_bytes.len();
 
         // Collect run_infos and reads (lightweight metadata, stays in memory)
         let run_infos = reader.run_infos().to_vec();
@@ -102,6 +135,15 @@ pub fn run(
 
         spinner.set_message(format!("files... ({}/{})", file_idx + 1, num_files));
     }
+
+    // Build and write combined Arrow IPC footer
+    let combined_footer = ArrowIpcFooter {
+        record_batches: all_batches,
+        batches_start_offset: 0, // Not used for writing
+        batches_end_offset: 0,   // Not used for writing
+        total_rows: writer.current_signal_row(),
+    };
+    writer.finish_raw_signal(&combined_footer, current_offset)?;
 
     spinner.finish_with_message(format!(
         "{} signal rows, {} reads collected",

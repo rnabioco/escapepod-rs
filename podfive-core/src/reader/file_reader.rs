@@ -455,6 +455,30 @@ impl Reader {
         Ok(batches)
     }
 
+    /// Get raw bytes of the signal table for direct byte-level copying.
+    /// This returns a slice into the memory-mapped file containing the complete
+    /// Arrow IPC stream for the signal table.
+    pub fn signal_table_bytes(&self) -> Result<&[u8]> {
+        let embedded = self
+            .footer
+            .signal_table()
+            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
+
+        let start = embedded.offset as usize;
+        let end = start + embedded.length as usize;
+
+        if end > self.mmap.len() {
+            return Err(Error::InvalidFooter(format!(
+                "Signal table extends beyond file: {}..{} > {}",
+                start,
+                end,
+                self.mmap.len()
+            )));
+        }
+
+        Ok(&self.mmap[start..end])
+    }
+
     /// Get the total number of signal rows across all batches.
     pub fn signal_row_count(&self) -> Result<u64> {
         let embedded = match self.footer.signal_table() {

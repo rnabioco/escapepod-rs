@@ -17,6 +17,7 @@
 //! # Ok::<(), podfive_core::Error>(())
 //! ```
 
+pub mod arrow_ipc;
 pub mod compression;
 pub mod error;
 pub mod footer;
