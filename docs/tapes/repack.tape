@@ -14,6 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "podfive repack ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5 -o /tmp/repacked/"
+Type "podfive repack data/drna/yeast_trna_reads.pod5 -o /tmp/repacked/"
 Enter
-Sleep 2s
+Sleep 5s

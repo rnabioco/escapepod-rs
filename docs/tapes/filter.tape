@@ -18,7 +18,7 @@ Type "# First, get some read IDs"
 Enter
 Sleep 500ms
 
-Type "podfive view ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5 --ids | head -2 > /tmp/ids.txt"
+Type "podfive view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"
 Enter
 Sleep 1s
 
@@ -30,6 +30,6 @@ Type "# Now filter to just those reads"
 Enter
 Sleep 500ms
 
-Type "podfive filter ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
+Type "podfive filter data/drna/yeast_trna_reads.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
 Enter
-Sleep 2s
+Sleep 5s
