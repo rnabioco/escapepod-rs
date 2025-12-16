@@ -4,8 +4,8 @@
 //! Uses lazy signal loading and block-level copying for maximum performance.
 
 use crate::util::{parse_uuid_flexible, resolve_pod5_inputs};
-use podfive_core::{Reader, Writer, WriterOptions};
-use std::collections::{HashMap, HashSet};
+use podfive_core::{PredefinedDictionaries, Reader, Writer, WriterOptions};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -35,12 +35,33 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         anyhow::bail!("No read IDs found in {}", ids_file.display());
     }
 
-    // Create writer with optimized batch sizes
-    // Signal batches can be smaller for frequent direct file writes
-    // Read batch must hold all reads to avoid dictionary replacement in Arrow IPC
-    let mut options = WriterOptions::default();
-    options.signal_batch_size = 1_000;
-    options.read_batch_size = 500_000;
+    // Pre-scan files to collect unique dictionary values for predefined dictionaries
+    let mut all_pore_types = BTreeSet::new();
+    let mut all_end_reasons = BTreeSet::new();
+    for file_path in &files {
+        if let Ok(reader) = Reader::open(file_path) {
+            if let Ok(reads_iter) = reader.reads() {
+                for read in reads_iter.flatten() {
+                    // Only collect values for reads we might filter
+                    if ids.contains(&read.read_id) {
+                        all_pore_types.insert(read.pore_type.clone());
+                        all_end_reasons.insert(read.end_reason.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Create writer with predefined dictionaries for consistent multi-batch writes
+    let options = WriterOptions {
+        signal_batch_size: 1_000,
+        read_batch_size: 10_000,
+        predefined_dictionaries: Some(PredefinedDictionaries {
+            pore_types: Some(all_pore_types.into_iter().collect()),
+            end_reasons: Some(all_end_reasons.into_iter().collect()),
+        }),
+        ..WriterOptions::default()
+    };
     let mut writer = Writer::create(&output, options)?;
 
     // Track run infos across all files

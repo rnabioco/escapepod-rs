@@ -75,4 +75,11 @@ pub enum Error {
     /// ZSTD compression/decompression error.
     #[error("ZSTD error: {0}")]
     Zstd(std::io::Error),
+
+    /// Dictionary value not found in predefined dictionary.
+    #[error("Dictionary value not found: {value} not in predefined {dictionary_name} dictionary")]
+    DictionaryValueNotFound {
+        value: String,
+        dictionary_name: String,
+    },
 }
