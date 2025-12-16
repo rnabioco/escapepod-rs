@@ -2,6 +2,8 @@
 
 Filter reads from a POD5 file based on a paired BAM file. Supports filtering by mapped status, genomic region, and mapping quality.
 
+![podfive filter](../images/bam-filter.gif)
+
 ## Usage
 
 ```bash
