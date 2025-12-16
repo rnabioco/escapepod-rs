@@ -37,8 +37,7 @@ pub fn parse_uuid_flexible(s: &str) -> Result<Uuid> {
             &s[16..20],
             &s[20..32]
         );
-        return Uuid::parse_str(&with_dashes)
-            .map_err(|e| Error::InvalidUuid(format!("{}", e)));
+        return Uuid::parse_str(&with_dashes).map_err(|e| Error::InvalidUuid(format!("{}", e)));
     }
 
     Err(Error::InvalidUuid(format!("Invalid format: '{}'", s)))

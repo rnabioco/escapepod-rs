@@ -10,9 +10,7 @@ use crate::util::{
     LimitedWarningReporter, OpenResult,
 };
 use podfive_core::operations::read_ids_from_file;
-use podfive_core::utils::{
-    add_run_infos_deduplicated, map_run_info_index, scan_dictionary_values,
-};
+use podfive_core::utils::{add_run_infos_deduplicated, map_run_info_index, scan_dictionary_values};
 use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;

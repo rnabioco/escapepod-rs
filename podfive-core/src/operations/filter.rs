@@ -156,14 +156,14 @@ pub fn filter_files<P: AsRef<Path>>(
             // Check if this read's ID is in the filter list
             if filter_ids.contains(&read.read_id) {
                 // Lazy load: only fetch signal for matching reads
-                let compressed_signal = match reader.get_compressed_signal_for_rows(&read.signal_rows)
-                {
-                    Ok(s) => s,
-                    Err(_) => {
-                        result.signal_errors += 1;
-                        continue;
-                    }
-                };
+                let compressed_signal =
+                    match reader.get_compressed_signal_for_rows(&read.signal_rows) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            result.signal_errors += 1;
+                            continue;
+                        }
+                    };
 
                 // Map run_info index
                 let new_run_info_idx =

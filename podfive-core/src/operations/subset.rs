@@ -68,7 +68,8 @@ pub fn parse_csv_mapping(csv_path: impl AsRef<Path>) -> Result<HashMap<Uuid, Str
         .ok_or_else(|| Error::Parse("CSV must have an 'output' column".to_string()))?;
 
     for (line_num, result) in csv_reader.records().enumerate() {
-        let record = result.map_err(|e| Error::Parse(format!("CSV error on line {}: {}", line_num + 2, e)))?;
+        let record = result
+            .map_err(|e| Error::Parse(format!("CSV error on line {}: {}", line_num + 2, e)))?;
 
         let read_id_str = record
             .get(read_id_col)
