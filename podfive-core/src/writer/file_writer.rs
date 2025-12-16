@@ -14,8 +14,9 @@ use arrow::array::{
 use arrow::datatypes::Int16Type;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;
 use arrow::record_batch::RecordBatch;
+use memmap2::MmapMut;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -1049,6 +1050,100 @@ impl Writer {
         file.flush()?;
         self.finalized = true;
         Ok(())
+    }
+}
+
+/// Memory-mapped writer for high-performance signal copying.
+///
+/// This writer uses mmap to write the signal section directly,
+/// avoiding buffer copies and syscall overhead. The file size
+/// must be known upfront.
+pub struct MmapSignalWriter {
+    mmap: MmapMut,
+    file: File,
+    write_pos: usize,
+    signal_start: usize,
+}
+
+impl MmapSignalWriter {
+    /// Create a new mmap-based signal writer.
+    ///
+    /// # Arguments
+    /// * `path` - Output file path
+    /// * `signal_size` - Total size of the signal section (header + batches + footer)
+    pub fn create<P: AsRef<Path>>(path: P, signal_size: usize) -> Result<Self> {
+        // POD5 header: signature (8) + section marker (16) = 24 bytes
+        let header_size = 24;
+        let file_size = header_size + signal_size;
+
+        // Create and size the file
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.as_ref())?;
+        file.set_len(file_size as u64)?;
+
+        // Create mmap
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        Ok(Self {
+            mmap,
+            file,
+            write_pos: 0,
+            signal_start: header_size,
+        })
+    }
+
+    /// Write the POD5 header (signature + section marker).
+    pub fn write_header(&mut self) -> Result<()> {
+        // Write POD5 signature
+        self.mmap[..8].copy_from_slice(&POD5_SIGNATURE);
+        self.write_pos = 8;
+
+        // Write section marker
+        let section_marker = Uuid::new_v4();
+        self.mmap[8..24].copy_from_slice(section_marker.as_bytes());
+        self.write_pos = 24;
+
+        Ok(())
+    }
+
+    /// Write raw signal bytes directly via mmap.
+    /// Returns the number of bytes written.
+    pub fn write_signal_bytes(&mut self, bytes: &[u8]) -> Result<usize> {
+        let end = self.write_pos + bytes.len();
+        if end > self.mmap.len() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Signal data exceeds allocated size",
+            )));
+        }
+
+        self.mmap[self.write_pos..end].copy_from_slice(bytes);
+        self.write_pos = end;
+
+        Ok(bytes.len())
+    }
+
+    /// Get current write position within the signal section.
+    pub fn signal_position(&self) -> usize {
+        self.write_pos - self.signal_start
+    }
+
+    /// Finish the signal section and return the underlying file for further writing.
+    /// The mmap is flushed and dropped.
+    pub fn finish_signal(self) -> Result<(File, usize)> {
+        let signal_end = self.write_pos;
+
+        // Flush mmap
+        self.mmap.flush()?;
+
+        // Drop mmap to release the mapping
+        drop(self.mmap);
+
+        Ok((self.file, signal_end))
     }
 }
 

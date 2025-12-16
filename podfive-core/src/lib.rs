@@ -21,6 +21,7 @@ pub mod arrow_ipc;
 pub mod compression;
 pub mod error;
 pub mod footer;
+pub mod merge;
 pub mod reader;
 pub mod schema;
 pub mod types;
@@ -28,9 +29,10 @@ pub mod writer;
 
 // Re-export commonly used types
 pub use error::{Error, Result};
+pub use merge::{merge_files, MergeOptions, MergeResult};
 pub use reader::Reader;
 pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
-pub use writer::{PredefinedDictionaries, Writer, WriterOptions};
+pub use writer::{MmapSignalWriter, PredefinedDictionaries, Writer, WriterOptions};
 
 // Re-export Arrow types needed for batch-level operations
 pub use arrow::record_batch::RecordBatch;

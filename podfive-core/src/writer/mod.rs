@@ -2,4 +2,4 @@
 
 mod file_writer;
 
-pub use file_writer::{PredefinedDictionaries, Writer, WriterOptions};
+pub use file_writer::{MmapSignalWriter, PredefinedDictionaries, Writer, WriterOptions};
