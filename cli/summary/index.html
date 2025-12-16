@@ -1595,8 +1595,8 @@
 <h1 id="podfive-summary">podfive summary<a class="headerlink" href="#podfive-summary" title="Permanent link">&para;</a></h1>
 <p>Generate a comprehensive summary of POD5 file(s) including read statistics, QC metrics, and run metadata.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>summary<span class="w"> </span>&lt;INPUT&gt;<span class="w"> </span><span class="o">[</span>--json<span class="o">]</span>
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>summary<span class="w"> </span>&lt;INPUT&gt;<span class="w"> </span><span class="o">[</span>--json<span class="o">]</span>
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1641,84 +1641,84 @@
 </ul>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="single-file">Single File<a class="headerlink" href="#single-file" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>podfive<span class="w"> </span>summary<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>summary<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="directory-of-files">Directory of Files<a class="headerlink" href="#directory-of-files" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>podfive<span class="w"> </span>summary<span class="w"> </span>pod5_pass/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>summary<span class="w"> </span>pod5_pass/
+</code></pre></div>
 <h3 id="json-output">JSON Output<a class="headerlink" href="#json-output" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>summary<span class="w"> </span>experiment.pod5<span class="w"> </span>--json
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>summary<span class="w"> </span>experiment.pod5<span class="w"> </span>--json
+</code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <h3 id="terminal-output">Terminal Output<a class="headerlink" href="#terminal-output" title="Permanent link">&para;</a></h3>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>┌─────────────────────────────────────────────────────────────────────────────┐
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>│ POD5 Summary: experiment.pod5                                               │
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>│  1.2 GB Size │  10,543 Reads │   4 kHz Rate │  36.6 hrs Duration           │
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>│ Flow Cell    FAK12345 (FLO-MIN106)  │ Kit          SQK-LSK109              │
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>│ Sample       sample_001             │ Protocol     sequencing_MIN106_DNA   │
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>│ Started      2024-01-15 10:30 UTC   │ Software     MinKNOW 23.04.5         │
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>│ READ LENGTH (samples)                                                       │
-</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>│   N50       65,000 │ Mean    50,000 │ Median   42,000 │ Range   1K-500K    │
-</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>│   ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁▁▁▁▁ length distribution                                │
-</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>│ CHANNELS   450/512 active (87.9%)                                           │
-</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a>│ END REASONS                                                                 │
-</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a>│   signal_positive          ████████████████████ 80.6%  (  8,500)            │
-</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a>│   signal_negative          ███░░░░░░░░░░░░░░░░░ 14.2%  (  1,500)            │
-</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a>│   mux_change               █░░░░░░░░░░░░░░░░░░░  3.8%  (    400)            │
-</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a>│   unblock_mux_change       ░░░░░░░░░░░░░░░░░░░░  1.4%  (    143)            │
-</span><span id="__span-4-21"><a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a>└─────────────────────────────────────────────────────────────────────────────┘
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│ POD5 Summary: experiment.pod5                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  1.2 GB Size │  10,543 Reads │   4 kHz Rate │  36.6 hrs Duration           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Flow Cell    FAK12345 (FLO-MIN106)  │ Kit          SQK-LSK109              │
+│ Sample       sample_001             │ Protocol     sequencing_MIN106_DNA   │
+│ Started      2024-01-15 10:30 UTC   │ Software     MinKNOW 23.04.5         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ READ LENGTH (samples)                                                       │
+│   N50       65,000 │ Mean    50,000 │ Median   42,000 │ Range   1K-500K    │
+│   ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁▁▁▁▁ length distribution                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ CHANNELS   450/512 active (87.9%)                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ END REASONS                                                                 │
+│   signal_positive          ████████████████████ 80.6%  (  8,500)            │
+│   signal_negative          ███░░░░░░░░░░░░░░░░░ 14.2%  (  1,500)            │
+│   mux_change               █░░░░░░░░░░░░░░░░░░░  3.8%  (    400)            │
+│   unblock_mux_change       ░░░░░░░░░░░░░░░░░░░░  1.4%  (    143)            │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
 <h3 id="json-output_1">JSON Output<a class="headerlink" href="#json-output_1" title="Permanent link">&para;</a></h3>
-<div class="language-json highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">{</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="nt">&quot;files&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span><span class="p">{</span>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">      </span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;experiment.pod5&quot;</span><span class="p">,</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">      </span><span class="nt">&quot;size_bytes&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1288490188</span><span class="p">,</span>
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">      </span><span class="nt">&quot;read_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10543</span><span class="p">,</span>
-</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">      </span><span class="nt">&quot;batch_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">      </span><span class="nt">&quot;pod5_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1.0&quot;</span><span class="p">,</span>
-</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">      </span><span class="nt">&quot;software&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MinKNOW&quot;</span><span class="p">,</span>
-</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">      </span><span class="nt">&quot;file_identifier&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;abc123-def456&quot;</span>
-</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">    </span><span class="p">}</span>
-</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">  </span><span class="p">],</span>
-</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="w">  </span><span class="nt">&quot;run_info&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">    </span><span class="nt">&quot;acquisition_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;abc123-def456&quot;</span><span class="p">,</span>
-</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="w">    </span><span class="nt">&quot;acquisition_start_time&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2024-01-15 10:30 UTC&quot;</span><span class="p">,</span>
-</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="w">    </span><span class="nt">&quot;sample_rate&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4000</span><span class="p">,</span>
-</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="w">    </span><span class="nt">&quot;flow_cell_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FAK12345&quot;</span><span class="p">,</span>
-</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="w">    </span><span class="nt">&quot;flow_cell_product_code&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FLO-MIN106&quot;</span><span class="p">,</span>
-</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="w">    </span><span class="nt">&quot;sequencing_kit&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SQK-LSK109&quot;</span><span class="p">,</span>
-</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="w">    </span><span class="nt">&quot;sample_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sample_001&quot;</span><span class="p">,</span>
-</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="w">    </span><span class="nt">&quot;experiment_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;my_experiment&quot;</span><span class="p">,</span>
-</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="w">    </span><span class="nt">&quot;protocol_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sequencing_MIN106_DNA&quot;</span><span class="p">,</span>
-</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="w">    </span><span class="nt">&quot;software&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MinKNOW 23.04.5&quot;</span><span class="p">,</span>
-</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="w">    </span><span class="nt">&quot;system_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MinION&quot;</span><span class="p">,</span>
-</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="w">    </span><span class="nt">&quot;system_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Mk1C&quot;</span>
-</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="w">  </span><span class="p">},</span>
-</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a><span class="w">  </span><span class="nt">&quot;statistics&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="w">    </span><span class="nt">&quot;total_samples&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">527150000</span><span class="p">,</span>
-</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="w">    </span><span class="nt">&quot;length_min&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
-</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="w">    </span><span class="nt">&quot;length_max&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">500000</span><span class="p">,</span>
-</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a><span class="w">    </span><span class="nt">&quot;length_mean&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">50000.0</span><span class="p">,</span>
-</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a><span class="w">    </span><span class="nt">&quot;length_median&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42000</span><span class="p">,</span>
-</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a><span class="w">    </span><span class="nt">&quot;length_n50&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">65000</span><span class="p">,</span>
-</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a><span class="w">    </span><span class="nt">&quot;active_channels&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">450</span><span class="p">,</span>
-</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a><span class="w">    </span><span class="nt">&quot;total_channels&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span>
-</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a><span class="w">  </span><span class="p">},</span>
-</span><span id="__span-5-37"><a id="__codelineno-5-37" name="__codelineno-5-37" href="#__codelineno-5-37"></a><span class="w">  </span><span class="nt">&quot;end_reasons&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-5-38"><a id="__codelineno-5-38" name="__codelineno-5-38" href="#__codelineno-5-38"></a><span class="w">    </span><span class="nt">&quot;signal_positive&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8500</span><span class="p">,</span>
-</span><span id="__span-5-39"><a id="__codelineno-5-39" name="__codelineno-5-39" href="#__codelineno-5-39"></a><span class="w">    </span><span class="nt">&quot;signal_negative&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1500</span><span class="p">,</span>
-</span><span id="__span-5-40"><a id="__codelineno-5-40" name="__codelineno-5-40" href="#__codelineno-5-40"></a><span class="w">    </span><span class="nt">&quot;mux_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">400</span><span class="p">,</span>
-</span><span id="__span-5-41"><a id="__codelineno-5-41" name="__codelineno-5-41" href="#__codelineno-5-41"></a><span class="w">    </span><span class="nt">&quot;unblock_mux_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">143</span>
-</span><span id="__span-5-42"><a id="__codelineno-5-42" name="__codelineno-5-42" href="#__codelineno-5-42"></a><span class="w">  </span><span class="p">},</span>
-</span><span id="__span-5-43"><a id="__codelineno-5-43" name="__codelineno-5-43" href="#__codelineno-5-43"></a><span class="w">  </span><span class="nt">&quot;warnings&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
-</span><span id="__span-5-44"><a id="__codelineno-5-44" name="__codelineno-5-44" href="#__codelineno-5-44"></a><span class="p">}</span>
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;files&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;experiment.pod5&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;size_bytes&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1288490188</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;read_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10543</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;batch_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;pod5_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1.0&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;software&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MinKNOW&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;file_identifier&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;abc123-def456&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;run_info&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;acquisition_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;abc123-def456&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;acquisition_start_time&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2024-01-15 10:30 UTC&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sample_rate&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;flow_cell_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FAK12345&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;flow_cell_product_code&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FLO-MIN106&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sequencing_kit&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SQK-LSK109&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sample_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sample_001&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;experiment_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;my_experiment&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;protocol_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sequencing_MIN106_DNA&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;software&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MinKNOW 23.04.5&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;system_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MinION&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;system_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Mk1C&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;statistics&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;total_samples&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">527150000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;length_min&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;length_max&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">500000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;length_mean&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">50000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;length_median&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;length_n50&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">65000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;active_channels&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">450</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;total_channels&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;end_reasons&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;signal_positive&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8500</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;signal_negative&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1500</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;mux_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">400</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;unblock_mux_change&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">143</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;warnings&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
+<span class="p">}</span>
+</code></pre></div>
 <h2 id="warnings">Warnings<a class="headerlink" href="#warnings" title="Permanent link">&para;</a></h2>
 <p>The command displays warnings for:</p>
 <ul>
@@ -1727,17 +1727,17 @@
 <li><strong>Read errors</strong>: Individual reads that fail to parse</li>
 </ul>
 <p>Example with warnings:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>┌─────────────────────────────────────────────────────────────────────────────┐
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>│ POD5 Summary: pod5_pass/ (24 files)                                         │
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>...
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>├─────────────────────────────────────────────────────────────────────────────┤
-</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>│ ⚠ WARNINGS                                                                  │
-</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>│   2 file(s) could not be read                                               │
-</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>│   Corrupted/unreadable file: pod5_pass/bad_file.pod5 (Invalid signature)    │
-</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>│   Old POD5 version: legacy.pod5 uses v0.3 (current: 1.0)                    │
-</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>└─────────────────────────────────────────────────────────────────────────────┘
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│ POD5 Summary: pod5_pass/ (24 files)                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+...
+├─────────────────────────────────────────────────────────────────────────────┤
+│ ⚠ WARNINGS                                                                  │
+│   2 file(s) could not be read                                               │
+│   Corrupted/unreadable file: pod5_pass/bad_file.pod5 (Invalid signature)    │
+│   Old POD5 version: legacy.pod5 uses v0.3 (current: 1.0)                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
 <h2 id="notes">Notes<a class="headerlink" href="#notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>When processing a directory, all <code>*.pod5</code> files are found recursively</li>

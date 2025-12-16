@@ -1573,8 +1573,8 @@
 <h1 id="podfive-subset">podfive subset<a class="headerlink" href="#podfive-subset" title="Permanent link">&para;</a></h1>
 <p>Split reads from a POD5 file into multiple output files based on a CSV mapping.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>subset<span class="w"> </span>--csv<span class="w"> </span>&lt;FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>subset<span class="w"> </span>--csv<span class="w"> </span>&lt;FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1619,11 +1619,11 @@
 </table>
 <h2 id="csv-file-format">CSV File Format<a class="headerlink" href="#csv-file-format" title="Permanent link">&para;</a></h2>
 <p>The CSV file must have a header row with <code>read_id</code> and <code>output</code> columns:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>read_id,output
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>b2c3d4e5-f6a7-8901-bcde-f12345678901,sample1.pod5
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>c3d4e5f6-a7b8-9012-cdef-123456789012,sample2.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>read_id,output
+a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5
+b2c3d4e5-f6a7-8901-bcde-f12345678901,sample1.pod5
+c3d4e5f6-a7b8-9012-cdef-123456789012,sample2.pod5
+</code></pre></div>
 <h3 id="supported-uuid-formats">Supported UUID Formats<a class="headerlink" href="#supported-uuid-formats" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Standard format: <code>a1b2c3d4-e5f6-7890-abcd-ef1234567890</code></li>
@@ -1639,39 +1639,39 @@
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-subsetting">Basic Subsetting<a class="headerlink" href="#basic-subsetting" title="Permanent link">&para;</a></h3>
 <p>Create a mapping file:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>mapping.csv<span class="w"> </span><span class="s">&lt;&lt; EOF</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="s">read_id,output</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="s">a1b2c3d4-e5f6-7890-abcd-ef1234567890,barcode01.pod5</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="s">b2c3d4e5-f6a7-8901-bcde-f12345678901,barcode01.pod5</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="s">c3d4e5f6-a7b8-9012-cdef-123456789012,barcode02.pod5</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="s">EOF</span>
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>cat<span class="w"> </span>&gt;<span class="w"> </span>mapping.csv<span class="w"> </span><span class="s">&lt;&lt; EOF</span>
+<span class="s">read_id,output</span>
+<span class="s">a1b2c3d4-e5f6-7890-abcd-ef1234567890,barcode01.pod5</span>
+<span class="s">b2c3d4e5-f6a7-8901-bcde-f12345678901,barcode01.pod5</span>
+<span class="s">c3d4e5f6-a7b8-9012-cdef-123456789012,barcode02.pod5</span>
+<span class="s">EOF</span>
+</code></pre></div>
 <p>Split the POD5 file:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>subset<span class="w"> </span>experiment.pod5<span class="w"> </span>--csv<span class="w"> </span>mapping.csv<span class="w"> </span>-o<span class="w"> </span>demultiplexed/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>subset<span class="w"> </span>experiment.pod5<span class="w"> </span>--csv<span class="w"> </span>mapping.csv<span class="w"> </span>-o<span class="w"> </span>demultiplexed/
+</code></pre></div>
 <h3 id="demultiplexing-by-barcode">Demultiplexing by Barcode<a class="headerlink" href="#demultiplexing-by-barcode" title="Permanent link">&para;</a></h3>
 <p>If you have demultiplexing results from basecalling:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Assuming you have a CSV from your demultiplexing pipeline</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>podfive<span class="w"> </span>subset<span class="w"> </span>multiplexed.pod5<span class="w"> </span>--csv<span class="w"> </span>barcode_assignments.csv<span class="w"> </span>-o<span class="w"> </span>demux/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Assuming you have a CSV from your demultiplexing pipeline</span>
+podfive<span class="w"> </span>subset<span class="w"> </span>multiplexed.pod5<span class="w"> </span>--csv<span class="w"> </span>barcode_assignments.csv<span class="w"> </span>-o<span class="w"> </span>demux/
+</code></pre></div>
 <h3 id="splitting-by-sample">Splitting by Sample<a class="headerlink" href="#splitting-by-sample" title="Permanent link">&para;</a></h3>
 <p>Split reads into per-sample files:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>podfive<span class="w"> </span>subset<span class="w"> </span>pooled.pod5<span class="w"> </span>--csv<span class="w"> </span>sample_mapping.csv<span class="w"> </span>-o<span class="w"> </span>samples/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>subset<span class="w"> </span>pooled.pod5<span class="w"> </span>--csv<span class="w"> </span>sample_mapping.csv<span class="w"> </span>-o<span class="w"> </span>samples/
+</code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints a summary of the subsetting operation:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>Subsetting 10000 reads into 3 output file(s)
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>Subsetting [████████████████████████████████████████] 10000/10000
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>Subset summary:
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>  Matched reads: 9500
-</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>  Unmatched reads: 500
-</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>
-</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>Output files:
-</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>  demux/barcode01.pod5 (4000 reads)
-</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>  demux/barcode02.pod5 (3500 reads)
-</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>  demux/barcode03.pod5 (2000 reads)
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>Subsetting 10000 reads into 3 output file(s)
+Subsetting [████████████████████████████████████████] 10000/10000
+
+Subset summary:
+  Matched reads: 9500
+  Unmatched reads: 500
+
+Output files:
+  demux/barcode01.pod5 (4000 reads)
+  demux/barcode02.pod5 (3500 reads)
+  demux/barcode03.pod5 (2000 reads)
+</code></pre></div>
 <h2 id="notes_1">Notes<a class="headerlink" href="#notes_1" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Reads not in the CSV mapping are excluded from output</li>

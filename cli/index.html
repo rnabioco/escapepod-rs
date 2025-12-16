@@ -1451,8 +1451,8 @@
 <h1 id="cli-reference">CLI Reference<a class="headerlink" href="#cli-reference" title="Permanent link">&para;</a></h1>
 <p>The <code>podfive</code> command-line tool provides utilities for working with POD5 files.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>&lt;COMMAND&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>&lt;COMMAND&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</code></pre></div>
 <h2 id="commands">Commands<a class="headerlink" href="#commands" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1497,39 +1497,39 @@
 </tbody>
 </table>
 <h2 id="global-options">Global Options<a class="headerlink" href="#global-options" title="Permanent link">&para;</a></h2>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>-h, --help     Print help information
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>-V, --version  Print version information
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>-h, --help     Print help information
+-V, --version  Print version information
+</code></pre></div>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-workflow">Basic Workflow<a class="headerlink" href="#basic-workflow" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># 1. Inspect what&#39;s in your files</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>podfive<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run1.pod5
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>podfive<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run2.pod5
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="c1"># 2. View the reads</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>podfive<span class="w"> </span>view<span class="w"> </span>run1.pod5
-</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1"># 3. Merge files from a run</span>
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="c1"># 4. Extract interesting reads</span>
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>selected_reads.txt<span class="w"> </span>-o<span class="w"> </span>subset.pod5<span class="w"> </span>combined.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Inspect what&#39;s in your files</span>
+podfive<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run1.pod5
+podfive<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run2.pod5
+
+<span class="c1"># 2. View the reads</span>
+podfive<span class="w"> </span>view<span class="w"> </span>run1.pod5
+
+<span class="c1"># 3. Merge files from a run</span>
+podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
+
+<span class="c1"># 4. Extract interesting reads</span>
+podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>selected_reads.txt<span class="w"> </span>-o<span class="w"> </span>subset.pod5<span class="w"> </span>combined.pod5
+</code></pre></div>
 <h3 id="working-with-multiple-files">Working with Multiple Files<a class="headerlink" href="#working-with-multiple-files" title="Permanent link">&para;</a></h3>
 <p>Process all POD5 files in a directory:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># List all files</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>ls<span class="w"> </span>*.pod5
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1"># Merge all files</span>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>all_data.pod5<span class="w"> </span>*.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># List all files</span>
+ls<span class="w"> </span>*.pod5
+
+<span class="c1"># Merge all files</span>
+podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>all_data.pod5<span class="w"> </span>*.pod5
+</code></pre></div>
 <h3 id="extracting-read-ids">Extracting Read IDs<a class="headerlink" href="#extracting-read-ids" title="Permanent link">&para;</a></h3>
 <p>To get a list of read IDs from a file:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>podfive<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>experiment.pod5<span class="w"> </span>&gt;<span class="w"> </span>read_ids.txt
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>experiment.pod5<span class="w"> </span>&gt;<span class="w"> </span>read_ids.txt
+</code></pre></div>
 <p>Then filter another file:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>read_ids.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>other_experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>read_ids.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>other_experiment.pod5
+</code></pre></div>
 
 
 

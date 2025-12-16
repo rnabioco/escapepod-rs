@@ -1551,8 +1551,8 @@
 <h1 id="podfive-merge">podfive merge<a class="headerlink" href="#podfive-merge" title="Permanent link">&para;</a></h1>
 <p>Merge multiple POD5 files into a single output file.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span>&lt;INPUT&gt;...
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span>&lt;INPUT&gt;...
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1603,28 +1603,28 @@
 </ul>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="merge-two-files">Merge Two Files<a class="headerlink" href="#merge-two-files" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
+</code></pre></div>
 <h3 id="merge-all-files-in-directory">Merge All Files in Directory<a class="headerlink" href="#merge-all-files-in-directory" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>all_data.pod5<span class="w"> </span>*.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>all_data.pod5<span class="w"> </span>*.pod5
+</code></pre></div>
 <h3 id="merge-with-explicit-file-list">Merge with Explicit File List<a class="headerlink" href="#merge-with-explicit-file-list" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>output.pod5<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span>/data/run1/file1.pod5<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">    </span>/data/run1/file2.pod5<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">    </span>/data/run2/file1.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>output.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/data/run1/file1.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/data/run1/file2.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/data/run2/file1.pod5
+</code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints progress information:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Merging 3 files into combined.pod5
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>  Processing: run1.pod5
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    Added 5000 reads
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>  Processing: run2.pod5
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    Added 4500 reads
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>  Processing: run3.pod5
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>    Added 5200 reads
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>Successfully merged 14700 reads into combined.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>Merging 3 files into combined.pod5
+  Processing: run1.pod5
+    Added 5000 reads
+  Processing: run2.pod5
+    Added 4500 reads
+  Processing: run3.pod5
+    Added 5200 reads
+Successfully merged 14700 reads into combined.pod5
+</code></pre></div>
 <h2 id="notes">Notes<a class="headerlink" href="#notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Large files may take significant time to merge</li>

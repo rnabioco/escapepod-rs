@@ -1495,8 +1495,8 @@
 <h1 id="podfive-view">podfive view<a class="headerlink" href="#podfive-view" title="Permanent link">&para;</a></h1>
 <p>Display reads from a POD5 file as a formatted table.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>view<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>view<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1589,29 +1589,29 @@
 </table>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-usage">Basic Usage<a class="headerlink" href="#basic-usage" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>podfive<span class="w"> </span>view<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>view<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <p>Output:
-<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>read_id                               channel  well  read_number  num_samples
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>a1b2c3d4-e5f6-7890-abcd-ef1234567890  1        1     1            50000
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>b2c3d4e5-f6a7-8901-bcde-f12345678901  1        1     2            75000
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>c3d4e5f6-a7b8-9012-cdef-123456789012  2        1     1            62000
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>...
-</span></code></pre></div></p>
+<div class="highlight"><pre><span></span><code>read_id                               channel  well  read_number  num_samples
+a1b2c3d4-e5f6-7890-abcd-ef1234567890  1        1     1            50000
+b2c3d4e5-f6a7-8901-bcde-f12345678901  1        1     2            75000
+c3d4e5f6-a7b8-9012-cdef-123456789012  2        1     1            62000
+...
+</code></pre></div></p>
 <h3 id="show-only-read-ids">Show Only Read IDs<a class="headerlink" href="#show-only-read-ids" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <p>Output:
-<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>a1b2c3d4-e5f6-7890-abcd-ef1234567890
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>b2c3d4e5-f6a7-8901-bcde-f12345678901
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>c3d4e5f6-a7b8-9012-cdef-123456789012
-</span></code></pre></div></p>
+<div class="highlight"><pre><span></span><code>a1b2c3d4-e5f6-7890-abcd-ef1234567890
+b2c3d4e5-f6a7-8901-bcde-f12345678901
+c3d4e5f6-a7b8-9012-cdef-123456789012
+</code></pre></div></p>
 <h3 id="save-to-file">Save to File<a class="headerlink" href="#save-to-file" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>podfive<span class="w"> </span>view<span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.tsv
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>view<span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.tsv
+</code></pre></div>
 <h3 id="select-specific-fields">Select Specific Fields<a class="headerlink" href="#select-specific-fields" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>podfive<span class="w"> </span>view<span class="w"> </span>--include<span class="w"> </span>read_id,channel,num_samples<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>view<span class="w"> </span>--include<span class="w"> </span>read_id,channel,num_samples<span class="w"> </span>experiment.pod5
+</code></pre></div>
 
 
 

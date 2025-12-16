@@ -1561,8 +1561,8 @@
 <h1 id="podfive-bam-filter">podfive bam-filter<a class="headerlink" href="#podfive-bam-filter" title="Permanent link">&para;</a></h1>
 <p>Filter reads from a POD5 file based on a paired BAM file. Supports filtering by mapped status, genomic region, and mapping quality.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1616,49 +1616,49 @@
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="extract-mapped-reads">Extract Mapped Reads<a class="headerlink" href="#extract-mapped-reads" title="Permanent link">&para;</a></h3>
 <p>Keep only reads that mapped to the reference:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>--mapped<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>--mapped<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="filter-by-region">Filter by Region<a class="headerlink" href="#filter-by-region" title="Permanent link">&para;</a></h3>
 <p>Extract reads mapping to a specific chromosome or region:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># All reads on chromosome 1</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>chr1.pod5<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>experiment.pod5
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1"># Reads in a specific region</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>region.pod5<span class="w"> </span>--region<span class="w"> </span>chr1:1000000-2000000<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># All reads on chromosome 1</span>
+podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>chr1.pod5<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>experiment.pod5
+
+<span class="c1"># Reads in a specific region</span>
+podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>region.pod5<span class="w"> </span>--region<span class="w"> </span>chr1:1000000-2000000<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="filter-by-mapping-quality">Filter by Mapping Quality<a class="headerlink" href="#filter-by-mapping-quality" title="Permanent link">&para;</a></h3>
 <p>Keep only high-quality alignments:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>high_quality.pod5<span class="w"> </span>-q<span class="w"> </span><span class="m">30</span><span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>high_quality.pod5<span class="w"> </span>-q<span class="w"> </span><span class="m">30</span><span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="combined-filters">Combined Filters<a class="headerlink" href="#combined-filters" title="Permanent link">&para;</a></h3>
 <p>Combine multiple filter criteria:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">    </span>--mapped<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>-q<span class="w"> </span><span class="m">20</span><span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mapped<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>-q<span class="w"> </span><span class="m">20</span><span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="process-a-directory">Process a Directory<a class="headerlink" href="#process-a-directory" title="Permanent link">&para;</a></h3>
 <p>Filter all POD5 files in a directory:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>pod5_directory/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>pod5_directory/
+</code></pre></div>
 <h2 id="bam-index">BAM Index<a class="headerlink" href="#bam-index" title="Permanent link">&para;</a></h2>
 <p>Region queries require a BAM index (<code>.bai</code> file). If the index doesn't exist, <code>podfive</code> will automatically create one:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>Info: BAI index not found, creating aligned.bam.bai...
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>Done: Created BAI index: aligned.bam.bai
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>Info: BAI index not found, creating aligned.bam.bai...
+Done: Created BAI index: aligned.bam.bai
+</code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints filtering statistics:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>Filtering experiment.pod5 using BAM aligned.bam
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>Output: filtered.pod5
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>  Filter: mapped reads only
-</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>  Filter: region chr1
-</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>  Filter: MAPQ &gt;= 20
-</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>Scanning BAM file...
-</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>50000 read IDs from 75000 BAM records
-</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>Scanning POD5 files for dictionary values...
-</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>45000 reads found
-</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>Filtering [████████████████████████████████████████] 45000/45000
-</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>Filtered 45000 reads from 100000 total (45.0%)
-</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>Note: 5000 BAM read IDs were not found in POD5 file(s)
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>Filtering experiment.pod5 using BAM aligned.bam
+Output: filtered.pod5
+  Filter: mapped reads only
+  Filter: region chr1
+  Filter: MAPQ &gt;= 20
+Scanning BAM file...
+50000 read IDs from 75000 BAM records
+Scanning POD5 files for dictionary values...
+45000 reads found
+Filtering [████████████████████████████████████████] 45000/45000
+Filtered 45000 reads from 100000 total (45.0%)
+Note: 5000 BAM read IDs were not found in POD5 file(s)
+</code></pre></div>
 <h2 id="notes">Notes<a class="headerlink" href="#notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Read IDs are matched by UUID from BAM query names</li>

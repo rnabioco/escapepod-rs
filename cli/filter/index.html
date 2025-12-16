@@ -1551,8 +1551,8 @@
 <h1 id="podfive-filter">podfive filter<a class="headerlink" href="#podfive-filter" title="Permanent link">&para;</a></h1>
 <p>Extract specific reads from a POD5 file based on read IDs.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>&lt;IDS_FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span>&lt;INPUT&gt;
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>&lt;IDS_FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span>&lt;INPUT&gt;
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1593,10 +1593,10 @@
 </table>
 <h2 id="id-file-format">ID File Format<a class="headerlink" href="#id-file-format" title="Permanent link">&para;</a></h2>
 <p>The IDs file should contain one UUID per line:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>a1b2c3d4-e5f6-7890-abcd-ef1234567890
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>b2c3d4e5-f6a7-8901-bcde-f12345678901
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>c3d4e5f6-a7b8-9012-cdef-123456789012
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>a1b2c3d4-e5f6-7890-abcd-ef1234567890
+b2c3d4e5-f6a7-8901-bcde-f12345678901
+c3d4e5f6-a7b8-9012-cdef-123456789012
+</code></pre></div>
 <h3 id="supported-formats">Supported Formats<a class="headerlink" href="#supported-formats" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Standard UUID: <code>a1b2c3d4-e5f6-7890-abcd-ef1234567890</code></li>
@@ -1607,35 +1607,35 @@
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-filtering">Basic Filtering<a class="headerlink" href="#basic-filtering" title="Permanent link">&para;</a></h3>
 <p>Create a file with read IDs:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>interesting_reads.txt<span class="w"> </span><span class="s">&lt;&lt; EOF</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="s">a1b2c3d4-e5f6-7890-abcd-ef1234567890</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="s">b2c3d4e5-f6a7-8901-bcde-f12345678901</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="s">EOF</span>
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>cat<span class="w"> </span>&gt;<span class="w"> </span>interesting_reads.txt<span class="w"> </span><span class="s">&lt;&lt; EOF</span>
+<span class="s">a1b2c3d4-e5f6-7890-abcd-ef1234567890</span>
+<span class="s">b2c3d4e5-f6a7-8901-bcde-f12345678901</span>
+<span class="s">EOF</span>
+</code></pre></div>
 <p>Filter the POD5 file:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>interesting_reads.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>interesting_reads.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="filter-from-basecalling-results">Filter from Basecalling Results<a class="headerlink" href="#filter-from-basecalling-results" title="Permanent link">&para;</a></h3>
 <p>If you have basecalling results with read IDs of interest:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Extract read IDs from a BAM file (requires samtools)</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>samtools<span class="w"> </span>view<span class="w"> </span>aligned.bam<span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-f1<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>mapped_reads.txt
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="c1"># Filter POD5 to only mapped reads</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>mapped_reads.txt<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Extract read IDs from a BAM file (requires samtools)</span>
+samtools<span class="w"> </span>view<span class="w"> </span>aligned.bam<span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-f1<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>mapped_reads.txt
+
+<span class="c1"># Filter POD5 to only mapped reads</span>
+podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>mapped_reads.txt<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h3 id="filter-using-another-pod5-file">Filter Using Another POD5 File<a class="headerlink" href="#filter-using-another-pod5-file" title="Permanent link">&para;</a></h3>
 <p>Extract reads that exist in another file:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>podfive<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>reference.pod5<span class="w"> </span>&gt;<span class="w"> </span>reference_ids.txt
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>reference_ids.txt<span class="w"> </span>-o<span class="w"> </span>matching.pod5<span class="w"> </span>experiment.pod5
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>reference.pod5<span class="w"> </span>&gt;<span class="w"> </span>reference_ids.txt
+podfive<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>reference_ids.txt<span class="w"> </span>-o<span class="w"> </span>matching.pod5<span class="w"> </span>experiment.pod5
+</code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints filtering statistics:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>Filtering experiment.pod5 using IDs from interesting_reads.txt
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>Output: filtered.pod5
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>Loaded 100 read IDs to filter
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>Filtered 95 reads from 10000 total (0.95%)
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>Warning: 5 requested IDs were not found in the input file
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>Filtering experiment.pod5 using IDs from interesting_reads.txt
+Output: filtered.pod5
+Loaded 100 read IDs to filter
+Filtered 95 reads from 10000 total (0.95%)
+Warning: 5 requested IDs were not found in the input file
+</code></pre></div>
 <h2 id="notes">Notes<a class="headerlink" href="#notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Only reads with matching IDs are included in output</li>

@@ -1517,8 +1517,8 @@
 <h1 id="podfive-repack">podfive repack<a class="headerlink" href="#podfive-repack" title="Permanent link">&para;</a></h1>
 <p>Repack POD5 files to optimize storage and apply current compression settings.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>podfive<span class="w"> </span>repack<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;FILES&gt;...
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>repack<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;FILES&gt;...
+</code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1559,24 +1559,24 @@
 </table>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="repack-a-single-file">Repack a Single File<a class="headerlink" href="#repack-a-single-file" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>podfive<span class="w"> </span>repack<span class="w"> </span>input.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>repack<span class="w"> </span>input.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
+</code></pre></div>
 <h3 id="repack-multiple-files">Repack Multiple Files<a class="headerlink" href="#repack-multiple-files" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>podfive<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
+</code></pre></div>
 <h3 id="overwrite-existing-files">Overwrite Existing Files<a class="headerlink" href="#overwrite-existing-files" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>podfive<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/<span class="w"> </span>--force
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/<span class="w"> </span>--force
+</code></pre></div>
 <h3 id="in-place-repacking">In-Place Repacking<a class="headerlink" href="#in-place-repacking" title="Permanent link">&para;</a></h3>
 <p>You can safely repack files in place (output to the same directory as input). The command uses temporary files to prevent data corruption:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>podfive<span class="w"> </span>repack<span class="w"> </span>data/*.pod5<span class="w"> </span>-o<span class="w"> </span>data/<span class="w"> </span>--force
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>podfive<span class="w"> </span>repack<span class="w"> </span>data/*.pod5<span class="w"> </span>-o<span class="w"> </span>data/<span class="w"> </span>--force
+</code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints progress and summary:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>Repacking 5 file(s) to repacked/
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>Repacking [████████████████████████████████████████] 5/5
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>Repacked 50000 reads across 5 file(s)
-</span></code></pre></div>
+<div class="highlight"><pre><span></span><code>Repacking 5 file(s) to repacked/
+Repacking [████████████████████████████████████████] 5/5
+Repacked 50000 reads across 5 file(s)
+</code></pre></div>
 <h2 id="notes">Notes<a class="headerlink" href="#notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Output files retain the same names as input files</li>
