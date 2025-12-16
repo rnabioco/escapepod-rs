@@ -2,6 +2,8 @@
 
 Generate a comprehensive summary of POD5 file(s) including read statistics, QC metrics, and run metadata.
 
+![podfive summary](../images/summary.gif)
+
 ## Usage
 
 ```bash

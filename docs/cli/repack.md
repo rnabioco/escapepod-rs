@@ -2,6 +2,8 @@
 
 Repack POD5 files to optimize storage and apply current compression settings.
 
+![podfive repack](../images/repack.gif)
+
 ## Usage
 
 ```bash

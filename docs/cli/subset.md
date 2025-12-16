@@ -2,6 +2,8 @@
 
 Split reads from a POD5 file into multiple output files based on a CSV mapping.
 
+![podfive subset](../images/subset.gif)
+
 ## Usage
 
 ```bash

@@ -2,6 +2,8 @@
 
 Inspect POD5 file metadata and contents.
 
+![podfive inspect](../images/inspect.gif)
+
 ## Usage
 
 ```bash
