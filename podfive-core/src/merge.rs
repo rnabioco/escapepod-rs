@@ -7,7 +7,6 @@ use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
-use crate::writer::{MmapSignalWriter, Writer, WriterOptions};
 use arrow::ipc::{Block, MetadataVersion};
 use flatbuffers::FlatBufferBuilder;
 use std::collections::{HashMap, HashSet};
@@ -20,10 +19,6 @@ use std::path::Path;
 pub struct MergeOptions {
     /// Allow duplicate read IDs (default: false, skip duplicates).
     pub duplicate_ok: bool,
-    /// Use mmap for signal writing (experimental).
-    pub use_mmap: bool,
-    /// Use async I/O for signal writing (overlaps reading and writing).
-    pub use_async: bool,
     /// Number of reads per batch in output file.
     pub read_batch_size: u32,
 }
@@ -32,8 +27,6 @@ impl Default for MergeOptions {
     fn default() -> Self {
         Self {
             duplicate_ok: false,
-            use_mmap: false,
-            use_async: false,
             read_batch_size: 100_000,
         }
     }
@@ -52,24 +45,10 @@ pub struct MergeResult {
     pub files_processed: usize,
 }
 
-/// Context collected from a single input file.
-struct FileContext {
-    signal_offset: u64,
-    run_infos: Vec<RunInfoData>,
-    reads: Vec<ReadData>,
-}
-
-/// Pre-scanned file info for mmap sizing.
-struct FileInfo {
-    footer: ArrowIpcFooter,
-    run_infos: Vec<RunInfoData>,
-    reads: Vec<ReadData>,
-}
-
 /// Merge multiple POD5 files into a single output file.
 ///
-/// This function uses raw byte copying for the signal table to avoid
-/// Arrow deserialization overhead, providing significant performance gains.
+/// This function uses zero-copy async I/O with scoped threads to overlap
+/// reading and writing, passing mmap slices directly to the writer thread.
 ///
 /// # Arguments
 /// * `inputs` - Slice of input file paths
@@ -89,164 +68,12 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
         return Err(Error::InvalidState("No input files specified".into()));
     }
 
-    if options.use_mmap {
-        merge_with_mmap(inputs, output, options, progress_callback)
-    } else if options.use_async {
-        merge_with_async(inputs, output, options, progress_callback)
-    } else {
-        merge_with_bufwriter(inputs, output, options, progress_callback)
-    }
+    merge_impl(inputs, output, options, progress_callback)
 }
 
-/// Merge using BufWriter (standard approach).
-fn merge_with_bufwriter<P: AsRef<Path>, Q: AsRef<Path>>(
-    inputs: &[P],
-    output: Q,
-    options: &MergeOptions,
-    progress_callback: Option<&dyn Fn(usize, usize)>,
-) -> Result<MergeResult> {
-    let num_files = inputs.len();
-
-    let writer_options = WriterOptions {
-        signal_batch_size: 100,
-        read_batch_size: options.read_batch_size,
-        ..WriterOptions::default()
-    };
-    let mut writer = Writer::create(output.as_ref(), writer_options)?;
-
-    let mut file_contexts: Vec<FileContext> = Vec::with_capacity(num_files);
-    let mut total_read_count = 0u64;
-
-    // Track all batches for building combined footer
-    let mut all_batches: Vec<BatchBlock> = Vec::new();
-    let mut current_offset: usize = 0;
-    let mut header_written = false;
-
-    for (file_idx, path) in inputs.iter().enumerate() {
-        let reader = Reader::open(path.as_ref())?;
-
-        // Record where this file's signal rows start
-        let signal_offset = writer.current_signal_row();
-
-        // Get raw signal table bytes and parse footer only
-        let signal_bytes = reader.signal_table_bytes()?;
-        let ipc_footer = ArrowIpcFooter::parse(signal_bytes)?;
-
-        // Write header from first file only
-        if !header_written {
-            let header_bytes = ipc_footer.header_bytes(signal_bytes);
-            current_offset = writer.write_raw_signal_header(header_bytes)?;
-            header_written = true;
-        }
-
-        // Copy batch bytes directly
-        let batches_bytes = ipc_footer.batches_bytes(signal_bytes);
-        writer.write_raw_signal_batches(batches_bytes, ipc_footer.total_rows)?;
-
-        // Adjust batch offsets for the combined output
-        for batch in &ipc_footer.record_batches {
-            let relative_offset = batch.offset as usize - ipc_footer.batches_start_offset;
-            let new_offset = current_offset + relative_offset;
-
-            all_batches.push(BatchBlock {
-                offset: new_offset as i64,
-                metadata_length: batch.metadata_length,
-                body_length: batch.body_length,
-                row_count: batch.row_count,
-            });
-        }
-
-        current_offset += batches_bytes.len();
-
-        // Collect run_infos and reads
-        let run_infos = reader.run_infos().to_vec();
-        let reads: Vec<ReadData> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
-        total_read_count += reads.len() as u64;
-
-        file_contexts.push(FileContext {
-            signal_offset,
-            run_infos,
-            reads,
-        });
-
-        if let Some(cb) = progress_callback {
-            cb(file_idx + 1, num_files);
-        }
-    }
-
-    // Build and write combined Arrow IPC footer
-    let combined_footer = ArrowIpcFooter {
-        record_batches: all_batches,
-        batches_start_offset: 0,
-        batches_end_offset: 0,
-        total_rows: writer.current_signal_row(),
-    };
-    writer.finish_raw_signal(&combined_footer, current_offset)?;
-
-    let signal_rows = writer.current_signal_row();
-
-    // Write reads
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
-    let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
-        HashSet::new()
-    } else {
-        HashSet::with_capacity(total_read_count as usize)
-    };
-
-    let mut total_reads = 0u64;
-    let mut duplicate_count = 0u64;
-
-    for ctx in &file_contexts {
-        // Add run infos (deduplicated by acquisition_id)
-        for run_info in &ctx.run_infos {
-            if !run_info_map.contains_key(&run_info.acquisition_id) {
-                let idx = writer.add_run_info(run_info.clone())?;
-                run_info_map.insert(run_info.acquisition_id.clone(), idx);
-            }
-        }
-
-        // Write reads with offset-adjusted signal rows
-        for read in &ctx.reads {
-            if !options.duplicate_ok {
-                if seen_reads.contains(&read.read_id) {
-                    duplicate_count += 1;
-                    continue;
-                }
-                seen_reads.insert(read.read_id);
-            }
-
-            let original_run_info = ctx.run_infos.get(read.run_info_index as usize);
-            let new_run_info_idx = if let Some(ri) = original_run_info {
-                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
-            } else {
-                0
-            };
-
-            let new_signal_rows: Vec<u64> = read
-                .signal_rows
-                .iter()
-                .map(|&row| row + ctx.signal_offset)
-                .collect();
-
-            let new_read = read.for_writing(new_run_info_idx);
-            writer.add_read_with_signal_rows(new_read, new_signal_rows)?;
-            total_reads += 1;
-        }
-    }
-
-    writer.finish()?;
-
-    Ok(MergeResult {
-        reads_written: total_reads,
-        duplicates_skipped: duplicate_count,
-        signal_rows,
-        files_processed: file_contexts.len(),
-    })
-}
-
-/// Merge using async I/O (overlaps reading and writing).
-/// Uses scoped threads to avoid copying mmap slices.
-fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
+/// Main merge implementation using zero-copy async I/O.
+/// Uses scoped threads to pass mmap slices directly to writer thread.
+fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     inputs: &[P],
     output: Q,
     options: &MergeOptions,
@@ -264,14 +91,17 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
         .collect::<Result<Vec<_>>>()?;
 
     // Phase 1: Collect metadata from all files
-    let mut file_infos: Vec<(ArrowIpcFooter, Vec<RunInfoData>, Vec<ReadData>)> = Vec::with_capacity(num_files);
+    let mut file_infos: Vec<(ArrowIpcFooter, Vec<RunInfoData>, Vec<ReadData>)> =
+        Vec::with_capacity(num_files);
     let mut total_read_count = 0u64;
 
     for reader in &readers {
         let signal_bytes = reader.signal_table_bytes()?;
         let footer = ArrowIpcFooter::parse(signal_bytes)?;
         let run_infos = reader.run_infos().to_vec();
-        let reads: Vec<ReadData> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let reads: Vec<ReadData> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         total_read_count += reads.len() as u64;
         file_infos.push((footer, run_infos, reads));
     }
@@ -311,7 +141,9 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
         // Main thread: send signal bytes to writer
         let mut header_written = false;
 
-        for (file_idx, (reader, (footer, _, _))) in readers.iter().zip(file_infos.iter()).enumerate() {
+        for (file_idx, (reader, (footer, _, _))) in
+            readers.iter().zip(file_infos.iter()).enumerate()
+        {
             let signal_bytes = reader.signal_table_bytes()?;
 
             // Record signal row offset for this file
@@ -320,14 +152,16 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
             // Write header from first file only
             if !header_written {
                 let header_bytes = footer.header_bytes(signal_bytes);
-                tx.send(header_bytes).map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
+                tx.send(header_bytes)
+                    .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
                 current_offset = header_bytes.len();
                 header_written = true;
             }
 
             // Send batch bytes directly (zero-copy from mmap)
             let batches_bytes = footer.batches_bytes(signal_bytes);
-            tx.send(batches_bytes).map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
+            tx.send(batches_bytes)
+                .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
 
             // Adjust batch offsets for the combined output
             for batch in &footer.record_batches {
@@ -355,7 +189,8 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
         drop(tx);
 
         // Wait for writer to finish with mmap data
-        let (mut file, _signal_end) = writer_handle.join()
+        let (mut file, _signal_end) = writer_handle
+            .join()
             .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
             .map_err(Error::Io)?;
 
@@ -364,7 +199,8 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
         file.write_all(&footer_bytes).map_err(Error::Io)?;
 
         let footer_len = footer_bytes.len() as i32;
-        file.write_all(&footer_len.to_le_bytes()).map_err(Error::Io)?;
+        file.write_all(&footer_len.to_le_bytes())
+            .map_err(Error::Io)?;
         file.write_all(b"ARROW1").map_err(Error::Io)?;
         file.flush().map_err(Error::Io)?;
 
@@ -372,8 +208,6 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
 
         Ok((file, final_pos, current_signal_row))
     })?;
-
-    let signal_rows = signal_rows;
 
     // Phase 3: Write remaining sections using BufWriter
     let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
@@ -476,235 +310,6 @@ fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let pod5_footer = build_pod5_footer(
         signal_offset_val,
-        signal_length,
-        run_info_offset,
-        run_info_length,
-        reads_offset,
-        reads_length,
-    )?;
-    file.write_all(&pod5_footer)?;
-
-    let footer_len = pod5_footer.len() as i64;
-    file.write_all(&footer_len.to_le_bytes())?;
-
-    let section_marker = Uuid::new_v4();
-    file.write_all(section_marker.as_bytes())?;
-    file.write_all(&POD5_SIGNATURE)?;
-
-    file.flush()?;
-
-    Ok(MergeResult {
-        reads_written: total_reads,
-        duplicates_skipped: duplicate_count,
-        signal_rows,
-        files_processed: file_infos.len(),
-    })
-}
-
-/// Merge using mmap for signal section (experimental).
-fn merge_with_mmap<P: AsRef<Path>, Q: AsRef<Path>>(
-    inputs: &[P],
-    output: Q,
-    options: &MergeOptions,
-    progress_callback: Option<&dyn Fn(usize, usize)>,
-) -> Result<MergeResult> {
-    let num_files = inputs.len();
-
-    // Open all readers and keep them alive (they hold mmap references)
-    let readers: Vec<Reader> = inputs
-        .iter()
-        .map(|p| Reader::open(p.as_ref()))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Phase 1: Scan all files to calculate sizes and collect metadata
-    let mut file_infos: Vec<FileInfo> = Vec::with_capacity(num_files);
-    let mut total_header_size = 0usize;
-    let mut total_batches_size = 0usize;
-    let mut total_read_count = 0u64;
-
-    for (file_idx, reader) in readers.iter().enumerate() {
-        let signal_bytes = reader.signal_table_bytes()?;
-        let footer = ArrowIpcFooter::parse(signal_bytes)?;
-
-        let header_size = footer.batches_start_offset;
-        let batches_size = footer.batches_end_offset - footer.batches_start_offset;
-
-        if file_infos.is_empty() {
-            total_header_size = header_size;
-        }
-        total_batches_size += batches_size;
-
-        let run_infos = reader.run_infos().to_vec();
-        let reads: Vec<ReadData> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
-        total_read_count += reads.len() as u64;
-
-        file_infos.push(FileInfo {
-            footer,
-            run_infos,
-            reads,
-        });
-
-        if let Some(cb) = progress_callback {
-            cb(file_idx + 1, num_files);
-        }
-    }
-
-    // Estimate footer size
-    let num_batches: usize = file_infos.iter().map(|f| f.footer.record_batches.len()).sum();
-    let footer_estimate = 256 + num_batches * 32;
-    let total_signal_size = total_header_size + total_batches_size + footer_estimate;
-
-    // Phase 2: Write signal section via mmap (reusing open readers)
-    let mut mmap_writer = MmapSignalWriter::create(output.as_ref(), total_signal_size)?;
-    mmap_writer.write_header()?;
-
-    let mut all_batches: Vec<BatchBlock> = Vec::new();
-    let mut current_offset: usize = 0;
-    let mut current_signal_row: u64 = 0;
-    let mut signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
-
-    for (file_idx, (reader, info)) in readers.iter().zip(file_infos.iter()).enumerate() {
-        let signal_bytes = reader.signal_table_bytes()?;
-
-        if file_idx == 0 {
-            let header_bytes = info.footer.header_bytes(signal_bytes);
-            mmap_writer.write_signal_bytes(header_bytes)?;
-            current_offset = header_bytes.len();
-        }
-
-        signal_offsets.push(current_signal_row);
-
-        let batches_bytes = info.footer.batches_bytes(signal_bytes);
-        mmap_writer.write_signal_bytes(batches_bytes)?;
-
-        for batch in &info.footer.record_batches {
-            let relative_offset = batch.offset as usize - info.footer.batches_start_offset;
-            let new_offset = current_offset + relative_offset;
-
-            all_batches.push(BatchBlock {
-                offset: new_offset as i64,
-                metadata_length: batch.metadata_length,
-                body_length: batch.body_length,
-                row_count: batch.row_count,
-            });
-        }
-
-        current_offset += batches_bytes.len();
-        current_signal_row += info.footer.total_rows;
-    }
-
-    // Write IPC footer
-    let footer_bytes = build_arrow_ipc_footer(&all_batches)?;
-    mmap_writer.write_signal_bytes(&footer_bytes)?;
-
-    let footer_len = footer_bytes.len() as i32;
-    mmap_writer.write_signal_bytes(&footer_len.to_le_bytes())?;
-    mmap_writer.write_signal_bytes(b"ARROW1")?;
-
-    let (file, signal_end) = mmap_writer.finish_signal()?;
-    let signal_rows = current_signal_row;
-
-    // Phase 3: Write remaining sections using BufWriter
-    let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
-    file.seek(SeekFrom::Start(signal_end as u64))?;
-
-    // Pad to 8-byte alignment
-    let padding_needed = (8 - (signal_end % 8)) % 8;
-    for _ in 0..padding_needed {
-        file.write_all(&[0u8])?;
-    }
-
-    // Write section marker
-    let section_marker = Uuid::new_v4();
-    file.write_all(section_marker.as_bytes())?;
-
-    // Build and write run_info table
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
-    let mut all_run_infos: Vec<RunInfoData> = Vec::new();
-
-    for info in &file_infos {
-        for run_info in &info.run_infos {
-            if !run_info_map.contains_key(&run_info.acquisition_id) {
-                let idx = all_run_infos.len() as u32;
-                run_info_map.insert(run_info.acquisition_id.clone(), idx);
-                all_run_infos.push(run_info.clone());
-            }
-        }
-    }
-
-    let run_info_offset = file.stream_position()? as i64;
-    let run_info_bytes = build_run_info_table(&all_run_infos)?;
-    file.write_all(&run_info_bytes)?;
-    let run_info_length = run_info_bytes.len() as i64;
-
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
-    let section_marker = Uuid::new_v4();
-    file.write_all(section_marker.as_bytes())?;
-
-    // Build and write reads table
-    let reads_offset = file.stream_position()? as i64;
-
-    let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
-        HashSet::new()
-    } else {
-        HashSet::with_capacity(total_read_count as usize)
-    };
-
-    let mut processed_reads: Vec<(ReadData, Vec<u64>)> = Vec::new();
-    let mut total_reads = 0u64;
-    let mut duplicate_count = 0u64;
-
-    for (info, &signal_offset) in file_infos.iter().zip(signal_offsets.iter()) {
-        for read in &info.reads {
-            if !options.duplicate_ok {
-                if seen_reads.contains(&read.read_id) {
-                    duplicate_count += 1;
-                    continue;
-                }
-                seen_reads.insert(read.read_id);
-            }
-
-            let original_run_info = info.run_infos.get(read.run_info_index as usize);
-            let new_run_info_idx = if let Some(ri) = original_run_info {
-                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
-            } else {
-                0
-            };
-
-            let new_signal_rows: Vec<u64> = read
-                .signal_rows
-                .iter()
-                .map(|&row| row + signal_offset)
-                .collect();
-
-            let new_read = read.for_writing(new_run_info_idx);
-            processed_reads.push((new_read, new_signal_rows));
-            total_reads += 1;
-        }
-    }
-
-    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos)?;
-    file.write_all(&reads_bytes)?;
-    let reads_length = reads_bytes.len() as i64;
-
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
-    let section_marker = Uuid::new_v4();
-    file.write_all(section_marker.as_bytes())?;
-
-    // Write POD5 footer
-    file.write_all(&FOOTER_MAGIC)?;
-
-    let signal_offset = 24i64; // POD5 header size
-    let signal_length = signal_end as i64 - 24;
-
-    let pod5_footer = build_pod5_footer(
-        signal_offset,
         signal_length,
         run_info_offset,
         run_info_length,
@@ -891,15 +496,11 @@ fn build_run_info_table(run_infos: &[RunInfoData]) -> Result<Vec<u8>> {
 }
 
 /// Build reads Arrow IPC table.
-fn build_reads_table(
-    reads: &[(ReadData, Vec<u64>)],
-    run_infos: &[RunInfoData],
-) -> Result<Vec<u8>> {
+fn build_reads_table(reads: &[(ReadData, Vec<u64>)], run_infos: &[RunInfoData]) -> Result<Vec<u8>> {
     use crate::schema::reads_schema;
     use arrow::array::{
-        ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, ListBuilder,
-        StringArray, StringDictionaryBuilder, UInt16Builder, UInt32Builder,
-        UInt64Builder, UInt8Builder,
+        ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, ListBuilder, StringArray,
+        StringDictionaryBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     };
     use arrow::datatypes::Int16Type;
     use arrow::ipc::writer::FileWriter as ArrowFileWriter;
@@ -1042,9 +643,9 @@ fn build_pod5_footer(
     let version = POD5_VERSION;
 
     let embedded_files = [
-        (signal_offset, signal_length, 1i16),    // SignalTable
+        (signal_offset, signal_length, 1i16),     // SignalTable
         (run_info_offset, run_info_length, 4i16), // RunInfoTable
-        (reads_offset, reads_length, 0i16),      // ReadsTable
+        (reads_offset, reads_length, 0i16),       // ReadsTable
     ];
 
     // Build minimal FlatBuffer
@@ -1057,8 +658,8 @@ fn build_pod5_footer(
     let vtable_pos = data.position() as usize;
     data.write_all(&12u16.to_le_bytes())?; // vtable size
     data.write_all(&20u16.to_le_bytes())?; // table size
-    data.write_all(&4u16.to_le_bytes())?;  // field 0 offset
-    data.write_all(&8u16.to_le_bytes())?;  // field 1 offset
+    data.write_all(&4u16.to_le_bytes())?; // field 0 offset
+    data.write_all(&8u16.to_le_bytes())?; // field 1 offset
     data.write_all(&12u16.to_le_bytes())?; // field 2 offset
     data.write_all(&16u16.to_le_bytes())?; // field 3 offset
 

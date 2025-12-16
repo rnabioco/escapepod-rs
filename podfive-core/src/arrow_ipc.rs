@@ -70,7 +70,9 @@ impl ArrowIpcFooter {
 
         // Verify trailing magic (6 bytes at end, no padding)
         if &ipc_bytes[len - 6..len] != ARROW_MAGIC {
-            return Err(Error::InvalidArrowIpc("Missing trailing ARROW1 magic".into()));
+            return Err(Error::InvalidArrowIpc(
+                "Missing trailing ARROW1 magic".into(),
+            ));
         }
 
         // Read footer length (4 bytes immediately before trailing magic)
@@ -130,8 +132,11 @@ impl ArrowIpcFooter {
         let table_start = root_offset;
 
         // Read vtable offset (signed, relative to table_start)
-        let vtable_soffset =
-            i32::from_le_bytes(footer_bytes[table_start..table_start + 4].try_into().unwrap());
+        let vtable_soffset = i32::from_le_bytes(
+            footer_bytes[table_start..table_start + 4]
+                .try_into()
+                .unwrap(),
+        );
         let vtable_pos = (table_start as i32 - vtable_soffset) as usize;
 
         if vtable_pos + 4 > footer_bytes.len() {
@@ -155,8 +160,11 @@ impl ArrowIpcFooter {
 
         // Get recordBatches vector offset (if vtable has it)
         let record_batches_field_offset = if vtable_size >= 12 {
-            let offset_in_vtable =
-                u16::from_le_bytes(footer_bytes[vtable_pos + 10..vtable_pos + 12].try_into().unwrap());
+            let offset_in_vtable = u16::from_le_bytes(
+                footer_bytes[vtable_pos + 10..vtable_pos + 12]
+                    .try_into()
+                    .unwrap(),
+            );
             if offset_in_vtable > 0 {
                 Some(offset_in_vtable as usize)
             } else {
@@ -173,15 +181,17 @@ impl ArrowIpcFooter {
             let vec_offset_pos = table_start + field_offset;
             if vec_offset_pos + 4 <= footer_bytes.len() {
                 let vec_offset = u32::from_le_bytes(
-                    footer_bytes[vec_offset_pos..vec_offset_pos + 4].try_into().unwrap(),
+                    footer_bytes[vec_offset_pos..vec_offset_pos + 4]
+                        .try_into()
+                        .unwrap(),
                 ) as usize;
                 let vec_pos = vec_offset_pos + vec_offset;
 
                 if vec_pos + 4 <= footer_bytes.len() {
                     // Read vector length
-                    let vec_len = u32::from_le_bytes(
-                        footer_bytes[vec_pos..vec_pos + 4].try_into().unwrap(),
-                    ) as usize;
+                    let vec_len =
+                        u32::from_le_bytes(footer_bytes[vec_pos..vec_pos + 4].try_into().unwrap())
+                            as usize;
 
                     // Each Block is a struct with: offset(i64) + metaDataLength(i32) + padding(i32) + bodyLength(i64) = 24 bytes
                     // Actually in FlatBuffers, Block struct is: offset(8) + metaDataLength(4) + bodyLength(8) = 20 bytes
@@ -199,11 +209,15 @@ impl ArrowIpcFooter {
                             footer_bytes[block_pos..block_pos + 8].try_into().unwrap(),
                         );
                         let metadata_length = i32::from_le_bytes(
-                            footer_bytes[block_pos + 8..block_pos + 12].try_into().unwrap(),
+                            footer_bytes[block_pos + 8..block_pos + 12]
+                                .try_into()
+                                .unwrap(),
                         );
                         // Skip 4 bytes padding
                         let body_length = i64::from_le_bytes(
-                            footer_bytes[block_pos + 16..block_pos + 24].try_into().unwrap(),
+                            footer_bytes[block_pos + 16..block_pos + 24]
+                                .try_into()
+                                .unwrap(),
                         );
 
                         // Parse row count from the batch message metadata
@@ -261,7 +275,9 @@ impl ArrowIpcFooter {
         };
 
         if metadata_start + 4 > ipc_bytes.len() {
-            return Err(Error::InvalidArrowIpc("Metadata offset out of bounds".into()));
+            return Err(Error::InvalidArrowIpc(
+                "Metadata offset out of bounds".into(),
+            ));
         }
 
         // The metadata is a Message FlatBuffer. We need to navigate to RecordBatch.length.
@@ -289,9 +305,11 @@ impl ArrowIpcFooter {
 
         // Message vtable: size(2), table_size(2), version(2), header_type(2), header(2), bodyLength(2)
         // We need header offset at vtable_pos + 8
-        let header_field_offset =
-            u16::from_le_bytes(metadata[vtable_pos + 8..vtable_pos + 10].try_into().unwrap())
-                as usize;
+        let header_field_offset = u16::from_le_bytes(
+            metadata[vtable_pos + 8..vtable_pos + 10]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         if header_field_offset == 0 {
             return Err(Error::InvalidArrowIpc("No header in message".into()));
@@ -302,29 +320,40 @@ impl ArrowIpcFooter {
         if header_offset_pos + 4 > metadata.len() {
             return Err(Error::InvalidArrowIpc("Header offset out of bounds".into()));
         }
-        let header_offset =
-            u32::from_le_bytes(metadata[header_offset_pos..header_offset_pos + 4].try_into().unwrap())
-                as usize;
+        let header_offset = u32::from_le_bytes(
+            metadata[header_offset_pos..header_offset_pos + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         let header_table_pos = header_offset_pos + header_offset;
 
         // Now we're at the RecordBatch table
         // RecordBatch vtable: size(2), table_size(2), length(2), nodes(2), buffers(2)
         if header_table_pos + 4 > metadata.len() {
-            return Err(Error::InvalidArrowIpc("RecordBatch table out of bounds".into()));
+            return Err(Error::InvalidArrowIpc(
+                "RecordBatch table out of bounds".into(),
+            ));
         }
 
-        let rb_vtable_soffset =
-            i32::from_le_bytes(metadata[header_table_pos..header_table_pos + 4].try_into().unwrap());
+        let rb_vtable_soffset = i32::from_le_bytes(
+            metadata[header_table_pos..header_table_pos + 4]
+                .try_into()
+                .unwrap(),
+        );
         let rb_vtable_pos = (header_table_pos as i32 - rb_vtable_soffset) as usize;
 
         if rb_vtable_pos + 6 > metadata.len() {
-            return Err(Error::InvalidArrowIpc("RecordBatch vtable out of bounds".into()));
+            return Err(Error::InvalidArrowIpc(
+                "RecordBatch vtable out of bounds".into(),
+            ));
         }
 
         // Read length field offset (first field after size and table_size)
-        let length_field_offset =
-            u16::from_le_bytes(metadata[rb_vtable_pos + 4..rb_vtable_pos + 6].try_into().unwrap())
-                as usize;
+        let length_field_offset = u16::from_le_bytes(
+            metadata[rb_vtable_pos + 4..rb_vtable_pos + 6]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         if length_field_offset == 0 {
             // No length field, assume 0 rows
@@ -380,7 +409,9 @@ mod tests {
         }
 
         let reader = crate::Reader::open(test_file).expect("Failed to open test file");
-        let signal_bytes = reader.signal_table_bytes().expect("Failed to get signal bytes");
+        let signal_bytes = reader
+            .signal_table_bytes()
+            .expect("Failed to get signal bytes");
 
         // Should parse without error
         let footer = ArrowIpcFooter::parse(signal_bytes).expect("Failed to parse IPC footer");
@@ -407,17 +438,20 @@ mod tests {
         );
         eprintln!(
             "Header: 0..{}, Batches: {}..{}",
-            footer.batches_start_offset,
-            footer.batches_start_offset,
-            footer.batches_end_offset
+            footer.batches_start_offset, footer.batches_start_offset, footer.batches_end_offset
         );
 
         // Print batch details for debugging
         for (i, batch) in footer.record_batches.iter().enumerate() {
             eprintln!(
                 "  Batch {}: offset={}, meta_len={}, body_len={}, rows={}, range={}..{}",
-                i, batch.offset, batch.metadata_length, batch.body_length, batch.row_count,
-                batch.byte_range().start, batch.byte_range().end
+                i,
+                batch.offset,
+                batch.metadata_length,
+                batch.body_length,
+                batch.row_count,
+                batch.byte_range().start,
+                batch.byte_range().end
             );
         }
 

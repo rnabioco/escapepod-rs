@@ -2,4 +2,4 @@
 
 mod file_writer;
 
-pub use file_writer::{AsyncSignalWriter, MmapSignalWriter, PredefinedDictionaries, Writer, WriterOptions};
+pub use file_writer::{PredefinedDictionaries, Writer, WriterOptions};

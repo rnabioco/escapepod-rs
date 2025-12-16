@@ -14,14 +14,11 @@ use arrow::array::{
 use arrow::datatypes::Int16Type;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;
 use arrow::record_batch::RecordBatch;
-use memmap2::MmapMut;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 /// Write buffer size (16MB for efficient I/O, reduces syscall overhead)
 const WRITE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
@@ -422,7 +419,11 @@ impl Writer {
     /// Write raw signal batch bytes directly, bypassing Arrow serialization.
     /// Returns (first_row_index, row_count) for the written batches.
     /// The batch_bytes should include all batches' raw IPC data.
-    pub fn write_raw_signal_batches(&mut self, batch_bytes: &[u8], row_count: u64) -> Result<(u64, u64)> {
+    pub fn write_raw_signal_batches(
+        &mut self,
+        batch_bytes: &[u8],
+        row_count: u64,
+    ) -> Result<(u64, u64)> {
         if self.finalized {
             return Err(Error::WriterFinalized);
         }
@@ -446,7 +447,11 @@ impl Writer {
 
     /// Finish raw signal writing by writing the IPC footer.
     /// Call this after all write_raw_signal_batches() calls.
-    pub fn finish_raw_signal(&mut self, footer: &crate::arrow_ipc::ArrowIpcFooter, current_offset: usize) -> Result<()> {
+    pub fn finish_raw_signal(
+        &mut self,
+        footer: &crate::arrow_ipc::ArrowIpcFooter,
+        current_offset: usize,
+    ) -> Result<()> {
         if self.finalized {
             return Err(Error::WriterFinalized);
         }
@@ -477,7 +482,10 @@ impl Writer {
     }
 
     /// Build Arrow IPC footer using Arrow's FlatBuffer types.
-    fn build_arrow_ipc_footer(batches: &[crate::arrow_ipc::BatchBlock], _offset_adjustment: usize) -> Result<Vec<u8>> {
+    fn build_arrow_ipc_footer(
+        batches: &[crate::arrow_ipc::BatchBlock],
+        _offset_adjustment: usize,
+    ) -> Result<Vec<u8>> {
         use arrow::ipc::{Block, MetadataVersion};
         use flatbuffers::FlatBufferBuilder;
 
@@ -494,7 +502,8 @@ impl Writer {
 
         // Build the footer using Arrow's generated builder
         // We need to build a minimal schema - just use an empty one
-        let schema_fields = fbb.create_vector::<flatbuffers::ForwardsUOffset<arrow::ipc::Field>>(&[]);
+        let schema_fields =
+            fbb.create_vector::<flatbuffers::ForwardsUOffset<arrow::ipc::Field>>(&[]);
         let schema = arrow::ipc::Schema::create(
             &mut fbb,
             &arrow::ipc::SchemaArgs {
@@ -1052,236 +1061,6 @@ impl Writer {
         file.flush()?;
         self.finalized = true;
         Ok(())
-    }
-}
-
-/// Memory-mapped writer for high-performance signal copying.
-///
-/// This writer uses mmap to write the signal section directly,
-/// avoiding buffer copies and syscall overhead. The file size
-/// must be known upfront.
-pub struct MmapSignalWriter {
-    mmap: MmapMut,
-    file: File,
-    write_pos: usize,
-    signal_start: usize,
-}
-
-impl MmapSignalWriter {
-    /// Create a new mmap-based signal writer.
-    ///
-    /// # Arguments
-    /// * `path` - Output file path
-    /// * `signal_size` - Total size of the signal section (header + batches + footer)
-    pub fn create<P: AsRef<Path>>(path: P, signal_size: usize) -> Result<Self> {
-        // POD5 header: signature (8) + section marker (16) = 24 bytes
-        let header_size = 24;
-        let file_size = header_size + signal_size;
-
-        // Create and size the file
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path.as_ref())?;
-        file.set_len(file_size as u64)?;
-
-        // Create mmap
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        Ok(Self {
-            mmap,
-            file,
-            write_pos: 0,
-            signal_start: header_size,
-        })
-    }
-
-    /// Write the POD5 header (signature + section marker).
-    pub fn write_header(&mut self) -> Result<()> {
-        // Write POD5 signature
-        self.mmap[..8].copy_from_slice(&POD5_SIGNATURE);
-        self.write_pos = 8;
-
-        // Write section marker
-        let section_marker = Uuid::new_v4();
-        self.mmap[8..24].copy_from_slice(section_marker.as_bytes());
-        self.write_pos = 24;
-
-        Ok(())
-    }
-
-    /// Write raw signal bytes directly via mmap.
-    /// Returns the number of bytes written.
-    pub fn write_signal_bytes(&mut self, bytes: &[u8]) -> Result<usize> {
-        let end = self.write_pos + bytes.len();
-        if end > self.mmap.len() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "Signal data exceeds allocated size",
-            )));
-        }
-
-        self.mmap[self.write_pos..end].copy_from_slice(bytes);
-        self.write_pos = end;
-
-        Ok(bytes.len())
-    }
-
-    /// Get current write position within the signal section.
-    pub fn signal_position(&self) -> usize {
-        self.write_pos - self.signal_start
-    }
-
-    /// Finish the signal section and return the underlying file for further writing.
-    /// The mmap is flushed asynchronously and dropped.
-    pub fn finish_signal(self) -> Result<(File, usize)> {
-        let signal_end = self.write_pos;
-
-        // Flush mmap asynchronously (don't wait for disk)
-        self.mmap.flush_async()?;
-
-        // Drop mmap to release the mapping
-        drop(self.mmap);
-
-        Ok((self.file, signal_end))
-    }
-}
-
-/// Message sent to the async writer thread.
-enum WriteCommand {
-    /// Write bytes to the file.
-    Write(Vec<u8>),
-    /// Finish writing and close.
-    Finish,
-}
-
-/// Async signal writer that performs I/O in a background thread.
-///
-/// This allows overlapping reading and writing during merge operations.
-/// Writes are queued and executed asynchronously, with backpressure
-/// when the queue gets too large.
-pub struct AsyncSignalWriter {
-    /// Channel to send write commands.
-    sender: Option<Sender<WriteCommand>>,
-    /// Handle to the writer thread.
-    writer_thread: Option<JoinHandle<std::io::Result<File>>>,
-    /// Current write position (for tracking).
-    write_pos: usize,
-    /// Signal section start offset.
-    signal_start: usize,
-}
-
-impl AsyncSignalWriter {
-    /// Create a new async signal writer.
-    ///
-    /// # Arguments
-    /// * `path` - Output file path
-    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_owned();
-
-        // Create the file
-        let file = File::create(&path)?;
-        let mut file = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
-
-        // Write POD5 header (signature + section marker)
-        file.write_all(&POD5_SIGNATURE)?;
-        let section_marker = Uuid::new_v4();
-        file.write_all(section_marker.as_bytes())?;
-
-        let signal_start = 24; // POD5 header size
-        let write_pos = signal_start;
-
-        // Create channel with bounded capacity for backpressure
-        // ~10 pending writes of up to ~10MB each = ~100MB max in flight
-        let (sender, receiver): (Sender<WriteCommand>, Receiver<WriteCommand>) = mpsc::channel();
-
-        // Spawn writer thread
-        let writer_thread = thread::spawn(move || {
-            Self::writer_loop(file, receiver)
-        });
-
-        Ok(Self {
-            sender: Some(sender),
-            writer_thread: Some(writer_thread),
-            write_pos,
-            signal_start,
-        })
-    }
-
-    /// The writer thread's main loop.
-    fn writer_loop(
-        mut file: BufWriter<File>,
-        receiver: Receiver<WriteCommand>,
-    ) -> std::io::Result<File> {
-        loop {
-            match receiver.recv() {
-                Ok(WriteCommand::Write(data)) => {
-                    file.write_all(&data)?;
-                }
-                Ok(WriteCommand::Finish) => {
-                    file.flush()?;
-                    return Ok(file.into_inner()?);
-                }
-                Err(_) => {
-                    // Channel closed, finish up
-                    file.flush()?;
-                    return Ok(file.into_inner()?);
-                }
-            }
-        }
-    }
-
-    /// Write raw signal bytes asynchronously.
-    /// This may block if too many writes are pending.
-    pub fn write_signal_bytes(&mut self, bytes: &[u8]) -> Result<usize> {
-        if let Some(ref sender) = self.sender {
-            // Send write command (this will block if channel is full due to bounded capacity)
-            sender
-                .send(WriteCommand::Write(bytes.to_vec()))
-                .map_err(|_| Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "Writer thread disconnected",
-                )))?;
-
-            self.write_pos += bytes.len();
-            Ok(bytes.len())
-        } else {
-            Err(Error::WriterFinalized)
-        }
-    }
-
-    /// Get current write position within the signal section.
-    pub fn signal_position(&self) -> usize {
-        self.write_pos - self.signal_start
-    }
-
-    /// Get total write position (including header).
-    pub fn total_position(&self) -> usize {
-        self.write_pos
-    }
-
-    /// Finish the signal section and return the underlying file for further writing.
-    pub fn finish_signal(mut self) -> Result<(File, usize)> {
-        let signal_end = self.write_pos;
-
-        // Send finish command
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(WriteCommand::Finish);
-        }
-
-        // Wait for writer thread to complete
-        if let Some(handle) = self.writer_thread.take() {
-            let file = handle
-                .join()
-                .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
-                .map_err(Error::Io)?;
-
-            Ok((file, signal_end))
-        } else {
-            Err(Error::WriterFinalized)
-        }
     }
 }
 

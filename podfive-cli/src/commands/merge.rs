@@ -10,48 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// I/O mode for merge operation.
-#[derive(Clone, Copy, PartialEq)]
-pub enum MergeMode {
-    /// Standard BufWriter (default).
-    Standard,
-    /// Memory-mapped output (experimental).
-    Mmap,
-    /// Async I/O with background writer thread.
-    Async,
-}
-
-pub fn run(
-    inputs: Vec<PathBuf>,
-    output: PathBuf,
-    duplicate_ok: bool,
-    _threads: Option<usize>,
-) -> anyhow::Result<()> {
-    run_impl(inputs, output, duplicate_ok, MergeMode::Standard)
-}
-
-pub fn run_mmap(
-    inputs: Vec<PathBuf>,
-    output: PathBuf,
-    duplicate_ok: bool,
-) -> anyhow::Result<()> {
-    run_impl(inputs, output, duplicate_ok, MergeMode::Mmap)
-}
-
-pub fn run_async(
-    inputs: Vec<PathBuf>,
-    output: PathBuf,
-    duplicate_ok: bool,
-) -> anyhow::Result<()> {
-    run_impl(inputs, output, duplicate_ok, MergeMode::Async)
-}
-
-fn run_impl(
-    inputs: Vec<PathBuf>,
-    output: PathBuf,
-    duplicate_ok: bool,
-    mode: MergeMode,
-) -> anyhow::Result<()> {
+pub fn run(inputs: Vec<PathBuf>, output: PathBuf, duplicate_ok: bool) -> anyhow::Result<()> {
     if inputs.is_empty() {
         anyhow::bail!("No input files specified");
     }
@@ -68,23 +27,15 @@ fn run_impl(
     }
 
     let num_files = all_files.len();
-    let mode_str = match mode {
-        MergeMode::Standard => "",
-        MergeMode::Mmap => " (mmap mode)",
-        MergeMode::Async => " (async mode)",
-    };
     eprintln!(
-        "{} {} files into {}{}",
+        "{} {} files into {}",
         style::action("Merging"),
         style::count(num_files),
         style::path(output.display()),
-        mode_str
     );
 
     let options = MergeOptions {
         duplicate_ok,
-        use_mmap: mode == MergeMode::Mmap,
-        use_async: mode == MergeMode::Async,
         read_batch_size: 100_000,
     };
 

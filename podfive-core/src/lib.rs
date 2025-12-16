@@ -32,7 +32,7 @@ pub use error::{Error, Result};
 pub use merge::{merge_files, MergeOptions, MergeResult};
 pub use reader::Reader;
 pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
-pub use writer::{MmapSignalWriter, PredefinedDictionaries, Writer, WriterOptions};
+pub use writer::{PredefinedDictionaries, Writer, WriterOptions};
 
 // Re-export Arrow types needed for batch-level operations
 pub use arrow::record_batch::RecordBatch;
