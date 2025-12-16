@@ -1,6 +1,8 @@
 //! Dictionary value scanning utilities.
 
 use crate::Reader;
+use arrow::array::{Array, DictionaryArray, StringArray};
+use arrow::datatypes::Int16Type;
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use uuid::Uuid;
@@ -16,49 +18,48 @@ pub struct ScannedDictionaries {
     pub total_read_count: u64,
 }
 
-/// Scan POD5 files to collect dictionary values for reads matching a filter.
+/// Extract dictionary values from a column's dictionary array.
+fn extract_dict_values(batch: &arrow::record_batch::RecordBatch, col_name: &str, values: &mut BTreeSet<String>) {
+    if let Some(col) = batch.column_by_name(col_name) {
+        if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
+            if let Some(dict_values) = dict.values().as_any().downcast_ref::<StringArray>() {
+                for i in 0..dict_values.len() {
+                    if !dict_values.is_null(i) {
+                        values.insert(dict_values.value(i).to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Scan POD5 files to collect dictionary values.
 ///
-/// This function scans multiple POD5 files and collects unique pore types and
-/// end reasons. This is useful for pre-batching operations where you need to
-/// know all dictionary values before writing.
+/// This function efficiently scans POD5 files to collect unique pore types and
+/// end reasons. Since dictionary values are typically a small set shared across
+/// all rows, we only need to read the first batch to get all unique values.
 ///
 /// # Arguments
 ///
 /// * `files` - Slice of POD5 file paths to scan
-/// * `filter_ids` - If `Some`, only collect values for reads whose IDs are in the set.
-///   If `None`, collect values for all reads.
-///
-/// # Example
-///
-/// ```no_run
-/// use podfive_core::utils::scan_dictionary_values;
-/// use std::path::PathBuf;
-///
-/// let files = vec![PathBuf::from("input.pod5")];
-/// let dictionaries = scan_dictionary_values(&files, None);
-///
-/// println!("Found {} pore types", dictionaries.pore_types.len());
-/// println!("Found {} end reasons", dictionaries.end_reasons.len());
-/// ```
+/// * `filter_ids` - Unused but kept for API compatibility. Dictionary values are
+///   collected from all reads since filtering would be more expensive.
 pub fn scan_dictionary_values<P: AsRef<Path>>(
     files: &[P],
-    filter_ids: Option<&HashSet<Uuid>>,
+    _filter_ids: Option<&HashSet<Uuid>>,
 ) -> ScannedDictionaries {
     let mut result = ScannedDictionaries::default();
 
     for file_path in files {
         if let Ok(reader) = Reader::open(file_path) {
-            if let Ok(reads_iter) = reader.reads() {
-                for read in reads_iter.flatten() {
-                    result.total_read_count += 1;
-                    // Only collect values for matching reads (or all if no filter)
-                    let should_collect = filter_ids
-                        .map(|ids| ids.contains(&read.read_id))
-                        .unwrap_or(true);
-                    if should_collect {
-                        result.pore_types.insert(read.pore_type.clone());
-                        result.end_reasons.insert(read.end_reason.to_string());
-                    }
+            // Get batch count for read count estimation (much faster than read_count())
+            if let Ok(num_batches) = reader.read_batch_count() {
+                // Read first batch to get dictionary values AND row count for estimation
+                if let Ok(batch) = reader.read_batch(0) {
+                    extract_dict_values(&batch, "pore_type", &mut result.pore_types);
+                    extract_dict_values(&batch, "end_reason", &mut result.end_reasons);
+                    // Estimate total rows: batch_size * num_batches (rough estimate)
+                    result.total_read_count += (batch.num_rows() * num_batches) as u64;
                 }
             }
         }

@@ -8,7 +8,7 @@ use crate::CompressedSignalChunk;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
-use std::cell::RefCell;
+use std::sync::RwLock;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
@@ -114,8 +114,8 @@ pub struct Reader {
     run_info_cache: Vec<RunInfoData>,
     /// Signal batch metadata for O(1) batch lookup.
     signal_metadata: Option<SignalBatchMetadata>,
-    /// LRU cache for signal batches (interior mutability for read operations).
-    signal_cache: RefCell<SignalBatchCache>,
+    /// LRU cache for signal batches (thread-safe for parallel operations).
+    signal_cache: RwLock<SignalBatchCache>,
 }
 
 impl Reader {
@@ -148,7 +148,7 @@ impl Reader {
             footer,
             run_info_cache,
             signal_metadata,
-            signal_cache: RefCell::new(SignalBatchCache::new(cache_size)),
+            signal_cache: RwLock::new(SignalBatchCache::new(cache_size)),
         })
     }
 
@@ -338,19 +338,19 @@ impl Reader {
 
             // Try to get from cache first
             let samples = {
-                let mut cache = self.signal_cache.borrow_mut();
+                let mut cache = self.signal_cache.write().unwrap();
                 if let Some(batch) = cache.get(batch_idx) {
                     // Cache hit - extract signal directly
                     self.extract_signal_from_batch(batch, local_row)?
                 } else {
                     // Cache miss - need to load the batch
-                    drop(cache); // Release borrow before loading
+                    drop(cache); // Release lock before loading
 
                     let batch = self.load_signal_batch(embedded, batch_idx)?;
                     let samples = self.extract_signal_from_batch(&batch, local_row)?;
 
                     // Insert into cache
-                    self.signal_cache.borrow_mut().insert(batch_idx, batch);
+                    self.signal_cache.write().unwrap().insert(batch_idx, batch);
 
                     samples
                 }
@@ -547,14 +547,14 @@ impl Reader {
 
             // Try to get from cache first
             let chunk = {
-                let mut cache = self.signal_cache.borrow_mut();
+                let mut cache = self.signal_cache.write().unwrap();
                 if let Some(batch) = cache.get(batch_idx) {
                     self.extract_single_compressed_chunk(batch, local_row)?
                 } else {
                     drop(cache);
                     let batch = self.load_signal_batch(embedded, batch_idx)?;
                     let chunk = self.extract_single_compressed_chunk(&batch, local_row)?;
-                    self.signal_cache.borrow_mut().insert(batch_idx, batch);
+                    self.signal_cache.write().unwrap().insert(batch_idx, batch);
                     chunk
                 }
             };
@@ -718,10 +718,298 @@ impl Reader {
         compression::decompress_signal(compressed_data, sample_count)
     }
 
+    /// Extract a read from a record batch at the given row.
+    ///
+    /// This is useful for batch-level parallel processing where you want to
+    /// process batches in parallel using rayon.
+    pub fn read_from_batch(batch: &RecordBatch, row: usize) -> Result<ReadData> {
+        use arrow::array::{
+            Array, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, ListArray,
+            UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        };
+
+        // Helper functions
+        let get_uuid = |name: &str| -> Result<Uuid> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected FixedSizeBinaryArray".to_string(),
+                })?;
+            let bytes = arr.value(row);
+            Uuid::from_slice(bytes).map_err(|e| Error::InvalidUuid(e.to_string()))
+        };
+
+        let get_u8 = |name: &str| -> Result<u8> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr =
+                col.as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected UInt8Array".to_string(),
+                    })?;
+            Ok(arr.value(row))
+        };
+
+        let get_u16 = |name: &str| -> Result<u16> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr =
+                col.as_any()
+                    .downcast_ref::<UInt16Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected UInt16Array".to_string(),
+                    })?;
+            Ok(arr.value(row))
+        };
+
+        let get_u32 = |name: &str| -> Result<u32> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr =
+                col.as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected UInt32Array".to_string(),
+                    })?;
+            Ok(arr.value(row))
+        };
+
+        let get_u64 = |name: &str| -> Result<u64> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr =
+                col.as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected UInt64Array".to_string(),
+                    })?;
+            Ok(arr.value(row))
+        };
+
+        let get_f32 = |name: &str| -> Result<f32> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr =
+                col.as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected Float32Array".to_string(),
+                    })?;
+            Ok(arr.value(row))
+        };
+
+        let get_bool = |name: &str| -> Result<bool> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+            let arr =
+                col.as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected BooleanArray".to_string(),
+                    })?;
+            Ok(arr.value(row))
+        };
+
+        // Get dictionary-encoded string value
+        let get_dict_string = |name: &str| -> Result<String> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+
+            // Try Int16 dictionary first
+            if let Some(dict) = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<arrow::datatypes::Int16Type>>()
+            {
+                let keys = dict.keys();
+                let values = dict.values();
+                let values = values
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: name.to_string(),
+                        message: "Expected String dictionary values".to_string(),
+                    })?;
+                let key = keys.value(row);
+                return Ok(values.value(key as usize).to_string());
+            }
+
+            Err(Error::InvalidField {
+                field: name.to_string(),
+                message: "Expected DictionaryArray".to_string(),
+            })
+        };
+
+        // Get run_info index from dictionary key
+        let get_run_info_index = |name: &str| -> Result<u32> {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| Error::MissingField(name.to_string()))?;
+
+            if let Some(dict) = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<arrow::datatypes::Int16Type>>()
+            {
+                let keys = dict.keys();
+                return Ok(keys.value(row) as u32);
+            }
+
+            Ok(0)
+        };
+
+        // Extract signal row indices from list
+        let signal_rows = {
+            let col = batch
+                .column_by_name("signal")
+                .ok_or_else(|| Error::MissingField("signal".to_string()))?;
+            let list_arr =
+                col.as_any()
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "signal".to_string(),
+                        message: "Expected ListArray".to_string(),
+                    })?;
+            let values = list_arr.value(row);
+            let u64_arr = values
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected UInt64Array values".to_string(),
+                })?;
+            u64_arr.values().to_vec()
+        };
+
+        Ok(ReadData {
+            read_id: get_uuid("read_id")?,
+            read_number: get_u32("read_number")?,
+            start_sample: get_u64("start_sample").or_else(|_| get_u64("start"))?,
+            channel: get_u16("channel")?,
+            well: get_u8("well")?,
+            pore_type: get_dict_string("pore_type").unwrap_or_default(),
+            calibration_offset: get_f32("calibration_offset")?,
+            calibration_scale: get_f32("calibration_scale")?,
+            median_before: get_f32("median_before")?,
+            end_reason: get_dict_string("end_reason")
+                .unwrap_or_default()
+                .parse()
+                .unwrap(),
+            end_reason_forced: get_bool("end_reason_forced")?,
+            run_info_index: get_run_info_index("run_info")?,
+            num_minknow_events: get_u64("num_minknow_events")?,
+            num_samples: get_u64("num_samples")?,
+            open_pore_level: get_f32("predicted_scaling_open_pore_level")
+                .or_else(|_| get_f32("open_pore_level"))
+                .unwrap_or(0.0),
+            signal_rows,
+        })
+    }
+
+    /// Get all read IDs from the file efficiently (reads only the read_id column).
+    ///
+    /// This is much faster than iterating over all reads when you only need the IDs,
+    /// as it uses Arrow column projection to avoid loading other columns.
+    pub fn read_ids(&self) -> Result<Vec<Uuid>> {
+        use arrow::array::{Array, FixedSizeBinaryArray};
+
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+
+        // Create reader with projection for just the read_id column (index 0)
+        let reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0]))?;
+
+        let mut read_ids = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result?;
+            // The projected batch will have read_id as column 0
+            if let Some(col) = batch.column(0).as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                for row in 0..col.len() {
+                    if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
+                        read_ids.push(uuid);
+                    }
+                }
+            }
+        }
+
+        Ok(read_ids)
+    }
+
+    /// Get read IDs from a specific batch efficiently (reads only the read_id column).
+    pub fn read_ids_from_batch(&self, batch_idx: usize) -> Result<Vec<Uuid>> {
+        use arrow::array::{Array, FixedSizeBinaryArray};
+
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+
+        // Create reader with projection for just the read_id column (index 0)
+        let mut reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0]))?;
+
+        if batch_idx >= reader.num_batches() {
+            return Err(Error::BatchIndexOutOfBounds {
+                index: batch_idx,
+                max: reader.num_batches(),
+            });
+        }
+
+        // Skip to the desired batch
+        for _ in 0..batch_idx {
+            reader.next();
+        }
+
+        let batch = reader
+            .next()
+            .ok_or_else(|| Error::BatchIndexOutOfBounds {
+                index: batch_idx,
+                max: reader.num_batches(),
+            })??;
+
+        let mut read_ids = Vec::new();
+        if let Some(col) = batch.column(0).as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            for row in 0..col.len() {
+                if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
+                    read_ids.push(uuid);
+                }
+            }
+        }
+
+        Ok(read_ids)
+    }
+
     /// Create an Arrow IPC file reader for an embedded file.
     fn create_arrow_reader(
         &self,
         embedded: &crate::footer::EmbeddedFile,
+    ) -> Result<ArrowFileReader<Cursor<&[u8]>>> {
+        self.create_arrow_reader_with_projection(embedded, None)
+    }
+
+    /// Create an Arrow IPC file reader with optional column projection.
+    fn create_arrow_reader_with_projection(
+        &self,
+        embedded: &crate::footer::EmbeddedFile,
+        projection: Option<Vec<usize>>,
     ) -> Result<ArrowFileReader<Cursor<&[u8]>>> {
         let start = embedded.offset as usize;
         let end = start + embedded.length as usize;
@@ -737,7 +1025,7 @@ impl Reader {
 
         let slice = &self.mmap[start..end];
         let cursor = Cursor::new(slice);
-        ArrowFileReader::try_new(cursor, None).map_err(Error::from)
+        ArrowFileReader::try_new(cursor, projection).map_err(Error::from)
     }
 
     /// Load run info from the run info table.

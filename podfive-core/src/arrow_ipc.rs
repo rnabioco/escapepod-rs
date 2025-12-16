@@ -381,6 +381,419 @@ impl ArrowIpcFooter {
     pub fn batches_bytes<'a>(&self, ipc_bytes: &'a [u8]) -> &'a [u8] {
         &ipc_bytes[self.batches_start_offset..self.batches_end_offset]
     }
+
+    /// Get the raw bytes for a single record batch by index.
+    /// Returns the slice containing the batch's metadata and body.
+    pub fn batch_bytes<'a>(&self, batch_idx: usize, ipc_bytes: &'a [u8]) -> &'a [u8] {
+        let batch = &self.record_batches[batch_idx];
+        &ipc_bytes[batch.byte_range()]
+    }
+
+    /// Get the first signal row index for a given batch.
+    /// Returns the cumulative row count before this batch.
+    pub fn batch_first_row(&self, batch_idx: usize) -> u64 {
+        self.record_batches[..batch_idx]
+            .iter()
+            .map(|b| b.row_count)
+            .sum()
+    }
+
+    /// Find which batch contains a given signal row.
+    /// Returns (batch_idx, row_within_batch).
+    pub fn batch_for_row(&self, signal_row: u64) -> Option<(usize, u64)> {
+        let mut cumulative = 0u64;
+        for (idx, batch) in self.record_batches.iter().enumerate() {
+            if signal_row < cumulative + batch.row_count {
+                return Some((idx, signal_row - cumulative));
+            }
+            cumulative += batch.row_count;
+        }
+        None
+    }
+
+    /// Extract a single compressed signal chunk from raw IPC bytes.
+    ///
+    /// This bypasses Arrow deserialization entirely, parsing the IPC format
+    /// directly to extract the signal bytes for a specific row.
+    ///
+    /// Signal table columns: read_id (FixedSizeBinary[16]), signal (LargeBinary), samples (UInt32)
+    pub fn extract_signal_row<'a>(
+        &self,
+        signal_row: u64,
+        ipc_bytes: &'a [u8],
+    ) -> Result<RawSignalChunk<'a>> {
+        let (batch_idx, local_row) = self
+            .batch_for_row(signal_row)
+            .ok_or_else(|| Error::InvalidState(format!("Signal row {} out of bounds", signal_row)))?;
+
+        let batch = &self.record_batches[batch_idx];
+        let batch_bytes = &ipc_bytes[batch.byte_range()];
+        let num_rows = batch.row_count as usize;
+
+        // Parse the batch to extract buffers
+        let parsed = ParsedBatch::parse(batch_bytes, batch.metadata_length as usize, num_rows)?;
+
+        // Extract the signal data for this row
+        let row = local_row as usize;
+
+        // Read UUID (16 bytes at row offset)
+        let read_id_offset = row * 16;
+        if read_id_offset + 16 > parsed.read_id_data.len() {
+            return Err(Error::InvalidState("read_id data out of bounds".into()));
+        }
+        let read_id_bytes: [u8; 16] = parsed.read_id_data[read_id_offset..read_id_offset + 16]
+            .try_into()
+            .map_err(|_| Error::InvalidState("Invalid read_id length".into()))?;
+
+        // Read signal offsets (i64 array, row and row+1)
+        let offset_start = row * 8;
+        let offset_end = (row + 1) * 8;
+        if offset_end + 8 > parsed.signal_offsets.len() {
+            return Err(Error::InvalidState("signal offset out of bounds".into()));
+        }
+        let signal_start =
+            i64::from_le_bytes(parsed.signal_offsets[offset_start..offset_start + 8].try_into().unwrap())
+                as usize;
+        let signal_end =
+            i64::from_le_bytes(parsed.signal_offsets[offset_end..offset_end + 8].try_into().unwrap())
+                as usize;
+
+        if signal_end > parsed.signal_data.len() {
+            return Err(Error::InvalidState("signal data out of bounds".into()));
+        }
+        let signal_bytes = &parsed.signal_data[signal_start..signal_end];
+
+        // Read samples count (u32)
+        let samples_offset = row * 4;
+        if samples_offset + 4 > parsed.samples_data.len() {
+            return Err(Error::InvalidState("samples data out of bounds".into()));
+        }
+        let samples =
+            u32::from_le_bytes(parsed.samples_data[samples_offset..samples_offset + 4].try_into().unwrap());
+
+        Ok(RawSignalChunk {
+            read_id: read_id_bytes,
+            signal: signal_bytes,
+            samples,
+        })
+    }
+
+    /// Extract multiple signal rows efficiently, grouping by batch.
+    pub fn extract_signal_rows<'a>(
+        &self,
+        signal_rows: &[u64],
+        ipc_bytes: &'a [u8],
+    ) -> Result<Vec<RawSignalChunk<'a>>> {
+        // Group rows by batch for efficiency
+        let mut batch_rows: std::collections::BTreeMap<usize, Vec<(usize, u64)>> =
+            std::collections::BTreeMap::new();
+
+        for (result_idx, &row) in signal_rows.iter().enumerate() {
+            if let Some((batch_idx, local_row)) = self.batch_for_row(row) {
+                batch_rows
+                    .entry(batch_idx)
+                    .or_default()
+                    .push((result_idx, local_row));
+            }
+        }
+
+        let mut results: Vec<Option<RawSignalChunk<'a>>> = vec![None; signal_rows.len()];
+
+        for (batch_idx, rows) in batch_rows {
+            let batch = &self.record_batches[batch_idx];
+            let batch_bytes = &ipc_bytes[batch.byte_range()];
+            let num_rows = batch.row_count as usize;
+
+            let parsed = ParsedBatch::parse(batch_bytes, batch.metadata_length as usize, num_rows)?;
+
+            for (result_idx, local_row) in rows {
+                let row = local_row as usize;
+
+                // Extract read_id
+                let read_id_offset = row * 16;
+                let read_id_bytes: [u8; 16] = parsed.read_id_data[read_id_offset..read_id_offset + 16]
+                    .try_into()
+                    .map_err(|_| Error::InvalidState("Invalid read_id".into()))?;
+
+                // Extract signal
+                let offset_start = row * 8;
+                let offset_end = (row + 1) * 8;
+                let signal_start = i64::from_le_bytes(
+                    parsed.signal_offsets[offset_start..offset_start + 8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let signal_end = i64::from_le_bytes(
+                    parsed.signal_offsets[offset_end..offset_end + 8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let signal_bytes = &parsed.signal_data[signal_start..signal_end];
+
+                // Extract samples
+                let samples_offset = row * 4;
+                let samples = u32::from_le_bytes(
+                    parsed.samples_data[samples_offset..samples_offset + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+
+                results[result_idx] = Some(RawSignalChunk {
+                    read_id: read_id_bytes,
+                    signal: signal_bytes,
+                    samples,
+                });
+            }
+        }
+
+        // Convert to vec, filtering out any missing
+        Ok(results.into_iter().flatten().collect())
+    }
+}
+
+/// A raw signal chunk extracted directly from IPC bytes (no deserialization).
+#[derive(Debug, Clone)]
+pub struct RawSignalChunk<'a> {
+    /// The read ID (16 bytes UUID).
+    pub read_id: [u8; 16],
+    /// The compressed VBZ signal data (borrowed from mmap).
+    pub signal: &'a [u8],
+    /// Number of samples in this chunk.
+    pub samples: u32,
+}
+
+/// Parsed buffer locations from a signal batch.
+struct ParsedBatch<'a> {
+    read_id_data: &'a [u8],
+    signal_offsets: &'a [u8],
+    signal_data: &'a [u8],
+    samples_data: &'a [u8],
+}
+
+impl<'a> ParsedBatch<'a> {
+    /// Parse a signal table batch to extract buffer locations.
+    ///
+    /// Signal table schema: read_id (FixedSizeBinary[16]), signal (LargeBinary), samples (UInt32)
+    /// Expected buffers:
+    /// - 0: read_id validity (may be empty/null)
+    /// - 1: read_id data (16 bytes * num_rows)
+    /// - 2: signal validity (may be empty/null)
+    /// - 3: signal offsets (8 bytes * (num_rows + 1))
+    /// - 4: signal data (variable)
+    /// - 5: samples validity (may be empty/null)
+    /// - 6: samples data (4 bytes * num_rows)
+    fn parse(batch_bytes: &'a [u8], metadata_length: usize, num_rows: usize) -> Result<Self> {
+        // Skip the message header to get to the body
+        // Message format: [4 bytes: continuation or length][4 bytes: metadata_length if continuation]
+        // Then metadata, then padding, then body
+
+        let (metadata_start, actual_metadata_len) = if batch_bytes.len() >= 4 {
+            let first_word = i32::from_le_bytes(batch_bytes[0..4].try_into().unwrap());
+            if first_word == -1 {
+                // Continuation marker, actual length follows
+                let len = i32::from_le_bytes(batch_bytes[4..8].try_into().unwrap()) as usize;
+                (8, len)
+            } else {
+                (4, first_word as usize)
+            }
+        } else {
+            return Err(Error::InvalidArrowIpc("Batch too small".into()));
+        };
+
+        // Body starts after metadata + padding to 8-byte boundary
+        let metadata_end = metadata_start + actual_metadata_len;
+        let padded_metadata_end = (metadata_end + 7) & !7; // Round up to 8
+        let body_start = padded_metadata_end;
+        let body = &batch_bytes[body_start..];
+
+        // Parse the metadata to get buffer offsets
+        // The RecordBatch message has a buffers vector with offset and length for each buffer
+        let metadata = &batch_bytes[metadata_start..metadata_end];
+        let buffer_infos = Self::parse_buffer_infos(metadata)?;
+
+        // We expect at least 7 buffers (some may be null/empty for validity)
+        // Find the non-empty buffers in order
+        let mut data_buffers: Vec<(usize, usize)> = Vec::new();
+        for (offset, length) in &buffer_infos {
+            if *length > 0 {
+                data_buffers.push((*offset, *length));
+            }
+        }
+
+        // Expected layout for non-null signal table:
+        // - read_id data (16 * num_rows)
+        // - signal offsets (8 * (num_rows + 1))
+        // - signal data (variable)
+        // - samples data (4 * num_rows)
+
+        // Find buffers by expected sizes
+        let read_id_size = 16 * num_rows;
+        let signal_offsets_size = 8 * (num_rows + 1);
+        let samples_size = 4 * num_rows;
+
+        let mut read_id_data: &[u8] = &[];
+        let mut signal_offsets: &[u8] = &[];
+        let mut signal_data: &[u8] = &[];
+        let mut samples_data: &[u8] = &[];
+
+        // Match buffers by size
+        for (offset, length) in &buffer_infos {
+            let offset = *offset;
+            let length = *length;
+
+            if length == 0 {
+                continue;
+            }
+
+            let end = offset + length;
+            if end > body.len() {
+                continue;
+            }
+
+            let buf = &body[offset..end];
+
+            if length == read_id_size && read_id_data.is_empty() {
+                read_id_data = buf;
+            } else if length == signal_offsets_size && signal_offsets.is_empty() {
+                signal_offsets = buf;
+            } else if length == samples_size && samples_data.is_empty() {
+                samples_data = buf;
+            } else if signal_data.is_empty()
+                && !read_id_data.is_empty()
+                && !signal_offsets.is_empty()
+            {
+                // Signal data comes after offsets
+                signal_data = buf;
+            }
+        }
+
+        if read_id_data.is_empty() || signal_offsets.is_empty() || samples_data.is_empty() {
+            return Err(Error::InvalidArrowIpc(format!(
+                "Could not locate all required buffers. Found: read_id={}, offsets={}, signal={}, samples={}",
+                read_id_data.len(), signal_offsets.len(), signal_data.len(), samples_data.len()
+            )));
+        }
+
+        Ok(ParsedBatch {
+            read_id_data,
+            signal_offsets,
+            signal_data,
+            samples_data,
+        })
+    }
+
+    /// Parse buffer info (offset, length) from RecordBatch metadata.
+    fn parse_buffer_infos(metadata: &[u8]) -> Result<Vec<(usize, usize)>> {
+        if metadata.len() < 4 {
+            return Err(Error::InvalidArrowIpc("Metadata too small".into()));
+        }
+
+        // Root table offset
+        let root_offset = u32::from_le_bytes(metadata[0..4].try_into().unwrap()) as usize;
+        if root_offset >= metadata.len() {
+            return Err(Error::InvalidArrowIpc("Invalid root offset".into()));
+        }
+
+        // Navigate to Message -> header (RecordBatch) -> buffers
+        let vtable_soffset =
+            i32::from_le_bytes(metadata[root_offset..root_offset + 4].try_into().unwrap());
+        let vtable_pos = (root_offset as i32 - vtable_soffset) as usize;
+
+        if vtable_pos + 10 > metadata.len() {
+            return Err(Error::InvalidArrowIpc("Invalid vtable".into()));
+        }
+
+        // Message vtable: size(2), table_size(2), version(2), header_type(2), header(2), bodyLength(2)
+        let header_field_offset = u16::from_le_bytes(
+            metadata[vtable_pos + 8..vtable_pos + 10]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        if header_field_offset == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Navigate to RecordBatch table
+        let header_offset_pos = root_offset + header_field_offset;
+        let header_offset = u32::from_le_bytes(
+            metadata[header_offset_pos..header_offset_pos + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let rb_table_pos = header_offset_pos + header_offset;
+
+        // RecordBatch vtable
+        let rb_vtable_soffset =
+            i32::from_le_bytes(metadata[rb_table_pos..rb_table_pos + 4].try_into().unwrap());
+        let rb_vtable_pos = (rb_table_pos as i32 - rb_vtable_soffset) as usize;
+
+        if rb_vtable_pos + 8 > metadata.len() {
+            return Err(Error::InvalidArrowIpc("RecordBatch vtable too small".into()));
+        }
+
+        let rb_vtable_size =
+            u16::from_le_bytes(metadata[rb_vtable_pos..rb_vtable_pos + 2].try_into().unwrap())
+                as usize;
+
+        // RecordBatch vtable: size(2), table_size(2), length(2), nodes(2), buffers(2)
+        // buffers is at offset 8 in vtable
+        if rb_vtable_size < 10 {
+            return Ok(Vec::new());
+        }
+
+        let buffers_field_offset = u16::from_le_bytes(
+            metadata[rb_vtable_pos + 8..rb_vtable_pos + 10]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        if buffers_field_offset == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Navigate to buffers vector
+        let buffers_offset_pos = rb_table_pos + buffers_field_offset;
+        if buffers_offset_pos + 4 > metadata.len() {
+            return Ok(Vec::new());
+        }
+
+        let buffers_offset = u32::from_le_bytes(
+            metadata[buffers_offset_pos..buffers_offset_pos + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let buffers_vec_pos = buffers_offset_pos + buffers_offset;
+
+        if buffers_vec_pos + 4 > metadata.len() {
+            return Ok(Vec::new());
+        }
+
+        let num_buffers = u32::from_le_bytes(
+            metadata[buffers_vec_pos..buffers_vec_pos + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        // Each Buffer struct is 16 bytes: offset(i64) + length(i64)
+        let mut buffers = Vec::with_capacity(num_buffers);
+        let buffers_data_start = buffers_vec_pos + 4;
+
+        for i in 0..num_buffers {
+            let buf_pos = buffers_data_start + i * 16;
+            if buf_pos + 16 > metadata.len() {
+                break;
+            }
+
+            let offset =
+                i64::from_le_bytes(metadata[buf_pos..buf_pos + 8].try_into().unwrap()) as usize;
+            let length =
+                i64::from_le_bytes(metadata[buf_pos + 8..buf_pos + 16].try_into().unwrap()) as usize;
+            buffers.push((offset, length));
+        }
+
+        Ok(buffers)
+    }
 }
 
 #[cfg(test)]

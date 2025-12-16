@@ -1,111 +1,106 @@
 //! Repack command implementation.
 //!
-//! Repacks POD5 files to optimize storage and apply current compression settings.
+//! Repacks POD5 files using block-level signal copying (no decompression/recompression).
+//! Files are processed in parallel using rayon. Supports directories as input.
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use podfive_core::{Reader, Writer, WriterOptions};
+use crate::util::resolve_pod5_inputs;
+use podfive_core::{repack_files, RepackOptions};
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Result<()> {
     if inputs.is_empty() {
         anyhow::bail!("No input files specified");
     }
 
+    // Expand any directories to individual POD5 files
+    let mut all_files = Vec::new();
+    for input in &inputs {
+        let files = resolve_pod5_inputs(input)?;
+        all_files.extend(files);
+    }
+
+    if all_files.is_empty() {
+        anyhow::bail!("No POD5 files found in specified inputs");
+    }
+
     // Ensure output directory exists
     std::fs::create_dir_all(&output_dir)?;
+
+    // Check for existing files if not forcing
+    if !force {
+        for input_path in &all_files {
+            if let Some(file_name) = input_path.file_name() {
+                let output_path = output_dir.join(file_name);
+                if output_path.exists() {
+                    anyhow::bail!(
+                        "Output file {} already exists. Use --force to overwrite.",
+                        output_path.display()
+                    );
+                }
+            }
+        }
+    }
 
     println!(
         "{} {} file(s) to {}",
         style::action("Repacking"),
-        style::count(inputs.len()),
+        style::count(all_files.len()),
         style::path(output_dir.display())
     );
 
-    let overall_bar = create_progress_bar(inputs.len() as u64, "Repacking")?;
+    let overall_bar = create_progress_bar(all_files.len() as u64, "Repacking")?;
+    let bar_progress = Arc::new(AtomicU64::new(0));
 
-    let mut total_reads = 0u64;
+    // Build file pairs (input, output)
+    let file_pairs: Vec<(PathBuf, PathBuf)> = all_files
+        .iter()
+        .filter_map(|input_path| {
+            input_path.file_name().map(|file_name| {
+                let output_path = output_dir.join(file_name);
+                (input_path.clone(), output_path)
+            })
+        })
+        .collect();
 
-    for input_path in &inputs {
-        let file_name = input_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("Invalid input path"))?;
-        let output_path = output_dir.join(file_name);
+    let options = RepackOptions {
+        force,
+        ..RepackOptions::default()
+    };
 
-        // Check if output exists
-        if output_path.exists() && !force {
-            anyhow::bail!(
-                "Output file {} already exists. Use --force to overwrite.",
-                output_path.display()
-            );
-        }
+    // Create progress callback
+    let bar = overall_bar.clone();
+    let progress_counter = bar_progress.clone();
+    let progress_callback: Box<dyn Fn(usize, usize) + Send + Sync> =
+        Box::new(move |done: usize, _total: usize| {
+            let prev = progress_counter.swap(done as u64, Ordering::Relaxed);
+            if done as u64 > prev {
+                bar.inc((done as u64) - prev);
+            }
+        });
 
-        overall_bar.set_message(format!("{}", file_name.to_string_lossy()));
-
-        let reads = repack_file(input_path, &output_path)?;
-        total_reads += reads;
-
-        overall_bar.inc(1);
-    }
+    // Process files in parallel using the new operation
+    let result = repack_files(&file_pairs, options, Some(progress_callback));
 
     overall_bar.finish_with_message("done");
 
     println!(
         "{} {} reads across {} file(s)",
         style::action("Repacked"),
-        style::count(total_reads),
-        style::value(inputs.len())
+        style::count(result.total_reads),
+        style::value(result.files_processed)
     );
 
+    if result.files_skipped > 0 {
+        println!(
+            "  {} {} file(s) skipped",
+            style::action("Warning:"),
+            style::count(result.files_skipped as u64)
+        );
+    }
+
     Ok(())
-}
-
-fn repack_file(input: &PathBuf, output: &PathBuf) -> anyhow::Result<u64> {
-    // Check if input and output resolve to the same file
-    // This prevents bus errors from truncating a memory-mapped file
-    let input_canonical = std::fs::canonicalize(input)?;
-    let same_file = output.exists() && std::fs::canonicalize(output)? == input_canonical;
-
-    // Use a temp file if writing to the same location as input
-    let (actual_output, temp_file): (PathBuf, Option<NamedTempFile>) = if same_file {
-        let temp = NamedTempFile::new_in(output.parent().unwrap_or(std::path::Path::new(".")))?;
-        (temp.path().to_path_buf(), Some(temp))
-    } else {
-        (output.clone(), None)
-    };
-
-    let reader = Reader::open(input)?;
-
-    let options = WriterOptions::default();
-    let mut writer = Writer::create(&actual_output, options)?;
-
-    // Copy run infos
-    let run_infos = reader.run_infos().to_vec();
-    for run_info in &run_infos {
-        writer.add_run_info(run_info.clone())?;
-    }
-
-    let mut count = 0u64;
-
-    // Copy reads with their signals
-    for read_result in reader.reads()? {
-        let read = read_result?;
-        let signal = reader.get_signal(&read.signal_rows)?;
-
-        let new_read = read.for_writing_same_run();
-
-        writer.add_read(new_read, &signal)?;
-        count += 1;
-    }
-
-    writer.finish()?;
-
-    // If we used a temp file, close the reader and rename temp to output
-    if let Some(temp) = temp_file {
-        drop(reader); // Release the memory map
-        temp.persist(output)?;
-    }
-
-    Ok(count)
 }
