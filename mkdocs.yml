@@ -60,6 +60,9 @@ nav:
       - inspect: cli/inspect.md
       - merge: cli/merge.md
       - filter: cli/filter.md
+      - bam-filter: cli/bam-filter.md
+      - repack: cli/repack.md
+      - subset: cli/subset.md
   - Library:
       - Overview: library/index.md
       - Reading Files: library/reading.md

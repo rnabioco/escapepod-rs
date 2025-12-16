@@ -16,7 +16,10 @@ podfive <COMMAND> [OPTIONS]
 | [view](view.md) | Display reads as a table |
 | [inspect](inspect.md) | Inspect file metadata and contents |
 | [merge](merge.md) | Combine multiple POD5 files |
-| [filter](filter.md) | Extract reads by ID |
+| [filter](filter.md) | Extract reads by ID list |
+| [bam-filter](bam-filter.md) | Filter reads based on paired BAM file |
+| [repack](repack.md) | Repack POD5 files to optimize storage |
+| [subset](subset.md) | Split reads into multiple files based on CSV mapping |
 
 ## Global Options
 
