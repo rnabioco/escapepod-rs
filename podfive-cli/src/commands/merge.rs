@@ -1,15 +1,23 @@
 //! Merge command implementation.
 //!
 //! Merges multiple POD5 files into a single output file.
-//! Uses batch-level signal copying to avoid memory copies for maximum performance.
+//! Uses single-pass batch-level signal copying for maximum performance.
 
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{batch_sizes, resolve_pod5_inputs};
-use podfive_core::{Reader, Writer, WriterOptions};
+use podfive_core::{ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// Context collected from a single input file during the signal copy phase.
+/// This allows us to process each file only once.
+struct FileContext {
+    signal_offset: u64,
+    run_infos: Vec<RunInfoData>,
+    reads: Vec<ReadData>,
+}
 
 pub fn run(
     inputs: Vec<PathBuf>,
@@ -49,22 +57,19 @@ pub fn run(
     };
     let mut writer = Writer::create(&output, options)?;
 
-    // Track run infos by acquisition_id to avoid duplicates
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
+    // Single-pass: copy signal batches AND collect reads/run_infos from each file
+    // This avoids re-opening files in a second pass
+    let spinner = create_spinner("Processing")?;
+    spinner.set_message("files...");
 
-    // Track signal offset for each file (where its signal rows start in output)
-    let mut file_signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
-
-    // Phase 1: Copy signal batches directly from each file
-    // This is zero-copy from mmap - batches reference the memory-mapped input directly
-    let signal_spinner = create_spinner("Copying")?;
-    signal_spinner.set_message("signal batches...");
+    let mut file_contexts: Vec<FileContext> = Vec::with_capacity(num_files);
+    let mut total_read_count = 0u64;
 
     for (file_idx, path) in all_files.iter().enumerate() {
         let reader = match Reader::open(path) {
             Ok(r) => r,
             Err(e) => {
-                signal_spinner.suspend(|| {
+                spinner.suspend(|| {
                     eprintln!(
                         "{} failed to read {}: {}",
                         style::warning_label("Warning:"),
@@ -72,80 +77,66 @@ pub fn run(
                         e
                     );
                 });
-                // Use u64::MAX as sentinel for failed files
-                file_signal_offsets.push(u64::MAX);
                 continue;
             }
         };
 
         // Record where this file's signal rows start
-        let start_row = writer.current_signal_row();
-        file_signal_offsets.push(start_row);
+        let signal_offset = writer.current_signal_row();
 
         // Copy signal batches directly (zero-copy from mmap)
         for batch in reader.signal_batches()? {
             writer.write_signal_batch(&batch)?;
         }
 
-        signal_spinner.set_message(format!(
-            "signal batches... ({}/{})",
-            file_idx + 1,
-            num_files
-        ));
+        // Collect run_infos and reads (lightweight metadata, stays in memory)
+        let run_infos = reader.run_infos().to_vec();
+        let reads: Vec<ReadData> = reader.reads()?.collect::<Result<Vec<_>, _>>()?;
+        total_read_count += reads.len() as u64;
+
+        file_contexts.push(FileContext {
+            signal_offset,
+            run_infos,
+            reads,
+        });
+
+        spinner.set_message(format!("files... ({}/{})", file_idx + 1, num_files));
     }
 
-    signal_spinner.finish_with_message(format!(
-        "{} signal rows written",
-        style::count(writer.current_signal_row())
+    spinner.finish_with_message(format!(
+        "{} signal rows, {} reads collected",
+        style::count(writer.current_signal_row()),
+        style::count(total_read_count)
     ));
 
-    // Phase 2: Copy reads with remapped signal indices
-    // We need to re-open files to read the reads (signal batches consumed the reader)
-    let mut total_read_count = 0u64;
-    for path in &all_files {
-        if let Ok(reader) = Reader::open(path) {
-            total_read_count += reader.read_count()? as u64;
-        }
-    }
-
+    // Phase 2: Write reads from collected data (no file I/O needed)
     let write_bar = create_progress_bar(total_read_count, "Writing")?;
     write_bar.set_message("reads");
+
+    // Track run infos by acquisition_id to avoid duplicates
+    let mut run_info_map: HashMap<String, u32> = HashMap::new();
 
     // Track read IDs for duplicate detection
     let mut seen_reads: HashSet<Uuid> = if duplicate_ok {
         HashSet::new()
     } else {
-        HashSet::with_capacity(100_000)
+        HashSet::with_capacity(total_read_count as usize)
     };
 
     let mut total_reads = 0u64;
     let mut duplicate_count = 0u64;
 
-    for (file_idx, path) in all_files.iter().enumerate() {
-        // Skip files that failed during signal copying
-        let signal_offset = file_signal_offsets[file_idx];
-        if signal_offset == u64::MAX {
-            continue;
-        }
-
-        let reader = match Reader::open(path) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
+    for ctx in &file_contexts {
         // Add run infos (deduplicated by acquisition_id)
-        let run_infos = reader.run_infos().to_vec();
-        for run_info in &run_infos {
+        for run_info in &ctx.run_infos {
             if !run_info_map.contains_key(&run_info.acquisition_id) {
                 let idx = writer.add_run_info(run_info.clone())?;
                 run_info_map.insert(run_info.acquisition_id.clone(), idx);
             }
         }
 
-        // Copy reads with offset-adjusted signal rows
-        for read_result in reader.reads()? {
-            let read = read_result?;
-
+        // Write reads with offset-adjusted signal rows
+        for read in &ctx.reads {
             // Check for duplicates
             if !duplicate_ok {
                 if seen_reads.contains(&read.read_id) {
@@ -157,7 +148,7 @@ pub fn run(
             }
 
             // Map run_info index
-            let original_run_info = run_infos.get(read.run_info_index as usize);
+            let original_run_info = ctx.run_infos.get(read.run_info_index as usize);
             let new_run_info_idx = if let Some(ri) = original_run_info {
                 *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
             } else {
@@ -168,7 +159,7 @@ pub fn run(
             let new_signal_rows: Vec<u64> = read
                 .signal_rows
                 .iter()
-                .map(|&row| row + signal_offset)
+                .map(|&row| row + ctx.signal_offset)
                 .collect();
 
             let new_read = read.for_writing(new_run_info_idx);
