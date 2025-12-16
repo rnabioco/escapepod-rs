@@ -29,3 +29,6 @@ flamegraph.svg
 
 # Benchmark temp files
 benchmarks/
+
+# External data
+data/
