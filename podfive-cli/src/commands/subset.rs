@@ -89,12 +89,13 @@ pub fn run(
         let read = read_result?;
 
         if let Some(output_name) = mapping.get(&read.read_id) {
-            let signal = reader.get_signal(&read.signal_rows)?;
+            // Use compressed signal to avoid decompress/recompress overhead
+            let compressed_signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
 
             let new_read = read.for_writing_same_run();
 
             if let Some(writer) = writers.get_mut(output_name) {
-                writer.add_read(new_read, &signal)?;
+                writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
                 *write_counts.get_mut(output_name).unwrap() += 1;
             }
 

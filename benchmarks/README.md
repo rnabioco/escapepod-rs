@@ -7,7 +7,7 @@ Comparison of `podfive-rs` vs the official Python `pod5` tool.
 - **CPU**: Apple M3 Pro
 - **Memory**: 18 GB
 - **OS**: macOS (Darwin 25.1.0)
-- **Date**: 2025-12-15
+- **Date**: 2025-12-16
 
 ## Test Data
 
@@ -22,27 +22,34 @@ Comparison of `podfive-rs` vs the official Python `pod5` tool.
 
 | Command | podfive-rs | pod5 (Python) | Speedup |
 |---------|------------|---------------|---------|
-| inspect summary | 3 ms | 237 ms | **79x faster** |
-| view | 19 ms | 460 ms | **24x faster** |
-| merge (3 files, 6.5 GB) | 11.1 s | 4.3 s | 2.6x slower |
-| repack | 7.5 s | 869 ms | 8.7x slower |
-| filter (10% of reads) | 2.8 s | 546 ms | 5.1x slower |
+| inspect summary | 5 ms | 253 ms | **56x faster** |
+| view | 19 ms | 586 ms | **30x faster** |
+| merge (3 files, 6.5 GB) | 1.6 s | 4.9 s | **3x faster** |
+| repack | 7.9 s | 917 ms | 8.6x slower |
+| filter (10% of reads) | 3.1 s | 593 ms | 5.2x slower |
 
 ## Analysis
 
 ### Where podfive-rs excels
 
-- **Read-only operations**: `inspect` and `view` commands are dramatically faster (26-64x) due to:
+- **Read-only operations**: `inspect` and `view` commands are dramatically faster (30-56x) due to:
   - No Python interpreter startup overhead
   - Memory-mapped file I/O
   - Efficient Arrow table iteration
 
+- **Merge operations**: `merge` is now **3x faster** than pod5 thanks to:
+  - Parallel file reading with rayon
+  - Raw Arrow IPC batch copying without deserialization
+  - Zero-copy async I/O via scoped threads
+  - Memory-mapped input files
+  - 16 MB buffered sequential writes
+
 ### Where pod5 (Python) is faster
 
-- **Write operations**: `merge`, `repack`, and `filter` are currently slower in podfive-rs:
+- **Write operations**: `repack` and `filter` are slower in podfive-rs:
   - The Python `pod5` tool uses optimized C++ libraries (lib_pod5) under the hood
   - `filter`: Despite using LRU-cached signal batch lookups and block-level copying (no decompression), podfive-rs iterates through all reads sequentially. The Python tool may have indexed access.
-  - `merge`/`repack`: The C++ library has highly optimized batch-level operations
+  - `repack`: Requires full decompression/recompression in podfive-rs. The C++ library has optimized batch-level operations.
 
 ## Running Benchmarks
 
@@ -52,9 +59,6 @@ cargo build --release
 
 # Run full benchmark suite
 ./benchmarks/benchmark.sh data/pod5/
-
-# Run merge-only benchmark
-./benchmarks/merge_benchmark.sh data/pod5/
 ```
 
 ### Requirements

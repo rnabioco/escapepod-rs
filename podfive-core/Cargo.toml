@@ -12,6 +12,7 @@ arrow = { workspace = true }
 byteorder = { workspace = true }
 flatbuffers = { workspace = true }
 memmap2 = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }

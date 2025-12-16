@@ -96,7 +96,6 @@ Examples:
 Examples:
   podfive merge *.pod5 -o merged.pod5          Merge all POD5 files
   podfive merge a.pod5 b.pod5 -o out.pod5      Merge specific files
-  podfive merge *.pod5 -o out.pod5 -t 8        Use 8 threads
   podfive merge *.pod5 -o out.pod5 --duplicate-ok
 ")]
     Merge {
@@ -111,10 +110,6 @@ Examples:
         /// Allow duplicate read IDs (skip duplicate checking)
         #[arg(long)]
         duplicate_ok: bool,
-
-        /// Number of parallel file readers
-        #[arg(short, long, value_name = "N")]
-        threads: Option<usize>,
     },
 
     /// Filter reads by ID list
@@ -270,8 +265,7 @@ fn main() -> anyhow::Result<()> {
             inputs,
             output,
             duplicate_ok,
-            threads,
-        } => commands::merge::run(inputs, output, duplicate_ok, threads),
+        } => commands::merge::run(inputs, output, duplicate_ok),
 
         Commands::Filter { input, ids, output } => commands::filter::run(input, ids, output),
 
