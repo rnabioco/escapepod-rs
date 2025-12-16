@@ -74,7 +74,7 @@ pub fn run(
     eprintln!("Reading {} files in parallel...", num_files);
     let file_results: Vec<Result<FileData, anyhow::Error>> = all_files
         .par_iter()
-        .map(|path| read_file_data(path))
+        .map(read_file_data)
         .collect();
 
     // Check for errors and collect successful results
@@ -95,11 +95,13 @@ pub fn run(
     // Phase 2: Write all data sequentially (Writer is not thread-safe)
     eprintln!("Writing merged output...");
 
-    let mut options = WriterOptions::default();
-    options.signal_batch_size = 100;
-    // Use large batch size to avoid Arrow IPC dictionary replacement issues
-    // (all reads should fit in a single batch for typical merge operations)
-    options.read_batch_size = 1_000_000;
+    let options = WriterOptions {
+        signal_batch_size: 100,
+        // Use large batch size to avoid Arrow IPC dictionary replacement issues
+        // (all reads should fit in a single batch for typical merge operations)
+        read_batch_size: 1_000_000,
+        ..WriterOptions::default()
+    };
     let mut writer = Writer::create(&output, options)?;
 
     // Track run infos by acquisition_id to avoid duplicates

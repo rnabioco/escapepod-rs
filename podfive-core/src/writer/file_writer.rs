@@ -7,7 +7,7 @@ use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE, PO
 use crate::CompressedSignalChunk;
 use arrow::array::{
     ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder,
-    LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder,
+    LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
     StringDictionaryBuilder, TimestampMillisecondBuilder, UInt16Builder, UInt32Builder,
     UInt64Builder, UInt8Builder,
 };
@@ -36,6 +36,9 @@ pub struct WriterOptions {
     pub compress_signal: bool,
     /// Software name to write in the footer.
     pub software: String,
+    /// Predefined dictionaries for multi-batch consistency.
+    /// When set, all dictionary values must exist in the predefined lists.
+    pub predefined_dictionaries: Option<PredefinedDictionaries>,
 }
 
 impl Default for WriterOptions {
@@ -46,8 +49,23 @@ impl Default for WriterOptions {
             read_batch_size: 1000,
             compress_signal: true,
             software: format!("podfive-rs {}", env!("CARGO_PKG_VERSION")),
+            predefined_dictionaries: None,
         }
     }
+}
+
+/// Predefined dictionary values for consistent multi-batch writing.
+///
+/// When predefined dictionaries are provided, only values in these lists
+/// are allowed. Encountering unknown values will result in an error.
+/// This enables smaller batch sizes by ensuring dictionary consistency
+/// across all batches in the Arrow IPC file.
+#[derive(Debug, Clone, Default)]
+pub struct PredefinedDictionaries {
+    /// Pore type values. If None, pore types are collected dynamically.
+    pub pore_types: Option<Vec<String>>,
+    /// End reason values. If None, end reasons are collected dynamically.
+    pub end_reasons: Option<Vec<String>>,
 }
 
 /// Internal structure to track a pending read.
@@ -106,6 +124,9 @@ pub struct Writer {
 
     // State
     finalized: bool,
+
+    // Predefined dictionary mode
+    use_predefined_dictionaries: bool,
 }
 
 impl Writer {
@@ -125,14 +146,52 @@ impl Writer {
         // Record signal table offset (after header)
         let signal_offset = file.stream_position()? as i64;
 
+        // Initialize dictionaries from predefined values if provided
+        let (pore_types, pore_type_index, end_reasons, end_reason_index, use_predefined) =
+            if let Some(ref predef) = options.predefined_dictionaries {
+                let (pt, pt_idx) = if let Some(ref vals) = predef.pore_types {
+                    let index: HashMap<String, i16> = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (s.clone(), i as i16))
+                        .collect();
+                    (vals.clone(), index)
+                } else {
+                    (Vec::with_capacity(16), HashMap::with_capacity(16))
+                };
+
+                let (er, er_idx) = if let Some(ref vals) = predef.end_reasons {
+                    let index: HashMap<String, i16> = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (s.clone(), i as i16))
+                        .collect();
+                    (vals.clone(), index)
+                } else {
+                    (Vec::with_capacity(16), HashMap::with_capacity(16))
+                };
+
+                // Use predefined mode if either dictionary is predefined
+                let predefined = predef.pore_types.is_some() || predef.end_reasons.is_some();
+                (pt, pt_idx, er, er_idx, predefined)
+            } else {
+                (
+                    Vec::with_capacity(16),
+                    HashMap::with_capacity(16),
+                    Vec::with_capacity(16),
+                    HashMap::with_capacity(16),
+                    false,
+                )
+            };
+
         Ok(Self {
             file: Some(file),
             file_id: Uuid::new_v4(),
             // Dictionary tracking with O(1) lookup
-            pore_types: Vec::with_capacity(16),
-            pore_type_index: HashMap::with_capacity(16),
-            end_reasons: Vec::with_capacity(16),
-            end_reason_index: HashMap::with_capacity(16),
+            pore_types,
+            pore_type_index,
+            end_reasons,
+            end_reason_index,
             run_infos: Vec::with_capacity(4),
             // Pre-allocate pending buffers based on batch sizes
             pending_reads: Vec::with_capacity(options.read_batch_size as usize),
@@ -145,6 +204,7 @@ impl Writer {
             current_signal_row: 0,
             section_marker,
             finalized: false,
+            use_predefined_dictionaries: use_predefined,
             options,
         })
     }
@@ -165,29 +225,41 @@ impl Writer {
         Ok(index)
     }
 
-    /// Get or add a pore type to the dictionary, returning its index.
-    /// Uses O(1) HashMap lookup instead of O(n) linear search.
-    fn get_or_add_pore_type(&mut self, pore_type: &str) -> i16 {
+    /// Get the index for a pore type.
+    /// In predefined mode, returns error if value not found.
+    /// In dynamic mode, adds new values as needed.
+    fn get_pore_type_index(&mut self, pore_type: &str) -> Result<i16> {
         if let Some(&idx) = self.pore_type_index.get(pore_type) {
-            idx
+            Ok(idx)
+        } else if self.use_predefined_dictionaries {
+            Err(Error::DictionaryValueNotFound {
+                value: pore_type.to_string(),
+                dictionary_name: "pore_type".to_string(),
+            })
         } else {
             let idx = self.pore_types.len() as i16;
             self.pore_types.push(pore_type.to_string());
             self.pore_type_index.insert(pore_type.to_string(), idx);
-            idx
+            Ok(idx)
         }
     }
 
-    /// Get or add an end reason to the dictionary, returning its index.
-    /// Uses O(1) HashMap lookup instead of O(n) linear search.
-    fn get_or_add_end_reason(&mut self, end_reason: &str) -> i16 {
+    /// Get the index for an end reason.
+    /// In predefined mode, returns error if value not found.
+    /// In dynamic mode, adds new values as needed.
+    fn get_end_reason_index(&mut self, end_reason: &str) -> Result<i16> {
         if let Some(&idx) = self.end_reason_index.get(end_reason) {
-            idx
+            Ok(idx)
+        } else if self.use_predefined_dictionaries {
+            Err(Error::DictionaryValueNotFound {
+                value: end_reason.to_string(),
+                dictionary_name: "end_reason".to_string(),
+            })
         } else {
             let idx = self.end_reasons.len() as i16;
             self.end_reasons.push(end_reason.to_string());
             self.end_reason_index.insert(end_reason.to_string(), idx);
-            idx
+            Ok(idx)
         }
     }
 
@@ -216,9 +288,9 @@ impl Writer {
             });
         }
 
-        // Track dictionary entries
-        self.get_or_add_pore_type(&read.pore_type);
-        self.get_or_add_end_reason(read.end_reason.as_str());
+        // Track dictionary entries (may fail in predefined mode)
+        self.get_pore_type_index(&read.pore_type)?;
+        self.get_end_reason_index(read.end_reason.as_str())?;
 
         self.pending_reads.push(PendingRead {
             data: read,
@@ -261,9 +333,9 @@ impl Writer {
             });
         }
 
-        // Track dictionary entries
-        self.get_or_add_pore_type(&read.pore_type);
-        self.get_or_add_end_reason(read.end_reason.as_str());
+        // Track dictionary entries (may fail in predefined mode)
+        self.get_pore_type_index(&read.pore_type)?;
+        self.get_end_reason_index(read.end_reason.as_str())?;
 
         self.pending_reads.push(PendingRead {
             data: read,
@@ -328,9 +400,9 @@ impl Writer {
             return Err(Error::WriterFinalized);
         }
 
-        // Track dictionary entries
-        self.get_or_add_pore_type(&read.pore_type);
-        self.get_or_add_end_reason(read.end_reason.as_str());
+        // Track dictionary entries (may fail in predefined mode)
+        self.get_pore_type_index(&read.pore_type)?;
+        self.get_end_reason_index(read.end_reason.as_str())?;
 
         self.pending_reads.push(PendingRead {
             data: read,
@@ -405,15 +477,23 @@ impl Writer {
         let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
         let mut channel_builder = UInt16Builder::with_capacity(num_reads);
         let mut well_builder = UInt8Builder::with_capacity(num_reads);
+
+        // Create dictionary builders with predefined dictionaries if available
+        // This ensures consistent dictionary indices across batches
+        let pore_type_dict = StringArray::from_iter_values(self.pore_types.iter().map(|s| s.as_str()));
         let mut pore_type_builder: StringDictionaryBuilder<Int16Type> =
-            StringDictionaryBuilder::new();
+            StringDictionaryBuilder::new_with_dictionary(num_reads, &pore_type_dict)?;
+
         let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
         let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
         let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
         let mut start_builder = UInt64Builder::with_capacity(num_reads);
         let mut median_before_builder = Float32Builder::with_capacity(num_reads);
+
+        let end_reason_dict = StringArray::from_iter_values(self.end_reasons.iter().map(|s| s.as_str()));
         let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
-            StringDictionaryBuilder::new();
+            StringDictionaryBuilder::new_with_dictionary(num_reads, &end_reason_dict)?;
+
         let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
         let mut run_info_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new();
