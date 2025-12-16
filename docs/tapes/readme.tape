@@ -24,7 +24,7 @@ Type "# Let's explore a POD5 file"
 Enter
 Sleep 500ms
 
-Type "podfive summary ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5"
+Type "podfive summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 3s
 
@@ -32,7 +32,7 @@ Type "# View reads as a table"
 Enter
 Sleep 500ms
 
-Type "podfive view ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5"
+Type "podfive view data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 2s
 
@@ -40,7 +40,7 @@ Type "# Extract just read IDs"
 Enter
 Sleep 500ms
 
-Type "podfive view ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5 --ids"
+Type "podfive view data/drna/yeast_trna_reads.pod5 --ids"
 Enter
 Sleep 2s
 
@@ -48,7 +48,7 @@ Type "# Inspect file metadata"
 Enter
 Sleep 500ms
 
-Type "podfive inspect summary ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5"
+Type "podfive inspect summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 2s
 
@@ -58,4 +58,4 @@ Sleep 500ms
 
 Type "podfive --help"
 Enter
-Sleep 3s
+Sleep 5s

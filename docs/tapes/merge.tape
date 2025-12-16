@@ -14,6 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "podfive merge ext/pod5-file-format/test_data/multi_fast5_zip_v*.pod5 -o /tmp/merged.pod5"
+Type "podfive merge data/drna/yeast_trna_reads.pod5 -o /tmp/merged.pod5"
 Enter
-Sleep 3s
+Sleep 5s
