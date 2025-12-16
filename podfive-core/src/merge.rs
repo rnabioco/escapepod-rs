@@ -11,6 +11,7 @@ use crate::writer::{MmapSignalWriter, Writer, WriterOptions};
 use arrow::ipc::{Block, MetadataVersion};
 use flatbuffers::FlatBufferBuilder;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -21,6 +22,8 @@ pub struct MergeOptions {
     pub duplicate_ok: bool,
     /// Use mmap for signal writing (experimental).
     pub use_mmap: bool,
+    /// Use async I/O for signal writing (overlaps reading and writing).
+    pub use_async: bool,
     /// Number of reads per batch in output file.
     pub read_batch_size: u32,
 }
@@ -30,6 +33,7 @@ impl Default for MergeOptions {
         Self {
             duplicate_ok: false,
             use_mmap: false,
+            use_async: false,
             read_batch_size: 100_000,
         }
     }
@@ -87,6 +91,8 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
 
     if options.use_mmap {
         merge_with_mmap(inputs, output, options, progress_callback)
+    } else if options.use_async {
+        merge_with_async(inputs, output, options, progress_callback)
     } else {
         merge_with_bufwriter(inputs, output, options, progress_callback)
     }
@@ -235,6 +241,263 @@ fn merge_with_bufwriter<P: AsRef<Path>, Q: AsRef<Path>>(
         duplicates_skipped: duplicate_count,
         signal_rows,
         files_processed: file_contexts.len(),
+    })
+}
+
+/// Merge using async I/O (overlaps reading and writing).
+/// Uses scoped threads to avoid copying mmap slices.
+fn merge_with_async<P: AsRef<Path>, Q: AsRef<Path>>(
+    inputs: &[P],
+    output: Q,
+    options: &MergeOptions,
+    progress_callback: Option<&dyn Fn(usize, usize)>,
+) -> Result<MergeResult> {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let num_files = inputs.len();
+
+    // Open all readers upfront (they hold mmap references to input files)
+    let readers: Vec<Reader> = inputs
+        .iter()
+        .map(|p| Reader::open(p.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Phase 1: Collect metadata from all files
+    let mut file_infos: Vec<(ArrowIpcFooter, Vec<RunInfoData>, Vec<ReadData>)> = Vec::with_capacity(num_files);
+    let mut total_read_count = 0u64;
+
+    for reader in &readers {
+        let signal_bytes = reader.signal_table_bytes()?;
+        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let run_infos = reader.run_infos().to_vec();
+        let reads: Vec<ReadData> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        total_read_count += reads.len() as u64;
+        file_infos.push((footer, run_infos, reads));
+    }
+
+    // Phase 2: Write signal data using scoped thread (zero-copy from mmap)
+    let mut all_batches: Vec<BatchBlock> = Vec::new();
+    let mut current_offset: usize = 0;
+    let mut current_signal_row: u64 = 0;
+    let mut signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
+
+    // Use scoped thread to allow borrowing mmap slices without copying
+    let (file, signal_end, signal_rows) = thread::scope(|scope| -> Result<(File, usize, u64)> {
+        // Channel for sending byte slices to writer thread
+        let (tx, rx) = mpsc::sync_channel::<&[u8]>(4); // Small buffer for backpressure
+
+        // Spawn writer thread within scope - can borrow from parent
+        let output_path = output.as_ref();
+        let writer_handle = scope.spawn(move || -> std::io::Result<(File, usize)> {
+            let file = File::create(output_path)?;
+            let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
+
+            // Write POD5 header
+            file.write_all(&POD5_SIGNATURE)?;
+            let section_marker = Uuid::new_v4();
+            file.write_all(section_marker.as_bytes())?;
+
+            // Write all signal data from channel
+            for bytes in rx {
+                file.write_all(bytes)?;
+            }
+
+            let pos = file.stream_position()? as usize;
+            file.flush()?;
+            Ok((file.into_inner()?, pos))
+        });
+
+        // Main thread: send signal bytes to writer
+        let mut header_written = false;
+
+        for (file_idx, (reader, (footer, _, _))) in readers.iter().zip(file_infos.iter()).enumerate() {
+            let signal_bytes = reader.signal_table_bytes()?;
+
+            // Record signal row offset for this file
+            signal_offsets.push(current_signal_row);
+
+            // Write header from first file only
+            if !header_written {
+                let header_bytes = footer.header_bytes(signal_bytes);
+                tx.send(header_bytes).map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
+                current_offset = header_bytes.len();
+                header_written = true;
+            }
+
+            // Send batch bytes directly (zero-copy from mmap)
+            let batches_bytes = footer.batches_bytes(signal_bytes);
+            tx.send(batches_bytes).map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
+
+            // Adjust batch offsets for the combined output
+            for batch in &footer.record_batches {
+                let relative_offset = batch.offset as usize - footer.batches_start_offset;
+                let new_offset = current_offset + relative_offset;
+
+                all_batches.push(BatchBlock {
+                    offset: new_offset as i64,
+                    metadata_length: batch.metadata_length,
+                    body_length: batch.body_length,
+                    row_count: batch.row_count,
+                });
+            }
+
+            current_offset += batches_bytes.len();
+            current_signal_row += footer.total_rows;
+
+            if let Some(cb) = progress_callback {
+                cb(file_idx + 1, num_files);
+            }
+        }
+
+        // Close channel - must happen before footer_bytes is created
+        // to ensure all mmap slices are consumed
+        drop(tx);
+
+        // Wait for writer to finish with mmap data
+        let (mut file, _signal_end) = writer_handle.join()
+            .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
+            .map_err(Error::Io)?;
+
+        // Write IPC footer directly (small data, no need for async)
+        let footer_bytes = build_arrow_ipc_footer(&all_batches)?;
+        file.write_all(&footer_bytes).map_err(Error::Io)?;
+
+        let footer_len = footer_bytes.len() as i32;
+        file.write_all(&footer_len.to_le_bytes()).map_err(Error::Io)?;
+        file.write_all(b"ARROW1").map_err(Error::Io)?;
+        file.flush().map_err(Error::Io)?;
+
+        let final_pos = file.stream_position().map_err(Error::Io)? as usize;
+
+        Ok((file, final_pos, current_signal_row))
+    })?;
+
+    let signal_rows = signal_rows;
+
+    // Phase 3: Write remaining sections using BufWriter
+    let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    file.seek(SeekFrom::Start(signal_end as u64))?;
+
+    // Pad to 8-byte alignment
+    let padding_needed = (8 - (signal_end % 8)) % 8;
+    for _ in 0..padding_needed {
+        file.write_all(&[0u8])?;
+    }
+
+    // Write section marker
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Build and write run_info table
+    let mut run_info_map: HashMap<String, u32> = HashMap::new();
+    let mut all_run_infos: Vec<RunInfoData> = Vec::new();
+
+    for (_, run_infos, _) in &file_infos {
+        for run_info in run_infos {
+            if !run_info_map.contains_key(&run_info.acquisition_id) {
+                let idx = all_run_infos.len() as u32;
+                run_info_map.insert(run_info.acquisition_id.clone(), idx);
+                all_run_infos.push(run_info.clone());
+            }
+        }
+    }
+
+    let run_info_offset = file.stream_position()? as i64;
+    let run_info_bytes = build_run_info_table(&all_run_infos)?;
+    file.write_all(&run_info_bytes)?;
+    let run_info_length = run_info_bytes.len() as i64;
+
+    // Pad and section marker
+    while file.stream_position()? % 8 != 0 {
+        file.write_all(&[0u8])?;
+    }
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Build and write reads table
+    let reads_offset = file.stream_position()? as i64;
+
+    let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
+        HashSet::new()
+    } else {
+        HashSet::with_capacity(total_read_count as usize)
+    };
+
+    let mut processed_reads: Vec<(ReadData, Vec<u64>)> = Vec::new();
+    let mut total_reads = 0u64;
+    let mut duplicate_count = 0u64;
+
+    for ((_, run_infos, reads), &signal_offset) in file_infos.iter().zip(signal_offsets.iter()) {
+        for read in reads {
+            if !options.duplicate_ok {
+                if seen_reads.contains(&read.read_id) {
+                    duplicate_count += 1;
+                    continue;
+                }
+                seen_reads.insert(read.read_id);
+            }
+
+            let original_run_info = run_infos.get(read.run_info_index as usize);
+            let new_run_info_idx = if let Some(ri) = original_run_info {
+                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
+            } else {
+                0
+            };
+
+            let new_signal_rows: Vec<u64> = read
+                .signal_rows
+                .iter()
+                .map(|&row| row + signal_offset)
+                .collect();
+
+            let new_read = read.for_writing(new_run_info_idx);
+            processed_reads.push((new_read, new_signal_rows));
+            total_reads += 1;
+        }
+    }
+
+    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos)?;
+    file.write_all(&reads_bytes)?;
+    let reads_length = reads_bytes.len() as i64;
+
+    // Pad and section marker
+    while file.stream_position()? % 8 != 0 {
+        file.write_all(&[0u8])?;
+    }
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Write POD5 footer
+    file.write_all(&FOOTER_MAGIC)?;
+
+    let signal_offset_val = 24i64; // POD5 header size
+    let signal_length = signal_end as i64 - 24;
+
+    let pod5_footer = build_pod5_footer(
+        signal_offset_val,
+        signal_length,
+        run_info_offset,
+        run_info_length,
+        reads_offset,
+        reads_length,
+    )?;
+    file.write_all(&pod5_footer)?;
+
+    let footer_len = pod5_footer.len() as i64;
+    file.write_all(&footer_len.to_le_bytes())?;
+
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+    file.write_all(&POD5_SIGNATURE)?;
+
+    file.flush()?;
+
+    Ok(MergeResult {
+        reads_written: total_reads,
+        duplicates_skipped: duplicate_count,
+        signal_rows,
+        files_processed: file_infos.len(),
     })
 }
 

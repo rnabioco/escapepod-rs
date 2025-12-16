@@ -99,6 +99,7 @@ Examples:
   podfive merge *.pod5 -o out.pod5 -t 8        Use 8 threads
   podfive merge *.pod5 -o out.pod5 --duplicate-ok
   podfive merge *.pod5 -o out.pod5 --mmap      Use mmap for signal writing
+  podfive merge *.pod5 -o out.pod5 --async-io  Use async I/O
 ")]
     Merge {
         /// Input POD5 files
@@ -120,6 +121,10 @@ Examples:
         /// Use mmap for signal writing (experimental)
         #[arg(long)]
         mmap: bool,
+
+        /// Use async I/O with background writer thread
+        #[arg(long, name = "async")]
+        async_io: bool,
     },
 
     /// Filter reads by ID list
@@ -277,9 +282,12 @@ fn main() -> anyhow::Result<()> {
             duplicate_ok,
             threads,
             mmap,
+            async_io,
         } => {
             if mmap {
                 commands::merge::run_mmap(inputs, output, duplicate_ok)
+            } else if async_io {
+                commands::merge::run_async(inputs, output, duplicate_ok)
             } else {
                 commands::merge::run(inputs, output, duplicate_ok, threads)
             }

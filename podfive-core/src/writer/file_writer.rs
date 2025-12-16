@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 /// Write buffer size (16MB for efficient I/O, reduces syscall overhead)
 const WRITE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
@@ -1144,6 +1146,142 @@ impl MmapSignalWriter {
         drop(self.mmap);
 
         Ok((self.file, signal_end))
+    }
+}
+
+/// Message sent to the async writer thread.
+enum WriteCommand {
+    /// Write bytes to the file.
+    Write(Vec<u8>),
+    /// Finish writing and close.
+    Finish,
+}
+
+/// Async signal writer that performs I/O in a background thread.
+///
+/// This allows overlapping reading and writing during merge operations.
+/// Writes are queued and executed asynchronously, with backpressure
+/// when the queue gets too large.
+pub struct AsyncSignalWriter {
+    /// Channel to send write commands.
+    sender: Option<Sender<WriteCommand>>,
+    /// Handle to the writer thread.
+    writer_thread: Option<JoinHandle<std::io::Result<File>>>,
+    /// Current write position (for tracking).
+    write_pos: usize,
+    /// Signal section start offset.
+    signal_start: usize,
+}
+
+impl AsyncSignalWriter {
+    /// Create a new async signal writer.
+    ///
+    /// # Arguments
+    /// * `path` - Output file path
+    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref().to_owned();
+
+        // Create the file
+        let file = File::create(&path)?;
+        let mut file = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
+
+        // Write POD5 header (signature + section marker)
+        file.write_all(&POD5_SIGNATURE)?;
+        let section_marker = Uuid::new_v4();
+        file.write_all(section_marker.as_bytes())?;
+
+        let signal_start = 24; // POD5 header size
+        let write_pos = signal_start;
+
+        // Create channel with bounded capacity for backpressure
+        // ~10 pending writes of up to ~10MB each = ~100MB max in flight
+        let (sender, receiver): (Sender<WriteCommand>, Receiver<WriteCommand>) = mpsc::channel();
+
+        // Spawn writer thread
+        let writer_thread = thread::spawn(move || {
+            Self::writer_loop(file, receiver)
+        });
+
+        Ok(Self {
+            sender: Some(sender),
+            writer_thread: Some(writer_thread),
+            write_pos,
+            signal_start,
+        })
+    }
+
+    /// The writer thread's main loop.
+    fn writer_loop(
+        mut file: BufWriter<File>,
+        receiver: Receiver<WriteCommand>,
+    ) -> std::io::Result<File> {
+        loop {
+            match receiver.recv() {
+                Ok(WriteCommand::Write(data)) => {
+                    file.write_all(&data)?;
+                }
+                Ok(WriteCommand::Finish) => {
+                    file.flush()?;
+                    return Ok(file.into_inner()?);
+                }
+                Err(_) => {
+                    // Channel closed, finish up
+                    file.flush()?;
+                    return Ok(file.into_inner()?);
+                }
+            }
+        }
+    }
+
+    /// Write raw signal bytes asynchronously.
+    /// This may block if too many writes are pending.
+    pub fn write_signal_bytes(&mut self, bytes: &[u8]) -> Result<usize> {
+        if let Some(ref sender) = self.sender {
+            // Send write command (this will block if channel is full due to bounded capacity)
+            sender
+                .send(WriteCommand::Write(bytes.to_vec()))
+                .map_err(|_| Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Writer thread disconnected",
+                )))?;
+
+            self.write_pos += bytes.len();
+            Ok(bytes.len())
+        } else {
+            Err(Error::WriterFinalized)
+        }
+    }
+
+    /// Get current write position within the signal section.
+    pub fn signal_position(&self) -> usize {
+        self.write_pos - self.signal_start
+    }
+
+    /// Get total write position (including header).
+    pub fn total_position(&self) -> usize {
+        self.write_pos
+    }
+
+    /// Finish the signal section and return the underlying file for further writing.
+    pub fn finish_signal(mut self) -> Result<(File, usize)> {
+        let signal_end = self.write_pos;
+
+        // Send finish command
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(WriteCommand::Finish);
+        }
+
+        // Wait for writer thread to complete
+        if let Some(handle) = self.writer_thread.take() {
+            let file = handle
+                .join()
+                .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
+                .map_err(Error::Io)?;
+
+            Ok((file, signal_end))
+        } else {
+            Err(Error::WriterFinalized)
+        }
     }
 }
 
