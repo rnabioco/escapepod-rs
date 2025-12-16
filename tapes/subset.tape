@@ -22,7 +22,7 @@ Type "echo 'read_id,output' > /tmp/mapping.csv"
 Enter
 Sleep 300ms
 
-Type "podfive view ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5 --ids | head -1 | xargs -I{} echo '{},sample1.pod5' >> /tmp/mapping.csv"
+Type "podfive view data/drna/yeast_trna_reads.pod5 --ids | head -1 | xargs -I{} echo '{},sample1.pod5' >> /tmp/mapping.csv"
 Enter
 Sleep 500ms
 
@@ -34,6 +34,6 @@ Type "# Subset reads based on mapping"
 Enter
 Sleep 500ms
 
-Type "podfive subset ext/pod5-file-format/test_data/multi_fast5_zip_v3.pod5 --csv /tmp/mapping.csv -o /tmp/subsets/"
+Type "podfive subset data/drna/yeast_trna_reads.pod5 --csv /tmp/mapping.csv -o /tmp/subsets/"
 Enter
-Sleep 2s
+Sleep 5s
