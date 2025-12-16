@@ -27,8 +27,10 @@ flamegraph.svg
 *.bak
 *.tmp
 
-# Benchmark temp files
-benchmarks/
+# Benchmark temp files (but track scripts)
+!/benchmarks/
+/benchmarks/*.json
+/benchmarks/*.pod5
 
 # External data
 data/
