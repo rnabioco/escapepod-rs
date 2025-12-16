@@ -1,36 +1,30 @@
 [workspace]
 resolver = "2"
-members = ["podfive-core", "podfive-cli"]
+members = ["podfive-cli", "podfive-core"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/jayhesselberth/podfive-rs"
 rust-version = "1.75"
+repository = "https://github.com/jayhesselberth/podfive-rs"
+license = "MIT"
 
 [workspace.dependencies]
 # Arrow ecosystem
 arrow = { version = "57", default-features = false, features = ["ipc"] }
-
-# Serialization
-flatbuffers = "25"
-uuid = { version = "1", features = ["v4"] }
-
-# Compression
-zstd = "0.13"
-
-# Error handling
-thiserror = "2"
-
-# I/O
-memmap2 = "0.9"
 byteorder = "1"
-
 # CLI
 clap = { version = "4", features = ["derive"] }
-rayon = "1"
+# Serialization
+flatbuffers = "25"
 indicatif = "0.18"
-
+# I/O
+memmap2 = "0.9"
 # Workspace crates
 podfive-core = { path = "podfive-core" }
+rayon = "1"
+# Error handling
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+# Compression
+zstd = "0.13"

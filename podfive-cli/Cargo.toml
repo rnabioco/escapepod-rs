@@ -1,39 +1,39 @@
 [package]
 name = "podfive-cli"
-description = "CLI tools for working with POD5 files (Oxford Nanopore)"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
+description = "CLI tools for working with POD5 files (Oxford Nanopore)"
+repository.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "podfive"
 path = "src/main.rs"
 
 [dependencies]
-podfive-core = { workspace = true }
-clap = { workspace = true }
-rayon = { workspace = true }
-indicatif = { workspace = true }
-uuid = { workspace = true }
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-csv = "1"
-tabled = { version = "0.17", features = ["ansi"] }
-owo-colors = "4"
-walkdir = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+bstr = "1"
 chrono = "0.4"
-
+clap = { workspace = true }
+csv = "1"
+indicatif = { workspace = true }
 # BAM file support
 noodles-bam = "0.85"
 noodles-bgzf = "0.45"
-noodles-csi = "0.53"
 noodles-core = "0.18"
+noodles-csi = "0.53"
 noodles-sam = "0.81"
-bstr = "1"
+owo-colors = "4"
+podfive-core = { workspace = true }
+rayon = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tabled = { version = "0.17", features = ["ansi"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+uuid = { workspace = true }
+walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
