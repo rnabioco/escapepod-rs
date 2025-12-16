@@ -275,7 +275,12 @@ impl Writer {
             let data: Arc<[u8]> = if self.options.compress_signal {
                 Arc::from(compression::compress_signal(chunk)?)
             } else {
-                Arc::from(chunk.iter().flat_map(|&s| s.to_le_bytes()).collect::<Vec<u8>>())
+                Arc::from(
+                    chunk
+                        .iter()
+                        .flat_map(|&s| s.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                )
             };
 
             signal_row_indices.push(self.current_signal_row);
@@ -377,13 +382,13 @@ impl Writer {
 
         // Create a new batch with our schema to ensure consistency
         // (input batches may have different metadata)
-        let normalized_batch = RecordBatch::try_new(
-            schema,
-            batch.columns().to_vec(),
-        )?;
+        let normalized_batch = RecordBatch::try_new(schema, batch.columns().to_vec())?;
 
         // Write batch directly
-        self.signal_writer.as_mut().unwrap().write(&normalized_batch)?;
+        self.signal_writer
+            .as_mut()
+            .unwrap()
+            .write(&normalized_batch)?;
         self.current_signal_row += row_count as u64;
 
         Ok((first_row, row_count))

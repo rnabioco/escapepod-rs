@@ -133,20 +133,20 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
             // Check if this read's ID is in the filter list
             if ids.contains(&read.read_id) {
                 // Lazy load: only fetch signal for matching reads (O(1) batch lookup + LRU cache)
-                let compressed_signal = match reader.get_compressed_signal_for_rows(&read.signal_rows)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        signal_errors += 1;
-                        if signal_errors <= 3 {
-                            eprintln!(
-                                "Warning: cannot read signal for read {}: {}",
-                                read.read_id, e
-                            );
+                let compressed_signal =
+                    match reader.get_compressed_signal_for_rows(&read.signal_rows) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            signal_errors += 1;
+                            if signal_errors <= 3 {
+                                eprintln!(
+                                    "Warning: cannot read signal for read {}: {}",
+                                    read.read_id, e
+                                );
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
 
                 // Map run_info index
                 let new_run_info_idx = if let Some(original_run_info) =

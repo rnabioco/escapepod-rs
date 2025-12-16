@@ -413,10 +413,17 @@ fn print_summary(
 
     builder.push_record([format!(
         "{} {} {} {} {} {} {} {} {} {} {}",
-        size_val.bold(), "Size".dimmed(), "│".dimmed(),
-        reads_val.bold(), "Reads".dimmed(), "│".dimmed(),
-        rate_val.bold(), "Rate".dimmed(), "│".dimmed(),
-        dur_val.bold(), "Duration".dimmed()
+        size_val.bold(),
+        "Size".dimmed(),
+        "│".dimmed(),
+        reads_val.bold(),
+        "Reads".dimmed(),
+        "│".dimmed(),
+        rate_val.bold(),
+        "Rate".dimmed(),
+        "│".dimmed(),
+        dur_val.bold(),
+        "Duration".dimmed()
     )]);
 
     // Run info rows - pad values BEFORE coloring
@@ -434,8 +441,11 @@ fn print_summary(
         let kit_val = format!("{:20}", truncate(&ri.sequencing_kit, 20));
         builder.push_record([format!(
             "{} {} {} {} {}",
-            fc_label.dimmed(), fc_val.bold(), "│".dimmed(),
-            kit_label.dimmed(), kit_val.bold()
+            fc_label.dimmed(),
+            fc_val.bold(),
+            "│".dimmed(),
+            kit_label.dimmed(),
+            kit_val.bold()
         )]);
 
         let sample_label = format!("{:10}", "Sample");
@@ -444,8 +454,11 @@ fn print_summary(
         let proto_val = format!("{:20}", truncate(&ri.protocol_name, 20));
         builder.push_record([format!(
             "{} {} {} {} {}",
-            sample_label.dimmed(), sample_val.bold(), "│".dimmed(),
-            proto_label.dimmed(), proto_val.bold()
+            sample_label.dimmed(),
+            sample_val.bold(),
+            "│".dimmed(),
+            proto_label.dimmed(),
+            proto_val.bold()
         )]);
 
         if let Some(start) = &ri.acquisition_start_time {
@@ -455,8 +468,11 @@ fn print_summary(
             let sw_val = format!("{:20}", truncate(&ri.software, 20));
             builder.push_record([format!(
                 "{} {} {} {} {}",
-                start_label.dimmed(), start_val.bold(), "│".dimmed(),
-                sw_label.dimmed(), sw_val.bold()
+                start_label.dimmed(),
+                start_val.bold(),
+                "│".dimmed(),
+                sw_label.dimmed(),
+                sw_val.bold()
             )]);
         }
     }
@@ -473,14 +489,28 @@ fn print_summary(
     let median_label = format!("{:6}", "Median");
     let median_val = format!("{:>9}", format_number(s.length_median));
     let range_label = format!("{:6}", "Range");
-    let range_val = format!("{:>9}", format!("{}-{}", format_compact(s.length_min), format_compact(s.length_max)));
+    let range_val = format!(
+        "{:>9}",
+        format!(
+            "{}-{}",
+            format_compact(s.length_min),
+            format_compact(s.length_max)
+        )
+    );
 
     builder.push_record([format!(
         "{} {} {} {} {} {} {} {} {} {} {}",
-        n50_label.dimmed(), n50_val.bold(), "│".dimmed(),
-        mean_label.dimmed(), mean_val.bold(), "│".dimmed(),
-        median_label.dimmed(), median_val.bold(), "│".dimmed(),
-        range_label.dimmed(), range_val.bold()
+        n50_label.dimmed(),
+        n50_val.bold(),
+        "│".dimmed(),
+        mean_label.dimmed(),
+        mean_val.bold(),
+        "│".dimmed(),
+        median_label.dimmed(),
+        median_val.bold(),
+        "│".dimmed(),
+        range_label.dimmed(),
+        range_val.bold()
     )]);
 
     // Sparkline
@@ -514,7 +544,10 @@ fn print_summary(
         let reason_pad = format!("{:20}", reason);
         builder.push_record([format!(
             "{}  {}  {:>5.1}%  ({:>8})",
-            reason_pad.bold(), bar, pct, count_str
+            reason_pad.bold(),
+            bar,
+            pct,
+            count_str
         )]);
     }
 

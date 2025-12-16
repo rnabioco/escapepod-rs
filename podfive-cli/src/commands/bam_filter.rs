@@ -139,20 +139,20 @@ pub fn run(
             // Check if this read's ID is in the BAM-derived filter set
             if ids.contains(&read.read_id) {
                 // Lazy load: only fetch signal for matching reads
-                let compressed_signal = match reader.get_compressed_signal_for_rows(&read.signal_rows)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        signal_errors += 1;
-                        if signal_errors <= 3 {
-                            eprintln!(
-                                "Warning: cannot read signal for read {}: {}",
-                                read.read_id, e
-                            );
+                let compressed_signal =
+                    match reader.get_compressed_signal_for_rows(&read.signal_rows) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            signal_errors += 1;
+                            if signal_errors <= 3 {
+                                eprintln!(
+                                    "Warning: cannot read signal for read {}: {}",
+                                    read.read_id, e
+                                );
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
 
                 // Map run_info index
                 let new_run_info_idx = if let Some(original_run_info) =
@@ -242,7 +242,13 @@ fn read_ids_from_bam(
         )?;
     } else {
         // Full file scan
-        read_ids_from_bam_full(bam_path, mapped_only, min_quality, &mut ids, &mut records_scanned)?;
+        read_ids_from_bam_full(
+            bam_path,
+            mapped_only,
+            min_quality,
+            &mut ids,
+            &mut records_scanned,
+        )?;
     }
 
     Ok((ids, records_scanned))
