@@ -3,6 +3,7 @@
 //! Filters reads from a POD5 file based on a list of read IDs.
 //! Uses lazy signal loading and block-level copying for maximum performance.
 
+use crate::progress::{create_progress_bar, create_spinner};
 use crate::util::{parse_uuid_flexible, resolve_pod5_inputs};
 use podfive_core::{PredefinedDictionaries, Reader, Writer, WriterOptions};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -35,13 +36,18 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         anyhow::bail!("No read IDs found in {}", ids_file.display());
     }
 
-    // Pre-scan files to collect unique dictionary values for predefined dictionaries
+    // Pre-scan files to collect unique dictionary values and count total reads
+    let spinner = create_spinner("Scanning")?;
+    spinner.set_message("files for dictionary values...");
+
     let mut all_pore_types = BTreeSet::new();
     let mut all_end_reasons = BTreeSet::new();
+    let mut total_read_count = 0u64;
     for file_path in &files {
         if let Ok(reader) = Reader::open(file_path) {
             if let Ok(reads_iter) = reader.reads() {
                 for read in reads_iter.flatten() {
+                    total_read_count += 1;
                     // Only collect values for reads we might filter
                     if ids.contains(&read.read_id) {
                         all_pore_types.insert(read.pore_type.clone());
@@ -51,6 +57,7 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
             }
         }
     }
+    spinner.finish_with_message(format!("{} reads found", total_read_count));
 
     // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
@@ -68,6 +75,7 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
 
     // Filter reads from all files
+    let filter_bar = create_progress_bar(total_read_count, "Filtering")?;
     let mut matched = 0u64;
     let mut total = 0u64;
     let mut read_errors = 0u64;
@@ -129,24 +137,26 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
                 }
             };
             total += 1;
+            filter_bar.inc(1);
+            filter_bar.set_message(format!("{} matched", matched));
 
             // Check if this read's ID is in the filter list
             if ids.contains(&read.read_id) {
                 // Lazy load: only fetch signal for matching reads (O(1) batch lookup + LRU cache)
-                let compressed_signal = match reader.get_compressed_signal_for_rows(&read.signal_rows)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        signal_errors += 1;
-                        if signal_errors <= 3 {
-                            eprintln!(
-                                "Warning: cannot read signal for read {}: {}",
-                                read.read_id, e
-                            );
+                let compressed_signal =
+                    match reader.get_compressed_signal_for_rows(&read.signal_rows) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            signal_errors += 1;
+                            if signal_errors <= 3 {
+                                eprintln!(
+                                    "Warning: cannot read signal for read {}: {}",
+                                    read.read_id, e
+                                );
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
 
                 // Map run_info index
                 let new_run_info_idx = if let Some(original_run_info) =
@@ -167,6 +177,8 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
             }
         }
     }
+
+    filter_bar.finish_with_message(format!("{} matched", matched));
 
     // Finalize output
     writer.finish()?;

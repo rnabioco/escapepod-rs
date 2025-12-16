@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
+mod progress;
 mod util;
 
 #[derive(Parser)]

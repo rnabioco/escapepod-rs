@@ -2,7 +2,7 @@
 //!
 //! Repacks POD5 files to optimize storage and apply current compression settings.
 
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::progress::create_progress_bar;
 use podfive_core::{Reader, Writer, WriterOptions};
 use std::path::PathBuf;
 
@@ -20,13 +20,7 @@ pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Re
         output_dir.display()
     );
 
-    let progress_style = ProgressStyle::default_bar()
-        .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} ({msg})")?
-        .progress_chars("━━─");
-
-    let overall_bar = ProgressBar::new(inputs.len() as u64);
-    overall_bar.set_style(progress_style);
-    overall_bar.set_prefix("Repacking");
+    let overall_bar = create_progress_bar(inputs.len() as u64, "Repacking")?;
 
     let mut total_reads = 0u64;
 

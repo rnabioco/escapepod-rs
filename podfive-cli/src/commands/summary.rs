@@ -2,6 +2,7 @@
 //!
 //! Generates a comprehensive summary of POD5 file(s) with statistics and QC metrics.
 
+use crate::progress::create_progress_bar;
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
 use chrono::{TimeZone, Utc};
 use owo_colors::OwoColorize;
@@ -106,8 +107,18 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     let mut corrupted_files = Vec::new();
     let mut old_version_files: HashMap<String, usize> = HashMap::new();
 
+    // Progress bar for file processing
+    let progress_bar = create_progress_bar(files.len() as u64, "Analyzing")?;
+    progress_bar.set_message("files");
+
     // Process each file
     for path in &files {
+        progress_bar.set_message(
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        );
         // Try to open the file, skip if corrupted
         let reader = match Reader::open(path) {
             Ok(r) => r,
@@ -199,7 +210,11 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
             software: reader.software().to_string(),
             file_identifier: reader.file_identifier().to_string(),
         });
+
+        progress_bar.inc(1);
     }
+
+    progress_bar.finish_and_clear();
 
     // Add summary of corrupted files
     if !corrupted_files.is_empty() {
@@ -413,10 +428,17 @@ fn print_summary(
 
     builder.push_record([format!(
         "{} {} {} {} {} {} {} {} {} {} {}",
-        size_val.bold(), "Size".dimmed(), "│".dimmed(),
-        reads_val.bold(), "Reads".dimmed(), "│".dimmed(),
-        rate_val.bold(), "Rate".dimmed(), "│".dimmed(),
-        dur_val.bold(), "Duration".dimmed()
+        size_val.bold(),
+        "Size".dimmed(),
+        "│".dimmed(),
+        reads_val.bold(),
+        "Reads".dimmed(),
+        "│".dimmed(),
+        rate_val.bold(),
+        "Rate".dimmed(),
+        "│".dimmed(),
+        dur_val.bold(),
+        "Duration".dimmed()
     )]);
 
     // Run info rows - pad values BEFORE coloring
@@ -434,8 +456,11 @@ fn print_summary(
         let kit_val = format!("{:20}", truncate(&ri.sequencing_kit, 20));
         builder.push_record([format!(
             "{} {} {} {} {}",
-            fc_label.dimmed(), fc_val.bold(), "│".dimmed(),
-            kit_label.dimmed(), kit_val.bold()
+            fc_label.dimmed(),
+            fc_val.bold(),
+            "│".dimmed(),
+            kit_label.dimmed(),
+            kit_val.bold()
         )]);
 
         let sample_label = format!("{:10}", "Sample");
@@ -444,8 +469,11 @@ fn print_summary(
         let proto_val = format!("{:20}", truncate(&ri.protocol_name, 20));
         builder.push_record([format!(
             "{} {} {} {} {}",
-            sample_label.dimmed(), sample_val.bold(), "│".dimmed(),
-            proto_label.dimmed(), proto_val.bold()
+            sample_label.dimmed(),
+            sample_val.bold(),
+            "│".dimmed(),
+            proto_label.dimmed(),
+            proto_val.bold()
         )]);
 
         if let Some(start) = &ri.acquisition_start_time {
@@ -455,8 +483,11 @@ fn print_summary(
             let sw_val = format!("{:20}", truncate(&ri.software, 20));
             builder.push_record([format!(
                 "{} {} {} {} {}",
-                start_label.dimmed(), start_val.bold(), "│".dimmed(),
-                sw_label.dimmed(), sw_val.bold()
+                start_label.dimmed(),
+                start_val.bold(),
+                "│".dimmed(),
+                sw_label.dimmed(),
+                sw_val.bold()
             )]);
         }
     }
@@ -473,14 +504,28 @@ fn print_summary(
     let median_label = format!("{:6}", "Median");
     let median_val = format!("{:>9}", format_number(s.length_median));
     let range_label = format!("{:6}", "Range");
-    let range_val = format!("{:>9}", format!("{}-{}", format_compact(s.length_min), format_compact(s.length_max)));
+    let range_val = format!(
+        "{:>9}",
+        format!(
+            "{}-{}",
+            format_compact(s.length_min),
+            format_compact(s.length_max)
+        )
+    );
 
     builder.push_record([format!(
         "{} {} {} {} {} {} {} {} {} {} {}",
-        n50_label.dimmed(), n50_val.bold(), "│".dimmed(),
-        mean_label.dimmed(), mean_val.bold(), "│".dimmed(),
-        median_label.dimmed(), median_val.bold(), "│".dimmed(),
-        range_label.dimmed(), range_val.bold()
+        n50_label.dimmed(),
+        n50_val.bold(),
+        "│".dimmed(),
+        mean_label.dimmed(),
+        mean_val.bold(),
+        "│".dimmed(),
+        median_label.dimmed(),
+        median_val.bold(),
+        "│".dimmed(),
+        range_label.dimmed(),
+        range_val.bold()
     )]);
 
     // Sparkline
@@ -514,7 +559,10 @@ fn print_summary(
         let reason_pad = format!("{:20}", reason);
         builder.push_record([format!(
             "{}  {}  {:>5.1}%  ({:>8})",
-            reason_pad.bold(), bar, pct, count_str
+            reason_pad.bold(),
+            bar,
+            pct,
+            count_str
         )]);
     }
 

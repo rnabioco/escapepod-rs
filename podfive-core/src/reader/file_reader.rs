@@ -640,8 +640,8 @@ impl Reader {
 
         for row in 0..batch.num_rows() {
             let read_id_bytes = read_id_array.value(row);
-            let read_id = Uuid::from_slice(read_id_bytes)
-                .map_err(|e| Error::InvalidUuid(e.to_string()))?;
+            let read_id =
+                Uuid::from_slice(read_id_bytes).map_err(|e| Error::InvalidUuid(e.to_string()))?;
             let compressed_data = signal_array.value(row);
             let samples = samples_array.value(row);
 
