@@ -107,14 +107,18 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             let reads: Vec<ReadData> = reader
                 .reads()?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(FileMetadata { reader, footer, run_infos, reads })
+            Ok(FileMetadata {
+                reader,
+                footer,
+                run_infos,
+                reads,
+            })
         })
         .collect();
 
     // Unwrap results and count reads
-    let file_metadata: Vec<FileMetadata> = metadata_results
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let file_metadata: Vec<FileMetadata> =
+        metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
     let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
 
     // Phase 2: Write signal data using scoped thread (zero-copy from mmap)
@@ -152,8 +156,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         // Main thread: send signal bytes to writer
         let mut header_written = false;
 
-        for (file_idx, metadata) in file_metadata.iter().enumerate()
-        {
+        for (file_idx, metadata) in file_metadata.iter().enumerate() {
             let signal_bytes = metadata.reader.signal_table_bytes()?;
 
             // Record signal row offset for this file
