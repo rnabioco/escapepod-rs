@@ -85,6 +85,32 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Filter reads based on paired BAM file
+    BamFilter {
+        /// Input POD5 file or directory
+        input: PathBuf,
+
+        /// Input BAM file (requires .bai index for region queries)
+        #[arg(short, long, required = true)]
+        bam: PathBuf,
+
+        /// Output POD5 file
+        #[arg(short, long, required = true)]
+        output: PathBuf,
+
+        /// Keep only mapped reads
+        #[arg(long)]
+        mapped: bool,
+
+        /// Filter by region (chr or chr:start-end)
+        #[arg(long)]
+        region: Option<String>,
+
+        /// Minimum mapping quality
+        #[arg(short = 'q', long)]
+        quality: Option<u8>,
+    },
+
     /// Repack POD5 files to optimize storage
     Repack {
         /// Input POD5 files
@@ -174,6 +200,15 @@ fn main() -> anyhow::Result<()> {
         } => commands::merge::run(inputs, output, duplicate_ok, threads),
 
         Commands::Filter { input, ids, output } => commands::filter::run(input, ids, output),
+
+        Commands::BamFilter {
+            input,
+            bam,
+            output,
+            mapped,
+            region,
+            quality,
+        } => commands::bam_filter::run(input, bam, output, mapped, region, quality),
 
         Commands::Repack {
             inputs,
