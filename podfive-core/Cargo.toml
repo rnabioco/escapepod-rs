@@ -1,0 +1,20 @@
+[package]
+name = "podfive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core library for reading and writing POD5 files (Oxford Nanopore)"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+byteorder = { workspace = true }
+flatbuffers = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
