@@ -4,9 +4,13 @@
 //! Uses lazy signal loading and block-level copying for maximum performance.
 
 use crate::progress::{create_progress_bar, create_spinner};
-use crate::util::{parse_uuid_flexible, resolve_pod5_inputs};
-use podfive_core::{PredefinedDictionaries, Reader, Writer, WriterOptions};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::util::{
+    add_run_infos_deduplicated, batch_sizes, map_run_info_index, open_reader_with_warning,
+    get_reads_iter_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
+    LimitedWarningReporter, OpenResult,
+};
+use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -39,33 +43,16 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     // Pre-scan files to collect unique dictionary values and count total reads
     let spinner = create_spinner("Scanning")?;
     spinner.set_message("files for dictionary values...");
-
-    let mut all_pore_types = BTreeSet::new();
-    let mut all_end_reasons = BTreeSet::new();
-    let mut total_read_count = 0u64;
-    for file_path in &files {
-        if let Ok(reader) = Reader::open(file_path) {
-            if let Ok(reads_iter) = reader.reads() {
-                for read in reads_iter.flatten() {
-                    total_read_count += 1;
-                    // Only collect values for reads we might filter
-                    if ids.contains(&read.read_id) {
-                        all_pore_types.insert(read.pore_type.clone());
-                        all_end_reasons.insert(read.end_reason.to_string());
-                    }
-                }
-            }
-        }
-    }
-    spinner.finish_with_message(format!("{} reads found", total_read_count));
+    let scanned = scan_dictionary_values(&files, Some(&ids));
+    spinner.finish_with_message(format!("{} reads found", scanned.total_read_count));
 
     // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
-        signal_batch_size: 1_000,
-        read_batch_size: 10_000,
+        signal_batch_size: batch_sizes::SIGNAL_BATCH_SIZE,
+        read_batch_size: batch_sizes::READ_BATCH_SIZE,
         predefined_dictionaries: Some(PredefinedDictionaries {
-            pore_types: Some(all_pore_types.into_iter().collect()),
-            end_reasons: Some(all_end_reasons.into_iter().collect()),
+            pore_types: Some(scanned.pore_types.into_iter().collect()),
+            end_reasons: Some(scanned.end_reasons.into_iter().collect()),
         }),
         ..WriterOptions::default()
     };
@@ -75,64 +62,36 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
 
     // Filter reads from all files
-    let filter_bar = create_progress_bar(total_read_count, "Filtering")?;
+    let filter_bar = create_progress_bar(scanned.total_read_count, "Filtering")?;
     let mut matched = 0u64;
     let mut total = 0u64;
-    let mut read_errors = 0u64;
-    let mut signal_errors = 0u64;
+    let mut read_warnings = LimitedWarningReporter::new(3);
+    let mut signal_warnings = LimitedWarningReporter::new(3);
 
     for file_path in &files {
-        let reader = match Reader::open(file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                if is_directory {
-                    eprintln!(
-                        "Warning: skipping {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
-                        e
-                    );
-                    continue;
-                } else {
-                    return Err(e.into());
-                }
-            }
+        let reader = match open_reader_with_warning(file_path, is_directory) {
+            OpenResult::Ok(r) => r,
+            OpenResult::Skip => continue,
+            OpenResult::Err(e) => return Err(e),
         };
 
         // Add run infos (deduplicated by acquisition_id)
-        for run_info in reader.run_infos() {
-            if !run_info_map.contains_key(&run_info.acquisition_id) {
-                let idx = writer.add_run_info(run_info.clone())?;
-                run_info_map.insert(run_info.acquisition_id.clone(), idx);
-            }
-        }
+        add_run_infos_deduplicated(&reader, &mut writer, &mut run_info_map)?;
 
         // NOTE: Signal is loaded lazily per-read, not all upfront
         // This is much more efficient when filtering a small subset of reads
 
-        let reads_iter = match reader.reads() {
-            Ok(iter) => iter,
-            Err(e) => {
-                if is_directory {
-                    eprintln!(
-                        "Warning: cannot read {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
-                        e
-                    );
-                    continue;
-                } else {
-                    return Err(e.into());
-                }
-            }
+        let reads_iter = match get_reads_iter_with_warning(&reader, file_path, is_directory) {
+            OpenResult::Ok(iter) => iter,
+            OpenResult::Skip => continue,
+            OpenResult::Err(e) => return Err(e),
         };
 
         for read_result in reads_iter {
             let read = match read_result {
                 Ok(r) => r,
                 Err(e) => {
-                    read_errors += 1;
-                    if read_errors <= 3 {
-                        eprintln!("Warning: error reading read record: {}", e);
-                    }
+                    read_warnings.warn(&format!("error reading read record: {}", e));
                     continue;
                 }
             };
@@ -147,27 +106,16 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
                     match reader.get_compressed_signal_for_rows(&read.signal_rows) {
                         Ok(s) => s,
                         Err(e) => {
-                            signal_errors += 1;
-                            if signal_errors <= 3 {
-                                eprintln!(
-                                    "Warning: cannot read signal for read {}: {}",
-                                    read.read_id, e
-                                );
-                            }
+                            signal_warnings.warn(&format!(
+                                "cannot read signal for read {}: {}",
+                                read.read_id, e
+                            ));
                             continue;
                         }
                     };
 
                 // Map run_info index
-                let new_run_info_idx = if let Some(original_run_info) =
-                    reader.get_run_info(read.run_info_index as usize)
-                {
-                    *run_info_map
-                        .get(&original_run_info.acquisition_id)
-                        .unwrap_or(&0)
-                } else {
-                    0
-                };
+                let new_run_info_idx = map_run_info_index(&reader, read.run_info_index, &run_info_map);
 
                 // Create new read data for writing
                 let new_read = read.for_writing(new_run_info_idx);
@@ -209,6 +157,8 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     }
 
     // Report any errors encountered
+    let read_errors = read_warnings.count();
+    let signal_errors = signal_warnings.count();
     if read_errors > 0 || signal_errors > 0 {
         eprintln!(
             "Warning: encountered {} read error(s) and {} signal error(s)",

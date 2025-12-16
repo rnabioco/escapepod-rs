@@ -191,17 +191,7 @@ fn parse_flatbuffer_footer(data: &[u8]) -> Result<Footer> {
 
     // Helper to read field offset from vtable
     let read_field_offset = |field_idx: usize| -> Option<usize> {
-        let vtable_entry_offset = vtable_start + 4 + field_idx * 2;
-        if vtable_entry_offset + 2 > vtable_start + vtable_size {
-            return None;
-        }
-        let offset =
-            u16::from_le_bytes([data[vtable_entry_offset], data[vtable_entry_offset + 1]]) as usize;
-        if offset == 0 {
-            None
-        } else {
-            Some(table_start + offset)
-        }
+        read_vtable_field_offset(data, vtable_start, vtable_size, table_start, field_idx)
     };
 
     // Helper to read string at offset
@@ -319,6 +309,30 @@ fn parse_embedded_files_vector(data: &[u8], offset: usize) -> Result<Vec<Embedde
     Ok(files)
 }
 
+/// Read a field offset from a FlatBuffer vtable.
+///
+/// Returns the absolute offset in `data` where the field value is located,
+/// or None if the field is not present.
+fn read_vtable_field_offset(
+    data: &[u8],
+    vtable_start: usize,
+    vtable_size: usize,
+    table_start: usize,
+    field_idx: usize,
+) -> Option<usize> {
+    let vtable_entry_offset = vtable_start + 4 + field_idx * 2;
+    if vtable_entry_offset + 2 > vtable_start + vtable_size {
+        return None;
+    }
+    let offset =
+        u16::from_le_bytes([data[vtable_entry_offset], data[vtable_entry_offset + 1]]) as usize;
+    if offset == 0 {
+        None
+    } else {
+        Some(table_start + offset)
+    }
+}
+
 /// Parse a single EmbeddedFile entry.
 fn parse_embedded_file(data: &[u8], table_start: usize) -> Result<EmbeddedFile> {
     if table_start + 4 > data.len() {
@@ -354,17 +368,7 @@ fn parse_embedded_file(data: &[u8], table_start: usize) -> Result<EmbeddedFile> 
 
     // Helper to read field offset
     let read_field_offset = |field_idx: usize| -> Option<usize> {
-        let vtable_entry_offset = vtable_start + 4 + field_idx * 2;
-        if vtable_entry_offset + 2 > vtable_start + vtable_size {
-            return None;
-        }
-        let offset =
-            u16::from_le_bytes([data[vtable_entry_offset], data[vtable_entry_offset + 1]]) as usize;
-        if offset == 0 {
-            None
-        } else {
-            Some(table_start + offset)
-        }
+        read_vtable_field_offset(data, vtable_start, vtable_size, table_start, field_idx)
     };
 
     // Read fields: offset (0), length (1), format (2), content_type (3)

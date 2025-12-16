@@ -4,7 +4,7 @@
 //! Uses parallel file reading and block-level signal copying for performance.
 
 use crate::progress::{create_progress_bar, create_spinner};
-use crate::util::resolve_pod5_inputs;
+use crate::util::{batch_sizes, resolve_pod5_inputs};
 use podfive_core::{CompressedSignalChunk, ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -103,7 +103,7 @@ pub fn run(
         signal_batch_size: 100,
         // Use large batch size to avoid Arrow IPC dictionary replacement issues
         // (all reads should fit in a single batch for typical merge operations)
-        read_batch_size: 1_000_000,
+        read_batch_size: batch_sizes::MERGE_READ_BATCH_SIZE,
         ..WriterOptions::default()
     };
     let mut writer = Writer::create(&output, options)?;

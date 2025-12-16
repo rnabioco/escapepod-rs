@@ -2,8 +2,8 @@
 //!
 //! Produces a tabular summary of reads from POD5 files.
 
-use crate::util::resolve_pod5_inputs;
-use podfive_core::{ReadData, Reader};
+use crate::util::{open_reader_with_warning, get_reads_iter_with_warning, resolve_pod5_inputs, OpenResult};
+use podfive_core::ReadData;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -68,37 +68,17 @@ pub fn run(
     // Process all files
     let is_directory = files.len() > 1;
     for file_path in &files {
-        let reader = match Reader::open(file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                if is_directory {
-                    eprintln!(
-                        "Warning: skipping {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
-                        e
-                    );
-                    continue;
-                } else {
-                    return Err(e.into());
-                }
-            }
+        let reader = match open_reader_with_warning(file_path, is_directory) {
+            OpenResult::Ok(r) => r,
+            OpenResult::Skip => continue,
+            OpenResult::Err(e) => return Err(e),
         };
 
         // Write reads
-        let reads_iter = match reader.reads() {
-            Ok(iter) => iter,
-            Err(e) => {
-                if is_directory {
-                    eprintln!(
-                        "Warning: cannot read {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
-                        e
-                    );
-                    continue;
-                } else {
-                    return Err(e.into());
-                }
-            }
+        let reads_iter = match get_reads_iter_with_warning(&reader, file_path, is_directory) {
+            OpenResult::Ok(iter) => iter,
+            OpenResult::Skip => continue,
+            OpenResult::Err(e) => return Err(e),
         };
 
         for read_result in reads_iter {
