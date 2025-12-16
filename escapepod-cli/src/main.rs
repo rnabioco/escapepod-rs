@@ -211,6 +211,38 @@ Examples:
   escapepod summary input.pod5 --json            Output as JSON
 ")]
     Summary(commands::summary::SummaryArgs),
+
+    /// Create archival copy with downsampled signal
+    #[command(after_help = "\
+Examples:
+  podfive archive input.pod5 -o archived.pod5              Default 2x downsampling
+  podfive archive input.pod5 -o archived.pod5 --factor 4   4x downsampling
+  podfive archive *.pod5 -o archived.pod5 --method average Use averaging
+
+Downsampling reduces storage by keeping fewer signal samples. This affects
+basecalling accuracy:
+  - 2x: Minimal impact on HAC, moderate on SUP models
+  - 4x: Noticeable impact on all models
+  - 8x+: Significant accuracy loss, use only for basic QC
+
+Archived files can be re-basecalled with fast or HAC models.
+")]
+    Archive {
+        /// Input POD5 file or directory
+        input: PathBuf,
+
+        /// Output POD5 file
+        #[arg(short, long, required = true, value_name = "FILE")]
+        output: PathBuf,
+
+        /// Downsampling factor (2-16)
+        #[arg(short, long, default_value = "2", value_name = "N")]
+        factor: u32,
+
+        /// Downsampling method
+        #[arg(short, long, default_value = "decimate", value_name = "METHOD")]
+        method: commands::archive::DownsampleMethod,
+    },
 }
 
 #[derive(Subcommand)]
@@ -292,5 +324,12 @@ fn main() -> anyhow::Result<()> {
         } => commands::subset::run(input, csv, output_dir, force),
 
         Commands::Summary(args) => commands::summary::run(args),
+
+        Commands::Archive {
+            input,
+            output,
+            factor,
+            method,
+        } => commands::archive::run(input, output, factor, method),
     }
 }

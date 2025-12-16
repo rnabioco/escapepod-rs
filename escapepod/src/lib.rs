@@ -33,6 +33,7 @@ pub mod error;
 pub mod merge;
 pub mod operations;
 pub mod reader;
+pub mod signal;
 pub mod types;
 pub mod writer;
 

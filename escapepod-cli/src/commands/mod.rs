@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+pub mod archive;
 pub mod bam_filter;
 pub mod filter;
 pub mod inspect;
