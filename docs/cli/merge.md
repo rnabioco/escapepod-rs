@@ -2,6 +2,8 @@
 
 Merge multiple POD5 files into a single output file.
 
+![podfive merge](../images/merge.gif)
+
 ## Usage
 
 ```bash

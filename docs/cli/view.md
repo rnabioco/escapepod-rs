@@ -2,6 +2,8 @@
 
 Display reads from a POD5 file as a formatted table.
 
+![podfive view](../images/view.gif)
+
 ## Usage
 
 ```bash

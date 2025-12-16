@@ -2,6 +2,8 @@
 
 Extract specific reads from a POD5 file based on read IDs.
 
+![podfive filter](../images/filter.gif)
+
 ## Usage
 
 ```bash
