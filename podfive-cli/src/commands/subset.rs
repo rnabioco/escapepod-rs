@@ -3,6 +3,7 @@
 //! Splits reads into multiple output files based on a CSV mapping.
 
 use crate::progress::create_progress_bar;
+use crate::style;
 use crate::util::parse_uuid_flexible;
 use podfive_core::{Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
@@ -31,9 +32,10 @@ pub fn run(
         .into_iter()
         .collect();
     println!(
-        "Subsetting {} reads into {} output file(s)",
-        mapping.len(),
-        output_files.len()
+        "{} {} reads into {} output file(s)",
+        style::action("Subsetting"),
+        style::count(mapping.len()),
+        style::value(output_files.len())
     );
 
     // Ensure output directory exists
@@ -112,13 +114,13 @@ pub fn run(
     }
 
     // Print summary
-    println!("\nSubset summary:");
-    println!("  Matched reads: {}", matched);
-    println!("  Unmatched reads: {}", unmatched);
-    println!("\nOutput files:");
+    println!("\n{}", style::header("Subset summary:"));
+    println!("  Matched reads: {}", style::count(matched));
+    println!("  Unmatched reads: {}", if unmatched > 0 { style::warning(unmatched) } else { unmatched.to_string() });
+    println!("\n{}", style::label("Output files:"));
     for (name, count) in &write_counts {
         let path = output_dir.join(name);
-        println!("  {} ({} reads)", path.display(), count);
+        println!("  {} ({} reads)", style::path(path.display()), style::count(count));
     }
 
     Ok(())

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod commands;
 mod progress;
+mod style;
 mod util;
 
 const STYLES: Styles = Styles::styled()

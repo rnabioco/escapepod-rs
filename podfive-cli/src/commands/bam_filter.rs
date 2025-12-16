@@ -10,13 +10,14 @@ use crate::util::{
     get_reads_iter_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
     LimitedWarningReporter, OpenResult,
 };
+use crate::style;
 use bstr::ByteSlice;
 use noodles_bam as bam;
 use noodles_core::Region;
 use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Run the bam-filter command.
@@ -33,25 +34,26 @@ pub fn run(
     let is_directory = files.len() > 1;
 
     println!(
-        "Filtering {} using BAM {}",
+        "{} {} using BAM {}",
+        style::action("Filtering"),
         if is_directory {
-            format!("{} ({} files)", input.display(), files.len())
+            format!("{} ({} files)", style::path(input.display()), style::value(files.len()))
         } else {
-            input.display().to_string()
+            style::path(input.display())
         },
-        bam_path.display()
+        style::path(bam_path.display())
     );
-    println!("Output: {}", output.display());
+    println!("{} {}", style::label("Output:"), style::path(output.display()));
 
     // Print filter criteria
     if mapped_only {
-        println!("  Filter: mapped reads only");
+        println!("  Filter: {}", style::value("mapped reads only"));
     }
     if let Some(ref r) = region {
-        println!("  Filter: region {}", r);
+        println!("  Filter: region {}", style::value(r));
     }
     if let Some(q) = min_quality {
-        println!("  Filter: MAPQ >= {}", q);
+        println!("  Filter: MAPQ >= {}", style::value(q));
     }
 
     // Read IDs from BAM file
@@ -61,7 +63,7 @@ pub fn run(
         read_ids_from_bam(&bam_path, mapped_only, region.as_deref(), min_quality)?;
     bam_spinner.finish_with_message(format!(
         "{} read IDs from {} BAM records",
-        ids.len(),
+        style::count(ids.len()),
         bam_records_scanned
     ));
 
@@ -76,7 +78,7 @@ pub fn run(
     let scan_spinner = create_spinner("Scanning")?;
     scan_spinner.set_message("POD5 files for dictionary values...");
     let scanned = scan_dictionary_values(&files, Some(&ids));
-    scan_spinner.finish_with_message(format!("{} reads found", scanned.total_read_count));
+    scan_spinner.finish_with_message(format!("{} reads found", style::count(scanned.total_read_count)));
 
     // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
@@ -171,22 +173,25 @@ pub fn run(
     // Finalize output
     writer.finish()?;
 
+    let percentage = if total > 0 {
+        (matched as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
     println!(
-        "Filtered {} reads from {} total ({:.1}%)",
-        matched,
+        "{} {} reads from {} total ({})",
+        style::action("Filtered"),
+        style::count(matched),
         total,
-        if total > 0 {
-            (matched as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        }
+        style::percentage(format!("{:.1}%", percentage))
     );
 
     let not_found = (ids.len() as u64).saturating_sub(matched);
     if not_found > 0 {
         println!(
-            "Note: {} BAM read IDs were not found in POD5 file(s)",
-            not_found
+            "{} {} BAM read IDs were not found in POD5 file(s)",
+            style::note_label("Note:"),
+            style::warning(not_found)
         );
     }
 
@@ -195,8 +200,10 @@ pub fn run(
     let signal_errors = signal_warnings.count();
     if read_errors > 0 || signal_errors > 0 {
         eprintln!(
-            "Warning: encountered {} read error(s) and {} signal error(s)",
-            read_errors, signal_errors
+            "{} encountered {} read error(s) and {} signal error(s)",
+            style::error_label("Warning:"),
+            style::error(read_errors),
+            style::error(signal_errors)
         );
     }
 
@@ -239,6 +246,51 @@ fn read_ids_from_bam(
     Ok((ids, records_scanned))
 }
 
+/// Ensure a BAI index exists for the given BAM file, creating one if necessary.
+///
+/// Returns the path to the BAI file (either existing or newly created).
+fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
+    // noodles expects the index at path.bam.bai
+    let bai_path = bam_path.with_extension("bam.bai");
+
+    if bai_path.exists() {
+        return Ok(bai_path);
+    }
+
+    // Also check for path.bai (alternative naming convention)
+    let alt_bai_path = bam_path.with_extension("bai");
+    if alt_bai_path.exists() {
+        // noodles indexed_reader expects .bam.bai, so we need to create it
+        // or we could copy/symlink, but creating is safer
+        eprintln!(
+            "{} Found index at {} but noodles expects {}",
+            style::note_label("Note:"),
+            style::path(alt_bai_path.display()),
+            style::path(bai_path.display())
+        );
+    }
+
+    eprintln!(
+        "{} BAI index not found, creating {}...",
+        style::info("Info:"),
+        style::path(bai_path.display())
+    );
+
+    // Build the index from the BAM file
+    let index = bam::fs::index(bam_path)?;
+
+    // Write the index to file
+    bam::bai::fs::write(&bai_path, &index)?;
+
+    eprintln!(
+        "{} Created BAI index: {}",
+        style::action("Done:"),
+        style::path(bai_path.display())
+    );
+
+    Ok(bai_path)
+}
+
 /// Read IDs from BAM using indexed region query.
 fn read_ids_from_bam_region(
     bam_path: &PathBuf,
@@ -248,13 +300,15 @@ fn read_ids_from_bam_region(
     ids: &mut HashSet<Uuid>,
     records_scanned: &mut u64,
 ) -> anyhow::Result<()> {
+    // Ensure BAI index exists (create if needed)
+    ensure_bai_index(bam_path)?;
+
     // Build indexed reader
     let mut reader = bam::io::indexed_reader::Builder::default()
         .build_from_path(bam_path)
         .map_err(|e| {
             anyhow::anyhow!(
-                "Cannot open indexed BAM file '{}': {}. \
-                 For region queries, ensure a .bai index exists (run `samtools index`)",
+                "Cannot open indexed BAM file '{}': {}",
                 bam_path.display(),
                 e
             )

@@ -4,6 +4,7 @@
 //! Uses lazy signal loading and block-level copying for maximum performance.
 
 use crate::progress::{create_progress_bar, create_spinner};
+use crate::style;
 use crate::util::{
     add_run_infos_deduplicated, batch_sizes, map_run_info_index, open_reader_with_warning,
     get_reads_iter_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
@@ -22,19 +23,20 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let is_directory = files.len() > 1;
 
     println!(
-        "Filtering {} using IDs from {}",
+        "{} {} using IDs from {}",
+        style::action("Filtering"),
         if is_directory {
-            format!("{} ({} files)", input.display(), files.len())
+            format!("{} ({} files)", style::path(input.display()), style::value(files.len()))
         } else {
-            input.display().to_string()
+            style::path(input.display())
         },
-        ids_file.display()
+        style::path(ids_file.display())
     );
-    println!("Output: {}", output.display());
+    println!("{} {}", style::label("Output:"), style::path(output.display()));
 
     // Read IDs from file
     let ids = read_ids_from_file(&ids_file)?;
-    println!("Loaded {} read IDs to filter", ids.len());
+    println!("Loaded {} read IDs to filter", style::count(ids.len()));
 
     if ids.is_empty() {
         anyhow::bail!("No read IDs found in {}", ids_file.display());
@@ -44,7 +46,7 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let spinner = create_spinner("Scanning")?;
     spinner.set_message("files for dictionary values...");
     let scanned = scan_dictionary_values(&files, Some(&ids));
-    spinner.finish_with_message(format!("{} reads found", scanned.total_read_count));
+    spinner.finish_with_message(format!("{} reads found", style::count(scanned.total_read_count)));
 
     // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
@@ -131,28 +133,32 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     // Finalize output
     writer.finish()?;
 
+    let percentage = if total > 0 {
+        (matched as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
     println!(
-        "Filtered {} reads from {} total ({:.1}%)",
-        matched,
+        "{} {} reads from {} total ({})",
+        style::action("Filtered"),
+        style::count(matched),
         total,
-        if total > 0 {
-            (matched as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        }
+        style::percentage(format!("{:.1}%", percentage))
     );
 
     let not_found = (ids.len() as u64).saturating_sub(matched);
     if not_found > 0 {
         println!(
-            "Warning: {} requested IDs were not found in the input",
-            not_found
+            "{} {} requested IDs were not found in the input",
+            style::warning_label("Warning:"),
+            style::warning(not_found)
         );
     }
     if matched > ids.len() as u64 {
         println!(
-            "Note: {} duplicate reads matched across multiple files",
-            matched - ids.len() as u64
+            "{} {} duplicate reads matched across multiple files",
+            style::note_label("Note:"),
+            style::warning(matched - ids.len() as u64)
         );
     }
 
@@ -161,8 +167,10 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let signal_errors = signal_warnings.count();
     if read_errors > 0 || signal_errors > 0 {
         eprintln!(
-            "Warning: encountered {} read error(s) and {} signal error(s)",
-            read_errors, signal_errors
+            "{} encountered {} read error(s) and {} signal error(s)",
+            style::error_label("Warning:"),
+            style::error(read_errors),
+            style::error(signal_errors)
         );
     }
 

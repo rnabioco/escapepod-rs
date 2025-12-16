@@ -1,5 +1,6 @@
 //! Inspect command implementation.
 
+use crate::style;
 use crate::util::resolve_pod5_inputs;
 use podfive_core::Reader;
 use std::path::PathBuf;
@@ -8,13 +9,13 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     let files = resolve_pod5_inputs(&input)?;
     let is_directory = files.len() > 1;
 
-    println!("POD5 File Summary");
+    println!("{}", style::header("POD5 File Summary"));
     println!("=================");
     println!();
 
     if is_directory {
-        println!("Directory: {}", input.display());
-        println!("Files: {}", files.len());
+        println!("{} {}", style::key("Directory:"), style::path(input.display()));
+        println!("{} {}", style::key("Files:"), style::count(files.len()));
     }
 
     let mut total_reads = 0usize;
@@ -26,8 +27,9 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
             Err(e) => {
                 if is_directory {
                     eprintln!(
-                        "  Warning: skipping {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        "  {} skipping {} ({})",
+                        style::warning_label("Warning:"),
+                        style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
                         e
                     );
                     continue;
@@ -38,10 +40,10 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
         };
 
         if !is_directory {
-            println!("File: {}", file_path.display());
-            println!("File ID: {}", reader.file_identifier());
-            println!("POD5 version: {}", reader.pod5_version());
-            println!("Software: {}", reader.software());
+            println!("{} {}", style::key("File:"), style::path(file_path.display()));
+            println!("{} {}", style::key("File ID:"), style::value(reader.file_identifier()));
+            println!("{} {}", style::key("POD5 version:"), style::value(reader.pod5_version()));
+            println!("{} {}", style::key("Software:"), style::value(reader.software()));
             println!();
         }
 
@@ -53,28 +55,28 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
         if is_directory {
             println!(
                 "  {}: {} reads, {} batches",
-                file_path.file_name().unwrap_or_default().to_string_lossy(),
-                read_count,
+                style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
+                style::count(read_count),
                 batch_count
             );
         } else {
-            println!("Reads: {}", read_count);
-            println!("Read batches: {}", batch_count);
+            println!("{} {}", style::key("Reads:"), style::count(read_count));
+            println!("{} {}", style::key("Read batches:"), batch_count);
             println!();
 
-            println!("Run info entries: {}", reader.run_info_count());
+            println!("{} {}", style::key("Run info entries:"), style::value(reader.run_info_count()));
             for (i, run_info) in reader.run_infos().iter().enumerate() {
-                println!("  [{}] acquisition_id: {}", i, run_info.acquisition_id);
-                println!("      sample_rate: {} Hz", run_info.sample_rate);
-                println!("      flow_cell_id: {}", run_info.flow_cell_id);
+                println!("  [{}] {}: {}", i, style::key("acquisition_id"), style::value(&run_info.acquisition_id));
+                println!("      {}: {} Hz", style::key("sample_rate"), style::value(run_info.sample_rate));
+                println!("      {}: {}", style::key("flow_cell_id"), style::value(&run_info.flow_cell_id));
             }
         }
     }
 
     if is_directory {
         println!();
-        println!("Total reads: {}", total_reads);
-        println!("Total batches: {}", total_batches);
+        println!("{} {}", style::key("Total reads:"), style::count(total_reads));
+        println!("{} {}", style::key("Total batches:"), total_batches);
     }
 
     Ok(())
@@ -96,8 +98,9 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
             Err(e) => {
                 if is_directory {
                     eprintln!(
-                        "Warning: skipping {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        "{} skipping {} ({})",
+                        style::warning_label("Warning:"),
+                        style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
                         e
                     );
                     continue;
@@ -112,8 +115,9 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
             Err(e) => {
                 if is_directory {
                     eprintln!(
-                        "Warning: cannot read {} ({})",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        "{} cannot read {} ({})",
+                        style::warning_label("Warning:"),
+                        style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
                         e
                     );
                     continue;
@@ -162,28 +166,28 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
                 Err(_) => continue,
             };
             if read.read_id == target_id {
-                println!("Read Details");
+                println!("{}", style::header("Read Details"));
                 println!("============");
                 println!();
                 if is_directory {
-                    println!("file: {}", file_path.display());
+                    println!("{}: {}", style::key("file"), style::path(file_path.display()));
                 }
-                println!("read_id: {}", read.read_id);
-                println!("read_number: {}", read.read_number);
-                println!("channel: {}", read.channel);
-                println!("well: {}", read.well);
-                println!("start_sample: {}", read.start_sample);
-                println!("num_samples: {}", read.num_samples);
-                println!("num_minknow_events: {}", read.num_minknow_events);
+                println!("{}: {}", style::key("read_id"), style::value(read.read_id));
+                println!("{}: {}", style::key("read_number"), style::value(read.read_number));
+                println!("{}: {}", style::key("channel"), style::value(read.channel));
+                println!("{}: {}", style::key("well"), style::value(read.well));
+                println!("{}: {}", style::key("start_sample"), style::value(read.start_sample));
+                println!("{}: {}", style::key("num_samples"), style::count(read.num_samples));
+                println!("{}: {}", style::key("num_minknow_events"), style::value(read.num_minknow_events));
                 println!();
-                println!("pore_type: {}", read.pore_type);
-                println!("calibration_offset: {}", read.calibration_offset);
-                println!("calibration_scale: {}", read.calibration_scale);
-                println!("median_before: {}", read.median_before);
-                println!("open_pore_level: {}", read.open_pore_level);
+                println!("{}: {}", style::key("pore_type"), style::value(&read.pore_type));
+                println!("{}: {}", style::key("calibration_offset"), style::value(read.calibration_offset));
+                println!("{}: {}", style::key("calibration_scale"), style::value(read.calibration_scale));
+                println!("{}: {}", style::key("median_before"), style::value(read.median_before));
+                println!("{}: {}", style::key("open_pore_level"), style::value(read.open_pore_level));
                 println!();
-                println!("end_reason: {}", read.end_reason);
-                println!("end_reason_forced: {}", read.end_reason_forced);
+                println!("{}: {}", style::key("end_reason"), style::value(read.end_reason));
+                println!("{}: {}", style::key("end_reason_forced"), style::value(read.end_reason_forced));
                 return Ok(());
             }
         }
