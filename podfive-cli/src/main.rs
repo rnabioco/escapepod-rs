@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
+mod progress;
 mod util;
 
 const STYLES: Styles = Styles::styled()
@@ -17,9 +18,11 @@ const STYLES: Styles = Styles::styled()
 #[command(name = "podfive")]
 #[command(author, version, styles = STYLES)]
 #[command(about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data)")]
-#[command(long_about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data).\n\n\
+#[command(
+    long_about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data).\n\n\
 POD5 is the native file format for Oxford Nanopore sequencing devices. This tool \
-provides commands for viewing, inspecting, merging, filtering, and repacking POD5 files.")]
+provides commands for viewing, inspecting, merging, filtering, and repacking POD5 files."
+)]
 #[command(after_help = "\
 Examples:
   podfive view input.pod5                    View all reads as TSV

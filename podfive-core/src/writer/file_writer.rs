@@ -485,7 +485,8 @@ impl Writer {
 
         // Create dictionary builders with predefined dictionaries if available
         // This ensures consistent dictionary indices across batches
-        let pore_type_dict = StringArray::from_iter_values(self.pore_types.iter().map(|s| s.as_str()));
+        let pore_type_dict =
+            StringArray::from_iter_values(self.pore_types.iter().map(|s| s.as_str()));
         let mut pore_type_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new_with_dictionary(num_reads, &pore_type_dict)?;
 
@@ -495,7 +496,8 @@ impl Writer {
         let mut start_builder = UInt64Builder::with_capacity(num_reads);
         let mut median_before_builder = Float32Builder::with_capacity(num_reads);
 
-        let end_reason_dict = StringArray::from_iter_values(self.end_reasons.iter().map(|s| s.as_str()));
+        let end_reason_dict =
+            StringArray::from_iter_values(self.end_reasons.iter().map(|s| s.as_str()));
         let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new_with_dictionary(num_reads, &end_reason_dict)?;
 

@@ -2,6 +2,7 @@
 //!
 //! Generates a comprehensive summary of POD5 file(s) with statistics and QC metrics.
 
+use crate::progress::create_progress_bar;
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
 use chrono::{TimeZone, Utc};
 use owo_colors::OwoColorize;
@@ -106,8 +107,18 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     let mut corrupted_files = Vec::new();
     let mut old_version_files: HashMap<String, usize> = HashMap::new();
 
+    // Progress bar for file processing
+    let progress_bar = create_progress_bar(files.len() as u64, "Analyzing")?;
+    progress_bar.set_message("files");
+
     // Process each file
     for path in &files {
+        progress_bar.set_message(
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        );
         // Try to open the file, skip if corrupted
         let reader = match Reader::open(path) {
             Ok(r) => r,
@@ -199,7 +210,11 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
             software: reader.software().to_string(),
             file_identifier: reader.file_identifier().to_string(),
         });
+
+        progress_bar.inc(1);
     }
+
+    progress_bar.finish_and_clear();
 
     // Add summary of corrupted files
     if !corrupted_files.is_empty() {

@@ -3,6 +3,7 @@
 //! Merges multiple POD5 files into a single output file.
 //! Uses parallel file reading and block-level signal copying for performance.
 
+use crate::progress::{create_progress_bar, create_spinner};
 use crate::util::resolve_pod5_inputs;
 use podfive_core::{CompressedSignalChunk, ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use rayon::prelude::*;
@@ -71,11 +72,11 @@ pub fn run(
     eprintln!("Merging {} files into {}", num_files, output.display());
 
     // Phase 1: Read all files in parallel
-    eprintln!("Reading {} files in parallel...", num_files);
-    let file_results: Vec<Result<FileData, anyhow::Error>> = all_files
-        .par_iter()
-        .map(read_file_data)
-        .collect();
+    let spinner = create_spinner("Reading")?;
+    spinner.set_message(format!("{} files in parallel...", num_files));
+
+    let file_results: Vec<Result<FileData, anyhow::Error>> =
+        all_files.par_iter().map(read_file_data).collect();
 
     // Check for errors and collect successful results
     let mut file_data_vec = Vec::with_capacity(num_files);
@@ -83,13 +84,20 @@ pub fn run(
         match result {
             Ok(data) => file_data_vec.push(data),
             Err(e) => {
-                eprintln!("Warning: failed to read {}: {}", all_files[i].display(), e);
+                spinner.suspend(|| {
+                    eprintln!("Warning: failed to read {}: {}", all_files[i].display(), e);
+                });
             }
         }
     }
+    spinner.finish_with_message(format!("{} files read", file_data_vec.len()));
+
+    // Count total reads for progress bar
+    let total_read_count: u64 = file_data_vec.iter().map(|fd| fd.reads.len() as u64).sum();
 
     // Phase 2: Write all data sequentially (Writer is not thread-safe)
-    eprintln!("Writing merged output...");
+    let write_bar = create_progress_bar(total_read_count, "Writing")?;
+    write_bar.set_message("reads");
 
     let options = WriterOptions {
         signal_batch_size: 100,
@@ -144,8 +152,11 @@ pub fn run(
             let new_read = read.for_writing(new_run_info_idx);
             writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
             total_reads += 1;
+            write_bar.inc(1);
         }
     }
+
+    write_bar.finish_with_message("done");
 
     // Finalize output file
     writer.finish()?;

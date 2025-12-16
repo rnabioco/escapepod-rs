@@ -2,8 +2,8 @@
 //!
 //! Splits reads into multiple output files based on a CSV mapping.
 
+use crate::progress::create_progress_bar;
 use crate::util::parse_uuid_flexible;
-use indicatif::{ProgressBar, ProgressStyle};
 use podfive_core::{Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
 use std::fs::File;
@@ -76,13 +76,8 @@ pub fn run(
 
     // Set up progress
     let read_count = reader.read_count()?;
-    let progress_style = ProgressStyle::default_bar()
-        .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} reads ({msg})")?
-        .progress_chars("━━─");
-
-    let progress = ProgressBar::new(read_count as u64);
-    progress.set_style(progress_style);
-    progress.set_prefix("Subsetting");
+    let progress = create_progress_bar(read_count as u64, "Subsetting")?;
+    progress.set_message("reads");
 
     let mut matched = 0u64;
     let mut unmatched = 0u64;
