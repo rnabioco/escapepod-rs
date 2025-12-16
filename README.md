@@ -5,6 +5,8 @@ A Rust CLI for reading and writing Oxford Nanopore POD5 files.
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+![podfive-rs demo](demo.gif)
+
 ## Overview
 
 podfive-rs is a pure Rust implementation for working with POD5 files, the native file format for Oxford Nanopore sequencing data.
