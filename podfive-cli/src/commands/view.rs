@@ -2,7 +2,9 @@
 //!
 //! Produces a tabular summary of reads from POD5 files.
 
-use crate::util::{open_reader_with_warning, get_reads_iter_with_warning, resolve_pod5_inputs, OpenResult};
+use crate::util::{
+    get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs, OpenResult,
+};
 use podfive_core::ReadData;
 use std::collections::HashSet;
 use std::fs::File;

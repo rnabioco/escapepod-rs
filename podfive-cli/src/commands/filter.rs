@@ -6,8 +6,8 @@
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{
-    add_run_infos_deduplicated, batch_sizes, map_run_info_index, open_reader_with_warning,
-    get_reads_iter_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
+    add_run_infos_deduplicated, batch_sizes, get_reads_iter_with_warning, map_run_info_index,
+    open_reader_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
     LimitedWarningReporter, OpenResult,
 };
 use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
@@ -26,13 +26,21 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         "{} {} using IDs from {}",
         style::action("Filtering"),
         if is_directory {
-            format!("{} ({} files)", style::path(input.display()), style::value(files.len()))
+            format!(
+                "{} ({} files)",
+                style::path(input.display()),
+                style::value(files.len())
+            )
         } else {
             style::path(input.display())
         },
         style::path(ids_file.display())
     );
-    println!("{} {}", style::label("Output:"), style::path(output.display()));
+    println!(
+        "{} {}",
+        style::label("Output:"),
+        style::path(output.display())
+    );
 
     // Read IDs from file
     let ids = read_ids_from_file(&ids_file)?;
@@ -46,7 +54,10 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     let spinner = create_spinner("Scanning")?;
     spinner.set_message("files for dictionary values...");
     let scanned = scan_dictionary_values(&files, Some(&ids));
-    spinner.finish_with_message(format!("{} reads found", style::count(scanned.total_read_count)));
+    spinner.finish_with_message(format!(
+        "{} reads found",
+        style::count(scanned.total_read_count)
+    ));
 
     // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
@@ -117,7 +128,8 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
                     };
 
                 // Map run_info index
-                let new_run_info_idx = map_run_info_index(&reader, read.run_info_index, &run_info_map);
+                let new_run_info_idx =
+                    map_run_info_index(&reader, read.run_info_index, &run_info_map);
 
                 // Create new read data for writing
                 let new_read = read.for_writing(new_run_info_idx);

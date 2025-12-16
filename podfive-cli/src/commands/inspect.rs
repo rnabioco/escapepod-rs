@@ -14,7 +14,11 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     println!();
 
     if is_directory {
-        println!("{} {}", style::key("Directory:"), style::path(input.display()));
+        println!(
+            "{} {}",
+            style::key("Directory:"),
+            style::path(input.display())
+        );
         println!("{} {}", style::key("Files:"), style::count(files.len()));
     }
 
@@ -40,10 +44,26 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
         };
 
         if !is_directory {
-            println!("{} {}", style::key("File:"), style::path(file_path.display()));
-            println!("{} {}", style::key("File ID:"), style::value(reader.file_identifier()));
-            println!("{} {}", style::key("POD5 version:"), style::value(reader.pod5_version()));
-            println!("{} {}", style::key("Software:"), style::value(reader.software()));
+            println!(
+                "{} {}",
+                style::key("File:"),
+                style::path(file_path.display())
+            );
+            println!(
+                "{} {}",
+                style::key("File ID:"),
+                style::value(reader.file_identifier())
+            );
+            println!(
+                "{} {}",
+                style::key("POD5 version:"),
+                style::value(reader.pod5_version())
+            );
+            println!(
+                "{} {}",
+                style::key("Software:"),
+                style::value(reader.software())
+            );
             println!();
         }
 
@@ -64,18 +84,39 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
             println!("{} {}", style::key("Read batches:"), batch_count);
             println!();
 
-            println!("{} {}", style::key("Run info entries:"), style::value(reader.run_info_count()));
+            println!(
+                "{} {}",
+                style::key("Run info entries:"),
+                style::value(reader.run_info_count())
+            );
             for (i, run_info) in reader.run_infos().iter().enumerate() {
-                println!("  [{}] {}: {}", i, style::key("acquisition_id"), style::value(&run_info.acquisition_id));
-                println!("      {}: {} Hz", style::key("sample_rate"), style::value(run_info.sample_rate));
-                println!("      {}: {}", style::key("flow_cell_id"), style::value(&run_info.flow_cell_id));
+                println!(
+                    "  [{}] {}: {}",
+                    i,
+                    style::key("acquisition_id"),
+                    style::value(&run_info.acquisition_id)
+                );
+                println!(
+                    "      {}: {} Hz",
+                    style::key("sample_rate"),
+                    style::value(run_info.sample_rate)
+                );
+                println!(
+                    "      {}: {}",
+                    style::key("flow_cell_id"),
+                    style::value(&run_info.flow_cell_id)
+                );
             }
         }
     }
 
     if is_directory {
         println!();
-        println!("{} {}", style::key("Total reads:"), style::count(total_reads));
+        println!(
+            "{} {}",
+            style::key("Total reads:"),
+            style::count(total_reads)
+        );
         println!("{} {}", style::key("Total batches:"), total_batches);
     }
 
@@ -170,24 +211,72 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
                 println!("============");
                 println!();
                 if is_directory {
-                    println!("{}: {}", style::key("file"), style::path(file_path.display()));
+                    println!(
+                        "{}: {}",
+                        style::key("file"),
+                        style::path(file_path.display())
+                    );
                 }
                 println!("{}: {}", style::key("read_id"), style::value(read.read_id));
-                println!("{}: {}", style::key("read_number"), style::value(read.read_number));
+                println!(
+                    "{}: {}",
+                    style::key("read_number"),
+                    style::value(read.read_number)
+                );
                 println!("{}: {}", style::key("channel"), style::value(read.channel));
                 println!("{}: {}", style::key("well"), style::value(read.well));
-                println!("{}: {}", style::key("start_sample"), style::value(read.start_sample));
-                println!("{}: {}", style::key("num_samples"), style::count(read.num_samples));
-                println!("{}: {}", style::key("num_minknow_events"), style::value(read.num_minknow_events));
+                println!(
+                    "{}: {}",
+                    style::key("start_sample"),
+                    style::value(read.start_sample)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("num_samples"),
+                    style::count(read.num_samples)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("num_minknow_events"),
+                    style::value(read.num_minknow_events)
+                );
                 println!();
-                println!("{}: {}", style::key("pore_type"), style::value(&read.pore_type));
-                println!("{}: {}", style::key("calibration_offset"), style::value(read.calibration_offset));
-                println!("{}: {}", style::key("calibration_scale"), style::value(read.calibration_scale));
-                println!("{}: {}", style::key("median_before"), style::value(read.median_before));
-                println!("{}: {}", style::key("open_pore_level"), style::value(read.open_pore_level));
+                println!(
+                    "{}: {}",
+                    style::key("pore_type"),
+                    style::value(&read.pore_type)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("calibration_offset"),
+                    style::value(read.calibration_offset)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("calibration_scale"),
+                    style::value(read.calibration_scale)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("median_before"),
+                    style::value(read.median_before)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("open_pore_level"),
+                    style::value(read.open_pore_level)
+                );
                 println!();
-                println!("{}: {}", style::key("end_reason"), style::value(read.end_reason));
-                println!("{}: {}", style::key("end_reason_forced"), style::value(read.end_reason_forced));
+                println!(
+                    "{}: {}",
+                    style::key("end_reason"),
+                    style::value(read.end_reason)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("end_reason_forced"),
+                    style::value(read.end_reason_forced)
+                );
                 return Ok(());
             }
         }

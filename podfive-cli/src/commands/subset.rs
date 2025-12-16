@@ -116,11 +116,22 @@ pub fn run(
     // Print summary
     println!("\n{}", style::header("Subset summary:"));
     println!("  Matched reads: {}", style::count(matched));
-    println!("  Unmatched reads: {}", if unmatched > 0 { style::warning(unmatched) } else { unmatched.to_string() });
+    println!(
+        "  Unmatched reads: {}",
+        if unmatched > 0 {
+            style::warning(unmatched)
+        } else {
+            unmatched.to_string()
+        }
+    );
     println!("\n{}", style::label("Output files:"));
     for (name, count) in &write_counts {
         let path = output_dir.join(name);
-        println!("  {} ({} reads)", style::path(path.display()), style::count(count));
+        println!(
+            "  {} ({} reads)",
+            style::path(path.display()),
+            style::count(count)
+        );
     }
 
     Ok(())

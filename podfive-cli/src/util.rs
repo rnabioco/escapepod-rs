@@ -130,10 +130,7 @@ pub enum OpenResult<T> {
 ///
 /// In directory mode, file open errors result in a warning and `Skip`.
 /// In single-file mode, errors are propagated.
-pub fn open_reader_with_warning(
-    file_path: &PathBuf,
-    is_directory: bool,
-) -> OpenResult<Reader> {
+pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> OpenResult<Reader> {
     match Reader::open(file_path) {
         Ok(r) => OpenResult::Ok(r),
         Err(e) => {

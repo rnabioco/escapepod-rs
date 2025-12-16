@@ -5,12 +5,12 @@
 //! Uses lazy signal loading and block-level copying for maximum performance.
 
 use crate::progress::{create_progress_bar, create_spinner};
+use crate::style;
 use crate::util::{
-    add_run_infos_deduplicated, batch_sizes, map_run_info_index, open_reader_with_warning,
-    get_reads_iter_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
+    add_run_infos_deduplicated, batch_sizes, get_reads_iter_with_warning, map_run_info_index,
+    open_reader_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
     LimitedWarningReporter, OpenResult,
 };
-use crate::style;
 use bstr::ByteSlice;
 use noodles_bam as bam;
 use noodles_core::Region;
@@ -37,13 +37,21 @@ pub fn run(
         "{} {} using BAM {}",
         style::action("Filtering"),
         if is_directory {
-            format!("{} ({} files)", style::path(input.display()), style::value(files.len()))
+            format!(
+                "{} ({} files)",
+                style::path(input.display()),
+                style::value(files.len())
+            )
         } else {
             style::path(input.display())
         },
         style::path(bam_path.display())
     );
-    println!("{} {}", style::label("Output:"), style::path(output.display()));
+    println!(
+        "{} {}",
+        style::label("Output:"),
+        style::path(output.display())
+    );
 
     // Print filter criteria
     if mapped_only {
@@ -78,7 +86,10 @@ pub fn run(
     let scan_spinner = create_spinner("Scanning")?;
     scan_spinner.set_message("POD5 files for dictionary values...");
     let scanned = scan_dictionary_values(&files, Some(&ids));
-    scan_spinner.finish_with_message(format!("{} reads found", style::count(scanned.total_read_count)));
+    scan_spinner.finish_with_message(format!(
+        "{} reads found",
+        style::count(scanned.total_read_count)
+    ));
 
     // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
@@ -146,7 +157,8 @@ pub fn run(
                     };
 
                 // Map run_info index
-                let new_run_info_idx = map_run_info_index(&reader, read.run_info_index, &run_info_map);
+                let new_run_info_idx =
+                    map_run_info_index(&reader, read.run_info_index, &run_info_map);
 
                 // Create new read data for writing
                 let new_read = read.for_writing(new_run_info_idx);
