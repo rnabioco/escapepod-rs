@@ -247,14 +247,19 @@ fn merge_with_mmap<P: AsRef<Path>, Q: AsRef<Path>>(
 ) -> Result<MergeResult> {
     let num_files = inputs.len();
 
-    // Phase 1: Pre-scan all files to calculate sizes
-    let mut file_infos: Vec<(std::path::PathBuf, FileInfo)> = Vec::with_capacity(num_files);
+    // Open all readers and keep them alive (they hold mmap references)
+    let readers: Vec<Reader> = inputs
+        .iter()
+        .map(|p| Reader::open(p.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Phase 1: Scan all files to calculate sizes and collect metadata
+    let mut file_infos: Vec<FileInfo> = Vec::with_capacity(num_files);
     let mut total_header_size = 0usize;
     let mut total_batches_size = 0usize;
     let mut total_read_count = 0u64;
 
-    for (file_idx, path) in inputs.iter().enumerate() {
-        let reader = Reader::open(path.as_ref())?;
+    for (file_idx, reader) in readers.iter().enumerate() {
         let signal_bytes = reader.signal_table_bytes()?;
         let footer = ArrowIpcFooter::parse(signal_bytes)?;
 
@@ -270,36 +275,32 @@ fn merge_with_mmap<P: AsRef<Path>, Q: AsRef<Path>>(
         let reads: Vec<ReadData> = reader.reads()?.collect::<std::result::Result<Vec<_>, _>>()?;
         total_read_count += reads.len() as u64;
 
-        file_infos.push((
-            path.as_ref().to_path_buf(),
-            FileInfo {
-                footer,
-                run_infos,
-                reads,
-            },
-        ));
+        file_infos.push(FileInfo {
+            footer,
+            run_infos,
+            reads,
+        });
 
         if let Some(cb) = progress_callback {
-            cb(file_idx + 1, num_files * 2); // First half is scanning
+            cb(file_idx + 1, num_files);
         }
     }
 
     // Estimate footer size
-    let num_batches: usize = file_infos.iter().map(|(_, f)| f.footer.record_batches.len()).sum();
+    let num_batches: usize = file_infos.iter().map(|f| f.footer.record_batches.len()).sum();
     let footer_estimate = 256 + num_batches * 32;
     let total_signal_size = total_header_size + total_batches_size + footer_estimate;
 
-    // Phase 2: Write signal section via mmap
+    // Phase 2: Write signal section via mmap (reusing open readers)
     let mut mmap_writer = MmapSignalWriter::create(output.as_ref(), total_signal_size)?;
     mmap_writer.write_header()?;
 
     let mut all_batches: Vec<BatchBlock> = Vec::new();
     let mut current_offset: usize = 0;
     let mut current_signal_row: u64 = 0;
-    let mut signal_offsets: Vec<u64> = Vec::with_capacity(file_infos.len());
+    let mut signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
 
-    for (file_idx, (path, info)) in file_infos.iter().enumerate() {
-        let reader = Reader::open(path)?;
+    for (file_idx, (reader, info)) in readers.iter().zip(file_infos.iter()).enumerate() {
         let signal_bytes = reader.signal_table_bytes()?;
 
         if file_idx == 0 {
@@ -327,10 +328,6 @@ fn merge_with_mmap<P: AsRef<Path>, Q: AsRef<Path>>(
 
         current_offset += batches_bytes.len();
         current_signal_row += info.footer.total_rows;
-
-        if let Some(cb) = progress_callback {
-            cb(num_files + file_idx + 1, num_files * 2);
-        }
     }
 
     // Write IPC footer
@@ -362,7 +359,7 @@ fn merge_with_mmap<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
     let mut all_run_infos: Vec<RunInfoData> = Vec::new();
 
-    for (_, info) in &file_infos {
+    for info in &file_infos {
         for run_info in &info.run_infos {
             if !run_info_map.contains_key(&run_info.acquisition_id) {
                 let idx = all_run_infos.len() as u32;
@@ -397,7 +394,7 @@ fn merge_with_mmap<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut total_reads = 0u64;
     let mut duplicate_count = 0u64;
 
-    for ((_, info), &signal_offset) in file_infos.iter().zip(signal_offsets.iter()) {
+    for (info, &signal_offset) in file_infos.iter().zip(signal_offsets.iter()) {
         for read in &info.reads {
             if !options.duplicate_ok {
                 if seen_reads.contains(&read.read_id) {

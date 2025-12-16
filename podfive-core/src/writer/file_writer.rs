@@ -1133,12 +1133,12 @@ impl MmapSignalWriter {
     }
 
     /// Finish the signal section and return the underlying file for further writing.
-    /// The mmap is flushed and dropped.
+    /// The mmap is flushed asynchronously and dropped.
     pub fn finish_signal(self) -> Result<(File, usize)> {
         let signal_end = self.write_pos;
 
-        // Flush mmap
-        self.mmap.flush()?;
+        // Flush mmap asynchronously (don't wait for disk)
+        self.mmap.flush_async()?;
 
         // Drop mmap to release the mapping
         drop(self.mmap);
