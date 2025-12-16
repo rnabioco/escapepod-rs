@@ -5,7 +5,7 @@ members = ["podfive-cli", "podfive-core"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 repository = "https://github.com/jayhesselberth/podfive-rs"
 license = "MIT"
 
