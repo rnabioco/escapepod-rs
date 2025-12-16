@@ -12,8 +12,6 @@ pub mod batch_sizes {
     pub const SIGNAL_BATCH_SIZE: u32 = 1_000;
     /// Reads per batch for filter operations.
     pub const READ_BATCH_SIZE: u32 = 10_000;
-    /// Reads per batch for merge operations (large to avoid dictionary issues).
-    pub const MERGE_READ_BATCH_SIZE: u32 = 1_000_000;
 }
 
 /// Resolve input path to a list of POD5 files.

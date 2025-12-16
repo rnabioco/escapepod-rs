@@ -82,4 +82,12 @@ pub enum Error {
         value: String,
         dictionary_name: String,
     },
+
+    /// Invalid Arrow IPC format.
+    #[error("Invalid Arrow IPC: {0}")]
+    InvalidArrowIpc(String),
+
+    /// Invalid state for operation.
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
 }
