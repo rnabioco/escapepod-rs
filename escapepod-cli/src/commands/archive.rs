@@ -247,7 +247,7 @@ fn create_archived_run_info(
 ) -> RunInfoData {
     let mut archived = original.clone();
 
-    // Add archive metadata to context_tags
+    // Add archive metadata to context_tags (preserve original for reference)
     archived.context_tags.insert(
         "podfive.archive.original_sample_rate".to_string(),
         original.sample_rate.to_string(),
@@ -260,10 +260,13 @@ fn create_archived_run_info(
         "podfive.archive.downsample_method".to_string(),
         method.to_string(),
     );
-    archived.context_tags.insert(
-        "podfive.archive.effective_sample_rate".to_string(),
-        downsampled_rate(original.sample_rate, factor).to_string(),
-    );
+
+    // Update sample_rate to reflect the effective rate after downsampling.
+    // This ensures timing calculations (read duration, start time) are correct.
+    // Note: This will cause dorado's chemistry lookup to return UNKNOWN since
+    // the (flowcell, kit, new_rate) tuple won't be in its chemistry map,
+    // but dorado handles this gracefully with a warning and continues.
+    archived.sample_rate = downsampled_rate(original.sample_rate, factor);
 
     archived
 }
