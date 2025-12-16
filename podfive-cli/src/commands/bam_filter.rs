@@ -7,13 +7,15 @@
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{
-    add_run_infos_deduplicated, batch_sizes, get_reads_iter_with_warning, map_run_info_index,
-    open_reader_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
+    batch_sizes, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
     LimitedWarningReporter, OpenResult,
 };
 use bstr::ByteSlice;
 use noodles_bam as bam;
 use noodles_core::Region;
+use podfive_core::utils::{
+    add_run_infos_deduplicated, map_run_info_index, parse_uuid_flexible, scan_dictionary_values,
+};
 use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;

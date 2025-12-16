@@ -6,16 +6,16 @@
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{
-    add_run_infos_deduplicated, batch_sizes, get_reads_iter_with_warning, map_run_info_index,
-    open_reader_with_warning, parse_uuid_flexible, resolve_pod5_inputs, scan_dictionary_values,
+    batch_sizes, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
     LimitedWarningReporter, OpenResult,
 };
+use podfive_core::operations::read_ids_from_file;
+use podfive_core::utils::{
+    add_run_infos_deduplicated, map_run_info_index, scan_dictionary_values,
+};
 use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     // Resolve input to list of POD5 files (supports directories)
@@ -42,7 +42,7 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
         style::path(output.display())
     );
 
-    // Read IDs from file
+    // Read IDs from file (using core library)
     let ids = read_ids_from_file(&ids_file)?;
     println!("Loaded {} read IDs to filter", style::count(ids.len()));
 
@@ -187,37 +187,4 @@ pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result
     }
 
     Ok(())
-}
-
-/// Read read IDs from a text file (one per line).
-///
-/// Supports UUIDs in various formats:
-/// - Standard: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
-/// - No dashes: `a1b2c3d4e5f67890abcdef1234567890`
-fn read_ids_from_file(path: &PathBuf) -> anyhow::Result<HashSet<Uuid>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut ids = HashSet::new();
-
-    for (line_num, line_result) in reader.lines().enumerate() {
-        let line = line_result?;
-        let line = line.trim();
-
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Try to parse as UUID (supports both standard and compact formats)
-        match parse_uuid_flexible(line) {
-            Ok(uuid) => {
-                ids.insert(uuid);
-            }
-            Err(e) => {
-                anyhow::bail!("Invalid UUID on line {}: '{}' ({})", line_num + 1, line, e);
-            }
-        }
-    }
-
-    Ok(ids)
 }
