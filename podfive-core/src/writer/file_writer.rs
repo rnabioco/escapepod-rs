@@ -20,8 +20,8 @@ use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Write buffer size (2MB for efficient I/O)
-const WRITE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// Write buffer size (16MB for efficient I/O, reduces syscall overhead)
+const WRITE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
 /// Options for writing POD5 files.
 #[derive(Debug, Clone)]
