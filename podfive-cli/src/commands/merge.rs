@@ -83,11 +83,7 @@ pub fn run(
         match result {
             Ok(data) => file_data_vec.push(data),
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to read {}: {}",
-                    all_files[i].display(),
-                    e
-                );
+                eprintln!("Warning: failed to read {}: {}", all_files[i].display(), e);
             }
         }
     }
