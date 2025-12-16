@@ -4,13 +4,10 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::parse_uuid_flexible;
+use podfive_core::operations::parse_csv_mapping;
 use podfive_core::{Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 pub fn run(
     input: PathBuf,
@@ -138,64 +135,13 @@ pub fn run(
     Ok(())
 }
 
-fn parse_csv_mapping(csv_file: &PathBuf) -> anyhow::Result<HashMap<Uuid, String>> {
-    let file = File::open(csv_file)?;
-    let reader = BufReader::new(file);
-    let mut csv_reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .trim(csv::Trim::All)
-        .from_reader(reader);
-
-    let mut mapping = HashMap::new();
-
-    // Check headers
-    let headers = csv_reader.headers()?.clone();
-    let read_id_col = headers
-        .iter()
-        .position(|h| h == "read_id")
-        .ok_or_else(|| anyhow::anyhow!("CSV must have a 'read_id' column"))?;
-    let output_col = headers
-        .iter()
-        .position(|h| h == "output")
-        .ok_or_else(|| anyhow::anyhow!("CSV must have an 'output' column"))?;
-
-    for (line_num, result) in csv_reader.records().enumerate() {
-        let record = result?;
-
-        let read_id_str = record
-            .get(read_id_col)
-            .ok_or_else(|| anyhow::anyhow!("Missing read_id on line {}", line_num + 2))?;
-
-        let output_file = record
-            .get(output_col)
-            .ok_or_else(|| anyhow::anyhow!("Missing output on line {}", line_num + 2))?;
-
-        if read_id_str.is_empty() || output_file.is_empty() {
-            continue;
-        }
-
-        // Parse UUID (handle both with and without dashes)
-        let uuid = parse_uuid_flexible(read_id_str).map_err(|e| {
-            anyhow::anyhow!(
-                "Invalid UUID '{}' on line {}: {}",
-                read_id_str,
-                line_num + 2,
-                e
-            )
-        })?;
-
-        mapping.insert(uuid, output_file.to_string());
-    }
-
-    Ok(mapping)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use podfive_core::operations::parse_csv_mapping;
+    use podfive_core::utils::parse_uuid_flexible;
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use uuid::Uuid;
 
     #[test]
     fn test_parse_uuid_standard_format() {
@@ -238,7 +184,7 @@ mod tests {
         .unwrap();
         temp_file.flush().unwrap();
 
-        let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();
+        let mapping = parse_csv_mapping(temp_file.path()).unwrap();
         assert_eq!(mapping.len(), 2);
 
         let uuid1 = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
@@ -255,7 +201,7 @@ mod tests {
         writeln!(temp_file, "a1b2c3d4e5f67890abcdef1234567890,sample1.pod5").unwrap();
         temp_file.flush().unwrap();
 
-        let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();
+        let mapping = parse_csv_mapping(temp_file.path()).unwrap();
         assert_eq!(mapping.len(), 1);
     }
 
@@ -277,7 +223,7 @@ mod tests {
         .unwrap();
         temp_file.flush().unwrap();
 
-        let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();
+        let mapping = parse_csv_mapping(temp_file.path()).unwrap();
         assert_eq!(mapping.len(), 2);
     }
 
@@ -292,7 +238,7 @@ mod tests {
         .unwrap();
         temp_file.flush().unwrap();
 
-        let result = parse_csv_mapping(&temp_file.path().to_path_buf());
+        let result = parse_csv_mapping(temp_file.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("read_id"));
     }
@@ -308,7 +254,7 @@ mod tests {
         .unwrap();
         temp_file.flush().unwrap();
 
-        let mapping = parse_csv_mapping(&temp_file.path().to_path_buf()).unwrap();
+        let mapping = parse_csv_mapping(temp_file.path()).unwrap();
         assert_eq!(mapping.len(), 1);
 
         let uuid = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
@@ -322,7 +268,7 @@ mod tests {
         writeln!(temp_file, "not-a-valid-uuid,sample1.pod5").unwrap();
         temp_file.flush().unwrap();
 
-        let result = parse_csv_mapping(&temp_file.path().to_path_buf());
+        let result = parse_csv_mapping(temp_file.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid UUID"));
     }

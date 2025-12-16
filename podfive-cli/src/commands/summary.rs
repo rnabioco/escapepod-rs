@@ -278,7 +278,7 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Compute statistics from collected read data.
+/// Compute statistics from collected read data (using core library).
 fn compute_statistics(stats: &mut ReadStats) -> StatisticsSummary {
     if stats.lengths.is_empty() {
         return StatisticsSummary {
@@ -293,53 +293,19 @@ fn compute_statistics(stats: &mut ReadStats) -> StatisticsSummary {
         };
     }
 
-    // Sort for median and N50
-    stats.lengths.sort_unstable();
-
-    let length_min = *stats.lengths.first().unwrap_or(&0);
-    let length_max = *stats.lengths.last().unwrap_or(&0);
-    let length_mean = stats.total_samples as f64 / stats.count as f64;
-
-    let length_median = if stats.lengths.len() % 2 == 0 {
-        let mid = stats.lengths.len() / 2;
-        (stats.lengths[mid - 1] + stats.lengths[mid]) / 2
-    } else {
-        stats.lengths[stats.lengths.len() / 2]
-    };
-
-    let length_n50 = compute_n50(&stats.lengths);
+    // Use core statistics function
+    let core_stats = podfive_core::utils::compute_statistics(&mut stats.lengths);
 
     StatisticsSummary {
         total_samples: stats.total_samples,
-        length_min,
-        length_max,
-        length_mean,
-        length_median,
-        length_n50,
+        length_min: core_stats.min,
+        length_max: core_stats.max,
+        length_mean: core_stats.mean,
+        length_median: core_stats.median,
+        length_n50: core_stats.n50,
         active_channels: stats.channels.len(),
         total_channels: 512,
     }
-}
-
-/// Compute N50 from sorted lengths.
-fn compute_n50(sorted_lengths: &[u64]) -> u64 {
-    if sorted_lengths.is_empty() {
-        return 0;
-    }
-
-    let total: u64 = sorted_lengths.iter().sum();
-    let half = total / 2;
-    let mut cumsum = 0u64;
-
-    // N50 requires reverse iteration (longest to shortest)
-    for &len in sorted_lengths.iter().rev() {
-        cumsum += len;
-        if cumsum >= half {
-            return len;
-        }
-    }
-
-    0
 }
 
 /// Format a timestamp in milliseconds to ISO 8601.
