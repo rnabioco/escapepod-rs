@@ -4,12 +4,13 @@
 //! Supports filtering by mapped status, region, and mapping quality.
 //! Uses lazy signal loading and block-level copying for maximum performance.
 
+use crate::progress::{create_progress_bar, create_spinner};
 use crate::util::{parse_uuid_flexible, resolve_pod5_inputs};
 use bstr::ByteSlice;
 use noodles_bam as bam;
 use noodles_core::Region;
-use podfive_core::{Reader, Writer, WriterOptions};
-use std::collections::{HashMap, HashSet};
+use podfive_core::{PredefinedDictionaries, Reader, Writer, WriterOptions};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::BufReader;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -50,13 +51,15 @@ pub fn run(
     }
 
     // Read IDs from BAM file
+    let bam_spinner = create_spinner("Scanning")?;
+    bam_spinner.set_message("BAM file...");
     let (ids, bam_records_scanned) =
         read_ids_from_bam(&bam_path, mapped_only, region.as_deref(), min_quality)?;
-    println!(
-        "Found {} read IDs from {} BAM records",
+    bam_spinner.finish_with_message(format!(
+        "{} read IDs from {} BAM records",
         ids.len(),
         bam_records_scanned
-    );
+    ));
 
     if ids.is_empty() {
         anyhow::bail!(
@@ -65,11 +68,38 @@ pub fn run(
         );
     }
 
-    // Create writer with optimized batch sizes
+    // Pre-scan files to collect unique dictionary values and count total reads
+    let scan_spinner = create_spinner("Scanning")?;
+    scan_spinner.set_message("POD5 files for dictionary values...");
+
+    let mut all_pore_types = BTreeSet::new();
+    let mut all_end_reasons = BTreeSet::new();
+    let mut total_read_count = 0u64;
+    for file_path in &files {
+        if let Ok(reader) = Reader::open(file_path) {
+            if let Ok(reads_iter) = reader.reads() {
+                for read in reads_iter.flatten() {
+                    total_read_count += 1;
+                    // Only collect values for reads we might filter
+                    if ids.contains(&read.read_id) {
+                        all_pore_types.insert(read.pore_type.clone());
+                        all_end_reasons.insert(read.end_reason.to_string());
+                    }
+                }
+            }
+        }
+    }
+    scan_spinner.finish_with_message(format!("{} reads found", total_read_count));
+
+    // Create writer with predefined dictionaries for consistent multi-batch writes
     let options = WriterOptions {
         signal_batch_size: 1_000,
-        read_batch_size: 500_000,
-        ..Default::default()
+        read_batch_size: 10_000,
+        predefined_dictionaries: Some(PredefinedDictionaries {
+            pore_types: Some(all_pore_types.into_iter().collect()),
+            end_reasons: Some(all_end_reasons.into_iter().collect()),
+        }),
+        ..WriterOptions::default()
     };
     let mut writer = Writer::create(&output, options)?;
 
@@ -77,6 +107,7 @@ pub fn run(
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
 
     // Filter reads from all files
+    let filter_bar = create_progress_bar(total_read_count, "Filtering")?;
     let mut matched = 0u64;
     let mut total = 0u64;
     let mut read_errors = 0u64;
@@ -135,6 +166,8 @@ pub fn run(
                 }
             };
             total += 1;
+            filter_bar.inc(1);
+            filter_bar.set_message(format!("{} matched", matched));
 
             // Check if this read's ID is in the BAM-derived filter set
             if ids.contains(&read.read_id) {
@@ -173,6 +206,8 @@ pub fn run(
             }
         }
     }
+
+    filter_bar.finish_with_message(format!("{} matched", matched));
 
     // Check for BAM/POD5 mismatch
     if matched == 0 && total > 0 {
