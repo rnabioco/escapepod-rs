@@ -20,11 +20,14 @@
 pub mod arrow_ipc;
 pub mod compression;
 pub mod error;
+pub mod fields;
 pub mod footer;
 pub mod merge;
+pub mod operations;
 pub mod reader;
 pub mod schema;
 pub mod types;
+pub mod utils;
 pub mod writer;
 
 // Re-export commonly used types

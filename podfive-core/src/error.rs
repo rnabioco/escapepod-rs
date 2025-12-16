@@ -90,4 +90,8 @@ pub enum Error {
     /// Invalid state for operation.
     #[error("Invalid state: {0}")]
     InvalidState(String),
+
+    /// Generic parsing error.
+    #[error("Parse error: {0}")]
+    Parse(String),
 }

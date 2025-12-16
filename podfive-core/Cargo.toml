@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 byteorder = { workspace = true }
+csv = "1"
 flatbuffers = { workspace = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
