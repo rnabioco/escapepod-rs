@@ -267,7 +267,7 @@ mod tests {
             "a1b2c3d4-e5f6-7890-abcd-ef1234567890,sample1.pod5"
         )
         .unwrap();
-        writeln!(temp_file, "").unwrap(); // Empty line
+        writeln!(temp_file).unwrap(); // Empty line
         writeln!(temp_file, ",").unwrap(); // Empty fields
         writeln!(
             temp_file,
