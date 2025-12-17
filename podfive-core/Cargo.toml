@@ -14,9 +14,9 @@ csv = "1"
 flatbuffers = { workspace = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
+tempfile = "3"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
