@@ -4,14 +4,6 @@ use podfive_core::Reader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Default batch sizes for write operations.
-pub mod batch_sizes {
-    /// Signal chunks per batch for filter operations.
-    pub const SIGNAL_BATCH_SIZE: u32 = 1_000;
-    /// Reads per batch for filter operations.
-    pub const READ_BATCH_SIZE: u32 = 10_000;
-}
-
 /// Resolve input path to a list of POD5 files.
 ///
 /// - If path is a file, return it as a single-element vector
@@ -137,41 +129,5 @@ pub fn get_reads_iter_with_warning<'a>(
                 OpenResult::Err(e.into())
             }
         }
-    }
-}
-
-/// A reporter that limits the number of warnings emitted.
-#[derive(Debug)]
-pub struct LimitedWarningReporter {
-    limit: u64,
-    count: u64,
-}
-
-impl LimitedWarningReporter {
-    /// Create a new reporter with the given limit.
-    pub fn new(limit: u64) -> Self {
-        Self { limit, count: 0 }
-    }
-
-    /// Report a warning, returning true if it was emitted.
-    pub fn warn(&mut self, message: &str) -> bool {
-        self.count += 1;
-        if self.count <= self.limit {
-            eprintln!("Warning: {}", message);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get the total count of warnings (including suppressed).
-    pub fn count(&self) -> u64 {
-        self.count
-    }
-
-    /// Check if any warnings were suppressed.
-    #[allow(dead_code)]
-    pub fn has_suppressed(&self) -> bool {
-        self.count > self.limit
     }
 }
