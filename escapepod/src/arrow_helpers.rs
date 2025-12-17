@@ -67,13 +67,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name(name)
             .ok_or_else(|| Error::MissingField(name.to_string()))?;
-        let arr = col
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .ok_or_else(|| Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected UInt16Array".to_string(),
-            })?;
+        let arr =
+            col.as_any()
+                .downcast_ref::<UInt16Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected UInt16Array".to_string(),
+                })?;
         Ok(arr.value(self.row))
     }
 
@@ -83,13 +83,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name(name)
             .ok_or_else(|| Error::MissingField(name.to_string()))?;
-        let arr = col
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected UInt32Array".to_string(),
-            })?;
+        let arr =
+            col.as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected UInt32Array".to_string(),
+                })?;
         Ok(arr.value(self.row))
     }
 
@@ -99,13 +99,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name(name)
             .ok_or_else(|| Error::MissingField(name.to_string()))?;
-        let arr = col
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected UInt64Array".to_string(),
-            })?;
+        let arr =
+            col.as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected UInt64Array".to_string(),
+                })?;
         Ok(arr.value(self.row))
     }
 
@@ -131,13 +131,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name(name)
             .ok_or_else(|| Error::MissingField(name.to_string()))?;
-        let arr = col
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected Float32Array".to_string(),
-            })?;
+        let arr =
+            col.as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected Float32Array".to_string(),
+                })?;
         Ok(arr.value(self.row))
     }
 
@@ -147,13 +147,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name(name)
             .ok_or_else(|| Error::MissingField(name.to_string()))?;
-        let arr = col
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected BooleanArray".to_string(),
-            })?;
+        let arr =
+            col.as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected BooleanArray".to_string(),
+                })?;
         Ok(arr.value(self.row))
     }
 
@@ -163,13 +163,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name(name)
             .ok_or_else(|| Error::MissingField(name.to_string()))?;
-        let arr = col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected StringArray".to_string(),
-            })?;
+        let arr =
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: name.to_string(),
+                    message: "Expected StringArray".to_string(),
+                })?;
         Ok(arr.value(self.row).to_string())
     }
 
@@ -240,13 +240,13 @@ impl<'a> BatchFieldExtractor<'a> {
             .batch
             .column_by_name("signal")
             .ok_or_else(|| Error::MissingField("signal".to_string()))?;
-        let list_arr = col
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "signal".to_string(),
-                message: "Expected ListArray".to_string(),
-            })?;
+        let list_arr =
+            col.as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected ListArray".to_string(),
+                })?;
         let values = list_arr.value(self.row);
         let u64_arr = values
             .as_any()
