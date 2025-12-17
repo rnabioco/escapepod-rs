@@ -135,43 +135,57 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
         .map(|m| m.matching_read_indices.len() as u64)
         .sum();
 
-    // Collect all signal rows we need to extract, grouped by file
-    // Also track the output order for each signal row
-    let mut all_signal_chunks: Vec<(usize, u64, u32)> = Vec::new(); // (chunk_output_idx, read_id, samples)
-    let mut signal_data_bytes: Vec<Vec<u8>> = Vec::new();
+    // Phase 2: Extract signal data in parallel across files
+    // Each file's mmap is independent, so extraction can be parallelized
+    struct FileSignalExtraction {
+        /// Extracted signal chunks (Arc to avoid copying)
+        chunks: Vec<(Arc<[u8]>, u32)>, // (signal_data, samples)
+    }
 
-    // Phase 2: Extract signal data using raw byte access (no Arrow deserialization)
+    let extractions: Vec<Result<FileSignalExtraction>> = file_metadata
+        .par_iter()
+        .map(|metadata| {
+            if metadata.matching_read_indices.is_empty() {
+                return Ok(FileSignalExtraction { chunks: Vec::new() });
+            }
+
+            let signal_bytes = metadata.reader.signal_table_bytes()?;
+
+            // Collect all signal rows needed from this file
+            let signal_row_indices: Vec<u64> = metadata
+                .matching_read_indices
+                .iter()
+                .flat_map(|&read_idx| metadata.reads[read_idx].signal_rows.iter().copied())
+                .collect();
+
+            // Extract all signal rows in batch
+            let raw_chunks = metadata
+                .signal_footer
+                .extract_signal_rows(&signal_row_indices, signal_bytes)?;
+
+            // Store as Arc to avoid copying signal bytes
+            let chunks: Vec<(Arc<[u8]>, u32)> = raw_chunks
+                .into_iter()
+                .map(|chunk| (Arc::from(chunk.signal), chunk.samples))
+                .collect();
+
+            Ok(FileSignalExtraction { chunks })
+        })
+        .collect();
+
+    // Unwrap results and combine sequentially (preserves file order)
+    let file_extractions: Vec<FileSignalExtraction> =
+        extractions.into_iter().collect::<Result<Vec<_>>>()?;
+
+    // Combine all signal chunks with sequential index assignment
+    let mut all_signal_chunks: Vec<(usize, u64, u32)> = Vec::new();
+    let mut signal_data_arcs: Vec<Arc<[u8]>> = Vec::new();
     let mut current_signal_row: u64 = 0;
 
-    for (file_idx, metadata) in file_metadata.iter().enumerate() {
-        if metadata.matching_read_indices.is_empty() {
-            continue;
-        }
-
-        let signal_bytes = metadata.reader.signal_table_bytes()?;
-
-        // Collect all signal rows needed from this file
-        let mut file_signal_rows: Vec<(usize, u64)> = Vec::new(); // (matching_read_idx, signal_row)
-        for &read_idx in &metadata.matching_read_indices {
-            for &signal_row in &metadata.reads[read_idx].signal_rows {
-                file_signal_rows.push((read_idx, signal_row));
-            }
-        }
-
-        // Extract all signal rows in batch (grouped by source batch for efficiency)
-        let signal_row_indices: Vec<u64> = file_signal_rows.iter().map(|(_, row)| *row).collect();
-        let raw_chunks = metadata
-            .signal_footer
-            .extract_signal_rows(&signal_row_indices, signal_bytes)?;
-
-        // Store extracted signal data
-        for chunk in raw_chunks {
-            signal_data_bytes.push(chunk.signal.to_vec());
-            all_signal_chunks.push((
-                signal_data_bytes.len() - 1,
-                current_signal_row,
-                chunk.samples,
-            ));
+    for (file_idx, extraction) in file_extractions.iter().enumerate() {
+        for (signal_data, samples) in &extraction.chunks {
+            signal_data_arcs.push(signal_data.clone());
+            all_signal_chunks.push((signal_data_arcs.len() - 1, current_signal_row, *samples));
             current_signal_row += 1;
         }
 
@@ -200,7 +214,7 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
 
     // Build the signal table using raw bytes
     let (signal_table_bytes, _signal_batches) = build_raw_signal_table(
-        &signal_data_bytes,
+        &signal_data_arcs,
         &all_signal_chunks,
         options.signal_batch_size,
     )?;
@@ -320,7 +334,7 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
 /// Build a signal table from raw signal chunks.
 /// Returns the complete IPC bytes and batch metadata.
 fn build_raw_signal_table(
-    signal_data: &[Vec<u8>],
+    signal_data: &[Arc<[u8]>],
     chunks: &[(usize, u64, u32)], // (data_idx, _signal_row, samples)
     batch_size: u32,
 ) -> Result<(Vec<u8>, Vec<BatchBlock>)> {

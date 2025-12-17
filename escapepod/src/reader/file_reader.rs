@@ -480,6 +480,33 @@ impl Reader {
         Ok(&self.mmap[start..end])
     }
 
+    /// Prefetch signal table pages using madvise (if supported).
+    /// This hints to the OS to read pages ahead, improving sequential read performance.
+    pub fn prefetch_signal(&self) {
+        if let Some(embedded) = self.footer.signal_table() {
+            let start = embedded.offset as usize;
+            let end = (start + embedded.length as usize).min(self.mmap.len());
+            // Use madvise to hint sequential access
+            #[cfg(unix)]
+            {
+                let _ = self.mmap.advise_range(
+                    memmap2::Advice::WillNeed,
+                    start,
+                    end.saturating_sub(start),
+                );
+            }
+            // Fallback for non-unix: touch pages manually
+            #[cfg(not(unix))]
+            {
+                let signal_bytes = &self.mmap[start..end];
+                let _ = signal_bytes
+                    .iter()
+                    .step_by(4096)
+                    .fold(0u8, |acc, &b| acc.wrapping_add(b));
+            }
+        }
+    }
+
     /// Get the total number of signal rows across all batches.
     pub fn signal_row_count(&self) -> Result<u64> {
         let embedded = match self.footer.signal_table() {
@@ -895,7 +922,9 @@ impl Reader {
             sample_rate: ext.get_u16("sample_rate")?,
             sequencing_kit: ext.get_string("sequencing_kit").unwrap_or_default(),
             sequencer_position: ext.get_string("sequencer_position").unwrap_or_default(),
-            sequencer_position_type: ext.get_string("sequencer_position_type").unwrap_or_default(),
+            sequencer_position_type: ext
+                .get_string("sequencer_position_type")
+                .unwrap_or_default(),
             software: ext.get_string("software").unwrap_or_default(),
             system_name: ext.get_string("system_name").unwrap_or_default(),
             system_type: ext.get_string("system_type").unwrap_or_default(),
@@ -925,8 +954,14 @@ impl Reader {
 
         if struct_array.num_columns() >= 2 {
             if let (Some(keys), Some(values)) = (
-                struct_array.column(0).as_any().downcast_ref::<StringArray>(),
-                struct_array.column(1).as_any().downcast_ref::<StringArray>(),
+                struct_array
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>(),
+                struct_array
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>(),
             ) {
                 for i in 0..struct_array.len() {
                     if !keys.is_null(i) && !values.is_null(i) {

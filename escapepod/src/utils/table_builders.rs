@@ -17,6 +17,7 @@ use arrow::ipc::writer::FileWriter as ArrowFileWriter;
 use arrow::ipc::{Block, MetadataVersion};
 use arrow::record_batch::RecordBatch;
 use flatbuffers::FlatBufferBuilder;
+use std::collections::HashSet;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -189,19 +190,18 @@ pub(crate) fn build_reads_table(
 
     let num_reads = reads.len();
 
-    // Collect unique pore types and end reasons for dictionaries
-    let mut pore_types: Vec<String> = Vec::new();
-    let mut end_reasons: Vec<String> = Vec::new();
+    // Collect unique pore types and end reasons for dictionaries using O(1) HashSet lookups
+    let mut pore_type_set: HashSet<&str> = HashSet::new();
+    let mut end_reason_set: HashSet<&str> = HashSet::new();
 
     for (read, _) in reads {
-        if !pore_types.contains(&read.pore_type) {
-            pore_types.push(read.pore_type.clone());
-        }
-        let end_reason_str = read.end_reason.as_str().to_string();
-        if !end_reasons.contains(&end_reason_str) {
-            end_reasons.push(end_reason_str);
-        }
+        pore_type_set.insert(&read.pore_type);
+        end_reason_set.insert(read.end_reason.as_str());
     }
+
+    // Convert to Vec for Arrow dictionary (order doesn't matter for correctness)
+    let pore_types: Vec<&str> = pore_type_set.into_iter().collect();
+    let end_reasons: Vec<&str> = end_reason_set.into_iter().collect();
 
     let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
     let signal_field = Arc::new(arrow::datatypes::Field::new(
@@ -213,7 +213,7 @@ pub(crate) fn build_reads_table(
     let mut channel_builder = UInt16Builder::with_capacity(num_reads);
     let mut well_builder = UInt8Builder::with_capacity(num_reads);
 
-    let pore_type_dict = StringArray::from_iter_values(pore_types.iter().map(|s| s.as_str()));
+    let pore_type_dict = StringArray::from_iter_values(pore_types.iter().copied());
     let mut pore_type_builder: StringDictionaryBuilder<Int16Type> =
         StringDictionaryBuilder::new_with_dictionary(num_reads, &pore_type_dict)?;
 
@@ -223,7 +223,7 @@ pub(crate) fn build_reads_table(
     let mut start_builder = UInt64Builder::with_capacity(num_reads);
     let mut median_before_builder = Float32Builder::with_capacity(num_reads);
 
-    let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().map(|s| s.as_str()));
+    let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().copied());
     let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
         StringDictionaryBuilder::new_with_dictionary(num_reads, &end_reason_dict)?;
 

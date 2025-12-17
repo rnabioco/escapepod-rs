@@ -229,23 +229,21 @@ impl Writer {
     /// In predefined mode, returns error if value not found.
     /// In dynamic mode, adds new values as needed.
     fn get_pore_type_index(&mut self, pore_type: &str) -> Result<i16> {
-        use std::collections::hash_map::Entry;
+        // Check first to avoid allocation when already present
+        if let Some(&idx) = self.pore_type_index.get(pore_type) {
+            return Ok(idx);
+        }
 
-        match self.pore_type_index.entry(pore_type.to_string()) {
-            Entry::Occupied(e) => Ok(*e.get()),
-            Entry::Vacant(e) => {
-                if self.use_predefined_dictionaries {
-                    Err(Error::DictionaryValueNotFound {
-                        value: pore_type.to_string(),
-                        dictionary_name: "pore_type".to_string(),
-                    })
-                } else {
-                    let idx = self.pore_types.len() as i16;
-                    self.pore_types.push(pore_type.to_string());
-                    e.insert(idx);
-                    Ok(idx)
-                }
-            }
+        if self.use_predefined_dictionaries {
+            Err(Error::DictionaryValueNotFound {
+                value: pore_type.to_string(),
+                dictionary_name: "pore_type".to_string(),
+            })
+        } else {
+            let idx = self.pore_types.len() as i16;
+            self.pore_types.push(pore_type.to_string());
+            self.pore_type_index.insert(pore_type.to_string(), idx);
+            Ok(idx)
         }
     }
 
@@ -253,23 +251,21 @@ impl Writer {
     /// In predefined mode, returns error if value not found.
     /// In dynamic mode, adds new values as needed.
     fn get_end_reason_index(&mut self, end_reason: &str) -> Result<i16> {
-        use std::collections::hash_map::Entry;
+        // Check first to avoid allocation when already present
+        if let Some(&idx) = self.end_reason_index.get(end_reason) {
+            return Ok(idx);
+        }
 
-        match self.end_reason_index.entry(end_reason.to_string()) {
-            Entry::Occupied(e) => Ok(*e.get()),
-            Entry::Vacant(e) => {
-                if self.use_predefined_dictionaries {
-                    Err(Error::DictionaryValueNotFound {
-                        value: end_reason.to_string(),
-                        dictionary_name: "end_reason".to_string(),
-                    })
-                } else {
-                    let idx = self.end_reasons.len() as i16;
-                    self.end_reasons.push(end_reason.to_string());
-                    e.insert(idx);
-                    Ok(idx)
-                }
-            }
+        if self.use_predefined_dictionaries {
+            Err(Error::DictionaryValueNotFound {
+                value: end_reason.to_string(),
+                dictionary_name: "end_reason".to_string(),
+            })
+        } else {
+            let idx = self.end_reasons.len() as i16;
+            self.end_reasons.push(end_reason.to_string());
+            self.end_reason_index.insert(end_reason.to_string(), idx);
+            Ok(idx)
         }
     }
 

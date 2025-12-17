@@ -119,15 +119,11 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
     let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
 
-    // Phase 1.5: Pre-fault mmap pages in parallel (touch bytes without copying)
+    // Phase 1.5: Pre-fault mmap pages in parallel using madvise
+    // This hints to the OS to read pages ahead without manual iteration overhead
     file_metadata.par_iter().for_each(|metadata| {
-        if let Ok(signal_bytes) = metadata.reader.signal_table_bytes() {
-            // Touch every 4KB page to trigger page faults in parallel
-            let _ = signal_bytes
-                .iter()
-                .step_by(4096)
-                .fold(0u8, |acc, &b| acc.wrapping_add(b));
-        }
+        // Use reader's madvise method if available, fallback to touching pages
+        metadata.reader.prefetch_signal();
     });
 
     // Phase 2: Write signal data using scoped thread (zero-copy from mmap)
@@ -143,7 +139,8 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     let (mut file, signal_end, signal_rows) =
         thread::scope(|scope| -> Result<(File, usize, u64)> {
             // Channel for sending byte slices to writer thread
-            let (tx, rx) = mpsc::sync_channel::<&[u8]>(4); // Small buffer for backpressure
+            // Buffer of 16 allows reader to stay ahead of writer for better I/O overlap
+            let (tx, rx) = mpsc::sync_channel::<&[u8]>(16);
 
             // Spawn writer thread within scope - can borrow from parent
             let output_path = output.as_ref();
