@@ -22,12 +22,12 @@ escapepod-rs is a pure Rust implementation for working with POD5 files, the nati
 
 escapepod is significantly faster than the Python `pod5` tool for most operations:
 
-| Operation | Speedup |
-|-----------|---------|
-| inspect | 43x faster |
-| view | 25x faster |
-| filter | 8x faster |
-| merge | 3.6x faster |
+| Command | escapepod | pod5 (Python/C++) | Speedup |
+|---------|-----------|---------------|---------|
+| inspect summary | 5 ms | 225 ms | **43x faster** |
+| view | 18 ms | 458 ms | **25x faster** |
+| merge (3 files, 6.5 GB) | 1.3 s | 4.6 s | **3.6x faster** |
+| filter (10% of reads) | 66 ms | 539 ms | **8x faster** |
 
 See [benchmarks/](benchmarks/) for detailed methodology and results.
 

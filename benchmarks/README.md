@@ -20,7 +20,7 @@ Comparison of `escapepod-rs` vs the official Python `pod5` tool.
 
 ## Results Summary
 
-| Command | escapepod | pod5 (Python) | Speedup |
+| Command | escapepod | pod5 (Python/C++) | Speedup |
 |---------|-----------|---------------|---------|
 | inspect summary | 5 ms | 225 ms | **43x faster** |
 | view | 18 ms | 458 ms | **25x faster** |
