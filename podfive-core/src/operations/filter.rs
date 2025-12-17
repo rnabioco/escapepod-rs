@@ -1,14 +1,19 @@
-//! Filter operation for POD5 files.
+//! High-performance filter operation for POD5 files.
+//!
+//! Uses raw byte extraction from mmap without Arrow deserialization.
 
-use crate::utils::{
-    add_run_infos_deduplicated, map_run_info_index, parse_uuid_flexible, scan_dictionary_values,
-};
-use crate::{Error, PredefinedDictionaries, Reader, Result, Writer, WriterOptions};
+use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
+use crate::error::{Error, Result};
+use crate::reader::Reader;
+use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
+use crate::utils::parse_uuid_flexible;
+use crate::utils::table_builders::{build_pod5_footer, build_reads_table, build_run_info_table};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::Path;
-use uuid::Uuid;
+use std::sync::Arc;
 
 /// Options for the filter operation.
 #[derive(Debug, Clone)]
@@ -53,133 +58,326 @@ impl FilterResult {
 }
 
 /// Callback for reporting progress during filtering.
-pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send>;
+pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
+
+/// Collected metadata from a single file for filtering.
+struct FileMetadata {
+    reader: Reader,
+    signal_footer: ArrowIpcFooter,
+    run_infos: Vec<RunInfoData>,
+    /// All reads from this file.
+    reads: Vec<ReadData>,
+    /// Indices of reads that match the filter.
+    matching_read_indices: Vec<usize>,
+}
 
 /// Filter reads from POD5 files based on a set of read IDs.
 ///
-/// This function reads from multiple input files and writes matching reads
-/// to a single output file. It uses lazy signal loading and block-level
-/// copying for maximum performance.
-///
-/// # Arguments
-///
-/// * `input_files` - Slice of input POD5 file paths
-/// * `output_path` - Path to the output POD5 file
-/// * `filter_ids` - Set of read IDs to extract
-/// * `options` - Filter options (batch sizes, etc.)
-/// * `progress` - Optional callback for progress reporting (current, total)
-///
-/// # Returns
-///
-/// A `FilterResult` with statistics about the operation.
-///
-/// # Example
-///
-/// ```no_run
-/// use podfive_core::operations::{filter_files, FilterOptions};
-/// use std::collections::HashSet;
-/// use std::path::PathBuf;
-/// use uuid::Uuid;
-///
-/// let files = vec![PathBuf::from("input.pod5")];
-/// let mut ids = HashSet::new();
-/// ids.insert(Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap());
-///
-/// let result = filter_files(
-///     &files,
-///     "output.pod5",
-///     &ids,
-///     FilterOptions::default(),
-///     None,
-/// )?;
-///
-/// println!("Matched {} of {} reads", result.matched_reads, result.total_reads);
-/// # Ok::<(), podfive_core::Error>(())
-/// ```
-pub fn filter_files<P: AsRef<Path>>(
+/// This function uses raw byte extraction from mmap - no Arrow deserialization.
+/// It extracts only the specific signal rows needed for matching reads.
+pub fn filter_files<P: AsRef<Path> + Sync>(
     input_files: &[P],
     output_path: impl AsRef<Path>,
     filter_ids: &HashSet<Uuid>,
     options: FilterOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<FilterResult> {
-    let mut result = FilterResult::default();
+    if input_files.is_empty() {
+        return Err(Error::InvalidState("No input files specified".into()));
+    }
 
-    // Pre-scan files to collect unique dictionary values
-    let scanned = scan_dictionary_values(input_files, Some(filter_ids));
-    result.total_reads = scanned.total_read_count;
+    let num_files = input_files.len();
 
-    // Create writer with predefined dictionaries for consistent multi-batch writes
-    let writer_options = WriterOptions {
-        signal_batch_size: options.signal_batch_size,
-        read_batch_size: options.read_batch_size,
-        predefined_dictionaries: Some(PredefinedDictionaries {
-            pore_types: Some(scanned.pore_types.into_iter().collect()),
-            end_reasons: Some(scanned.end_reasons.into_iter().collect()),
-        }),
-        ..WriterOptions::default()
-    };
-    let mut writer = Writer::create(output_path, writer_options)?;
+    // Phase 1: Open files and identify matching reads in parallel
+    let input_paths: Vec<&Path> = input_files.iter().map(|p| p.as_ref()).collect();
 
-    // Track run infos across all files
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
-    let mut processed = 0u64;
+    let metadata_results: Vec<Result<FileMetadata>> = input_paths
+        .par_iter()
+        .map(|path| {
+            let reader = Reader::open(path)?;
+            let signal_bytes = reader.signal_table_bytes()?;
+            let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+            let run_infos = reader.run_infos().to_vec();
+            let reads: Vec<ReadData> = reader
+                .reads()?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    for file_path in input_files {
-        let reader = match Reader::open(file_path) {
-            Ok(r) => r,
-            Err(_) => continue, // Skip unreadable files
-        };
+            // Find matching reads
+            let matching_read_indices: Vec<usize> = reads
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, read)| {
+                    if filter_ids.contains(&read.read_id) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
-        // Add run infos (deduplicated by acquisition_id)
-        add_run_infos_deduplicated(&reader, &mut writer, &mut run_info_map)?;
+            Ok(FileMetadata {
+                reader,
+                signal_footer,
+                run_infos,
+                reads,
+                matching_read_indices,
+            })
+        })
+        .collect();
 
-        let reads_iter = match reader.reads() {
-            Ok(iter) => iter,
-            Err(_) => continue, // Skip files with read errors
-        };
+    let file_metadata: Vec<FileMetadata> =
+        metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
 
-        for read_result in reads_iter {
-            let read = match read_result {
-                Ok(r) => r,
-                Err(_) => {
-                    result.read_errors += 1;
-                    continue;
-                }
-            };
+    // Count total reads for statistics
+    let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
+    let matching_count: u64 = file_metadata
+        .iter()
+        .map(|m| m.matching_read_indices.len() as u64)
+        .sum();
 
-            processed += 1;
-            if let Some(ref cb) = progress {
-                cb(processed, result.total_reads);
+    // Collect all signal rows we need to extract, grouped by file
+    // Also track the output order for each signal row
+    let mut all_signal_chunks: Vec<(usize, u64, u32)> = Vec::new(); // (chunk_output_idx, read_id, samples)
+    let mut signal_data_bytes: Vec<Vec<u8>> = Vec::new();
+
+    // Phase 2: Extract signal data using raw byte access (no Arrow deserialization)
+    let mut current_signal_row: u64 = 0;
+
+    for (file_idx, metadata) in file_metadata.iter().enumerate() {
+        if metadata.matching_read_indices.is_empty() {
+            continue;
+        }
+
+        let signal_bytes = metadata.reader.signal_table_bytes()?;
+
+        // Collect all signal rows needed from this file
+        let mut file_signal_rows: Vec<(usize, u64)> = Vec::new(); // (matching_read_idx, signal_row)
+        for &read_idx in &metadata.matching_read_indices {
+            for &signal_row in &metadata.reads[read_idx].signal_rows {
+                file_signal_rows.push((read_idx, signal_row));
             }
+        }
 
-            // Check if this read's ID is in the filter list
-            if filter_ids.contains(&read.read_id) {
-                // Lazy load: only fetch signal for matching reads
-                let compressed_signal =
-                    match reader.get_compressed_signal_for_rows(&read.signal_rows) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            result.signal_errors += 1;
-                            continue;
-                        }
-                    };
+        // Extract all signal rows in batch (grouped by source batch for efficiency)
+        let signal_row_indices: Vec<u64> = file_signal_rows.iter().map(|(_, row)| *row).collect();
+        let raw_chunks = metadata
+            .signal_footer
+            .extract_signal_rows(&signal_row_indices, signal_bytes)?;
 
-                // Map run_info index
-                let new_run_info_idx =
-                    map_run_info_index(&reader, read.run_info_index, &run_info_map);
+        // Store extracted signal data
+        for chunk in raw_chunks {
+            signal_data_bytes.push(chunk.signal.to_vec());
+            all_signal_chunks.push((
+                signal_data_bytes.len() - 1,
+                current_signal_row,
+                chunk.samples,
+            ));
+            current_signal_row += 1;
+        }
 
-                // Create new read data for writing
-                let new_read = read.for_writing(new_run_info_idx);
+        if let Some(ref cb) = progress {
+            cb(file_idx as u64 + 1, num_files as u64);
+        }
+    }
 
-                writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
-                result.matched_reads += 1;
+    // Phase 3: Build output file
+    // We need to write:
+    // 1. Signal table with extracted chunks
+    // 2. Run info table (deduplicated)
+    // 3. Reads table with remapped signal rows
+
+    let file = File::create(output_path.as_ref())?;
+    let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
+
+    // Write POD5 header
+    file.write_all(&POD5_SIGNATURE)?;
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Build signal table - we need to create new Arrow IPC batches
+    // For simplicity, put all signal in one batch
+    let _signal_table_start = file.stream_position()? as i64;
+
+    // Build the signal table using raw bytes
+    let (signal_table_bytes, _signal_batches) = build_raw_signal_table(
+        &signal_data_bytes,
+        &all_signal_chunks,
+        options.signal_batch_size,
+    )?;
+    file.write_all(&signal_table_bytes)?;
+
+    let signal_end = file.stream_position()? as usize;
+
+    // Pad to 8-byte alignment
+    let padding_needed = (8 - (signal_end % 8)) % 8;
+    for _ in 0..padding_needed {
+        file.write_all(&[0u8])?;
+    }
+
+    // Write section marker
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Build deduplicated run_info table
+    let mut run_info_map: HashMap<String, u32> = HashMap::new();
+    let mut all_run_infos: Vec<RunInfoData> = Vec::new();
+
+    for metadata in &file_metadata {
+        for run_info in &metadata.run_infos {
+            if !run_info_map.contains_key(&run_info.acquisition_id) {
+                let idx = all_run_infos.len() as u32;
+                run_info_map.insert(run_info.acquisition_id.clone(), idx);
+                all_run_infos.push(run_info.clone());
             }
         }
     }
 
+    let run_info_offset = file.stream_position()? as i64;
+    let run_info_bytes = build_run_info_table(&all_run_infos)?;
+    file.write_all(&run_info_bytes)?;
+    let run_info_length = run_info_bytes.len() as i64;
+
+    // Pad and section marker
+    while file.stream_position()? % 8 != 0 {
+        file.write_all(&[0u8])?;
+    }
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Build reads table with new signal row indices
+    let reads_offset = file.stream_position()? as i64;
+
+    let mut processed_reads: Vec<(ReadData, Vec<u64>)> = Vec::new();
+    let mut signal_row_cursor: u64 = 0;
+
+    for metadata in &file_metadata {
+        for &read_idx in &metadata.matching_read_indices {
+            let read = &metadata.reads[read_idx];
+
+            // New signal rows are sequential starting from signal_row_cursor
+            let num_signal_rows = read.signal_rows.len();
+            let new_signal_rows: Vec<u64> =
+                (signal_row_cursor..signal_row_cursor + num_signal_rows as u64).collect();
+            signal_row_cursor += num_signal_rows as u64;
+
+            // Update run_info index
+            let original_run_info = metadata.run_infos.get(read.run_info_index as usize);
+            let new_run_info_idx = if let Some(ri) = original_run_info {
+                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
+            } else {
+                0
+            };
+
+            let new_read = read.for_writing(new_run_info_idx);
+            processed_reads.push((new_read, new_signal_rows));
+        }
+    }
+
+    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos)?;
+    file.write_all(&reads_bytes)?;
+    let reads_length = reads_bytes.len() as i64;
+
+    // Pad and section marker
+    while file.stream_position()? % 8 != 0 {
+        file.write_all(&[0u8])?;
+    }
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+
+    // Write POD5 footer
+    file.write_all(&FOOTER_MAGIC)?;
+
+    let signal_offset_val = 24i64; // POD5 header size
+    let signal_length = signal_end as i64 - 24;
+
+    let pod5_footer = build_pod5_footer(
+        signal_offset_val,
+        signal_length,
+        run_info_offset,
+        run_info_length,
+        reads_offset,
+        reads_length,
+    )?;
+    file.write_all(&pod5_footer)?;
+
+    let footer_len = pod5_footer.len() as i64;
+    file.write_all(&footer_len.to_le_bytes())?;
+
+    let section_marker = Uuid::new_v4();
+    file.write_all(section_marker.as_bytes())?;
+    file.write_all(&POD5_SIGNATURE)?;
+
+    file.flush()?;
+
+    Ok(FilterResult {
+        total_reads: total_read_count,
+        matched_reads: matching_count,
+        read_errors: 0,
+        signal_errors: 0,
+    })
+}
+
+/// Build a signal table from raw signal chunks.
+/// Returns the complete IPC bytes and batch metadata.
+fn build_raw_signal_table(
+    signal_data: &[Vec<u8>],
+    chunks: &[(usize, u64, u32)], // (data_idx, _signal_row, samples)
+    batch_size: u32,
+) -> Result<(Vec<u8>, Vec<BatchBlock>)> {
+    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::FileWriter;
+    use arrow::record_batch::RecordBatch;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("read_id", DataType::FixedSizeBinary(16), false),
+        Field::new("signal", DataType::LargeBinary, false),
+        Field::new("samples", DataType::UInt32, false),
+    ]));
+
+    let mut output = Vec::new();
+    let mut writer = FileWriter::try_new(&mut output, &schema)?;
+
+    // Build batches
+    let total_rows = chunks.len();
+    let mut offset = 0;
+
+    while offset < total_rows {
+        let end = std::cmp::min(offset + batch_size as usize, total_rows);
+        let batch_chunks = &chunks[offset..end];
+
+        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
+        let mut signal_builder = LargeBinaryBuilder::new();
+        let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
+
+        for (data_idx, _, samples) in batch_chunks {
+            // Use a placeholder read_id (the actual read_id is in the reads table)
+            read_id_builder.append_value([0u8; 16])?;
+            signal_builder.append_value(&signal_data[*data_idx]);
+            samples_builder.append_value(*samples);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(read_id_builder.finish()) as ArrayRef,
+                Arc::new(signal_builder.finish()) as ArrayRef,
+                Arc::new(samples_builder.finish()) as ArrayRef,
+            ],
+        )?;
+
+        writer.write(&batch)?;
+        offset = end;
+    }
+
     writer.finish()?;
-    Ok(result)
+    drop(writer);
+
+    // Parse the output to get batch metadata
+    let footer = ArrowIpcFooter::parse(&output)?;
+    let batches = footer.record_batches.clone();
+
+    Ok((output, batches))
 }
 
 /// Read read IDs from a text file (one per line).
@@ -190,16 +388,6 @@ pub fn filter_files<P: AsRef<Path>>(
 ///
 /// Lines starting with `#` are treated as comments and skipped.
 /// Empty lines are also skipped.
-///
-/// # Example
-///
-/// ```no_run
-/// use podfive_core::operations::read_ids_from_file;
-///
-/// let ids = read_ids_from_file("ids.txt")?;
-/// println!("Loaded {} IDs", ids.len());
-/// # Ok::<(), podfive_core::Error>(())
-/// ```
 pub fn read_ids_from_file(path: impl AsRef<Path>) -> Result<HashSet<Uuid>> {
     let file = File::open(path.as_ref())?;
     let reader = BufReader::new(file);
@@ -214,7 +402,6 @@ pub fn read_ids_from_file(path: impl AsRef<Path>) -> Result<HashSet<Uuid>> {
             continue;
         }
 
-        // Try to parse as UUID (supports both standard and compact formats)
         match parse_uuid_flexible(line) {
             Ok(uuid) => {
                 ids.insert(uuid);

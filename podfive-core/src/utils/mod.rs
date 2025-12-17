@@ -5,10 +5,12 @@
 //! - Run info deduplication
 //! - Dictionary value scanning
 //! - Statistics computation
+//! - Table building for POD5 output
 
 mod dictionary;
 mod run_info;
 mod statistics;
+pub(crate) mod table_builders;
 mod uuid;
 
 pub use dictionary::{scan_dictionary_values, ScannedDictionaries};
