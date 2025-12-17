@@ -29,7 +29,7 @@ escapepod = { workspace = true }
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tabled = { version = "0.17", features = ["ansi"] }
+tabled = { version = "0.20", features = ["ansi"] }
 tempfile = "3"
 uuid = { workspace = true }
 walkdir = "2"
