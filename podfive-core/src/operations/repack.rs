@@ -105,7 +105,7 @@ fn repack_single_file(
     // If we used a temp file, rename it to the output
     if let Some(temp) = temp_file {
         drop(reader); // Release the memory map
-        temp.persist(output).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        temp.persist(output).map_err(std::io::Error::other)?;
     }
 
     Ok(count)

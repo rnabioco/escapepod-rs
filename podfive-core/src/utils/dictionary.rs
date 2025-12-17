@@ -19,7 +19,11 @@ pub struct ScannedDictionaries {
 }
 
 /// Extract dictionary values from a column's dictionary array.
-fn extract_dict_values(batch: &arrow::record_batch::RecordBatch, col_name: &str, values: &mut BTreeSet<String>) {
+fn extract_dict_values(
+    batch: &arrow::record_batch::RecordBatch,
+    col_name: &str,
+    values: &mut BTreeSet<String>,
+) {
     if let Some(col) = batch.column_by_name(col_name) {
         if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
             if let Some(dict_values) = dict.values().as_any().downcast_ref::<StringArray>() {

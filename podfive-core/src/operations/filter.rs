@@ -2,18 +2,16 @@
 //!
 //! Uses raw byte extraction from mmap without Arrow deserialization.
 
-use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock, RawSignalChunk};
+use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
 use crate::utils::parse_uuid_flexible;
-use crate::utils::table_builders::{
-    build_arrow_ipc_footer, build_pod5_footer, build_reads_table, build_run_info_table,
-};
+use crate::utils::table_builders::{build_pod5_footer, build_reads_table, build_run_info_table};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -84,9 +82,6 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
     options: FilterOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<FilterResult> {
-    use std::sync::mpsc;
-    use std::thread;
-
     if input_files.is_empty() {
         return Err(Error::InvalidState("No input files specified".into()));
     }
@@ -172,7 +167,11 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
         // Store extracted signal data
         for chunk in raw_chunks {
             signal_data_bytes.push(chunk.signal.to_vec());
-            all_signal_chunks.push((signal_data_bytes.len() - 1, current_signal_row, chunk.samples));
+            all_signal_chunks.push((
+                signal_data_bytes.len() - 1,
+                current_signal_row,
+                chunk.samples,
+            ));
             current_signal_row += 1;
         }
 
@@ -197,11 +196,14 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
 
     // Build signal table - we need to create new Arrow IPC batches
     // For simplicity, put all signal in one batch
-    let signal_table_start = file.stream_position()? as i64;
+    let _signal_table_start = file.stream_position()? as i64;
 
     // Build the signal table using raw bytes
-    let (signal_table_bytes, signal_batches) =
-        build_raw_signal_table(&signal_data_bytes, &all_signal_chunks, options.signal_batch_size)?;
+    let (signal_table_bytes, _signal_batches) = build_raw_signal_table(
+        &signal_data_bytes,
+        &all_signal_chunks,
+        options.signal_batch_size,
+    )?;
     file.write_all(&signal_table_bytes)?;
 
     let signal_end = file.stream_position()? as usize;

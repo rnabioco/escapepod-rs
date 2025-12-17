@@ -8,12 +8,12 @@ use crate::CompressedSignalChunk;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
-use std::sync::RwLock;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
@@ -942,7 +942,11 @@ impl Reader {
         for batch_result in reader {
             let batch = batch_result?;
             // The projected batch will have read_id as column 0
-            if let Some(col) = batch.column(0).as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            if let Some(col) = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+            {
                 for row in 0..col.len() {
                     if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
                         read_ids.push(uuid);
@@ -978,15 +982,17 @@ impl Reader {
             reader.next();
         }
 
-        let batch = reader
-            .next()
-            .ok_or_else(|| Error::BatchIndexOutOfBounds {
-                index: batch_idx,
-                max: reader.num_batches(),
-            })??;
+        let batch = reader.next().ok_or_else(|| Error::BatchIndexOutOfBounds {
+            index: batch_idx,
+            max: reader.num_batches(),
+        })??;
 
         let mut read_ids = Vec::new();
-        if let Some(col) = batch.column(0).as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        if let Some(col) = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+        {
             for row in 0..col.len() {
                 if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
                     read_ids.push(uuid);

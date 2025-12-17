@@ -422,9 +422,9 @@ impl ArrowIpcFooter {
         signal_row: u64,
         ipc_bytes: &'a [u8],
     ) -> Result<RawSignalChunk<'a>> {
-        let (batch_idx, local_row) = self
-            .batch_for_row(signal_row)
-            .ok_or_else(|| Error::InvalidState(format!("Signal row {} out of bounds", signal_row)))?;
+        let (batch_idx, local_row) = self.batch_for_row(signal_row).ok_or_else(|| {
+            Error::InvalidState(format!("Signal row {} out of bounds", signal_row))
+        })?;
 
         let batch = &self.record_batches[batch_idx];
         let batch_bytes = &ipc_bytes[batch.byte_range()];
@@ -451,12 +451,16 @@ impl ArrowIpcFooter {
         if offset_end + 8 > parsed.signal_offsets.len() {
             return Err(Error::InvalidState("signal offset out of bounds".into()));
         }
-        let signal_start =
-            i64::from_le_bytes(parsed.signal_offsets[offset_start..offset_start + 8].try_into().unwrap())
-                as usize;
-        let signal_end =
-            i64::from_le_bytes(parsed.signal_offsets[offset_end..offset_end + 8].try_into().unwrap())
-                as usize;
+        let signal_start = i64::from_le_bytes(
+            parsed.signal_offsets[offset_start..offset_start + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let signal_end = i64::from_le_bytes(
+            parsed.signal_offsets[offset_end..offset_end + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         if signal_end > parsed.signal_data.len() {
             return Err(Error::InvalidState("signal data out of bounds".into()));
@@ -468,8 +472,11 @@ impl ArrowIpcFooter {
         if samples_offset + 4 > parsed.samples_data.len() {
             return Err(Error::InvalidState("samples data out of bounds".into()));
         }
-        let samples =
-            u32::from_le_bytes(parsed.samples_data[samples_offset..samples_offset + 4].try_into().unwrap());
+        let samples = u32::from_le_bytes(
+            parsed.samples_data[samples_offset..samples_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
 
         Ok(RawSignalChunk {
             read_id: read_id_bytes,
@@ -511,7 +518,8 @@ impl ArrowIpcFooter {
 
                 // Extract read_id
                 let read_id_offset = row * 16;
-                let read_id_bytes: [u8; 16] = parsed.read_id_data[read_id_offset..read_id_offset + 16]
+                let read_id_bytes: [u8; 16] = parsed.read_id_data
+                    [read_id_offset..read_id_offset + 16]
                     .try_into()
                     .map_err(|_| Error::InvalidState("Invalid read_id".into()))?;
 
@@ -582,7 +590,7 @@ impl<'a> ParsedBatch<'a> {
     /// - 4: signal data (variable)
     /// - 5: samples validity (may be empty/null)
     /// - 6: samples data (4 bytes * num_rows)
-    fn parse(batch_bytes: &'a [u8], metadata_length: usize, num_rows: usize) -> Result<Self> {
+    fn parse(batch_bytes: &'a [u8], _metadata_length: usize, num_rows: usize) -> Result<Self> {
         // Skip the message header to get to the body
         // Message format: [4 bytes: continuation or length][4 bytes: metadata_length if continuation]
         // Then metadata, then padding, then body
@@ -729,12 +737,16 @@ impl<'a> ParsedBatch<'a> {
         let rb_vtable_pos = (rb_table_pos as i32 - rb_vtable_soffset) as usize;
 
         if rb_vtable_pos + 8 > metadata.len() {
-            return Err(Error::InvalidArrowIpc("RecordBatch vtable too small".into()));
+            return Err(Error::InvalidArrowIpc(
+                "RecordBatch vtable too small".into(),
+            ));
         }
 
-        let rb_vtable_size =
-            u16::from_le_bytes(metadata[rb_vtable_pos..rb_vtable_pos + 2].try_into().unwrap())
-                as usize;
+        let rb_vtable_size = u16::from_le_bytes(
+            metadata[rb_vtable_pos..rb_vtable_pos + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         // RecordBatch vtable: size(2), table_size(2), length(2), nodes(2), buffers(2)
         // buffers is at offset 8 in vtable
@@ -787,8 +799,8 @@ impl<'a> ParsedBatch<'a> {
 
             let offset =
                 i64::from_le_bytes(metadata[buf_pos..buf_pos + 8].try_into().unwrap()) as usize;
-            let length =
-                i64::from_le_bytes(metadata[buf_pos + 8..buf_pos + 16].try_into().unwrap()) as usize;
+            let length = i64::from_le_bytes(metadata[buf_pos + 8..buf_pos + 16].try_into().unwrap())
+                as usize;
             buffers.push((offset, length));
         }
 
