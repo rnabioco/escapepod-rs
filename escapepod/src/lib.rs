@@ -17,18 +17,29 @@
 //! # Ok::<(), escapepod::Error>(())
 //! ```
 
-pub mod arrow_ipc;
+// Internal modules - not part of public API
+pub(crate) mod arrow_helpers;
+pub(crate) mod arrow_ipc;
+pub(crate) mod footer;
+pub(crate) mod schema;
+
+// Modules with some public re-exports (implementation details hidden)
+mod fields;
+mod utils;
+
+// Public modules
 pub mod compression;
 pub mod error;
-pub mod fields;
-pub mod footer;
 pub mod merge;
 pub mod operations;
 pub mod reader;
-pub mod schema;
 pub mod types;
-pub mod utils;
 pub mod writer;
+
+// Re-export CLI-facing utilities
+pub use fields::{determine_fields, get_field_value, FieldError, ALL_FIELDS, DEFAULT_FIELDS};
+pub use utils::parse_uuid_flexible;
+pub use utils::{compute_n50, compute_statistics, Statistics};
 
 // Re-export commonly used types
 pub use error::{Error, Result};

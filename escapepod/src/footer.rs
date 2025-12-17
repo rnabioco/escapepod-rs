@@ -60,6 +60,7 @@ pub struct EmbeddedFile {
     /// Length of the embedded file (excluding padding).
     pub length: i64,
     /// Format of the embedded file.
+    #[allow(dead_code)]
     pub format: Format,
     /// Type of content in the embedded file.
     pub content_type: ContentType,

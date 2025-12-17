@@ -62,7 +62,7 @@ pub enum FieldError {
 /// # Example
 ///
 /// ```
-/// use escapepod::fields::determine_fields;
+/// use escapepod::determine_fields;
 ///
 /// // Use defaults
 /// let fields = determine_fields(None, None, false).unwrap();
@@ -139,7 +139,7 @@ pub fn determine_fields(
 /// # Example
 ///
 /// ```no_run
-/// use escapepod::{Reader, fields::get_field_value};
+/// use escapepod::{Reader, get_field_value};
 ///
 /// let reader = Reader::open("example.pod5")?;
 /// for read in reader.reads()?.flatten() {

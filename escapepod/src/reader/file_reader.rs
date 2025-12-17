@@ -1,5 +1,6 @@
 //! Main POD5 file reader.
 
+use crate::arrow_helpers::BatchFieldExtractor;
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
@@ -723,204 +724,7 @@ impl Reader {
     /// This is useful for batch-level parallel processing where you want to
     /// process batches in parallel using rayon.
     pub fn read_from_batch(batch: &RecordBatch, row: usize) -> Result<ReadData> {
-        use arrow::array::{
-            Array, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, ListArray,
-            UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-        };
-
-        // Helper functions
-        let get_uuid = |name: &str| -> Result<Uuid> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr = col
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: name.to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
-            let bytes = arr.value(row);
-            Uuid::from_slice(bytes).map_err(|e| Error::InvalidUuid(e.to_string()))
-        };
-
-        let get_u8 = |name: &str| -> Result<u8> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt8Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt8Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u16 = |name: &str| -> Result<u16> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt16Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u32 = |name: &str| -> Result<u32> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt32Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u64 = |name: &str| -> Result<u64> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt64Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_f32 = |name: &str| -> Result<f32> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected Float32Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_bool = |name: &str| -> Result<bool> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected BooleanArray".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        // Get dictionary-encoded string value
-        let get_dict_string = |name: &str| -> Result<String> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-
-            // Try Int16 dictionary first
-            if let Some(dict) = col
-                .as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::Int16Type>>()
-            {
-                let keys = dict.keys();
-                let values = dict.values();
-                let values = values
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected String dictionary values".to_string(),
-                    })?;
-                let key = keys.value(row);
-                return Ok(values.value(key as usize).to_string());
-            }
-
-            Err(Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected DictionaryArray".to_string(),
-            })
-        };
-
-        // Get run_info index from dictionary key
-        let get_run_info_index = |name: &str| -> Result<u32> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-
-            if let Some(dict) = col
-                .as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::Int16Type>>()
-            {
-                let keys = dict.keys();
-                return Ok(keys.value(row) as u32);
-            }
-
-            Ok(0)
-        };
-
-        // Extract signal row indices from list
-        let signal_rows = {
-            let col = batch
-                .column_by_name("signal")
-                .ok_or_else(|| Error::MissingField("signal".to_string()))?;
-            let list_arr =
-                col.as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
-            let values = list_arr.value(row);
-            let u64_arr = values
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected UInt64Array values".to_string(),
-                })?;
-            u64_arr.values().to_vec()
-        };
-
-        Ok(ReadData {
-            read_id: get_uuid("read_id")?,
-            read_number: get_u32("read_number")?,
-            start_sample: get_u64("start_sample").or_else(|_| get_u64("start"))?,
-            channel: get_u16("channel")?,
-            well: get_u8("well")?,
-            pore_type: get_dict_string("pore_type").unwrap_or_default(),
-            calibration_offset: get_f32("calibration_offset")?,
-            calibration_scale: get_f32("calibration_scale")?,
-            median_before: get_f32("median_before")?,
-            end_reason: get_dict_string("end_reason")
-                .unwrap_or_default()
-                .parse()
-                .unwrap(),
-            end_reason_forced: get_bool("end_reason_forced")?,
-            run_info_index: get_run_info_index("run_info")?,
-            num_minknow_events: get_u64("num_minknow_events")?,
-            num_samples: get_u64("num_samples")?,
-            open_pore_level: get_f32("predicted_scaling_open_pore_level")
-                .or_else(|_| get_f32("open_pore_level"))
-                .unwrap_or(0.0),
-            signal_rows,
-        })
+        extract_read_from_batch(batch, row, true)
     }
 
     /// Get all read IDs from the file efficiently (reads only the read_id column).
@@ -1067,88 +871,72 @@ impl Reader {
 
     /// Extract RunInfoData from a batch row.
     fn run_info_from_batch(batch: &RecordBatch, row: usize) -> Result<RunInfoData> {
-        use arrow::array::{
-            Array, Int16Array, StringArray, TimestampMillisecondArray, UInt16Array,
-        };
+        let ext = BatchFieldExtractor::new(batch, row);
 
-        let get_string = |name: &str| -> Result<String> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected StringArray".to_string(),
-                    })?;
-            Ok(arr.value(row).to_string())
-        };
+        // Parse context_tags map if present
+        let context_tags = Self::parse_map_column(batch, "context_tags", row);
 
-        let get_i16 = |name: &str| -> Result<i16> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected Int16Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u16 = |name: &str| -> Result<u16> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt16Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_timestamp = |name: &str| -> Result<i64> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: name.to_string(),
-                    message: "Expected TimestampMillisecondArray".to_string(),
-                })?;
-            Ok(arr.value(row))
-        };
+        // Parse tracking_id map if present
+        let tracking_id = Self::parse_map_column(batch, "tracking_id", row);
 
         Ok(RunInfoData {
-            acquisition_id: get_string("acquisition_id")?,
-            acquisition_start_time: get_timestamp("acquisition_start_time")?,
-            adc_max: get_i16("adc_max")?,
-            adc_min: get_i16("adc_min")?,
-            context_tags: HashMap::new(), // TODO: parse map
-            experiment_name: get_string("experiment_name").unwrap_or_default(),
-            flow_cell_id: get_string("flow_cell_id").unwrap_or_default(),
-            flow_cell_product_code: get_string("flow_cell_product_code").unwrap_or_default(),
-            protocol_name: get_string("protocol_name").unwrap_or_default(),
-            protocol_run_id: get_string("protocol_run_id").unwrap_or_default(),
-            protocol_start_time: get_timestamp("protocol_start_time").unwrap_or(0),
-            sample_id: get_string("sample_id").unwrap_or_default(),
-            sample_rate: get_u16("sample_rate")?,
-            sequencing_kit: get_string("sequencing_kit").unwrap_or_default(),
-            sequencer_position: get_string("sequencer_position").unwrap_or_default(),
-            sequencer_position_type: get_string("sequencer_position_type").unwrap_or_default(),
-            software: get_string("software").unwrap_or_default(),
-            system_name: get_string("system_name").unwrap_or_default(),
-            system_type: get_string("system_type").unwrap_or_default(),
-            tracking_id: HashMap::new(), // TODO: parse map
+            acquisition_id: ext.get_string("acquisition_id")?,
+            acquisition_start_time: ext.get_timestamp("acquisition_start_time")?,
+            adc_max: ext.get_i16("adc_max")?,
+            adc_min: ext.get_i16("adc_min")?,
+            context_tags,
+            experiment_name: ext.get_string("experiment_name").unwrap_or_default(),
+            flow_cell_id: ext.get_string("flow_cell_id").unwrap_or_default(),
+            flow_cell_product_code: ext.get_string("flow_cell_product_code").unwrap_or_default(),
+            protocol_name: ext.get_string("protocol_name").unwrap_or_default(),
+            protocol_run_id: ext.get_string("protocol_run_id").unwrap_or_default(),
+            protocol_start_time: ext.get_timestamp("protocol_start_time").unwrap_or(0),
+            sample_id: ext.get_string("sample_id").unwrap_or_default(),
+            sample_rate: ext.get_u16("sample_rate")?,
+            sequencing_kit: ext.get_string("sequencing_kit").unwrap_or_default(),
+            sequencer_position: ext.get_string("sequencer_position").unwrap_or_default(),
+            sequencer_position_type: ext.get_string("sequencer_position_type").unwrap_or_default(),
+            software: ext.get_string("software").unwrap_or_default(),
+            system_name: ext.get_string("system_name").unwrap_or_default(),
+            system_type: ext.get_string("system_type").unwrap_or_default(),
+            tracking_id,
         })
+    }
+
+    /// Parse a Map column into a HashMap.
+    fn parse_map_column(batch: &RecordBatch, name: &str, row: usize) -> HashMap<String, String> {
+        use arrow::array::{Array, MapArray, StringArray, StructArray};
+
+        let Some(col) = batch.column_by_name(name) else {
+            return HashMap::new();
+        };
+
+        let Some(map_array) = col.as_any().downcast_ref::<MapArray>() else {
+            return HashMap::new();
+        };
+
+        let mut result = HashMap::new();
+
+        // Get the entries for this row as a StructArray
+        let entries = map_array.value(row);
+        let Some(struct_array) = entries.as_any().downcast_ref::<StructArray>() else {
+            return HashMap::new();
+        };
+
+        if struct_array.num_columns() >= 2 {
+            if let (Some(keys), Some(values)) = (
+                struct_array.column(0).as_any().downcast_ref::<StringArray>(),
+                struct_array.column(1).as_any().downcast_ref::<StringArray>(),
+            ) {
+                for i in 0..struct_array.len() {
+                    if !keys.is_null(i) && !values.is_null(i) {
+                        result.insert(keys.value(i).to_string(), values.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -1195,184 +983,69 @@ impl<'a> Iterator for ReadIterator<'a> {
 
 impl<'a> ReadIterator<'a> {
     fn read_from_batch(batch: &RecordBatch, row: usize) -> Result<ReadData> {
-        use arrow::array::{
-            Array, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, ListArray,
-            UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-        };
-
-        // Helper functions
-        let get_uuid = |name: &str| -> Result<Uuid> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr = col
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: name.to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
-            let bytes = arr.value(row);
-            Uuid::from_slice(bytes).map_err(|e| Error::InvalidUuid(e.to_string()))
-        };
-
-        let get_u8 = |name: &str| -> Result<u8> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt8Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt8Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u16 = |name: &str| -> Result<u16> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt16Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u32 = |name: &str| -> Result<u32> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt32Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_u64 = |name: &str| -> Result<u64> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected UInt64Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_f32 = |name: &str| -> Result<f32> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected Float32Array".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        let get_bool = |name: &str| -> Result<bool> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-            let arr =
-                col.as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected BooleanArray".to_string(),
-                    })?;
-            Ok(arr.value(row))
-        };
-
-        // Get dictionary-encoded string value
-        let get_dict_string = |name: &str| -> Result<String> {
-            let col = batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::MissingField(name.to_string()))?;
-
-            // Try Int16 dictionary first
-            if let Some(dict) = col
-                .as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::Int16Type>>()
-            {
-                let keys = dict.keys();
-                let values = dict.values();
-                let values = values
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: name.to_string(),
-                        message: "Expected String dictionary values".to_string(),
-                    })?;
-                let key = keys.value(row);
-                return Ok(values.value(key as usize).to_string());
-            }
-
-            Err(Error::InvalidField {
-                field: name.to_string(),
-                message: "Expected DictionaryArray".to_string(),
-            })
-        };
-
-        // Extract signal row indices from list
-        let signal_rows = {
-            let col = batch
-                .column_by_name("signal")
-                .ok_or_else(|| Error::MissingField("signal".to_string()))?;
-            let list_arr =
-                col.as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
-            let values = list_arr.value(row);
-            let u64_arr = values
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected UInt64Array values".to_string(),
-                })?;
-            u64_arr.values().to_vec()
-        };
-
-        Ok(ReadData {
-            read_id: get_uuid("read_id")?,
-            read_number: get_u32("read_number")?,
-            start_sample: get_u64("start")?,
-            channel: get_u16("channel")?,
-            well: get_u8("well")?,
-            pore_type: get_dict_string("pore_type").unwrap_or_default(),
-            calibration_offset: get_f32("calibration_offset")?,
-            calibration_scale: get_f32("calibration_scale")?,
-            median_before: get_f32("median_before")?,
-            end_reason: get_dict_string("end_reason")
-                .unwrap_or_default()
-                .parse()
-                .unwrap(),
-            end_reason_forced: get_bool("end_reason_forced")?,
-            run_info_index: 0, // TODO: parse from dictionary
-            num_minknow_events: get_u64("num_minknow_events")?,
-            num_samples: get_u64("num_samples")?,
-            open_pore_level: get_f32("open_pore_level").unwrap_or(0.0),
-            signal_rows,
-        })
+        extract_read_from_batch(batch, row, false)
     }
+}
+
+/// Extract a read from a record batch at the given row.
+///
+/// This is the shared implementation used by both `Reader::read_from_batch`
+/// and `ReadIterator::read_from_batch`.
+///
+/// The `try_alternate_field_names` parameter controls whether to try alternate
+/// field names for compatibility with different POD5 versions:
+/// - `start_sample` vs `start`
+/// - `predicted_scaling_open_pore_level` vs `open_pore_level`
+fn extract_read_from_batch(
+    batch: &RecordBatch,
+    row: usize,
+    try_alternate_field_names: bool,
+) -> Result<ReadData> {
+    let ext = BatchFieldExtractor::new(batch, row);
+
+    // Handle start_sample field name variations
+    let start_sample = if try_alternate_field_names {
+        ext.get_u64("start_sample")
+            .or_else(|_| ext.get_u64("start"))?
+    } else {
+        ext.get_u64("start")?
+    };
+
+    // Handle open_pore_level field name variations
+    let open_pore_level = if try_alternate_field_names {
+        ext.get_f32("predicted_scaling_open_pore_level")
+            .or_else(|_| ext.get_f32("open_pore_level"))
+            .unwrap_or(0.0)
+    } else {
+        ext.get_f32("open_pore_level").unwrap_or(0.0)
+    };
+
+    // Get run_info index from dictionary key
+    let run_info_index = ext
+        .get_dict_index("run_info")
+        .map(|idx| idx as u32)
+        .unwrap_or(0);
+
+    // Parse end_reason - use FromStr which returns Infallible
+    let end_reason_str = ext.get_dict_string("end_reason").unwrap_or_default();
+    let end_reason = end_reason_str.parse().unwrap_or_default();
+
+    Ok(ReadData {
+        read_id: ext.get_uuid("read_id")?,
+        read_number: ext.get_u32("read_number")?,
+        start_sample,
+        channel: ext.get_u16("channel")?,
+        well: ext.get_u8("well")?,
+        pore_type: ext.get_dict_string("pore_type").unwrap_or_default(),
+        calibration_offset: ext.get_f32("calibration_offset")?,
+        calibration_scale: ext.get_f32("calibration_scale")?,
+        median_before: ext.get_f32("median_before")?,
+        end_reason,
+        end_reason_forced: ext.get_bool("end_reason_forced")?,
+        run_info_index,
+        num_minknow_events: ext.get_u64("num_minknow_events")?,
+        num_samples: ext.get_u64("num_samples")?,
+        open_pore_level,
+        signal_rows: ext.get_signal_rows()?,
+    })
 }

@@ -229,18 +229,23 @@ impl Writer {
     /// In predefined mode, returns error if value not found.
     /// In dynamic mode, adds new values as needed.
     fn get_pore_type_index(&mut self, pore_type: &str) -> Result<i16> {
-        if let Some(&idx) = self.pore_type_index.get(pore_type) {
-            Ok(idx)
-        } else if self.use_predefined_dictionaries {
-            Err(Error::DictionaryValueNotFound {
-                value: pore_type.to_string(),
-                dictionary_name: "pore_type".to_string(),
-            })
-        } else {
-            let idx = self.pore_types.len() as i16;
-            self.pore_types.push(pore_type.to_string());
-            self.pore_type_index.insert(pore_type.to_string(), idx);
-            Ok(idx)
+        use std::collections::hash_map::Entry;
+
+        match self.pore_type_index.entry(pore_type.to_string()) {
+            Entry::Occupied(e) => Ok(*e.get()),
+            Entry::Vacant(e) => {
+                if self.use_predefined_dictionaries {
+                    Err(Error::DictionaryValueNotFound {
+                        value: pore_type.to_string(),
+                        dictionary_name: "pore_type".to_string(),
+                    })
+                } else {
+                    let idx = self.pore_types.len() as i16;
+                    self.pore_types.push(pore_type.to_string());
+                    e.insert(idx);
+                    Ok(idx)
+                }
+            }
         }
     }
 
@@ -248,18 +253,23 @@ impl Writer {
     /// In predefined mode, returns error if value not found.
     /// In dynamic mode, adds new values as needed.
     fn get_end_reason_index(&mut self, end_reason: &str) -> Result<i16> {
-        if let Some(&idx) = self.end_reason_index.get(end_reason) {
-            Ok(idx)
-        } else if self.use_predefined_dictionaries {
-            Err(Error::DictionaryValueNotFound {
-                value: end_reason.to_string(),
-                dictionary_name: "end_reason".to_string(),
-            })
-        } else {
-            let idx = self.end_reasons.len() as i16;
-            self.end_reasons.push(end_reason.to_string());
-            self.end_reason_index.insert(end_reason.to_string(), idx);
-            Ok(idx)
+        use std::collections::hash_map::Entry;
+
+        match self.end_reason_index.entry(end_reason.to_string()) {
+            Entry::Occupied(e) => Ok(*e.get()),
+            Entry::Vacant(e) => {
+                if self.use_predefined_dictionaries {
+                    Err(Error::DictionaryValueNotFound {
+                        value: end_reason.to_string(),
+                        dictionary_name: "end_reason".to_string(),
+                    })
+                } else {
+                    let idx = self.end_reasons.len() as i16;
+                    self.end_reasons.push(end_reason.to_string());
+                    e.insert(idx);
+                    Ok(idx)
+                }
+            }
         }
     }
 
@@ -385,10 +395,13 @@ impl Writer {
         let normalized_batch = RecordBatch::try_new(schema, batch.columns().to_vec())?;
 
         // Write batch directly
-        self.signal_writer
-            .as_mut()
-            .unwrap()
-            .write(&normalized_batch)?;
+        if let Some(ref mut writer) = self.signal_writer {
+            writer.write(&normalized_batch)?;
+        } else {
+            return Err(Error::InvalidState(
+                "Signal writer not initialized".to_string(),
+            ));
+        }
         self.current_signal_row += row_count as u64;
 
         Ok((first_row, row_count))
@@ -595,7 +608,9 @@ impl Writer {
             let file = self.file.take().ok_or(Error::WriterFinalized)?;
             self.signal_writer = Some(ArrowFileWriter::try_new(file, &schema)?);
         }
-        self.signal_writer.as_mut().unwrap().write(&batch)?;
+        if let Some(ref mut writer) = self.signal_writer {
+            writer.write(&batch)?;
+        }
 
         Ok(())
     }
@@ -706,7 +721,9 @@ impl Writer {
             let cursor = Cursor::new(Vec::new());
             self.reads_writer = Some(ArrowFileWriter::try_new(cursor, &schema)?);
         }
-        self.reads_writer.as_mut().unwrap().write(&batch)?;
+        if let Some(ref mut writer) = self.reads_writer {
+            writer.write(&batch)?;
+        }
 
         Ok(())
     }
