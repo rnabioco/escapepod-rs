@@ -5,8 +5,8 @@
 use crate::progress::create_progress_bar;
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
 use chrono::{TimeZone, Utc};
-use owo_colors::OwoColorize;
 use escapepod::{Reader, RunInfoData};
+use owo_colors::OwoColorize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
