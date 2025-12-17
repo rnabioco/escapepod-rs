@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=podfive-basecall-bench
+#SBATCH --job-name=escapepod-basecall-bench
 #SBATCH --partition=aa100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -10,7 +10,7 @@
 #SBATCH --output=benchmark_%j.out
 #SBATCH --error=benchmark_%j.err
 
-# Basecall benchmark for podfive archive command on SLURM cluster
+# Basecall benchmark for escapepod archive command on SLURM cluster
 #
 # Usage:
 #   sbatch slurm_benchmark.sbatch <pod5_file> <reference.fa> <output_dir> [factors]
@@ -31,22 +31,22 @@ set -euo pipefail
 # Pixi environment name (set to empty string if not using pixi)
 PIXI_ENV="${PIXI_ENV:-}"
 
-# Path to podfive binary (will auto-detect if in PATH or built locally)
-PODFIVE_BIN="${PODFIVE_BIN:-}"
+# Path to escapepod binary (will auto-detect if in PATH or built locally)
+escapepod_BIN="${escapepod_BIN:-}"
 
 # ==============================================================================
 # Parse arguments
 # ==============================================================================
 
 if [[ $# -lt 3 ]]; then
-    echo "Usage: sbatch $0 <pod5_file> <reference.fa> <output_dir> [factors]"
-    echo ""
-    echo "Arguments:"
-    echo "  pod5_file    - Input POD5 file to benchmark"
-    echo "  reference.fa - Reference genome for alignment"
-    echo "  output_dir   - Directory for results"
-    echo "  factors      - Downsample factors (default: \"2 4\")"
-    exit 1
+  echo "Usage: sbatch $0 <pod5_file> <reference.fa> <output_dir> [factors]"
+  echo ""
+  echo "Arguments:"
+  echo "  pod5_file    - Input POD5 file to benchmark"
+  echo "  reference.fa - Reference genome for alignment"
+  echo "  output_dir   - Directory for results"
+  echo "  factors      - Downsample factors (default: \"2 4\")"
+  exit 1
 fi
 
 POD5_FILE="$1"
@@ -73,32 +73,32 @@ echo ""
 
 # Activate pixi environment if specified
 if [[ -n "$PIXI_ENV" ]]; then
-    echo "Activating pixi environment: $PIXI_ENV"
-    eval "$(pixi shell-hook -s bash -e "$PIXI_ENV")"
+  echo "Activating pixi environment: $PIXI_ENV"
+  eval "$(pixi shell-hook -s bash -e "$PIXI_ENV")"
 fi
 
-# Find podfive binary
-if [[ -n "$PODFIVE_BIN" ]]; then
-    PODFIVE="$PODFIVE_BIN"
-elif command -v podfive &> /dev/null; then
-    PODFIVE="podfive"
-elif [[ -x "./target/release/podfive" ]]; then
-    PODFIVE="./target/release/podfive"
+# Find escapepod binary
+if [[ -n "$escapepod_BIN" ]]; then
+  escapepod="$escapepod_BIN"
+elif command -v escapepod &>/dev/null; then
+  escapepod="escapepod"
+elif [[ -x "./target/release/escapepod" ]]; then
+  escapepod="./target/release/escapepod"
 else
-    echo "ERROR: podfive not found. Set PODFIVE_BIN or add to PATH."
-    exit 1
+  echo "ERROR: escapepod not found. Set escapepod_BIN or add to PATH."
+  exit 1
 fi
 
 # Verify dependencies
 echo "Checking dependencies..."
 for cmd in dorado samtools python3; do
-    if ! command -v "$cmd" &> /dev/null; then
-        echo "ERROR: $cmd not found in PATH"
-        exit 1
-    fi
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "ERROR: $cmd not found in PATH"
+    exit 1
+  fi
 done
 
-echo "  podfive:  $PODFIVE"
+echo "  escapepod:  $escapepod"
 echo "  dorado:   $(command -v dorado)"
 echo "  samtools: $(command -v samtools)"
 echo "  python3:  $(command -v python3)"
