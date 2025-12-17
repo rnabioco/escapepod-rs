@@ -1,4 +1,4 @@
-# VHS tape for podfive inspect command
+# VHS tape for escapepod inspect command
 Output docs/images/inspect.gif
 
 Set Shell "bash"
@@ -14,6 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "podfive inspect summary data/drna/yeast_trna_reads.pod5"
+Type "escapepod inspect summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 5s
