@@ -6,7 +6,7 @@
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use podfive_core::operations::{filter_files, read_ids_from_file, FilterOptions};
+use escapepod::operations::{filter_files, read_ids_from_file, FilterOptions};
 use std::path::PathBuf;
 
 pub fn run(input: PathBuf, ids_file: PathBuf, output: PathBuf) -> anyhow::Result<()> {

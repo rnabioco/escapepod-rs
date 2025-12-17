@@ -1,13 +1,13 @@
-# podfive summary
+# escapepod summary
 
 Generate a comprehensive summary of POD5 file(s) including read statistics, QC metrics, and run metadata.
 
-![podfive summary](../images/summary.gif)
+![escapepod summary](../images/summary.gif)
 
 ## Usage
 
 ```bash
-podfive summary <INPUT> [--json]
+escapepod summary <INPUT> [--json]
 ```
 
 ## Arguments
@@ -36,19 +36,19 @@ podfive summary <INPUT> [--json]
 ### Single File
 
 ```bash
-podfive summary experiment.pod5
+escapepod summary experiment.pod5
 ```
 
 ### Directory of Files
 
 ```bash
-podfive summary pod5_pass/
+escapepod summary pod5_pass/
 ```
 
 ### JSON Output
 
 ```bash
-podfive summary experiment.pod5 --json
+escapepod summary experiment.pod5 --json
 ```
 
 ## Output

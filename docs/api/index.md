@@ -5,7 +5,7 @@ Full API documentation is generated from source code using `cargo doc`.
 ## Generating Documentation
 
 ```bash
-cd podfive-rs
+cd escapepod-rs
 cargo doc --open --no-deps
 ```
 
@@ -13,7 +13,7 @@ This opens the documentation in your browser.
 
 ## Crate Structure
 
-### podfive-core
+### escapepod
 
 The core library providing POD5 read/write functionality.
 
@@ -40,7 +40,7 @@ The core library providing POD5 read/write functionality.
 | `schema` | Arrow schema definitions |
 | `types` | Core data types |
 
-### podfive-cli
+### escapepod-cli
 
 The command-line interface binary.
 
@@ -58,7 +58,7 @@ The command-line interface binary.
 ### Opening Files
 
 ```rust
-use podfive_core::Reader;
+use escapepod::Reader;
 
 let reader = Reader::open("file.pod5")?;
 ```
@@ -66,7 +66,7 @@ let reader = Reader::open("file.pod5")?;
 ### Creating Files
 
 ```rust
-use podfive_core::{Writer, WriterOptions};
+use escapepod::{Writer, WriterOptions};
 
 let writer = Writer::create("output.pod5", WriterOptions::default())?;
 ```
@@ -103,7 +103,7 @@ writer.finish()?;
 ## Error Handling
 
 ```rust
-use podfive_core::Error;
+use escapepod::Error;
 
 match result {
     Ok(value) => { /* success */ }
@@ -119,7 +119,7 @@ Currently no optional features. All functionality is included by default.
 
 ## Dependencies
 
-### podfive-core
+### escapepod
 
 | Crate | Purpose |
 |-------|---------|
@@ -130,7 +130,7 @@ Currently no optional features. All functionality is included by default.
 | `memmap2` | Memory-mapped files |
 | `thiserror` | Error derive |
 
-### podfive-cli
+### escapepod-cli
 
 | Crate | Purpose |
 |-------|---------|

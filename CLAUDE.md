@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-podfive-rs is a pure Rust implementation for reading and writing POD5 files, the native file format for Oxford Nanopore sequencing data. The project provides both a library crate (`podfive-core`) and a CLI tool (`podfive-cli`).
+escapepod-rs is a pure Rust implementation for reading and writing POD5 files, the native file format for Oxford Nanopore sequencing data. The project provides both a library crate (`escapepod`) and a CLI tool (`escapepod-cli`).
 
 ## Build Commands
 
@@ -22,15 +22,15 @@ cargo test test_round_trip_single_read
 cargo clippy
 
 # Run the CLI (after building)
-./target/release/podfive <command>
+./target/release/escapepod <command>
 ```
 
 ## Architecture
 
 ### Workspace Structure
 
-- **podfive-core**: Core library for reading/writing POD5 files
-- **podfive-cli**: CLI binary that uses podfive-core
+- **escapepod**: Core library for reading/writing POD5 files
+- **escapepod-cli**: CLI binary that uses escapepod
 
 ### POD5 File Format
 
@@ -49,7 +49,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 <POD5 signature>
 ```
 
-### Core Library (podfive-core)
+### Core Library (escapepod)
 
 - **reader/file_reader.rs**: Memory-mapped file reader using `memmap2`. Opens POD5 files, parses the FlatBuffer footer, and provides iterators over reads and signal data.
 - **writer/file_writer.rs**: Buffered writer that constructs POD5 files. Handles signal chunking, VBZ compression, and batching of Arrow record batches.

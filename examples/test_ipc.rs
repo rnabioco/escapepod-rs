@@ -1,4 +1,4 @@
-use podfive_core::{Reader, arrow_ipc::ArrowIpcFooter};
+use escapepod::{Reader, arrow_ipc::ArrowIpcFooter};
 
 fn main() -> anyhow::Result<()> {
     let reader = Reader::open("data/dna/pod5/FBC74904_90b682e0_e09f0700_0.pod5")?;

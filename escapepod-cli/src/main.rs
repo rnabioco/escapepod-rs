@@ -16,7 +16,7 @@ const STYLES: Styles = Styles::styled()
     .placeholder(AnsiColor::Cyan.on_default());
 
 #[derive(Parser)]
-#[command(name = "podfive")]
+#[command(name = "escapepod")]
 #[command(author, version, styles = STYLES)]
 #[command(about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data)")]
 #[command(
@@ -26,12 +26,12 @@ provides commands for viewing, inspecting, merging, filtering, and repacking POD
 )]
 #[command(after_help = "\
 Examples:
-  podfive view input.pod5                    View all reads as TSV
-  podfive view input.pod5 --ids              Extract just read IDs
-  podfive inspect summary input.pod5         Show file summary
-  podfive merge *.pod5 -o merged.pod5        Merge multiple files
-  podfive filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
-  podfive summary input.pod5                 Comprehensive statistics
+  escapepod view input.pod5                    View all reads as TSV
+  escapepod view input.pod5 --ids              Extract just read IDs
+  escapepod inspect summary input.pod5         Show file summary
+  escapepod merge *.pod5 -o merged.pod5        Merge multiple files
+  escapepod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
+  escapepod summary input.pod5                 Comprehensive statistics
 ")]
 struct Cli {
     #[command(subcommand)]
@@ -43,12 +43,12 @@ enum Commands {
     /// View read summaries from a POD5 file as TSV
     #[command(after_help = "\
 Examples:
-  podfive view input.pod5                      Output all fields as TSV
-  podfive view input.pod5 --ids                Output only read IDs
-  podfive view input.pod5 --include read_id,channel
-  podfive view input.pod5 --exclude signal_rows,pore_type
-  podfive view input.pod5 -o reads.tsv         Write to file
-  podfive view input.pod5 --separator ','      Use comma separator
+  escapepod view input.pod5                      Output all fields as TSV
+  escapepod view input.pod5 --ids                Output only read IDs
+  escapepod view input.pod5 --include read_id,channel
+  escapepod view input.pod5 --exclude signal_rows,pore_type
+  escapepod view input.pod5 -o reads.tsv         Write to file
+  escapepod view input.pod5 --separator ','      Use comma separator
 ")]
     View {
         /// Input POD5 file
@@ -82,9 +82,9 @@ Examples:
     /// Inspect POD5 file contents
     #[command(after_help = "\
 Examples:
-  podfive inspect summary input.pod5           Show file summary
-  podfive inspect reads input.pod5             List all read IDs
-  podfive inspect read input.pod5 <READ_ID>    Show details for one read
+  escapepod inspect summary input.pod5           Show file summary
+  escapepod inspect reads input.pod5             List all read IDs
+  escapepod inspect read input.pod5 <READ_ID>    Show details for one read
 ")]
     Inspect {
         #[command(subcommand)]
@@ -94,9 +94,9 @@ Examples:
     /// Merge multiple POD5 files into one
     #[command(after_help = "\
 Examples:
-  podfive merge *.pod5 -o merged.pod5          Merge all POD5 files
-  podfive merge a.pod5 b.pod5 -o out.pod5      Merge specific files
-  podfive merge *.pod5 -o out.pod5 --duplicate-ok
+  escapepod merge *.pod5 -o merged.pod5          Merge all POD5 files
+  escapepod merge a.pod5 b.pod5 -o out.pod5      Merge specific files
+  escapepod merge *.pod5 -o out.pod5 --duplicate-ok
 ")]
     Merge {
         /// Input POD5 files
@@ -115,7 +115,7 @@ Examples:
     /// Filter reads by ID list
     #[command(after_help = "\
 Examples:
-  podfive filter input.pod5 -i ids.txt -o filtered.pod5
+  escapepod filter input.pod5 -i ids.txt -o filtered.pod5
 
 The ID file should contain one read ID per line (UUID format).
 ")]
@@ -161,8 +161,8 @@ The ID file should contain one read ID per line (UUID format).
     /// Repack POD5 files to optimize storage
     #[command(after_help = "\
 Examples:
-  podfive repack input.pod5 -o output_dir/
-  podfive repack *.pod5 -o repacked/ --force
+  escapepod repack input.pod5 -o output_dir/
+  escapepod repack *.pod5 -o repacked/ --force
 ")]
     Repack {
         /// Input POD5 files
@@ -181,7 +181,7 @@ Examples:
     /// Subset reads into multiple files based on CSV mapping
     #[command(after_help = "\
 Examples:
-  podfive subset input.pod5 --csv mapping.csv -o output_dir/
+  escapepod subset input.pod5 --csv mapping.csv -o output_dir/
 
 The CSV file should have columns: read_id,output
 Each unique 'output' value creates a separate POD5 file.
@@ -206,9 +206,9 @@ Each unique 'output' value creates a separate POD5 file.
     /// Show comprehensive summary of POD5 file(s)
     #[command(after_help = "\
 Examples:
-  podfive summary input.pod5                   Summary for one file
-  podfive summary *.pod5                       Summary across all files
-  podfive summary input.pod5 --json            Output as JSON
+  escapepod summary input.pod5                   Summary for one file
+  escapepod summary *.pod5                       Summary across all files
+  escapepod summary input.pod5 --json            Output as JSON
 ")]
     Summary(commands::summary::SummaryArgs),
 }

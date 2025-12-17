@@ -12,40 +12,40 @@
 Clone the repository and build:
 
 ```bash
-git clone https://github.com/rnabioco/podfive-rs.git
-cd podfive-rs
+git clone https://github.com/rnabioco/escapepod-rs.git
+cd escapepod-rs
 cargo build --release
 ```
 
-The binary will be at `target/release/podfive`. You can copy it to a directory in your PATH:
+The binary will be at `target/release/escapepod`. You can copy it to a directory in your PATH:
 
 ```bash
-cp target/release/podfive ~/.local/bin/
+cp target/release/escapepod ~/.local/bin/
 # or
-sudo cp target/release/podfive /usr/local/bin/
+sudo cp target/release/escapepod /usr/local/bin/
 ```
 
 ### Verify Installation
 
 ```bash
-podfive --version
-podfive --help
+escapepod --version
+escapepod --help
 ```
 
 ## Using the Library
 
-Add podfive-core to your `Cargo.toml`:
+Add escapepod to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-podfive-core = { git = "https://github.com/rnabioco/podfive-rs.git" }
+escapepod = { git = "https://github.com/rnabioco/escapepod-rs.git" }
 ```
 
 Or if published to crates.io:
 
 ```toml
 [dependencies]
-podfive-core = "0.1"
+escapepod = "0.1"
 ```
 
 ## Building Documentation
@@ -58,12 +58,12 @@ cargo doc --open
 
 ## Development Setup
 
-For contributing to podfive-rs:
+For contributing to escapepod-rs:
 
 ```bash
 # Clone the repository
-git clone https://github.com/rnabioco/podfive-rs.git
-cd podfive-rs
+git clone https://github.com/rnabioco/escapepod-rs.git
+cd escapepod-rs
 
 # Run tests
 cargo test

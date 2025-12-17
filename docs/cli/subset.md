@@ -1,13 +1,13 @@
-# podfive subset
+# escapepod subset
 
 Split reads from a POD5 file into multiple output files based on a CSV mapping.
 
-![podfive subset](../images/subset.gif)
+![escapepod subset](../images/subset.gif)
 
 ## Usage
 
 ```bash
-podfive subset --csv <FILE> -o <OUTPUT_DIR> [OPTIONS] <INPUT>
+escapepod subset --csv <FILE> -o <OUTPUT_DIR> [OPTIONS] <INPUT>
 ```
 
 ## Arguments
@@ -66,7 +66,7 @@ EOF
 Split the POD5 file:
 
 ```bash
-podfive subset experiment.pod5 --csv mapping.csv -o demultiplexed/
+escapepod subset experiment.pod5 --csv mapping.csv -o demultiplexed/
 ```
 
 ### Demultiplexing by Barcode
@@ -75,7 +75,7 @@ If you have demultiplexing results from basecalling:
 
 ```bash
 # Assuming you have a CSV from your demultiplexing pipeline
-podfive subset multiplexed.pod5 --csv barcode_assignments.csv -o demux/
+escapepod subset multiplexed.pod5 --csv barcode_assignments.csv -o demux/
 ```
 
 ### Splitting by Sample
@@ -83,7 +83,7 @@ podfive subset multiplexed.pod5 --csv barcode_assignments.csv -o demux/
 Split reads into per-sample files:
 
 ```bash
-podfive subset pooled.pod5 --csv sample_mapping.csv -o samples/
+escapepod subset pooled.pod5 --csv sample_mapping.csv -o samples/
 ```
 
 ## Output

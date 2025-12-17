@@ -1,13 +1,13 @@
-# podfive filter
+# escapepod filter
 
 Extract specific reads from a POD5 file based on read IDs.
 
-![podfive filter](../images/filter.gif)
+![escapepod filter](../images/filter.gif)
 
 ## Usage
 
 ```bash
-podfive filter -i <IDS_FILE> -o <OUTPUT> <INPUT>
+escapepod filter -i <IDS_FILE> -o <OUTPUT> <INPUT>
 ```
 
 ## Arguments
@@ -57,7 +57,7 @@ EOF
 Filter the POD5 file:
 
 ```bash
-podfive filter -i interesting_reads.txt -o filtered.pod5 experiment.pod5
+escapepod filter -i interesting_reads.txt -o filtered.pod5 experiment.pod5
 ```
 
 ### Filter from Basecalling Results
@@ -69,7 +69,7 @@ If you have basecalling results with read IDs of interest:
 samtools view aligned.bam | cut -f1 | sort -u > mapped_reads.txt
 
 # Filter POD5 to only mapped reads
-podfive filter -i mapped_reads.txt -o mapped.pod5 experiment.pod5
+escapepod filter -i mapped_reads.txt -o mapped.pod5 experiment.pod5
 ```
 
 ### Filter Using Another POD5 File
@@ -77,8 +77,8 @@ podfive filter -i mapped_reads.txt -o mapped.pod5 experiment.pod5
 Extract reads that exist in another file:
 
 ```bash
-podfive inspect reads reference.pod5 > reference_ids.txt
-podfive filter -i reference_ids.txt -o matching.pod5 experiment.pod5
+escapepod inspect reads reference.pod5 > reference_ids.txt
+escapepod filter -i reference_ids.txt -o matching.pod5 experiment.pod5
 ```
 
 ## Output

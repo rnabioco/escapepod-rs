@@ -56,7 +56,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p podfive-cli
+        run: cargo build --release --target ${{ matrix.target }} -p escapepod-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
@@ -64,21 +64,21 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czvf ../../../podfive-${{ github.ref_name }}-${{ matrix.target }}.tar.gz podfive
+          tar czvf ../../../escapepod-${{ github.ref_name }}-${{ matrix.target }}.tar.gz escapepod
           cd ../../..
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../podfive-${{ github.ref_name }}-${{ matrix.target }}.zip podfive.exe
+          7z a ../../../escapepod-${{ github.ref_name }}-${{ matrix.target }}.zip escapepod.exe
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: podfive-${{ matrix.target }}
-          path: podfive-${{ github.ref_name }}-${{ matrix.target }}.*
+          name: escapepod-${{ matrix.target }}
+          path: escapepod-${{ github.ref_name }}-${{ matrix.target }}.*
 
   release:
     name: Create Release
@@ -96,7 +96,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum podfive-* > SHA256SUMS.txt
+          sha256sum escapepod-* > SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

@@ -305,7 +305,7 @@ pub(crate) fn build_pod5_footer(
     reads_length: i64,
 ) -> Result<Vec<u8>> {
     let file_id = Uuid::new_v4().to_string();
-    let software = format!("podfive-rs {}", env!("CARGO_PKG_VERSION"));
+    let software = format!("escapepod-rs {}", env!("CARGO_PKG_VERSION"));
     let version = POD5_VERSION;
 
     let embedded_files = [

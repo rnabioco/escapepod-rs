@@ -11,7 +11,7 @@ use crate::{Error, Result, Uuid};
 /// # Examples
 ///
 /// ```
-/// use podfive_core::utils::parse_uuid_flexible;
+/// use escapepod::utils::parse_uuid_flexible;
 ///
 /// // Standard format
 /// let uuid = parse_uuid_flexible("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();

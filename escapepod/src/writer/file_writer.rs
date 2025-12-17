@@ -48,7 +48,7 @@ impl Default for WriterOptions {
             signal_batch_size: 100,
             read_batch_size: 1000,
             compress_signal: true,
-            software: format!("podfive-rs {}", env!("CARGO_PKG_VERSION")),
+            software: format!("escapepod-rs {}", env!("CARGO_PKG_VERSION")),
             predefined_dictionaries: None,
         }
     }

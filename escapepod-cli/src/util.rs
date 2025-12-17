@@ -1,6 +1,6 @@
 //! Utility functions for the CLI.
 
-use podfive_core::Reader;
+use escapepod::Reader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -114,7 +114,7 @@ pub fn get_reads_iter_with_warning<'a>(
     reader: &'a Reader,
     file_path: &Path,
     is_directory: bool,
-) -> OpenResult<impl Iterator<Item = podfive_core::Result<podfive_core::ReadData>> + 'a> {
+) -> OpenResult<impl Iterator<Item = escapepod::Result<escapepod::ReadData>> + 'a> {
     match reader.reads() {
         Ok(iter) => OpenResult::Ok(iter),
         Err(e) => {

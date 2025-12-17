@@ -1,13 +1,13 @@
-# podfive repack
+# escapepod repack
 
 Repack POD5 files to optimize storage and apply current compression settings.
 
-![podfive repack](../images/repack.gif)
+![escapepod repack](../images/repack.gif)
 
 ## Usage
 
 ```bash
-podfive repack -o <OUTPUT_DIR> [OPTIONS] <FILES>...
+escapepod repack -o <OUTPUT_DIR> [OPTIONS] <FILES>...
 ```
 
 ## Arguments
@@ -29,19 +29,19 @@ podfive repack -o <OUTPUT_DIR> [OPTIONS] <FILES>...
 ### Repack a Single File
 
 ```bash
-podfive repack input.pod5 -o repacked/
+escapepod repack input.pod5 -o repacked/
 ```
 
 ### Repack Multiple Files
 
 ```bash
-podfive repack *.pod5 -o repacked/
+escapepod repack *.pod5 -o repacked/
 ```
 
 ### Overwrite Existing Files
 
 ```bash
-podfive repack *.pod5 -o repacked/ --force
+escapepod repack *.pod5 -o repacked/ --force
 ```
 
 ### In-Place Repacking
@@ -49,7 +49,7 @@ podfive repack *.pod5 -o repacked/ --force
 You can safely repack files in place (output to the same directory as input). The command uses temporary files to prevent data corruption:
 
 ```bash
-podfive repack data/*.pod5 -o data/ --force
+escapepod repack data/*.pod5 -o data/ --force
 ```
 
 ## Output

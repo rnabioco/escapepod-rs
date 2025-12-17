@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide will help you get started with podfive-rs in just a few minutes.
+This guide will help you get started with escapepod-rs in just a few minutes.
 
 ## CLI Quick Start
 
@@ -9,7 +9,7 @@ This guide will help you get started with podfive-rs in just a few minutes.
 The simplest way to explore a POD5 file is with the `view` command:
 
 ```bash
-podfive view experiment.pod5
+escapepod view experiment.pod5
 ```
 
 This displays a table of reads with key information like read ID, channel, and sample count.
@@ -19,7 +19,7 @@ This displays a table of reads with key information like read ID, channel, and s
 Get a summary of the file:
 
 ```bash
-podfive inspect summary experiment.pod5
+escapepod inspect summary experiment.pod5
 ```
 
 Output:
@@ -33,7 +33,7 @@ File size: 1.2 GB
 List all reads:
 
 ```bash
-podfive inspect reads experiment.pod5
+escapepod inspect reads experiment.pod5
 ```
 
 ### Merging Files
@@ -41,7 +41,7 @@ podfive inspect reads experiment.pod5
 Combine multiple POD5 files from a sequencing run:
 
 ```bash
-podfive merge -o combined.pod5 file1.pod5 file2.pod5 file3.pod5
+escapepod merge -o combined.pod5 file1.pod5 file2.pod5 file3.pod5
 ```
 
 ### Filtering Reads
@@ -56,7 +56,7 @@ b2c3d4e5-f6a7-8901-bcde-f12345678901
 Then filter:
 
 ```bash
-podfive filter -i read_ids.txt -o filtered.pod5 experiment.pod5
+escapepod filter -i read_ids.txt -o filtered.pod5 experiment.pod5
 ```
 
 ## Library Quick Start
@@ -64,7 +64,7 @@ podfive filter -i read_ids.txt -o filtered.pod5 experiment.pod5
 ### Reading a POD5 File
 
 ```rust
-use podfive_core::{Reader, Result};
+use escapepod::{Reader, Result};
 
 fn main() -> Result<()> {
     // Open a POD5 file
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
 ### Accessing Run Information
 
 ```rust
-use podfive_core::Reader;
+use escapepod::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
 
@@ -118,9 +118,9 @@ for run_info in reader.run_infos() {
 ### Writing a POD5 File
 
 ```rust
-use podfive_core::{Writer, WriterOptions, ReadData, RunInfoData};
+use escapepod::{Writer, WriterOptions, ReadData, RunInfoData};
 
-fn main() -> podfive_core::Result<()> {
+fn main() -> escapepod::Result<()> {
     // Create a new POD5 file
     let mut writer = Writer::create("output.pod5", WriterOptions::default())?;
 
