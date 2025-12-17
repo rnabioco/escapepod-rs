@@ -18,6 +18,19 @@ escapepod-rs is a pure Rust implementation for working with POD5 files, the nati
 - Full support for reads, signal, and run info tables
 - CLI tools for viewing, inspecting, merging, and filtering POD5 files
 
+## Performance
+
+escapepod is significantly faster than the Python `pod5` tool for most operations:
+
+| Operation | Speedup |
+|-----------|---------|
+| inspect | 43x faster |
+| view | 25x faster |
+| filter | 8x faster |
+| merge | 3.6x faster |
+
+See [benchmarks/](benchmarks/) for detailed methodology and results.
+
 ## Installation
 
 ### From source
