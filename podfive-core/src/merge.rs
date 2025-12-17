@@ -13,7 +13,7 @@ use crate::utils::table_builders::{
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 /// Options for merge operations.
@@ -81,6 +81,7 @@ struct FileMetadata {
     reads: Vec<ReadData>,
 }
 
+
 /// Main merge implementation using zero-copy async I/O.
 /// Uses scoped threads to pass mmap slices directly to writer thread.
 fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -89,9 +90,6 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     options: &MergeOptions,
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeResult> {
-    use std::sync::mpsc;
-    use std::thread;
-
     let num_files = inputs.len();
 
     // Convert to owned paths for parallel processing
@@ -122,6 +120,17 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
     let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
 
+    // Phase 1.5: Pre-fault mmap pages in parallel (touch bytes without copying)
+    file_metadata.par_iter().for_each(|metadata| {
+        if let Ok(signal_bytes) = metadata.reader.signal_table_bytes() {
+            // Touch every 4KB page to trigger page faults in parallel
+            let _ = signal_bytes
+                .iter()
+                .step_by(4096)
+                .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        }
+    });
+
     // Phase 2: Write signal data using scoped thread (zero-copy from mmap)
     let mut all_batches: Vec<BatchBlock> = Vec::new();
     let mut current_offset: usize = 0;
@@ -129,7 +138,10 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
 
     // Use scoped thread to allow borrowing mmap slices without copying
-    let (file, signal_end, signal_rows) = thread::scope(|scope| -> Result<(File, usize, u64)> {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let (mut file, signal_end, signal_rows) = thread::scope(|scope| -> Result<(File, usize, u64)> {
         // Channel for sending byte slices to writer thread
         let (tx, rx) = mpsc::sync_channel::<&[u8]>(4); // Small buffer for backpressure
 
@@ -198,11 +210,10 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             }
         }
 
-        // Close channel - must happen before footer_bytes is created
-        // to ensure all mmap slices are consumed
+        // Close channel
         drop(tx);
 
-        // Wait for writer to finish with mmap data
+        // Wait for writer to finish
         let (mut file, _signal_end) = writer_handle
             .join()
             .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
@@ -223,9 +234,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         Ok((file, final_pos, current_signal_row))
     })?;
 
-    // Phase 3: Write remaining sections using BufWriter
-    let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
-    file.seek(SeekFrom::Start(signal_end as u64))?;
+    // Phase 3: Write remaining sections (file is already buffered)
 
     // Pad to 8-byte alignment
     let padding_needed = (8 - (signal_end % 8)) % 8;
