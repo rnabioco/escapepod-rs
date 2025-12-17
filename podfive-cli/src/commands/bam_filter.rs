@@ -2,22 +2,17 @@
 //!
 //! Filters reads from a POD5 file based on a paired BAM file.
 //! Supports filtering by mapped status, region, and mapping quality.
-//! Uses lazy signal loading and block-level copying for maximum performance.
+//! Uses the optimized filter_files() for maximum performance.
 
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
-use crate::util::{
-    batch_sizes, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
-    LimitedWarningReporter, OpenResult,
-};
+use crate::util::resolve_pod5_inputs;
 use bstr::ByteSlice;
 use noodles_bam as bam;
 use noodles_core::Region;
-use podfive_core::utils::{
-    add_run_infos_deduplicated, map_run_info_index, parse_uuid_flexible, scan_dictionary_values,
-};
-use podfive_core::{PredefinedDictionaries, Writer, WriterOptions};
-use std::collections::{HashMap, HashSet};
+use podfive_core::operations::{filter_files, FilterOptions};
+use podfive_core::utils::parse_uuid_flexible;
+use std::collections::HashSet;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -84,123 +79,50 @@ pub fn run(
         );
     }
 
-    // Pre-scan files to collect unique dictionary values and count total reads
-    let scan_spinner = create_spinner("Scanning")?;
-    scan_spinner.set_message("POD5 files for dictionary values...");
-    let scanned = scan_dictionary_values(&files, Some(&ids));
-    scan_spinner.finish_with_message(format!(
-        "{} reads found",
-        style::count(scanned.total_read_count)
-    ));
+    // Set up progress bar
+    let filter_bar = create_progress_bar(0, "Filtering")?;
+    filter_bar.set_length(0); // Will be set by first progress callback
 
-    // Create writer with predefined dictionaries for consistent multi-batch writes
-    let options = WriterOptions {
-        signal_batch_size: batch_sizes::SIGNAL_BATCH_SIZE,
-        read_batch_size: batch_sizes::READ_BATCH_SIZE,
-        predefined_dictionaries: Some(PredefinedDictionaries {
-            pore_types: Some(scanned.pore_types.into_iter().collect()),
-            end_reasons: Some(scanned.end_reasons.into_iter().collect()),
-        }),
-        ..WriterOptions::default()
+    let bar_for_callback = filter_bar.clone();
+
+    // Create progress callback
+    let progress: Box<dyn Fn(u64, u64) + Send + Sync> =
+        Box::new(move |current: u64, total: u64| {
+            bar_for_callback.set_length(total);
+            bar_for_callback.set_position(current);
+        });
+
+    // Use the core library's optimized filter
+    let options = FilterOptions {
+        signal_batch_size: 1_000,
+        read_batch_size: 10_000,
     };
-    let mut writer = Writer::create(&output, options)?;
 
-    // Track run infos across all files
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
+    let result = filter_files(&files, &output, &ids, options, Some(progress))?;
 
-    // Filter reads from all files
-    let filter_bar = create_progress_bar(scanned.total_read_count, "Filtering")?;
-    let mut matched = 0u64;
-    let mut total = 0u64;
-    let mut read_warnings = LimitedWarningReporter::new(3);
-    let mut signal_warnings = LimitedWarningReporter::new(3);
-
-    for file_path in &files {
-        let reader = match open_reader_with_warning(file_path, is_directory) {
-            OpenResult::Ok(r) => r,
-            OpenResult::Skip => continue,
-            OpenResult::Err(e) => return Err(e),
-        };
-
-        // Add run infos (deduplicated by acquisition_id)
-        add_run_infos_deduplicated(&reader, &mut writer, &mut run_info_map)?;
-
-        let reads_iter = match get_reads_iter_with_warning(&reader, file_path, is_directory) {
-            OpenResult::Ok(iter) => iter,
-            OpenResult::Skip => continue,
-            OpenResult::Err(e) => return Err(e),
-        };
-
-        for read_result in reads_iter {
-            let read = match read_result {
-                Ok(r) => r,
-                Err(e) => {
-                    read_warnings.warn(&format!("error reading read record: {}", e));
-                    continue;
-                }
-            };
-            total += 1;
-            filter_bar.inc(1);
-            filter_bar.set_message(format!("{} matched", matched));
-
-            // Check if this read's ID is in the BAM-derived filter set
-            if ids.contains(&read.read_id) {
-                // Lazy load: only fetch signal for matching reads
-                let compressed_signal =
-                    match reader.get_compressed_signal_for_rows(&read.signal_rows) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            signal_warnings.warn(&format!(
-                                "cannot read signal for read {}: {}",
-                                read.read_id, e
-                            ));
-                            continue;
-                        }
-                    };
-
-                // Map run_info index
-                let new_run_info_idx =
-                    map_run_info_index(&reader, read.run_info_index, &run_info_map);
-
-                // Create new read data for writing
-                let new_read = read.for_writing(new_run_info_idx);
-
-                writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
-                matched += 1;
-            }
-        }
-    }
-
-    filter_bar.finish_with_message(format!("{} matched", matched));
+    filter_bar.finish_with_message(format!("{} matched", result.matched_reads));
 
     // Check for BAM/POD5 mismatch
-    if matched == 0 && total > 0 {
+    if result.matched_reads == 0 && result.total_reads > 0 {
         anyhow::bail!(
             "No overlap between BAM and POD5 files. \
              The BAM file may not correspond to this POD5 data. \
              POD5 contained {} reads, BAM filter matched {} read IDs.",
-            total,
+            result.total_reads,
             ids.len()
         );
     }
 
-    // Finalize output
-    writer.finish()?;
-
-    let percentage = if total > 0 {
-        (matched as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
+    let percentage = result.match_percentage();
     println!(
         "{} {} reads from {} total ({})",
         style::action("Filtered"),
-        style::count(matched),
-        total,
+        style::count(result.matched_reads),
+        result.total_reads,
         style::percentage(format!("{:.1}%", percentage))
     );
 
-    let not_found = (ids.len() as u64).saturating_sub(matched);
+    let not_found = (ids.len() as u64).saturating_sub(result.matched_reads);
     if not_found > 0 {
         println!(
             "{} {} BAM read IDs were not found in POD5 file(s)",
@@ -210,14 +132,12 @@ pub fn run(
     }
 
     // Report any errors encountered
-    let read_errors = read_warnings.count();
-    let signal_errors = signal_warnings.count();
-    if read_errors > 0 || signal_errors > 0 {
+    if result.read_errors > 0 || result.signal_errors > 0 {
         eprintln!(
             "{} encountered {} read error(s) and {} signal error(s)",
             style::error_label("Warning:"),
-            style::error(read_errors),
-            style::error(signal_errors)
+            style::error(result.read_errors),
+            style::error(result.signal_errors)
         );
     }
 
