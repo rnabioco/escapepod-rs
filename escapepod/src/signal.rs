@@ -18,7 +18,7 @@
 ///
 /// # Example
 /// ```
-/// use podfive_core::signal::downsample;
+/// use escapepod::signal::downsample;
 ///
 /// let signal = vec![100i16, 110, 105, 115, 108, 118, 112, 122];
 /// let downsampled = downsample(&signal, 2);
@@ -48,7 +48,7 @@ pub fn downsample(signal: &[i16], factor: u32) -> Vec<i16> {
 ///
 /// # Example
 /// ```
-/// use podfive_core::signal::downsample_average;
+/// use escapepod::signal::downsample_average;
 ///
 /// let signal = vec![100i16, 110, 105, 115, 108, 118, 112, 122];
 /// let downsampled = downsample_average(&signal, 2);

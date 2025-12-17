@@ -11,7 +11,7 @@
 #
 # Requirements:
 #   - dorado (in PATH)
-#   - podfive (in PATH or ./target/release/)
+#   - escapepod (in PATH or ./target/release/)
 #   - samtools (in PATH)
 #   - Python 3 with pysam, pandas
 #
@@ -71,14 +71,14 @@ if [[ ! -f "$REFERENCE" ]]; then
     exit 1
 fi
 
-# Find podfive binary
-PODFIVE=""
-if command -v podfive &> /dev/null; then
-    PODFIVE="podfive"
-elif [[ -x "./target/release/podfive" ]]; then
-    PODFIVE="./target/release/podfive"
+# Find escapepod binary
+ESCAPEPOD=""
+if command -v escapepod &> /dev/null; then
+    ESCAPEPOD="escapepod"
+elif [[ -x "./target/release/escapepod" ]]; then
+    ESCAPEPOD="./target/release/escapepod"
 else
-    log_error "podfive not found. Build with 'cargo build --release' or add to PATH."
+    log_error "escapepod not found. Build with 'cargo build --release' or add to PATH."
     exit 1
 fi
 
@@ -99,7 +99,7 @@ log_info "  Reference: $REFERENCE"
 log_info "  Output dir: $OUTPUT_DIR"
 log_info "  Downsample factors: $FACTORS"
 log_info "  Models: $MODELS"
-log_info "  podfive: $PODFIVE"
+log_info "  escapepod: $ESCAPEPOD"
 echo ""
 
 # Step 1: Create archived (downsampled) POD5 files
@@ -110,7 +110,7 @@ for factor in $FACTORS; do
         log_warn "Skipping existing: $archived"
     else
         log_info "  Creating ${factor}x downsampled file..."
-        "$PODFIVE" archive "$POD5_FILE" -o "$archived" --factor "$factor"
+        "$ESCAPEPOD" archive "$POD5_FILE" -o "$archived" --factor "$factor"
     fi
 done
 echo ""

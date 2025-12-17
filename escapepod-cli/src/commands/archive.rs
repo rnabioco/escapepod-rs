@@ -6,12 +6,9 @@
 
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
-use crate::util::{
-    batch_sizes, get_reads_iter_with_warning, map_run_info_index, open_reader_with_warning,
-    resolve_pod5_inputs, scan_dictionary_values, LimitedWarningReporter, OpenResult,
-};
-use podfive_core::signal::{downsample, downsample_average, downsampled_rate};
-use podfive_core::{PredefinedDictionaries, Reader, RunInfoData, Writer, WriterOptions};
+use crate::util::{get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs, OpenResult};
+use escapepod::signal::{downsample, downsample_average, downsampled_rate};
+use escapepod::{Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -80,39 +77,38 @@ pub fn run(
     // Print warning about basecalling impact
     print_basecalling_warning(factor);
 
-    // Pre-scan files to collect unique dictionary values and count total reads
+    // Pre-scan files to count total reads
     let spinner = create_spinner("Scanning")?;
     spinner.set_message("files...");
-    let scanned = scan_dictionary_values(&files, None);
+    let mut total_read_count = 0u64;
+    for file_path in &files {
+        if let Ok(reader) = Reader::open(file_path) {
+            if let Ok(reads) = reader.reads() {
+                total_read_count += reads.count() as u64;
+            }
+        }
+    }
     spinner.finish_with_message(format!(
         "{} reads found",
-        style::count(scanned.total_read_count)
+        style::count(total_read_count)
     ));
 
-    // Create writer with predefined dictionaries for consistent multi-batch writes
-    let options = WriterOptions {
-        signal_batch_size: batch_sizes::SIGNAL_BATCH_SIZE,
-        read_batch_size: batch_sizes::READ_BATCH_SIZE,
-        predefined_dictionaries: Some(PredefinedDictionaries {
-            pore_types: Some(scanned.pore_types.into_iter().collect()),
-            end_reasons: Some(scanned.end_reasons.into_iter().collect()),
-        }),
-        ..WriterOptions::default()
-    };
+    // Create writer with default options
+    let options = WriterOptions::default();
     let mut writer = Writer::create(&output, options)?;
 
-    // Track run infos across all files
+    // Track run infos across all files (deduplicated by acquisition_id)
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
 
     // Track statistics
     let mut total_reads = 0u64;
     let mut total_original_samples = 0u64;
     let mut total_downsampled_samples = 0u64;
+    let mut read_errors = 0u64;
+    let mut signal_errors = 0u64;
 
     // Process reads from all files
-    let progress_bar = create_progress_bar(scanned.total_read_count, "Archiving")?;
-    let mut read_warnings = LimitedWarningReporter::new(3);
-    let mut signal_warnings = LimitedWarningReporter::new(3);
+    let progress_bar = create_progress_bar(total_read_count, "Archiving")?;
 
     for file_path in &files {
         let reader = match open_reader_with_warning(file_path, is_directory) {
@@ -130,11 +126,14 @@ pub fn run(
             OpenResult::Err(e) => return Err(e),
         };
 
+        // Collect run_infos for index mapping
+        let run_infos: Vec<_> = reader.run_infos().to_vec();
+
         for read_result in reads_iter {
             let read = match read_result {
                 Ok(r) => r,
-                Err(e) => {
-                    read_warnings.warn(&format!("error reading read record: {}", e));
+                Err(_e) => {
+                    read_errors += 1;
                     continue;
                 }
             };
@@ -145,11 +144,8 @@ pub fn run(
             // Get decompressed signal
             let signal = match reader.get_signal(&read.signal_rows) {
                 Ok(s) => s,
-                Err(e) => {
-                    signal_warnings.warn(&format!(
-                        "cannot read signal for read {}: {}",
-                        read.read_id, e
-                    ));
+                Err(_e) => {
+                    signal_errors += 1;
                     continue;
                 }
             };
@@ -164,8 +160,12 @@ pub fn run(
 
             total_downsampled_samples += downsampled.len() as u64;
 
-            // Map run_info index
-            let new_run_info_idx = map_run_info_index(&reader, read.run_info_index, &run_info_map);
+            // Map run_info index from reader to writer
+            let new_run_info_idx = if let Some(run_info) = run_infos.get(read.run_info_index as usize) {
+                *run_info_map.get(&run_info.acquisition_id).unwrap_or(&0)
+            } else {
+                0
+            };
 
             // Create new read data with updated sample count
             let mut new_read = read.for_writing(new_run_info_idx);
@@ -203,8 +203,6 @@ pub fn run(
     );
 
     // Report any errors encountered
-    let read_errors = read_warnings.count();
-    let signal_errors = signal_warnings.count();
     if read_errors > 0 || signal_errors > 0 {
         eprintln!(
             "{} encountered {} read error(s) and {} signal error(s)",
@@ -231,7 +229,7 @@ fn add_archived_run_infos(
     for run_info in reader.run_infos() {
         if !run_info_map.contains_key(&run_info.acquisition_id) {
             // Create a modified run_info with archive metadata
-            let archived_run_info = create_archived_run_info(run_info, factor, method);
+            let archived_run_info = create_archived_run_info(&run_info, factor, method);
             let idx = writer.add_run_info(archived_run_info)?;
             run_info_map.insert(run_info.acquisition_id.clone(), idx);
         }
@@ -249,15 +247,15 @@ fn create_archived_run_info(
 
     // Add archive metadata to context_tags (preserve original for reference)
     archived.context_tags.insert(
-        "podfive.archive.original_sample_rate".to_string(),
+        "escapepod.archive.original_sample_rate".to_string(),
         original.sample_rate.to_string(),
     );
     archived.context_tags.insert(
-        "podfive.archive.downsample_factor".to_string(),
+        "escapepod.archive.downsample_factor".to_string(),
         factor.to_string(),
     );
     archived.context_tags.insert(
-        "podfive.archive.downsample_method".to_string(),
+        "escapepod.archive.downsample_method".to_string(),
         method.to_string(),
     );
 
