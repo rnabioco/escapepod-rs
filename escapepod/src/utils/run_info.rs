@@ -19,8 +19,8 @@ use std::collections::HashMap;
 /// # Example
 ///
 /// ```no_run
-/// use podfive_core::{Reader, Writer, WriterOptions};
-/// use podfive_core::utils::add_run_infos_deduplicated;
+/// use escapepod::{Reader, Writer, WriterOptions};
+/// use escapepod::utils::add_run_infos_deduplicated;
 /// use std::collections::HashMap;
 ///
 /// let reader = Reader::open("input.pod5")?;
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 /// let mut run_info_map = HashMap::new();
 ///
 /// add_run_infos_deduplicated(&reader, &mut writer, &mut run_info_map)?;
-/// # Ok::<(), podfive_core::Error>(())
+/// # Ok::<(), escapepod::Error>(())
 /// ```
 pub fn add_run_infos_deduplicated(
     reader: &Reader,

@@ -1,6 +1,6 @@
 # Benchmark Results
 
-Comparison of `podfive-rs` vs the official Python `pod5` tool.
+Comparison of `escapepod-rs` vs the official Python `pod5` tool.
 
 ## Test Environment
 
@@ -20,7 +20,7 @@ Comparison of `podfive-rs` vs the official Python `pod5` tool.
 
 ## Results Summary
 
-| Command | podfive-rs | pod5 (Python) | Speedup |
+| Command | escapepod-rs | pod5 (Python) | Speedup |
 |---------|------------|---------------|---------|
 | inspect summary | 5 ms | 253 ms | **56x faster** |
 | view | 19 ms | 586 ms | **30x faster** |
@@ -30,7 +30,7 @@ Comparison of `podfive-rs` vs the official Python `pod5` tool.
 
 ## Analysis
 
-### Where podfive-rs excels
+### Where escapepod-rs excels
 
 - **Read-only operations**: `inspect` and `view` commands are dramatically faster (30-56x) due to:
   - No Python interpreter startup overhead
@@ -46,10 +46,10 @@ Comparison of `podfive-rs` vs the official Python `pod5` tool.
 
 ### Where pod5 (Python) is faster
 
-- **Write operations**: `repack` and `filter` are slower in podfive-rs:
+- **Write operations**: `repack` and `filter` are slower in escapepod-rs:
   - The Python `pod5` tool uses optimized C++ libraries (lib_pod5) under the hood
-  - `filter`: Despite using LRU-cached signal batch lookups and block-level copying (no decompression), podfive-rs iterates through all reads sequentially. The Python tool may have indexed access.
-  - `repack`: Requires full decompression/recompression in podfive-rs. The C++ library has optimized batch-level operations.
+  - `filter`: Despite using LRU-cached signal batch lookups and block-level copying (no decompression), escapepod-rs iterates through all reads sequentially. The Python tool may have indexed access.
+  - `repack`: Requires full decompression/recompression in escapepod-rs. The C++ library has optimized batch-level operations.
 
 ## Running Benchmarks
 

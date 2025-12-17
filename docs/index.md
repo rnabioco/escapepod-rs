@@ -1,4 +1,4 @@
-# podfive-rs
+# escapepod-rs
 
 A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
@@ -10,9 +10,9 @@ POD5 is the native file format for Oxford Nanopore sequencing data. It stores:
 - **Read metadata** - Information about each read (channel, timing, calibration)
 - **Run information** - Experimental metadata (flow cell, protocol, sample)
 
-## Why podfive-rs?
+## Why escapepod-rs?
 
-podfive-rs provides a fast, memory-efficient Rust implementation for working with POD5 files:
+escapepod-rs provides a fast, memory-efficient Rust implementation for working with POD5 files:
 
 - **Performance** - Memory-mapped I/O and efficient compression handling
 - **Safety** - Rust's type system prevents common errors
@@ -25,19 +25,19 @@ podfive-rs provides a fast, memory-efficient Rust implementation for working wit
 
 ```bash
 # View reads in a POD5 file
-podfive view experiment.pod5
+escapepod view experiment.pod5
 
 # Merge multiple files
-podfive merge -o combined.pod5 run1.pod5 run2.pod5
+escapepod merge -o combined.pod5 run1.pod5 run2.pod5
 
 # Filter by read IDs
-podfive filter -i interesting_reads.txt -o subset.pod5 experiment.pod5
+escapepod filter -i interesting_reads.txt -o subset.pod5 experiment.pod5
 ```
 
 ### Library
 
 ```rust
-use podfive_core::Reader;
+use escapepod::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
 
@@ -52,11 +52,11 @@ for read in reader.reads()? {
 
 ## Getting Started
 
-- [Installation](getting-started/installation.md) - How to install podfive-rs
+- [Installation](getting-started/installation.md) - How to install escapepod-rs
 - [Quick Start](getting-started/quickstart.md) - Get up and running quickly
 
 ## Documentation
 
 - [CLI Reference](cli/index.md) - Command-line tool documentation
-- [Library Guide](library/index.md) - Using podfive-core in your Rust projects
+- [Library Guide](library/index.md) - Using escapepod in your Rust projects
 - [File Format](format/index.md) - Technical details of the POD5 format

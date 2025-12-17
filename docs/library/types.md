@@ -158,7 +158,7 @@ pub enum Error {
 ### Error Handling Example
 
 ```rust
-use podfive_core::{Reader, Error};
+use escapepod::{Reader, Error};
 
 fn process_file(path: &str) -> Result<(), String> {
     let reader = Reader::open(path).map_err(|e| match e {

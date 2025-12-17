@@ -1,13 +1,13 @@
-# podfive view
+# escapepod view
 
 Display reads from a POD5 file as a formatted table.
 
-![podfive view](../images/view.gif)
+![escapepod view](../images/view.gif)
 
 ## Usage
 
 ```bash
-podfive view [OPTIONS] <INPUT>
+escapepod view [OPTIONS] <INPUT>
 ```
 
 ## Arguments
@@ -46,7 +46,7 @@ The default output includes:
 ### Basic Usage
 
 ```bash
-podfive view experiment.pod5
+escapepod view experiment.pod5
 ```
 
 Output:
@@ -61,7 +61,7 @@ c3d4e5f6-a7b8-9012-cdef-123456789012  2        1     1            62000
 ### Show Only Read IDs
 
 ```bash
-podfive view --ids experiment.pod5
+escapepod view --ids experiment.pod5
 ```
 
 Output:
@@ -74,11 +74,11 @@ c3d4e5f6-a7b8-9012-cdef-123456789012
 ### Save to File
 
 ```bash
-podfive view experiment.pod5 -o reads.tsv
+escapepod view experiment.pod5 -o reads.tsv
 ```
 
 ### Select Specific Fields
 
 ```bash
-podfive view --include read_id,channel,num_samples experiment.pod5
+escapepod view --include read_id,channel,num_samples experiment.pod5
 ```

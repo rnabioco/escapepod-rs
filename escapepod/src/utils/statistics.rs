@@ -37,7 +37,7 @@ pub struct Statistics {
 /// # Example
 ///
 /// ```
-/// use podfive_core::utils::compute_statistics;
+/// use escapepod::utils::compute_statistics;
 ///
 /// let mut lengths = vec![100, 200, 300, 400, 500];
 /// let stats = compute_statistics(&mut lengths);
@@ -98,7 +98,7 @@ pub fn compute_statistics(values: &mut [u64]) -> Statistics {
 /// # Example
 ///
 /// ```
-/// use podfive_core::utils::compute_n50;
+/// use escapepod::utils::compute_n50;
 ///
 /// let lengths = vec![100, 200, 300, 400, 500];
 /// let n50 = compute_n50(&lengths);

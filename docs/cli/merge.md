@@ -1,13 +1,13 @@
-# podfive merge
+# escapepod merge
 
 Merge multiple POD5 files into a single output file.
 
-![podfive merge](../images/merge.gif)
+![escapepod merge](../images/merge.gif)
 
 ## Usage
 
 ```bash
-podfive merge -o <OUTPUT> <INPUT>...
+escapepod merge -o <OUTPUT> <INPUT>...
 ```
 
 ## Arguments
@@ -43,19 +43,19 @@ The merge command combines multiple POD5 files into a single file. This is usefu
 ### Merge Two Files
 
 ```bash
-podfive merge -o combined.pod5 run1.pod5 run2.pod5
+escapepod merge -o combined.pod5 run1.pod5 run2.pod5
 ```
 
 ### Merge All Files in Directory
 
 ```bash
-podfive merge -o all_data.pod5 *.pod5
+escapepod merge -o all_data.pod5 *.pod5
 ```
 
 ### Merge with Explicit File List
 
 ```bash
-podfive merge -o output.pod5 \
+escapepod merge -o output.pod5 \
     /data/run1/file1.pod5 \
     /data/run1/file2.pod5 \
     /data/run2/file1.pod5

@@ -24,13 +24,13 @@ use uuid::Uuid;
 /// # Example
 ///
 /// ```no_run
-/// use podfive_core::operations::parse_csv_mapping;
+/// use escapepod::operations::parse_csv_mapping;
 ///
 /// let mapping = parse_csv_mapping("mapping.csv")?;
 /// for (uuid, output) in &mapping {
 ///     println!("{} -> {}", uuid, output);
 /// }
-/// # Ok::<(), podfive_core::Error>(())
+/// # Ok::<(), escapepod::Error>(())
 /// ```
 ///
 /// # CSV Format

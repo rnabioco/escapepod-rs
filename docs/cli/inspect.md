@@ -1,13 +1,13 @@
-# podfive inspect
+# escapepod inspect
 
 Inspect POD5 file metadata and contents.
 
-![podfive inspect](../images/inspect.gif)
+![escapepod inspect](../images/inspect.gif)
 
 ## Usage
 
 ```bash
-podfive inspect <SUBCOMMAND> <INPUT>
+escapepod inspect <SUBCOMMAND> <INPUT>
 ```
 
 ## Subcommands
@@ -18,20 +18,20 @@ podfive inspect <SUBCOMMAND> <INPUT>
 | `reads` | List all read IDs |
 | `read` | Show details for a specific read |
 
-## podfive inspect summary
+## escapepod inspect summary
 
 Display summary information about a POD5 file.
 
 ### Usage
 
 ```bash
-podfive inspect summary <INPUT>
+escapepod inspect summary <INPUT>
 ```
 
 ### Example
 
 ```bash
-podfive inspect summary experiment.pod5
+escapepod inspect summary experiment.pod5
 ```
 
 Output:
@@ -49,20 +49,20 @@ Run: abc123-def456
   Started: 2024-01-15 10:30:00
 ```
 
-## podfive inspect reads
+## escapepod inspect reads
 
 List all read IDs in the file.
 
 ### Usage
 
 ```bash
-podfive inspect reads <INPUT>
+escapepod inspect reads <INPUT>
 ```
 
 ### Example
 
 ```bash
-podfive inspect reads experiment.pod5
+escapepod inspect reads experiment.pod5
 ```
 
 Output:
@@ -76,17 +76,17 @@ c3d4e5f6-a7b8-9012-cdef-123456789012
 This is useful for creating filter lists:
 
 ```bash
-podfive inspect reads experiment.pod5 > all_reads.txt
+escapepod inspect reads experiment.pod5 > all_reads.txt
 ```
 
-## podfive inspect read
+## escapepod inspect read
 
 Show detailed information about a specific read.
 
 ### Usage
 
 ```bash
-podfive inspect read <INPUT> <READ_ID>
+escapepod inspect read <INPUT> <READ_ID>
 ```
 
 ### Arguments
@@ -99,7 +99,7 @@ podfive inspect read <INPUT> <READ_ID>
 ### Example
 
 ```bash
-podfive inspect read experiment.pod5 a1b2c3d4-e5f6-7890-abcd-ef1234567890
+escapepod inspect read experiment.pod5 a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
 Output:

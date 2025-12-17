@@ -4,8 +4,8 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use podfive_core::operations::parse_csv_mapping;
-use podfive_core::{Reader, RunInfoData, Writer, WriterOptions};
+use escapepod::operations::parse_csv_mapping;
+use escapepod::{Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -137,8 +137,8 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use podfive_core::operations::parse_csv_mapping;
-    use podfive_core::utils::parse_uuid_flexible;
+    use escapepod::operations::parse_csv_mapping;
+    use escapepod::utils::parse_uuid_flexible;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use uuid::Uuid;

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Comprehensive benchmark comparing podfive-rs vs official pod5
+# Comprehensive benchmark comparing escapepod-rs vs official pod5
 #
 # Usage: ./benchmarks/benchmark.sh <pod5_dir>
 #
@@ -8,9 +8,9 @@
 set -e
 
 POD5_DIR="${1:-.}"
-PODFIVE_BIN="./target/release/podfive"
+ESCAPEPOD_BIN="./target/release/escapepod"
 POD5_BIN="${HOME}/.venv/bin/pod5"
-OUTPUT_DIR="/tmp/podfive_benchmark"
+OUTPUT_DIR="/tmp/escapepod_benchmark"
 WARMUP=1
 RUNS=5
 
@@ -20,8 +20,8 @@ if ! command -v hyperfine &> /dev/null; then
     exit 1
 fi
 
-if [ ! -f "$PODFIVE_BIN" ]; then
-    echo "Error: podfive-rs binary not found. Run: cargo build --release"
+if [ ! -f "$ESCAPEPOD_BIN" ]; then
+    echo "Error: escapepod-rs binary not found. Run: cargo build --release"
     exit 1
 fi
 
@@ -69,8 +69,8 @@ hyperfine \
     --warmup "$WARMUP" \
     --runs "$RUNS" \
     --export-json "$OUTPUT_DIR/inspect_summary.json" \
-    --command-name "podfive-rs" \
-    "$PODFIVE_BIN inspect summary $FIRST_FILE" \
+    --command-name "escapepod-rs" \
+    "$ESCAPEPOD_BIN inspect summary $FIRST_FILE" \
     --command-name "pod5 (Python)" \
     "$POD5_BIN inspect summary $FIRST_FILE"
 
@@ -86,8 +86,8 @@ hyperfine \
     --warmup "$WARMUP" \
     --runs "$RUNS" \
     --export-json "$OUTPUT_DIR/view.json" \
-    --command-name "podfive-rs" \
-    "$PODFIVE_BIN view $FIRST_FILE > /dev/null" \
+    --command-name "escapepod-rs" \
+    "$ESCAPEPOD_BIN view $FIRST_FILE > /dev/null" \
     --command-name "pod5 (Python)" \
     "$POD5_BIN view $FIRST_FILE > /dev/null"
 
@@ -103,17 +103,17 @@ if [ "$FILE_COUNT" -ge 2 ]; then
     hyperfine \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        --prepare "rm -f $OUTPUT_DIR/merged_podfive.pod5 $OUTPUT_DIR/merged_pod5.pod5 || true" \
+        --prepare "rm -f $OUTPUT_DIR/merged_escapepod.pod5 $OUTPUT_DIR/merged_pod5.pod5 || true" \
         --export-json "$OUTPUT_DIR/merge.json" \
-        --command-name "podfive-rs" \
-        "$PODFIVE_BIN merge $FILE_LIST -o $OUTPUT_DIR/merged_podfive.pod5" \
+        --command-name "escapepod-rs" \
+        "$ESCAPEPOD_BIN merge $FILE_LIST -o $OUTPUT_DIR/merged_escapepod.pod5" \
         --command-name "pod5 (Python)" \
         "$POD5_BIN merge $FILE_LIST -o $OUTPUT_DIR/merged_pod5.pod5"
 
     # Verify merge outputs
     echo ""
     echo "Verifying merge outputs..."
-    echo "podfive-rs: $($PODFIVE_BIN inspect summary $OUTPUT_DIR/merged_podfive.pod5 2>/dev/null | grep 'Reads:' | head -1)"
+    echo "escapepod-rs: $($ESCAPEPOD_BIN inspect summary $OUTPUT_DIR/merged_escapepod.pod5 2>/dev/null | grep 'Reads:' | head -1)"
     echo "pod5:       $($POD5_BIN inspect summary $OUTPUT_DIR/merged_pod5.pod5 2>/dev/null | grep -i 'read' | head -1)"
 fi
 
@@ -128,10 +128,10 @@ echo "========================================"
 hyperfine \
     --warmup "$WARMUP" \
     --runs "$RUNS" \
-    --prepare "rm -rf $OUTPUT_DIR/repacked_podfive.pod5 $OUTPUT_DIR/repacked_pod5/ || true" \
+    --prepare "rm -rf $OUTPUT_DIR/repacked_escapepod.pod5 $OUTPUT_DIR/repacked_pod5/ || true" \
     --export-json "$OUTPUT_DIR/repack.json" \
-    --command-name "podfive-rs" \
-    "$PODFIVE_BIN repack $FIRST_FILE -o $OUTPUT_DIR/repacked_podfive.pod5" \
+    --command-name "escapepod-rs" \
+    "$ESCAPEPOD_BIN repack $FIRST_FILE -o $OUTPUT_DIR/repacked_escapepod.pod5" \
     --command-name "pod5 (Python)" \
     "$POD5_BIN repack $FIRST_FILE -o $OUTPUT_DIR/repacked_pod5/"
 
@@ -144,7 +144,7 @@ echo "Benchmark: filter (10% of reads)"
 echo "========================================"
 
 # Extract 10% of read IDs for filtering
-$PODFIVE_BIN view $FIRST_FILE --include read_id 2>/dev/null | tail -n +2 | awk 'NR % 10 == 1' > "$OUTPUT_DIR/filter_ids.txt"
+$ESCAPEPOD_BIN view $FIRST_FILE --include read_id 2>/dev/null | tail -n +2 | awk 'NR % 10 == 1' > "$OUTPUT_DIR/filter_ids.txt"
 FILTER_COUNT=$(wc -l < "$OUTPUT_DIR/filter_ids.txt" | tr -d ' ')
 echo "Filtering $FILTER_COUNT reads..."
 
@@ -152,10 +152,10 @@ if [ "$FILTER_COUNT" -gt 0 ]; then
     hyperfine \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        --prepare "rm -f $OUTPUT_DIR/filtered_podfive.pod5 $OUTPUT_DIR/filtered_pod5.pod5 || true" \
+        --prepare "rm -f $OUTPUT_DIR/filtered_escapepod.pod5 $OUTPUT_DIR/filtered_pod5.pod5 || true" \
         --export-json "$OUTPUT_DIR/filter.json" \
-        --command-name "podfive-rs" \
-        "$PODFIVE_BIN filter $FIRST_FILE --ids $OUTPUT_DIR/filter_ids.txt -o $OUTPUT_DIR/filtered_podfive.pod5" \
+        --command-name "escapepod-rs" \
+        "$ESCAPEPOD_BIN filter $FIRST_FILE --ids $OUTPUT_DIR/filter_ids.txt -o $OUTPUT_DIR/filtered_escapepod.pod5" \
         --command-name "pod5 (Python)" \
         "$POD5_BIN filter $FIRST_FILE --ids $OUTPUT_DIR/filter_ids.txt -o $OUTPUT_DIR/filtered_pod5.pod5 --missing-ok"
 else

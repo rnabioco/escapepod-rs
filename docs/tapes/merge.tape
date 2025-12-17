@@ -1,4 +1,4 @@
-# VHS tape for podfive merge command
+# VHS tape for escapepod merge command
 Output docs/images/merge.gif
 
 Set Shell "bash"
@@ -14,6 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "podfive merge data/drna/yeast_trna_reads.pod5 -o /tmp/merged.pod5"
+Type "escapepod merge data/drna/yeast_trna_reads.pod5 -o /tmp/merged.pod5"
 Enter
 Sleep 5s

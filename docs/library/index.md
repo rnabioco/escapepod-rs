@@ -1,6 +1,6 @@
 # Library Overview
 
-The `podfive-core` library provides Rust APIs for reading and writing POD5 files.
+The `escapepod` library provides Rust APIs for reading and writing POD5 files.
 
 ## Features
 
@@ -12,7 +12,7 @@ The `podfive-core` library provides Rust APIs for reading and writing POD5 files
 ## Quick Example
 
 ```rust
-use podfive_core::{Reader, Writer, WriterOptions, ReadData, RunInfoData};
+use escapepod::{Reader, Writer, WriterOptions, ReadData, RunInfoData};
 
 // Read a POD5 file
 let reader = Reader::open("input.pod5")?;
@@ -39,10 +39,10 @@ writer.finish()?;
 
 ## Error Handling
 
-All operations return `Result<T, podfive_core::Error>`. The error type provides detailed information about what went wrong:
+All operations return `Result<T, escapepod::Error>`. The error type provides detailed information about what went wrong:
 
 ```rust
-use podfive_core::{Reader, Error};
+use escapepod::{Reader, Error};
 
 match Reader::open("file.pod5") {
     Ok(reader) => { /* use reader */ }

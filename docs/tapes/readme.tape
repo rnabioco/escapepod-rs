@@ -1,4 +1,4 @@
-# VHS tape file for podfive-rs demo
+# VHS tape file for escapepod-rs demo
 # Run with: vhs demo.tape
 
 Output docs/images/readme.gif
@@ -16,7 +16,7 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "# podfive-rs - A fast Rust CLI for POD5 files"
+Type "# escapepod-rs - A fast Rust CLI for POD5 files"
 Enter
 Sleep 1s
 
@@ -24,7 +24,7 @@ Type "# Let's explore a POD5 file"
 Enter
 Sleep 500ms
 
-Type "podfive summary data/drna/yeast_trna_reads.pod5"
+Type "escapepod summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 3s
 
@@ -32,7 +32,7 @@ Type "# View reads as a table"
 Enter
 Sleep 500ms
 
-Type "podfive view data/drna/yeast_trna_reads.pod5"
+Type "escapepod view data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 2s
 
@@ -40,7 +40,7 @@ Type "# Extract just read IDs"
 Enter
 Sleep 500ms
 
-Type "podfive view data/drna/yeast_trna_reads.pod5 --ids"
+Type "escapepod view data/drna/yeast_trna_reads.pod5 --ids"
 Enter
 Sleep 2s
 
@@ -48,7 +48,7 @@ Type "# Inspect file metadata"
 Enter
 Sleep 500ms
 
-Type "podfive inspect summary data/drna/yeast_trna_reads.pod5"
+Type "escapepod inspect summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 2s
 
@@ -56,6 +56,6 @@ Type "# List available commands"
 Enter
 Sleep 500ms
 
-Type "podfive --help"
+Type "escapepod --help"
 Enter
 Sleep 5s

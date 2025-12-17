@@ -1,11 +1,11 @@
 //! Merge command implementation.
 //!
-//! Thin wrapper around podfive_core::merge_files.
+//! Thin wrapper around escapepod::merge_files.
 
 use crate::progress::create_spinner;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use podfive_core::{merge_files, MergeOptions};
+use escapepod::{merge_files, MergeOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

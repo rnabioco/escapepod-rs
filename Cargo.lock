@@ -578,6 +578,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "escapepod"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "byteorder",
+ "csv",
+ "flatbuffers",
+ "memmap2",
+ "rayon",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "escapepod-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bstr",
+ "chrono",
+ "clap",
+ "csv",
+ "escapepod",
+ "indicatif",
+ "noodles-bam",
+ "noodles-bgzf",
+ "noodles-core",
+ "noodles-csi",
+ "noodles-sam",
+ "owo-colors",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tabled",
+ "tempfile",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,48 +1059,6 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
-
-[[package]]
-name = "podfive-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bstr",
- "chrono",
- "clap",
- "csv",
- "indicatif",
- "noodles-bam",
- "noodles-bgzf",
- "noodles-core",
- "noodles-csi",
- "noodles-sam",
- "owo-colors",
- "podfive-core",
- "rayon",
- "serde",
- "serde_json",
- "tabled",
- "tempfile",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "podfive-core"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "byteorder",
- "csv",
- "flatbuffers",
- "memmap2",
- "rayon",
- "tempfile",
- "thiserror",
- "uuid",
- "zstd",
-]
 
 [[package]]
 name = "portable-atomic"

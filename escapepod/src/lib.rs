@@ -7,14 +7,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use podfive_core::Reader;
+//! use escapepod::Reader;
 //!
 //! let reader = Reader::open("example.pod5")?;
 //! for read_result in reader.reads()? {
 //!     let read = read_result?;
 //!     println!("Read: {}", read.read_id);
 //! }
-//! # Ok::<(), podfive_core::Error>(())
+//! # Ok::<(), escapepod::Error>(())
 //! ```
 
 pub mod arrow_ipc;

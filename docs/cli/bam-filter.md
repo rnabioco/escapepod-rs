@@ -1,13 +1,13 @@
-# podfive bam-filter
+# escapepod bam-filter
 
 Filter reads from a POD5 file based on a paired BAM file. Supports filtering by mapped status, genomic region, and mapping quality.
 
-![podfive filter](../images/bam-filter.gif)
+![escapepod filter](../images/bam-filter.gif)
 
 ## Usage
 
 ```bash
-podfive bam-filter -b <BAM> -o <OUTPUT> [OPTIONS] <INPUT>
+escapepod bam-filter -b <BAM> -o <OUTPUT> [OPTIONS] <INPUT>
 ```
 
 ## Arguments
@@ -34,7 +34,7 @@ podfive bam-filter -b <BAM> -o <OUTPUT> [OPTIONS] <INPUT>
 Keep only reads that mapped to the reference:
 
 ```bash
-podfive bam-filter -b aligned.bam -o mapped.pod5 --mapped experiment.pod5
+escapepod bam-filter -b aligned.bam -o mapped.pod5 --mapped experiment.pod5
 ```
 
 ### Filter by Region
@@ -43,10 +43,10 @@ Extract reads mapping to a specific chromosome or region:
 
 ```bash
 # All reads on chromosome 1
-podfive bam-filter -b aligned.bam -o chr1.pod5 --region chr1 experiment.pod5
+escapepod bam-filter -b aligned.bam -o chr1.pod5 --region chr1 experiment.pod5
 
 # Reads in a specific region
-podfive bam-filter -b aligned.bam -o region.pod5 --region chr1:1000000-2000000 experiment.pod5
+escapepod bam-filter -b aligned.bam -o region.pod5 --region chr1:1000000-2000000 experiment.pod5
 ```
 
 ### Filter by Mapping Quality
@@ -54,7 +54,7 @@ podfive bam-filter -b aligned.bam -o region.pod5 --region chr1:1000000-2000000 e
 Keep only high-quality alignments:
 
 ```bash
-podfive bam-filter -b aligned.bam -o high_quality.pod5 -q 30 experiment.pod5
+escapepod bam-filter -b aligned.bam -o high_quality.pod5 -q 30 experiment.pod5
 ```
 
 ### Combined Filters
@@ -62,7 +62,7 @@ podfive bam-filter -b aligned.bam -o high_quality.pod5 -q 30 experiment.pod5
 Combine multiple filter criteria:
 
 ```bash
-podfive bam-filter -b aligned.bam -o filtered.pod5 \
+escapepod bam-filter -b aligned.bam -o filtered.pod5 \
     --mapped --region chr1 -q 20 experiment.pod5
 ```
 
@@ -71,12 +71,12 @@ podfive bam-filter -b aligned.bam -o filtered.pod5 \
 Filter all POD5 files in a directory:
 
 ```bash
-podfive bam-filter -b aligned.bam -o filtered.pod5 pod5_directory/
+escapepod bam-filter -b aligned.bam -o filtered.pod5 pod5_directory/
 ```
 
 ## BAM Index
 
-Region queries require a BAM index (`.bai` file). If the index doesn't exist, `podfive` will automatically create one:
+Region queries require a BAM index (`.bai` file). If the index doesn't exist, `escapepod` will automatically create one:
 
 ```
 Info: BAI index not found, creating aligned.bam.bai...
