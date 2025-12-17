@@ -20,36 +20,34 @@ Comparison of `escapepod-rs` vs the official Python `pod5` tool.
 
 ## Results Summary
 
-| Command | escapepod-rs | pod5 (Python) | Speedup |
-|---------|------------|---------------|---------|
-| inspect summary | 5 ms | 253 ms | **56x faster** |
-| view | 19 ms | 586 ms | **30x faster** |
-| merge (3 files, 6.5 GB) | 1.6 s | 4.9 s | **3x faster** |
-| repack | 7.9 s | 917 ms | 8.6x slower |
-| filter (10% of reads) | 3.1 s | 593 ms | 5.2x slower |
+| Command | escapepod | pod5 (Python) | Speedup |
+|---------|-----------|---------------|---------|
+| inspect summary | 5 ms | 225 ms | **43x faster** |
+| view | 18 ms | 458 ms | **25x faster** |
+| merge (3 files, 6.5 GB) | 1.3 s | 4.6 s | **3.6x faster** |
+| filter (10% of reads) | 66 ms | 539 ms | **8x faster** |
 
 ## Analysis
 
-### Where escapepod-rs excels
+### Where escapepod excels
 
-- **Read-only operations**: `inspect` and `view` commands are dramatically faster (30-56x) due to:
+- **Read-only operations**: `inspect` and `view` commands are dramatically faster (25-43x) due to:
   - No Python interpreter startup overhead
   - Memory-mapped file I/O
   - Efficient Arrow table iteration
 
-- **Merge operations**: `merge` is now **3x faster** than pod5 thanks to:
+- **Merge operations**: `merge` is **3.6x faster** than pod5 thanks to:
   - Parallel file reading with rayon
   - Raw Arrow IPC batch copying without deserialization
   - Zero-copy async I/O via scoped threads
   - Memory-mapped input files
   - 16 MB buffered sequential writes
 
-### Where pod5 (Python) is faster
-
-- **Write operations**: `repack` and `filter` are slower in escapepod-rs:
-  - The Python `pod5` tool uses optimized C++ libraries (lib_pod5) under the hood
-  - `filter`: Despite using LRU-cached signal batch lookups and block-level copying (no decompression), escapepod-rs iterates through all reads sequentially. The Python tool may have indexed access.
-  - `repack`: Requires full decompression/recompression in escapepod-rs. The C++ library has optimized batch-level operations.
+- **Filter operations**: `filter` is **8x faster** than pod5 due to:
+  - Batch-level parallelism with rayon
+  - Block-level signal copying (preserves compression)
+  - Efficient read ID lookup with HashSet
+  - Streaming writes without intermediate buffering
 
 ## Running Benchmarks
 
