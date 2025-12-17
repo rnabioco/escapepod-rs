@@ -294,7 +294,7 @@ fn compute_statistics(stats: &mut ReadStats) -> StatisticsSummary {
     }
 
     // Use core statistics function
-    let core_stats = escapepod::utils::compute_statistics(&mut stats.lengths);
+    let core_stats = escapepod::compute_statistics(&mut stats.lengths);
 
     StatisticsSummary {
         total_samples: stats.total_samples,

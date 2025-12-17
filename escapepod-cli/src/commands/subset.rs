@@ -138,7 +138,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use escapepod::operations::parse_csv_mapping;
-    use escapepod::utils::parse_uuid_flexible;
+    use escapepod::parse_uuid_flexible;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use uuid::Uuid;

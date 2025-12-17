@@ -9,7 +9,7 @@ use crate::style;
 use crate::util::resolve_pod5_inputs;
 use bstr::ByteSlice;
 use escapepod::operations::{filter_files, FilterOptions};
-use escapepod::utils::parse_uuid_flexible;
+use escapepod::parse_uuid_flexible;
 use noodles_bam as bam;
 use noodles_core::Region;
 use std::collections::HashSet;

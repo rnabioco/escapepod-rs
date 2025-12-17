@@ -34,6 +34,7 @@ pub fn signal_schema() -> Schema {
 }
 
 /// Create the Arrow schema for uncompressed signal data.
+#[allow(dead_code)]
 pub fn signal_schema_uncompressed() -> Schema {
     use std::sync::Arc;
 

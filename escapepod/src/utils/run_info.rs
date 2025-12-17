@@ -18,19 +18,19 @@ use std::collections::HashMap;
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// use escapepod::{Reader, Writer, WriterOptions};
-/// use escapepod::utils::add_run_infos_deduplicated;
 /// use std::collections::HashMap;
 ///
 /// let reader = Reader::open("input.pod5")?;
 /// let mut writer = Writer::create("output.pod5", WriterOptions::default())?;
 /// let mut run_info_map = HashMap::new();
 ///
+/// // Note: This is an internal utility function
 /// add_run_infos_deduplicated(&reader, &mut writer, &mut run_info_map)?;
 /// # Ok::<(), escapepod::Error>(())
 /// ```
-pub fn add_run_infos_deduplicated(
+pub(crate) fn add_run_infos_deduplicated(
     reader: &Reader,
     writer: &mut Writer,
     run_info_map: &mut HashMap<String, u32>,
@@ -58,7 +58,7 @@ pub fn add_run_infos_deduplicated(
 /// # Returns
 ///
 /// The new run_info index to use in the writer, or 0 if not found.
-pub fn map_run_info_index(
+pub(crate) fn map_run_info_index(
     reader: &Reader,
     read_run_info_index: u32,
     run_info_map: &HashMap<String, u32>,
