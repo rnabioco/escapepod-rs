@@ -3,7 +3,7 @@ resolver = "2"
 members = ["escapepod-cli", "escapepod"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 edition = "2021"
 rust-version = "1.85"
 repository = "https://github.com/rnabioco/escapepod-rs"
