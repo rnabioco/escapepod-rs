@@ -1,5 +1,7 @@
 # escapepod
 
+🚧 **escapepod is under active development.** Caveat emptor. 🚧
+
 A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
