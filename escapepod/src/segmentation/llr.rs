@@ -226,6 +226,11 @@ impl LlrTrace {
         let search_start = start + min_obs;
         let search_end = end.saturating_sub(border_trim);
 
+        // Check for invalid range (segment too short)
+        if search_start >= search_end || search_end > gains.len() {
+            return None;
+        }
+
         gains[search_start..search_end]
             .iter()
             .enumerate()
