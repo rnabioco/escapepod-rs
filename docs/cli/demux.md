@@ -23,18 +23,8 @@ Tested on RNA004 data with 5 barcodes (1000 reads total), 4 threads:
 | **Detection speed** | 14x faster | baseline |
 | **Full pipeline** | ~0.5s | ~2.4s |
 | **Throughput** | ~2000 reads/sec | ~400 reads/sec |
-| **Classification accuracy** | 99.9% | 99.9% |
 
-### Accuracy Results (RNA004 Gold Standard)
-
-| Barcode | Correct | Total | Accuracy |
-|---------|---------|-------|----------|
-| BC00 | 187 | 187 | 100.0% |
-| BC01 | 190 | 190 | 100.0% |
-| BC02 | 191 | 192 | 99.5% |
-| BC03 | 189 | 189 | 100.0% |
-| BC04 | 195 | 195 | 100.0% |
-| **Total** | **952** | **953** | **99.9%** |
+**Note:** For best classification accuracy, use WarpDemuX pre-trained models via the `classify --model` option. The escapepod training workflow is experimental and may not generalize well to new samples.
 
 ## Overview
 
@@ -544,7 +534,6 @@ escapepod demux train --assignments <CSV> -o <OUTPUT>
 | `--input-dir <DIR>` | Directory with barcode subdirectories containing POD5 files |
 | `--assignments <CSV>` | CSV with read_id, barcode, pod5_file columns |
 | `-o, --output <FILE>` | Output reference JSON file (required) |
-| `--knn` | Output KNN model format (individual fingerprints for `classify --model`) |
 | `--segment-start <N>` | Start sample for fingerprint region (default: 1000) |
 | `--segment-end <N>` | End sample for fingerprint region (default: 2000) |
 | `--num-segments <N>` | Number of fingerprint segments (default: 10) |
@@ -555,9 +544,10 @@ escapepod demux train --assignments <CSV> -o <OUTPUT>
 | `-j, --threads <N>` | Number of threads (default: 4) |
 | `-h, --help` | Print help |
 
-### Output Formats
+### Output Format
 
-**Default format** (consensus fingerprints):
+The train command outputs a JSON file with consensus fingerprints for each barcode:
+
 ```json
 {
   "barcodes": {
@@ -571,31 +561,19 @@ escapepod demux train --assignments <CSV> -o <OUTPUT>
 }
 ```
 
-**KNN format** (`--knn`, for use with `classify --model`):
-```json
-{
-  "training_fingerprints": [[0.12, -0.45, ...], ...],
-  "training_labels": [0, 0, 1, 1, 2, ...],
-  "label_map": {"BC00": 0, "BC01": 1, "BC02": 2, ...},
-  "kernel_params": {"gamma": 0.1, "power": 1.0},
-  "threshold": 0.8,
-  "threshold_type": "ratio"
-}
-```
-
-The KNN format stores all individual training fingerprints for nearest-neighbor classification, which typically provides better accuracy than consensus-based classification.
+**Note:** For best classification accuracy, we recommend using WarpDemuX pre-trained models instead of training your own. The escapepod training workflow produces consensus fingerprints that may not generalize as well as WarpDemuX's SVM-based models.
 
 ### Example
 
 ```bash
-# From directory structure (consensus format)
+# From directory structure
 escapepod demux train --input-dir training_samples/ -o reference.json
 
-# From assignments CSV (KNN format for best accuracy)
-escapepod demux train --assignments known_barcodes.csv -o model.json --knn
+# From assignments CSV
+escapepod demux train --assignments known_barcodes.csv -o reference.json
 
-# Use KNN model for classification
-escapepod demux classify fingerprints.csv --model model.json -o classifications.csv
+# Use trained reference for classification
+escapepod demux classify fingerprints.csv --reference reference.json -o classifications.csv
 ```
 
 ---
@@ -621,9 +599,9 @@ escapepod demux split *.pod5 --classifications classifications.csv -d demuxed/ -
 cut -d, -f2 classifications.csv | sort | uniq -c | sort -rn
 ```
 
-### Training Your Own Model
+### Training Your Own Reference (Experimental)
 
-If you have known barcode samples, train a KNN model for best accuracy:
+If you have known barcode samples, you can train a consensus-based reference:
 
 ```bash
 # Create assignments CSV with known read-to-barcode mappings
@@ -634,14 +612,16 @@ b2c3d4e5-...,BC00,sample1.pod5
 c3d4e5f6-...,BC01,sample2.pod5
 EOF
 
-# Train KNN model (recommended for best accuracy)
-escapepod demux train --assignments assignments.csv -o model.json --knn -j 8
+# Train reference fingerprints
+escapepod demux train --assignments assignments.csv -o reference.json -j 8
 
-# Use the trained model for classification
+# Use the trained reference for classification
 escapepod demux detect *.pod5 -o boundaries.csv -j 8
 escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
-escapepod demux classify fingerprints.csv --model model.json -o classifications.csv
+escapepod demux classify fingerprints.csv --reference reference.json -o classifications.csv
 ```
+
+**Note:** For production use, we recommend using WarpDemuX pre-trained models which provide significantly better generalization.
 
 ### Using WarpDemuX Models
 

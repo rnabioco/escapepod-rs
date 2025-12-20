@@ -7,7 +7,6 @@ use super::utils::{
 };
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod::demux::{KernelParams, WarpDemuxModel};
 use escapepod::segmentation::detect_adapter;
 use escapepod::Reader;
 use rayon::prelude::*;
@@ -32,10 +31,6 @@ pub struct TrainArgs {
     /// Output JSON file for reference fingerprints
     #[arg(short, long, required = true, value_name = "FILE")]
     pub output: PathBuf,
-
-    /// Output in KNN model format (individual fingerprints for classify --model)
-    #[arg(long)]
-    pub knn: bool,
 
     /// Start sample for fingerprint region
     #[arg(long, default_value = "1000", value_name = "N")]
@@ -127,42 +122,23 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
         style::count(all_fingerprints.len())
     );
 
-    // Write output in appropriate format
+    // Compute consensus fingerprints and build output
     let output_file = File::create(&args.output)?;
     let writer = BufWriter::new(output_file);
 
-    if args.knn {
-        // Build KNN model with individual fingerprints
-        let knn_model = build_knn_model(&barcode_fingerprints);
-        serde_json::to_writer_pretty(writer, &knn_model)?;
+    let training_output = build_training_output(&args, &barcode_fingerprints);
+    serde_json::to_writer_pretty(writer, &training_output)?;
 
-        println!(
-            "{} KNN model written to {}",
-            style::action("Trained"),
-            style::path(args.output.display())
-        );
-        println!(
-            "{} {} barcodes, {} training samples",
-            style::label("Total:"),
-            style::count(knn_model.label_map.len()),
-            style::count(knn_model.training_fingerprints.len())
-        );
-    } else {
-        // Compute consensus fingerprints and build output
-        let training_output = build_training_output(&args, &barcode_fingerprints);
-        serde_json::to_writer_pretty(writer, &training_output)?;
-
-        println!(
-            "{} reference fingerprints written to {}",
-            style::action("Trained"),
-            style::path(args.output.display())
-        );
-        println!(
-            "{} {} barcodes",
-            style::label("Total:"),
-            style::count(training_output.barcodes.len())
-        );
-    }
+    println!(
+        "{} reference fingerprints written to {}",
+        style::action("Trained"),
+        style::path(args.output.display())
+    );
+    println!(
+        "{} {} barcodes",
+        style::label("Total:"),
+        style::count(training_output.barcodes.len())
+    );
 
     Ok(())
 }
@@ -400,61 +376,4 @@ fn build_training_output(
     }
 
     training_output
-}
-
-/// Build a KNN model with individual training fingerprints.
-fn build_knn_model(barcode_fingerprints: &HashMap<String, Vec<Vec<f32>>>) -> WarpDemuxModel {
-    let mut training_fingerprints = Vec::new();
-    let mut training_labels = Vec::new();
-    let mut label_map = HashMap::new();
-
-    // Assign label IDs to barcodes in sorted order for consistency
-    let mut sorted_barcodes: Vec<&String> = barcode_fingerprints.keys().collect();
-    sorted_barcodes.sort();
-
-    for (label_id, barcode) in sorted_barcodes.iter().enumerate() {
-        label_map.insert((*barcode).clone(), label_id as i32);
-
-        if let Some(fingerprints) = barcode_fingerprints.get(*barcode) {
-            // Filter to most common fingerprint length
-            let mut length_counts: HashMap<usize, usize> = HashMap::new();
-            for fp in fingerprints {
-                *length_counts.entry(fp.len()).or_insert(0) += 1;
-            }
-            let target_length = length_counts
-                .into_iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(len, _)| len)
-                .unwrap_or(0);
-
-            let valid_fingerprints: Vec<&Vec<f32>> = fingerprints
-                .iter()
-                .filter(|fp| fp.len() == target_length)
-                .collect();
-
-            for fp in valid_fingerprints {
-                training_fingerprints.push(fp.iter().map(|&v| v as f64).collect());
-                training_labels.push(label_id as i32);
-            }
-
-            println!(
-                "{} {} training samples from {} reads",
-                style::label(format!("{}:", barcode)),
-                style::action("Added"),
-                style::count(fingerprints.len())
-            );
-        }
-    }
-
-    WarpDemuxModel {
-        training_fingerprints,
-        training_labels,
-        kernel_params: KernelParams {
-            gamma: 0.1,
-            power: 1.0,
-        },
-        label_map,
-        threshold: 0.8,
-        threshold_type: "ratio".to_string(),
-    }
 }
