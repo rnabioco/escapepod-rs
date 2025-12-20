@@ -1,0 +1,1974 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Rust library and CLI for Oxford Nanopore POD5 files">
+      
+      
+      
+        <link rel="canonical" href="https://rnabioco.github.io/escapepod-rs/format/segmentation/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
+    
+    
+      
+        <title>Signal Segmentation & DTW Algorithms - escapepod-rs</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#signal-segmentation-dtw-algorithms" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="escapepod-rs" class="md-header__button md-logo" aria-label="escapepod-rs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            escapepod-rs
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Signal Segmentation &amp; DTW Algorithms
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/rnabioco/escapepod-rs" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    rnabioco/escapepod-rs
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="escapepod-rs" class="md-nav__button md-logo" aria-label="escapepod-rs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    escapepod-rs
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/rnabioco/escapepod-rs" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    rnabioco/escapepod-rs
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../cli/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    CLI Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/summary/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    summary
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/view/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    view
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/inspect/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    inspect
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/merge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    merge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/filter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    filter
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/bam-filter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    bam-filter
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/repack/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    repack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/subset/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    subset
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../library/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Library
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Library
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../library/reading/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reading Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../library/writing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Writing Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../library/types/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Types
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    File Format
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    File Format
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../container/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Container Structure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../compression/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Signal Compression
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#llr-boundary-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LLR Boundary Detection
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="LLR Boundary Detection">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#mathematical-foundation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Mathematical Foundation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#efficient-variance-computation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Efficient Variance Computation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#three-split-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Three-Split Strategy
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#visualization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Visualization
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#t-test-segmentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        T-test Segmentation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="T-test Segmentation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#windowed-t-test" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Windowed T-test
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#finding-changepoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Finding Changepoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#segment-mean-computation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Segment Mean Computation
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dynamic-time-warping-dtw" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Time Warping (DTW)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Dynamic Time Warping (DTW)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#basic-algorithm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Basic Algorithm
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#memory-efficient-implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Memory-Efficient Implementation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sakoe-chiba-band" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sakoe-Chiba Band
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dtw-for-classification" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DTW for Classification
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#signal-normalization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Signal Normalization
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Signal Normalization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#mad-median-absolute-deviation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MAD (Median Absolute Deviation)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fingerprint-normalization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fingerprint Normalization
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#performance-considerations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Considerations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Performance Considerations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#parallel-processing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parallel Processing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#early-stopping-in-llr" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Early Stopping in LLR
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#library-api" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Library API
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Library API">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#llr-module" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LLR Module
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#t-test-module" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        T-test Module
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dtw-module" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DTW Module
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        References
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="signal-segmentation-dtw-algorithms">Signal Segmentation &amp; DTW Algorithms<a class="headerlink" href="#signal-segmentation-dtw-algorithms" title="Permanent link">&para;</a></h1>
+<p>This document describes the signal processing algorithms used for barcode demultiplexing in escapepod.</p>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>The demux pipeline uses three core algorithms:</p>
+<ol>
+<li><strong>LLR (Log-Likelihood Ratio)</strong> - Detects adapter boundaries</li>
+<li><strong>T-test Segmentation</strong> - Extracts fingerprints from adapter regions</li>
+<li><strong>DTW (Dynamic Time Warping)</strong> - Classifies barcodes by signal similarity</li>
+</ol>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SIGNAL PROCESSING PIPELINE                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Raw Signal (i16)
+    │
+    ▼
+┌─────────────────┐
+│  Normalization  │  MAD: (x - median) / MAD
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│  LLR Boundary   │  Find adapter start/end positions
+│    Detection    │
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│  Extract        │  Isolate adapter region signal
+│  Adapter        │
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│  T-test         │  Find changepoints within adapter
+│  Segmentation   │
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│  Compute        │  Mean value per segment = fingerprint
+│  Segment Means  │
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│  DTW Distance   │  Compare to reference barcodes
+└─────────────────┘
+    │
+    ▼
+Classification Result
+</code></pre></div>
+<hr />
+<h2 id="llr-boundary-detection">LLR Boundary Detection<a class="headerlink" href="#llr-boundary-detection" title="Permanent link">&para;</a></h2>
+<p>The Log-Likelihood Ratio algorithm detects abrupt changes in signal variance, which indicate boundaries between different signal regions (open pore, adapter, RNA).</p>
+<h3 id="mathematical-foundation">Mathematical Foundation<a class="headerlink" href="#mathematical-foundation" title="Permanent link">&para;</a></h3>
+<p>For a signal segment, the LLR gain at position <code>i</code> measures how much better the data is explained by two separate distributions vs. one:</p>
+<div class="highlight"><pre><span></span><code>LLR Gain Formula
+────────────────
+
+gain(i) = n × log(σ²_full) - [n_head × log(σ²_head) + n_tail × log(σ²_tail)]
+
+Where:
+  n       = total samples in segment
+  n_head  = samples before split point
+  n_tail  = samples after split point
+  σ²_full = variance of entire segment
+  σ²_head = variance of [0, i)
+  σ²_tail = variance of [i, n)
+</code></pre></div>
+<h3 id="efficient-variance-computation">Efficient Variance Computation<a class="headerlink" href="#efficient-variance-computation" title="Permanent link">&para;</a></h3>
+<p>Using cumulative sums enables O(1) variance calculation for any segment:</p>
+<div class="highlight"><pre><span></span><code>Precomputed Cumulative Sums
+───────────────────────────
+
+Signal:     s₀   s₁   s₂   s₃   s₄   s₅   ...
+           ─────────────────────────────────────
+cumsum:     s₀   s₀+s₁  Σs₀₋₂  ...
+cumsum_sq:  s₀²  s₀²+s₁²  Σs₀₋₂²  ...
+
+Variance of [start, end):
+  mean = (cumsum[end-1] - cumsum[start-1]) / (end - start)
+  var  = (cumsum_sq[end-1] - cumsum_sq[start-1]) / (end - start) - mean²
+</code></pre></div>
+<h3 id="three-split-strategy">Three-Split Strategy<a class="headerlink" href="#three-split-strategy" title="Permanent link">&para;</a></h3>
+<p>The algorithm uses a three-split strategy to identify adapter regions:</p>
+<div class="highlight"><pre><span></span><code>Three-Split Boundary Detection
+──────────────────────────────
+
+Step 1: Find primary split (adapter end)
+────────────────────────────────────────
+Signal: ████████████████████████▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+                              ▲
+                              x_first (max gain)
+
+Step 2: Split left segment (find adapter start)
+───────────────────────────────────────────────
+Signal: ▁▁▁▁▁▁▁▁████████████████████▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+              ▲                   │
+              x_head              x_first
+
+Step 3: Split right segment (refinement)
+────────────────────────────────────────
+Signal: ▁▁▁▁▁▁▁▁████████████████████▄▄▄▄▄▄▄▄████████████████████████
+              │                   │       ▲
+              x_head              x_first x_tail
+
+Final boundaries determined by median analysis:
+  - Compare median levels of all 4 segments
+  - Adapters show characteristic &quot;dip&quot; in pA level
+  - Select adapter_start and adapter_end accordingly
+</code></pre></div>
+<h3 id="visualization">Visualization<a class="headerlink" href="#visualization" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>LLR Gain Curve Example
+──────────────────────
+
+gain
+  │                    ╭─╮
+  │                   ╱   ╲
+  │                  ╱     ╲
+  │                 ╱       ╲
+  │           ╭────╯         ╰────╮
+  │      ╭───╯                     ╰───╮
+  │  ───╯                               ╰───
+  └──────────────────────────────────────────▶ position
+                       ▲
+                       │
+                  Best split
+                  (max gain)
+
+Signal at same positions:
+  │  ▁▁▁▁▁▁▁▁███████████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+  └──────────────────────────────────────────▶
+</code></pre></div>
+<hr />
+<h2 id="t-test-segmentation">T-test Segmentation<a class="headerlink" href="#t-test-segmentation" title="Permanent link">&para;</a></h2>
+<p>After isolating the adapter region, t-test segmentation divides it into discrete levels (events) to create a fingerprint.</p>
+<h3 id="windowed-t-test">Windowed T-test<a class="headerlink" href="#windowed-t-test" title="Permanent link">&para;</a></h3>
+<p>The algorithm slides two adjacent windows across the signal, computing a t-score at each position:</p>
+<div class="highlight"><pre><span></span><code>Sliding Window T-test
+─────────────────────
+
+        Window 1       Window 2
+       ◀────w────▶   ◀────w────▶
+Signal: ...████████████▄▄▄▄▄▄▄▄▄▄▄▄...
+              ▲           ▲
+             m₁          m₂
+
+T-score formula (simplified):
+
+  t = |m₁ - m₂| / √(var₁ + var₂)
+
+Where:
+  m₁, m₂   = means of windows 1 and 2
+  var₁, var₂ = variances of windows 1 and 2
+</code></pre></div>
+<h3 id="finding-changepoints">Finding Changepoints<a class="headerlink" href="#finding-changepoints" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Changepoint Selection Algorithm
+───────────────────────────────
+
+Step 1: Compute t-scores for all positions
+──────────────────────────────────────────
+
+t-score
+  │           ╭╮        ╭╮
+  │          ╱  ╲      ╱  ╲
+  │    ╭╮   ╱    ╲    ╱    ╲   ╭╮
+  │   ╱  ╲ ╱      ╲  ╱      ╲ ╱  ╲
+  │ ──    ─        ──        ─    ──
+  └──────────────────────────────────────▶ position
+         ▲          ▲         ▲
+         │          │         │
+        p₁         p₂        p₃   (local maxima)
+
+
+Step 2: Sort by t-score (descending)
+────────────────────────────────────
+Candidates: [p₂, p₁, p₃, ...]  (sorted by score)
+
+
+Step 3: Select with minimum separation
+──────────────────────────────────────
+Selected: []
+Blacklist: {}
+
+For p₂: not in blacklist → SELECT
+  Selected: [p₂]
+  Blacklist: {p₂-sep, ..., p₂+sep}  (nearby positions)
+
+For p₁: not in blacklist → SELECT
+  Selected: [p₂, p₁]
+  Blacklist: {p₁-sep, ..., p₁+sep, p₂-sep, ..., p₂+sep}
+
+For p₃: not in blacklist → SELECT
+  Selected: [p₂, p₁, p₃]
+
+Final: sort by position → [p₁, p₂, p₃]
+</code></pre></div>
+<h3 id="segment-mean-computation">Segment Mean Computation<a class="headerlink" href="#segment-mean-computation" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>From Changepoints to Fingerprint
+────────────────────────────────
+
+Changepoints: [p₁, p₂, p₃]
+Boundaries:   [0, p₁, p₂, p₃, n]
+
+Signal:
+  │ ████│▄▄▄▄▄▄▄│██████│▁▁▁▁▁▁▁│███████████
+  │ seg0│ seg1  │ seg2 │ seg3  │   seg4
+  └──────────────────────────────────────────▶
+
+Fingerprint computation:
+  fp[0] = mean(signal[0:p₁])
+  fp[1] = mean(signal[p₁:p₂])
+  fp[2] = mean(signal[p₂:p₃])
+  fp[3] = mean(signal[p₃:n])
+
+Fingerprint = [fp₀, fp₁, fp₂, fp₃]
+            = [1.23, -0.45, 0.87, -0.12]
+</code></pre></div>
+<hr />
+<h2 id="dynamic-time-warping-dtw">Dynamic Time Warping (DTW)<a class="headerlink" href="#dynamic-time-warping-dtw" title="Permanent link">&para;</a></h2>
+<p>DTW measures the similarity between two sequences that may have different lengths or temporal variations.</p>
+<h3 id="basic-algorithm">Basic Algorithm<a class="headerlink" href="#basic-algorithm" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>DTW Cost Matrix
+───────────────
+
+Given:
+  Query Q = [q₀, q₁, q₂, q₃]
+  Reference R = [r₀, r₁, r₂]
+
+Build cost matrix D where D[i,j] = min cost to align Q[0:i] with R[0:j]:
+
+        r₀    r₁    r₂
+      ┌─────┬─────┬─────┐
+  q₀  │  ●──┼─────┼─────┤  D[i,j] = cost(qᵢ, rⱼ) + min( D[i-1,j-1],  ← match
+      │  │╲ │     │     │                                D[i-1,j],    ← insertion
+      ├──┼─╲┼─────┼─────┤                                D[i,j-1] )   ← deletion
+  q₁  │  │  │  ●──┼─────┤
+      │  │  │  │╲ │     │  cost(qᵢ, rⱼ) = |qᵢ - rⱼ|
+      ├──┼──┼──┼─╲┼─────┤
+  q₂  │  │  │  │  │  ●──┤
+      │  │  │  │  │  │╲ │
+      ├──┼──┼──┼──┼──┼─╲┤
+  q₃  │  │  │  │  │  │  ●  DTW distance = D[n-1, m-1]
+      └──┴──┴──┴──┴──┴──┘
+
+Allowed moves from (i,j):
+  ↘ (i+1, j+1)  diagonal (match/substitute)
+  ↓ (i+1, j)    vertical (insertion in Q)
+  → (i, j+1)    horizontal (insertion in R)
+</code></pre></div>
+<h3 id="memory-efficient-implementation">Memory-Efficient Implementation<a class="headerlink" href="#memory-efficient-implementation" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Two-Row DTW Computation
+───────────────────────
+
+Only need previous row to compute current row:
+
+Iteration i=0:
+  prev: [0, ∞, ∞, ∞]
+  curr: [∞, d₀₀, d₀₁, d₀₂]
+
+Iteration i=1:
+  prev: [∞, d₀₀, d₀₁, d₀₂]
+  curr: [∞, d₁₀, d₁₁, d₁₂]
+
+Iteration i=2:
+  prev: [∞, d₁₀, d₁₁, d₁₂]
+  curr: [∞, d₂₀, d₂₁, d₂₂]
+
+Space complexity: O(m) instead of O(nm)
+</code></pre></div>
+<h3 id="sakoe-chiba-band">Sakoe-Chiba Band<a class="headerlink" href="#sakoe-chiba-band" title="Permanent link">&para;</a></h3>
+<p>The Sakoe-Chiba constraint limits the warping path to a diagonal band, reducing computation:</p>
+<div class="highlight"><pre><span></span><code>Sakoe-Chiba Band Constraint
+───────────────────────────
+
+Full DTW matrix (window = ∞):        With window = 1:
+      ┌───┬───┬───┬───┬───┐          ┌───┬───┬───┬───┬───┐
+  q₀  │░░░│░░░│░░░│░░░│░░░│      q₀  │░░░│░░░│   │   │   │
+      ├───┼───┼───┼───┼───┤          ├───┼───┼───┼───┼───┤
+  q₁  │░░░│░░░│░░░│░░░│░░░│      q₁  │░░░│░░░│░░░│   │   │
+      ├───┼───┼───┼───┼───┤          ├───┼───┼───┼───┼───┤
+  q₂  │░░░│░░░│░░░│░░░│░░░│      q₂  │   │░░░│░░░│░░░│   │
+      ├───┼───┼───┼───┼───┤          ├───┼───┼───┼───┼───┤
+  q₃  │░░░│░░░│░░░│░░░│░░░│      q₃  │   │   │░░░│░░░│░░░│
+      ├───┼───┼───┼───┼───┤          ├───┼───┼───┼───┼───┤
+  q₄  │░░░│░░░│░░░│░░░│░░░│      q₄  │   │   │   │░░░│░░░│
+      └───┴───┴───┴───┴───┘          └───┴───┴───┴───┴───┘
+
+  Time: O(n × m)                     Time: O(n × w)
+
+Constraint: |i - j| ≤ window
+
+Benefits:
+  - Prevents excessive warping
+  - Faster computation
+  - Often improves classification accuracy
+</code></pre></div>
+<h3 id="dtw-for-classification">DTW for Classification<a class="headerlink" href="#dtw-for-classification" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Classification with DTW
+───────────────────────
+
+Query fingerprint: Q
+
+References:
+  barcode_01: R₁ = [0.5, -0.3, 0.8, ...]
+  barcode_02: R₂ = [0.2, 0.4, -0.1, ...]
+  barcode_03: R₃ = [-0.4, 0.7, 0.2, ...]
+  barcode_04: R₄ = [0.6, -0.5, 0.9, ...]
+
+Compute distances:
+  d₁ = DTW(Q, R₁) = 0.23
+  d₂ = DTW(Q, R₂) = 0.87
+  d₃ = DTW(Q, R₃) = 0.45
+  d₄ = DTW(Q, R₄) = 0.91
+
+Sort: [d₁, d₃, d₂, d₄] = [0.23, 0.45, 0.87, 0.91]
+
+Confidence ratio:
+  ratio = d_best / d_second_best
+        = 0.23 / 0.45
+        = 0.51
+
+Decision (threshold = 0.8):
+  ratio (0.51) &lt; threshold (0.8)
+  → Confident: assign to barcode_01
+</code></pre></div>
+<hr />
+<h2 id="signal-normalization">Signal Normalization<a class="headerlink" href="#signal-normalization" title="Permanent link">&para;</a></h2>
+<h3 id="mad-median-absolute-deviation">MAD (Median Absolute Deviation)<a class="headerlink" href="#mad-median-absolute-deviation" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>MAD Normalization
+─────────────────
+
+Given signal: [s₀, s₁, s₂, ..., sₙ]
+
+Step 1: Compute median
+  median = median([s₀, s₁, s₂, ..., sₙ])
+
+Step 2: Compute MAD
+  deviations = [|s₀ - median|, |s₁ - median|, ...]
+  MAD = median(deviations)
+
+Step 3: Normalize
+  normalized[i] = (s[i] - median) / MAD
+
+Properties:
+  - Robust to outliers (unlike z-score)
+  - Centers signal around 0
+  - Scales by robust spread measure
+</code></pre></div>
+<h3 id="fingerprint-normalization">Fingerprint Normalization<a class="headerlink" href="#fingerprint-normalization" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Normalization Methods for Fingerprints
+──────────────────────────────────────
+
+Z-score:
+  μ = mean(fp)
+  σ = std(fp)
+  normalized[i] = (fp[i] - μ) / σ
+
+Min-Max:
+  normalized[i] = (fp[i] - min(fp)) / (max(fp) - min(fp))
+
+Median:
+  med = median(fp)
+  MAD = median(|fp[i] - med|)
+  normalized[i] = (fp[i] - med) / MAD
+
+None:
+  normalized[i] = fp[i]  (no transformation)
+</code></pre></div>
+<hr />
+<h2 id="performance-considerations">Performance Considerations<a class="headerlink" href="#performance-considerations" title="Permanent link">&para;</a></h2>
+<h3 id="parallel-processing">Parallel Processing<a class="headerlink" href="#parallel-processing" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Parallel DTW Distance Matrix
+────────────────────────────
+
+For N queries and M references:
+
+Sequential:
+  for i in 0..N:
+    for j in 0..M:
+      D[i,j] = dtw(Q[i], R[j])
+
+  Time: O(N × M × n × m)
+
+Parallel (rayon):
+  (0..N).par_iter().flat_map(|i| {
+    (0..M).map(|j| dtw(Q[i], R[j]))
+  })
+
+  Time: O(N × M × n × m / num_threads)
+
+Block-based parallel (for very large matrices):
+  - Divide into blocks of size B × B
+  - Process blocks in parallel
+  - Better cache locality
+</code></pre></div>
+<h3 id="early-stopping-in-llr">Early Stopping in LLR<a class="headerlink" href="#early-stopping-in-llr" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Early Stopping Optimization
+───────────────────────────
+
+Monitor derivative of gain curve:
+  if mean_derivative(window) &lt; 0:
+    stop_searching
+
+         gain
+           │     ╭─╮
+           │    ╱   ╲
+           │   ╱     ╲  ← derivative becomes negative
+           │  ╱       ╲
+           │ ╱         ╲
+           └──────────────────▶ position
+                 ▲
+                 │
+            Stop here (past peak)
+
+Benefits:
+  - Avoids unnecessary computation
+  - Useful for very long signals
+  - Configurable window and stride
+</code></pre></div>
+<hr />
+<h2 id="library-api">Library API<a class="headerlink" href="#library-api" title="Permanent link">&para;</a></h2>
+<h3 id="llr-module">LLR Module<a class="headerlink" href="#llr-module" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">escapepod</span><span class="p">::</span><span class="n">segmentation</span><span class="p">::{</span><span class="n">LlrTrace</span><span class="p">,</span><span class="w"> </span><span class="n">detect_adapter</span><span class="p">};</span>
+
+<span class="c1">// Create trace from signal</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">trace</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LlrTrace</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">signal</span><span class="p">,</span><span class="w"> </span><span class="n">stride</span><span class="p">);</span>
+
+<span class="c1">// Compute gains for a range</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">gains</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">compute_gains</span><span class="p">(</span><span class="n">start</span><span class="p">,</span><span class="w"> </span><span class="n">end</span><span class="p">,</span><span class="w"> </span><span class="n">min_obs</span><span class="p">,</span><span class="w"> </span><span class="n">border_trim</span><span class="p">);</span>
+
+<span class="c1">// Find best split</span>
+<span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">position</span><span class="p">,</span><span class="w"> </span><span class="n">gain</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">best_split</span><span class="p">(</span><span class="n">start</span><span class="p">,</span><span class="w"> </span><span class="n">end</span><span class="p">,</span><span class="w"> </span><span class="n">min_obs</span><span class="p">,</span><span class="w"> </span><span class="n">border_trim</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="c1">// Full adapter detection</span>
+<span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">adapter_start</span><span class="p">,</span><span class="w"> </span><span class="n">adapter_end</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">detect_adapter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">signal</span><span class="p">,</span><span class="w"> </span><span class="n">min_obs</span><span class="p">,</span><span class="w"> </span><span class="n">border_trim</span><span class="p">);</span>
+</code></pre></div>
+<h3 id="t-test-module">T-test Module<a class="headerlink" href="#t-test-module" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">escapepod</span><span class="p">::</span><span class="n">segmentation</span><span class="p">::{</span>
+<span class="w">    </span><span class="n">windowed_ttest</span><span class="p">,</span>
+<span class="w">    </span><span class="n">find_changepoints</span><span class="p">,</span>
+<span class="w">    </span><span class="n">compute_segment_means</span><span class="p">,</span>
+<span class="w">    </span><span class="n">segment_signal</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="c1">// Compute t-scores</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">t_scores</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">windowed_ttest</span><span class="p">(</span><span class="o">&amp;</span><span class="n">signal</span><span class="p">,</span><span class="w"> </span><span class="n">window_width</span><span class="p">);</span>
+
+<span class="c1">// Find changepoints</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">changepoints</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">find_changepoints</span><span class="p">(</span><span class="o">&amp;</span><span class="n">signal</span><span class="p">,</span><span class="w"> </span><span class="n">window_width</span><span class="p">,</span><span class="w"> </span><span class="n">num_changepoints</span><span class="p">,</span><span class="w"> </span><span class="n">min_separation</span><span class="p">);</span>
+
+<span class="c1">// Get segment means</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">compute_segment_means</span><span class="p">(</span><span class="o">&amp;</span><span class="n">signal</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">changepoints</span><span class="p">);</span>
+
+<span class="c1">// All-in-one</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">segment_signal</span><span class="p">(</span><span class="o">&amp;</span><span class="n">signal</span><span class="p">,</span><span class="w"> </span><span class="n">window_width</span><span class="p">,</span><span class="w"> </span><span class="n">num_changepoints</span><span class="p">,</span><span class="w"> </span><span class="n">min_separation</span><span class="p">);</span>
+</code></pre></div>
+<h3 id="dtw-module">DTW Module<a class="headerlink" href="#dtw-module" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">escapepod</span><span class="p">::</span><span class="n">dtw</span><span class="p">::{</span><span class="n">dtw_distance</span><span class="p">,</span><span class="w"> </span><span class="n">dtw_distance_matrix</span><span class="p">};</span>
+
+<span class="c1">// Single distance</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">distance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dtw_distance</span><span class="p">(</span><span class="o">&amp;</span><span class="n">query</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">reference</span><span class="p">,</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">window</span><span class="p">));</span>
+
+<span class="c1">// Distance matrix (parallel)</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">matrix</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dtw_distance_matrix</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queries</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">references</span><span class="p">,</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">window</span><span class="p">));</span>
+</code></pre></div>
+<hr />
+<h2 id="references">References<a class="headerlink" href="#references" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>ADAPTed</strong>: van der Toorn, W.K. et al. "Adapter and poly(A) Detection And Profiling Tool"</li>
+<li><strong>Tombo</strong>: Oxford Nanopore Technologies. Signal-level analysis for modified bases</li>
+<li><strong>DTW</strong>: Sakoe, H. &amp; Chiba, S. (1978). "Dynamic programming algorithm optimization for spoken word recognition"</li>
+<li><strong>WarpDemuX</strong>: Barcode demultiplexing using signal-level analysis</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2025 RNA Bioscience Initiative
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/rnabioco/escapepod-rs" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.sections", "navigation.expand", "navigation.top", "navigation.indexes", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
