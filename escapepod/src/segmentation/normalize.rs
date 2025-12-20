@@ -1,6 +1,7 @@
 //! Signal normalization utilities for nanopore signal processing.
 //!
-//! Provides MAD (Median Absolute Deviation) normalization and downscaling operations.
+//! Provides MAD (Median Absolute Deviation) normalization, dwell time normalization,
+//! and downscaling operations.
 
 /// Compute the median of a sorted slice of values.
 ///
@@ -99,6 +100,92 @@ pub fn mad_normalize_with_clipping(signal: &[f32], clip_sigma: f32) -> Vec<f32> 
             (clipped - med) / mad_val
         })
         .collect()
+}
+
+/// Normalize dwell times using log-transform followed by z-score normalization.
+///
+/// Dwell times are inherently right-skewed (most are short, few are long),
+/// so log transformation before normalization is recommended. This creates
+/// a more Gaussian-like distribution suitable for distance-based classification.
+///
+/// The transformation is: `(log(dwell) - mean(log(dwell))) / std(log(dwell))`
+///
+/// # Arguments
+/// * `dwell_times` - Raw dwell times in samples
+///
+/// # Returns
+/// A new vector containing the normalized dwell times.
+/// Returns empty vector if input is empty.
+/// If all dwells are identical, returns zeros.
+///
+/// # Example
+/// ```
+/// use escapepod::segmentation::normalize_dwell_times;
+///
+/// let dwells = vec![30.0, 45.0, 32.0, 100.0, 28.0];
+/// let normalized = normalize_dwell_times(&dwells);
+/// ```
+pub fn normalize_dwell_times(dwell_times: &[f32]) -> Vec<f32> {
+    if dwell_times.is_empty() {
+        return Vec::new();
+    }
+
+    // Log transform (add small epsilon to avoid log(0))
+    let log_dwells: Vec<f32> = dwell_times.iter().map(|&d| (d.max(1.0)).ln()).collect();
+
+    // Compute mean and std of log-transformed values
+    let n = log_dwells.len() as f32;
+    let mean = log_dwells.iter().sum::<f32>() / n;
+    let variance = log_dwells.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+    let std = variance.sqrt();
+
+    if std < 1e-6 {
+        // All dwells are essentially identical
+        return vec![0.0; dwell_times.len()];
+    }
+
+    // Z-score normalize
+    log_dwells.iter().map(|&x| (x - mean) / std).collect()
+}
+
+/// Normalize dwell times using MAD (robust to outliers).
+///
+/// Uses log-transform followed by MAD normalization instead of z-score.
+/// This is more robust to extreme dwell time outliers.
+///
+/// # Arguments
+/// * `dwell_times` - Raw dwell times in samples
+///
+/// # Returns
+/// A new vector containing the normalized dwell times.
+/// Returns empty vector if input is empty.
+/// If MAD is zero, returns zeros.
+///
+/// # Example
+/// ```
+/// use escapepod::segmentation::normalize_dwell_times_mad;
+///
+/// let dwells = vec![30.0, 45.0, 32.0, 500.0, 28.0];  // 500 is outlier
+/// let normalized = normalize_dwell_times_mad(&dwells);
+/// ```
+pub fn normalize_dwell_times_mad(dwell_times: &[f32]) -> Vec<f32> {
+    if dwell_times.is_empty() {
+        return Vec::new();
+    }
+
+    // Log transform (add small epsilon to avoid log(0))
+    let log_dwells: Vec<f32> = dwell_times.iter().map(|&d| (d.max(1.0)).ln()).collect();
+
+    // Compute median and MAD
+    let (med, mad_val) = median_and_mad(&log_dwells);
+
+    if mad_val < 1e-6 {
+        // All dwells are essentially identical
+        return vec![0.0; dwell_times.len()];
+    }
+
+    // MAD normalize
+    log_dwells.iter().map(|&x| (x - med) / mad_val).collect()
 }
 
 /// Downscale signal by averaging consecutive samples.
@@ -237,5 +324,76 @@ mod tests {
     fn test_mad_normalize_constant_signal() {
         let signal = vec![5.0, 5.0, 5.0, 5.0];
         mad_normalize(&signal);
+    }
+
+    #[test]
+    fn test_normalize_dwell_times() {
+        // Typical dwell times in samples (right-skewed distribution)
+        let dwells = vec![30.0, 45.0, 32.0, 100.0, 28.0];
+        let normalized = normalize_dwell_times(&dwells);
+
+        assert_eq!(normalized.len(), 5);
+
+        // After z-score normalization, mean should be ~0
+        let mean: f32 = normalized.iter().sum::<f32>() / normalized.len() as f32;
+        assert!(mean.abs() < 1e-5);
+
+        // The outlier (100) should have the highest normalized value
+        let max_idx = normalized
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(max_idx, 3); // Index of 100.0
+    }
+
+    #[test]
+    fn test_normalize_dwell_times_empty() {
+        let dwells: Vec<f32> = vec![];
+        let normalized = normalize_dwell_times(&dwells);
+        assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_dwell_times_constant() {
+        // All identical dwell times
+        let dwells = vec![50.0, 50.0, 50.0, 50.0];
+        let normalized = normalize_dwell_times(&dwells);
+
+        // Should return zeros for constant values
+        assert_eq!(normalized.len(), 4);
+        for &val in &normalized {
+            assert_eq!(val, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_normalize_dwell_times_mad() {
+        // Include an outlier
+        let dwells = vec![30.0, 45.0, 32.0, 500.0, 28.0]; // 500 is extreme outlier
+        let normalized = normalize_dwell_times_mad(&dwells);
+
+        assert_eq!(normalized.len(), 5);
+
+        // The outlier should still have the highest value
+        let max_idx = normalized
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(max_idx, 3); // Index of 500.0
+    }
+
+    #[test]
+    fn test_normalize_dwell_times_preserves_order() {
+        let dwells = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let normalized = normalize_dwell_times(&dwells);
+
+        // Monotonically increasing dwells should still be monotonically increasing
+        for i in 1..normalized.len() {
+            assert!(normalized[i] > normalized[i - 1]);
+        }
     }
 }
