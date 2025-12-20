@@ -31,6 +31,31 @@ use rayon::prelude::*;
 /// assert_eq!(distance, 0.0);
 /// ```
 pub fn dtw_distance(a: &[f32], b: &[f32], window: Option<usize>) -> f32 {
+    dtw_distance_bounded(a, b, window, f32::INFINITY)
+}
+
+/// Compute DTW distance with early abandonment.
+///
+/// If the minimum distance in any row exceeds `upper_bound`, returns `f32::INFINITY`
+/// early without completing the full computation. This is useful when searching for
+/// the best match and we can skip candidates that can't beat the current best.
+///
+/// # Arguments
+///
+/// * `a` - First sequence
+/// * `b` - Second sequence
+/// * `window` - Optional Sakoe-Chiba band width
+/// * `upper_bound` - If all values in a row exceed this, return early
+///
+/// # Returns
+///
+/// The DTW distance, or `f32::INFINITY` if early abandonment occurred.
+pub fn dtw_distance_bounded(
+    a: &[f32],
+    b: &[f32],
+    window: Option<usize>,
+    upper_bound: f32,
+) -> f32 {
     let n = a.len();
     let m = b.len();
 
@@ -59,10 +84,19 @@ pub fn dtw_distance(a: &[f32], b: &[f32], window: Option<usize>) -> f32 {
             m
         };
 
+        // Track minimum value in this row for early abandonment
+        let mut row_min = f32::INFINITY;
+
         for j in j_start..=j_end {
             let cost = (a[i - 1] - b[j - 1]).abs();
             let min_prev = prev[j - 1].min(prev[j]).min(curr[j - 1]);
             curr[j] = cost + min_prev;
+            row_min = row_min.min(curr[j]);
+        }
+
+        // Early abandonment: if minimum in row exceeds bound, can't beat best
+        if row_min > upper_bound {
+            return f32::INFINITY;
         }
 
         std::mem::swap(&mut prev, &mut curr);
@@ -293,5 +327,42 @@ mod tests {
         // Should be able to align despite length difference
         assert!(distance < f32::INFINITY);
         assert!(distance >= 0.0);
+    }
+
+    #[test]
+    fn test_dtw_bounded_no_abandonment() {
+        // With high upper bound, should return same result as unbounded
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![2.0, 3.0, 4.0, 5.0];
+
+        let unbounded = dtw_distance(&a, &b, None);
+        let bounded = dtw_distance_bounded(&a, &b, None, 100.0);
+        assert_eq!(unbounded, bounded);
+    }
+
+    #[test]
+    fn test_dtw_bounded_early_abandonment() {
+        // With very low upper bound, should abandon early
+        let a = vec![0.0, 0.0, 0.0, 0.0];
+        let b = vec![10.0, 10.0, 10.0, 10.0];
+
+        // The actual distance would be 40, so bound of 5 should cause abandonment
+        let bounded = dtw_distance_bounded(&a, &b, None, 5.0);
+        assert!(bounded.is_infinite());
+    }
+
+    #[test]
+    fn test_dtw_bounded_exact_bound() {
+        // Bound equal to actual distance should not abandon
+        let a = vec![0.0];
+        let b = vec![1.0];
+
+        // Distance is exactly 1.0
+        let bounded = dtw_distance_bounded(&a, &b, None, 1.0);
+        assert_eq!(bounded, 1.0);
+
+        // Just below should abandon
+        let bounded_low = dtw_distance_bounded(&a, &b, None, 0.5);
+        assert!(bounded_low.is_infinite());
     }
 }
