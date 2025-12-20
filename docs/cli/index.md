@@ -20,6 +20,7 @@ escapepod <COMMAND> [OPTIONS]
 | [bam-filter](bam-filter.md) | Filter reads based on paired BAM file |
 | [repack](repack.md) | Repack POD5 files to optimize storage |
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
+| [demux](demux.md) | Barcode demultiplexing (detect, fingerprint, classify, split, train) |
 
 ## Global Options
 
