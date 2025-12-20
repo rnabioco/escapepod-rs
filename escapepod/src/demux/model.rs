@@ -74,7 +74,10 @@ impl WarpDemuxModel {
 
     /// Get the fingerprint dimension (number of features).
     pub fn feature_dim(&self) -> usize {
-        self.training_fingerprints.first().map(|v| v.len()).unwrap_or(0)
+        self.training_fingerprints
+            .first()
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Validate the model structure.
@@ -160,11 +163,12 @@ pub fn load_model(path: &Path) -> Result<WarpDemuxModel, anyhow::Error> {
 
     let reader = BufReader::new(file);
 
-    let model: WarpDemuxModel = serde_json::from_reader(reader)
-        .with_context(|| "Failed to parse model JSON")?;
+    let model: WarpDemuxModel =
+        serde_json::from_reader(reader).with_context(|| "Failed to parse model JSON")?;
 
     // Validate the model
-    model.validate()
+    model
+        .validate()
         .map_err(|e| anyhow::anyhow!("Invalid model: {}", e))?;
 
     Ok(model)

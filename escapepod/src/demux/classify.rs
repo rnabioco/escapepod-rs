@@ -211,7 +211,7 @@ mod tests {
     fn test_classify_close_match() {
         let model = create_test_model();
         let fingerprint = vec![0.02, 0.02, 0.02]; // Very close to BC01 [0.0, 0.0, 0.0]
-                                                    // Much farther from BC02 [1.0, 1.0, 1.0]
+                                                  // Much farther from BC02 [1.0, 1.0, 1.0]
 
         let result = classify_read(&model, &fingerprint);
 

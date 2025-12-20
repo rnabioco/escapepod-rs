@@ -183,10 +183,7 @@ pub fn extract_fingerprint_from_signal(
     }
 
     // Extract segment means as fingerprint
-    let fingerprint_values: Vec<f32> = segments
-        .iter()
-        .map(|(_, _, mean)| *mean as f32)
-        .collect();
+    let fingerprint_values: Vec<f32> = segments.iter().map(|(_, _, mean)| *mean as f32).collect();
 
     // Normalize the fingerprint
     let mut fp = Fingerprint::new(fingerprint_values, read_id);
@@ -254,11 +251,26 @@ mod tests {
 
     #[test]
     fn test_parse_norm_method_valid() {
-        assert!(matches!(parse_norm_method("zscore").unwrap(), NormMethod::ZScore));
-        assert!(matches!(parse_norm_method("ZSCORE").unwrap(), NormMethod::ZScore));
-        assert!(matches!(parse_norm_method("minmax").unwrap(), NormMethod::MinMax));
-        assert!(matches!(parse_norm_method("median").unwrap(), NormMethod::Median));
-        assert!(matches!(parse_norm_method("none").unwrap(), NormMethod::None));
+        assert!(matches!(
+            parse_norm_method("zscore").unwrap(),
+            NormMethod::ZScore
+        ));
+        assert!(matches!(
+            parse_norm_method("ZSCORE").unwrap(),
+            NormMethod::ZScore
+        ));
+        assert!(matches!(
+            parse_norm_method("minmax").unwrap(),
+            NormMethod::MinMax
+        ));
+        assert!(matches!(
+            parse_norm_method("median").unwrap(),
+            NormMethod::Median
+        ));
+        assert!(matches!(
+            parse_norm_method("none").unwrap(),
+            NormMethod::None
+        ));
     }
 
     #[test]
@@ -271,8 +283,16 @@ mod tests {
     fn test_parse_boundaries_csv_valid() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "read_id,num_samples,adapter_start,adapter_end").unwrap();
-        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,1000,100,500").unwrap();
-        writeln!(temp_file, "b2c3d4e5-f6a7-8901-bcde-f12345678901,2000,200,600").unwrap();
+        writeln!(
+            temp_file,
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,1000,100,500"
+        )
+        .unwrap();
+        writeln!(
+            temp_file,
+            "b2c3d4e5-f6a7-8901-bcde-f12345678901,2000,200,600"
+        )
+        .unwrap();
         temp_file.flush().unwrap();
 
         let result = parse_boundaries_csv(&temp_file.path().to_path_buf()).unwrap();
@@ -292,7 +312,11 @@ mod tests {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "read_id,num_samples,adapter_start,adapter_end").unwrap();
         // Invalid: adapter_end <= adapter_start
-        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,1000,500,100").unwrap();
+        writeln!(
+            temp_file,
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,1000,500,100"
+        )
+        .unwrap();
         temp_file.flush().unwrap();
 
         let result = parse_boundaries_csv(&temp_file.path().to_path_buf()).unwrap();
@@ -391,10 +415,7 @@ mod tests {
 
     #[test]
     fn test_compute_std_dev_fingerprint_multiple() {
-        let fingerprints = vec![
-            vec![1.0, 0.0],
-            vec![3.0, 0.0],
-        ];
+        let fingerprints = vec![vec![1.0, 0.0], vec![3.0, 0.0]];
         let consensus = vec![2.0, 0.0];
         let result = compute_std_dev_fingerprint(&fingerprints, &consensus);
         // Variance = ((1-2)^2 + (3-2)^2) / 2 = (1 + 1) / 2 = 1
@@ -424,15 +445,8 @@ mod tests {
         // Create a signal with enough samples
         let signal: Vec<i16> = (0..1000).map(|i| (i as i16) % 1000).collect();
         let read_id = Uuid::new_v4();
-        let result = extract_fingerprint_from_signal(
-            &signal,
-            0,
-            500,
-            10,
-            5,
-            NormMethod::None,
-            read_id,
-        );
+        let result =
+            extract_fingerprint_from_signal(&signal, 0, 500, 10, 5, NormMethod::None, read_id);
         assert!(result.is_some());
         let fp = result.unwrap();
         assert_eq!(fp.read_id, read_id);
