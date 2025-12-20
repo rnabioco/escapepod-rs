@@ -3,6 +3,7 @@
 use super::utils::parse_reference_csv;
 use crate::style;
 use escapepod::dtw::dtw_distance_matrix;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -117,11 +118,11 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
         anyhow::bail!("No valid query fingerprints found");
     }
 
-    // Classify each query
+    // Classify each query in parallel
     println!("{} reads...", style::action("Classifying"));
 
     let results: Vec<ClassifyResult> = query_fps
-        .iter()
+        .par_iter()
         .map(|(read_id, fingerprint)| {
             let result = classify_read(&model, fingerprint);
             ClassifyResult {
