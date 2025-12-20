@@ -130,10 +130,7 @@ fn group_by_barcode(mapping: &HashMap<Uuid, String>) -> HashMap<String, HashSet<
         } else {
             barcode.clone()
         };
-        groups
-            .entry(barcode_key)
-            .or_default()
-            .insert(*read_id);
+        groups.entry(barcode_key).or_default().insert(*read_id);
     }
 
     groups

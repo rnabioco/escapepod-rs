@@ -140,7 +140,11 @@ mod tests {
 
         // All kernel values should be in (0, 1]
         for &value in kernel.iter() {
-            assert!(value > 0.0 && value <= 1.0, "Kernel value {} out of range", value);
+            assert!(
+                value > 0.0 && value <= 1.0,
+                "Kernel value {} out of range",
+                value
+            );
         }
 
         // Diagonal should be 1.0 (distance=0)

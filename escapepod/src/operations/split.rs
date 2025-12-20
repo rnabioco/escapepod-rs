@@ -141,11 +141,7 @@ mod tests {
     fn test_parse_barcode_mapping_empty_barcode() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "read_id,barcode").unwrap();
-        writeln!(
-            temp_file,
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,barcode01"
-        )
-        .unwrap();
+        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,barcode01").unwrap();
         writeln!(temp_file, "b2c3d4e5-f6a7-8901-bcde-f12345678901,").unwrap(); // Empty barcode
         temp_file.flush().unwrap();
 
@@ -160,11 +156,7 @@ mod tests {
     fn test_parse_barcode_mapping_missing_header() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "uuid,bc").unwrap(); // Wrong headers
-        writeln!(
-            temp_file,
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890,barcode01"
-        )
-        .unwrap();
+        writeln!(temp_file, "a1b2c3d4-e5f6-7890-abcd-ef1234567890,barcode01").unwrap();
         temp_file.flush().unwrap();
 
         let result = parse_barcode_mapping(temp_file.path());

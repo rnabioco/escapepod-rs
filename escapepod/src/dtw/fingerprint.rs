@@ -94,16 +94,8 @@ pub fn normalize_fingerprint(fp: &mut Fingerprint, method: NormMethod) {
             }
         }
         NormMethod::MinMax => {
-            let min = fp
-                .values
-                .iter()
-                .copied()
-                .fold(f32::INFINITY, f32::min);
-            let max = fp
-                .values
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
+            let min = fp.values.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = fp.values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let range = max - min;
 
             if range > 0.0 {
@@ -207,11 +199,7 @@ mod tests {
         assert!(min.abs() < 1e-5);
 
         // Max should be 1
-        let max = fp
-            .values
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max = fp.values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         assert!((max - 1.0).abs() < 1e-5);
     }
 

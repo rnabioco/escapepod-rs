@@ -293,7 +293,8 @@ fn extract_training_fingerprint(
     let normalized = normalize_signal(signal);
 
     // Detect adapter using LLR
-    let (adapter_start, adapter_end) = detect_adapter(&normalized, args.min_adapter, args.border_trim);
+    let (adapter_start, adapter_end) =
+        detect_adapter(&normalized, args.min_adapter, args.border_trim);
 
     if adapter_end <= adapter_start {
         return None;

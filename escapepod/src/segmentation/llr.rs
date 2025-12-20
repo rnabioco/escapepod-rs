@@ -171,8 +171,7 @@ impl LlrTrace {
 
         for i in (search_start..search_end).step_by(self.stride) {
             // Check for early stopping
-            if i >= search_start + early_stop_window
-                && (i - search_start) % early_stop_stride == 0
+            if i >= search_start + early_stop_window && (i - search_start) % early_stop_stride == 0
             {
                 // Compute mean derivative over the window
                 let window_start = i - early_stop_window;
@@ -273,12 +272,18 @@ impl LlrTrace {
 /// let signal = vec![120.0; 100]; // Simplified example
 /// let (start, end) = detect_adapter(&signal, 10, 5);
 /// ```
-pub fn detect_adapter(signal: &[f32], min_obs_adapter: usize, border_trim: usize) -> (usize, usize) {
+pub fn detect_adapter(
+    signal: &[f32],
+    min_obs_adapter: usize,
+    border_trim: usize,
+) -> (usize, usize) {
     let trace = LlrTrace::new(signal, 1);
     let length = trace.len();
 
     // Find primary split
-    let Some((x_first, _)) = trace.best_split(0, length, min_obs_adapter + border_trim, border_trim) else {
+    let Some((x_first, _)) =
+        trace.best_split(0, length, min_obs_adapter + border_trim, border_trim)
+    else {
         return (0, 0);
     };
 
@@ -448,7 +453,7 @@ mod tests {
         // Create a signal with adapter-like pattern: high - low - high
         let mut signal = Vec::new();
         signal.extend(vec![120.0; 30]); // Open pore
-        signal.extend(vec![80.0; 40]);  // Adapter (lower)
+        signal.extend(vec![80.0; 40]); // Adapter (lower)
         signal.extend(vec![110.0; 30]); // RNA
 
         let (start, end) = detect_adapter(&signal, 10, 5);
