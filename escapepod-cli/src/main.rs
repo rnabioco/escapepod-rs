@@ -211,6 +211,15 @@ Examples:
   escapepod summary input.pod5 --json            Output as JSON
 ")]
     Summary(commands::summary::SummaryArgs),
+
+    /// Barcode demultiplexing workflow
+    #[command(after_help = "\
+Examples:
+  escapepod demux detect input.pod5 -o boundaries.csv
+  escapepod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
+  escapepod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
+")]
+    Demux(commands::demux::DemuxArgs),
 }
 
 #[derive(Subcommand)]
@@ -292,5 +301,7 @@ fn main() -> anyhow::Result<()> {
         } => commands::subset::run(input, csv, output_dir, force),
 
         Commands::Summary(args) => commands::summary::run(args),
+
+        Commands::Demux(args) => commands::demux::run(args),
     }
 }

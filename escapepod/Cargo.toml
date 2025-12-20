@@ -8,12 +8,16 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 arrow = { workspace = true }
 byteorder = { workspace = true }
 csv = "1"
 flatbuffers = { workspace = true }
 memmap2 = { workspace = true }
+ndarray = "0.16"
 rayon = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"
 thiserror = { workspace = true }
 uuid = { workspace = true }

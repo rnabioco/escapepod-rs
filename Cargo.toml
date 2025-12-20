@@ -24,6 +24,7 @@ memmap2 = "0.9"
 escapepod = { path = "escapepod" }
 rayon = "1"
 # Error handling
+anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Compression
