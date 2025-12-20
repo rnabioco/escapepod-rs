@@ -331,20 +331,34 @@ pub fn detect_adapter(
     }
 }
 
-/// Helper function to compute median of a slice.
+/// Helper function to compute median of a slice using O(N) selection.
+///
+/// Uses `select_nth_unstable` for O(N) performance instead of O(N log N) sort.
+/// For even-length arrays, returns the lower-middle element (acceptable for comparisons).
 fn median_slice(data: &[f32]) -> f32 {
     if data.is_empty() {
         return 0.0;
     }
 
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = sorted.len() / 2;
+    let mut buf = data.to_vec();
+    let mid = buf.len() / 2;
 
-    if sorted.len() % 2 == 0 {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+    // select_nth_unstable partitions so that element at mid is the nth smallest
+    // This is O(N) average case vs O(N log N) for full sort
+    buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+
+    if buf.len() % 2 == 0 && mid > 0 {
+        // For even length, need to also find max of left partition for true median
+        // Since we're only using this for comparisons, approximate with lower middle
+        // To get exact even-length median:
+        let left_max = buf[..mid]
+            .iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .copied()
+            .unwrap_or(buf[mid]);
+        (left_max + buf[mid]) / 2.0
     } else {
-        sorted[mid]
+        buf[mid]
     }
 }
 
