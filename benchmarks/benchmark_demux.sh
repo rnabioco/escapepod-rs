@@ -140,6 +140,149 @@ escapepod_time=$(echo "$time_end - $time_start" | bc)
 echo "Escapepod time (detect + fingerprint): ${escapepod_time}s"
 
 # ========================================
+# Benchmark: Classification Accuracy
+# ========================================
+echo ""
+echo "========================================"
+echo "Benchmark 3: Classification Accuracy"
+echo "========================================"
+echo ""
+echo "Testing escapepod demux accuracy against gold standard"
+echo "Using RNA004 test data with 5 barcodes (1000 reads total)"
+echo ""
+
+ACCURACY_DATA_DIR="$PROJECT_ROOT/ext/WarpDemuX/test_data/live_balancing"
+ACCURACY_OUTPUT_DIR="$OUTPUT_DIR/accuracy_test"
+
+# Check if accuracy test data exists
+if [ -d "$ACCURACY_DATA_DIR" ] && [ -f "$ACCURACY_DATA_DIR/small_pod5_0.pod5" ]; then
+    mkdir -p "$ACCURACY_OUTPUT_DIR"
+
+    # Step 1: Create assignments CSV from gold standard
+    echo "Creating assignments from gold standard..."
+    export ACCURACY_DATA_DIR ACCURACY_OUTPUT_DIR
+    python3 << 'PYEOF'
+import os
+
+data_dir = os.environ['ACCURACY_DATA_DIR']
+output_dir = os.environ['ACCURACY_OUTPUT_DIR']
+
+with open(f"{output_dir}/assignments.csv", 'w') as out:
+    out.write("read_id,barcode,pod5_file\n")
+    for i in range(5):
+        barcode = f"BC0{i}"
+        pod5_file = f"{data_dir}/small_pod5_{i}.pod5"
+        with open(f"{data_dir}/read_ids{i}.txt") as f:
+            for line in f:
+                read_id = line.strip()
+                if read_id:
+                    out.write(f"{read_id},{barcode},{pod5_file}\n")
+print("Created assignments.csv")
+PYEOF
+
+    # Step 2: Train KNN model
+    echo "Training KNN model..."
+    "$ESCAPEPOD_BIN" demux train \
+        --assignments "$ACCURACY_OUTPUT_DIR/assignments.csv" \
+        -o "$ACCURACY_OUTPUT_DIR/knn_model.json" \
+        --knn -j 4 2>/dev/null
+
+    # Step 3: Detect adapter boundaries
+    echo "Detecting adapter boundaries..."
+    "$ESCAPEPOD_BIN" demux detect \
+        "$ACCURACY_DATA_DIR/small_pod5_0.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_1.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_2.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_3.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_4.pod5" \
+        -o "$ACCURACY_OUTPUT_DIR/boundaries.csv" -j 4 2>/dev/null
+
+    # Step 4: Extract fingerprints
+    echo "Extracting fingerprints..."
+    "$ESCAPEPOD_BIN" demux fingerprint \
+        "$ACCURACY_DATA_DIR/small_pod5_0.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_1.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_2.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_3.pod5" \
+        "$ACCURACY_DATA_DIR/small_pod5_4.pod5" \
+        --boundaries "$ACCURACY_OUTPUT_DIR/boundaries.csv" \
+        -o "$ACCURACY_OUTPUT_DIR/fingerprints.csv" -j 4 2>/dev/null
+
+    # Step 5: Classify
+    echo "Classifying reads..."
+    "$ESCAPEPOD_BIN" demux classify \
+        "$ACCURACY_OUTPUT_DIR/fingerprints.csv" \
+        --model "$ACCURACY_OUTPUT_DIR/knn_model.json" \
+        -o "$ACCURACY_OUTPUT_DIR/classifications.csv" 2>/dev/null
+
+    # Step 6: Calculate accuracy
+    echo ""
+    echo "=== Classification Results ==="
+    python3 << 'PYEOF'
+import os
+
+data_dir = os.environ['ACCURACY_DATA_DIR']
+output_dir = os.environ['ACCURACY_OUTPUT_DIR']
+
+# Load ground truth
+ground_truth = {}
+for i in range(5):
+    barcode = f"BC0{i}"
+    with open(f"{data_dir}/read_ids{i}.txt") as f:
+        for line in f:
+            read_id = line.strip()
+            if read_id:
+                ground_truth[read_id] = barcode
+
+# Load classifications
+correct = 0
+incorrect = 0
+confident_correct = 0
+confident_incorrect = 0
+barcode_counts = {f"BC0{i}": {"correct": 0, "total": 0} for i in range(5)}
+
+with open(f"{output_dir}/classifications.csv") as f:
+    next(f)  # skip header
+    for line in f:
+        parts = line.strip().split(',')
+        read_id = parts[0]
+        predicted = parts[1]
+        is_confident = parts[5].lower() == 'true'
+
+        if read_id in ground_truth:
+            actual = ground_truth[read_id]
+            barcode_counts[actual]["total"] += 1
+            if predicted == actual:
+                correct += 1
+                barcode_counts[actual]["correct"] += 1
+                if is_confident:
+                    confident_correct += 1
+            else:
+                incorrect += 1
+                if is_confident:
+                    confident_incorrect += 1
+
+total = correct + incorrect
+accuracy = correct / total * 100 if total > 0 else 0
+
+print(f"  Total classified: {total}")
+print(f"  Correct: {correct}")
+print(f"  Incorrect: {incorrect}")
+print(f"  Overall accuracy: {accuracy:.1f}%")
+print()
+print("  Per-barcode accuracy:")
+for bc in sorted(barcode_counts.keys()):
+    counts = barcode_counts[bc]
+    if counts["total"] > 0:
+        acc = counts["correct"] / counts["total"] * 100
+        print(f"    {bc}: {counts['correct']}/{counts['total']} = {acc:.1f}%")
+PYEOF
+
+else
+    echo "  Skipping accuracy test (test data not found at $ACCURACY_DATA_DIR)"
+fi
+
+# ========================================
 # Summary
 # ========================================
 echo ""

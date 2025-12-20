@@ -28,6 +28,14 @@ pub struct FingerprintArgs {
     #[arg(short, long, required = true, value_name = "FILE")]
     pub output: PathBuf,
 
+    /// Start sample offset within adapter region for fingerprinting
+    #[arg(long, default_value = "1000", value_name = "N")]
+    pub segment_start: usize,
+
+    /// End sample offset within adapter region for fingerprinting
+    #[arg(long, default_value = "2000", value_name = "N")]
+    pub segment_end: usize,
+
     /// Number of segments for fingerprint
     #[arg(long, default_value = "10", value_name = "N")]
     pub num_segments: usize,
@@ -115,10 +123,19 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     let fingerprints: Vec<ReadFingerprint> = reads_to_process
         .par_iter()
         .filter_map(|(read_id, adapter_start, adapter_end, signal)| {
+            // Compute the region within the adapter for fingerprinting
+            let region_start = adapter_start + args.segment_start;
+            let region_end = (adapter_start + args.segment_end).min(*adapter_end);
+
+            if region_end <= region_start {
+                progress_bar.inc(1);
+                return None;
+            }
+
             let result = extract_fingerprint_from_signal(
                 signal,
-                *adapter_start,
-                *adapter_end,
+                region_start,
+                region_end,
                 args.num_segments,
                 args.window_width,
                 norm_method,
