@@ -226,7 +226,8 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
     }
 
     // Find the most common length
-    let mut length_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut length_counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
     for fp in fingerprints {
         *length_counts.entry(fp.len()).or_insert(0) += 1;
     }
@@ -237,7 +238,10 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
         .unwrap_or(0);
 
     // Filter to fingerprints with target length
-    let filtered: Vec<&Vec<f32>> = fingerprints.iter().filter(|fp| fp.len() == target_length).collect();
+    let filtered: Vec<&Vec<f32>> = fingerprints
+        .iter()
+        .filter(|fp| fp.len() == target_length)
+        .collect();
     if filtered.is_empty() {
         return Vec::new();
     }
@@ -272,7 +276,10 @@ pub fn compute_std_dev_fingerprint(fingerprints: &[Vec<f32>], consensus: &[f32])
     let length = consensus.len();
 
     // Filter to fingerprints matching consensus length
-    let filtered: Vec<&Vec<f32>> = fingerprints.iter().filter(|fp| fp.len() == length).collect();
+    let filtered: Vec<&Vec<f32>> = fingerprints
+        .iter()
+        .filter(|fp| fp.len() == length)
+        .collect();
     if filtered.is_empty() {
         return vec![0.0; length];
     }

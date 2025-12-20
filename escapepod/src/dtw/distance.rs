@@ -50,12 +50,7 @@ pub fn dtw_distance(a: &[f32], b: &[f32], window: Option<usize>) -> f32 {
 /// # Returns
 ///
 /// The DTW distance, or `f32::INFINITY` if early abandonment occurred.
-pub fn dtw_distance_bounded(
-    a: &[f32],
-    b: &[f32],
-    window: Option<usize>,
-    upper_bound: f32,
-) -> f32 {
+pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_bound: f32) -> f32 {
     let n = a.len();
     let m = b.len();
 

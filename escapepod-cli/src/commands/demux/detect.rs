@@ -1,7 +1,9 @@
 //! Detect subcommand - LLR-based adapter boundary detection.
 
 use super::types::ReadBoundaries;
-use super::utils::{collect_reads_with_signals, configure_thread_pool, downscale_signal, normalize_signal};
+use super::utils::{
+    collect_reads_with_signals, configure_thread_pool, downscale_signal, normalize_signal,
+};
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod::segmentation::detect_adapter;
@@ -96,8 +98,11 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
             let scaled_border_trim = args.border_trim / scale_factor;
 
             // Detect adapter using LLR
-            let (adapter_start, adapter_end) =
-                detect_adapter(&processed_signal, scaled_min_adapter.max(1), scaled_border_trim.max(1));
+            let (adapter_start, adapter_end) = detect_adapter(
+                &processed_signal,
+                scaled_min_adapter.max(1),
+                scaled_border_trim.max(1),
+            );
 
             // Scale results back to original resolution
             let adapter_start = adapter_start * scale_factor;
