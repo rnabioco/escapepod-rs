@@ -187,8 +187,11 @@ PYEOF
         -o "$ACCURACY_OUTPUT_DIR/knn_model.json" \
         --knn -j 4 2>/dev/null
 
+    # Step 3-5: Time the full pipeline (detect + fingerprint + classify)
+    echo "Running timed classification pipeline..."
+    accuracy_time_start=$(date +%s.%N)
+
     # Step 3: Detect adapter boundaries
-    echo "Detecting adapter boundaries..."
     "$ESCAPEPOD_BIN" demux detect \
         "$ACCURACY_DATA_DIR/small_pod5_0.pod5" \
         "$ACCURACY_DATA_DIR/small_pod5_1.pod5" \
@@ -198,7 +201,6 @@ PYEOF
         -o "$ACCURACY_OUTPUT_DIR/boundaries.csv" -j 4 2>/dev/null
 
     # Step 4: Extract fingerprints
-    echo "Extracting fingerprints..."
     "$ESCAPEPOD_BIN" demux fingerprint \
         "$ACCURACY_DATA_DIR/small_pod5_0.pod5" \
         "$ACCURACY_DATA_DIR/small_pod5_1.pod5" \
@@ -209,11 +211,22 @@ PYEOF
         -o "$ACCURACY_OUTPUT_DIR/fingerprints.csv" -j 4 2>/dev/null
 
     # Step 5: Classify
-    echo "Classifying reads..."
     "$ESCAPEPOD_BIN" demux classify \
         "$ACCURACY_OUTPUT_DIR/fingerprints.csv" \
         --model "$ACCURACY_OUTPUT_DIR/knn_model.json" \
         -o "$ACCURACY_OUTPUT_DIR/classifications.csv" 2>/dev/null
+
+    accuracy_time_end=$(date +%s.%N)
+    accuracy_pipeline_time=$(echo "$accuracy_time_end - $accuracy_time_start" | bc)
+    accuracy_read_count=$(wc -l < "$ACCURACY_OUTPUT_DIR/classifications.csv" | tr -d ' ')
+    accuracy_read_count=$((accuracy_read_count - 1))  # subtract header
+    accuracy_throughput=$(echo "scale=0; $accuracy_read_count / $accuracy_pipeline_time" | bc)
+
+    echo ""
+    echo "=== Classification Timing ==="
+    echo "  Pipeline time: ${accuracy_pipeline_time}s"
+    echo "  Reads classified: ${accuracy_read_count}"
+    echo "  Throughput: ~${accuracy_throughput} reads/sec"
 
     # Step 6: Calculate accuracy
     echo ""
