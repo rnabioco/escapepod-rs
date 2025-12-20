@@ -114,8 +114,12 @@ pub struct ClassifyArgs {
     pub fingerprints: PathBuf,
 
     /// Reference barcode fingerprints (training data)
-    #[arg(long, required = true, value_name = "FILE")]
-    pub reference: PathBuf,
+    #[arg(long, value_name = "FILE")]
+    pub reference: Option<PathBuf>,
+
+    /// Trained WarpDemuX model (JSON format)
+    #[arg(long, value_name = "FILE")]
+    pub model: Option<PathBuf>,
 
     /// Output classifications file
     #[arg(short, long, required = true, value_name = "FILE")]
@@ -125,7 +129,7 @@ pub struct ClassifyArgs {
     #[arg(long, value_name = "N")]
     pub window: Option<usize>,
 
-    /// Minimum distance ratio for confident classification
+    /// Minimum distance ratio for confident classification (CSV mode only)
     #[arg(long, default_value = "0.8", value_name = "RATIO")]
     pub min_ratio: f32,
 }
@@ -434,7 +438,152 @@ fn run_fingerprint(args: FingerprintArgs) -> anyhow::Result<()> {
 }
 
 /// Run the classify subcommand using DTW distance.
-fn run_classify(args: ClassifyArgs) -> anyhow::Result<()> {
+fn run_classify(mut args: ClassifyArgs) -> anyhow::Result<()> {
+    // Check that either reference or model is provided
+    if args.reference.is_none() && args.model.is_none() {
+        anyhow::bail!("Either --reference or --model must be provided");
+    }
+
+    if args.reference.is_some() && args.model.is_some() {
+        anyhow::bail!("Cannot specify both --reference and --model");
+    }
+
+    // Dispatch to appropriate classification method
+    if let Some(model_path) = args.model.take() {
+        run_classify_with_model(args, model_path)
+    } else if let Some(reference_path) = args.reference.take() {
+        run_classify_with_csv(args, reference_path)
+    } else {
+        unreachable!()
+    }
+}
+
+/// Run classification using a trained WarpDemuX model.
+fn run_classify_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()> {
+    use escapepod::demux::{classify_read, load_model};
+
+    println!("{} reads using WarpDemuX model", style::action("Classifying"),);
+    println!(
+        "{} {}",
+        style::label("Fingerprints:"),
+        style::path(args.fingerprints.display())
+    );
+    println!(
+        "{} {}",
+        style::label("Model:"),
+        style::path(model_path.display())
+    );
+    println!(
+        "{} {}",
+        style::label("Output:"),
+        style::path(args.output.display())
+    );
+
+    // Load the model
+    println!("{} model...", style::action("Loading"));
+    let model = load_model(&model_path)?;
+
+    println!(
+        "{} {} training samples, {} features, threshold={:.3} ({})",
+        style::label("Model:"),
+        style::count(model.num_samples()),
+        style::value(model.feature_dim()),
+        style::value(model.threshold),
+        model.threshold_type
+    );
+
+    // Read query fingerprints
+    let query_file = File::open(&args.fingerprints)?;
+    let query_reader = BufReader::new(query_file);
+
+    let mut query_fps: Vec<(Uuid, Vec<f64>)> = Vec::new();
+    let mut header_seen = false;
+
+    for line in query_reader.lines() {
+        let line = line?;
+        if !header_seen {
+            header_seen = true;
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 2 {
+            if let Ok(read_id) = Uuid::parse_str(parts[0]) {
+                let values: Vec<f64> = parts[1..]
+                    .iter()
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if !values.is_empty() {
+                    query_fps.push((read_id, values));
+                }
+            }
+        }
+    }
+
+    println!(
+        "{} {} query fingerprints",
+        style::label("Loaded:"),
+        style::count(query_fps.len())
+    );
+
+    if query_fps.is_empty() {
+        anyhow::bail!("No valid query fingerprints found");
+    }
+
+    // Classify each query
+    println!("{} reads...", style::action("Classifying"));
+
+    let output_file = File::create(&args.output)?;
+    let mut writer = BufWriter::new(output_file);
+
+    writeln!(
+        writer,
+        "read_id,barcode,confidence,best_distance,second_best_distance,is_confident"
+    )?;
+
+    let mut confident_count = 0;
+    let mut unclassified_count = 0;
+
+    for (read_id, fingerprint) in &query_fps {
+        let result = classify_read(&model, fingerprint);
+
+        if result.is_confident {
+            confident_count += 1;
+        } else {
+            unclassified_count += 1;
+        }
+
+        writeln!(
+            writer,
+            "{},{},{:.6},{:.4},{:.4},{}",
+            read_id,
+            result.barcode,
+            result.confidence,
+            result.best_distance,
+            result.second_best_distance,
+            result.is_confident
+        )?;
+    }
+
+    writer.flush()?;
+
+    println!(
+        "{} classifications written to {}",
+        style::action("Wrote"),
+        style::path(args.output.display())
+    );
+    println!(
+        "{} {} confident, {} unclassified",
+        style::label("Result:"),
+        style::count(confident_count),
+        style::warning(unclassified_count)
+    );
+
+    Ok(())
+}
+
+/// Run classification using CSV reference fingerprints.
+fn run_classify_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<()> {
     println!("{} reads by barcode using DTW", style::action("Classifying"),);
     println!(
         "{} {}",
@@ -444,7 +593,7 @@ fn run_classify(args: ClassifyArgs) -> anyhow::Result<()> {
     println!(
         "{} {}",
         style::label("Reference:"),
-        style::path(args.reference.display())
+        style::path(reference_path.display())
     );
     println!(
         "{} {}",
@@ -456,7 +605,7 @@ fn run_classify(args: ClassifyArgs) -> anyhow::Result<()> {
     }
 
     // Read reference fingerprints
-    let ref_file = File::open(&args.reference)?;
+    let ref_file = File::open(&reference_path)?;
     let ref_reader = BufReader::new(ref_file);
 
     let mut reference_fps: Vec<(String, Vec<f32>)> = Vec::new();
