@@ -29,6 +29,7 @@ mod utils;
 
 // Public modules
 pub mod compression;
+pub mod demux;
 pub mod dtw;
 pub mod error;
 pub mod merge;

@@ -581,6 +581,7 @@ dependencies = [
 name = "escapepod"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "anyhow",
  "arrow",
  "byteorder",
  "csv",
@@ -588,6 +589,8 @@ dependencies = [
  "memmap2",
  "ndarray",
  "rayon",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "uuid",
