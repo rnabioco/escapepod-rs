@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(normalized.len(), 5);
         // All values should be within [-2, 2] range
         for &val in &normalized {
-            assert!(val >= -2.0 && val <= 2.0);
+            assert!((-2.0..=2.0).contains(&val));
         }
     }
 

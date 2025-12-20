@@ -5,10 +5,10 @@
 //!
 //! Inspired by WarpDemuX for nanopore barcode demultiplexing.
 
-mod dtw;
+mod distance;
 mod fingerprint;
 mod kernel;
 
-pub use dtw::{dtw_distance, dtw_distance_matrix, dtw_distance_matrix_blocked};
+pub use distance::{dtw_distance, dtw_distance_matrix, dtw_distance_matrix_blocked};
 pub use fingerprint::{normalize_fingerprint, Fingerprint, NormMethod};
 pub use kernel::{distance_to_kernel, distance_to_kernel_auto};
