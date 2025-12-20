@@ -218,16 +218,34 @@ pub fn extract_fingerprint_from_signal(
 }
 
 /// Compute consensus fingerprint as element-wise median.
+///
+/// Filters fingerprints to only include those with the most common length.
 pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
     if fingerprints.is_empty() {
         return Vec::new();
     }
 
-    let length = fingerprints[0].len();
-    let mut consensus = Vec::with_capacity(length);
+    // Find the most common length
+    let mut length_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for fp in fingerprints {
+        *length_counts.entry(fp.len()).or_insert(0) += 1;
+    }
+    let target_length = length_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(len, _)| len)
+        .unwrap_or(0);
 
-    for i in 0..length {
-        let mut values: Vec<f32> = fingerprints.iter().map(|fp| fp[i]).collect();
+    // Filter to fingerprints with target length
+    let filtered: Vec<&Vec<f32>> = fingerprints.iter().filter(|fp| fp.len() == target_length).collect();
+    if filtered.is_empty() {
+        return Vec::new();
+    }
+
+    let mut consensus = Vec::with_capacity(target_length);
+
+    for i in 0..target_length {
+        let mut values: Vec<f32> = filtered.iter().map(|fp| fp[i]).collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let median = if values.len() % 2 == 0 {
@@ -244,21 +262,30 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
 }
 
 /// Compute element-wise standard deviation.
+///
+/// Only uses fingerprints that match the consensus length.
 pub fn compute_std_dev_fingerprint(fingerprints: &[Vec<f32>], consensus: &[f32]) -> Vec<f32> {
-    if fingerprints.is_empty() {
+    if fingerprints.is_empty() || consensus.is_empty() {
         return Vec::new();
     }
 
     let length = consensus.len();
+
+    // Filter to fingerprints matching consensus length
+    let filtered: Vec<&Vec<f32>> = fingerprints.iter().filter(|fp| fp.len() == length).collect();
+    if filtered.is_empty() {
+        return vec![0.0; length];
+    }
+
     let mut std_dev = Vec::with_capacity(length);
 
     for i in 0..length {
         let mean = consensus[i];
-        let variance = fingerprints
+        let variance = filtered
             .iter()
             .map(|fp| (fp[i] - mean).powi(2))
             .sum::<f32>()
-            / fingerprints.len() as f32;
+            / filtered.len() as f32;
         std_dev.push(variance.sqrt());
     }
 
