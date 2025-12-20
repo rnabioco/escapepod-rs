@@ -2,6 +2,40 @@
 
 Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.
 
+## Comparison with WarpDemuX
+
+Escapepod demux is a pure Rust reimplementation of the signal-level barcode demultiplexing algorithms from [WarpDemuX](https://github.com/KleistLab/WarpDemuX) and [ADAPTed](https://github.com/KleistLab/ADAPTed). The key differences are:
+
+| Feature | Escapepod | WarpDemuX/ADAPTed |
+|---------|-----------|-------------------|
+| Language | Pure Rust | Python + C |
+| Dependencies | None (statically linked) | PyTorch, dtaidistance, pod5 |
+| Adapter detection | LLR only | LLR + CNN + fallback |
+| Classification | DTW (Rust) | DTW (dtaidistance) |
+| Model format | JSON (native or WarpDemuX) | Scikit-learn pickle |
+
+### Performance Benchmarks
+
+Tested on RNA004 data with 5 barcodes (1000 reads total), 4 threads:
+
+| Metric | Escapepod | WarpDemuX |
+|--------|-----------|-----------|
+| **Detection speed** | 14x faster | baseline |
+| **Full pipeline** | ~0.5s | ~2.4s |
+| **Throughput** | ~2000 reads/sec | ~400 reads/sec |
+| **Classification accuracy** | 99.9% | 99.9% |
+
+### Accuracy Results (RNA004 Gold Standard)
+
+| Barcode | Correct | Total | Accuracy |
+|---------|---------|-------|----------|
+| BC00 | 187 | 187 | 100.0% |
+| BC01 | 190 | 190 | 100.0% |
+| BC02 | 191 | 192 | 99.5% |
+| BC03 | 189 | 189 | 100.0% |
+| BC04 | 195 | 195 | 100.0% |
+| **Total** | **952** | **953** | **99.9%** |
+
 ## Overview
 
 The demux workflow analyzes the raw nanopore signal to detect adapter regions, extract barcode fingerprints, classify reads, and optionally split them into separate files.
@@ -109,6 +143,7 @@ escapepod demux detect <FILES>... -o <OUTPUT>
 | `-o, --output <FILE>` | Output boundaries CSV file (required) |
 | `--min-adapter <N>` | Minimum adapter observations (default: 200) |
 | `--border-trim <N>` | Border trim size (default: 50) |
+| `--downscale <N>` | Downscale factor for signal processing (default: 1, use 10 for WarpDemuX compatibility) |
 | `-j, --threads <N>` | Number of threads (default: 4) |
 | `-h, --help` | Print help |
 
@@ -244,11 +279,15 @@ escapepod demux fingerprint <FILES>... --boundaries <CSV> -o <OUTPUT>
 |--------|-------------|
 | `--boundaries <FILE>` | Boundaries CSV from detect command (required) |
 | `-o, --output <FILE>` | Output fingerprints CSV file (required) |
+| `--segment-start <N>` | Start sample offset within adapter region (default: 1000) |
+| `--segment-end <N>` | End sample offset within adapter region (default: 2000) |
 | `--num-segments <N>` | Number of fingerprint segments (default: 10) |
 | `--window-width <N>` | T-test window width (default: 5) |
 | `--normalize <METHOD>` | Normalization method: zscore, minmax, median, none (default: zscore) |
 | `-j, --threads <N>` | Number of threads (default: 4) |
 | `-h, --help` | Print help |
+
+**Note:** The `--segment-start` and `--segment-end` options define which region within the adapter to use for fingerprinting. The defaults (1000-2000) match the training parameters, ensuring consistency between training and classification.
 
 ### Output Format
 
@@ -505,6 +544,9 @@ escapepod demux train --assignments <CSV> -o <OUTPUT>
 | `--input-dir <DIR>` | Directory with barcode subdirectories containing POD5 files |
 | `--assignments <CSV>` | CSV with read_id, barcode, pod5_file columns |
 | `-o, --output <FILE>` | Output reference JSON file (required) |
+| `--knn` | Output KNN model format (individual fingerprints for `classify --model`) |
+| `--segment-start <N>` | Start sample for fingerprint region (default: 1000) |
+| `--segment-end <N>` | End sample for fingerprint region (default: 2000) |
 | `--num-segments <N>` | Number of fingerprint segments (default: 10) |
 | `--window-width <N>` | T-test window width (default: 5) |
 | `--normalize <METHOD>` | Normalization method (default: zscore) |
@@ -513,19 +555,54 @@ escapepod demux train --assignments <CSV> -o <OUTPUT>
 | `-j, --threads <N>` | Number of threads (default: 4) |
 | `-h, --help` | Print help |
 
+### Output Formats
+
+**Default format** (consensus fingerprints):
+```json
+{
+  "barcodes": {
+    "BC00": {
+      "fingerprint": [0.12, -0.45, ...],
+      "std_dev": [0.05, 0.08, ...],
+      "read_count": 150
+    }
+  },
+  "params": { "segment_start": 1000, "segment_end": 2000, "num_segments": 10 }
+}
+```
+
+**KNN format** (`--knn`, for use with `classify --model`):
+```json
+{
+  "training_fingerprints": [[0.12, -0.45, ...], ...],
+  "training_labels": [0, 0, 1, 1, 2, ...],
+  "label_map": {"BC00": 0, "BC01": 1, "BC02": 2, ...},
+  "kernel_params": {"gamma": 0.1, "power": 1.0},
+  "threshold": 0.8,
+  "threshold_type": "ratio"
+}
+```
+
+The KNN format stores all individual training fingerprints for nearest-neighbor classification, which typically provides better accuracy than consensus-based classification.
+
 ### Example
 
 ```bash
-# From directory structure
+# From directory structure (consensus format)
 escapepod demux train --input-dir training_samples/ -o reference.json
 
-# From assignments CSV
-escapepod demux train --assignments known_barcodes.csv -o reference.json --num-segments 12
+# From assignments CSV (KNN format for best accuracy)
+escapepod demux train --assignments known_barcodes.csv -o model.json --knn
+
+# Use KNN model for classification
+escapepod demux classify fingerprints.csv --model model.json -o classifications.csv
 ```
 
 ---
 
 ## Complete Workflow Example
+
+### Basic Workflow (with pre-trained model)
 
 ```bash
 # 1. Detect adapter boundaries in all POD5 files
@@ -534,20 +611,48 @@ escapepod demux detect *.pod5 -o boundaries.csv -j 8
 # 2. Extract fingerprints from adapter regions
 escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
 
-# 3a. Train reference (if you have known samples)
-escapepod demux train --input-dir training_data/ -o reference.json
+# 3. Classify reads using a pre-trained model
+escapepod demux classify fingerprints.csv --model warpdemux_model.json -o classifications.csv
 
-# 3b. Or use a pre-trained WarpDemuX model
-# (exported from Python using scripts/export_warpdemux_model.py)
-
-# 4. Classify reads
-escapepod demux classify fingerprints.csv --reference reference.json -o classifications.csv
-
-# 5. Split into separate files
+# 4. Split into separate files
 escapepod demux split *.pod5 --classifications classifications.csv -d demuxed/ --unclassified
 
 # View classification summary
 cut -d, -f2 classifications.csv | sort | uniq -c | sort -rn
+```
+
+### Training Your Own Model
+
+If you have known barcode samples, train a KNN model for best accuracy:
+
+```bash
+# Create assignments CSV with known read-to-barcode mappings
+cat > assignments.csv << EOF
+read_id,barcode,pod5_file
+a1b2c3d4-...,BC00,sample1.pod5
+b2c3d4e5-...,BC00,sample1.pod5
+c3d4e5f6-...,BC01,sample2.pod5
+EOF
+
+# Train KNN model (recommended for best accuracy)
+escapepod demux train --assignments assignments.csv -o model.json --knn -j 8
+
+# Use the trained model for classification
+escapepod demux detect *.pod5 -o boundaries.csv -j 8
+escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
+escapepod demux classify fingerprints.csv --model model.json -o classifications.csv
+```
+
+### Using WarpDemuX Models
+
+You can export WarpDemuX models using the provided script:
+
+```bash
+# Export a WarpDemuX model to JSON format
+python scripts/export_warpdemux_model.py path/to/warpdemux_model.pkl -o model.json
+
+# Use the exported model
+escapepod demux classify fingerprints.csv --model model.json -o classifications.csv
 ```
 
 ## Algorithm References
