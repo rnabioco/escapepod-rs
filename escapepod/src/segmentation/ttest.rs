@@ -243,6 +243,88 @@ pub fn segment_signal(
     compute_segment_means(signal, &changepoints)
 }
 
+/// Segmentation result containing both event means and dwell times.
+#[derive(Debug, Clone)]
+pub struct SegmentationResult {
+    /// Mean signal value for each segment (event)
+    pub event_means: Vec<f32>,
+    /// Duration of each segment in samples (dwell time)
+    pub dwell_times: Vec<f32>,
+    /// Segment boundaries: (start, end) indices into the original signal
+    pub boundaries: Vec<(usize, usize)>,
+}
+
+impl SegmentationResult {
+    /// Get the number of segments/events.
+    pub fn num_events(&self) -> usize {
+        self.event_means.len()
+    }
+
+    /// Check if the segmentation is empty.
+    pub fn is_empty(&self) -> bool {
+        self.event_means.is_empty()
+    }
+
+    /// Get the total signal duration covered by all segments.
+    pub fn total_duration(&self) -> usize {
+        self.dwell_times.iter().map(|&d| d as usize).sum()
+    }
+}
+
+/// Perform t-test segmentation and return both event means and dwell times.
+///
+/// This function is essential for barcode fingerprinting as dwell times
+/// provide independent discriminative information from signal levels.
+/// DNA barcodes translocate ~3-4% faster than RNA, creating a detectable
+/// signature in dwell time patterns.
+///
+/// # Arguments
+/// * `signal` - The signal to segment
+/// * `window_width` - Width of comparison windows for t-test
+/// * `num_changepoints` - Number of changepoints to detect
+/// * `min_separation` - Minimum separation between changepoints
+///
+/// # Returns
+/// A `SegmentationResult` containing event means, dwell times, and boundaries.
+///
+/// # Example
+/// ```
+/// use escapepod::segmentation::segment_signal_with_dwell;
+///
+/// let signal = vec![50.0; 100];
+/// let result = segment_signal_with_dwell(&signal, 10, 5, 15);
+///
+/// println!("Found {} events", result.num_events());
+/// for (mean, dwell) in result.event_means.iter().zip(&result.dwell_times) {
+///     println!("  mean={:.2}, dwell={} samples", mean, dwell);
+/// }
+/// ```
+pub fn segment_signal_with_dwell(
+    signal: &[f32],
+    window_width: usize,
+    num_changepoints: usize,
+    min_separation: usize,
+) -> SegmentationResult {
+    let changepoints = find_changepoints(signal, window_width, num_changepoints, min_separation);
+    let segments = compute_segment_means(signal, &changepoints);
+
+    let mut event_means = Vec::with_capacity(segments.len());
+    let mut dwell_times = Vec::with_capacity(segments.len());
+    let mut boundaries = Vec::with_capacity(segments.len());
+
+    for (start, end, mean) in segments {
+        event_means.push(mean as f32);
+        dwell_times.push((end - start) as f32);
+        boundaries.push((start, end));
+    }
+
+    SegmentationResult {
+        event_means,
+        dwell_times,
+        boundaries,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +494,87 @@ mod tests {
         for i in 1..changepoints.len() {
             assert!(changepoints[i - 1] < changepoints[i]);
         }
+    }
+
+    #[test]
+    fn test_segment_signal_with_dwell_basic() {
+        // Create signal with clear steps
+        let mut signal = vec![1.0; 30];
+        signal.extend(vec![5.0; 30]);
+
+        let result = segment_signal_with_dwell(&signal, 5, 1, 10);
+
+        // Should have multiple segments
+        assert!(result.num_events() >= 2);
+        assert!(!result.is_empty());
+
+        // event_means and dwell_times should have same length
+        assert_eq!(result.event_means.len(), result.dwell_times.len());
+        assert_eq!(result.event_means.len(), result.boundaries.len());
+    }
+
+    #[test]
+    fn test_segment_signal_with_dwell_dwell_times() {
+        // Create signal with clear steps
+        let signal = vec![1.0; 60];
+
+        let result = segment_signal_with_dwell(&signal, 5, 2, 10);
+
+        // Dwell times should sum to approximately signal length
+        let total: usize = result.dwell_times.iter().map(|&d| d as usize).sum();
+        assert_eq!(total, signal.len());
+
+        // All dwell times should be positive
+        for &dwell in &result.dwell_times {
+            assert!(dwell > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_segment_signal_with_dwell_boundaries() {
+        let signal = vec![1.0; 60];
+
+        let result = segment_signal_with_dwell(&signal, 5, 2, 10);
+
+        // Boundaries should be contiguous
+        for i in 1..result.boundaries.len() {
+            assert_eq!(
+                result.boundaries[i].0,
+                result.boundaries[i - 1].1,
+                "Boundaries should be contiguous"
+            );
+        }
+
+        // First boundary should start at 0, last should end at signal length
+        if !result.boundaries.is_empty() {
+            assert_eq!(result.boundaries[0].0, 0);
+            assert_eq!(
+                result.boundaries[result.boundaries.len() - 1].1,
+                signal.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_segment_signal_with_dwell_total_duration() {
+        let signal = vec![1.0; 100];
+
+        let result = segment_signal_with_dwell(&signal, 5, 3, 10);
+
+        // total_duration should equal signal length
+        assert_eq!(result.total_duration(), signal.len());
+    }
+
+    #[test]
+    fn test_segmentation_result_empty() {
+        let result = SegmentationResult {
+            event_means: vec![],
+            dwell_times: vec![],
+            boundaries: vec![],
+        };
+
+        assert!(result.is_empty());
+        assert_eq!(result.num_events(), 0);
+        assert_eq!(result.total_duration(), 0);
     }
 }

@@ -53,5 +53,11 @@ pub mod ttest;
 
 // Re-export main types and functions for convenience
 pub use llr::{detect_adapter, LlrTrace};
-pub use normalize::{downscale, mad_normalize, mad_normalize_with_clipping};
-pub use ttest::{compute_segment_means, find_changepoints, segment_signal, windowed_ttest};
+pub use normalize::{
+    downscale, mad_normalize, mad_normalize_with_clipping, normalize_dwell_times,
+    normalize_dwell_times_mad,
+};
+pub use ttest::{
+    compute_segment_means, find_changepoints, segment_signal, segment_signal_with_dwell,
+    windowed_ttest, SegmentationResult,
+};
