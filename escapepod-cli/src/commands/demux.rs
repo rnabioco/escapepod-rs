@@ -9,11 +9,13 @@ use escapepod::dtw::{dtw_distance_matrix, normalize_fingerprint, Fingerprint, No
 use escapepod::segmentation::{detect_adapter, mad_normalize, segment_signal};
 use escapepod::Reader;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 /// Main demux command arguments.
 #[derive(Debug, clap::Args)]
@@ -48,6 +50,14 @@ Examples:
   escapepod demux classify fingerprints.csv --reference barcodes.csv -o out.csv --window 10
 ")]
     Classify(ClassifyArgs),
+
+    /// Train reference barcode fingerprints from known samples
+    #[command(after_help = "\
+Examples:
+  escapepod demux train --input-dir barcodes/ -o reference.json
+  escapepod demux train --assignments assignments.csv -o reference.json
+")]
+    Train(TrainArgs),
 }
 
 /// Arguments for the detect subcommand.
@@ -130,12 +140,61 @@ pub struct ClassifyArgs {
     pub min_ratio: f32,
 }
 
+/// Arguments for the train subcommand.
+#[derive(Debug, clap::Args)]
+pub struct TrainArgs {
+    /// Input directory with barcode subdirectories (mutually exclusive with --assignments)
+    #[arg(long, value_name = "DIR", conflicts_with = "assignments")]
+    pub input_dir: Option<PathBuf>,
+
+    /// CSV file with read_id,barcode,pod5_file columns (mutually exclusive with --input-dir)
+    #[arg(long, value_name = "FILE", conflicts_with = "input_dir")]
+    pub assignments: Option<PathBuf>,
+
+    /// Output JSON file for reference fingerprints
+    #[arg(short, long, required = true, value_name = "FILE")]
+    pub output: PathBuf,
+
+    /// Start sample for fingerprint region
+    #[arg(long, default_value = "1000", value_name = "N")]
+    pub segment_start: usize,
+
+    /// End sample for fingerprint region
+    #[arg(long, default_value = "2000", value_name = "N")]
+    pub segment_end: usize,
+
+    /// Number of segments for fingerprinting
+    #[arg(long, default_value = "10", value_name = "N")]
+    pub num_segments: usize,
+
+    /// Window width for t-test segmentation
+    #[arg(long, default_value = "5", value_name = "N")]
+    pub window_width: usize,
+
+    /// Normalization method (zscore, minmax, median, none)
+    #[arg(long, default_value = "zscore", value_name = "METHOD")]
+    pub normalize: String,
+
+    /// Minimum observations for adapter segment
+    #[arg(long, default_value = "200", value_name = "N")]
+    pub min_adapter: usize,
+
+    /// Border trim size for adapter detection
+    #[arg(long, default_value = "50", value_name = "N")]
+    pub border_trim: usize,
+
+    /// Number of threads for parallel processing
+    #[arg(short = 'j', long, default_value = "4", value_name = "N")]
+    pub threads: usize,
+}
+
 /// Run the demux command.
 pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
     match args.command {
         DemuxCommand::Detect(detect_args) => run_detect(detect_args),
         DemuxCommand::Fingerprint(fingerprint_args) => run_fingerprint(fingerprint_args),
         DemuxCommand::Classify(classify_args) => run_classify(classify_args),
+        DemuxCommand::Train(train_args) => run_train(train_args),
     }
 }
 
@@ -602,4 +661,390 @@ fn run_classify(args: ClassifyArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Barcode statistics for training output.
+#[derive(Debug, Serialize, Deserialize)]
+struct BarcodeStats {
+    fingerprint: Vec<f64>,
+    read_count: usize,
+    std_dev: Vec<f64>,
+}
+
+/// Training parameters.
+#[derive(Debug, Serialize, Deserialize)]
+struct TrainParams {
+    segment_start: usize,
+    segment_end: usize,
+    num_segments: usize,
+}
+
+/// Training output JSON structure.
+#[derive(Debug, Serialize, Deserialize)]
+struct TrainingOutput {
+    barcodes: HashMap<String, BarcodeStats>,
+    params: TrainParams,
+}
+
+/// Run the train subcommand - generate reference fingerprints from known samples.
+fn run_train(args: TrainArgs) -> anyhow::Result<()> {
+    println!("{} reference barcode fingerprints", style::action("Training"));
+
+    // Validate that either input_dir or assignments is provided
+    if args.input_dir.is_none() && args.assignments.is_none() {
+        anyhow::bail!("Either --input-dir or --assignments must be provided");
+    }
+
+    // Parse normalization method
+    let norm_method = match args.normalize.to_lowercase().as_str() {
+        "zscore" => NormMethod::ZScore,
+        "minmax" => NormMethod::MinMax,
+        "median" => NormMethod::Median,
+        "none" => NormMethod::None,
+        _ => {
+            anyhow::bail!(
+                "Invalid normalization method: {}. Use zscore, minmax, median, or none",
+                args.normalize
+            );
+        }
+    };
+
+    // Set thread pool size
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()
+        .ok();
+
+    // Collect barcode assignments: read_id -> (barcode, pod5_path)
+    let assignments = if let Some(input_dir) = &args.input_dir {
+        collect_assignments_from_directory(input_dir)?
+    } else if let Some(assignments_file) = &args.assignments {
+        collect_assignments_from_csv(assignments_file)?
+    } else {
+        unreachable!()
+    };
+
+    println!(
+        "{} {} read assignments across {} barcodes",
+        style::label("Loaded:"),
+        style::count(assignments.len()),
+        style::count(
+            assignments
+                .values()
+                .map(|(bc, _)| bc.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        )
+    );
+
+    // Group reads by POD5 file for efficient reading
+    let mut reads_by_file: HashMap<PathBuf, Vec<(Uuid, String)>> = HashMap::new();
+    for (read_id, (barcode, pod5_path)) in &assignments {
+        reads_by_file
+            .entry(pod5_path.clone())
+            .or_insert_with(Vec::new)
+            .push((*read_id, barcode.clone()));
+    }
+
+    println!(
+        "{} {} POD5 files to process",
+        style::label("Files:"),
+        style::count(reads_by_file.len())
+    );
+
+    // Extract fingerprints for all reads
+    let all_fingerprints = extract_fingerprints_from_assignments(
+        &reads_by_file,
+        &args,
+        norm_method,
+    )?;
+
+    // Group fingerprints by barcode
+    let mut barcode_fingerprints: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    for (read_id, fingerprint) in &all_fingerprints {
+        if let Some((barcode, _)) = assignments.get(read_id) {
+            barcode_fingerprints
+                .entry(barcode.clone())
+                .or_insert_with(Vec::new)
+                .push(fingerprint.clone());
+        }
+    }
+
+    println!(
+        "{} {} total fingerprints extracted",
+        style::label("Extracted:"),
+        style::count(all_fingerprints.len())
+    );
+
+    // Compute consensus fingerprints
+    let mut training_output = TrainingOutput {
+        barcodes: HashMap::new(),
+        params: TrainParams {
+            segment_start: args.segment_start,
+            segment_end: args.segment_end,
+            num_segments: args.num_segments,
+        },
+    };
+
+    for (barcode, fingerprints) in barcode_fingerprints {
+        let consensus = compute_consensus_fingerprint(&fingerprints);
+        let std_dev = compute_std_dev_fingerprint(&fingerprints, &consensus);
+
+        training_output.barcodes.insert(
+            barcode.clone(),
+            BarcodeStats {
+                fingerprint: consensus.iter().map(|&v| v as f64).collect(),
+                read_count: fingerprints.len(),
+                std_dev: std_dev.iter().map(|&v| v as f64).collect(),
+            },
+        );
+
+        println!(
+            "{} {} fingerprints from {} reads",
+            style::label(&format!("{}:", barcode)),
+            style::action("Computed consensus"),
+            style::count(fingerprints.len())
+        );
+    }
+
+    // Write JSON output
+    let output_file = File::create(&args.output)?;
+    let writer = BufWriter::new(output_file);
+    serde_json::to_writer_pretty(writer, &training_output)?;
+
+    println!(
+        "{} reference fingerprints written to {}",
+        style::action("Trained"),
+        style::path(args.output.display())
+    );
+    println!(
+        "{} {} barcodes",
+        style::label("Total:"),
+        style::count(training_output.barcodes.len())
+    );
+
+    Ok(())
+}
+
+/// Collect read assignments from directory structure.
+/// Each subdirectory represents a barcode, containing POD5 files.
+fn collect_assignments_from_directory(
+    input_dir: &PathBuf,
+) -> anyhow::Result<HashMap<Uuid, (String, PathBuf)>> {
+    let mut assignments = HashMap::new();
+
+    // Iterate through subdirectories
+    for entry in fs::read_dir(input_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let barcode = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| anyhow::anyhow!("Invalid directory name"))?
+                .to_string();
+
+            // Find all POD5 files in this barcode directory
+            for pod5_entry in WalkDir::new(&path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s == "pod5")
+                        .unwrap_or(false)
+                })
+            {
+                let pod5_path = pod5_entry.path().to_path_buf();
+                let reader = Reader::open(&pod5_path)?;
+
+                if let Ok(reads) = reader.reads() {
+                    for read_result in reads {
+                        let read = read_result?;
+                        assignments.insert(read.read_id, (barcode.clone(), pod5_path.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(assignments)
+}
+
+/// Collect read assignments from CSV file.
+/// Expected columns: read_id, barcode, pod5_file
+fn collect_assignments_from_csv(
+    csv_path: &PathBuf,
+) -> anyhow::Result<HashMap<Uuid, (String, PathBuf)>> {
+    let mut assignments = HashMap::new();
+    let file = File::open(csv_path)?;
+    let reader = BufReader::new(file);
+
+    let mut line_count = 0;
+    for line in reader.lines() {
+        let line = line?;
+        line_count += 1;
+
+        // Skip header
+        if line_count == 1 {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 3 {
+            if let Ok(read_id) = Uuid::parse_str(parts[0]) {
+                let barcode = parts[1].to_string();
+                let pod5_file = PathBuf::from(parts[2]);
+                assignments.insert(read_id, (barcode, pod5_file));
+            }
+        }
+    }
+
+    Ok(assignments)
+}
+
+/// Extract fingerprints from reads based on assignments.
+fn extract_fingerprints_from_assignments(
+    reads_by_file: &HashMap<PathBuf, Vec<(Uuid, String)>>,
+    args: &TrainArgs,
+    norm_method: NormMethod,
+) -> anyhow::Result<HashMap<Uuid, Vec<f32>>> {
+    let total_reads: usize = reads_by_file.values().map(|v| v.len()).sum();
+    let progress_bar = create_progress_bar(total_reads as u64, "Processing")?;
+
+    let all_fingerprints: HashMap<Uuid, Vec<f32>> = reads_by_file
+        .par_iter()
+        .flat_map(|(pod5_path, read_list)| {
+            let mut fingerprints = Vec::new();
+            let read_ids: std::collections::HashSet<Uuid> =
+                read_list.iter().map(|(id, _)| *id).collect();
+
+            if let Ok(reader) = Reader::open(pod5_path) {
+                if let Ok(reads) = reader.reads() {
+                    for read_result in reads {
+                        if let Ok(read) = read_result {
+                            if read_ids.contains(&read.read_id) && !read.signal_rows.is_empty() {
+                                if let Ok(signal) = reader.get_signal(&read.signal_rows) {
+                                    // Convert i16 signal to f32
+                                    let signal_f32: Vec<f32> =
+                                        signal.iter().map(|&s| s as f32).collect();
+
+                                    // Apply MAD normalization
+                                    let normalized = if signal_f32.len() > 10 {
+                                        mad_normalize(&signal_f32)
+                                    } else {
+                                        signal_f32
+                                    };
+
+                                    // Detect adapter using LLR
+                                    let (adapter_start, adapter_end) = detect_adapter(
+                                        &normalized,
+                                        args.min_adapter,
+                                        args.border_trim,
+                                    );
+
+                                    if adapter_end > adapter_start {
+                                        // Extract the specified region
+                                        let region_start = adapter_start + args.segment_start;
+                                        let region_end =
+                                            (adapter_start + args.segment_end).min(adapter_end);
+
+                                        if region_end > region_start
+                                            && region_end <= normalized.len()
+                                        {
+                                            let region_signal =
+                                                &normalized[region_start..region_end];
+
+                                            // Segment the region
+                                            let segments = segment_signal(
+                                                region_signal,
+                                                args.window_width,
+                                                args.num_segments.saturating_sub(1),
+                                                args.window_width,
+                                            );
+
+                                            if !segments.is_empty() {
+                                                // Extract segment means as fingerprint
+                                                let fingerprint_values: Vec<f32> = segments
+                                                    .iter()
+                                                    .map(|(_, _, mean)| *mean as f32)
+                                                    .collect();
+
+                                                // Normalize the fingerprint
+                                                let mut fp = Fingerprint::new(
+                                                    fingerprint_values,
+                                                    read.read_id,
+                                                );
+                                                normalize_fingerprint(&mut fp, norm_method);
+
+                                                fingerprints
+                                                    .push((read.read_id, fp.values.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            progress_bar.inc(1);
+                        }
+                    }
+                }
+            }
+
+            fingerprints
+        })
+        .collect();
+
+    progress_bar.finish_with_message("complete");
+
+    Ok(all_fingerprints)
+}
+
+/// Compute consensus fingerprint as element-wise median.
+fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
+    if fingerprints.is_empty() {
+        return Vec::new();
+    }
+
+    let length = fingerprints[0].len();
+    let mut consensus = Vec::with_capacity(length);
+
+    for i in 0..length {
+        let mut values: Vec<f32> = fingerprints.iter().map(|fp| fp[i]).collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let median = if values.len() % 2 == 0 {
+            let mid = values.len() / 2;
+            (values[mid - 1] + values[mid]) / 2.0
+        } else {
+            values[values.len() / 2]
+        };
+
+        consensus.push(median);
+    }
+
+    consensus
+}
+
+/// Compute element-wise standard deviation.
+fn compute_std_dev_fingerprint(fingerprints: &[Vec<f32>], consensus: &[f32]) -> Vec<f32> {
+    if fingerprints.is_empty() {
+        return Vec::new();
+    }
+
+    let length = consensus.len();
+    let mut std_dev = Vec::with_capacity(length);
+
+    for i in 0..length {
+        let mean = consensus[i];
+        let variance = fingerprints
+            .iter()
+            .map(|fp| (fp[i] - mean).powi(2))
+            .sum::<f32>()
+            / fingerprints.len() as f32;
+        std_dev.push(variance.sqrt());
+    }
+
+    std_dev
 }
