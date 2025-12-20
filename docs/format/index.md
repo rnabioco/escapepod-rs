@@ -76,6 +76,14 @@ Signal data uses the VBZ codec:
 
 See [Compression](compression.md) for algorithm details.
 
+## Signal Analysis Algorithms
+
+For barcode demultiplexing and signal analysis, see [Segmentation Algorithms](segmentation.md):
+
+- **LLR boundary detection** - Find adapter regions using log-likelihood ratio
+- **T-test segmentation** - Extract fingerprints from signal segments
+- **DTW classification** - Dynamic time warping for barcode matching
+
 ## Arrow Extension Types
 
 POD5 uses custom Arrow extension types:
