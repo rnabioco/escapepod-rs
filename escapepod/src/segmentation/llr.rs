@@ -226,17 +226,17 @@ impl LlrTrace {
         let search_start = start + min_obs;
         let search_end = end.saturating_sub(border_trim);
 
-        let mut best_pos = None;
-        let mut best_gain = 0.0;
-
-        for i in search_start..search_end {
-            if gains[i] > best_gain {
-                best_gain = gains[i];
-                best_pos = Some(i);
-            }
-        }
-
-        best_pos.map(|pos| (pos, best_gain))
+        gains[search_start..search_end]
+            .iter()
+            .enumerate()
+            .fold(None, |best, (offset, &gain)| {
+                let i = search_start + offset;
+                match best {
+                    Some((_, best_gain)) if gain <= best_gain => best,
+                    _ if gain > 0.0 => Some((i, gain)),
+                    _ => best,
+                }
+            })
     }
 
     /// Get the length of the signal.
@@ -405,7 +405,7 @@ mod tests {
             .unwrap();
 
         // The maximum gain should be near position 50 (the boundary)
-        assert!(max_gain_pos >= 40 && max_gain_pos <= 60);
+        assert!((40..=60).contains(&max_gain_pos));
     }
 
     #[test]
@@ -426,7 +426,7 @@ mod tests {
         let (pos, gain) = result.unwrap();
 
         // Position should be near the boundary
-        assert!(pos >= 40 && pos <= 60);
+        assert!((40..=60).contains(&pos));
         // Gain should be positive
         assert!(gain > 0.0);
     }

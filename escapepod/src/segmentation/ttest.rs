@@ -258,7 +258,7 @@ mod tests {
 
         // Maximum should be near the boundary (position 40 in candidate space)
         // which corresponds to position 50 in signal space (after adjusting for window)
-        assert!(max_score_pos >= 30 && max_score_pos <= 50);
+        assert!((30..=50).contains(&max_score_pos));
     }
 
     #[test]

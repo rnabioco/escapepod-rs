@@ -13,8 +13,8 @@ use rayon::prelude::*;
 /// * `a` - First sequence
 /// * `b` - Second sequence
 /// * `window` - Optional Sakoe-Chiba band width. If `Some(w)`, only compute
-///              distances where `|i - j| <= w`. This restricts the warping path
-///              to a diagonal band and improves performance.
+///   distances where `|i - j| <= w`. This restricts the warping path
+///   to a diagonal band and improves performance.
 ///
 /// # Returns
 ///
