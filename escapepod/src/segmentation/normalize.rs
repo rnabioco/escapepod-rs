@@ -2,13 +2,12 @@
 //!
 //! Provides MAD (Median Absolute Deviation) normalization and downscaling operations.
 
-/// Compute the median of a slice of values.
+/// Compute the median of a sorted slice of values.
 ///
 /// # Panics
 /// Panics if the slice is empty.
-fn median(data: &[f32]) -> f32 {
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+#[inline]
+fn median_sorted(sorted: &[f32]) -> f32 {
     let mid = sorted.len() / 2;
     if sorted.len() % 2 == 0 {
         (sorted[mid - 1] + sorted[mid]) / 2.0
@@ -17,17 +16,24 @@ fn median(data: &[f32]) -> f32 {
     }
 }
 
-/// Compute the Median Absolute Deviation (MAD) of a slice.
+/// Compute median and MAD together with only 2 sorts (the minimum required).
 ///
-/// MAD is defined as the median of the absolute deviations from the median:
-/// MAD = median(|x_i - median(x)|)
+/// Returns (median, MAD) tuple.
 ///
 /// # Panics
 /// Panics if the slice is empty.
-fn mad(data: &[f32]) -> f32 {
-    let med = median(data);
-    let abs_devs: Vec<f32> = data.iter().map(|&x| (x - med).abs()).collect();
-    median(&abs_devs)
+fn median_and_mad(data: &[f32]) -> (f32, f32) {
+    // Sort once to get median
+    let mut sorted = data.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = median_sorted(&sorted);
+
+    // Compute absolute deviations and sort for MAD
+    let mut abs_devs: Vec<f32> = data.iter().map(|&x| (x - med).abs()).collect();
+    abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad_val = median_sorted(&abs_devs);
+
+    (med, mad_val)
 }
 
 /// Normalize signal using MAD (Median Absolute Deviation).
@@ -54,8 +60,7 @@ fn mad(data: &[f32]) -> f32 {
 /// let normalized = mad_normalize(&signal);
 /// ```
 pub fn mad_normalize(signal: &[f32]) -> Vec<f32> {
-    let med = median(signal);
-    let mad_val = mad(signal);
+    let (med, mad_val) = median_and_mad(signal);
 
     if mad_val == 0.0 {
         panic!("MAD is zero - cannot normalize signal with no variation");
@@ -78,8 +83,7 @@ pub fn mad_normalize(signal: &[f32]) -> Vec<f32> {
 /// # Panics
 /// Panics if the signal is empty or if MAD is zero.
 pub fn mad_normalize_with_clipping(signal: &[f32], clip_sigma: f32) -> Vec<f32> {
-    let med = median(signal);
-    let mad_val = mad(signal);
+    let (med, mad_val) = median_and_mad(signal);
 
     if mad_val == 0.0 {
         panic!("MAD is zero - cannot normalize signal with no variation");
@@ -147,19 +151,21 @@ mod tests {
     #[test]
     fn test_median_odd_length() {
         let data = vec![1.0, 3.0, 2.0, 5.0, 4.0];
-        assert_eq!(median(&data), 3.0);
+        let (med, _) = median_and_mad(&data);
+        assert_eq!(med, 3.0);
     }
 
     #[test]
     fn test_median_even_length() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
-        assert_eq!(median(&data), 2.5);
+        let (med, _) = median_and_mad(&data);
+        assert_eq!(med, 2.5);
     }
 
     #[test]
     fn test_mad_calculation() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let mad_val = mad(&data);
+        let (_, mad_val) = median_and_mad(&data);
         // median is 3.0, deviations are [2.0, 1.0, 0.0, 1.0, 2.0], median of abs devs is 1.0
         assert_eq!(mad_val, 1.0);
     }
