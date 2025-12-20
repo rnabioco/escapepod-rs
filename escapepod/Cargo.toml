@@ -13,6 +13,7 @@ byteorder = { workspace = true }
 csv = "1"
 flatbuffers = { workspace = true }
 memmap2 = { workspace = true }
+ndarray = "0.16"
 rayon = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
