@@ -146,6 +146,28 @@ pub fn normalize_signal(signal: &[i16]) -> Vec<f32> {
     }
 }
 
+/// Downscale a signal by averaging consecutive samples.
+///
+/// Similar to WarpDemuX/ADAPTed's average pooling for faster LLR computation.
+/// A factor of 10 matches WarpDemuX's default behavior.
+pub fn downscale_signal(signal: &[f32], factor: usize) -> Vec<f32> {
+    if factor <= 1 {
+        return signal.to_vec();
+    }
+
+    let n_output = signal.len() / factor;
+    let mut result = Vec::with_capacity(n_output);
+
+    for i in 0..n_output {
+        let start = i * factor;
+        let end = start + factor;
+        let sum: f32 = signal[start..end].iter().sum();
+        result.push(sum / factor as f32);
+    }
+
+    result
+}
+
 /// Extract a fingerprint from an adapter region of a signal.
 ///
 /// Returns None if the region is too small or segmentation fails.
@@ -422,6 +444,32 @@ mod tests {
         // Std dev = sqrt(1) = 1
         assert_eq!(result[0], 1.0);
         assert_eq!(result[1], 0.0);
+    }
+
+    #[test]
+    fn test_downscale_signal_factor_1() {
+        let signal = vec![1.0, 2.0, 3.0, 4.0];
+        let result = downscale_signal(&signal, 1);
+        assert_eq!(result, signal);
+    }
+
+    #[test]
+    fn test_downscale_signal_factor_2() {
+        let signal = vec![1.0, 3.0, 5.0, 7.0];
+        let result = downscale_signal(&signal, 2);
+        // (1+3)/2=2, (5+7)/2=6
+        assert_eq!(result, vec![2.0, 6.0]);
+    }
+
+    #[test]
+    fn test_downscale_signal_factor_10() {
+        let signal: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let result = downscale_signal(&signal, 10);
+        assert_eq!(result.len(), 10);
+        // First chunk: 0+1+...+9 = 45, avg = 4.5
+        assert!((result[0] - 4.5).abs() < 0.001);
+        // Last chunk: 90+91+...+99 = 945, avg = 94.5
+        assert!((result[9] - 94.5).abs() < 0.001);
     }
 
     #[test]

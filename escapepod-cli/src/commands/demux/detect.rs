@@ -1,7 +1,7 @@
 //! Detect subcommand - LLR-based adapter boundary detection.
 
 use super::types::ReadBoundaries;
-use super::utils::{collect_reads_with_signals, configure_thread_pool, normalize_signal};
+use super::utils::{collect_reads_with_signals, configure_thread_pool, downscale_signal, normalize_signal};
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod::segmentation::detect_adapter;
@@ -29,6 +29,10 @@ pub struct DetectArgs {
     #[arg(long, default_value = "50", value_name = "N")]
     pub border_trim: usize,
 
+    /// Downscale factor for signal processing (1 = no downscaling, 10 = WarpDemuX-compatible)
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub downscale: usize,
+
     /// Number of threads for parallel processing
     #[arg(short = 'j', long, default_value = "4", value_name = "N")]
     pub threads: usize,
@@ -51,10 +55,11 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
         style::path(args.output.display())
     );
     println!(
-        "{} min_adapter={}, border_trim={}",
+        "{} min_adapter={}, border_trim={}, downscale={}",
         style::label("Parameters:"),
         style::value(args.min_adapter),
-        style::value(args.border_trim)
+        style::value(args.border_trim),
+        style::value(args.downscale)
     );
 
     // Set thread pool size
@@ -72,15 +77,31 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
     let progress_bar = create_progress_bar(all_reads.len() as u64, "Detecting")?;
 
     // Process reads in parallel
+    let downscale = args.downscale.max(1); // Ensure at least 1
     let results: Vec<ReadBoundaries> = all_reads
         .par_iter()
         .map(|(read_id, num_samples, signal)| {
             // Normalize signal
             let normalized = normalize_signal(signal);
 
+            // Optionally downscale signal
+            let (processed_signal, scale_factor) = if downscale > 1 {
+                (downscale_signal(&normalized, downscale), downscale)
+            } else {
+                (normalized, 1)
+            };
+
+            // Scale parameters for downscaled signal
+            let scaled_min_adapter = args.min_adapter / scale_factor;
+            let scaled_border_trim = args.border_trim / scale_factor;
+
             // Detect adapter using LLR
             let (adapter_start, adapter_end) =
-                detect_adapter(&normalized, args.min_adapter, args.border_trim);
+                detect_adapter(&processed_signal, scaled_min_adapter.max(1), scaled_border_trim.max(1));
+
+            // Scale results back to original resolution
+            let adapter_start = adapter_start * scale_factor;
+            let adapter_end = adapter_end * scale_factor;
 
             progress_bar.inc(1);
 
