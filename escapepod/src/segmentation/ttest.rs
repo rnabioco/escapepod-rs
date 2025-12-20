@@ -33,38 +33,57 @@ pub fn windowed_ttest(signal: &[f32], window_width: usize) -> Vec<f64> {
         return Vec::new();
     }
 
+    let w = window_width as f64;
+
+    // Precompute prefix sums for O(1) window statistics
+    // cumsum[i] = sum of signal[0..i], cumsum[0] = 0
+    // cumsum_sq[i] = sum of signal[0..i]^2, cumsum_sq[0] = 0
+    let mut cumsum = Vec::with_capacity(signal.len() + 1);
+    let mut cumsum_sq = Vec::with_capacity(signal.len() + 1);
+    cumsum.push(0.0);
+    cumsum_sq.push(0.0);
+
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    for &val in signal {
+        let v = val as f64;
+        sum += v;
+        sum_sq += v * v;
+        cumsum.push(sum);
+        cumsum_sq.push(sum_sq);
+    }
+
     let mut t_scores = Vec::with_capacity(num_candidates);
 
     for pos in 0..num_candidates {
-        // Compute mean of first window
-        let mut m1 = 0.0;
-        for idx in 0..window_width {
-            m1 += signal[pos + idx] as f64;
-        }
-        m1 /= window_width as f64;
+        // Window 1: [pos, pos + window_width)
+        let w1_start = pos;
+        let w1_end = pos + window_width;
 
-        // Compute mean of second window
-        let mut m2 = 0.0;
-        for idx in 0..window_width {
-            m2 += signal[pos + window_width + idx] as f64;
-        }
-        m2 /= window_width as f64;
+        // Window 2: [pos + window_width, pos + 2*window_width)
+        let w2_start = pos + window_width;
+        let w2_end = pos + 2 * window_width;
 
-        // Compute sum of variances
-        let mut var1 = 0.0;
-        for idx in 0..window_width {
-            let diff = signal[pos + idx] as f64 - m1;
-            var1 += diff * diff;
-        }
+        // O(1) mean calculation using prefix sums
+        let sum1 = cumsum[w1_end] - cumsum[w1_start];
+        let sum2 = cumsum[w2_end] - cumsum[w2_start];
+        let m1 = sum1 / w;
+        let m2 = sum2 / w;
 
-        let mut var2 = 0.0;
-        for idx in 0..window_width {
-            let diff = signal[pos + window_width + idx] as f64 - m2;
-            var2 += diff * diff;
-        }
+        // O(1) variance calculation using prefix sums
+        // var = E[X²] - E[X]² = (sum_sq / n) - mean²
+        // We need sum of (x - mean)² = sum_sq - 2*mean*sum + n*mean²
+        //                            = sum_sq - 2*mean*sum + n*mean²
+        //                            = sum_sq - n*mean² (since sum = n*mean)
+        let sum_sq1 = cumsum_sq[w1_end] - cumsum_sq[w1_start];
+        let sum_sq2 = cumsum_sq[w2_end] - cumsum_sq[w2_start];
+
+        // Sum of squared deviations (not normalized variance)
+        let var1 = sum_sq1 - w * m1 * m1;
+        let var2 = sum_sq2 - w * m2 * m2;
 
         // Compute t-score (monotonic transform, not true t-score)
-        let t_score = if var1 + var2 == 0.0 {
+        let t_score = if var1 + var2 <= 0.0 {
             0.0
         } else {
             (m1 - m2).abs() / (var1 + var2).sqrt()
