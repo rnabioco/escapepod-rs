@@ -33,6 +33,7 @@ struct ReadStats {
     total_samples: u64,
     lengths: Vec<u64>,
     channels: HashMap<u16, u64>,
+    max_channel: u16,
     wells: [u64; 5], // Index 0 unused, wells 1-4
     end_reasons: HashMap<String, u64>,
 }
@@ -90,7 +91,7 @@ struct StatisticsSummary {
 }
 
 /// Current POD5 version for comparison.
-const CURRENT_POD5_VERSION: &str = "1.0";
+const CURRENT_POD5_VERSION: &str = "0.3";
 
 /// Run the summary command.
 pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
@@ -168,6 +169,7 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
                             stats.lengths.push(read.num_samples);
 
                             *stats.channels.entry(read.channel).or_insert(0) += 1;
+                            stats.max_channel = stats.max_channel.max(read.channel);
 
                             if read.well >= 1 && read.well <= 4 {
                                 stats.wells[read.well as usize] += 1;
@@ -278,6 +280,23 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Infer total channels from max channel seen.
+/// Known flowcell sizes:
+/// - MinION/Flongle: 512 channels
+/// - PromethION/P2: 2675 or 3000 channels
+fn infer_total_channels(max_channel: u16) -> u16 {
+    if max_channel <= 512 {
+        512
+    } else if max_channel <= 2675 {
+        2675
+    } else if max_channel <= 3000 {
+        3000
+    } else {
+        // Unknown flowcell, use max as lower bound
+        max_channel
+    }
+}
+
 /// Compute statistics from collected read data (using core library).
 fn compute_statistics(stats: &mut ReadStats) -> StatisticsSummary {
     if stats.lengths.is_empty() {
@@ -304,7 +323,7 @@ fn compute_statistics(stats: &mut ReadStats) -> StatisticsSummary {
         length_median: core_stats.median,
         length_n50: core_stats.n50,
         active_channels: stats.channels.len(),
-        total_channels: 512,
+        total_channels: infer_total_channels(stats.max_channel),
     }
 }
 
