@@ -8,16 +8,19 @@ use crate::error::Result;
 use crate::schema::{reads_schema, run_info_schema};
 use crate::types::{ReadData, RunInfoData, Uuid, POD5_VERSION};
 use arrow::array::{
-    ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder, ListBuilder,
-    MapBuilder, MapFieldNames, StringArray, StringBuilder, StringDictionaryBuilder,
-    TimestampMillisecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, FixedSizeBinaryArray,
+    FixedSizeBinaryBuilder, Float32Array, Float32Builder, Int16Array, Int16Builder, ListArray,
+    ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+    TimestampMillisecondBuilder, UInt16Array, UInt16Builder, UInt32Array, UInt32Builder,
+    UInt64Array, UInt64Builder, UInt8Array, UInt8Builder,
 };
-use arrow::datatypes::Int16Type;
+use arrow::compute::concat;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;
 use arrow::ipc::{Block, MetadataVersion};
 use arrow::record_batch::RecordBatch;
 use flatbuffers::FlatBufferBuilder;
-use std::collections::HashSet;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -172,7 +175,127 @@ pub(crate) fn build_run_info_table(run_infos: &[RunInfoData]) -> Result<Vec<u8>>
     Ok(buffer)
 }
 
+/// Arrays built for a single partition of reads.
+/// Dictionary columns are stored as keys only (Int16Array) to allow
+/// concatenation with a shared dictionary.
+struct PartitionArrays {
+    read_id: FixedSizeBinaryArray,
+    signal: ListArray,
+    channel: UInt16Array,
+    well: UInt8Array,
+    pore_type_keys: Int16Array,
+    calibration_offset: Float32Array,
+    calibration_scale: Float32Array,
+    read_number: UInt32Array,
+    start: UInt64Array,
+    median_before: Float32Array,
+    end_reason_keys: Int16Array,
+    end_reason_forced: BooleanArray,
+    run_info_keys: Int16Array,
+    num_minknow_events: UInt64Array,
+    num_samples: UInt64Array,
+    open_pore_level: Float32Array,
+}
+
+/// Build arrays for a single partition of reads.
+fn build_partition(
+    reads: &[(ReadData, Vec<u64>)],
+    pore_type_map: &HashMap<&str, i16>,
+    end_reason_map: &HashMap<&str, i16>,
+    run_info_map: &HashMap<&str, i16>,
+    run_infos: &[RunInfoData],
+) -> PartitionArrays {
+    let num_reads = reads.len();
+
+    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
+    let signal_field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::UInt64,
+        false,
+    ));
+    let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
+    let mut channel_builder = UInt16Builder::with_capacity(num_reads);
+    let mut well_builder = UInt8Builder::with_capacity(num_reads);
+    let mut pore_type_keys_builder = Int16Builder::with_capacity(num_reads);
+    let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
+    let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
+    let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
+    let mut start_builder = UInt64Builder::with_capacity(num_reads);
+    let mut median_before_builder = Float32Builder::with_capacity(num_reads);
+    let mut end_reason_keys_builder = Int16Builder::with_capacity(num_reads);
+    let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
+    let mut run_info_keys_builder = Int16Builder::with_capacity(num_reads);
+    let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
+    let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
+    let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
+
+    for (read, signal_rows) in reads {
+        // read_id is infallible for 16-byte slices
+        let _ = read_id_builder.append_value(read.read_id.as_bytes());
+
+        let values = signal_builder.values();
+        for &idx in signal_rows {
+            values.append_value(idx);
+        }
+        signal_builder.append(true);
+
+        channel_builder.append_value(read.channel);
+        well_builder.append_value(read.well);
+
+        // Use pre-computed dictionary key indices
+        let pore_key = pore_type_map.get(read.pore_type.as_str()).copied().unwrap_or(0);
+        pore_type_keys_builder.append_value(pore_key);
+
+        calibration_offset_builder.append_value(read.calibration_offset);
+        calibration_scale_builder.append_value(read.calibration_scale);
+        read_number_builder.append_value(read.read_number);
+        start_builder.append_value(read.start_sample);
+        median_before_builder.append_value(read.median_before);
+
+        let end_key = end_reason_map.get(read.end_reason.as_str()).copied().unwrap_or(0);
+        end_reason_keys_builder.append_value(end_key);
+
+        end_reason_forced_builder.append_value(read.end_reason_forced);
+
+        // Look up run_info by index, then get dictionary key from acquisition_id
+        let run_info_key = run_infos
+            .get(read.run_info_index as usize)
+            .and_then(|ri| run_info_map.get(ri.acquisition_id.as_str()).copied())
+            .unwrap_or(0);
+        run_info_keys_builder.append_value(run_info_key);
+
+        num_minknow_events_builder.append_value(read.num_minknow_events);
+        num_samples_builder.append_value(read.num_samples);
+        open_pore_level_builder.append_value(read.open_pore_level);
+    }
+
+    PartitionArrays {
+        read_id: read_id_builder.finish(),
+        signal: signal_builder.finish(),
+        channel: channel_builder.finish(),
+        well: well_builder.finish(),
+        pore_type_keys: pore_type_keys_builder.finish(),
+        calibration_offset: calibration_offset_builder.finish(),
+        calibration_scale: calibration_scale_builder.finish(),
+        read_number: read_number_builder.finish(),
+        start: start_builder.finish(),
+        median_before: median_before_builder.finish(),
+        end_reason_keys: end_reason_keys_builder.finish(),
+        end_reason_forced: end_reason_forced_builder.finish(),
+        run_info_keys: run_info_keys_builder.finish(),
+        num_minknow_events: num_minknow_events_builder.finish(),
+        num_samples: num_samples_builder.finish(),
+        open_pore_level: open_pore_level_builder.finish(),
+    }
+}
+
 /// Build reads Arrow IPC table.
+///
+/// Uses parallel partition-based building for performance:
+/// 1. Parallel dictionary collection (unique pore types, end reasons)
+/// 2. Create O(1) lookup maps for dictionary keys
+/// 3. Parallel partition building (split reads, build arrays per partition)
+/// 4. Concatenate partition arrays and create final RecordBatch
 pub(crate) fn build_reads_table(
     reads: &[(ReadData, Vec<u64>)],
     run_infos: &[RunInfoData],
@@ -188,99 +311,147 @@ pub(crate) fn build_reads_table(
         return Ok(buffer);
     }
 
-    let num_reads = reads.len();
+    // Phase 1: Parallel dictionary collection
+    let (pore_type_set, end_reason_set): (HashSet<&str>, HashSet<&str>) = reads
+        .par_iter()
+        .fold(
+            || (HashSet::new(), HashSet::new()),
+            |(mut pores, mut ends), (read, _)| {
+                pores.insert(read.pore_type.as_str());
+                ends.insert(read.end_reason.as_str());
+                (pores, ends)
+            },
+        )
+        .reduce(
+            || (HashSet::new(), HashSet::new()),
+            |(mut a_pores, mut a_ends), (b_pores, b_ends)| {
+                a_pores.extend(b_pores);
+                a_ends.extend(b_ends);
+                (a_pores, a_ends)
+            },
+        );
 
-    // Collect unique pore types and end reasons for dictionaries using O(1) HashSet lookups
-    let mut pore_type_set: HashSet<&str> = HashSet::new();
-    let mut end_reason_set: HashSet<&str> = HashSet::new();
-
-    for (read, _) in reads {
-        pore_type_set.insert(&read.pore_type);
-        end_reason_set.insert(read.end_reason.as_str());
-    }
-
-    // Convert to Vec for Arrow dictionary (order doesn't matter for correctness)
     let pore_types: Vec<&str> = pore_type_set.into_iter().collect();
     let end_reasons: Vec<&str> = end_reason_set.into_iter().collect();
+    let run_info_ids: Vec<&str> = run_infos.iter().map(|ri| ri.acquisition_id.as_str()).collect();
 
-    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
-    let signal_field = Arc::new(arrow::datatypes::Field::new(
-        "item",
-        arrow::datatypes::DataType::UInt64,
-        false,
-    ));
-    let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
-    let mut channel_builder = UInt16Builder::with_capacity(num_reads);
-    let mut well_builder = UInt8Builder::with_capacity(num_reads);
+    // Phase 2: Create O(1) lookup maps for dictionary keys
+    let pore_type_map: HashMap<&str, i16> = pore_types
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as i16))
+        .collect();
+    let end_reason_map: HashMap<&str, i16> = end_reasons
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as i16))
+        .collect();
+    let run_info_map: HashMap<&str, i16> = run_info_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as i16))
+        .collect();
 
-    let pore_type_dict = StringArray::from_iter_values(pore_types.iter().copied());
-    let mut pore_type_builder: StringDictionaryBuilder<Int16Type> =
-        StringDictionaryBuilder::new_with_dictionary(num_reads, &pore_type_dict)?;
+    // Phase 3: Parallel partition building
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (reads.len() + num_threads - 1) / num_threads;
 
-    let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
-    let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
-    let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
-    let mut start_builder = UInt64Builder::with_capacity(num_reads);
-    let mut median_before_builder = Float32Builder::with_capacity(num_reads);
+    let partition_arrays: Vec<PartitionArrays> = reads
+        .par_chunks(chunk_size)
+        .map(|chunk| build_partition(chunk, &pore_type_map, &end_reason_map, &run_info_map, run_infos))
+        .collect();
 
-    let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().copied());
-    let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
-        StringDictionaryBuilder::new_with_dictionary(num_reads, &end_reason_dict)?;
+    // Phase 4: Concatenate partition arrays and create DictionaryArrays
 
-    let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
-    let mut run_info_builder: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-    let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
-    let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
-    let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
-
-    for (read, signal_rows) in reads {
-        read_id_builder.append_value(read.read_id.as_bytes())?;
-
-        let values = signal_builder.values();
-        for &idx in signal_rows {
-            values.append_value(idx);
-        }
-        signal_builder.append(true);
-
-        channel_builder.append_value(read.channel);
-        well_builder.append_value(read.well);
-        pore_type_builder.append_value(&read.pore_type);
-        calibration_offset_builder.append_value(read.calibration_offset);
-        calibration_scale_builder.append_value(read.calibration_scale);
-        read_number_builder.append_value(read.read_number);
-        start_builder.append_value(read.start_sample);
-        median_before_builder.append_value(read.median_before);
-        end_reason_builder.append_value(read.end_reason.as_str());
-        end_reason_forced_builder.append_value(read.end_reason_forced);
-
-        if let Some(run_info) = run_infos.get(read.run_info_index as usize) {
-            run_info_builder.append_value(&run_info.acquisition_id);
-        } else {
-            run_info_builder.append_value("");
-        }
-
-        num_minknow_events_builder.append_value(read.num_minknow_events);
-        num_samples_builder.append_value(read.num_samples);
-        open_pore_level_builder.append_value(read.open_pore_level);
+    // Helper to concatenate arrays of a specific type
+    macro_rules! concat_arrays {
+        ($field:ident, $array_type:ty) => {{
+            let refs: Vec<&dyn Array> = partition_arrays
+                .iter()
+                .map(|p| &p.$field as &dyn Array)
+                .collect();
+            Arc::new(
+                concat(&refs)?
+                    .as_any()
+                    .downcast_ref::<$array_type>()
+                    .unwrap()
+                    .clone(),
+            ) as ArrayRef
+        }};
     }
 
+    // Concatenate primitive arrays
+    let read_id_array = concat_arrays!(read_id, FixedSizeBinaryArray);
+    let signal_array = concat_arrays!(signal, ListArray);
+    let channel_array = concat_arrays!(channel, UInt16Array);
+    let well_array = concat_arrays!(well, UInt8Array);
+    let calibration_offset_array = concat_arrays!(calibration_offset, Float32Array);
+    let calibration_scale_array = concat_arrays!(calibration_scale, Float32Array);
+    let read_number_array = concat_arrays!(read_number, UInt32Array);
+    let start_array = concat_arrays!(start, UInt64Array);
+    let median_before_array = concat_arrays!(median_before, Float32Array);
+    let end_reason_forced_array = concat_arrays!(end_reason_forced, BooleanArray);
+    let num_minknow_events_array = concat_arrays!(num_minknow_events, UInt64Array);
+    let num_samples_array = concat_arrays!(num_samples, UInt64Array);
+    let open_pore_level_array = concat_arrays!(open_pore_level, Float32Array);
+
+    // Concatenate dictionary key arrays and create DictionaryArrays
+    let pore_type_keys_refs: Vec<&dyn Array> = partition_arrays
+        .iter()
+        .map(|p| &p.pore_type_keys as &dyn Array)
+        .collect();
+    let pore_type_keys = concat(&pore_type_keys_refs)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap()
+        .clone();
+    let pore_type_dict = StringArray::from_iter_values(pore_types.iter().copied());
+    let pore_type_array: ArrayRef =
+        Arc::new(DictionaryArray::new(pore_type_keys, Arc::new(pore_type_dict)));
+
+    let end_reason_keys_refs: Vec<&dyn Array> = partition_arrays
+        .iter()
+        .map(|p| &p.end_reason_keys as &dyn Array)
+        .collect();
+    let end_reason_keys = concat(&end_reason_keys_refs)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap()
+        .clone();
+    let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().copied());
+    let end_reason_array: ArrayRef =
+        Arc::new(DictionaryArray::new(end_reason_keys, Arc::new(end_reason_dict)));
+
+    let run_info_keys_refs: Vec<&dyn Array> = partition_arrays
+        .iter()
+        .map(|p| &p.run_info_keys as &dyn Array)
+        .collect();
+    let run_info_keys = concat(&run_info_keys_refs)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap()
+        .clone();
+    let run_info_dict = StringArray::from_iter_values(run_info_ids.iter().copied());
+    let run_info_array: ArrayRef =
+        Arc::new(DictionaryArray::new(run_info_keys, Arc::new(run_info_dict)));
+
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(read_id_builder.finish()),
-        Arc::new(signal_builder.finish()),
-        Arc::new(channel_builder.finish()),
-        Arc::new(well_builder.finish()),
-        Arc::new(pore_type_builder.finish()),
-        Arc::new(calibration_offset_builder.finish()),
-        Arc::new(calibration_scale_builder.finish()),
-        Arc::new(read_number_builder.finish()),
-        Arc::new(start_builder.finish()),
-        Arc::new(median_before_builder.finish()),
-        Arc::new(end_reason_builder.finish()),
-        Arc::new(end_reason_forced_builder.finish()),
-        Arc::new(run_info_builder.finish()),
-        Arc::new(num_minknow_events_builder.finish()),
-        Arc::new(num_samples_builder.finish()),
-        Arc::new(open_pore_level_builder.finish()),
+        read_id_array,
+        signal_array,
+        channel_array,
+        well_array,
+        pore_type_array,
+        calibration_offset_array,
+        calibration_scale_array,
+        read_number_array,
+        start_array,
+        median_before_array,
+        end_reason_array,
+        end_reason_forced_array,
+        run_info_array,
+        num_minknow_events_array,
+        num_samples_array,
+        open_pore_level_array,
     ];
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;

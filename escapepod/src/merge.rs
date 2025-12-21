@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Options for merge operations.
 #[derive(Debug, Clone)]
@@ -32,6 +33,28 @@ impl Default for MergeOptions {
             read_batch_size: 100_000,
         }
     }
+}
+
+/// Phase of the merge operation for progress reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePhase {
+    /// Loading metadata from input files (parallel).
+    LoadingMetadata,
+    /// Writing signal data to output file.
+    WritingSignal,
+    /// Writing reads table.
+    WritingReads,
+}
+
+/// Progress information for merge operations.
+#[derive(Debug, Clone)]
+pub struct MergeProgress {
+    /// Current phase of the merge.
+    pub phase: MergePhase,
+    /// Current item being processed (file index or similar).
+    pub current: usize,
+    /// Total items in this phase.
+    pub total: usize,
 }
 
 /// Result of a merge operation.
@@ -56,7 +79,7 @@ pub struct MergeResult {
 /// * `inputs` - Slice of input file paths
 /// * `output` - Output file path
 /// * `options` - Merge options
-/// * `progress_callback` - Optional callback for progress updates (file_idx, total_files)
+/// * `progress_callback` - Optional callback for progress updates with phase info
 ///
 /// # Returns
 /// A `MergeResult` with statistics about the merge operation.
@@ -64,7 +87,7 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
     inputs: &[P],
     output: Q,
     options: &MergeOptions,
-    progress_callback: Option<&dyn Fn(usize, usize)>,
+    progress_callback: Option<&(dyn Fn(MergeProgress) + Sync + Send)>,
 ) -> Result<MergeResult> {
     if inputs.is_empty() {
         return Err(Error::InvalidState("No input files specified".into()));
@@ -75,10 +98,13 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
 
 /// Collected metadata from a single file for merging.
 struct FileMetadata {
-    reader: Reader,
     footer: ArrowIpcFooter,
     run_infos: Vec<RunInfoData>,
     reads: Vec<ReadData>,
+    /// Pre-read signal header bytes (Arrow schema/magic).
+    signal_header: Vec<u8>,
+    /// Pre-read signal batch bytes (all record batches).
+    signal_batches: Vec<u8>,
 }
 
 /// Main merge implementation using zero-copy async I/O.
@@ -87,14 +113,18 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     inputs: &[P],
     output: Q,
     options: &MergeOptions,
-    progress_callback: Option<&dyn Fn(usize, usize)>,
+    progress_callback: Option<&(dyn Fn(MergeProgress) + Sync + Send)>,
 ) -> Result<MergeResult> {
     let num_files = inputs.len();
 
     // Convert to owned paths for parallel processing
     let input_paths: Vec<&Path> = inputs.iter().map(|p| p.as_ref()).collect();
 
-    // Phase 1: Open files and collect metadata in parallel (single open per file)
+    // Progress counter for parallel metadata loading
+    let files_loaded = AtomicUsize::new(0);
+
+    // Phase 1: Open files and collect metadata in parallel
+    // Pre-reads signal bytes into memory so Phase 2 only writes from RAM
     let metadata_results: Vec<Result<FileMetadata>> = input_paths
         .par_iter()
         .map(|path| {
@@ -105,11 +135,27 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             let reads: Vec<ReadData> = reader
                 .reads()?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            // Pre-read signal bytes into memory (moves I/O to parallel phase)
+            let signal_header = footer.header_bytes(signal_bytes).to_vec();
+            let signal_batches = footer.batches_bytes(signal_bytes).to_vec();
+
+            // Update progress after successfully loading a file
+            let loaded = files_loaded.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(cb) = &progress_callback {
+                cb(MergeProgress {
+                    phase: MergePhase::LoadingMetadata,
+                    current: loaded,
+                    total: num_files,
+                });
+            }
+
             Ok(FileMetadata {
-                reader,
                 footer,
                 run_infos,
                 reads,
+                signal_header,
+                signal_batches,
             })
         })
         .collect();
@@ -119,34 +165,27 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
     let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
 
-    // Phase 1.5: Pre-fault mmap pages in parallel using madvise
-    // This hints to the OS to read pages ahead without manual iteration overhead
-    file_metadata.par_iter().for_each(|metadata| {
-        // Use reader's madvise method if available, fallback to touching pages
-        metadata.reader.prefetch_signal();
-    });
-
-    // Phase 2: Write signal data using scoped thread (zero-copy from mmap)
+    // Phase 2: Write signal data using scoped thread (from pre-read memory)
     let mut all_batches: Vec<BatchBlock> = Vec::new();
     let mut current_offset: usize = 0;
     let mut current_signal_row: u64 = 0;
     let mut signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
 
-    // Use scoped thread to allow borrowing mmap slices without copying
     use std::sync::mpsc;
     use std::thread;
 
     let (mut file, signal_end, signal_rows) =
         thread::scope(|scope| -> Result<(File, usize, u64)> {
             // Channel for sending byte slices to writer thread
-            // Buffer of 16 allows reader to stay ahead of writer for better I/O overlap
-            let (tx, rx) = mpsc::sync_channel::<&[u8]>(16);
+            // Buffer of 32 allows sender to stay ahead of writer
+            let (tx, rx) = mpsc::sync_channel::<&[u8]>(32);
 
             // Spawn writer thread within scope - can borrow from parent
             let output_path = output.as_ref();
             let writer_handle = scope.spawn(move || -> std::io::Result<(File, usize)> {
                 let file = File::create(output_path)?;
-                let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
+                // 128MB buffer for better throughput on large files
+                let mut file = BufWriter::with_capacity(128 * 1024 * 1024, file);
 
                 // Write POD5 header
                 file.write_all(&POD5_SIGNATURE)?;
@@ -163,27 +202,23 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                 Ok((file.into_inner()?, pos))
             });
 
-            // Main thread: send signal bytes to writer
+            // Main thread: send pre-read signal bytes to writer
             let mut header_written = false;
 
             for (file_idx, metadata) in file_metadata.iter().enumerate() {
-                let signal_bytes = metadata.reader.signal_table_bytes()?;
-
                 // Record signal row offset for this file
                 signal_offsets.push(current_signal_row);
 
                 // Write header from first file only
                 if !header_written {
-                    let header_bytes = metadata.footer.header_bytes(signal_bytes);
-                    tx.send(header_bytes)
+                    tx.send(&metadata.signal_header)
                         .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
-                    current_offset = header_bytes.len();
+                    current_offset = metadata.signal_header.len();
                     header_written = true;
                 }
 
-                // Send batch bytes directly (zero-copy from mmap)
-                let batches_bytes = metadata.footer.batches_bytes(signal_bytes);
-                tx.send(batches_bytes)
+                // Send pre-read batch bytes (no mmap access here)
+                tx.send(&metadata.signal_batches)
                     .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
 
                 // Adjust batch offsets for the combined output
@@ -200,11 +235,15 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                     });
                 }
 
-                current_offset += batches_bytes.len();
+                current_offset += metadata.signal_batches.len();
                 current_signal_row += metadata.footer.total_rows;
 
                 if let Some(cb) = progress_callback {
-                    cb(file_idx + 1, num_files);
+                    cb(MergeProgress {
+                        phase: MergePhase::WritingSignal,
+                        current: file_idx + 1,
+                        total: num_files,
+                    });
                 }
             }
 
@@ -273,44 +312,70 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     // Build and write reads table
     let reads_offset = file.stream_position()? as i64;
 
+    // Notify start of reads phase
+    if let Some(cb) = progress_callback {
+        cb(MergeProgress {
+            phase: MergePhase::WritingReads,
+            current: 0,
+            total: total_read_count as usize,
+        });
+    }
+
+    // Phase 3a: Transform reads in parallel (signal row adjustment, run_info remapping)
+    // Each file's reads are processed independently
+    let per_file_reads: Vec<Vec<(Uuid, ReadData, Vec<u64>)>> = file_metadata
+        .par_iter()
+        .zip(signal_offsets.par_iter())
+        .map(|(metadata, &signal_offset)| {
+            metadata
+                .reads
+                .iter()
+                .map(|read| {
+                    let original_run_info = metadata.run_infos.get(read.run_info_index as usize);
+                    let new_run_info_idx = if let Some(ri) = original_run_info {
+                        *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
+                    } else {
+                        0
+                    };
+
+                    let new_signal_rows: Vec<u64> = read
+                        .signal_rows
+                        .iter()
+                        .map(|&row| row + signal_offset)
+                        .collect();
+
+                    let new_read = read.for_writing(new_run_info_idx);
+                    (read.read_id, new_read, new_signal_rows)
+                })
+                .collect()
+        })
+        .collect();
+
+    // Phase 3b: Sequential duplicate filtering (requires ordered access to seen_reads)
     let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
         HashSet::new()
     } else {
         HashSet::with_capacity(total_read_count as usize)
     };
 
-    let mut processed_reads: Vec<(ReadData, Vec<u64>)> = Vec::new();
-    let mut total_reads = 0u64;
+    let mut processed_reads: Vec<(ReadData, Vec<u64>)> =
+        Vec::with_capacity(total_read_count as usize);
     let mut duplicate_count = 0u64;
 
-    for (metadata, &signal_offset) in file_metadata.iter().zip(signal_offsets.iter()) {
-        for read in &metadata.reads {
+    for file_reads in per_file_reads {
+        for (read_id, new_read, new_signal_rows) in file_reads {
             if !options.duplicate_ok {
-                if seen_reads.contains(&read.read_id) {
+                if seen_reads.contains(&read_id) {
                     duplicate_count += 1;
                     continue;
                 }
-                seen_reads.insert(read.read_id);
+                seen_reads.insert(read_id);
             }
-
-            let original_run_info = metadata.run_infos.get(read.run_info_index as usize);
-            let new_run_info_idx = if let Some(ri) = original_run_info {
-                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
-            } else {
-                0
-            };
-
-            let new_signal_rows: Vec<u64> = read
-                .signal_rows
-                .iter()
-                .map(|&row| row + signal_offset)
-                .collect();
-
-            let new_read = read.for_writing(new_run_info_idx);
             processed_reads.push((new_read, new_signal_rows));
-            total_reads += 1;
         }
     }
+
+    let total_reads = processed_reads.len() as u64;
 
     let reads_bytes = build_reads_table(&processed_reads, &all_run_infos)?;
     file.write_all(&reads_bytes)?;

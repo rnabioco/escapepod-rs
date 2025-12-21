@@ -46,7 +46,7 @@ pub use utils::{compute_n50, compute_statistics, Statistics};
 
 // Re-export commonly used types
 pub use error::{Error, Result};
-pub use merge::{merge_files, MergeOptions, MergeResult};
+pub use merge::{merge_files, MergeOptions, MergePhase, MergeProgress, MergeResult};
 pub use operations::{repack_files, RepackOptions, RepackResult};
 pub use reader::Reader;
 pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
