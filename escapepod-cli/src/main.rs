@@ -110,6 +110,14 @@ Examples:
         /// Allow duplicate read IDs (skip duplicate checking)
         #[arg(long)]
         duplicate_ok: bool,
+
+        /// Number of threads for parallel processing (default: all CPUs)
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
+
+        /// Print profiling information (phase timing, throughput)
+        #[arg(long)]
+        profile: bool,
     },
 
     /// Filter reads by ID list
@@ -274,7 +282,9 @@ fn main() -> anyhow::Result<()> {
             inputs,
             output,
             duplicate_ok,
-        } => commands::merge::run(inputs, output, duplicate_ok),
+            threads,
+            profile,
+        } => commands::merge::run(inputs, output, duplicate_ok, threads, profile),
 
         Commands::Filter { input, ids, output } => commands::filter::run(input, ids, output),
 
