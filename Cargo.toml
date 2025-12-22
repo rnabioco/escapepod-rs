@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["escapepod-cli", "escapepod"]
+members = ["escapepod", "escapepod-cli"]
 
 [workspace.package]
 version = "0.1.0-alpha.3"
@@ -10,21 +10,21 @@ repository = "https://github.com/rnabioco/escapepod-rs"
 license = "MIT"
 
 [workspace.dependencies]
+# Error handling
+anyhow = "1"
 # Arrow ecosystem
 arrow = { version = "57", default-features = false, features = ["ipc"] }
 byteorder = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
+# Workspace crates
+escapepod = { path = "escapepod" }
 # Serialization
 flatbuffers = "25"
 indicatif = "0.18"
 # I/O
 memmap2 = "0.9"
-# Workspace crates
-escapepod = { path = "escapepod" }
 rayon = "1"
-# Error handling
-anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Compression
