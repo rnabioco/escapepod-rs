@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "escapepod-rs"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
