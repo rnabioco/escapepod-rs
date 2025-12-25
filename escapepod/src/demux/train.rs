@@ -52,10 +52,7 @@ impl Default for TrainConfig {
 /// Compute the full DTW distance matrix between all fingerprints.
 ///
 /// Returns a symmetric matrix D where D[i,j] = DTW(fp_i, fp_j).
-pub fn compute_distance_matrix(
-    fingerprints: &[Vec<f64>],
-    window: Option<usize>,
-) -> Array2<f64> {
+pub fn compute_distance_matrix(fingerprints: &[Vec<f64>], window: Option<usize>) -> Array2<f64> {
     let n = fingerprints.len();
     let mut distances = Array2::<f64>::zeros((n, n));
 
@@ -77,11 +74,7 @@ pub fn compute_distance_matrix(
 /// Convert distance matrix to kernel matrix using RBF.
 ///
 /// K[i,j] = exp(-gamma * D[i,j]^power)
-pub fn distance_to_kernel_matrix(
-    distances: &Array2<f64>,
-    gamma: f64,
-    power: f64,
-) -> Array2<f64> {
+pub fn distance_to_kernel_matrix(distances: &Array2<f64>, gamma: f64, power: f64) -> Array2<f64> {
     distances.mapv(|d| (-gamma * d.powf(power)).exp())
 }
 
@@ -191,9 +184,8 @@ fn train_binary_svm(
     let n_samples = fingerprints.len();
 
     // Convert targets to bool for linfa-svm
-    let targets: Array1<bool> = Array1::from_vec(
-        target_indices.iter().map(|&idx| idx == 1).collect()
-    );
+    let targets: Array1<bool> =
+        Array1::from_vec(target_indices.iter().map(|&idx| idx == 1).collect());
 
     // Create dataset with kernel matrix as features
     let dataset = Dataset::new(kernel_matrix.clone(), targets);

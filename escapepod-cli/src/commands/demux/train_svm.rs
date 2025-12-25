@@ -106,9 +106,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
 ///
 /// Expected format: read_id,barcode,feat1,feat2,...,featN
 /// Returns: (fingerprints, labels, barcode_names)
-fn load_fingerprints(
-    path: &PathBuf,
-) -> anyhow::Result<(Vec<Vec<f64>>, Vec<i32>, Vec<String>)> {
+fn load_fingerprints(path: &PathBuf) -> anyhow::Result<(Vec<Vec<f64>>, Vec<i32>, Vec<String>)> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 

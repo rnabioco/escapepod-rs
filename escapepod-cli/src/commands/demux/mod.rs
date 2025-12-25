@@ -84,11 +84,14 @@ Examples:
 
     /// Train SVM model from fingerprints (requires --features train)
     #[cfg(feature = "train")]
-    #[command(name = "train-svm", after_help = "\
+    #[command(
+        name = "train-svm",
+        after_help = "\
 Examples:
   escapepod demux train-svm -f fingerprints.csv -o model.json
   escapepod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
-")]
+"
+    )]
     TrainSvm(TrainSvmArgs),
 }
 

@@ -174,9 +174,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     }
 
     if criteria.is_empty() {
-        return Err(Error::InvalidState(
-            "No filter criteria specified".into(),
-        ));
+        return Err(Error::InvalidState("No filter criteria specified".into()));
     }
 
     let num_files = input_files.len();

@@ -8,11 +8,7 @@ use crate::dtw::dtw_distance;
 /// Returns (is_confident, confidence_score) based on the ratio of best to second-best distance.
 /// Lower ratio = more confident (best is much closer than second-best).
 #[inline]
-fn compute_ratio_confidence(
-    best_dist: f64,
-    second_best_dist: f64,
-    threshold: f64,
-) -> (bool, f64) {
+fn compute_ratio_confidence(best_dist: f64, second_best_dist: f64, threshold: f64) -> (bool, f64) {
     let ratio = if second_best_dist > 0.0 {
         best_dist / second_best_dist
     } else {

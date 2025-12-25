@@ -47,11 +47,7 @@ pub fn distances_to_kernel(distances: &[f64], params: &KernelParams) -> Vec<f64>
 /// # Returns
 ///
 /// Vector of DTW distances
-pub fn compute_distances(
-    query: &[f64],
-    training: &[Vec<f64>],
-    window: Option<usize>,
-) -> Vec<f64> {
+pub fn compute_distances(query: &[f64], training: &[Vec<f64>], window: Option<usize>) -> Vec<f64> {
     let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
 
     training
@@ -162,8 +158,7 @@ impl<'a> SvmPredictor<'a> {
                 // Decision function: sum over support vectors
                 let mut sum = self.model.intercept[pair_idx];
 
-                for (sv_local_idx, &sv_global_idx) in
-                    self.model.support_indices.iter().enumerate()
+                for (sv_local_idx, &sv_global_idx) in self.model.support_indices.iter().enumerate()
                 {
                     let coef = if sv_local_idx < self.model.dual_coef[0].len() {
                         let row_idx = (i + j - 1) % self.model.dual_coef.len();
@@ -272,6 +267,7 @@ impl<'a> SvmPredictor<'a> {
     /// Couple pairwise probabilities to class probabilities.
     ///
     /// Implements the coupling algorithm from Wu et al. (2004).
+    #[allow(clippy::needless_range_loop)] // Matrix filling requires index access pattern
     fn couple_probabilities(&self, pair_probs: &[f64]) -> Vec<f64> {
         let n_classes = self.model.n_classes;
 
@@ -353,11 +349,8 @@ impl<'a> SvmPredictor<'a> {
     /// Tuple of (probabilities, prediction result)
     pub fn predict(&self, query: &[f64]) -> (Vec<f64>, ProbabilityResult) {
         // Compute DTW distances
-        let distances = compute_distances(
-            query,
-            &self.model.training_fingerprints,
-            self.model.window,
-        );
+        let distances =
+            compute_distances(query, &self.model.training_fingerprints, self.model.window);
 
         // Convert to kernel
         let kernel_values = distances_to_kernel(&distances, &self.model.kernel_params);
@@ -445,10 +438,7 @@ mod tests {
     #[test]
     fn test_compute_distances() {
         let query = vec![0.0, 0.0, 0.0];
-        let training = vec![
-            vec![0.0, 0.0, 0.0],
-            vec![1.0, 1.0, 1.0],
-        ];
+        let training = vec![vec![0.0, 0.0, 0.0], vec![1.0, 1.0, 1.0]];
 
         let distances = compute_distances(&query, &training, None);
 
@@ -529,9 +519,9 @@ mod tests {
         let model = DtwSvmModel {
             version: "1.0".to_string(),
             training_fingerprints: vec![
-                vec![0.1, 0.1, 0.1],  // Class 0
-                vec![0.9, 0.9, 0.9],  // Class 1
-                vec![0.5, 0.5, 0.5],  // Class 2
+                vec![0.1, 0.1, 0.1], // Class 0
+                vec![0.9, 0.9, 0.9], // Class 1
+                vec![0.5, 0.5, 0.5], // Class 2
             ],
             training_labels: vec![0, 1, 2],
             support_indices: vec![0, 1, 2],
@@ -552,19 +542,28 @@ mod tests {
         // Query close to class 0
         let query0 = vec![0.12, 0.12, 0.12];
         let (probs0, result0) = classify_with_svm(&model, &query0);
-        println!("Query near class 0: probs={:?}, predicted={}", probs0, result0.predicted_barcode);
+        println!(
+            "Query near class 0: probs={:?}, predicted={}",
+            probs0, result0.predicted_barcode
+        );
         assert_eq!(result0.predicted_barcode, 0, "Should predict class 0");
 
         // Query close to class 1
         let query1 = vec![0.88, 0.88, 0.88];
         let (probs1, result1) = classify_with_svm(&model, &query1);
-        println!("Query near class 1: probs={:?}, predicted={}", probs1, result1.predicted_barcode);
+        println!(
+            "Query near class 1: probs={:?}, predicted={}",
+            probs1, result1.predicted_barcode
+        );
         assert_eq!(result1.predicted_barcode, 1, "Should predict class 1");
 
         // Query close to class 2
         let query2 = vec![0.52, 0.52, 0.52];
         let (probs2, result2) = classify_with_svm(&model, &query2);
-        println!("Query near class 2: probs={:?}, predicted={}", probs2, result2.predicted_barcode);
+        println!(
+            "Query near class 2: probs={:?}, predicted={}",
+            probs2, result2.predicted_barcode
+        );
         assert_eq!(result2.predicted_barcode, 2, "Should predict class 2");
     }
 }

@@ -99,10 +99,7 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
 
 /// Run classification using a trained SVM model.
 fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Result<()> {
-    println!(
-        "{} reads using SVM model",
-        style::action("Classifying")
-    );
+    println!("{} reads using SVM model", style::action("Classifying"));
     println!(
         "{} {}",
         style::label("Fingerprints:"),
@@ -119,10 +116,7 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
         style::path(args.output.display())
     );
     if args.probabilities {
-        println!(
-            "{} per-class probabilities",
-            style::label("Including:")
-        );
+        println!("{} per-class probabilities", style::label("Including:"));
     }
 
     // Load the SVM model
