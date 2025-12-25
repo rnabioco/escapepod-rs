@@ -5,7 +5,7 @@
 use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
-use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
+use crate::types::{EndReason, ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
 use crate::utils::parse_uuid_flexible;
 use crate::utils::table_builders::{build_pod5_footer, build_reads_table, build_run_info_table};
 use rayon::prelude::*;
@@ -14,6 +14,72 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
+
+/// Criteria for filtering reads.
+#[derive(Debug, Clone, Default)]
+pub struct FilterCriteria {
+    /// Only include reads with these IDs.
+    pub read_ids: Option<HashSet<Uuid>>,
+    /// Minimum number of samples (inclusive).
+    pub min_samples: Option<u64>,
+    /// Maximum number of samples (inclusive).
+    pub max_samples: Option<u64>,
+    /// Only include reads with these end reasons.
+    pub include_end_reasons: Option<HashSet<EndReason>>,
+    /// Exclude reads with these end reasons.
+    pub exclude_end_reasons: Option<HashSet<EndReason>>,
+}
+
+impl FilterCriteria {
+    /// Check if a read matches all the filter criteria.
+    pub fn matches(&self, read: &ReadData) -> bool {
+        // Check read ID filter
+        if let Some(ref ids) = self.read_ids {
+            if !ids.contains(&read.read_id) {
+                return false;
+            }
+        }
+
+        // Check min samples
+        if let Some(min) = self.min_samples {
+            if read.num_samples < min {
+                return false;
+            }
+        }
+
+        // Check max samples
+        if let Some(max) = self.max_samples {
+            if read.num_samples > max {
+                return false;
+            }
+        }
+
+        // Check include end reasons (if specified, read must have one of these)
+        if let Some(ref include) = self.include_end_reasons {
+            if !include.contains(&read.end_reason) {
+                return false;
+            }
+        }
+
+        // Check exclude end reasons
+        if let Some(ref exclude) = self.exclude_end_reasons {
+            if exclude.contains(&read.end_reason) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Returns true if no criteria are set (matches all reads).
+    pub fn is_empty(&self) -> bool {
+        self.read_ids.is_none()
+            && self.min_samples.is_none()
+            && self.max_samples.is_none()
+            && self.include_end_reasons.is_none()
+            && self.exclude_end_reasons.is_none()
+    }
+}
 
 /// Options for the filter operation.
 #[derive(Debug, Clone)]
@@ -75,6 +141,9 @@ struct FileMetadata {
 ///
 /// This function uses raw byte extraction from mmap - no Arrow deserialization.
 /// It extracts only the specific signal rows needed for matching reads.
+///
+/// This is a convenience wrapper around `filter_files_with_criteria` for
+/// backwards compatibility.
 pub fn filter_files<P: AsRef<Path> + Sync>(
     input_files: &[P],
     output_path: impl AsRef<Path>,
@@ -82,8 +151,32 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
     options: FilterOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<FilterResult> {
+    let criteria = FilterCriteria {
+        read_ids: Some(filter_ids.clone()),
+        ..Default::default()
+    };
+    filter_files_with_criteria(input_files, output_path, &criteria, options, progress)
+}
+
+/// Filter reads from POD5 files based on filter criteria.
+///
+/// This function uses raw byte extraction from mmap - no Arrow deserialization.
+/// It extracts only the specific signal rows needed for matching reads.
+pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
+    input_files: &[P],
+    output_path: impl AsRef<Path>,
+    criteria: &FilterCriteria,
+    options: FilterOptions,
+    progress: Option<ProgressCallback>,
+) -> Result<FilterResult> {
     if input_files.is_empty() {
         return Err(Error::InvalidState("No input files specified".into()));
+    }
+
+    if criteria.is_empty() {
+        return Err(Error::InvalidState(
+            "No filter criteria specified".into(),
+        ));
     }
 
     let num_files = input_files.len();
@@ -102,12 +195,12 @@ pub fn filter_files<P: AsRef<Path> + Sync>(
                 .reads()?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            // Find matching reads
+            // Find matching reads using the criteria
             let matching_read_indices: Vec<usize> = reads
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, read)| {
-                    if filter_ids.contains(&read.read_id) {
+                    if criteria.matches(read) {
                         Some(idx)
                     } else {
                         None

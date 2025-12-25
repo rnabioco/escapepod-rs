@@ -120,20 +120,39 @@ Examples:
         profile: bool,
     },
 
-    /// Filter reads by ID list
+    /// Filter reads by various criteria
     #[command(after_help = "\
 Examples:
   escapepod filter input.pod5 -i ids.txt -o filtered.pod5
+  escapepod filter input.pod5 --min-samples 4000 -o long_reads.pod5
+  escapepod filter input.pod5 --exclude-end-reason unblock_mux_change -o no_rejects.pod5
+  escapepod filter input.pod5 --end-reason signal_positive,signal_negative -o normal.pod5
 
-The ID file should contain one read ID per line (UUID format).
+At least one filter criterion must be specified.
 ")]
     Filter {
-        /// Input POD5 file
+        /// Input POD5 file or directory
         input: PathBuf,
 
         /// File containing read IDs (one per line)
-        #[arg(short, long, required = true, value_name = "FILE")]
-        ids: PathBuf,
+        #[arg(short, long, value_name = "FILE")]
+        ids: Option<PathBuf>,
+
+        /// Minimum number of samples (inclusive)
+        #[arg(long, value_name = "N")]
+        min_samples: Option<u64>,
+
+        /// Maximum number of samples (inclusive)
+        #[arg(long, value_name = "N")]
+        max_samples: Option<u64>,
+
+        /// Only include reads with these end reasons (comma-separated)
+        #[arg(long, value_name = "REASONS", value_delimiter = ',')]
+        end_reason: Option<Vec<String>>,
+
+        /// Exclude reads with these end reasons (comma-separated)
+        #[arg(long, value_name = "REASONS", value_delimiter = ',')]
+        exclude_end_reason: Option<Vec<String>>,
 
         /// Output POD5 file
         #[arg(short, long, required = true, value_name = "FILE")]
@@ -286,7 +305,23 @@ fn main() -> anyhow::Result<()> {
             profile,
         } => commands::merge::run(inputs, output, duplicate_ok, threads, profile),
 
-        Commands::Filter { input, ids, output } => commands::filter::run(input, ids, output),
+        Commands::Filter {
+            input,
+            ids,
+            min_samples,
+            max_samples,
+            end_reason,
+            exclude_end_reason,
+            output,
+        } => commands::filter::run(
+            input,
+            ids,
+            min_samples,
+            max_samples,
+            end_reason,
+            exclude_end_reason,
+            output,
+        ),
 
         Commands::BamFilter {
             input,
