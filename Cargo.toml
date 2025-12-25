@@ -29,3 +29,10 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Compression
 zstd = "0.13"
+
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
