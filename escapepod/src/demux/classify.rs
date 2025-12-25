@@ -3,6 +3,24 @@
 use super::model::WarpDemuxModel;
 use crate::dtw::dtw_distance;
 
+/// Compute distance ratio confidence.
+///
+/// Returns (is_confident, confidence_score) based on the ratio of best to second-best distance.
+/// Lower ratio = more confident (best is much closer than second-best).
+#[inline]
+fn compute_ratio_confidence(best_dist: f64, second_best_dist: f64, threshold: f64) -> (bool, f64) {
+    let ratio = if second_best_dist > 0.0 {
+        best_dist / second_best_dist
+    } else {
+        1.0
+    };
+
+    let confident = ratio <= threshold;
+    let confidence_score = if confident { 1.0 - ratio } else { 0.0 };
+
+    (confident, confidence_score)
+}
+
 /// Result of classifying a read by barcode.
 #[derive(Debug, Clone)]
 pub struct ClassificationResult {
@@ -94,13 +112,12 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
     // Sort by distance (ascending)
     distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Get best and second-best matches
-    let (best_idx, best_dist) = distances[0];
-    let second_best_dist = if distances.len() > 1 {
-        distances[1].1
-    } else {
-        f32::INFINITY
+    // Get best and second-best matches (with bounds check)
+    let (best_idx, best_dist) = match distances.first() {
+        Some(&pair) => pair,
+        None => return ClassificationResult::unclassified(f64::INFINITY, f64::INFINITY),
     };
+    let second_best_dist = distances.get(1).map(|&(_, d)| d).unwrap_or(f32::INFINITY);
 
     let best_dist_f64 = best_dist as f64;
     let second_best_dist_f64 = second_best_dist as f64;
@@ -111,24 +128,6 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
 
     // Determine confidence based on threshold type
     let (is_confident, confidence) = match model.threshold_type.as_str() {
-        "ratio" => {
-            // Ratio of best to second-best distance
-            // Lower ratio = more confident (best is much closer than second-best)
-            let ratio = if second_best_dist_f64 > 0.0 {
-                best_dist_f64 / second_best_dist_f64
-            } else {
-                1.0
-            };
-
-            let confident = ratio <= model.threshold;
-            let confidence_score = if confident {
-                1.0 - ratio // Higher is better
-            } else {
-                0.0
-            };
-
-            (confident, confidence_score)
-        }
         "kernel" => {
             // Convert distance to kernel similarity using RBF
             let gamma = model.kernel_params.gamma;
@@ -138,19 +137,8 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
             let confident = kernel_value >= model.threshold;
             (confident, kernel_value)
         }
-        _ => {
-            // Default to ratio if unknown type
-            let ratio = if second_best_dist_f64 > 0.0 {
-                best_dist_f64 / second_best_dist_f64
-            } else {
-                1.0
-            };
-
-            let confident = ratio <= model.threshold;
-            let confidence_score = if confident { 1.0 - ratio } else { 0.0 };
-
-            (confident, confidence_score)
-        }
+        // "ratio" or any unknown type defaults to ratio-based confidence
+        _ => compute_ratio_confidence(best_dist_f64, second_best_dist_f64, model.threshold),
     };
 
     if is_confident {

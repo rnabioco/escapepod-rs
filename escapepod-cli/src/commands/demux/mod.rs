@@ -10,6 +10,7 @@
 //! 3. **classify**: Assign reads to barcodes using DTW distance
 //! 4. **split**: Write demultiplexed reads to separate POD5 files
 //! 5. **train**: Generate reference barcodes from known samples
+//! 6. **train-svm**: Train SVM model from fingerprints (requires `train` feature)
 
 mod classify;
 mod detect;
@@ -19,11 +20,17 @@ mod train;
 mod types;
 mod utils;
 
+#[cfg(feature = "train")]
+mod train_svm;
+
 pub use classify::ClassifyArgs;
 pub use detect::DetectArgs;
 pub use fingerprint::FingerprintArgs;
 pub use split::SplitArgs;
 pub use train::TrainArgs;
+
+#[cfg(feature = "train")]
+pub use train_svm::TrainSvmArgs;
 
 /// Main demux command arguments.
 #[derive(Debug, clap::Args)]
@@ -74,6 +81,18 @@ Examples:
   escapepod demux train --assignments assignments.csv -o reference.json
 ")]
     Train(TrainArgs),
+
+    /// Train SVM model from fingerprints (requires --features train)
+    #[cfg(feature = "train")]
+    #[command(
+        name = "train-svm",
+        after_help = "\
+Examples:
+  escapepod demux train-svm -f fingerprints.csv -o model.json
+  escapepod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
+"
+    )]
+    TrainSvm(TrainSvmArgs),
 }
 
 /// Run the demux command.
@@ -84,5 +103,7 @@ pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
         DemuxCommand::Classify(classify_args) => classify::run(classify_args),
         DemuxCommand::Split(split_args) => split::run(split_args),
         DemuxCommand::Train(train_args) => train::run(train_args),
+        #[cfg(feature = "train")]
+        DemuxCommand::TrainSvm(train_svm_args) => train_svm::run(train_svm_args),
     }
 }
