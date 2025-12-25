@@ -1560,6 +1560,78 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#train-svm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        train-svm
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="train-svm">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#usage_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#options_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#input-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Input Format
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#building-with-train-feature" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building with train feature
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#complete-workflow-example" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1776,6 +1848,10 @@
 <tr>
 <td><a href="#train">train</a></td>
 <td>Train reference fingerprints from known samples</td>
+</tr>
+<tr>
+<td><a href="#train-svm">train-svm</a></td>
+<td>Train SVM model from fingerprints (requires <code>train</code> feature)</td>
 </tr>
 </tbody>
 </table>
@@ -2423,6 +2499,76 @@ escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="
 
 <span class="c1"># Use trained reference for classification</span>
 escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+</code></pre></div>
+<hr />
+<h2 id="train-svm">train-svm<a class="headerlink" href="#train-svm" title="Permanent link">&para;</a></h2>
+<p>Train an SVM model from labeled fingerprints for probabilistic barcode classification. This command requires the <code>train</code> feature to be enabled.</p>
+<p><strong>Note:</strong> This creates a DTW-SVM model that provides probability outputs for each class, enabling more nuanced confidence thresholds.</p>
+<h3 id="usage_5">Usage<a class="headerlink" href="#usage_5" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</code></pre></div>
+<h3 id="options_5">Options<a class="headerlink" href="#options_5" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-f, --fingerprints &lt;FILE&gt;</code></td>
+<td>CSV file with fingerprints (read_id, barcode, feat1, feat2, ...) (required)</td>
+</tr>
+<tr>
+<td><code>-o, --output &lt;FILE&gt;</code></td>
+<td>Output JSON file for trained SVM model (required)</td>
+</tr>
+<tr>
+<td><code>--gamma &lt;VALUE&gt;</code></td>
+<td>RBF kernel gamma parameter (default: 1.0)</td>
+</tr>
+<tr>
+<td><code>--power &lt;VALUE&gt;</code></td>
+<td>Power to raise distances before exponential (default: 1.0)</td>
+</tr>
+<tr>
+<td><code>--c &lt;VALUE&gt;</code></td>
+<td>SVM regularization parameter C (default: 1.0)</td>
+</tr>
+<tr>
+<td><code>--window &lt;N&gt;</code></td>
+<td>DTW window constraint (Sakoe-Chiba band)</td>
+</tr>
+<tr>
+<td><code>--thresholds &lt;VALUES&gt;</code></td>
+<td>Per-class confidence thresholds (comma-separated)</td>
+</tr>
+<tr>
+<td><code>-h, --help</code></td>
+<td>Print help</td>
+</tr>
+</tbody>
+</table>
+<h3 id="input-format">Input Format<a class="headerlink" href="#input-format" title="Permanent link">&para;</a></h3>
+<p>The fingerprints CSV should include barcode labels:</p>
+<div class="highlight"><pre><span></span><code>read_id,barcode,fp_0,fp_1,fp_2,...,fp_9
+a1b2c3d4-...,BC00,-0.823,1.234,-0.156,...
+b2c3d4e5-...,BC00,-0.712,0.987,-0.234,...
+c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
+</code></pre></div>
+<h3 id="example_5">Example<a class="headerlink" href="#example_5" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Train SVM with default parameters</span>
+escapepod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>fingerprints.csv<span class="w"> </span>-o<span class="w"> </span>model.json
+
+<span class="c1"># Train with custom hyperparameters</span>
+escapepod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>fingerprints.csv<span class="w"> </span>-o<span class="w"> </span>model.json<span class="w"> </span>--gamma<span class="w"> </span><span class="m">0</span>.5<span class="w"> </span>--c<span class="w"> </span><span class="m">10</span>.0<span class="w"> </span>--window<span class="w"> </span><span class="m">10</span>
+
+<span class="c1"># Use trained SVM model for classification (with classify --model-svm)</span>
+escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model-svm<span class="w"> </span>model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+</code></pre></div>
+<h3 id="building-with-train-feature">Building with train feature<a class="headerlink" href="#building-with-train-feature" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--features<span class="w"> </span>train
 </code></pre></div>
 <hr />
 <h2 id="complete-workflow-example">Complete Workflow Example<a class="headerlink" href="#complete-workflow-example" title="Permanent link">&para;</a></h2>

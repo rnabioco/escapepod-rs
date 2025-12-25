@@ -1766,7 +1766,7 @@ cargo<span class="w"> </span>doc<span class="w"> </span>--open<span class="w"> <
 <span class="kd">let</span><span class="w"> </span><span class="n">writer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Writer</span><span class="p">::</span><span class="n">create</span><span class="p">(</span><span class="s">&quot;output.pod5&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">WriterOptions</span><span class="p">::</span><span class="n">default</span><span class="p">())</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div>
 <h3 id="read-iteration">Read Iteration<a class="headerlink" href="#read-iteration" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">read</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">reader</span><span class="p">.</span><span class="n">reads</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">read</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">reader</span><span class="p">.</span><span class="n">reads</span><span class="p">()</span><span class="o">?</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}: {} samples&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">read</span><span class="p">.</span><span class="n">read_id</span><span class="p">,</span><span class="w"> </span><span class="n">read</span><span class="p">.</span><span class="n">num_samples</span><span class="p">);</span>
 <span class="p">}</span>
 </code></pre></div>
@@ -1793,7 +1793,21 @@ cargo<span class="w"> </span>doc<span class="w"> </span>--open<span class="w"> <
 <span class="p">}</span>
 </code></pre></div>
 <h2 id="feature-flags">Feature Flags<a class="headerlink" href="#feature-flags" title="Permanent link">&para;</a></h2>
-<p>Currently no optional features. All functionality is included by default.</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>train</code></td>
+<td>Enables SVM model training with <code>linfa</code> and <code>linfa-svm</code></td>
+</tr>
+</tbody>
+</table>
+<p>Core functionality is included by default. Use <code>--features train</code> to enable model training capabilities.</p>
 <h2 id="dependencies">Dependencies<a class="headerlink" href="#dependencies" title="Permanent link">&para;</a></h2>
 <h3 id="escapepod_1">escapepod<a class="headerlink" href="#escapepod_1" title="Permanent link">&para;</a></h3>
 <table>
@@ -1850,7 +1864,7 @@ cargo<span class="w"> </span>doc<span class="w"> </span>--open<span class="w"> <
 </tbody>
 </table>
 <h2 id="minimum-supported-rust-version">Minimum Supported Rust Version<a class="headerlink" href="#minimum-supported-rust-version" title="Permanent link">&para;</a></h2>
-<p>Rust 1.75 or later is required.</p>
+<p>Rust 1.85 or later is required.</p>
 
 
 

@@ -684,6 +684,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#csv-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CSV Output
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1328,6 +1339,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#csv-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CSV Output
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1394,6 +1416,14 @@
 <tr>
 <td><code>--ids</code></td>
 <td>Only show read IDs</td>
+</tr>
+<tr>
+<td><code>--separator &lt;SEP&gt;</code></td>
+<td>Field separator (default: tab)</td>
+</tr>
+<tr>
+<td><code>--no-header</code></td>
+<td>Suppress header row output</td>
 </tr>
 <tr>
 <td><code>-o, --output &lt;FILE&gt;</code></td>
@@ -1473,6 +1503,13 @@ c3d4e5f6-a7b8-9012-cdef-123456789012
 </code></pre></div>
 <h3 id="select-specific-fields">Select Specific Fields<a class="headerlink" href="#select-specific-fields" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span>--include<span class="w"> </span>read_id,channel,num_samples<span class="w"> </span>experiment.pod5
+</code></pre></div>
+<h3 id="csv-output">CSV Output<a class="headerlink" href="#csv-output" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Use comma separator for CSV format</span>
+escapepod<span class="w"> </span>view<span class="w"> </span>--separator<span class="w"> </span><span class="s1">&#39;,&#39;</span><span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.csv
+
+<span class="c1"># Without header for piping</span>
+escapepod<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>--no-header<span class="w"> </span>experiment.pod5<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">10</span>
 </code></pre></div>
 
 

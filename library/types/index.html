@@ -1424,6 +1424,9 @@
 <span class="w">    </span><span class="sd">/// Total number of signal samples</span>
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">num_samples</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span>
 
+<span class="w">    </span><span class="sd">/// Estimated open pore current level</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">open_pore_level</span><span class="p">:</span><span class="w"> </span><span class="kt">f32</span><span class="p">,</span>
+
 <span class="w">    </span><span class="sd">/// Signal row indices (internal use)</span>
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">signal_rows</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u64</span><span class="o">&gt;</span><span class="p">,</span>
 <span class="p">}</span>
@@ -1440,7 +1443,7 @@
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">acquisition_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
 
 <span class="w">    </span><span class="sd">/// Start time in milliseconds since epoch</span>
-<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">acquisition_start_time_ms</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">acquisition_start_time</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span>
 
 <span class="w">    </span><span class="sd">/// Maximum ADC value</span>
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">adc_max</span><span class="p">:</span><span class="w"> </span><span class="kt">i16</span><span class="p">,</span>
@@ -1448,13 +1451,52 @@
 <span class="w">    </span><span class="sd">/// Minimum ADC value</span>
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">adc_min</span><span class="p">:</span><span class="w"> </span><span class="kt">i16</span><span class="p">,</span>
 
-<span class="w">    </span><span class="sd">/// Sampling rate in Hz</span>
-<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">sample_rate</span><span class="p">:</span><span class="w"> </span><span class="kt">u16</span><span class="p">,</span>
-
 <span class="w">    </span><span class="sd">/// Context tags (key-value metadata)</span>
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">context_tags</span><span class="p">:</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
 
-<span class="w">    </span><span class="sd">/// Tracking ID metadata</span>
+<span class="w">    </span><span class="sd">/// Experiment name</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">experiment_name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Flow cell ID</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">flow_cell_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Flow cell product code</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">flow_cell_product_code</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Protocol name</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">protocol_name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Protocol run ID</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">protocol_run_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Protocol start time in milliseconds since epoch</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">protocol_start_time</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Sample ID</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">sample_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Sampling rate in Hz</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">sample_rate</span><span class="p">:</span><span class="w"> </span><span class="kt">u16</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Sequencing kit name</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">sequencing_kit</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Sequencer position identifier</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">sequencer_position</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Sequencer position type</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">sequencer_position_type</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Software that produced the data</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">software</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// System name</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">system_name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// System type</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">system_type</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+
+<span class="w">    </span><span class="sd">/// Tracking ID metadata (key-value pairs)</span>
 <span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">tracking_id</span><span class="p">:</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
 <span class="p">}</span>
 </code></pre></div>
