@@ -329,6 +329,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     }
 
     // Extract values for DTW computation
+    // Note: dtw_distance_matrix takes &[Vec<f32>], so we need owned vectors
     let query_values: Vec<Vec<f32>> = query_fps.iter().map(|(_, v)| v.clone()).collect();
     let ref_values: Vec<Vec<f32>> = reference_fps.iter().map(|fp| fp.values.clone()).collect();
 
@@ -348,12 +349,21 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
             let mut indexed: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            let (best_idx, best_dist) = indexed[0];
-            let second_best_dist = if indexed.len() > 1 {
-                indexed[1].1
-            } else {
-                f32::INFINITY
+            // Bounds check for empty reference set
+            let (best_idx, best_dist) = match indexed.first() {
+                Some(&pair) => pair,
+                None => {
+                    return ClassifyResult {
+                        read_id: *read_id,
+                        barcode: "unclassified".to_string(),
+                        confidence: 0.0,
+                        best_distance: f64::INFINITY,
+                        second_best_distance: f64::INFINITY,
+                        is_confident: false,
+                    };
+                }
             };
+            let second_best_dist = indexed.get(1).map(|&(_, d)| d).unwrap_or(f32::INFINITY);
 
             let ratio = if second_best_dist > 0.0 {
                 best_dist / second_best_dist
@@ -396,8 +406,14 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     Ok(())
 }
 
-/// Parse query fingerprints as f64 (for model classification).
-fn parse_query_fingerprints_f64(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<f64>)>> {
+/// Parse query fingerprints from CSV file.
+///
+/// The CSV should have a header row, with the first column being the read_id (UUID)
+/// and subsequent columns being feature values.
+fn parse_query_fingerprints<T>(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<T>)>>
+where
+    T: std::str::FromStr,
+{
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -414,9 +430,9 @@ fn parse_query_fingerprints_f64(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() >= 2 {
             if let Ok(read_id) = Uuid::parse_str(parts[0]) {
-                let values: Vec<f64> = parts[1..]
+                let values: Vec<T> = parts[1..]
                     .iter()
-                    .filter_map(|s| s.parse::<f64>().ok())
+                    .filter_map(|s| s.parse::<T>().ok())
                     .collect();
                 if !values.is_empty() {
                     fingerprints.push((read_id, values));
@@ -428,36 +444,16 @@ fn parse_query_fingerprints_f64(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec
     Ok(fingerprints)
 }
 
+/// Parse query fingerprints as f64 (for model classification).
+#[inline]
+fn parse_query_fingerprints_f64(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<f64>)>> {
+    parse_query_fingerprints(path)
+}
+
 /// Parse query fingerprints as f32 (for CSV classification).
+#[inline]
 fn parse_query_fingerprints_f32(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<f32>)>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut fingerprints = Vec::new();
-    let mut header_seen = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        if !header_seen {
-            header_seen = true;
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 2 {
-            if let Ok(read_id) = Uuid::parse_str(parts[0]) {
-                let values: Vec<f32> = parts[1..]
-                    .iter()
-                    .filter_map(|s| s.parse::<f32>().ok())
-                    .collect();
-                if !values.is_empty() {
-                    fingerprints.push((read_id, values));
-                }
-            }
-        }
-    }
-
-    Ok(fingerprints)
+    parse_query_fingerprints(path)
 }
 
 /// Write model classification results to CSV.

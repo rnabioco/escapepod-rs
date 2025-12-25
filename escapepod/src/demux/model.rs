@@ -291,12 +291,22 @@ impl WarpDemuxModel {
     ///
     /// The barcode name, or "unknown" if not found.
     pub fn get_barcode_name(&self, label_id: i32) -> String {
-        for (name, &id) in &self.label_map {
-            if id == label_id {
-                return name.clone();
-            }
-        }
-        format!("unknown_{}", label_id)
+        // Build reverse map inline - for frequent lookups, consider caching
+        self.label_map
+            .iter()
+            .find(|(_, &id)| id == label_id)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| format!("unknown_{}", label_id))
+    }
+
+    /// Build a reverse label map (label_id -> barcode_name) for O(1) lookups.
+    ///
+    /// Use this when you need to look up many barcode names.
+    pub fn build_reverse_label_map(&self) -> HashMap<i32, String> {
+        self.label_map
+            .iter()
+            .map(|(name, &id)| (id, name.clone()))
+            .collect()
     }
 
     /// Get the number of training samples.
