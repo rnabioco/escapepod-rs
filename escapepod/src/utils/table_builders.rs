@@ -363,7 +363,7 @@ pub(crate) fn build_reads_table(
 
     // Phase 3: Parallel partition building
     let num_threads = rayon::current_num_threads().max(1);
-    let chunk_size = (reads.len() + num_threads - 1) / num_threads;
+    let chunk_size = reads.len().div_ceil(num_threads);
 
     let partition_arrays: Vec<PartitionArrays> = reads
         .par_chunks(chunk_size)
