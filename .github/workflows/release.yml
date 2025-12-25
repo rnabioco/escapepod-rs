@@ -56,21 +56,21 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p escapepod-cli
+        run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           tar czvf ../../../escapepod-${{ github.ref_name }}-${{ matrix.target }}.tar.gz escapepod
           cd ../../..
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           7z a ../../../escapepod-${{ github.ref_name }}-${{ matrix.target }}.zip escapepod.exe
           cd ../../..
 
