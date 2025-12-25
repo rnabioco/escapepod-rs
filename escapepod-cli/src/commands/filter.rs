@@ -45,12 +45,18 @@ pub fn run(
 
     // Parse end reason filters
     if let Some(reasons) = end_reason {
-        let parsed: HashSet<EndReason> = reasons.iter().map(|s| EndReason::from(s.as_str())).collect();
+        let parsed: HashSet<EndReason> = reasons
+            .iter()
+            .map(|s| EndReason::from(s.as_str()))
+            .collect();
         criteria.include_end_reasons = Some(parsed);
     }
 
     if let Some(reasons) = exclude_end_reason {
-        let parsed: HashSet<EndReason> = reasons.iter().map(|s| EndReason::from(s.as_str())).collect();
+        let parsed: HashSet<EndReason> = reasons
+            .iter()
+            .map(|s| EndReason::from(s.as_str()))
+            .collect();
         criteria.exclude_end_reasons = Some(parsed);
     }
 
