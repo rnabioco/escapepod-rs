@@ -67,6 +67,7 @@ The demux workflow analyzes the raw nanopore signal to detect adapter regions, e
 | [classify](#classify) | Classify reads by barcode using DTW distance |
 | [split](#split) | Split reads into separate POD5 files by barcode |
 | [train](#train) | Train reference fingerprints from known samples |
+| [train-svm](#train-svm) | Train SVM model from fingerprints (requires `train` feature) |
 
 ---
 
@@ -574,6 +575,63 @@ escapepod demux train --assignments known_barcodes.csv -o reference.json
 
 # Use trained reference for classification
 escapepod demux classify fingerprints.csv --reference reference.json -o classifications.csv
+```
+
+---
+
+## train-svm
+
+Train an SVM model from labeled fingerprints for probabilistic barcode classification. This command requires the `train` feature to be enabled.
+
+**Note:** This creates a DTW-SVM model that provides probability outputs for each class, enabling more nuanced confidence thresholds.
+
+### Usage
+
+```bash
+escapepod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-f, --fingerprints <FILE>` | CSV file with fingerprints (read_id, barcode, feat1, feat2, ...) (required) |
+| `-o, --output <FILE>` | Output JSON file for trained SVM model (required) |
+| `--gamma <VALUE>` | RBF kernel gamma parameter (default: 1.0) |
+| `--power <VALUE>` | Power to raise distances before exponential (default: 1.0) |
+| `--c <VALUE>` | SVM regularization parameter C (default: 1.0) |
+| `--window <N>` | DTW window constraint (Sakoe-Chiba band) |
+| `--thresholds <VALUES>` | Per-class confidence thresholds (comma-separated) |
+| `-h, --help` | Print help |
+
+### Input Format
+
+The fingerprints CSV should include barcode labels:
+
+```csv
+read_id,barcode,fp_0,fp_1,fp_2,...,fp_9
+a1b2c3d4-...,BC00,-0.823,1.234,-0.156,...
+b2c3d4e5-...,BC00,-0.712,0.987,-0.234,...
+c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
+```
+
+### Example
+
+```bash
+# Train SVM with default parameters
+escapepod demux train-svm -f fingerprints.csv -o model.json
+
+# Train with custom hyperparameters
+escapepod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --c 10.0 --window 10
+
+# Use trained SVM model for classification (with classify --model-svm)
+escapepod demux classify fingerprints.csv --model-svm model.json -o classifications.csv
+```
+
+### Building with train feature
+
+```bash
+cargo build --release --features train
 ```
 
 ---

@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 let run_info = RunInfoData {
     acquisition_id: "abc123-def456".to_string(),
-    acquisition_start_time_ms: 1705320600000,
+    acquisition_start_time: 1705320600000,  // milliseconds since epoch
     adc_max: 2047,
     adc_min: -2048,
     sample_rate: 4000,

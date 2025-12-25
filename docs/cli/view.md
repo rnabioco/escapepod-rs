@@ -23,6 +23,8 @@ escapepod view [OPTIONS] <INPUT>
 | `--include <FIELDS>` | Comma-separated list of fields to include |
 | `--exclude <FIELDS>` | Comma-separated list of fields to exclude |
 | `--ids` | Only show read IDs |
+| `--separator <SEP>` | Field separator (default: tab) |
+| `--no-header` | Suppress header row output |
 | `-o, --output <FILE>` | Write output to file instead of stdout |
 | `-h, --help` | Print help |
 
@@ -81,4 +83,14 @@ escapepod view experiment.pod5 -o reads.tsv
 
 ```bash
 escapepod view --include read_id,channel,num_samples experiment.pod5
+```
+
+### CSV Output
+
+```bash
+# Use comma separator for CSV format
+escapepod view --separator ',' experiment.pod5 -o reads.csv
+
+# Without header for piping
+escapepod view --ids --no-header experiment.pod5 | head -n 10
 ```
