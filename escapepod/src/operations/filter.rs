@@ -174,9 +174,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     }
 
     if criteria.is_empty() {
-        return Err(Error::InvalidState(
-            "No filter criteria specified".into(),
-        ));
+        return Err(Error::InvalidState("No filter criteria specified".into()));
     }
 
     let num_files = input_files.len();
@@ -487,7 +485,10 @@ fn build_raw_signal_table(
     Ok((output, batches))
 }
 
-/// Read read IDs from a text file (one per line).
+/// Read read IDs from a text file or stdin (one per line).
+///
+/// If `path` is "-" or "stdin" (case-insensitive), reads from stdin.
+/// Otherwise reads from the specified file.
 ///
 /// Supports UUIDs in various formats:
 /// - Standard: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
@@ -496,8 +497,18 @@ fn build_raw_signal_table(
 /// Lines starting with `#` are treated as comments and skipped.
 /// Empty lines are also skipped.
 pub fn read_ids_from_file(path: impl AsRef<Path>) -> Result<HashSet<Uuid>> {
-    let file = File::open(path.as_ref())?;
-    let reader = BufReader::new(file);
+    let path_str = path.as_ref().to_string_lossy();
+
+    if path_str == "-" || path_str.eq_ignore_ascii_case("stdin") {
+        read_ids_from_reader(std::io::stdin().lock())
+    } else {
+        let file = File::open(path.as_ref())?;
+        read_ids_from_reader(BufReader::new(file))
+    }
+}
+
+/// Read read IDs from any `BufRead` source.
+fn read_ids_from_reader<R: BufRead>(reader: R) -> Result<HashSet<Uuid>> {
     let mut ids = HashSet::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
