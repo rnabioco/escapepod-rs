@@ -529,8 +529,195 @@ pub fn read_ids_from_file(path: impl AsRef<Path>) -> Result<HashSet<Uuid>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ReadData;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn make_test_read(num_samples: u64, end_reason: EndReason) -> ReadData {
+        ReadData {
+            read_id: Uuid::new_v4(),
+            num_samples,
+            end_reason,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_filter_criteria_is_empty() {
+        let criteria = FilterCriteria::default();
+        assert!(criteria.is_empty());
+
+        let criteria = FilterCriteria {
+            min_samples: Some(100),
+            ..Default::default()
+        };
+        assert!(!criteria.is_empty());
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_read_ids() {
+        let read = make_test_read(1000, EndReason::SignalPositive);
+        let mut ids = HashSet::new();
+        ids.insert(read.read_id);
+
+        let criteria = FilterCriteria {
+            read_ids: Some(ids),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Different read ID should not match
+        let other_read = make_test_read(1000, EndReason::SignalPositive);
+        assert!(!criteria.matches(&other_read));
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_min_samples() {
+        let read = make_test_read(5000, EndReason::SignalPositive);
+
+        // Read with 5000 samples should match min_samples=4000
+        let criteria = FilterCriteria {
+            min_samples: Some(4000),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Read with 5000 samples should match min_samples=5000 (inclusive)
+        let criteria = FilterCriteria {
+            min_samples: Some(5000),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Read with 5000 samples should not match min_samples=6000
+        let criteria = FilterCriteria {
+            min_samples: Some(6000),
+            ..Default::default()
+        };
+        assert!(!criteria.matches(&read));
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_max_samples() {
+        let read = make_test_read(5000, EndReason::SignalPositive);
+
+        // Read with 5000 samples should match max_samples=6000
+        let criteria = FilterCriteria {
+            max_samples: Some(6000),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Read with 5000 samples should match max_samples=5000 (inclusive)
+        let criteria = FilterCriteria {
+            max_samples: Some(5000),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Read with 5000 samples should not match max_samples=4000
+        let criteria = FilterCriteria {
+            max_samples: Some(4000),
+            ..Default::default()
+        };
+        assert!(!criteria.matches(&read));
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_include_end_reasons() {
+        let read = make_test_read(1000, EndReason::SignalPositive);
+
+        // Should match when end_reason is in the include set
+        let mut include = HashSet::new();
+        include.insert(EndReason::SignalPositive);
+        include.insert(EndReason::SignalNegative);
+        let criteria = FilterCriteria {
+            include_end_reasons: Some(include),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Should not match when end_reason is not in the include set
+        let mut include = HashSet::new();
+        include.insert(EndReason::MuxChange);
+        let criteria = FilterCriteria {
+            include_end_reasons: Some(include),
+            ..Default::default()
+        };
+        assert!(!criteria.matches(&read));
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_exclude_end_reasons() {
+        let read = make_test_read(1000, EndReason::SignalPositive);
+
+        // Should match when end_reason is not in the exclude set
+        let mut exclude = HashSet::new();
+        exclude.insert(EndReason::MuxChange);
+        exclude.insert(EndReason::UnblockMuxChange);
+        let criteria = FilterCriteria {
+            exclude_end_reasons: Some(exclude),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Should not match when end_reason is in the exclude set
+        let mut exclude = HashSet::new();
+        exclude.insert(EndReason::SignalPositive);
+        let criteria = FilterCriteria {
+            exclude_end_reasons: Some(exclude),
+            ..Default::default()
+        };
+        assert!(!criteria.matches(&read));
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_combined() {
+        let read = make_test_read(5000, EndReason::SignalPositive);
+
+        // Should match when all criteria are satisfied
+        let criteria = FilterCriteria {
+            min_samples: Some(4000),
+            max_samples: Some(6000),
+            include_end_reasons: Some([EndReason::SignalPositive].into_iter().collect()),
+            ..Default::default()
+        };
+        assert!(criteria.matches(&read));
+
+        // Should not match when one criterion fails (samples too low)
+        let criteria = FilterCriteria {
+            min_samples: Some(6000),
+            max_samples: Some(10000),
+            include_end_reasons: Some([EndReason::SignalPositive].into_iter().collect()),
+            ..Default::default()
+        };
+        assert!(!criteria.matches(&read));
+
+        // Should not match when one criterion fails (wrong end reason)
+        let criteria = FilterCriteria {
+            min_samples: Some(4000),
+            max_samples: Some(6000),
+            include_end_reasons: Some([EndReason::MuxChange].into_iter().collect()),
+            ..Default::default()
+        };
+        assert!(!criteria.matches(&read));
+    }
+
+    #[test]
+    fn test_filter_criteria_matches_sample_range() {
+        // Test combined min and max samples
+        let criteria = FilterCriteria {
+            min_samples: Some(4000),
+            max_samples: Some(6000),
+            ..Default::default()
+        };
+
+        assert!(!criteria.matches(&make_test_read(3999, EndReason::SignalPositive)));
+        assert!(criteria.matches(&make_test_read(4000, EndReason::SignalPositive)));
+        assert!(criteria.matches(&make_test_read(5000, EndReason::SignalPositive)));
+        assert!(criteria.matches(&make_test_read(6000, EndReason::SignalPositive)));
+        assert!(!criteria.matches(&make_test_read(6001, EndReason::SignalPositive)));
+    }
 
     #[test]
     fn test_read_ids_from_file() {
