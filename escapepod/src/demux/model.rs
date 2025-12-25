@@ -96,6 +96,11 @@ pub struct DtwSvmModel {
     /// Whether the model has a dedicated noise class.
     #[serde(default)]
     pub noise_class: bool,
+
+    /// Whether to use kernel-weighted voting instead of SVM dual coefficients.
+    /// Set to true for models trained with placeholder coefficients.
+    #[serde(default)]
+    pub use_kernel_weighted: bool,
 }
 
 fn default_version() -> String {
@@ -514,6 +519,7 @@ mod tests {
             prob_b: None,
             n_classes: 3,
             noise_class: false,
+            use_kernel_weighted: false,
         }
     }
 

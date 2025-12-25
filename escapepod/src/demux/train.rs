@@ -235,6 +235,7 @@ fn train_binary_svm(
         prob_b: None,
         n_classes,
         noise_class: false,
+        use_kernel_weighted: true, // Use kernel-weighted voting since we can't extract real dual coefficients
     })
 }
 
@@ -328,6 +329,7 @@ fn train_multiclass_svm(
         prob_b: None,
         n_classes,
         noise_class: false,
+        use_kernel_weighted: true, // Use kernel-weighted voting since we can't extract real dual coefficients
     })
 }
 

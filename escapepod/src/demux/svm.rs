@@ -75,9 +75,54 @@ impl<'a> SvmPredictor<'a> {
         Self { model }
     }
 
+    /// Compute class scores using kernel-weighted voting.
+    ///
+    /// For each class, sum the kernel similarities to all training samples of that class.
+    /// This provides a soft voting mechanism where closer samples contribute more.
+    ///
+    /// # Arguments
+    ///
+    /// * `kernel_values` - Kernel values K(query, x_i) for all training samples
+    ///
+    /// # Returns
+    ///
+    /// Score for each class (higher = more similar to that class)
+    pub fn kernel_weighted_scores(&self, kernel_values: &[f64]) -> Vec<f64> {
+        let n_classes = self.model.n_classes;
+        let mut class_scores = vec![0.0; n_classes];
+        let mut class_counts = vec![0usize; n_classes];
+
+        // Map labels to class indices
+        let label_to_class: std::collections::HashMap<i32, usize> = self
+            .model
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(idx, &label)| (label, idx))
+            .collect();
+
+        // Accumulate kernel-weighted votes for each class
+        for (i, &label) in self.model.training_labels.iter().enumerate() {
+            if let Some(&class_idx) = label_to_class.get(&label) {
+                class_scores[class_idx] += kernel_values[i];
+                class_counts[class_idx] += 1;
+            }
+        }
+
+        // Normalize by class size to avoid bias toward larger classes
+        for (score, count) in class_scores.iter_mut().zip(class_counts.iter()) {
+            if *count > 0 {
+                *score /= *count as f64;
+            }
+        }
+
+        class_scores
+    }
+
     /// Compute decision function for a query fingerprint.
     ///
     /// For OvO classification, this computes decision values for each pair of classes.
+    /// Uses kernel-weighted voting if model.use_kernel_weighted is true.
     ///
     /// # Arguments
     ///
@@ -90,6 +135,25 @@ impl<'a> SvmPredictor<'a> {
         let n_classes = self.model.n_classes;
         let n_pairs = n_classes * (n_classes - 1) / 2;
 
+        // Use kernel-weighted voting if specified in model
+        if self.model.use_kernel_weighted {
+            // Use kernel-weighted scores to generate OvO decisions
+            let class_scores = self.kernel_weighted_scores(kernel_values);
+            let mut decisions = vec![0.0; n_pairs];
+            let mut pair_idx = 0;
+
+            for i in 0..n_classes {
+                for j in (i + 1)..n_classes {
+                    // Decision: positive if class i wins, negative if class j wins
+                    decisions[pair_idx] = class_scores[i] - class_scores[j];
+                    pair_idx += 1;
+                }
+            }
+
+            return decisions;
+        }
+
+        // Use real SVM dual coefficients
         let mut decisions = vec![0.0; n_pairs];
         let mut pair_idx = 0;
 
@@ -101,14 +165,7 @@ impl<'a> SvmPredictor<'a> {
                 for (sv_local_idx, &sv_global_idx) in
                     self.model.support_indices.iter().enumerate()
                 {
-                    // dual_coef layout for sklearn SVC OvO:
-                    // Row i contains coefficients for class i vs all higher classes
-                    // For pair (i, j): use row j-1 for coefs of class i's SVs
-                    //                  and row i for coefs of class j's SVs
-
                     let coef = if sv_local_idx < self.model.dual_coef[0].len() {
-                        // Simplified: just use all dual coefficients
-                        // This is a linear combination over all support vectors
                         let row_idx = (i + j - 1) % self.model.dual_coef.len();
                         self.model.dual_coef[row_idx]
                             .get(sv_local_idx)
@@ -370,6 +427,7 @@ mod tests {
             prob_b: None,
             n_classes: 3,
             noise_class: false,
+            use_kernel_weighted: false,
         }
     }
 
@@ -438,5 +496,75 @@ mod tests {
 
         assert_eq!(probs.len(), 3);
         assert!(result.is_confident);
+    }
+
+    #[test]
+    fn test_kernel_weighted_scores() {
+        let model = create_test_model();
+        let predictor = SvmPredictor::new(&model);
+
+        // Kernel values: high for class 0 (index 0), low for others
+        // Training: sample 0 = class 4, sample 1 = class 5, sample 2 = class 6
+        let kernel_values = vec![0.9, 0.1, 0.05];
+        let scores = predictor.kernel_weighted_scores(&kernel_values);
+
+        println!("Kernel values: {:?}", kernel_values);
+        println!("Scores: {:?}", scores);
+        println!("Training labels: {:?}", model.training_labels);
+        println!("Classes: {:?}", model.classes);
+
+        // Class 0 (barcode 4) should have highest score
+        assert!(scores[0] > scores[1], "Class 0 should beat class 1");
+        assert!(scores[0] > scores[2], "Class 0 should beat class 2");
+    }
+
+    #[test]
+    fn test_classify_different_classes() {
+        // Create a model with clear class separation
+        let mut label_mapper = HashMap::new();
+        label_mapper.insert(0, 0);
+        label_mapper.insert(1, 1);
+        label_mapper.insert(2, 2);
+
+        let model = DtwSvmModel {
+            version: "1.0".to_string(),
+            training_fingerprints: vec![
+                vec![0.1, 0.1, 0.1],  // Class 0
+                vec![0.9, 0.9, 0.9],  // Class 1
+                vec![0.5, 0.5, 0.5],  // Class 2
+            ],
+            training_labels: vec![0, 1, 2],
+            support_indices: vec![0, 1, 2],
+            dual_coef: vec![vec![0.333, 0.333, 0.333], vec![0.333, 0.333, 0.333]],
+            intercept: vec![0.0, 0.0, 0.0],
+            classes: vec![0, 1, 2],
+            kernel_params: KernelParams::default(),
+            window: None,
+            label_mapper,
+            thresholds: None,
+            prob_a: None,
+            prob_b: None,
+            n_classes: 3,
+            noise_class: false,
+            use_kernel_weighted: true, // Use kernel-weighted voting
+        };
+
+        // Query close to class 0
+        let query0 = vec![0.12, 0.12, 0.12];
+        let (probs0, result0) = classify_with_svm(&model, &query0);
+        println!("Query near class 0: probs={:?}, predicted={}", probs0, result0.predicted_barcode);
+        assert_eq!(result0.predicted_barcode, 0, "Should predict class 0");
+
+        // Query close to class 1
+        let query1 = vec![0.88, 0.88, 0.88];
+        let (probs1, result1) = classify_with_svm(&model, &query1);
+        println!("Query near class 1: probs={:?}, predicted={}", probs1, result1.predicted_barcode);
+        assert_eq!(result1.predicted_barcode, 1, "Should predict class 1");
+
+        // Query close to class 2
+        let query2 = vec![0.52, 0.52, 0.52];
+        let (probs2, result2) = classify_with_svm(&model, &query2);
+        println!("Query near class 2: probs={:?}, predicted={}", probs2, result2.predicted_barcode);
+        assert_eq!(result2.predicted_barcode, 2, "Should predict class 2");
     }
 }
