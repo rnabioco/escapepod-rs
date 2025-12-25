@@ -127,6 +127,7 @@ Examples:
   escapepod filter input.pod5 --min-samples 4000 -o long_reads.pod5
   escapepod filter input.pod5 --exclude-end-reason unblock_mux_change -o no_rejects.pod5
   escapepod filter input.pod5 --end-reason signal_positive,signal_negative -o normal.pod5
+  cat ids.txt | escapepod filter input.pod5 -i - -o filtered.pod5
 
 At least one filter criterion must be specified.
 ")]
@@ -134,7 +135,7 @@ At least one filter criterion must be specified.
         /// Input POD5 file or directory
         input: PathBuf,
 
-        /// File containing read IDs (one per line)
+        /// File containing read IDs (one per line), or '-'/'stdin' to read from stdin
         #[arg(short, long, value_name = "FILE")]
         ids: Option<PathBuf>,
 
