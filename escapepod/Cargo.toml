@@ -23,4 +23,12 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
 
+# Training dependencies (optional)
+linfa = { version = "0.8", optional = true }
+linfa-svm = { version = "0.8", optional = true }
+
+[features]
+default = []
+train = ["linfa", "linfa-svm"]
+
 [dev-dependencies]

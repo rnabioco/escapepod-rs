@@ -1,22 +1,28 @@
 //! Barcode demultiplexing using WarpDemuX-style models.
 //!
 //! This module provides support for loading and using trained WarpDemuX models
-//! to classify nanopore reads by barcode. The workflow includes:
+//! to classify nanopore reads by barcode.
 //!
-//! 1. Load a trained model from JSON (exported using `export_warpdemux_model.py`)
+//! ## Model Types
+//!
+//! Two model types are supported:
+//!
+//! - **WarpDemuxModel**: Legacy distance-based nearest-neighbor classifier
+//! - **DtwSvmModel**: Full SVM classifier with probability output
+//!
+//! ## Workflow
+//!
+//! 1. Load a trained model from JSON
 //! 2. Extract fingerprints from reads (using DTW fingerprinting)
-//! 3. Classify reads using DTW distance + RBF kernel similarity
+//! 3. Classify reads and get probability distributions
 //!
-//! # Example
+//! ## Example (Legacy Model)
 //!
 //! ```no_run
 //! use escapepod::demux::{load_model, classify_read};
 //! use std::path::Path;
 //!
-//! // Load the model
 //! let model = load_model(Path::new("model.json"))?;
-//!
-//! // Classify a fingerprint
 //! let fingerprint = vec![0.1, 0.2, 0.3, 0.4, 0.5];
 //! let result = classify_read(&model, &fingerprint);
 //!
@@ -24,9 +30,44 @@
 //! println!("Confidence: {:.3}", result.confidence);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! ## Example (SVM Model with Probabilities)
+//!
+//! ```no_run
+//! use escapepod::demux::{load_svm_model, classify_with_svm};
+//! use std::path::Path;
+//!
+//! let model = load_svm_model(Path::new("svm_model.json"))?;
+//! let fingerprint = vec![0.1, 0.2, 0.3, 0.4, 0.5];
+//! let (probs, result) = classify_with_svm(&model, &fingerprint);
+//!
+//! println!("Barcode: {}", result.predicted_barcode);
+//! println!("Confidence: {:.3}", result.confidence);
+//! println!("Probabilities: {:?}", probs);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 mod classify;
 mod model;
+mod probability;
+mod svm;
 
+// Training module (feature-gated)
+#[cfg(feature = "train")]
+mod train;
+
+// Legacy exports (distance-based classifier)
 pub use classify::{classify_read, ClassificationResult};
 pub use model::{load_model, KernelParams, WarpDemuxModel};
+
+// New SVM exports
+pub use model::{load_svm_model, DtwSvmModel};
+pub use probability::{
+    confidence_margin, format_probability_columns, process_probabilities, softmax,
+    ProbabilityResult,
+};
+pub use svm::{classify_with_svm, compute_distances, distances_to_kernel, SvmModel, SvmPredictor};
+
+// Training exports (feature-gated)
+#[cfg(feature = "train")]
+pub use train::*;

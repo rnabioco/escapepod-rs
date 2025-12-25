@@ -33,3 +33,7 @@ tabled = { version = "0.20", features = ["ansi"] }
 tempfile = "3"
 uuid = { workspace = true }
 walkdir = "2"
+
+[features]
+default = []
+train = ["escapepod/train"]
