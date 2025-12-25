@@ -16,10 +16,10 @@ The file is memory-mapped for efficient access. The reader validates the file si
 
 ```rust
 // Number of reads in the file
-let count = reader.read_count();
+let count = reader.read_count()?;
 
 // Number of batches (internal structure)
-let batches = reader.batch_count();
+let batches = reader.read_batch_count()?;
 
 // Access run info
 for (i, run_info) in reader.run_infos().iter().enumerate() {
@@ -31,7 +31,7 @@ for (i, run_info) in reader.run_infos().iter().enumerate() {
 
 ```rust
 // Iterate over all reads
-for read in reader.reads() {
+for read in reader.reads()? {
     println!("Read: {}", read.read_id);
     println!("  Channel: {}", read.channel);
     println!("  Samples: {}", read.num_samples);
@@ -68,16 +68,29 @@ let pa_signal = to_picoamps(&signal, read.calibration_offset, read.calibration_s
 
 ## Finding Specific Reads
 
-Find reads by their UUIDs:
+Filter reads by their UUIDs:
 
 ```rust
 use uuid::Uuid;
+use std::collections::HashSet;
 
-let target_ids = vec![
+let target_ids: HashSet<Uuid> = [
     Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890")?,
-];
+].into_iter().collect();
 
-let found_reads = reader.find_reads(&target_ids)?;
+// Filter reads while iterating
+for read in reader.reads()? {
+    if target_ids.contains(&read.read_id) {
+        println!("Found: {}", read.read_id);
+    }
+}
+```
+
+Get all read IDs in the file:
+
+```rust
+let all_ids = reader.read_ids()?;
+println!("File contains {} reads", all_ids.len());
 ```
 
 ## Batch Access
@@ -85,7 +98,7 @@ let found_reads = reader.find_reads(&target_ids)?;
 For advanced use cases, access raw Arrow batches:
 
 ```rust
-for batch_idx in 0..reader.batch_count() {
+for batch_idx in 0..reader.read_batch_count()? {
     let batch = reader.read_batch(batch_idx)?;
     println!("Batch {} has {} rows", batch_idx, batch.num_rows());
 }

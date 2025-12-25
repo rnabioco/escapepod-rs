@@ -50,6 +50,9 @@ pub struct ReadData {
     /// Total number of signal samples
     pub num_samples: u64,
 
+    /// Estimated open pore current level
+    pub open_pore_level: f32,
+
     /// Signal row indices (internal use)
     pub signal_rows: Vec<u64>,
 }
@@ -73,7 +76,7 @@ pub struct RunInfoData {
     pub acquisition_id: String,
 
     /// Start time in milliseconds since epoch
-    pub acquisition_start_time_ms: i64,
+    pub acquisition_start_time: i64,
 
     /// Maximum ADC value
     pub adc_max: i16,
@@ -81,13 +84,52 @@ pub struct RunInfoData {
     /// Minimum ADC value
     pub adc_min: i16,
 
-    /// Sampling rate in Hz
-    pub sample_rate: u16,
-
     /// Context tags (key-value metadata)
     pub context_tags: HashMap<String, String>,
 
-    /// Tracking ID metadata
+    /// Experiment name
+    pub experiment_name: String,
+
+    /// Flow cell ID
+    pub flow_cell_id: String,
+
+    /// Flow cell product code
+    pub flow_cell_product_code: String,
+
+    /// Protocol name
+    pub protocol_name: String,
+
+    /// Protocol run ID
+    pub protocol_run_id: String,
+
+    /// Protocol start time in milliseconds since epoch
+    pub protocol_start_time: i64,
+
+    /// Sample ID
+    pub sample_id: String,
+
+    /// Sampling rate in Hz
+    pub sample_rate: u16,
+
+    /// Sequencing kit name
+    pub sequencing_kit: String,
+
+    /// Sequencer position identifier
+    pub sequencer_position: String,
+
+    /// Sequencer position type
+    pub sequencer_position_type: String,
+
+    /// Software that produced the data
+    pub software: String,
+
+    /// System name
+    pub system_name: String,
+
+    /// System type
+    pub system_type: String,
+
+    /// Tracking ID metadata (key-value pairs)
     pub tracking_id: HashMap<String, String>,
 }
 ```

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.85 or later
 - Cargo (comes with Rust)
 
 ## Installing the CLI

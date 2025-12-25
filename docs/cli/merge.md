@@ -21,6 +21,8 @@ escapepod merge -o <OUTPUT> <INPUT>...
 | Option | Description |
 |--------|-------------|
 | `-o, --output <FILE>` | Output file path (required) |
+| `-t, --threads <N>` | Number of threads for parallel processing |
+| `--profile` | Enable profiling output with timing and throughput |
 | `-h, --help` | Print help |
 
 ## Description

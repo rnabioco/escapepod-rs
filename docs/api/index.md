@@ -74,7 +74,7 @@ let writer = Writer::create("output.pod5", WriterOptions::default())?;
 ### Read Iteration
 
 ```rust
-for read in reader.reads() {
+for read in reader.reads()? {
     println!("{}: {} samples", read.read_id, read.num_samples);
 }
 ```
@@ -115,7 +115,11 @@ match result {
 
 ## Feature Flags
 
-Currently no optional features. All functionality is included by default.
+| Feature | Description |
+|---------|-------------|
+| `train` | Enables SVM model training with `linfa` and `linfa-svm` |
+
+Core functionality is included by default. Use `--features train` to enable model training capabilities.
 
 ## Dependencies
 
@@ -139,4 +143,4 @@ Currently no optional features. All functionality is included by default.
 
 ## Minimum Supported Rust Version
 
-Rust 1.75 or later is required.
+Rust 1.85 or later is required.
