@@ -140,7 +140,12 @@ pub fn run(
                 MergePhase::WritingReads => "Writing reads table",
             };
             let pct = (duration.as_secs_f64() / total_elapsed.as_secs_f64()) * 100.0;
-            eprintln!("  {:<30} {:>8.2}s ({:>5.1}%)", phase_name, duration.as_secs_f64(), pct);
+            eprintln!(
+                "  {:<30} {:>8.2}s ({:>5.1}%)",
+                phase_name,
+                duration.as_secs_f64(),
+                pct
+            );
         }
         eprintln!("  {:<30} {:>8.2}s", "Total", total_elapsed.as_secs_f64());
 

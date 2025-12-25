@@ -243,7 +243,10 @@ fn build_partition(
         well_builder.append_value(read.well);
 
         // Use pre-computed dictionary key indices
-        let pore_key = pore_type_map.get(read.pore_type.as_str()).copied().unwrap_or(0);
+        let pore_key = pore_type_map
+            .get(read.pore_type.as_str())
+            .copied()
+            .unwrap_or(0);
         pore_type_keys_builder.append_value(pore_key);
 
         calibration_offset_builder.append_value(read.calibration_offset);
@@ -252,7 +255,10 @@ fn build_partition(
         start_builder.append_value(read.start_sample);
         median_before_builder.append_value(read.median_before);
 
-        let end_key = end_reason_map.get(read.end_reason.as_str()).copied().unwrap_or(0);
+        let end_key = end_reason_map
+            .get(read.end_reason.as_str())
+            .copied()
+            .unwrap_or(0);
         end_reason_keys_builder.append_value(end_key);
 
         end_reason_forced_builder.append_value(read.end_reason_forced);
@@ -333,7 +339,10 @@ pub(crate) fn build_reads_table(
 
     let pore_types: Vec<&str> = pore_type_set.into_iter().collect();
     let end_reasons: Vec<&str> = end_reason_set.into_iter().collect();
-    let run_info_ids: Vec<&str> = run_infos.iter().map(|ri| ri.acquisition_id.as_str()).collect();
+    let run_info_ids: Vec<&str> = run_infos
+        .iter()
+        .map(|ri| ri.acquisition_id.as_str())
+        .collect();
 
     // Phase 2: Create O(1) lookup maps for dictionary keys
     let pore_type_map: HashMap<&str, i16> = pore_types
@@ -358,7 +367,15 @@ pub(crate) fn build_reads_table(
 
     let partition_arrays: Vec<PartitionArrays> = reads
         .par_chunks(chunk_size)
-        .map(|chunk| build_partition(chunk, &pore_type_map, &end_reason_map, &run_info_map, run_infos))
+        .map(|chunk| {
+            build_partition(
+                chunk,
+                &pore_type_map,
+                &end_reason_map,
+                &run_info_map,
+                run_infos,
+            )
+        })
         .collect();
 
     // Phase 4: Concatenate partition arrays and create DictionaryArrays
@@ -406,8 +423,10 @@ pub(crate) fn build_reads_table(
         .unwrap()
         .clone();
     let pore_type_dict = StringArray::from_iter_values(pore_types.iter().copied());
-    let pore_type_array: ArrayRef =
-        Arc::new(DictionaryArray::new(pore_type_keys, Arc::new(pore_type_dict)));
+    let pore_type_array: ArrayRef = Arc::new(DictionaryArray::new(
+        pore_type_keys,
+        Arc::new(pore_type_dict),
+    ));
 
     let end_reason_keys_refs: Vec<&dyn Array> = partition_arrays
         .iter()
@@ -419,8 +438,10 @@ pub(crate) fn build_reads_table(
         .unwrap()
         .clone();
     let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().copied());
-    let end_reason_array: ArrayRef =
-        Arc::new(DictionaryArray::new(end_reason_keys, Arc::new(end_reason_dict)));
+    let end_reason_array: ArrayRef = Arc::new(DictionaryArray::new(
+        end_reason_keys,
+        Arc::new(end_reason_dict),
+    ));
 
     let run_info_keys_refs: Vec<&dyn Array> = partition_arrays
         .iter()
