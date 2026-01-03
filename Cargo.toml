@@ -30,6 +30,14 @@ uuid = { version = "1", features = ["v4"] }
 # Compression
 zstd = "0.13"
 
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+# Enable frame pointers for accurate call stacks
+[profile.profiling.build-override]
+debug = true
+
 [profile.dist]
 inherits = "release"
 lto = true
