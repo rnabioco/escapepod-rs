@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "escapepod"
+name = "escpod"
 path = "src/main.rs"
 
 [dependencies]
