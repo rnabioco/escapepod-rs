@@ -37,3 +37,4 @@ walkdir = "2"
 [features]
 default = []
 train = ["escapepod/train"]
+catboost = ["escapepod/catboost"]

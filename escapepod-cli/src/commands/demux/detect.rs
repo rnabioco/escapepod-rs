@@ -2,15 +2,18 @@
 
 use super::types::ReadBoundaries;
 use super::utils::{
-    collect_reads_with_signals, configure_thread_pool, downscale_signal, normalize_signal,
+    collect_read_metadata, configure_thread_pool, downscale_signal, normalize_signal, open_readers,
+    ReadMetadata,
 };
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod::segmentation::detect_adapter;
+use escapepod::Reader;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Arguments for the detect subcommand.
 #[derive(Debug, clap::Args)]
@@ -67,55 +70,26 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
     // Set thread pool size
     configure_thread_pool(args.threads);
 
-    // Collect all reads with their signals
-    let all_reads = collect_reads_with_signals(&args.input)?;
+    // Open all POD5 files - Arc-wrapped for parallel access
+    let readers = open_readers(&args.input)?;
+
+    // Collect read metadata (fast - no signal decompression)
+    let read_metadata = collect_read_metadata(&readers)?;
 
     println!(
         "{} {} reads to process",
         style::label("Found:"),
-        style::count(all_reads.len())
+        style::count(read_metadata.len())
     );
 
-    let progress_bar = create_progress_bar(all_reads.len() as u64, "Detecting")?;
+    let progress_bar = create_progress_bar(read_metadata.len() as u64, "Detecting")?;
 
-    // Process reads in parallel
+    // Process reads in parallel - signal decompression is now parallelized
     let downscale = args.downscale.max(1); // Ensure at least 1
-    let results: Vec<ReadBoundaries> = all_reads
+    let results: Vec<ReadBoundaries> = read_metadata
         .par_iter()
-        .map(|(read_id, num_samples, signal)| {
-            // Normalize signal
-            let normalized = normalize_signal(signal);
-
-            // Optionally downscale signal
-            let (processed_signal, scale_factor) = if downscale > 1 {
-                (downscale_signal(&normalized, downscale), downscale)
-            } else {
-                (normalized, 1)
-            };
-
-            // Scale parameters for downscaled signal
-            let scaled_min_adapter = args.min_adapter / scale_factor;
-            let scaled_border_trim = args.border_trim / scale_factor;
-
-            // Detect adapter using LLR
-            let (adapter_start, adapter_end) = detect_adapter(
-                &processed_signal,
-                scaled_min_adapter.max(1),
-                scaled_border_trim.max(1),
-            );
-
-            // Scale results back to original resolution
-            let adapter_start = adapter_start * scale_factor;
-            let adapter_end = adapter_end * scale_factor;
-
-            progress_bar.inc(1);
-
-            ReadBoundaries {
-                read_id: *read_id,
-                num_samples: *num_samples,
-                adapter_start,
-                adapter_end,
-            }
+        .filter_map(|meta| {
+            process_read(&readers, meta, downscale, &args, &progress_bar)
         })
         .collect();
 
@@ -156,4 +130,59 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Process a single read: decompress signal, normalize, detect adapter.
+fn process_read(
+    readers: &[Arc<Reader>],
+    meta: &ReadMetadata,
+    downscale: usize,
+    args: &DetectArgs,
+    progress_bar: &indicatif::ProgressBar,
+) -> Option<ReadBoundaries> {
+    // Get the reader for this file
+    let reader = &readers[meta.file_index];
+
+    // Decompress signal (this is the expensive operation, now parallelized)
+    let signal = match reader.get_signal(&meta.signal_rows) {
+        Ok(s) => s,
+        Err(_) => {
+            progress_bar.inc(1);
+            return None;
+        }
+    };
+
+    // Normalize signal
+    let normalized = normalize_signal(&signal);
+
+    // Optionally downscale signal
+    let (processed_signal, scale_factor) = if downscale > 1 {
+        (downscale_signal(&normalized, downscale), downscale)
+    } else {
+        (normalized, 1)
+    };
+
+    // Scale parameters for downscaled signal
+    let scaled_min_adapter = args.min_adapter / scale_factor;
+    let scaled_border_trim = args.border_trim / scale_factor;
+
+    // Detect adapter using LLR
+    let (adapter_start, adapter_end) = detect_adapter(
+        &processed_signal,
+        scaled_min_adapter.max(1),
+        scaled_border_trim.max(1),
+    );
+
+    // Scale results back to original resolution
+    let adapter_start = adapter_start * scale_factor;
+    let adapter_end = adapter_end * scale_factor;
+
+    progress_bar.inc(1);
+
+    Some(ReadBoundaries {
+        read_id: meta.read_id,
+        num_samples: meta.num_samples,
+        adapter_start,
+        adapter_end,
+    })
 }

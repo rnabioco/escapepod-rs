@@ -27,8 +27,12 @@ zstd = { workspace = true }
 linfa = { version = "0.8", optional = true }
 linfa-svm = { version = "0.8", optional = true }
 
+# CatBoost inference (optional)
+catboost-rust = { version = "0.3", optional = true }
+
 [features]
 default = []
 train = ["linfa", "linfa-svm"]
+catboost = ["catboost-rust"]
 
 [dev-dependencies]

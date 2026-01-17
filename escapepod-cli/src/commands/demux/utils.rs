@@ -8,7 +8,24 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Metadata for a read, used for parallel processing without loading signals.
+///
+/// This allows collecting read information first (fast), then processing
+/// signals in parallel (where decompression is the bottleneck).
+#[derive(Debug, Clone)]
+pub struct ReadMetadata {
+    /// Unique read identifier.
+    pub read_id: Uuid,
+    /// Total number of samples in the signal.
+    pub num_samples: u64,
+    /// Signal row indices for fetching signal data.
+    pub signal_rows: Vec<u64>,
+    /// Index of the source file in the readers array.
+    pub file_index: usize,
+}
 
 /// Parse a normalization method string into a NormMethod enum.
 ///
@@ -34,6 +51,43 @@ pub fn configure_thread_pool(num_threads: usize) {
         .num_threads(num_threads)
         .build_global()
         .ok();
+}
+
+/// Open multiple POD5 files and return Arc-wrapped readers.
+///
+/// The readers are wrapped in Arc to allow safe parallel access during
+/// signal decompression.
+pub fn open_readers(input_files: &[PathBuf]) -> anyhow::Result<Vec<Arc<Reader>>> {
+    input_files
+        .iter()
+        .map(|path| Ok(Arc::new(Reader::open(path)?)))
+        .collect()
+}
+
+/// Collect read metadata from opened readers without decompressing signals.
+///
+/// This is the first step in parallel processing: quickly gather metadata,
+/// then decompress signals in parallel (which is the actual bottleneck).
+pub fn collect_read_metadata(readers: &[Arc<Reader>]) -> anyhow::Result<Vec<ReadMetadata>> {
+    let mut all_reads = Vec::new();
+
+    for (file_index, reader) in readers.iter().enumerate() {
+        if let Ok(reads) = reader.reads() {
+            for read_result in reads {
+                let read = read_result?;
+                if !read.signal_rows.is_empty() {
+                    all_reads.push(ReadMetadata {
+                        read_id: read.read_id,
+                        num_samples: read.num_samples,
+                        signal_rows: read.signal_rows.clone(),
+                        file_index,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(all_reads)
 }
 
 /// Parse a boundaries CSV file into a map of read_id -> ReadBoundaries.
@@ -106,31 +160,6 @@ pub fn parse_reference_csv(path: &PathBuf) -> anyhow::Result<Vec<BarcodeFingerpr
     }
 
     Ok(fingerprints)
-}
-
-/// Collect reads with signal data from POD5 files.
-///
-/// Returns a vector of (read_id, num_samples, signal) tuples.
-pub fn collect_reads_with_signals(
-    input_files: &[PathBuf],
-) -> anyhow::Result<Vec<(Uuid, u64, Vec<i16>)>> {
-    let mut all_reads = Vec::new();
-
-    for path in input_files {
-        let reader = Reader::open(path)?;
-        if let Ok(reads) = reader.reads() {
-            for read_result in reads {
-                let read = read_result?;
-                if !read.signal_rows.is_empty() {
-                    if let Ok(signal) = reader.get_signal(&read.signal_rows) {
-                        all_reads.push((read.read_id, read.num_samples, signal));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(all_reads)
 }
 
 /// Process raw signal for adapter detection.

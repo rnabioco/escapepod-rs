@@ -47,11 +47,16 @@
 //! }
 //! ```
 
+pub mod consensus;
 pub mod llr;
 pub mod normalize;
 pub mod ttest;
 
 // Re-export main types and functions for convenience
+pub use consensus::{
+    segment_with_consensus, ConsensusConfig, ConsensusSegmentationResult,
+    CONSENSUS_RNA004_130BPS_V1_0,
+};
 pub use llr::{detect_adapter, LlrTrace};
 pub use normalize::{
     downscale, mad_normalize, mad_normalize_with_clipping, normalize_dwell_times,

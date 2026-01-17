@@ -52,6 +52,10 @@ mod model;
 mod probability;
 mod svm;
 
+// CatBoost module (feature-gated)
+#[cfg(feature = "catboost")]
+mod catboost;
+
 // Training module (feature-gated)
 #[cfg(feature = "train")]
 mod train;
@@ -67,6 +71,10 @@ pub use probability::{
     ProbabilityResult,
 };
 pub use svm::{classify_with_svm, compute_distances, distances_to_kernel, SvmModel, SvmPredictor};
+
+// CatBoost exports (feature-gated)
+#[cfg(feature = "catboost")]
+pub use catboost::{CatBoostClassifier, CatBoostMeta, CatBoostResult};
 
 // Training exports (feature-gated)
 #[cfg(feature = "train")]

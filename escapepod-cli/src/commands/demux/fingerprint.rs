@@ -1,16 +1,24 @@
 //! Fingerprint subcommand - extract signal features from adapter regions.
 
-use super::types::ReadFingerprint;
+use super::types::{ReadBoundaries, ReadFingerprint};
 use super::utils::{
-    configure_thread_pool, extract_fingerprint_from_signal, parse_boundaries_csv, parse_norm_method,
+    collect_read_metadata, configure_thread_pool, extract_fingerprint_from_signal, open_readers,
+    parse_boundaries_csv, parse_norm_method, ReadMetadata,
 };
 use crate::progress::create_progress_bar;
 use crate::style;
+use escapepod::dtw::NormMethod;
+use escapepod::segmentation::{
+    mad_normalize_with_clipping, segment_with_consensus, ConsensusConfig,
+    CONSENSUS_RNA004_130BPS_V1_0,
+};
 use escapepod::Reader;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Arguments for the fingerprint subcommand.
@@ -48,6 +56,13 @@ pub struct FingerprintArgs {
     #[arg(long, default_value = "zscore", value_name = "METHOD")]
     pub normalize: String,
 
+    /// Use consensus-guided segmentation (WarpDemuX-compatible)
+    ///
+    /// This uses DTW alignment to find the barcode region within the adapter,
+    /// matching WarpDemuX's fingerprint extraction algorithm.
+    #[arg(long)]
+    pub consensus: bool,
+
     /// Number of threads for parallel processing
     #[arg(short = 'j', long, default_value = "4", value_name = "N")]
     pub threads: usize,
@@ -71,6 +86,12 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
         style::label("Output:"),
         style::path(args.output.display())
     );
+    if args.consensus {
+        println!(
+            "{} consensus-guided (WarpDemuX-compatible)",
+            style::label("Mode:")
+        );
+    }
 
     // Parse normalization method
     let norm_method = parse_norm_method(&args.normalize)?;
@@ -87,29 +108,17 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
         style::count(boundaries_map.len())
     );
 
-    // Collect reads that have boundaries
-    let mut reads_to_process: Vec<(Uuid, usize, usize, Vec<i16>)> = Vec::new();
+    // Open all POD5 files - Arc-wrapped for parallel access
+    let readers = open_readers(&args.input)?;
 
-    for path in &args.input {
-        let reader = Reader::open(path)?;
-        if let Ok(reads) = reader.reads() {
-            for read_result in reads {
-                let read = read_result?;
-                if let Some(boundaries) = boundaries_map.get(&read.read_id) {
-                    if !read.signal_rows.is_empty() {
-                        if let Ok(signal) = reader.get_signal(&read.signal_rows) {
-                            reads_to_process.push((
-                                read.read_id,
-                                boundaries.adapter_start,
-                                boundaries.adapter_end,
-                                signal,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Collect read metadata (fast - no signal decompression)
+    let all_metadata = collect_read_metadata(&readers)?;
+
+    // Filter to only reads with boundaries
+    let reads_to_process: Vec<_> = all_metadata
+        .into_iter()
+        .filter(|meta| boundaries_map.contains_key(&meta.read_id))
+        .collect();
 
     println!(
         "{} {} reads to fingerprint",
@@ -119,33 +128,38 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
 
     let progress_bar = create_progress_bar(reads_to_process.len() as u64, "Fingerprinting")?;
 
-    // Process reads in parallel
-    let fingerprints: Vec<ReadFingerprint> = reads_to_process
-        .par_iter()
-        .filter_map(|(read_id, adapter_start, adapter_end, signal)| {
-            // Compute the region within the adapter for fingerprinting
-            let region_start = adapter_start + args.segment_start;
-            let region_end = (adapter_start + args.segment_end).min(*adapter_end);
-
-            if region_end <= region_start {
-                progress_bar.inc(1);
-                return None;
-            }
-
-            let result = extract_fingerprint_from_signal(
-                signal,
-                region_start,
-                region_end,
-                args.num_segments,
-                args.window_width,
-                norm_method,
-                *read_id,
-            );
-
-            progress_bar.inc(1);
-            result
-        })
-        .collect();
+    // Process reads in parallel - signal decompression is now parallelized
+    let fingerprints: Vec<ReadFingerprint> = if args.consensus {
+        // Consensus-guided segmentation (WarpDemuX-compatible)
+        let consensus_config = ConsensusConfig::default();
+        reads_to_process
+            .par_iter()
+            .filter_map(|meta| {
+                process_fingerprint_consensus(
+                    &readers,
+                    meta,
+                    &boundaries_map,
+                    &consensus_config,
+                    &progress_bar,
+                )
+            })
+            .collect()
+    } else {
+        // Original t-test based segmentation
+        reads_to_process
+            .par_iter()
+            .filter_map(|meta| {
+                process_fingerprint(
+                    &readers,
+                    meta,
+                    &boundaries_map,
+                    &args,
+                    norm_method,
+                    &progress_bar,
+                )
+            })
+            .collect()
+    };
 
     progress_bar.finish_with_message("complete");
 
@@ -187,4 +201,99 @@ fn write_fingerprints_csv(path: &PathBuf, fingerprints: &[ReadFingerprint]) -> a
 
     writer.flush()?;
     Ok(())
+}
+
+/// Process a single read: decompress signal, extract fingerprint.
+fn process_fingerprint(
+    readers: &[Arc<Reader>],
+    meta: &ReadMetadata,
+    boundaries_map: &HashMap<Uuid, ReadBoundaries>,
+    args: &FingerprintArgs,
+    norm_method: NormMethod,
+    progress_bar: &indicatif::ProgressBar,
+) -> Option<ReadFingerprint> {
+    // Get boundaries for this read
+    let boundaries = boundaries_map.get(&meta.read_id)?;
+
+    // Get the reader for this file
+    let reader = &readers[meta.file_index];
+
+    // Decompress signal (this is the expensive operation, now parallelized)
+    let signal = match reader.get_signal(&meta.signal_rows) {
+        Ok(s) => s,
+        Err(_) => {
+            progress_bar.inc(1);
+            return None;
+        }
+    };
+
+    // Compute the region within the adapter for fingerprinting
+    let region_start = boundaries.adapter_start + args.segment_start;
+    let region_end = (boundaries.adapter_start + args.segment_end).min(boundaries.adapter_end);
+
+    if region_end <= region_start {
+        progress_bar.inc(1);
+        return None;
+    }
+
+    let result = extract_fingerprint_from_signal(
+        &signal,
+        region_start,
+        region_end,
+        args.num_segments,
+        args.window_width,
+        norm_method,
+        meta.read_id,
+    );
+
+    progress_bar.inc(1);
+    result
+}
+
+/// Process a single read using consensus-guided segmentation.
+fn process_fingerprint_consensus(
+    readers: &[Arc<Reader>],
+    meta: &ReadMetadata,
+    boundaries_map: &HashMap<Uuid, ReadBoundaries>,
+    config: &ConsensusConfig,
+    progress_bar: &indicatif::ProgressBar,
+) -> Option<ReadFingerprint> {
+    // Get boundaries for this read
+    let boundaries = boundaries_map.get(&meta.read_id)?;
+
+    // Get the reader for this file
+    let reader = &readers[meta.file_index];
+
+    // Decompress signal
+    let signal = match reader.get_signal(&meta.signal_rows) {
+        Ok(s) => s,
+        Err(_) => {
+            progress_bar.inc(1);
+            return None;
+        }
+    };
+
+    // Extract adapter region
+    if boundaries.adapter_end <= boundaries.adapter_start {
+        progress_bar.inc(1);
+        return None;
+    }
+
+    let adapter_signal: Vec<f32> = signal[boundaries.adapter_start..boundaries.adapter_end]
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+
+    // Normalize signal (MAD normalization with clipping, matching WarpDemuX)
+    let normalized = mad_normalize_with_clipping(&adapter_signal, 5.0);
+
+    // Apply consensus-guided segmentation
+    let result = segment_with_consensus(&normalized, &CONSENSUS_RNA004_130BPS_V1_0, config);
+
+    progress_bar.inc(1);
+
+    result.map(|seg| ReadFingerprint {
+        read_id: meta.read_id,
+        values: seg.fingerprint.into_iter().map(|x| x as f64).collect(),
+    })
 }

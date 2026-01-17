@@ -1,4 +1,4 @@
-//! Classify subcommand - barcode classification using DTW distance.
+//! Classify subcommand - barcode classification using DTW distance or CatBoost.
 
 use super::utils::parse_reference_csv;
 use crate::style;
@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+#[cfg(feature = "catboost")]
+use escapepod::demux::{CatBoostClassifier, CatBoostResult};
 
 /// Arguments for the classify subcommand.
 #[derive(Debug, clap::Args)]
@@ -28,6 +31,16 @@ pub struct ClassifyArgs {
     /// Trained SVM model (JSON format, with probabilities)
     #[arg(long, value_name = "FILE")]
     pub svm_model: Option<PathBuf>,
+
+    /// CatBoost model file (.cbm format, from WarpDemuX Fpt_Boost)
+    #[cfg(feature = "catboost")]
+    #[arg(long, value_name = "FILE")]
+    pub catboost_model: Option<PathBuf>,
+
+    /// CatBoost metadata file (JSON with label_mapper and thresholds)
+    #[cfg(feature = "catboost")]
+    #[arg(long, value_name = "FILE")]
+    pub catboost_meta: Option<PathBuf>,
 
     /// Output classifications file
     #[arg(short, long, required = true, value_name = "FILE")]
@@ -68,7 +81,8 @@ struct SvmClassifyResult {
 /// Run the classify subcommand.
 pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     // Count how many input sources are provided
-    let source_count = [
+    #[allow(unused_mut)]
+    let mut source_count = [
         args.reference.is_some(),
         args.model.is_some(),
         args.svm_model.is_some(),
@@ -77,15 +91,40 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     .filter(|&&x| x)
     .count();
 
+    #[cfg(feature = "catboost")]
+    {
+        if args.catboost_model.is_some() {
+            source_count += 1;
+        }
+    }
+
     if source_count == 0 {
+        #[cfg(feature = "catboost")]
+        anyhow::bail!(
+            "One of --reference, --model, --svm-model, or --catboost-model must be provided"
+        );
+        #[cfg(not(feature = "catboost"))]
         anyhow::bail!("One of --reference, --model, or --svm-model must be provided");
     }
 
     if source_count > 1 {
+        #[cfg(feature = "catboost")]
+        anyhow::bail!(
+            "Only one of --reference, --model, --svm-model, or --catboost-model can be specified"
+        );
+        #[cfg(not(feature = "catboost"))]
         anyhow::bail!("Only one of --reference, --model, or --svm-model can be specified");
     }
 
     // Dispatch to appropriate classification method
+    #[cfg(feature = "catboost")]
+    if let Some(catboost_model_path) = args.catboost_model.take() {
+        let meta_path = args.catboost_meta.take().ok_or_else(|| {
+            anyhow::anyhow!("--catboost-meta is required when using --catboost-model")
+        })?;
+        return run_with_catboost(args, catboost_model_path, meta_path);
+    }
+
     if let Some(svm_model_path) = args.svm_model.take() {
         run_with_svm_model(args, svm_model_path)
     } else if let Some(model_path) = args.model.take() {
@@ -397,6 +436,157 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         style::warning(unclassified_count)
     );
 
+    Ok(())
+}
+
+/// Run classification using a CatBoost model (WarpDemuX Fpt_Boost).
+#[cfg(feature = "catboost")]
+fn run_with_catboost(
+    args: ClassifyArgs,
+    model_path: PathBuf,
+    meta_path: PathBuf,
+) -> anyhow::Result<()> {
+    println!(
+        "{} reads using CatBoost model",
+        style::action("Classifying")
+    );
+    println!(
+        "{} {}",
+        style::label("Fingerprints:"),
+        style::path(args.fingerprints.display())
+    );
+    println!(
+        "{} {}",
+        style::label("CatBoost Model:"),
+        style::path(model_path.display())
+    );
+    println!(
+        "{} {}",
+        style::label("Metadata:"),
+        style::path(meta_path.display())
+    );
+    println!(
+        "{} {}",
+        style::label("Output:"),
+        style::path(args.output.display())
+    );
+    if args.probabilities {
+        println!("{} per-class probabilities", style::label("Including:"));
+    }
+
+    // Load the CatBoost model and metadata
+    println!("{} CatBoost model...", style::action("Loading"));
+    let classifier = CatBoostClassifier::load(&model_path, &meta_path)?;
+
+    println!(
+        "{} {} classes, thresholds: {:?}",
+        style::label("Model:"),
+        style::count(classifier.n_classes()),
+        classifier.meta.thresholds
+    );
+
+    // Read query fingerprints
+    let query_fps = parse_query_fingerprints_f64(&args.fingerprints)?;
+
+    println!(
+        "{} {} query fingerprints",
+        style::label("Loaded:"),
+        style::count(query_fps.len())
+    );
+
+    if query_fps.is_empty() {
+        anyhow::bail!("No valid query fingerprints found");
+    }
+
+    // Classify each query (sequential for now, CatBoost handles batching internally)
+    println!("{} reads with CatBoost...", style::action("Classifying"));
+
+    let results: Vec<(Uuid, CatBoostResult)> = query_fps
+        .iter()
+        .map(|(read_id, fingerprint)| {
+            let result = classifier
+                .classify(fingerprint)
+                .expect("CatBoost classification failed");
+            (*read_id, result)
+        })
+        .collect();
+
+    // Write output
+    write_catboost_classifications(&args.output, &results, &classifier, args.probabilities)?;
+
+    let confident_count = results.iter().filter(|(_, r)| r.passes_threshold).count();
+    let unclassified_count = results.len() - confident_count;
+
+    println!(
+        "{} classifications written to {}",
+        style::action("Wrote"),
+        style::path(args.output.display())
+    );
+    println!(
+        "{} {} confident, {} unclassified",
+        style::label("Result:"),
+        style::count(confident_count),
+        style::warning(unclassified_count)
+    );
+
+    Ok(())
+}
+
+/// Write CatBoost classification results to CSV.
+#[cfg(feature = "catboost")]
+fn write_catboost_classifications(
+    path: &PathBuf,
+    results: &[(Uuid, CatBoostResult)],
+    classifier: &CatBoostClassifier,
+    include_probabilities: bool,
+) -> anyhow::Result<()> {
+    let output_file = File::create(path)?;
+    let mut writer = BufWriter::new(output_file);
+
+    // Write header
+    if include_probabilities {
+        // Generate probability column headers from the model's label mapper
+        let prob_header: String = (0..classifier.n_classes())
+            .map(|i| {
+                let barcode_id = classifier.meta.get_barcode_id(i).unwrap_or(i as i32);
+                format!("p{:02}", barcode_id)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            writer,
+            "read_id,predicted_barcode,confidence,is_confident,{}",
+            prob_header
+        )?;
+    } else {
+        writeln!(writer, "read_id,predicted_barcode,confidence,is_confident")?;
+    }
+
+    // Write results
+    for (read_id, result) in results {
+        if include_probabilities {
+            let prob_str: String = result
+                .probabilities
+                .iter()
+                .map(|p| format!("{:.6}", p))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            writeln!(
+                writer,
+                "{},{},{:.6},{},{}",
+                read_id, result.barcode, result.confidence, result.passes_threshold, prob_str
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "{},{},{:.6},{}",
+                read_id, result.barcode, result.confidence, result.passes_threshold
+            )?;
+        }
+    }
+
+    writer.flush()?;
     Ok(())
 }
 

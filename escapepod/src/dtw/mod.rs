@@ -8,9 +8,11 @@
 mod distance;
 mod fingerprint;
 mod kernel;
+mod subsequence;
 
 pub use distance::{
     dtw_distance, dtw_distance_bounded, dtw_distance_matrix, dtw_distance_matrix_blocked,
 };
 pub use fingerprint::{normalize_fingerprint, Fingerprint, NormMethod};
 pub use kernel::{distance_to_kernel, distance_to_kernel_auto};
+pub use subsequence::{dtw_subsequence_match, dtw_subsequence_sliding, SubsequenceMatch};
