@@ -61,6 +61,7 @@ nav:
       - bam-filter: cli/bam-filter.md
       - repack: cli/repack.md
       - subset: cli/subset.md
+      - demux: cli/demux.md
   - Library:
       - Overview: library/index.md
       - Reading Files: library/reading.md
