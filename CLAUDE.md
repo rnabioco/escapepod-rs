@@ -29,7 +29,7 @@ cargo test test_round_trip_single_read
 cargo clippy
 
 # Run the CLI (after building)
-./target/release/escapepod <command>
+./target/release/escpod <command>
 ```
 
 ## Architecture
