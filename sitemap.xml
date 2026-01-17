@@ -2,90 +2,90 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/api/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/bam-filter/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/demux/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/filter/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/inspect/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/merge/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/repack/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/subset/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/summary/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/cli/view/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/format/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/format/compression/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/format/container/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/format/segmentation/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/getting-started/installation/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/getting-started/quickstart/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/library/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/library/reading/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/library/types/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
     <url>
          <loc>https://rnabioco.github.io/escapepod-rs/library/writing/</loc>
-         <lastmod>2026-01-08</lastmod>
+         <lastmod>2026-01-17</lastmod>
     </url>
 </urlset>
