@@ -126,45 +126,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         println!("  Applied MAD normalization to kmer levels");
     }
 
-    // Load POD5 reads into a map by UUID
-    let pod5_files = resolve_pod5_inputs(&args.input)?;
-    println!(
-        "{} POD5 data from {} ({})",
-        style::action("Loading"),
-        style::path(args.input.display()),
-        if pod5_files.len() > 1 {
-            format!("{} files", pod5_files.len())
-        } else {
-            "1 file".to_string()
-        }
-    );
-
-    // Open all POD5 readers and collect reads
-    let mut pod5_reads: HashMap<uuid::Uuid, Pod5ReadInfo> = HashMap::new();
-    let mut pod5_readers: Vec<escapepod::Reader> = Vec::new();
-
-    for (reader_idx, path) in pod5_files.iter().enumerate() {
-        let reader = escapepod::Reader::open(path)?;
-        for read_result in reader.reads()? {
-            let read = read_result?;
-            pod5_reads.insert(
-                read.read_id,
-                Pod5ReadInfo {
-                    reader_idx,
-                    calibration_scale: read.calibration_scale,
-                    calibration_offset: read.calibration_offset,
-                    signal_rows: read.signal_rows.clone(),
-                },
-            );
-        }
-        pod5_readers.push(reader);
-    }
-    println!(
-        "  {} reads indexed from POD5",
-        style::count(pod5_reads.len())
-    );
-
-    // Scan BAM file
+    // Load BAM first to determine which POD5 reads we need
     println!(
         "{} BAM records from {}",
         style::action("Loading"),
@@ -182,7 +144,99 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     }
     println!("  {} BAM records loaded", style::count(records.len()));
 
-    // --- Phase 2: Refine (parallel) ---
+    // Collect UUIDs we need from BAM
+    let needed_uuids: std::collections::HashSet<uuid::Uuid> = records
+        .iter()
+        .filter_map(|r| {
+            r.name().and_then(|name| {
+                let name_bytes: &[u8] = name.as_ref();
+                let name_str = name_bytes.to_str().ok()?;
+                parse_uuid_flexible(name_str).ok()
+            })
+        })
+        .collect();
+    println!(
+        "  {} unique read IDs in BAM",
+        style::count(needed_uuids.len())
+    );
+
+    // Load only matching POD5 reads
+    let pod5_files = resolve_pod5_inputs(&args.input)?;
+    println!(
+        "{} POD5 data from {} ({})",
+        style::action("Indexing"),
+        style::path(args.input.display()),
+        if pod5_files.len() > 1 {
+            format!("{} files", pod5_files.len())
+        } else {
+            "1 file".to_string()
+        }
+    );
+
+    let mut pod5_reads: HashMap<uuid::Uuid, Pod5ReadInfo> = HashMap::new();
+    let mut pod5_readers: Vec<escapepod::Reader> = Vec::new();
+
+    for (reader_idx, path) in pod5_files.iter().enumerate() {
+        let reader = escapepod::Reader::open(path)?;
+        for read_result in reader.reads()? {
+            let read = read_result?;
+            if needed_uuids.contains(&read.read_id) {
+                pod5_reads.insert(
+                    read.read_id,
+                    Pod5ReadInfo {
+                        reader_idx,
+                        calibration_scale: read.calibration_scale,
+                        calibration_offset: read.calibration_offset,
+                        signal_rows: read.signal_rows.clone(),
+                    },
+                );
+            }
+        }
+        pod5_readers.push(reader);
+    }
+    println!(
+        "  {} reads matched from POD5",
+        style::count(pod5_reads.len())
+    );
+
+    // --- Phase 2: Bulk extract signal data (fast batch-grouped extraction) ---
+    println!(
+        "{} signal data for {} matched reads",
+        style::action("Extracting"),
+        style::count(pod5_reads.len())
+    );
+
+    let mut signal_cache: HashMap<uuid::Uuid, Vec<f32>> = HashMap::new();
+
+    // Group reads by reader index for bulk extraction
+    let mut reads_by_reader: HashMap<usize, Vec<(uuid::Uuid, Vec<u64>)>> = HashMap::new();
+    for (&read_id, info) in &pod5_reads {
+        reads_by_reader
+            .entry(info.reader_idx)
+            .or_default()
+            .push((read_id, info.signal_rows.clone()));
+    }
+
+    for (reader_idx, read_list) in &reads_by_reader {
+        let reader = &pod5_readers[*reader_idx];
+        match reader.get_signal_bulk(read_list) {
+            Ok(results) => {
+                for (read_id, signal_i16) in results {
+                    let signal_f32: Vec<f32> = signal_i16.iter().map(|&s| s as f32).collect();
+                    signal_cache.insert(read_id, signal_f32);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: bulk signal extraction failed: {}", e);
+            }
+        }
+    }
+    println!(
+        "  {} signals extracted",
+        style::count(signal_cache.len())
+    );
+
+    // --- Phase 3: Refine (parallel, no POD5 I/O) ---
     println!(
         "{} signal-to-base mappings (half_bandwidth={}, iterations={}, algo={:?})",
         style::action("Refining"),
@@ -195,16 +249,27 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     let skip_count = std::sync::atomic::AtomicUsize::new(0);
     let error_count = std::sync::atomic::AtomicUsize::new(0);
 
+    // Track skip reasons for diagnostics
+    let skip_reasons: std::sync::Mutex<HashMap<String, usize>> =
+        std::sync::Mutex::new(HashMap::new());
+
     records.par_iter_mut().for_each(|record| {
-        match refine_single_read(record, &pod5_readers, &pod5_reads, &kmer_table, &settings) {
+        match refine_single_read(record, &pod5_reads, &signal_cache, &kmer_table, &settings) {
             Ok(true) => {
                 refined_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(false) => {
                 skip_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            Err(_) => {
+            Err(e) => {
                 error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reason = format!("{}", e);
+                skip_reasons
+                    .lock()
+                    .unwrap()
+                    .entry(reason)
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
             }
         }
     });
@@ -219,6 +284,12 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         skipped,
         errors
     );
+    if errors > 0 {
+        let reasons = skip_reasons.lock().unwrap();
+        for (reason, count) in reasons.iter() {
+            eprintln!("  error ({}x): {}", count, reason);
+        }
+    }
 
     // --- Phase 3: Write ---
     println!(
@@ -262,8 +333,8 @@ struct Pod5ReadInfo {
 /// Returns Ok(true) if refined, Ok(false) if skipped.
 fn refine_single_read(
     record: &mut RecordBuf,
-    pod5_readers: &[escapepod::Reader],
     pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
+    signal_cache: &HashMap<uuid::Uuid, Vec<f32>>,
     kmer_table: &KmerTable,
     settings: &RefineSettings,
 ) -> anyhow::Result<bool> {
@@ -274,13 +345,13 @@ fn refine_single_read(
             let name_str = name_bytes.to_str()?;
             parse_uuid_flexible(name_str)?
         }
-        None => return Ok(false),
+        None => bail!("no read name"),
     };
 
     // Look up POD5 read
     let pod5_info = match pod5_reads.get(&read_id) {
         Some(info) => info,
-        None => return Ok(false), // No matching POD5 read
+        None => bail!("no matching POD5 read"),
     };
 
     // Extract move table from mv tag
@@ -288,39 +359,67 @@ fn refine_single_read(
     let (stride, moves) = match record.data().get(&mv_tag) {
         Some(Value::Array(Array::UInt8(data))) => {
             if data.len() < 2 {
-                return Ok(false);
+                bail!("mv tag too short (UInt8)");
             }
             (data[0] as usize, data[1..].to_vec())
         }
         Some(Value::Array(Array::Int8(data))) => {
             if data.len() < 2 {
-                return Ok(false);
+                bail!("mv tag too short (Int8)");
             }
             (
                 data[0] as usize,
                 data[1..].iter().map(|&b| b as u8).collect::<Vec<u8>>(),
             )
         }
-        _ => return Ok(false), // No move table
+        _ => bail!("no mv tag"),
     };
 
     if stride == 0 {
-        return Ok(false);
+        bail!("stride is 0");
     }
 
-    // Extract sequence
-    let sequence = decode_sequence(record.sequence());
+    // Extract sequence (noodles already decodes BAM 4-bit to ASCII)
+    let sequence: &[u8] = record.sequence().as_ref();
     if sequence.is_empty() {
-        return Ok(false);
+        bail!("empty sequence");
     }
 
     // Build initial query-to-signal map from move table
     let seq_to_signal = build_query_to_signal_map(&moves, stride, sequence.len())?;
 
-    // Get raw signal from POD5
-    let reader = &pod5_readers[pod5_info.reader_idx];
-    let signal_i16 = reader.get_signal(&pod5_info.signal_rows)?;
-    let signal_f32: Vec<f32> = signal_i16.iter().map(|&s| s as f32).collect();
+    // Get pre-extracted signal
+    let full_signal = match signal_cache.get(&read_id) {
+        Some(s) => s,
+        None => bail!("no signal in cache"),
+    };
+
+    // Extract signal trimming tags (sp, ts, ns) to trim the signal
+    // as fishnet does before alignment
+    let sp_tag = Tag::new(b's', b'p');
+    let ts_tag = Tag::new(b't', b's');
+    let ns_tag = Tag::new(b'n', b's');
+
+    let parent_signal_offset = get_int_tag(record, &sp_tag).unwrap_or(0) as usize;
+    let trimmed_signal_len = get_int_tag(record, &ts_tag).unwrap_or(0) as usize;
+    let subread_signal_len = get_int_tag(record, &ns_tag);
+
+    let signal_start = parent_signal_offset + trimmed_signal_len;
+    let signal_end = match subread_signal_len {
+        Some(ns) => parent_signal_offset + ns as usize,
+        None => full_signal.len(),
+    };
+
+    if signal_start >= signal_end || signal_end > full_signal.len() {
+        bail!(
+            "invalid signal trim: start={}, end={}, signal_len={}",
+            signal_start,
+            signal_end,
+            full_signal.len()
+        );
+    }
+
+    let signal_f32 = &full_signal[signal_start..signal_end];
 
     // Get initial scaling from POD5 calibration + BAM sm/sd tags
     let sm_tag = Tag::new(b's', b'm');
@@ -338,35 +437,49 @@ fn refine_single_read(
     // Extract expected levels from kmer table
     let levels = match kmer_table.extract_levels(&sequence) {
         Ok(l) => l,
-        Err(_) => return Ok(false), // Sequence too short or contains non-ACGT
+        Err(e) => bail!("kmer levels: {}", e),
     };
 
-    // Verify map is valid for the signal
+    // Verify map is valid for the trimmed signal
     if let Some(&last) = seq_to_signal.last() {
         if last > signal_f32.len() {
-            return Ok(false);
+            bail!(
+                "map end {} > trimmed signal len {} (seq_len={}, moves={}, stride={}, trim_start={}, trim_end={})",
+                last,
+                signal_f32.len(),
+                sequence.len(),
+                moves.len(),
+                stride,
+                signal_start,
+                signal_end,
+            );
         }
     }
 
-    // Run refinement
+    // Run refinement on trimmed signal
     let result = match refine_signal_map(
         settings,
-        &signal_f32,
+        signal_f32,
         &seq_to_signal,
         &levels,
         initial_scale,
         initial_shift,
     ) {
         Ok(r) => r,
-        Err(_) => return Ok(false),
+        Err(e) => bail!("refinement failed: {}", e),
     };
 
     // Insert refined tags into the BAM record
+    // Add signal_start offset back so boundaries are in full-signal coordinates
     let rs_tag = Tag::new(b'r', b's');
     let rc_tag = Tag::new(b'r', b'c');
     let ro_tag = Tag::new(b'r', b'o');
 
-    let boundaries: Vec<u32> = result.seq_to_signal_map.iter().map(|&x| x as u32).collect();
+    let boundaries: Vec<u32> = result
+        .seq_to_signal_map
+        .iter()
+        .map(|&x| (x + signal_start) as u32)
+        .collect();
 
     record
         .data_mut()
@@ -375,20 +488,6 @@ fn refine_single_read(
     record.data_mut().insert(ro_tag, Value::Float(result.shift));
 
     Ok(true)
-}
-
-/// Decode a RecordBuf sequence from BAM 4-bit encoding to ASCII bytes.
-fn decode_sequence(seq: &sam::alignment::record_buf::Sequence) -> Vec<u8> {
-    seq.as_ref()
-        .iter()
-        .map(|&b| match b {
-            1 => b'A',
-            2 => b'C',
-            4 => b'G',
-            8 => b'T',
-            _ => b'N',
-        })
-        .collect()
 }
 
 /// Build a query-to-signal map from the BAM move table.
@@ -429,6 +528,19 @@ fn build_query_to_signal_map(
 fn get_float_tag(record: &RecordBuf, tag: &Tag) -> Option<f32> {
     match record.data().get(tag) {
         Some(Value::Float(f)) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Extract an integer value from a BAM auxiliary tag.
+fn get_int_tag(record: &RecordBuf, tag: &Tag) -> Option<i64> {
+    match record.data().get(tag) {
+        Some(Value::Int8(v)) => Some(*v as i64),
+        Some(Value::UInt8(v)) => Some(*v as i64),
+        Some(Value::Int16(v)) => Some(*v as i64),
+        Some(Value::UInt16(v)) => Some(*v as i64),
+        Some(Value::Int32(v)) => Some(*v as i64),
+        Some(Value::UInt32(v)) => Some(*v as i64),
         _ => None,
     }
 }

@@ -480,6 +480,55 @@ impl Reader {
         Ok(&self.mmap[start..end])
     }
 
+    /// Bulk extract decompressed signal for multiple reads.
+    ///
+    /// Takes a slice of `(key, signal_rows)` pairs and returns a Vec of
+    /// `(key, Vec<i16>)` with the decompressed signal for each. Uses the fast
+    /// raw byte extraction path (batch-grouped, no Arrow deserialization),
+    /// which is much faster than calling `get_signal` per read.
+    pub fn get_signal_bulk<K: Clone + Send>(
+        &self,
+        reads: &[(K, Vec<u64>)],
+    ) -> Result<Vec<(K, Vec<i16>)>> {
+        use crate::arrow_ipc::ArrowIpcFooter;
+        use crate::compression::vbz::decompress_signal;
+
+        let signal_bytes = self.signal_table_bytes()?;
+        let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+
+        // Collect all signal rows with back-references to which read they belong to
+        // (read_index, chunk_index_within_read, signal_row)
+        let mut all_rows: Vec<(usize, usize, u64)> = Vec::new();
+        for (read_idx, (_key, rows)) in reads.iter().enumerate() {
+            for (chunk_idx, &row) in rows.iter().enumerate() {
+                all_rows.push((read_idx, chunk_idx, row));
+            }
+        }
+
+        // Extract all signal rows at once (batch-grouped, fast)
+        let row_indices: Vec<u64> = all_rows.iter().map(|&(_, _, row)| row).collect();
+        let raw_chunks = signal_footer.extract_signal_rows(&row_indices, signal_bytes)?;
+
+        // Decompress and assemble per-read
+        let mut result_chunks: Vec<Vec<(usize, Vec<i16>)>> = vec![Vec::new(); reads.len()];
+        for (i, chunk) in raw_chunks.iter().enumerate() {
+            let (read_idx, chunk_idx, _) = all_rows[i];
+            let decompressed = decompress_signal(chunk.signal, chunk.samples as usize)?;
+            result_chunks[read_idx].push((chunk_idx, decompressed));
+        }
+
+        // Sort chunks within each read and concatenate
+        let mut results = Vec::with_capacity(reads.len());
+        for (read_idx, (key, _)) in reads.iter().enumerate() {
+            let chunks = &mut result_chunks[read_idx];
+            chunks.sort_by_key(|(idx, _)| *idx);
+            let signal: Vec<i16> = chunks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+            results.push((key.clone(), signal));
+        }
+
+        Ok(results)
+    }
+
     /// Prefetch signal table pages using madvise (if supported).
     /// This hints to the OS to read pages ahead, improving sequential read performance.
     pub fn prefetch_signal(&self) {
