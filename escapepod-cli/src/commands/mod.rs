@@ -6,6 +6,7 @@ pub mod filter;
 pub mod inspect;
 pub mod merge;
 pub mod repack;
+pub mod resquiggle;
 pub mod subset;
 pub mod summary;
 pub mod view;
