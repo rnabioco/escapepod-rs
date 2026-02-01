@@ -14,7 +14,6 @@ use escapepod::resquiggle::{
     calculate_initial_scaling, refine_signal_map, KmerTable, RefineAlgo, RefineSettings,
     RescaleAlgo, RoughRescaleAlgo,
 };
-
 use noodles_bam as bam;
 use noodles_sam as sam;
 use sam::alignment::record::data::field::Tag;
@@ -199,7 +198,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         style::count(pod5_reads.len())
     );
 
-    // --- Phase 2: Bulk extract signal data (fast batch-grouped extraction) ---
+    // --- Phase 2: Bulk extract signal data (batch-grouped I/O, parallel decompression) ---
     println!(
         "{} signal data for {} matched reads",
         style::action("Extracting"),
@@ -288,7 +287,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         }
     }
 
-    // --- Phase 3: Write ---
+    // --- Phase 4: Write ---
     println!(
         "{} output BAM to {}",
         style::action("Writing"),
