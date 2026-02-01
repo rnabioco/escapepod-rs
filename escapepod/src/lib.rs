@@ -50,6 +50,7 @@ pub use error::{Error, Result};
 pub use merge::{merge_files, MergeOptions, MergePhase, MergeProgress, MergeResult};
 pub use operations::{repack_files, RepackOptions, RepackResult};
 pub use reader::Reader;
+pub use reader::SignalExtractor;
 pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{PredefinedDictionaries, Writer, WriterOptions};
 
