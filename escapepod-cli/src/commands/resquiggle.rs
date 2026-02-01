@@ -21,6 +21,7 @@ use sam::alignment::record_buf::data::field::value::Array;
 use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
 
+use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::resolve_pod5_inputs;
 
@@ -126,11 +127,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     }
 
     // Load BAM first to determine which POD5 reads we need
-    println!(
-        "{} BAM records from {}",
-        style::action("Loading"),
-        style::path(args.bam.display())
-    );
+    let bam_spinner = create_spinner("Loading")?;
+    bam_spinner.set_message(format!("BAM records from {}", args.bam.display()));
     let file = std::fs::File::open(&args.bam)?;
     let mut bam_reader = bam::io::Reader::new(BufReader::new(file));
     let header = bam_reader.read_header()?;
@@ -141,7 +139,11 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         records.push(record_buf.clone());
         record_buf = RecordBuf::default();
     }
-    println!("  {} BAM records loaded", style::count(records.len()));
+    bam_spinner.finish_with_message(format!(
+        "{} BAM records loaded from {}",
+        style::count(records.len()),
+        style::path(args.bam.display())
+    ));
 
     // Collect UUIDs we need from BAM
     let needed_uuids: std::collections::HashSet<uuid::Uuid> = records
@@ -161,16 +163,16 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
 
     // Load only matching POD5 reads
     let pod5_files = resolve_pod5_inputs(&args.input)?;
-    println!(
-        "{} POD5 data from {} ({})",
-        style::action("Indexing"),
-        style::path(args.input.display()),
+    let pod5_spinner = create_spinner("Indexing")?;
+    pod5_spinner.set_message(format!(
+        "POD5 data from {} ({})",
+        args.input.display(),
         if pod5_files.len() > 1 {
             format!("{} files", pod5_files.len())
         } else {
             "1 file".to_string()
         }
-    );
+    ));
 
     let mut pod5_reads: HashMap<uuid::Uuid, Pod5ReadInfo> = HashMap::new();
     let mut pod5_readers: Vec<escapepod::Reader> = Vec::new();
@@ -193,17 +195,17 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         }
         pod5_readers.push(reader);
     }
-    println!(
-        "  {} reads matched from POD5",
+    pod5_spinner.finish_with_message(format!(
+        "{} reads matched from POD5",
         style::count(pod5_reads.len())
-    );
+    ));
 
     // --- Phase 2: Bulk extract signal data (batch-grouped I/O, parallel decompression) ---
-    println!(
-        "{} signal data for {} matched reads",
-        style::action("Extracting"),
-        style::count(pod5_reads.len())
-    );
+    let signal_spinner = create_spinner("Extracting")?;
+    signal_spinner.set_message(format!(
+        "signal data for {} matched reads",
+        pod5_reads.len()
+    ));
 
     let mut signal_cache: HashMap<uuid::Uuid, Vec<f32>> = HashMap::new();
 
@@ -230,19 +232,15 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             }
         }
     }
-    println!("  {} signals extracted", style::count(signal_cache.len()));
+    signal_spinner.finish_with_message(format!(
+        "{} signals extracted",
+        style::count(signal_cache.len())
+    ));
 
     // --- Phase 3: Refine (parallel, no POD5 I/O) ---
-    println!(
-        "{} signal-to-base mappings (half_bandwidth={}, iterations={}, algo={:?})",
-        style::action("Refining"),
-        settings.half_bandwidth,
-        settings.n_refinement_iters,
-        settings.refinement_algo,
-    );
+    let refine_bar = create_progress_bar(records.len() as u64, "Refining")?;
 
     let refined_count = std::sync::atomic::AtomicUsize::new(0);
-    let skip_count = std::sync::atomic::AtomicUsize::new(0);
     let error_count = std::sync::atomic::AtomicUsize::new(0);
 
     // Track skip reasons for diagnostics
@@ -254,9 +252,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             Ok(true) => {
                 refined_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            Ok(false) => {
-                skip_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            Ok(false) => {}
             Err(e) => {
                 error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reason = format!("{}", e);
@@ -268,18 +264,17 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
                     .or_insert(1);
             }
         }
+        refine_bar.inc(1);
     });
 
     let refined = refined_count.load(std::sync::atomic::Ordering::Relaxed);
-    let skipped = skip_count.load(std::sync::atomic::Ordering::Relaxed);
     let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
 
-    println!(
-        "  {} refined, {} skipped, {} errors",
+    refine_bar.finish_with_message(format!(
+        "{} refined, {} errors",
         style::count(refined),
-        skipped,
         errors
-    );
+    ));
     if errors > 0 {
         let reasons = skip_reasons.lock().unwrap();
         for (reason, count) in reasons.iter() {
@@ -288,11 +283,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     }
 
     // --- Phase 4: Write ---
-    println!(
-        "{} output BAM to {}",
-        style::action("Writing"),
-        style::path(args.output.display())
-    );
+    let write_spinner = create_spinner("Writing")?;
+    write_spinner.set_message(format!("output BAM to {}", args.output.display()));
 
     let output_file = std::fs::File::create(&args.output)?;
     let mut writer = bam::io::Writer::new(output_file);
@@ -307,12 +299,11 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     let inner = writer.into_inner();
     inner.finish()?;
 
-    println!(
-        "{} {} records written to {}",
-        style::action("Done:"),
+    write_spinner.finish_with_message(format!(
+        "{} records written to {}",
         style::count(records.len()),
         style::path(args.output.display())
-    );
+    ));
 
     Ok(())
 }
