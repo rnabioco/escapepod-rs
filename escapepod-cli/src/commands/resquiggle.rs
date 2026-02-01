@@ -231,10 +231,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             }
         }
     }
-    println!(
-        "  {} signals extracted",
-        style::count(signal_cache.len())
-    );
+    println!("  {} signals extracted", style::count(signal_cache.len()));
 
     // --- Phase 3: Refine (parallel, no POD5 I/O) ---
     println!(
@@ -435,7 +432,7 @@ fn refine_single_read(
     );
 
     // Extract expected levels from kmer table
-    let levels = match kmer_table.extract_levels(&sequence) {
+    let levels = match kmer_table.extract_levels(sequence) {
         Ok(l) => l,
         Err(e) => bail!("kmer levels: {}", e),
     };
