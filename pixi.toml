@@ -1,10 +1,10 @@
 [workspace]
 name = "escapepod-rs"
-channels = ["conda-forge"]
+channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
 
 [dependencies]
-samtools = "*"
+samtools = ">=1.23,<2"
 pysam = "*"
 pandas = "*"
 

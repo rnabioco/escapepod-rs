@@ -1,7 +1,6 @@
 //! Resquiggle command: refine signal-to-base mapping using banded DP.
 
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::path::PathBuf;
 
 use anyhow::bail;
@@ -15,13 +14,14 @@ use escapepod::resquiggle::{
     RescaleAlgo, RoughRescaleAlgo,
 };
 use noodles_bam as bam;
+use noodles_bgzf as bgzf;
 use noodles_sam as sam;
 use sam::alignment::record::data::field::Tag;
 use sam::alignment::record_buf::data::field::value::Array;
 use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
 
-use crate::progress::{create_progress_bar, create_spinner};
+use crate::progress::create_spinner;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
 
@@ -114,7 +114,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         normalize_levels: args.normalize_levels,
     };
 
-    // --- Phase 1: Load ---
+    // --- Phase 1: Load kmer table ---
     println!(
         "{} kmer table from {}",
         style::action("Loading"),
@@ -126,42 +126,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         println!("  Applied MAD normalization to kmer levels");
     }
 
-    // Load BAM first to determine which POD5 reads we need
-    let bam_spinner = create_spinner("Loading")?;
-    bam_spinner.set_message(format!("BAM records from {}", args.bam.display()));
-    let file = std::fs::File::open(&args.bam)?;
-    let mut bam_reader = bam::io::Reader::new(BufReader::new(file));
-    let header = bam_reader.read_header()?;
-
-    let mut records: Vec<RecordBuf> = Vec::new();
-    let mut record_buf = RecordBuf::default();
-    while bam_reader.read_record_buf(&header, &mut record_buf)? != 0 {
-        records.push(record_buf.clone());
-        record_buf = RecordBuf::default();
-    }
-    bam_spinner.finish_with_message(format!(
-        "{} BAM records loaded from {}",
-        style::count(records.len()),
-        style::path(args.bam.display())
-    ));
-
-    // Collect UUIDs we need from BAM
-    let needed_uuids: std::collections::HashSet<uuid::Uuid> = records
-        .iter()
-        .filter_map(|r| {
-            r.name().and_then(|name| {
-                let name_bytes: &[u8] = name.as_ref();
-                let name_str = name_bytes.to_str().ok()?;
-                parse_uuid_flexible(name_str).ok()
-            })
-        })
-        .collect();
-    println!(
-        "  {} unique read IDs in BAM",
-        style::count(needed_uuids.len())
-    );
-
-    // Load only matching POD5 reads
+    // --- Phase 2: Index all POD5 reads ---
     let pod5_files = resolve_pod5_inputs(&args.input)?;
     let pod5_spinner = create_spinner("Indexing")?;
     pod5_spinner.set_message(format!(
@@ -181,82 +146,206 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         let reader = escapepod::Reader::open(path)?;
         for read_result in reader.reads()? {
             let read = read_result?;
-            if needed_uuids.contains(&read.read_id) {
-                pod5_reads.insert(
-                    read.read_id,
-                    Pod5ReadInfo {
-                        reader_idx,
-                        calibration_scale: read.calibration_scale,
-                        calibration_offset: read.calibration_offset,
-                        signal_rows: read.signal_rows.clone(),
-                    },
-                );
-            }
+            pod5_reads.insert(
+                read.read_id,
+                Pod5ReadInfo {
+                    reader_idx,
+                    calibration_scale: read.calibration_scale,
+                    calibration_offset: read.calibration_offset,
+                    signal_rows: read.signal_rows.clone(),
+                },
+            );
         }
         pod5_readers.push(reader);
     }
     pod5_spinner.finish_with_message(format!(
-        "{} reads matched from POD5",
+        "{} reads indexed from POD5",
         style::count(pod5_reads.len())
     ));
 
-    // --- Phase 2: Bulk extract signal data (batch-grouped I/O, parallel decompression) ---
-    let signal_spinner = create_spinner("Extracting")?;
-    signal_spinner.set_message(format!(
-        "signal data for {} matched reads",
-        pod5_reads.len()
-    ));
+    // Create signal extractors (one per reader) for parallel on-demand extraction
+    let signal_extractors: Vec<_> = pod5_readers
+        .iter()
+        .map(|r| r.signal_extractor())
+        .collect::<escapepod::Result<_>>()?;
 
-    let mut signal_cache: HashMap<uuid::Uuid, Vec<f32>> = HashMap::new();
+    // --- Phase 3: Stream BAM, refine in parallel, write asynchronously ---
+    let file = std::fs::File::open(&args.bam)?;
+    let worker_count = args
+        .threads
+        .and_then(std::num::NonZeroUsize::new)
+        .or_else(|| std::thread::available_parallelism().ok())
+        .unwrap_or(std::num::NonZeroUsize::MIN);
+    let decoder = bgzf::io::MultithreadedReader::with_worker_count(worker_count, file);
+    let mut bam_reader = bam::io::Reader::from(decoder);
+    let header = bam_reader.read_header()?;
 
-    // Group reads by reader index for bulk extraction
-    let mut reads_by_reader: HashMap<usize, Vec<(uuid::Uuid, Vec<u64>)>> = HashMap::new();
-    for (&read_id, info) in &pod5_reads {
-        reads_by_reader
-            .entry(info.reader_idx)
-            .or_default()
-            .push((read_id, info.signal_rows.clone()));
-    }
+    let stats = RefineStats::new();
 
-    for (reader_idx, read_list) in &reads_by_reader {
-        let reader = &pod5_readers[*reader_idx];
-        match reader.get_signal_bulk(read_list) {
-            Ok(results) => {
-                for (read_id, signal_i16) in results {
-                    let signal_f32: Vec<f32> = signal_i16.iter().map(|&s| s as f32).collect();
-                    signal_cache.insert(read_id, signal_f32);
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: bulk signal extraction failed: {}", e);
+    // Spawn writer thread — receives ordered chunks via channel
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<RecordBuf>>(2);
+    let header_clone = header.clone();
+    let output_path = args.output.clone();
+    let writer_handle = std::thread::spawn(move || -> anyhow::Result<usize> {
+        let output_file = std::fs::File::create(&output_path)?;
+        let mut writer = bam::io::Writer::new(output_file);
+        writer.write_header(&header_clone)?;
+
+        let mut count = 0;
+        for chunk in rx {
+            for record in &chunk {
+                use sam::alignment::io::Write as _;
+                writer.write_alignment_record(&header_clone, record)?;
+                count += 1;
             }
         }
+
+        let inner = writer.into_inner();
+        inner.finish()?;
+        Ok(count)
+    });
+
+    // Stream BAM records, filter against POD5 index, and process in chunks
+    const CHUNK_SIZE: usize = 10_000;
+    let stream_spinner = create_spinner("Processing")?;
+    let mut chunk: Vec<RecordBuf> = Vec::with_capacity(CHUNK_SIZE);
+    let mut total_bam: usize = 0;
+    let mut matched: usize = 0;
+
+    loop {
+        let mut record_buf = RecordBuf::default();
+        if bam_reader.read_record_buf(&header, &mut record_buf)? == 0 {
+            break;
+        }
+        total_bam += 1;
+
+        // Check if this read has a matching POD5 entry
+        let has_match = record_buf
+            .name()
+            .and_then(|name| {
+                let name_bytes: &[u8] = name.as_ref();
+                let name_str = name_bytes.to_str().ok()?;
+                let uuid = parse_uuid_flexible(name_str).ok()?;
+                if pod5_reads.contains_key(&uuid) {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
+
+        if !has_match {
+            continue;
+        }
+        matched += 1;
+        chunk.push(record_buf);
+
+        if total_bam % 50_000 == 0 {
+            stream_spinner.set_message(format!(
+                "{} matched / {} scanned from BAM",
+                style::count(matched),
+                style::count(total_bam)
+            ));
+        }
+
+        if chunk.len() >= CHUNK_SIZE {
+            refine_and_send_chunk(
+                &mut chunk,
+                &pod5_reads,
+                &signal_extractors,
+                &kmer_table,
+                &settings,
+                &stats,
+                &tx,
+            )?;
+            chunk = Vec::with_capacity(CHUNK_SIZE);
+        }
     }
-    signal_spinner.finish_with_message(format!(
-        "{} signals extracted",
-        style::count(signal_cache.len())
+
+    // Flush remaining records
+    if !chunk.is_empty() {
+        refine_and_send_chunk(
+            &mut chunk,
+            &pod5_reads,
+            &signal_extractors,
+            &kmer_table,
+            &settings,
+            &stats,
+            &tx,
+        )?;
+    }
+    drop(tx);
+
+    stream_spinner.finish_with_message(format!(
+        "{} matched / {} scanned from BAM",
+        style::count(matched),
+        style::count(total_bam)
     ));
 
-    // --- Phase 3: Refine (parallel, no POD5 I/O) ---
-    let refine_bar = create_progress_bar(records.len() as u64, "Refining")?;
+    // Wait for writer to finish
+    let written = writer_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
 
-    let refined_count = std::sync::atomic::AtomicUsize::new(0);
-    let error_count = std::sync::atomic::AtomicUsize::new(0);
+    let refined = stats.refined_count.load(std::sync::atomic::Ordering::Relaxed);
+    let errors = stats.error_count.load(std::sync::atomic::Ordering::Relaxed);
 
-    // Track skip reasons for diagnostics
-    let skip_reasons: std::sync::Mutex<HashMap<String, usize>> =
-        std::sync::Mutex::new(HashMap::new());
+    println!(
+        "{} {} refined, {} errors, {} written to {}",
+        style::action("Done:"),
+        style::count(refined),
+        errors,
+        style::count(written),
+        style::path(args.output.display())
+    );
+    if errors > 0 {
+        let reasons = stats.skip_reasons.lock().unwrap();
+        for (reason, count) in reasons.iter() {
+            eprintln!("  error ({}x): {}", count, reason);
+        }
+    }
 
-    records.par_iter_mut().for_each(|record| {
-        match refine_single_read(record, &pod5_reads, &signal_cache, &kmer_table, &settings) {
+    Ok(())
+}
+
+/// Counters for tracking refinement progress and errors.
+struct RefineStats {
+    refined_count: std::sync::atomic::AtomicUsize,
+    error_count: std::sync::atomic::AtomicUsize,
+    skip_reasons: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+impl RefineStats {
+    fn new() -> Self {
+        Self {
+            refined_count: std::sync::atomic::AtomicUsize::new(0),
+            error_count: std::sync::atomic::AtomicUsize::new(0),
+            skip_reasons: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Refine a chunk of BAM records in parallel and send to the writer thread.
+fn refine_and_send_chunk(
+    chunk: &mut Vec<RecordBuf>,
+    pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
+    signal_extractors: &[escapepod::SignalExtractor<'_>],
+    kmer_table: &KmerTable,
+    settings: &RefineSettings,
+    stats: &RefineStats,
+    tx: &std::sync::mpsc::SyncSender<Vec<RecordBuf>>,
+) -> anyhow::Result<()> {
+    chunk.par_iter_mut().for_each(|record| {
+        match refine_single_read(record, pod5_reads, signal_extractors, kmer_table, settings) {
             Ok(true) => {
-                refined_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.refined_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(false) => {}
             Err(e) => {
-                error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reason = format!("{}", e);
-                skip_reasons
+                stats
+                    .skip_reasons
                     .lock()
                     .unwrap()
                     .entry(reason)
@@ -264,47 +353,9 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
                     .or_insert(1);
             }
         }
-        refine_bar.inc(1);
     });
-
-    let refined = refined_count.load(std::sync::atomic::Ordering::Relaxed);
-    let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
-
-    refine_bar.finish_with_message(format!(
-        "{} refined, {} errors",
-        style::count(refined),
-        errors
-    ));
-    if errors > 0 {
-        let reasons = skip_reasons.lock().unwrap();
-        for (reason, count) in reasons.iter() {
-            eprintln!("  error ({}x): {}", count, reason);
-        }
-    }
-
-    // --- Phase 4: Write ---
-    let write_spinner = create_spinner("Writing")?;
-    write_spinner.set_message(format!("output BAM to {}", args.output.display()));
-
-    let output_file = std::fs::File::create(&args.output)?;
-    let mut writer = bam::io::Writer::new(output_file);
-    writer.write_header(&header)?;
-
-    for record in &records {
-        use sam::alignment::io::Write as _;
-        writer.write_alignment_record(&header, record)?;
-    }
-
-    // Finish BGZF
-    let inner = writer.into_inner();
-    inner.finish()?;
-
-    write_spinner.finish_with_message(format!(
-        "{} records written to {}",
-        style::count(records.len()),
-        style::path(args.output.display())
-    ));
-
+    let finished_chunk = std::mem::take(chunk);
+    tx.send(finished_chunk)?;
     Ok(())
 }
 
@@ -321,7 +372,7 @@ struct Pod5ReadInfo {
 fn refine_single_read(
     record: &mut RecordBuf,
     pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
-    signal_cache: &HashMap<uuid::Uuid, Vec<f32>>,
+    signal_extractors: &[escapepod::SignalExtractor<'_>],
     kmer_table: &KmerTable,
     settings: &RefineSettings,
 ) -> anyhow::Result<bool> {
@@ -375,11 +426,10 @@ fn refine_single_read(
     // Build initial query-to-signal map from move table
     let seq_to_signal = build_query_to_signal_map(&moves, stride, sequence.len())?;
 
-    // Get pre-extracted signal
-    let full_signal = match signal_cache.get(&read_id) {
-        Some(s) => s,
-        None => bail!("no signal in cache"),
-    };
+    // Extract signal on-demand (parallel decompression)
+    let signal_i16 = signal_extractors[pod5_info.reader_idx]
+        .get_signal(&pod5_info.signal_rows)?;
+    let full_signal: Vec<f32> = signal_i16.iter().map(|&s| s as f32).collect();
 
     // Extract signal trimming tags (sp, ts, ns) to trim the signal
     // as fishnet does before alignment
