@@ -222,18 +222,16 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         total_bam += 1;
 
         // Parse UUID once and check for POD5 match
-        let read_id = record_buf
-            .name()
-            .and_then(|name| {
-                let name_bytes: &[u8] = name.as_ref();
-                let name_str = name_bytes.to_str().ok()?;
-                let uuid = parse_uuid_flexible(name_str).ok()?;
-                if pod5_reads.contains_key(&uuid) {
-                    Some(uuid)
-                } else {
-                    None
-                }
-            });
+        let read_id = record_buf.name().and_then(|name| {
+            let name_bytes: &[u8] = name.as_ref();
+            let name_str = name_bytes.to_str().ok()?;
+            let uuid = parse_uuid_flexible(name_str).ok()?;
+            if pod5_reads.contains_key(&uuid) {
+                Some(uuid)
+            } else {
+                None
+            }
+        });
 
         let read_id = match read_id {
             Some(id) => id,
@@ -289,7 +287,9 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
 
-    let refined = stats.refined_count.load(std::sync::atomic::Ordering::Relaxed);
+    let refined = stats
+        .refined_count
+        .load(std::sync::atomic::Ordering::Relaxed);
     let errors = stats.error_count.load(std::sync::atomic::Ordering::Relaxed);
 
     println!(
@@ -338,13 +338,24 @@ fn refine_and_send_chunk(
     tx: &std::sync::mpsc::SyncSender<Vec<RecordBuf>>,
 ) -> anyhow::Result<()> {
     chunk.par_iter_mut().for_each(|(read_id, record)| {
-        match refine_single_read(*read_id, record, pod5_reads, signal_extractors, kmer_table, settings) {
+        match refine_single_read(
+            *read_id,
+            record,
+            pod5_reads,
+            signal_extractors,
+            kmer_table,
+            settings,
+        ) {
             Ok(true) => {
-                stats.refined_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .refined_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(false) => {}
             Err(e) => {
-                stats.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .error_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reason = format!("{}", e);
                 stats
                     .skip_reasons
@@ -357,10 +368,7 @@ fn refine_and_send_chunk(
         }
     });
     // Extract just the RecordBufs for the writer
-    let records: Vec<RecordBuf> = std::mem::take(chunk)
-        .into_iter()
-        .map(|(_, r)| r)
-        .collect();
+    let records: Vec<RecordBuf> = std::mem::take(chunk).into_iter().map(|(_, r)| r).collect();
     tx.send(records)?;
     Ok(())
 }
@@ -424,8 +432,7 @@ fn refine_single_read(
     let seq_to_signal = build_query_to_signal_map(&moves, stride, sequence.len())?;
 
     // Extract signal on-demand (parallel decompression) — kept as i16
-    let signal_i16 = signal_extractors[pod5_info.reader_idx]
-        .get_signal(&pod5_info.signal_rows)?;
+    let signal_i16 = signal_extractors[pod5_info.reader_idx].get_signal(&pod5_info.signal_rows)?;
 
     // Compute signal trimming bounds on the i16 signal (no conversion yet)
     let sp_tag = Tag::new(b's', b'p');

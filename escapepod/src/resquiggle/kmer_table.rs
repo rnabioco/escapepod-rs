@@ -152,8 +152,7 @@ impl KmerTable {
         if kmer.len() != self.k {
             bail!("kmer length {} != expected {}", kmer.len(), self.k);
         }
-        let idx = encode_kmer(kmer)
-            .ok_or_else(|| anyhow::anyhow!("kmer contains invalid base"))?;
+        let idx = encode_kmer(kmer).ok_or_else(|| anyhow::anyhow!("kmer contains invalid base"))?;
         Ok(self.levels[idx])
     }
 
