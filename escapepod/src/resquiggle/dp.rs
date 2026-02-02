@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Inspired by fishnet, licensed under the GNU General Public License v3.0.
+
 //! Banded dynamic programming for sequence-to-signal alignment.
 
 use super::bands::Band;
 use super::types::RefineAlgo;
 
-const LARGE_SCORE: f32 = 100.0;
+/// Penalty score for invalid or out-of-band transitions.
+const INVALID_PENALTY: f32 = 100.0;
 
 /// Squared error score between expected and measured signal levels.
 #[inline]
@@ -36,7 +40,7 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
 
     // Pre-allocate dwell penalty buffers (reused across all bases)
     let mut dp_buf = match method {
-        RefineAlgo::DwellPenalty { .. } => Some(DpTempBuffers::new(max_bandwidth)),
+        RefineAlgo::DwellPenalty { .. } => Some(StepBuffers::new(max_bandwidth)),
         RefineAlgo::Viterbi => None,
     };
 
@@ -57,28 +61,28 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
     path
 }
 
-/// Reusable temporary buffers for the dwell penalty forward step.
-struct DpTempBuffers {
-    unpen_scores: Vec<f32>,
-    unpen_tb: Vec<i32>,
+/// Reusable temporary buffers for the dwell penalty DP step.
+struct StepBuffers {
+    base_scores: Vec<f32>,
+    base_traceback: Vec<i32>,
 }
 
-impl DpTempBuffers {
+impl StepBuffers {
     fn new(capacity: usize) -> Self {
         Self {
-            unpen_scores: vec![0.0f32; capacity],
-            unpen_tb: vec![0i32; capacity],
+            base_scores: vec![0.0f32; capacity],
+            base_traceback: vec![0i32; capacity],
         }
     }
 
     /// Ensure buffers are at least `len` elements and zero them.
     fn prepare(&mut self, len: usize) {
-        if self.unpen_scores.len() < len {
-            self.unpen_scores.resize(len, 0.0);
-            self.unpen_tb.resize(len, 0);
+        if self.base_scores.len() < len {
+            self.base_scores.resize(len, 0.0);
+            self.base_traceback.resize(len, 0);
         }
-        self.unpen_scores[..len].fill(0.0);
-        self.unpen_tb[..len].fill(0);
+        self.base_scores[..len].fill(0.0);
+        self.base_traceback[..len].fill(0);
     }
 }
 
@@ -92,7 +96,7 @@ fn forward_pass(
     band: &Band,
     base_offsets: &[usize],
     method: &RefineAlgo,
-    dp_buf: &mut Option<DpTempBuffers>,
+    dp_buf: &mut Option<StepBuffers>,
 ) {
     let mut short_dwell_penalty_vec = Vec::new();
     let use_dwell_penalty = match method {
@@ -101,7 +105,7 @@ fn forward_pass(
             limit,
             weight,
         } => {
-            short_dwell_penalty_vec = calculate_short_dwell_penalty_vec(*target, *limit, *weight);
+            short_dwell_penalty_vec = build_dwell_penalties(*target, *limit, *weight);
             true
         }
         RefineAlgo::Viterbi => false,
@@ -116,7 +120,7 @@ fn forward_pass(
     previous_scores[0] = 0.0;
 
     if use_dwell_penalty {
-        forward_step_dwell_penalty(
+        dp_step_with_dwell_penalty(
             &mut all_scores[0..current_bandwidth],
             &mut traceback[0..current_bandwidth],
             &previous_scores,
@@ -127,7 +131,7 @@ fn forward_pass(
             dp_buf.as_mut().unwrap(),
         );
     } else {
-        forward_step_viterbi(
+        dp_step(
             &mut all_scores[0..current_bandwidth],
             &mut traceback[0..current_bandwidth],
             &previous_scores,
@@ -149,30 +153,30 @@ fn forward_pass(
         let current_offset = base_offsets[base_idx];
         let current_slice_end = current_offset + current_bandwidth;
 
-        let band_start_diff = current_band_start - previous_band_start;
+        let prev_band_offset = current_band_start - previous_band_start;
 
         // Split the scores array to get non-overlapping mutable slices
         let (scores_prev_slice, scores_current_slice) = all_scores.split_at_mut(current_offset);
 
         if use_dwell_penalty {
-            forward_step_dwell_penalty(
+            dp_step_with_dwell_penalty(
                 &mut scores_current_slice[0..current_bandwidth],
                 &mut traceback[current_offset..current_slice_end],
                 &scores_prev_slice[previous_offset..],
                 expected_levels[base_idx],
                 &signal[current_band_start..current_band_end],
-                band_start_diff,
+                prev_band_offset,
                 &short_dwell_penalty_vec,
                 dp_buf.as_mut().unwrap(),
             );
         } else {
-            forward_step_viterbi(
+            dp_step(
                 &mut scores_current_slice[0..current_bandwidth],
                 &mut traceback[current_offset..current_slice_end],
                 &scores_prev_slice[previous_offset..],
                 expected_levels[base_idx],
                 &signal[current_band_start..current_band_end],
-                band_start_diff,
+                prev_band_offset,
             );
         }
 
@@ -182,25 +186,25 @@ fn forward_pass(
 }
 
 /// Forward step using the Viterbi algorithm (no dwell penalty).
-pub fn forward_step_viterbi(
+pub fn dp_step(
     current_scores: &mut [f32],
     current_traceback: &mut [i32],
     previous_scores: &[f32],
     current_level: f32,
     current_signal: &[f32],
-    band_start_diff: usize,
+    prev_band_offset: usize,
 ) {
     // Handle start position
-    if band_start_diff == 0 {
-        current_scores[0] = LARGE_SCORE + previous_scores[previous_scores.len() - 1];
+    if prev_band_offset == 0 {
+        current_scores[0] = INVALID_PENALTY + previous_scores[previous_scores.len() - 1];
         current_traceback[0] = -1;
     } else {
         let base_score = score(current_level, current_signal[0]);
-        current_scores[0] = previous_scores[band_start_diff - 1] + base_score;
+        current_scores[0] = previous_scores[prev_band_offset - 1] + base_score;
         current_traceback[0] = 0;
     }
 
-    let previous_scores_slice = &previous_scores[band_start_diff..];
+    let previous_scores_slice = &previous_scores[prev_band_offset..];
 
     let process_len = if previous_scores_slice.len() == current_scores.len() {
         previous_scores_slice.len() - 1
@@ -234,38 +238,38 @@ pub fn forward_step_viterbi(
 
 /// Forward step with dwell time penalties.
 ///
-/// Uses pre-allocated `DpTempBuffers` to avoid per-call heap allocations.
+/// Uses pre-allocated `StepBuffers` to avoid per-call heap allocations.
 #[allow(clippy::too_many_arguments)]
-fn forward_step_dwell_penalty(
+fn dp_step_with_dwell_penalty(
     current_scores: &mut [f32],
     current_traceback: &mut [i32],
     previous_scores: &[f32],
     current_level: f32,
     current_signal: &[f32],
-    band_start_diff: usize,
+    prev_band_offset: usize,
     dwell_penalty: &[f32],
-    buf: &mut DpTempBuffers,
+    buf: &mut StepBuffers,
 ) {
     let len = current_scores.len();
     buf.prepare(len);
 
-    let unpen_scores = &mut buf.unpen_scores[..len];
-    let unpen_tb = &mut buf.unpen_tb[..len];
+    let base_scores = &mut buf.base_scores[..len];
+    let base_traceback = &mut buf.base_traceback[..len];
 
-    forward_step_viterbi(
-        unpen_scores,
-        unpen_tb,
+    dp_step(
+        base_scores,
+        base_traceback,
         previous_scores,
         current_level,
         current_signal,
-        band_start_diff,
+        prev_band_offset,
     );
 
     let max_penalized_len = dwell_penalty.len();
 
     for band_pos in 0..current_scores.len() {
         // Past end of previous band — stay until the end
-        if band_pos as i32 + band_start_diff as i32 - previous_scores.len() as i32
+        if band_pos as i32 + prev_band_offset as i32 - previous_scores.len() as i32
             >= max_penalized_len as i32
         {
             current_scores[band_pos] =
@@ -275,23 +279,23 @@ fn forward_step_dwell_penalty(
         }
 
         // Default: invalid score
-        current_scores[band_pos] = LARGE_SCORE + previous_scores[previous_scores.len() - 1];
+        current_scores[band_pos] = INVALID_PENALTY + previous_scores[previous_scores.len() - 1];
         current_traceback[band_pos] = -1;
 
-        if band_pos == 0 && band_start_diff == 0 {
+        if band_pos == 0 && prev_band_offset == 0 {
             continue;
         }
 
         let mut running_pos_score = 0.0;
         for dwell_idx in 0..dwell_penalty.len() {
-            if dwell_idx > band_pos || (band_start_diff == 0 && band_pos == dwell_idx) {
+            if dwell_idx > band_pos || (prev_band_offset == 0 && band_pos == dwell_idx) {
                 break;
             }
 
             running_pos_score += score(current_level, current_signal[band_pos - dwell_idx]);
 
             let dwell_offset =
-                (band_pos as i32 - dwell_idx as i32 - 1 + band_start_diff as i32) as usize;
+                (band_pos as i32 - dwell_idx as i32 - 1 + prev_band_offset as i32) as usize;
             if dwell_offset >= previous_scores.len() {
                 continue;
             }
@@ -306,19 +310,19 @@ fn forward_step_dwell_penalty(
         }
 
         if band_pos >= max_penalized_len {
-            let pos_score = unpen_scores[band_pos - max_penalized_len] + running_pos_score;
+            let pos_score = base_scores[band_pos - max_penalized_len] + running_pos_score;
 
             if pos_score < current_scores[band_pos] {
                 current_scores[band_pos] = pos_score;
                 current_traceback[band_pos] =
-                    unpen_tb[band_pos - max_penalized_len] + max_penalized_len as i32;
+                    base_traceback[band_pos - max_penalized_len] + max_penalized_len as i32;
             }
         }
     }
 }
 
 /// Calculate the dwell penalty vector.
-fn calculate_short_dwell_penalty_vec(target: f32, limit: f32, weight: f32) -> Vec<f32> {
+fn build_dwell_penalties(target: f32, limit: f32, weight: f32) -> Vec<f32> {
     let actual_limit = if limit > target { target } else { limit };
     let size = actual_limit as usize;
     (0..size)
@@ -361,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_short_dwell_penalty_vec() {
-        let vec = calculate_short_dwell_penalty_vec(4.0, 3.0, 0.5);
+    fn test_build_dwell_penalties() {
+        let vec = build_dwell_penalties(4.0, 3.0, 0.5);
         assert_eq!(vec, vec![8.0, 4.5, 2.0]);
     }
 
@@ -423,7 +427,7 @@ mod tests {
             -0.08305858,
         ];
 
-        forward_step_viterbi(
+        dp_step(
             &mut scores[..band_width],
             &mut tb[..band_width],
             &prev_scores,
@@ -510,9 +514,9 @@ mod tests {
             -0.08305858,
         ];
         let dwell_penalty = vec![8., 4.5, 2.];
-        let mut buf = DpTempBuffers::new(band_width);
+        let mut buf = StepBuffers::new(band_width);
 
-        forward_step_dwell_penalty(
+        dp_step_with_dwell_penalty(
             &mut scores[..band_width],
             &mut tb[..band_width],
             &prev_scores,

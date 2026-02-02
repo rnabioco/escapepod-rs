@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Inspired by fishnet, licensed under the GNU General Public License v3.0.
+
 //! Top-level refinement pipeline: iterative DP + rescale loop.
 
 use anyhow::Result;

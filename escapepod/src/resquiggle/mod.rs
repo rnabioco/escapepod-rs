@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Inspired by fishnet, licensed under the GNU General Public License v3.0.
+
 //! Signal-to-sequence alignment refinement (resquiggle).
 //!
-//! This module ports the core resquiggle algorithms from fishnet, providing
+//! This module is inspired by the resquiggle algorithms from fishnet, providing
 //! banded dynamic programming for refining basecaller signal-to-base mappings
 //! against a kmer level model.
 
