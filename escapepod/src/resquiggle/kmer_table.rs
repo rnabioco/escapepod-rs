@@ -2,15 +2,39 @@
 
 use anyhow::{bail, Result};
 use flate2::read::GzDecoder;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+/// Encode a nucleotide base to a 2-bit value (A=0, C=1, G=2, T/U=3).
+#[inline]
+fn encode_base(b: u8) -> Option<usize> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' | b'U' | b'u' => Some(3),
+        _ => None,
+    }
+}
+
+/// Encode a kmer as an integer index for flat array lookup.
+#[inline]
+fn encode_kmer(kmer: &[u8]) -> Option<usize> {
+    let mut idx = 0usize;
+    for &b in kmer {
+        idx = (idx << 2) | encode_base(b)?;
+    }
+    Some(idx)
+}
+
 /// A table mapping k-mers to their expected signal levels.
+///
+/// Uses a flat array indexed by 2-bit-per-base encoding for O(1) lookup
+/// (4^k entries for k-mers over {A,C,G,T/U}).
 #[derive(Debug)]
 pub struct KmerTable {
-    index: HashMap<Vec<u8>, usize>,
     levels: Vec<f32>,
     k: usize,
     dominant_base: usize,
@@ -32,8 +56,7 @@ impl KmerTable {
         };
 
         let mut unique_kmers = HashSet::new();
-        let mut kmers_unsorted: Vec<Vec<u8>> = Vec::new();
-        let mut levels_unsorted: Vec<f32> = Vec::new();
+        let mut kmer_levels: Vec<(Vec<u8>, f32)> = Vec::new();
         let mut prev_k: Option<usize> = None;
 
         for line in reader.lines() {
@@ -69,48 +92,36 @@ impl KmerTable {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("cannot parse level '{}': {}", parts[1], e))?;
 
-            kmers_unsorted.push(kmer);
-            levels_unsorted.push(level);
+            kmer_levels.push((kmer, level));
         }
 
-        if kmers_unsorted.is_empty() {
+        if kmer_levels.is_empty() {
             bail!("empty kmer table file");
         }
 
-        let k = kmers_unsorted[0].len();
-        let exp_len = 4usize.pow(k as u32);
-        if kmers_unsorted.len() < exp_len {
+        let k = kmer_levels[0].0.len();
+        let table_size = 4usize.pow(k as u32);
+        if kmer_levels.len() < table_size {
             bail!(
                 "kmer table has {} entries, expected at least {} (4^{})",
-                kmers_unsorted.len(),
-                exp_len,
+                kmer_levels.len(),
+                table_size,
                 k
             );
         }
 
-        // Sort by level and build index
-        let mut indices: Vec<usize> = (0..levels_unsorted.len()).collect();
-        indices.sort_by(|&i, &j| {
-            levels_unsorted[i]
-                .partial_cmp(&levels_unsorted[j])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut index = HashMap::new();
-        let mut kmers_sorted = Vec::with_capacity(kmers_unsorted.len());
-        let mut levels_sorted = Vec::with_capacity(levels_unsorted.len());
-
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            kmers_sorted.push(kmers_unsorted[old_idx].clone());
-            levels_sorted.push(levels_unsorted[old_idx]);
-            index.insert(kmers_unsorted[old_idx].clone(), new_idx);
+        // Build flat array indexed by encoded kmer
+        let mut levels = vec![0.0f32; table_size];
+        for (kmer, level) in &kmer_levels {
+            let idx = encode_kmer(kmer)
+                .ok_or_else(|| anyhow::anyhow!("invalid base in kmer: {:?}", kmer))?;
+            levels[idx] = *level;
         }
 
-        let dominant_base = determine_dominant_base(&kmers_sorted, k);
+        let dominant_base = determine_dominant_base(&levels, k);
 
         Ok(KmerTable {
-            index,
-            levels: levels_sorted,
+            levels,
             k,
             dominant_base,
         })
@@ -128,43 +139,50 @@ impl KmerTable {
             bail!("MAD is zero, cannot normalize");
         }
 
-        self.levels = self
-            .levels
-            .iter()
-            .map(|el| (el - median) / scaled_mad)
-            .collect();
+        for level in &mut self.levels {
+            *level = (*level - median) / scaled_mad;
+        }
 
         Ok(())
     }
 
     /// Look up the level for a kmer (as bytes).
+    #[inline]
     pub fn get(&self, kmer: &[u8]) -> Result<f32> {
         if kmer.len() != self.k {
             bail!("kmer length {} != expected {}", kmer.len(), self.k);
         }
-        let idx = self
-            .index
-            .get(kmer)
-            .ok_or_else(|| anyhow::anyhow!("kmer not found in table"))?;
-        Ok(self.levels[*idx])
+        let idx = encode_kmer(kmer)
+            .ok_or_else(|| anyhow::anyhow!("kmer contains invalid base"))?;
+        Ok(self.levels[idx])
     }
 
     /// Extract expected levels for each position in a sequence.
     ///
-    /// Slides a kmer window across the sequence and assigns each kmer's level
-    /// to the dominant base position within that kmer.
+    /// Uses rolling 2-bit encoding for O(1) per-position lookup.
     pub fn extract_levels(&self, seq: &[u8]) -> Result<Vec<f32>> {
         if seq.len() < self.k {
             bail!("sequence length {} < kmer size {}", seq.len(), self.k);
         }
 
         let mut levels = vec![0.0f32; seq.len()];
+        let mask = (1usize << (2 * self.k)) - 1;
 
-        for pos in 0..(seq.len() - self.k + 1) {
-            let center_pos = pos + self.dominant_base;
-            let kmer = &seq[pos..(pos + self.k)];
-            let level = self.get(kmer)?;
-            levels[center_pos] = level;
+        // Encode first kmer
+        let mut idx = 0usize;
+        for (i, &base) in seq[..self.k].iter().enumerate() {
+            let b = encode_base(base)
+                .ok_or_else(|| anyhow::anyhow!("invalid base at position {}", i))?;
+            idx = (idx << 2) | b;
+        }
+        levels[self.dominant_base] = self.levels[idx];
+
+        // Rolling encode for remaining positions
+        for pos in 1..=(seq.len() - self.k) {
+            let new_base = encode_base(seq[pos + self.k - 1])
+                .ok_or_else(|| anyhow::anyhow!("invalid base at position {}", pos + self.k - 1))?;
+            idx = ((idx << 2) | new_base) & mask;
+            levels[pos + self.dominant_base] = self.levels[idx];
         }
 
         Ok(levels)
@@ -178,24 +196,42 @@ impl KmerTable {
 
 /// Determine which position in the kmer has the most influence on levels
 /// using the Kruskal-Wallis H test.
-fn determine_dominant_base(kmers_sorted: &[Vec<u8>], k: usize) -> usize {
-    let n_kmers = kmers_sorted.len();
+fn determine_dominant_base(levels: &[f32], k: usize) -> usize {
+    let n_kmers = levels.len();
+
+    // Sort kmer indices by level to get rank ordering
+    let mut sorted_indices: Vec<usize> = (0..n_kmers).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        levels[a]
+            .partial_cmp(&levels[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Build rank array: rank[encoded_kmer] = position in sorted order
+    let mut rank = vec![0usize; n_kmers];
+    for (sort_pos, &encoded_idx) in sorted_indices.iter().enumerate() {
+        rank[encoded_idx] = sort_pos;
+    }
+
     let mut best_pos = k / 2; // default to center
     let mut best_h = f64::NEG_INFINITY;
 
     for base_idx in 0..k {
+        let shift = 2 * (k - 1 - base_idx);
         let mut indices_a = Vec::with_capacity(n_kmers / 4);
         let mut indices_c = Vec::with_capacity(n_kmers / 4);
         let mut indices_g = Vec::with_capacity(n_kmers / 4);
         let mut indices_t = Vec::with_capacity(n_kmers / 4);
 
-        for (kmer_idx, kmer) in kmers_sorted.iter().enumerate() {
-            match kmer[base_idx] {
-                b'A' | b'a' => indices_a.push(kmer_idx),
-                b'C' | b'c' => indices_c.push(kmer_idx),
-                b'G' | b'g' => indices_g.push(kmer_idx),
-                b'T' | b't' => indices_t.push(kmer_idx),
-                _ => {}
+        for (encoded_idx, &r) in rank.iter().enumerate() {
+            // Extract the base at position base_idx from the encoded kmer
+            let base = (encoded_idx >> shift) & 0x3;
+            match base {
+                0 => indices_a.push(r),
+                1 => indices_c.push(r),
+                2 => indices_g.push(r),
+                3 => indices_t.push(r),
+                _ => unreachable!(),
             }
         }
 
@@ -247,6 +283,18 @@ fn median_f32(data: &[f32]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_kmer() {
+        assert_eq!(encode_kmer(b"A"), Some(0));
+        assert_eq!(encode_kmer(b"C"), Some(1));
+        assert_eq!(encode_kmer(b"G"), Some(2));
+        assert_eq!(encode_kmer(b"T"), Some(3));
+        assert_eq!(encode_kmer(b"AC"), Some(0b0001));
+        assert_eq!(encode_kmer(b"GT"), Some(0b1011));
+        assert_eq!(encode_kmer(b"AAAAAAAAA"), Some(0));
+        assert_eq!(encode_kmer(b"N"), None);
+    }
 
     #[test]
     fn test_kruskal_h() {

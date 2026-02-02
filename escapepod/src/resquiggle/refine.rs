@@ -70,9 +70,14 @@ pub fn refine_signal_map(
     let perform_rescaling = n_iterations > 0;
     let n_iter = n_iterations.max(1);
 
+    // Pre-allocate normalization buffer (reused across iterations)
+    let mut signal_norm = vec![0.0f32; signal.len()];
+
     for _i in 0..n_iter {
-        // Normalize signal
-        let signal_norm: Vec<f32> = signal.iter().map(|el| (el - shift) / scale).collect();
+        // Normalize signal in-place into reusable buffer
+        for (i, el) in signal.iter().enumerate() {
+            signal_norm[i] = (el - shift) / scale;
+        }
 
         // Run one refinement step (trim, band, DP)
         map = refinement_step(map, &signal_norm, expected_levels, settings)?;

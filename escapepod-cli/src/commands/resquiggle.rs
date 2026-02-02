@@ -188,7 +188,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     let output_path = args.output.clone();
     let writer_handle = std::thread::spawn(move || -> anyhow::Result<usize> {
         let output_file = std::fs::File::create(&output_path)?;
-        let mut writer = bam::io::Writer::new(output_file);
+        let encoder = bgzf::io::MultithreadedWriter::with_worker_count(worker_count, output_file);
+        let mut writer = bam::io::Writer::from(encoder);
         writer.write_header(&header_clone)?;
 
         let mut count = 0;
@@ -200,15 +201,16 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             }
         }
 
-        let inner = writer.into_inner();
+        let mut inner = writer.into_inner();
         inner.finish()?;
         Ok(count)
     });
 
     // Stream BAM records, filter against POD5 index, and process in chunks
+    // Each chunk entry carries the pre-parsed UUID to avoid double parsing.
     const CHUNK_SIZE: usize = 10_000;
     let stream_spinner = create_spinner("Processing")?;
-    let mut chunk: Vec<RecordBuf> = Vec::with_capacity(CHUNK_SIZE);
+    let mut chunk: Vec<(uuid::Uuid, RecordBuf)> = Vec::with_capacity(CHUNK_SIZE);
     let mut total_bam: usize = 0;
     let mut matched: usize = 0;
 
@@ -219,26 +221,26 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         }
         total_bam += 1;
 
-        // Check if this read has a matching POD5 entry
-        let has_match = record_buf
+        // Parse UUID once and check for POD5 match
+        let read_id = record_buf
             .name()
             .and_then(|name| {
                 let name_bytes: &[u8] = name.as_ref();
                 let name_str = name_bytes.to_str().ok()?;
                 let uuid = parse_uuid_flexible(name_str).ok()?;
                 if pod5_reads.contains_key(&uuid) {
-                    Some(())
+                    Some(uuid)
                 } else {
                     None
                 }
-            })
-            .is_some();
+            });
 
-        if !has_match {
-            continue;
-        }
+        let read_id = match read_id {
+            Some(id) => id,
+            None => continue,
+        };
         matched += 1;
-        chunk.push(record_buf);
+        chunk.push((read_id, record_buf));
 
         if total_bam % 50_000 == 0 {
             stream_spinner.set_message(format!(
@@ -327,7 +329,7 @@ impl RefineStats {
 
 /// Refine a chunk of BAM records in parallel and send to the writer thread.
 fn refine_and_send_chunk(
-    chunk: &mut Vec<RecordBuf>,
+    chunk: &mut Vec<(uuid::Uuid, RecordBuf)>,
     pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
     signal_extractors: &[escapepod::SignalExtractor<'_>],
     kmer_table: &KmerTable,
@@ -335,8 +337,8 @@ fn refine_and_send_chunk(
     stats: &RefineStats,
     tx: &std::sync::mpsc::SyncSender<Vec<RecordBuf>>,
 ) -> anyhow::Result<()> {
-    chunk.par_iter_mut().for_each(|record| {
-        match refine_single_read(record, pod5_reads, signal_extractors, kmer_table, settings) {
+    chunk.par_iter_mut().for_each(|(read_id, record)| {
+        match refine_single_read(*read_id, record, pod5_reads, signal_extractors, kmer_table, settings) {
             Ok(true) => {
                 stats.refined_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -354,8 +356,12 @@ fn refine_and_send_chunk(
             }
         }
     });
-    let finished_chunk = std::mem::take(chunk);
-    tx.send(finished_chunk)?;
+    // Extract just the RecordBufs for the writer
+    let records: Vec<RecordBuf> = std::mem::take(chunk)
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    tx.send(records)?;
     Ok(())
 }
 
@@ -370,23 +376,14 @@ struct Pod5ReadInfo {
 /// Refine a single BAM record's signal-to-base mapping.
 /// Returns Ok(true) if refined, Ok(false) if skipped.
 fn refine_single_read(
+    read_id: uuid::Uuid,
     record: &mut RecordBuf,
     pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
     signal_extractors: &[escapepod::SignalExtractor<'_>],
     kmer_table: &KmerTable,
     settings: &RefineSettings,
 ) -> anyhow::Result<bool> {
-    // Extract read ID from query name
-    let read_id = match record.name() {
-        Some(name) => {
-            let name_bytes: &[u8] = name.as_ref();
-            let name_str = name_bytes.to_str()?;
-            parse_uuid_flexible(name_str)?
-        }
-        None => bail!("no read name"),
-    };
-
-    // Look up POD5 read
+    // Look up POD5 read (UUID already parsed by caller)
     let pod5_info = match pod5_reads.get(&read_id) {
         Some(info) => info,
         None => bail!("no matching POD5 read"),
@@ -426,13 +423,11 @@ fn refine_single_read(
     // Build initial query-to-signal map from move table
     let seq_to_signal = build_query_to_signal_map(&moves, stride, sequence.len())?;
 
-    // Extract signal on-demand (parallel decompression)
+    // Extract signal on-demand (parallel decompression) — kept as i16
     let signal_i16 = signal_extractors[pod5_info.reader_idx]
         .get_signal(&pod5_info.signal_rows)?;
-    let full_signal: Vec<f32> = signal_i16.iter().map(|&s| s as f32).collect();
 
-    // Extract signal trimming tags (sp, ts, ns) to trim the signal
-    // as fishnet does before alignment
+    // Compute signal trimming bounds on the i16 signal (no conversion yet)
     let sp_tag = Tag::new(b's', b'p');
     let ts_tag = Tag::new(b't', b's');
     let ns_tag = Tag::new(b'n', b's');
@@ -444,19 +439,23 @@ fn refine_single_read(
     let signal_start = parent_signal_offset + trimmed_signal_len;
     let signal_end = match subread_signal_len {
         Some(ns) => parent_signal_offset + ns as usize,
-        None => full_signal.len(),
+        None => signal_i16.len(),
     };
 
-    if signal_start >= signal_end || signal_end > full_signal.len() {
+    if signal_start >= signal_end || signal_end > signal_i16.len() {
         bail!(
             "invalid signal trim: start={}, end={}, signal_len={}",
             signal_start,
             signal_end,
-            full_signal.len()
+            signal_i16.len()
         );
     }
 
-    let signal_f32 = &full_signal[signal_start..signal_end];
+    // Convert only the trimmed range from i16 to f32
+    let signal_f32: Vec<f32> = signal_i16[signal_start..signal_end]
+        .iter()
+        .map(|&s| s as f32)
+        .collect();
 
     // Get initial scaling from POD5 calibration + BAM sm/sd tags
     let sm_tag = Tag::new(b's', b'm');
@@ -496,7 +495,7 @@ fn refine_single_read(
     // Run refinement on trimmed signal
     let result = match refine_signal_map(
         settings,
-        signal_f32,
+        &signal_f32,
         &seq_to_signal,
         &levels,
         initial_scale,

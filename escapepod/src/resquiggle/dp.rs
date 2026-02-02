@@ -22,14 +22,23 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
     let mut base_offsets = Vec::with_capacity(band.len() + 1);
     base_offsets.push(0);
     let mut offset_cumsum = 0;
+    let mut max_bandwidth = 0usize;
     for i in 0..band.len() {
-        offset_cumsum += band.end[i] - band.start[i];
+        let bw = band.end[i] - band.start[i];
+        max_bandwidth = max_bandwidth.max(bw);
+        offset_cumsum += bw;
         base_offsets.push(offset_cumsum);
     }
 
     let band_len = offset_cumsum;
     let mut all_scores = vec![f32::INFINITY; band_len];
     let mut traceback = vec![0i32; band_len];
+
+    // Pre-allocate dwell penalty buffers (reused across all bases)
+    let mut dp_buf = match method {
+        RefineAlgo::DwellPenalty { .. } => Some(DpTempBuffers::new(max_bandwidth)),
+        RefineAlgo::Viterbi => None,
+    };
 
     forward_pass(
         &mut all_scores,
@@ -39,6 +48,7 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
         band,
         &base_offsets,
         method,
+        &mut dp_buf,
     );
 
     let mut path = vec![0usize; levels.len() + 1];
@@ -47,7 +57,33 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
     path
 }
 
+/// Reusable temporary buffers for the dwell penalty forward step.
+struct DpTempBuffers {
+    unpen_scores: Vec<f32>,
+    unpen_tb: Vec<i32>,
+}
+
+impl DpTempBuffers {
+    fn new(capacity: usize) -> Self {
+        Self {
+            unpen_scores: vec![0.0f32; capacity],
+            unpen_tb: vec![0i32; capacity],
+        }
+    }
+
+    /// Ensure buffers are at least `len` elements and zero them.
+    fn prepare(&mut self, len: usize) {
+        if self.unpen_scores.len() < len {
+            self.unpen_scores.resize(len, 0.0);
+            self.unpen_tb.resize(len, 0);
+        }
+        self.unpen_scores[..len].fill(0.0);
+        self.unpen_tb[..len].fill(0);
+    }
+}
+
 /// Forward pass of banded DP.
+#[allow(clippy::too_many_arguments)]
 fn forward_pass(
     all_scores: &mut [f32],
     traceback: &mut [i32],
@@ -56,6 +92,7 @@ fn forward_pass(
     band: &Band,
     base_offsets: &[usize],
     method: &RefineAlgo,
+    dp_buf: &mut Option<DpTempBuffers>,
 ) {
     let mut short_dwell_penalty_vec = Vec::new();
     let use_dwell_penalty = match method {
@@ -87,6 +124,7 @@ fn forward_pass(
             &signal[0..current_bandwidth],
             1,
             &short_dwell_penalty_vec,
+            dp_buf.as_mut().unwrap(),
         );
     } else {
         forward_step_viterbi(
@@ -125,6 +163,7 @@ fn forward_pass(
                 &signal[current_band_start..current_band_end],
                 band_start_diff,
                 &short_dwell_penalty_vec,
+                dp_buf.as_mut().unwrap(),
             );
         } else {
             forward_step_viterbi(
@@ -194,7 +233,10 @@ pub fn forward_step_viterbi(
 }
 
 /// Forward step with dwell time penalties.
-pub fn forward_step_dwell_penalty(
+///
+/// Uses pre-allocated `DpTempBuffers` to avoid per-call heap allocations.
+#[allow(clippy::too_many_arguments)]
+fn forward_step_dwell_penalty(
     current_scores: &mut [f32],
     current_traceback: &mut [i32],
     previous_scores: &[f32],
@@ -202,14 +244,17 @@ pub fn forward_step_dwell_penalty(
     current_signal: &[f32],
     band_start_diff: usize,
     dwell_penalty: &[f32],
+    buf: &mut DpTempBuffers,
 ) {
-    // Compute un-penalized scores for lookup after dwell_penalty range
-    let mut unpen_scores = vec![0.0f32; current_scores.len()];
-    let mut unpen_tb = vec![0i32; current_traceback.len()];
+    let len = current_scores.len();
+    buf.prepare(len);
+
+    let unpen_scores = &mut buf.unpen_scores[..len];
+    let unpen_tb = &mut buf.unpen_tb[..len];
 
     forward_step_viterbi(
-        &mut unpen_scores,
-        &mut unpen_tb,
+        unpen_scores,
+        unpen_tb,
         previous_scores,
         current_level,
         current_signal,
@@ -465,6 +510,7 @@ mod tests {
             -0.08305858,
         ];
         let dwell_penalty = vec![8., 4.5, 2.];
+        let mut buf = DpTempBuffers::new(band_width);
 
         forward_step_dwell_penalty(
             &mut scores[..band_width],
@@ -474,6 +520,7 @@ mod tests {
             &signal,
             1,
             &dwell_penalty,
+            &mut buf,
         );
 
         let expected_scores: Vec<f32> = vec![
