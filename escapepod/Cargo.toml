@@ -34,3 +34,6 @@ default = []
 train = ["linfa", "linfa-svm"]
 
 [dev-dependencies]
+parquet = { version = "57", default-features = false, features = ["arrow", "snap", "zstd"] }
+noodles-bam = "0.85"
+noodles-sam = "0.81"
