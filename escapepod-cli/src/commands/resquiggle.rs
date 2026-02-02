@@ -47,7 +47,7 @@ pub struct ResquiggleArgs {
     pub algo: RefineAlgo,
 
     /// Number of refinement iterations
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "2")]
     pub iterations: usize,
 
     /// Half bandwidth for banded DP
@@ -110,7 +110,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         half_bandwidth: args.half_bandwidth,
         adjust_band_min_size: 2,
         rescale_algo: args.rescale.clone(),
-        rough_rescale_algo: RoughRescaleAlgo::None,
+        rough_rescale_algo: RoughRescaleAlgo::default(),
         normalize_levels: args.normalize_levels,
     };
 

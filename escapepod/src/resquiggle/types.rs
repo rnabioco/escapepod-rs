@@ -65,10 +65,9 @@ impl Default for RescaleAlgo {
 }
 
 /// Algorithm for initial rough rescaling of signals.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RoughRescaleAlgo {
     /// No rough rescaling applied.
-    #[default]
     None,
     /// Least-squares regression-based rough rescaling.
     LeastSquares {
@@ -84,12 +83,22 @@ pub enum RoughRescaleAlgo {
     },
 }
 
+impl Default for RoughRescaleAlgo {
+    fn default() -> Self {
+        Self::TheilSen {
+            quantiles: Self::default_quantiles(),
+            clip_bases: 10,
+            use_base_center: true,
+        }
+    }
+}
+
 impl RoughRescaleAlgo {
     /// Default quantiles used for rough rescaling (0.05 to 0.95 in steps of 0.05).
     pub fn default_quantiles() -> Vec<f32> {
         vec![
-            0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8,
-            0.85, 0.9, 0.95,
+            0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75,
+            0.8, 0.85, 0.9, 0.95,
         ]
     }
 }
@@ -117,7 +126,7 @@ impl Default for RefineSettings {
     fn default() -> Self {
         Self {
             refinement_algo: RefineAlgo::default(),
-            n_refinement_iters: 1,
+            n_refinement_iters: 2,
             half_bandwidth: 5,
             adjust_band_min_size: 2,
             rescale_algo: RescaleAlgo::default(),

@@ -350,7 +350,13 @@ pub fn banded_traceback(
         let band_start = seq_band_start[base_idx];
         let traceback_idx = base_offset + (sig_lookup_pos - band_start);
         let next_sig_offset = traceback[traceback_idx];
-        path[base_idx] = sig_lookup_pos - (next_sig_offset as usize);
+        path[base_idx] = if next_sig_offset >= 0 {
+            sig_lookup_pos - (next_sig_offset as usize)
+        } else {
+            // Traceback hit an unreachable cell (band too narrow or bad inputs).
+            // Fall back to band start to avoid underflow.
+            band_start
+        };
     }
 }
 
