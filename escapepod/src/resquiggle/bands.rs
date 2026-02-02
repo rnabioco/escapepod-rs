@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Inspired by fishnet, licensed under the GNU General Public License v3.0.
+
 //! Signal band and sequence band computation for banded dynamic programming.
 
 use anyhow::{bail, Result};
@@ -139,7 +142,7 @@ impl Band {
         self.end = seq_end;
         self.is_sequence_band = true;
 
-        self.adjust_sequence_band(min_step)?;
+        self.enforce_min_step(min_step)?;
 
         // Validate
         if self.start[0] != 0 {
@@ -157,8 +160,8 @@ impl Band {
         Ok(())
     }
 
-    /// Adjust sequence band boundaries to enforce minimum step between bases.
-    fn adjust_sequence_band(&mut self, min_step: usize) -> Result<()> {
+    /// Enforce minimum signal step between consecutive bases in a sequence band.
+    fn enforce_min_step(&mut self, min_step: usize) -> Result<()> {
         let band_min = self.start[0];
         let band_max = self.end[self.end.len() - 1];
         let seq_len = self.start.len();
