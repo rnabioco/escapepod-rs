@@ -133,6 +133,12 @@ escapepod resquiggle reads.pod5 \
     -j 8
 ```
 
+## Algorithm References
+
+The resquiggle algorithms are inspired by:
+
+- **Banded DP refinement and signal rescaling**: Inspired by [fishnet](https://www.researchsquare.com/article/rs-8345719/v1) by Brickner et al., licensed under GPL-3.0.
+
 ## Notes
 
 - Only reads present in both the BAM and POD5 input are refined; all BAM records are still written to the output.
