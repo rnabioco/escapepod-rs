@@ -29,7 +29,9 @@ use sam::alignment::record_buf::data::field::value::Array as SamArray;
 use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
 
-use escapepod::resquiggle::{calculate_initial_scaling, refine_signal_map, KmerTable, RefineSettings};
+use escapepod::resquiggle::{
+    calculate_initial_scaling, refine_signal_map, KmerTable, RefineSettings,
+};
 use escapepod::{parse_uuid_flexible, Reader};
 
 /// POD5 read metadata needed for refinement.
@@ -153,7 +155,6 @@ fn test_resquiggle_vs_fishnet() {
         return;
     }
     let fishnet_ref = load_fishnet_reference(&parquet_path);
-    eprintln!("Loaded {} fishnet reference reads", fishnet_ref.len());
 
     // --- Load kmer table ---
     let kmer_path = project_root.join("data/kmer_models/rna004_9mer_levels_v1.txt.gz");
@@ -175,8 +176,9 @@ fn test_resquiggle_vs_fishnet() {
             },
         );
     }
-    let signal_extractor = reader.signal_extractor().expect("failed to create signal extractor");
-    eprintln!("Indexed {} POD5 reads", pod5_index.len());
+    let signal_extractor = reader
+        .signal_extractor()
+        .expect("failed to create signal extractor");
 
     // --- Open BAM and process reads ---
     let bam_path = project_root.join("data/drna/yeast_trna_mappings.bam");
@@ -188,10 +190,6 @@ fn test_resquiggle_vs_fishnet() {
 
     let mut compared = 0usize;
     let mut total_match_pct = 0.0f64;
-    let mut min_match_pct = 1.0f64;
-    let mut min_match_read = String::new();
-    let mut panicked = 0usize;
-    let mut skipped = 0usize;
 
     loop {
         let mut record = RecordBuf::default();
@@ -223,10 +221,7 @@ fn test_resquiggle_vs_fishnet() {
         };
         let fishnet_boundaries = match fishnet_ref.get(&read_id) {
             Some(b) => b,
-            None => {
-                skipped += 1;
-                continue;
-            }
+            None => continue,
         };
 
         // --- Extract move table ---
@@ -282,7 +277,6 @@ fn test_resquiggle_vs_fishnet() {
 
         // Validate move table length matches signal (fishnet query_to_signal.rs:61)
         if moves.len() != trimmed_len / stride {
-            skipped += 1;
             continue;
         }
 
@@ -295,7 +289,6 @@ fn test_resquiggle_vs_fishnet() {
 
         // Verify reversed map: first boundary should be 0, last should be trimmed_len
         if seq_to_signal[0] != 0 || seq_to_signal[seq_to_signal.len() - 1] != trimmed_len {
-            skipped += 1;
             continue;
         }
 
@@ -315,26 +308,6 @@ fn test_resquiggle_vs_fishnet() {
             Err(_) => continue,
         };
 
-        // --- Diagnostic output for first read ---
-        if compared == 0 && panicked == 0 {
-            let flags = record.flags();
-            eprintln!("  First read diagnostics: {}", read_id);
-            eprintln!("  BAM flags: {:?} (reverse: {})", flags, flags.is_reverse_complemented());
-            eprintln!("  seq_len={} signal_len={} stride={} moves_len={}", sequence.len(), trimmed_len, stride, moves.len());
-            eprintln!("  scale={} shift={}", scale, shift);
-            eprintln!("  forward_map first/last: {:?} / {:?}", &forward_map[..5.min(forward_map.len())], &forward_map[forward_map.len().saturating_sub(3)..]);
-            eprintln!("  seq_to_signal first/last: {:?} / {:?}", &seq_to_signal[..5.min(seq_to_signal.len())], &seq_to_signal[seq_to_signal.len().saturating_sub(3)..]);
-            eprintln!("  fishnet first/last: {:?} / {:?}", &fishnet_boundaries[..5.min(fishnet_boundaries.len())], &fishnet_boundaries[fishnet_boundaries.len().saturating_sub(3)..]);
-            eprintln!("  levels first/last: {:?} / {:?}", &levels[..5.min(levels.len())], &levels[levels.len().saturating_sub(5)..]);
-            // Normalize a few signal values for comparison
-            let sig_norm_start: Vec<f32> = signal_f32[..10.min(signal_f32.len())].iter().map(|&s| (s - shift) / scale).collect();
-            let sig_norm_end: Vec<f32> = signal_f32[signal_f32.len().saturating_sub(10)..].iter().map(|&s| (s - shift) / scale).collect();
-            eprintln!("  signal_norm start: {:?}", sig_norm_start);
-            eprintln!("  signal_norm end: {:?}", sig_norm_end);
-            eprintln!("  seq first 20 bases: {:?}", std::str::from_utf8(&sequence[..20.min(sequence.len())]).unwrap_or("?"));
-            eprintln!("  seq last 20 bases: {:?}", std::str::from_utf8(&sequence[sequence.len().saturating_sub(20)..]).unwrap_or("?"));
-        }
-
         // --- Run refinement on reversed signal ---
         let settings_clone = settings.clone();
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -348,14 +321,8 @@ fn test_resquiggle_vs_fishnet() {
             )
         })) {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => {
-                skipped += 1;
-                continue;
-            }
-            Err(_) => {
-                panicked += 1;
-                continue;
-            }
+            Ok(Err(_)) => continue,
+            Err(_) => continue,
         };
 
         // --- Compare directly with fishnet boundaries ---
@@ -383,49 +350,12 @@ fn test_resquiggle_vs_fishnet() {
 
         compared += 1;
         total_match_pct += match_pct;
-        if match_pct < min_match_pct {
-            min_match_pct = match_pct;
-            min_match_read = read_id.to_string();
-        }
-
-        // Log reads with very low match for debugging
-        if match_pct < 0.80 && compared <= 5 {
-            eprintln!(
-                "  Low match: {} {:.1}% ({}/{}) seq_len={}",
-                read_id,
-                match_pct * 100.0,
-                matching,
-                n_boundaries,
-                seq_len
-            );
-            // Print first few boundary differences
-            for i in 0..n_boundaries.min(8) {
-                let e = escapepod_map[i];
-                let f = fishnet_boundaries[i] as usize;
-                let marker = if e == f { "=" } else { "!" };
-                eprintln!("    [{}] escapepod={} fishnet={} {}", i, e, f, marker);
-            }
-        }
     }
 
     // --- Report ---
     assert!(compared > 0, "No reads were compared — check data paths");
 
     let mean_match_pct = total_match_pct / compared as f64;
-    eprintln!(
-        "\n=== Resquiggle vs fishnet comparison (RNA, reversed signal) ===\n\
-         Reads compared:      {}\n\
-         Reads skipped:       {}\n\
-         Reads panicked (DP): {}\n\
-         Mean boundary match: {:.1}%\n\
-         Min boundary match:  {:.1}% ({})",
-        compared,
-        skipped,
-        panicked,
-        mean_match_pct * 100.0,
-        min_match_pct * 100.0,
-        min_match_read
-    );
 
     // With identical DP algorithms operating on the same reversed signal,
     // we expect very high agreement. Allow for minor floating-point differences
