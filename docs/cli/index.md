@@ -21,6 +21,7 @@ escapepod <COMMAND> [OPTIONS]
 | [repack](repack.md) | Repack POD5 files to optimize storage |
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
 | [demux](demux.md) | Barcode demultiplexing (detect, fingerprint, classify, split, train) |
+| [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP |
 
 ## Global Options
 
