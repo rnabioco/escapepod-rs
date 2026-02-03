@@ -50,10 +50,10 @@ environments:
       - conda: https://conda.anaconda.org/bioconda/linux-64/lib-pod5-0.3.33-py312h12fc78b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libabseil-20250512.1-cxx17_hba17884_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libaec-1.1.5-h088129d_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-20.0.0-h65c7729_33_cpu.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-acero-20.0.0-h635bf11_33_cpu.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-dataset-20.0.0-h635bf11_33_cpu.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-substrait-20.0.0-h3f74fd7_33_cpu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-19.0.1-h65c7729_41_cpu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-acero-19.0.1-h635bf11_41_cpu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-dataset-19.0.1-h635bf11_41_cpu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-substrait-19.0.1-h3f74fd7_41_cpu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libblas-3.11.0-5_h4a7cf45_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libbrotlicommon-1.2.0-hb03c661_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libbrotlidec-1.2.0-hb03c661_1.conda
@@ -83,7 +83,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libopenblas-0.3.30-pthreads_h94d23a6_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libopentelemetry-cpp-1.21.0-hb9b0907_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libopentelemetry-cpp-headers-1.21.0-ha770c72_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libparquet-20.0.0-h7376487_33_cpu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libparquet-19.0.1-h7376487_41_cpu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libprotobuf-6.31.1-h49aed37_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libre2-11-2025.11.05-h7b12aa8_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.51.2-hf4e2dac_0.conda
@@ -110,8 +110,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/polars-1.37.1-pyh6a1acc5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-32-1.37.1-py310hffdcd12_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/prometheus-cpp-1.3.0-ha5d0236_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-20.0.0-py312h7900ff3_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-20.0.0-py312hc195796_1_cpu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-19.0.1-py312h7900ff3_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-19.0.1-py312hc195796_1_cpu.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/pysam-0.23.3-py312h47d5410_1.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.12-hd63d673_2_cpython.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/python-dateutil-2.9.0.post0-pyhe01879c_2.conda
@@ -649,10 +649,10 @@ packages:
   license_family: BSD
   size: 36544
   timestamp: 1769221884824
-- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-20.0.0-h65c7729_33_cpu.conda
-  build_number: 33
-  sha256: 59ca8fde84e1e85c927e2c87db4c60fbc8f1695aa8da03abe7cd1a9f9867252e
-  md5: 8d6287c02044df1a9ae79f26bb3a4301
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-19.0.1-h65c7729_41_cpu.conda
+  build_number: 41
+  sha256: 20175caecf022fc72afec43d141cf7f6fb0d1fac8042142882daef50f8fdc22b
+  md5: 2dec924e31a93f17d114c79ee87dd75c
   depends:
   - __glibc >=2.17,<3.0.a0
   - aws-crt-cpp >=0.35.4,<0.35.5.0a0
@@ -682,59 +682,59 @@ packages:
   - snappy >=1.2.2,<1.3.0a0
   - zstd >=1.5.7,<1.6.0a0
   constrains:
-  - arrow-cpp <0.0a0
-  - parquet-cpp <0.0a0
   - apache-arrow-proc =*=cpu
+  - parquet-cpp <0.0a0
+  - arrow-cpp <0.0a0
   license: Apache-2.0
   license_family: APACHE
-  size: 9416852
-  timestamp: 1769167499682
-- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-acero-20.0.0-h635bf11_33_cpu.conda
-  build_number: 33
-  sha256: b289a92ef2a5f7972bfe08815cf8679425433c7ec9f75d9d361a13b0336f8c65
-  md5: d4faec1b68026c99552c6d85ca5c2ba2
+  size: 9190242
+  timestamp: 1769167531617
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-acero-19.0.1-h635bf11_41_cpu.conda
+  build_number: 41
+  sha256: 75ca8c4d56054ed27dadf213b9eb2530416a76e733951445a229dd79897a1c9b
+  md5: c3e2f12e35b9eeafc1a4b629ea6d6c43
   depends:
   - __glibc >=2.17,<3.0.a0
-  - libarrow 20.0.0 h65c7729_33_cpu
+  - libarrow 19.0.1 h65c7729_41_cpu
   - libgcc >=14
   - libstdcxx >=14
   license: Apache-2.0
   license_family: APACHE
-  size: 668737
-  timestamp: 1769167576422
-- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-dataset-20.0.0-h635bf11_33_cpu.conda
-  build_number: 33
-  sha256: 2a96398bd239dfeb7529bb23ea8b4bdedd3fb67f3c01564fedac80259e331b20
-  md5: aca705868340a255579597abc122646b
+  size: 672305
+  timestamp: 1769167609547
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-dataset-19.0.1-h635bf11_41_cpu.conda
+  build_number: 41
+  sha256: 39f4b2249238d1321c2d131ae422b68c124700772555cdb1746352f288db3d72
+  md5: ad6d541126f0e6583699f65df597c960
   depends:
   - __glibc >=2.17,<3.0.a0
-  - libarrow 20.0.0 h65c7729_33_cpu
-  - libarrow-acero 20.0.0 h635bf11_33_cpu
+  - libarrow 19.0.1 h65c7729_41_cpu
+  - libarrow-acero 19.0.1 h635bf11_41_cpu
   - libgcc >=14
-  - libparquet 20.0.0 h7376487_33_cpu
+  - libparquet 19.0.1 h7376487_41_cpu
   - libstdcxx >=14
   license: Apache-2.0
   license_family: APACHE
-  size: 637395
-  timestamp: 1769167702966
-- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-substrait-20.0.0-h3f74fd7_33_cpu.conda
-  build_number: 33
-  sha256: 3e634ba1733ca05761f0b156fd272d365a5b7a232bed3e37492ef41a51103e2f
-  md5: 8e63867fb364f755433850f1b361a19d
+  size: 644095
+  timestamp: 1769167742740
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libarrow-substrait-19.0.1-h3f74fd7_41_cpu.conda
+  build_number: 41
+  sha256: b57a20d487ebc1e6a9b5f4da13abbe92e5756957301bfde7b65a416c72ea1495
+  md5: fedd210b3d9f6c7f09947ebe18037c58
   depends:
   - __glibc >=2.17,<3.0.a0
   - libabseil * cxx17*
   - libabseil >=20250512.1,<20250513.0a0
-  - libarrow 20.0.0 h65c7729_33_cpu
-  - libarrow-acero 20.0.0 h635bf11_33_cpu
-  - libarrow-dataset 20.0.0 h635bf11_33_cpu
+  - libarrow 19.0.1 h65c7729_41_cpu
+  - libarrow-acero 19.0.1 h635bf11_41_cpu
+  - libarrow-dataset 19.0.1 h635bf11_41_cpu
   - libgcc >=14
   - libprotobuf >=6.31.1,<6.31.2.0a0
   - libstdcxx >=14
   license: Apache-2.0
   license_family: APACHE
-  size: 525491
-  timestamp: 1769167794748
+  size: 532906
+  timestamp: 1769167835334
 - conda: https://conda.anaconda.org/conda-forge/linux-64/libblas-3.11.0-5_h4a7cf45_openblas.conda
   build_number: 5
   sha256: 18c72545080b86739352482ba14ba2c4815e19e26a7417ca21a95b76ec8da24c
@@ -1098,21 +1098,21 @@ packages:
   license_family: APACHE
   size: 363444
   timestamp: 1751782679053
-- conda: https://conda.anaconda.org/conda-forge/linux-64/libparquet-20.0.0-h7376487_33_cpu.conda
-  build_number: 33
-  sha256: b69b42741e8ffb95594015342eb6b8a1f75df40a3954adefe18c0f1ca0d3b70f
-  md5: 2fc757f4c77e8c22defbfccdb4699e0b
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libparquet-19.0.1-h7376487_41_cpu.conda
+  build_number: 41
+  sha256: 1920c552a45e52fcf7d3c984ab8418b6ccd99ecf172b8a871ddb9792fcdaca18
+  md5: c7ae585d520a9882c743b89a0ec8acd3
   depends:
   - __glibc >=2.17,<3.0.a0
-  - libarrow 20.0.0 h65c7729_33_cpu
+  - libarrow 19.0.1 h65c7729_41_cpu
   - libgcc >=14
   - libstdcxx >=14
   - libthrift >=0.22.0,<0.22.1.0a0
   - openssl >=3.5.4,<4.0a0
   license: Apache-2.0
   license_family: APACHE
-  size: 1267053
-  timestamp: 1769167671146
+  size: 1271352
+  timestamp: 1769167710553
 - conda: https://conda.anaconda.org/conda-forge/linux-64/libprotobuf-6.31.1-h49aed37_4.conda
   sha256: 0ef142ac31e6fd59b4af89ac800acb6deb3fbd9cc4ccf070c03cc2c784dc7296
   md5: 07479fc04ba3ddd5d9f760ef1635cfa7
@@ -1498,28 +1498,28 @@ packages:
   license_family: MIT
   size: 199544
   timestamp: 1730769112346
-- conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-20.0.0-py312h7900ff3_1.conda
-  sha256: d5bd9bcb7b2de8171f35c0384b71eadb55af3e96533c3251964682b0dd5512a4
-  md5: 13de7800d704cdb76665fccbbe23a9ad
+- conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-19.0.1-py312h7900ff3_1.conda
+  sha256: 802529c7416d715f1161e86a37cafe5f6853cd308050142f2e6eef669d94bce7
+  md5: 6dd4c98262defe06528a056f93e9fd2d
   depends:
-  - libarrow-acero 20.0.0.*
-  - libarrow-dataset 20.0.0.*
-  - libarrow-substrait 20.0.0.*
-  - libparquet 20.0.0.*
-  - pyarrow-core 20.0.0 *_1_*
+  - libarrow-acero 19.0.1.*
+  - libarrow-dataset 19.0.1.*
+  - libarrow-substrait 19.0.1.*
+  - libparquet 19.0.1.*
+  - pyarrow-core 19.0.1 *_1_*
   - python >=3.12,<3.13.0a0
   - python_abi 3.12.* *_cp312
   license: Apache-2.0
   license_family: APACHE
-  size: 32393
-  timestamp: 1768957180825
-- conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-20.0.0-py312hc195796_1_cpu.conda
+  size: 32418
+  timestamp: 1768964764186
+- conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-19.0.1-py312hc195796_1_cpu.conda
   build_number: 1
-  sha256: 748c774b6824ab2baf4456f72fac019e70034e6063e1bbe2faca79cae480b3e0
-  md5: 3152fe9b55ecbdc081020953b920fa7e
+  sha256: f5a67082c75a47276711953702840000c34932dfeece48b1bb21a01b28e5a050
+  md5: 021c5dc39f52b4f3374619fe2298856a
   depends:
   - __glibc >=2.17,<3.0.a0
-  - libarrow 20.0.0.* *cpu
+  - libarrow 19.0.1.* *cpu
   - libgcc >=14
   - libstdcxx >=14
   - libzlib >=1.3.1,<2.0a0
@@ -1530,8 +1530,8 @@ packages:
   - apache-arrow-proc * cpu
   license: Apache-2.0
   license_family: APACHE
-  size: 5165884
-  timestamp: 1768957076123
+  size: 5228512
+  timestamp: 1768964740857
 - conda: https://conda.anaconda.org/bioconda/linux-64/pysam-0.23.3-py312h47d5410_1.tar.bz2
   sha256: 435029af0a0e9c211974f16f607f6c326d5b3309bc1d80b42bff9b97e06441c6
   md5: 24e122bc224797801b00f2d26902fb93

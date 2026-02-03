@@ -8,6 +8,7 @@ samtools = ">=1.23,<2"
 pysam = "*"
 pandas = "*"
 pod5 = ">=0.3.33,<0.4"
+pyarrow = ">=20,<21"
 
 [activation]
 env = { DORADO_VERSION = "1.3.0", PATH = "$PIXI_CACHE_DIR/tools/dorado-$DORADO_VERSION-linux-x64/bin:$PATH" }

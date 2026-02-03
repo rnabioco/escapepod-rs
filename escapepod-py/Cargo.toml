@@ -1,0 +1,18 @@
+[package]
+name = "escapepod-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Python bindings for the escapepod POD5 library"
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "_escapepod"
+crate-type = ["cdylib"]
+
+[dependencies]
+escapepod = { workspace = true }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+uuid = { workspace = true }

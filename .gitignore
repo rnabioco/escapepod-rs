@@ -32,5 +32,17 @@ flamegraph.svg
 /benchmarks/*.json
 /benchmarks/*.pod5
 
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+*.eggs/
+dist/
+build/
+.venv/
+*.whl
+
 # External data
 data/
