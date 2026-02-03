@@ -62,6 +62,7 @@ nav:
       - repack: cli/repack.md
       - subset: cli/subset.md
       - demux: cli/demux.md
+      - resquiggle: cli/resquiggle.md
   - Library:
       - Overview: library/index.md
       - Reading Files: library/reading.md

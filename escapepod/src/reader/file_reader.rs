@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 
 /// Default maximum number of signal batches to cache.
@@ -113,8 +114,8 @@ pub struct Reader {
     footer: Footer,
     /// Cached run info data.
     run_info_cache: Vec<RunInfoData>,
-    /// Signal batch metadata for O(1) batch lookup.
-    signal_metadata: Option<SignalBatchMetadata>,
+    /// Signal batch metadata for O(1) batch lookup (lazy — computed on first use).
+    signal_metadata: OnceLock<Option<SignalBatchMetadata>>,
     /// LRU cache for signal batches (thread-safe for parallel operations).
     signal_cache: RwLock<SignalBatchCache>,
 }
@@ -141,20 +142,23 @@ impl Reader {
         // Load run info eagerly (it's usually small)
         let run_info_cache = Self::load_run_info(&mmap, &footer)?;
 
-        // Load signal batch metadata (batch size from batch 0, like C++ implementation)
-        let signal_metadata = Self::load_signal_metadata(&mmap, &footer)?;
-
         Ok(Self {
             mmap,
             footer,
             run_info_cache,
-            signal_metadata,
+            signal_metadata: OnceLock::new(),
             signal_cache: RwLock::new(SignalBatchCache::new(cache_size)),
         })
     }
 
     /// Load signal batch metadata for O(1) batch lookup.
+    ///
+    /// Uses the Arrow IPC footer (a few KB at the end of the signal table)
+    /// to extract batch count and row counts, avoiding deserialization of
+    /// the first signal batch (which can be 50-100MB on large files).
     fn load_signal_metadata(mmap: &Mmap, footer: &Footer) -> Result<Option<SignalBatchMetadata>> {
+        use crate::arrow_ipc::ArrowIpcFooter;
+
         let embedded = match footer.signal_table() {
             Some(e) => e,
             None => return Ok(None),
@@ -170,21 +174,18 @@ impl Reader {
         }
 
         let slice = &mmap[start..end];
-        let cursor = Cursor::new(slice);
-        let reader = ArrowFileReader::try_new(cursor, None)?;
+        let ipc_footer = ArrowIpcFooter::parse(slice)?;
 
-        let num_batches = reader.num_batches();
+        let num_batches = ipc_footer.record_batches.len();
         if num_batches == 0 {
             return Ok(None);
         }
 
-        // Read batch 0 to determine batch size (like C++ implementation)
-        let mut reader_iter = reader.into_iter();
-        let batch_size = match reader_iter.next() {
-            Some(Ok(batch)) => batch.num_rows(),
-            Some(Err(e)) => return Err(Error::from(e)),
-            None => return Ok(None),
-        };
+        // Use the row count from batch 0 as the uniform batch size
+        let batch_size = ipc_footer.record_batches[0].row_count as usize;
+        if batch_size == 0 {
+            return Ok(None);
+        }
 
         Ok(Some(SignalBatchMetadata {
             batch_size,
@@ -303,8 +304,12 @@ impl Reader {
     /// The `signal_rows` parameter should be the signal row indices from the read record.
     /// Uses O(1) batch lookup and LRU caching for efficient repeated access.
     pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
-        // Use optimized path if we have signal metadata
-        if let Some(ref metadata) = self.signal_metadata {
+        // Lazily compute signal metadata on first use
+        let metadata = self
+            .signal_metadata
+            .get_or_init(|| Self::load_signal_metadata(&self.mmap, &self.footer).unwrap_or(None));
+
+        if let Some(ref metadata) = metadata {
             return self.get_signal_optimized(signal_rows, metadata);
         }
 
@@ -480,6 +485,78 @@ impl Reader {
         Ok(&self.mmap[start..end])
     }
 
+    /// Bulk extract decompressed signal for multiple reads.
+    ///
+    /// Takes a slice of `(key, signal_rows)` pairs and returns a Vec of
+    /// `(key, Vec<i16>)` with the decompressed signal for each. Uses the fast
+    /// raw byte extraction path (batch-grouped, no Arrow deserialization),
+    /// which is much faster than calling `get_signal` per read.
+    pub fn get_signal_bulk<K: Clone + Send>(
+        &self,
+        reads: &[(K, Vec<u64>)],
+    ) -> Result<Vec<(K, Vec<i16>)>> {
+        use crate::arrow_ipc::ArrowIpcFooter;
+        use crate::compression::vbz::decompress_signal;
+        use rayon::prelude::*;
+
+        let signal_bytes = self.signal_table_bytes()?;
+        let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+
+        // Collect all signal rows with back-references to which read they belong to
+        // (read_index, chunk_index_within_read, signal_row)
+        let mut all_rows: Vec<(usize, usize, u64)> = Vec::new();
+        for (read_idx, (_key, rows)) in reads.iter().enumerate() {
+            for (chunk_idx, &row) in rows.iter().enumerate() {
+                all_rows.push((read_idx, chunk_idx, row));
+            }
+        }
+
+        // Extract all signal rows at once (batch-grouped, sequential I/O)
+        let row_indices: Vec<u64> = all_rows.iter().map(|&(_, _, row)| row).collect();
+        let raw_chunks = signal_footer.extract_signal_rows(&row_indices, signal_bytes)?;
+
+        // Decompress in parallel (VBZ decompression is CPU-bound)
+        let decompressed: Vec<Result<Vec<i16>>> = raw_chunks
+            .par_iter()
+            .map(|chunk| decompress_signal(chunk.signal, chunk.samples as usize))
+            .collect();
+
+        // Assemble per-read
+        let mut result_chunks: Vec<Vec<(usize, Vec<i16>)>> = vec![Vec::new(); reads.len()];
+        for (i, decompressed_result) in decompressed.into_iter().enumerate() {
+            let (read_idx, chunk_idx, _) = all_rows[i];
+            result_chunks[read_idx].push((chunk_idx, decompressed_result?));
+        }
+
+        // Sort chunks within each read and concatenate
+        let mut results = Vec::with_capacity(reads.len());
+        for (read_idx, (key, _)) in reads.iter().enumerate() {
+            let chunks = &mut result_chunks[read_idx];
+            chunks.sort_by_key(|(idx, _)| *idx);
+            let signal: Vec<i16> = chunks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+            results.push((key.clone(), signal));
+        }
+
+        Ok(results)
+    }
+
+    /// Create a thread-safe `SignalExtractor` for parallel per-read signal extraction.
+    ///
+    /// The returned extractor borrows the memory-mapped signal table and can be
+    /// shared across rayon threads (`Send + Sync`). Each thread can call
+    /// `extractor.get_signal(&signal_rows)` independently without contention.
+    pub fn signal_extractor(&self) -> Result<SignalExtractor<'_>> {
+        use crate::arrow_ipc::ArrowIpcFooter;
+
+        let signal_bytes = self.signal_table_bytes()?;
+        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+
+        Ok(SignalExtractor {
+            signal_bytes,
+            footer,
+        })
+    }
+
     /// Prefetch signal table pages using madvise (if supported).
     /// This hints to the OS to read pages ahead, improving sequential read performance.
     pub fn prefetch_signal(&self) {
@@ -532,8 +609,12 @@ impl Reader {
         &self,
         signal_rows: &[u64],
     ) -> Result<Vec<CompressedSignalChunk>> {
-        // Use optimized path if we have signal metadata
-        if let Some(ref metadata) = self.signal_metadata {
+        // Lazily compute signal metadata on first use
+        let metadata = self
+            .signal_metadata
+            .get_or_init(|| Self::load_signal_metadata(&self.mmap, &self.footer).unwrap_or(None));
+
+        if let Some(ref metadata) = metadata {
             return self.get_compressed_signal_optimized(signal_rows, metadata);
         }
 
@@ -972,6 +1053,38 @@ impl Reader {
         }
 
         result
+    }
+}
+
+/// Thread-safe signal extractor for parallel per-read signal extraction.
+///
+/// Holds an immutable reference to the memory-mapped signal table bytes and
+/// a pre-parsed Arrow IPC footer. Because it contains only immutable data,
+/// it is `Send + Sync` and can be shared across rayon threads.
+pub struct SignalExtractor<'a> {
+    signal_bytes: &'a [u8],
+    footer: crate::arrow_ipc::ArrowIpcFooter,
+}
+
+impl<'a> SignalExtractor<'a> {
+    /// Extract and decompress signal for a single read's signal rows.
+    ///
+    /// Thread-safe: no shared mutable state.
+    pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
+        use crate::compression::vbz::decompress_signal;
+
+        let raw_chunks = self
+            .footer
+            .extract_signal_rows(signal_rows, self.signal_bytes)?;
+        let total_samples: usize = raw_chunks.iter().map(|c| c.samples as usize).sum();
+        let mut result = Vec::with_capacity(total_samples);
+
+        for chunk in &raw_chunks {
+            let decompressed = decompress_signal(chunk.signal, chunk.samples as usize)?;
+            result.extend_from_slice(&decompressed);
+        }
+
+        Ok(result)
     }
 }
 

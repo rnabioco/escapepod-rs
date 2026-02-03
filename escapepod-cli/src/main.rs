@@ -248,6 +248,9 @@ Examples:
   escapepod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
 ")]
     Demux(commands::demux::DemuxArgs),
+
+    /// Refine signal-to-base mapping using banded DP
+    Resquiggle(commands::resquiggle::ResquiggleArgs),
 }
 
 #[derive(Subcommand)]
@@ -349,5 +352,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Summary(args) => commands::summary::run(args),
 
         Commands::Demux(args) => commands::demux::run(args),
+
+        Commands::Resquiggle(args) => commands::resquiggle::run(args),
     }
 }

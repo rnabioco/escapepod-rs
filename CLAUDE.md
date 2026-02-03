@@ -94,6 +94,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 - `bam-filter`: Filter reads based on paired BAM file (mapped status, region, quality)
 - `repack`: Repack files for optimized storage
 - `subset`: Split reads into multiple files based on CSV mapping
+- `resquiggle`: Refine signal-to-base mapping using banded DP with POD5 signal and BAM move tables
 - `demux`: Barcode demultiplexing workflow with subcommands:
   - `detect`: LLR-based adapter boundary detection
   - `fingerprint`: T-test segmentation for barcode fingerprints
