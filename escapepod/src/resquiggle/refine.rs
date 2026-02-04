@@ -8,7 +8,7 @@ use anyhow::Result;
 use super::bands::Band;
 use super::dp::banded_dp;
 use super::rescale::{rescale, rough_rescale};
-use super::types::RefineSettings;
+use super::types::{RefineAlgo, RefineSettings};
 
 /// Result of the refinement pipeline.
 #[derive(Debug, Clone)]
@@ -68,6 +68,22 @@ pub fn refine_signal_map(
 
     let mut map = seq_to_signal_map.to_vec();
 
+    // Step 1.5: resolve auto-target for dwell penalty from move table median
+    let resolved_algo = match &settings.refinement_algo {
+        RefineAlgo::DwellPenalty { target, weight } if *target <= 0.0 => {
+            let median = median_dwell(&map);
+            RefineAlgo::DwellPenalty {
+                target: median,
+                weight: *weight,
+            }
+        }
+        other => other.clone(),
+    };
+    let resolved_settings = RefineSettings {
+        refinement_algo: resolved_algo,
+        ..settings.clone()
+    };
+
     // Step 2: iterative refinement + rescale
     let n_iterations = settings.n_refinement_iters;
     let perform_rescaling = n_iterations > 0;
@@ -83,7 +99,7 @@ pub fn refine_signal_map(
         }
 
         // Run one refinement step (trim, band, DP)
-        map = refinement_step(map, &signal_norm, expected_levels, settings)?;
+        map = refinement_step(map, &signal_norm, expected_levels, &resolved_settings)?;
 
         // Rescale if configured
         if perform_rescaling {
@@ -146,4 +162,177 @@ fn refinement_step(
 
     // Adjust back to original coordinates
     Ok(optimized.iter().map(|el| el + sig_start).collect())
+}
+
+/// Compute the median dwell time (in signal samples per base) from a signal map.
+///
+/// The signal map has `n_bases + 1` entries (boundaries). Dwell for base i
+/// is `map[i+1] - map[i]`.
+fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
+    if seq_to_signal_map.len() < 2 {
+        return 1.0;
+    }
+    let mut dwells: Vec<usize> = seq_to_signal_map
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .collect();
+    dwells.sort_unstable();
+    let n = dwells.len();
+    if n % 2 == 1 {
+        dwells[n / 2] as f32
+    } else {
+        (dwells[n / 2 - 1] + dwells[n / 2]) as f32 / 2.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::types::{RescaleAlgo, RoughRescaleAlgo};
+
+    #[test]
+    fn test_median_dwell_odd() {
+        // 5 bases with dwells: 3, 5, 2, 7, 4 → sorted: 2, 3, 4, 5, 7 → median = 4
+        let map = vec![0, 3, 8, 10, 17, 21];
+        assert_eq!(median_dwell(&map), 4.0);
+    }
+
+    #[test]
+    fn test_median_dwell_even() {
+        // 4 bases with dwells: 3, 5, 2, 6 → sorted: 2, 3, 5, 6 → median = (3+5)/2 = 4
+        let map = vec![0, 3, 8, 10, 16];
+        assert_eq!(median_dwell(&map), 4.0);
+    }
+
+    #[test]
+    fn test_median_dwell_single_base() {
+        let map = vec![0, 10];
+        assert_eq!(median_dwell(&map), 10.0);
+    }
+
+    #[test]
+    fn test_median_dwell_empty() {
+        let map: Vec<usize> = vec![];
+        assert_eq!(median_dwell(&map), 1.0);
+    }
+
+    #[test]
+    fn test_median_dwell_single_entry() {
+        let map = vec![5];
+        assert_eq!(median_dwell(&map), 1.0);
+    }
+
+    #[test]
+    fn test_median_dwell_uniform() {
+        // All dwells identical: 10, 10, 10
+        let map = vec![0, 10, 20, 30];
+        assert_eq!(median_dwell(&map), 10.0);
+    }
+
+    #[test]
+    fn test_calculate_initial_scaling() {
+        // Identity calibration: cal_scale=1, cal_offset=0
+        let (scale, shift) = calculate_initial_scaling(1.0, 0.0, 2.0, 5.0);
+        assert!((scale - 2.0).abs() < 1e-6);
+        assert!((shift - 5.0).abs() < 1e-6);
+
+        // With offset: cal_scale=2, cal_offset=10
+        let (scale, shift) = calculate_initial_scaling(2.0, 10.0, 1.0, 3.0);
+        // scale_raw_to_pa = 1/2 = 0.5
+        // scale = 0.5 * 1.0 = 0.5
+        // shift = 0.5 * 3.0 - 10.0 = 1.5 - 10.0 = -8.5
+        assert!((scale - 0.5).abs() < 1e-6);
+        assert!((shift - (-8.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_refine_signal_map_viterbi_basic() {
+        // Simple test: 5 bases, each with ~10 signal samples
+        // Signal is constant per base matching expected levels
+        let n_bases = 5;
+        let samples_per_base = 10;
+        let signal_len = n_bases * samples_per_base;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0];
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..samples_per_base {
+                signal[i * samples_per_base + j] = level;
+            }
+        }
+
+        let map: Vec<usize> = (0..=n_bases).map(|i| i * samples_per_base).collect();
+
+        let settings = RefineSettings {
+            refinement_algo: RefineAlgo::Viterbi,
+            n_refinement_iters: 0, // just 1 DP pass, no rescale
+            half_bandwidth: 3,
+            adjust_band_min_size: 2,
+            rescale_algo: RescaleAlgo::default(),
+            rough_rescale_algo: RoughRescaleAlgo::None,
+            normalize_levels: false,
+        };
+
+        let result = refine_signal_map(&settings, &signal, &map, &levels, 1.0, 0.0).unwrap();
+
+        // Path should start at 0 and end at signal_len
+        assert_eq!(result.seq_to_signal_map[0], 0);
+        assert_eq!(result.seq_to_signal_map[n_bases], signal_len);
+
+        // Path should be monotonically increasing
+        for w in result.seq_to_signal_map.windows(2) {
+            assert!(w[1] > w[0], "path not strictly increasing");
+        }
+
+        // With perfect signal, the boundaries should be close to the original map
+        for (i, &boundary) in result.seq_to_signal_map.iter().enumerate() {
+            let expected = i * samples_per_base;
+            let diff = (boundary as i64 - expected as i64).unsigned_abs() as usize;
+            assert!(
+                diff <= settings.half_bandwidth,
+                "boundary {} deviated by {} (expected ~{})",
+                i, diff, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_refine_signal_map_dwell_penalty_auto_target() {
+        // Verify auto-target resolution (target=0 → median dwell from map)
+        let n_bases = 5;
+        let samples_per_base = 10;
+        let signal_len = n_bases * samples_per_base;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0];
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..samples_per_base {
+                signal[i * samples_per_base + j] = level;
+            }
+        }
+
+        let map: Vec<usize> = (0..=n_bases).map(|i| i * samples_per_base).collect();
+
+        let settings = RefineSettings {
+            refinement_algo: RefineAlgo::DwellPenalty {
+                target: 0.0, // auto
+                weight: 0.5,
+            },
+            n_refinement_iters: 0,
+            half_bandwidth: 3,
+            adjust_band_min_size: 2,
+            rescale_algo: RescaleAlgo::default(),
+            rough_rescale_algo: RoughRescaleAlgo::None,
+            normalize_levels: false,
+        };
+
+        let result = refine_signal_map(&settings, &signal, &map, &levels, 1.0, 0.0).unwrap();
+
+        assert_eq!(result.seq_to_signal_map[0], 0);
+        assert_eq!(result.seq_to_signal_map[n_bases], signal_len);
+
+        for w in result.seq_to_signal_map.windows(2) {
+            assert!(w[1] > w[0]);
+        }
+    }
 }

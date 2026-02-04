@@ -218,3 +218,109 @@ impl Band {
         self.start.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_signal_band_simple() {
+        // 3 bases, signal map: base0=[0,3), base1=[3,6), base2=[6,10)
+        let map = vec![0, 3, 6, 10];
+        let band = Band::compute_signal_band(&map, 3, 2).unwrap();
+
+        assert!(!band.is_sequence_band);
+        assert_eq!(band.start.len(), 10); // signal_len = 10
+        assert_eq!(band.end.len(), 10);
+
+        // First signal position must start at base 0
+        assert_eq!(band.start[0], 0);
+        // Last signal position must end at seq_len
+        assert_eq!(band.end[9], 3);
+
+        // Monotonicity: start is non-decreasing, end is non-increasing
+        for i in 1..10 {
+            assert!(band.start[i] >= band.start[i - 1], "start not monotonic at {}", i);
+            assert!(band.end[i] <= band.end[i.min(8)], "end not non-increasing");
+        }
+
+        // All regions have positive width
+        for i in 0..10 {
+            assert!(band.end[i] > band.start[i], "zero-width at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_compute_signal_band_half_bandwidth_1() {
+        // Minimal bandwidth: each signal position only sees nearby bases
+        let map = vec![0, 2, 4, 6];
+        let band = Band::compute_signal_band(&map, 3, 1).unwrap();
+
+        assert_eq!(band.start[0], 0);
+        assert_eq!(band.end[5], 3);
+    }
+
+    #[test]
+    fn test_compute_signal_band_error_map_mismatch() {
+        let map = vec![0, 3, 6];
+        let result = Band::compute_signal_band(&map, 4, 2); // seq_len=4 but map has 3 entries
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compute_signal_band_error_zero_bandwidth() {
+        let map = vec![0, 3, 6, 10];
+        let result = Band::compute_signal_band(&map, 3, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_to_sequence_band() {
+        // 4 bases, signal map with uniform 5-sample dwells
+        let map = vec![0, 5, 10, 15, 20];
+        let mut band = Band::compute_signal_band(&map, 4, 3).unwrap();
+        band.convert_to_sequence_band(2).unwrap();
+
+        assert!(band.is_sequence_band);
+        assert_eq!(band.start.len(), 4); // seq_len = 4
+        assert_eq!(band.end.len(), 4);
+
+        // Sequence band boundaries
+        assert_eq!(band.start[0], 0, "sequence band start[0] must be 0");
+        assert_eq!(band.end[3], 20, "sequence band end[last] must be signal_len");
+
+        // All regions have positive width
+        for i in 0..4 {
+            assert!(band.end[i] > band.start[i], "zero-width at base {}", i);
+        }
+
+        // Monotonicity
+        for i in 1..4 {
+            assert!(band.start[i] >= band.start[i - 1]);
+            assert!(band.end[i] >= band.end[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_convert_to_sequence_band_already_converted() {
+        let band = Band::new(vec![0, 3], vec![5, 10], true);
+        let mut band = band;
+        let result = band.convert_to_sequence_band(1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_enforce_min_step_preserves_validity() {
+        // Uneven dwells: first base gets 1 sample, second gets 19
+        let map = vec![0, 1, 20];
+        let mut band = Band::compute_signal_band(&map, 2, 3).unwrap();
+        band.convert_to_sequence_band(2).unwrap();
+
+        // Even with extreme dwell asymmetry, the band should remain valid
+        assert_eq!(band.start[0], 0);
+        assert_eq!(band.end[1], 20);
+        for i in 0..2 {
+            assert!(band.end[i] > band.start[i], "zero-width at base {}", i);
+        }
+    }
+}

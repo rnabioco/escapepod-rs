@@ -8,12 +8,12 @@
 pub enum RefineAlgo {
     /// Viterbi algorithm (short dwell times are not penalized).
     Viterbi,
-    /// Dwell penalty algorithm, which discourages short dwell times.
+    /// Dwell penalty algorithm with asymmetric penalty: quadratic below target,
+    /// logarithmic above. Discourages short dwells strongly while allowing
+    /// genuinely long dwells (e.g., aminoacylation) to survive.
     DwellPenalty {
-        /// Preferred dwell time.
+        /// Preferred dwell time (0.0 = auto from move table median).
         target: f32,
-        /// Maximum dwell time that is penalized.
-        limit: f32,
         /// Strength of the penalty.
         weight: f32,
     },
@@ -22,8 +22,7 @@ pub enum RefineAlgo {
 impl Default for RefineAlgo {
     fn default() -> Self {
         Self::DwellPenalty {
-            target: 4.0,
-            limit: 3.0,
+            target: 0.0,
             weight: 0.5,
         }
     }

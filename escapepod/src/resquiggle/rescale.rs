@@ -376,3 +376,155 @@ pub fn rescale(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_quantiles_basic() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let q = calculate_quantiles(&data, &[0.0, 0.5, 1.0]).unwrap();
+        assert!((q[0] - 1.0).abs() < 1e-6);
+        assert!((q[1] - 3.0).abs() < 1e-6);
+        assert!((q[2] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_calculate_quantiles_interpolation() {
+        let data = vec![1.0, 3.0, 5.0, 7.0];
+        let q = calculate_quantiles(&data, &[0.25]).unwrap();
+        // pos = 0.25 * 3 = 0.75, floor=0, ceil=1, w=0.75
+        // (0.25)*1.0 + (0.75)*3.0 = 2.5
+        assert!((q[0] - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_calculate_quantiles_unsorted_input() {
+        // Data is not pre-sorted; function should handle it
+        let data = vec![5.0, 1.0, 3.0];
+        let q = calculate_quantiles(&data, &[0.0, 0.5, 1.0]).unwrap();
+        assert!((q[0] - 1.0).abs() < 1e-6);
+        assert!((q[1] - 3.0).abs() < 1e-6);
+        assert!((q[2] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_calculate_quantiles_empty_data() {
+        let result = calculate_quantiles(&[], &[0.5]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_calculate_quantiles_empty_quantiles() {
+        let result = calculate_quantiles(&[1.0, 2.0], &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_least_squares_identity() {
+        // y = x (slope=1, intercept=0)
+        let x = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let y = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let (new_shift, new_scale) = least_squares(&x, &y, 0.0, 1.0).unwrap();
+        // slope_est = 1.0, intercept_est = 0.0
+        // new_shift = 0.0 - (1.0 * 0.0 / 1.0) = 0.0
+        // new_scale = 1.0 / 1.0 = 1.0
+        assert!((new_shift - 0.0).abs() < 1e-6);
+        assert!((new_scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_least_squares_with_slope() {
+        // y = 2x + 1 (slope=2, intercept=1)
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let y = vec![1.0, 3.0, 5.0, 7.0];
+        let (new_shift, new_scale) = least_squares(&x, &y, 0.0, 1.0).unwrap();
+        // slope_est = 2.0, intercept_est = 1.0
+        // new_shift = 0.0 - (1.0 * 1.0 / 2.0) = -0.5
+        // new_scale = 1.0 / 2.0 = 0.5
+        assert!((new_shift - (-0.5)).abs() < 1e-6);
+        assert!((new_scale - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_least_squares_constant_x() {
+        // All x values the same → degenerate, should return original params
+        let x = vec![2.0, 2.0, 2.0];
+        let y = vec![1.0, 3.0, 5.0];
+        let (new_shift, new_scale) = least_squares(&x, &y, 5.0, 2.0).unwrap();
+        assert!((new_shift - 5.0).abs() < 1e-6);
+        assert!((new_scale - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_least_squares_length_mismatch() {
+        let result = least_squares(&[1.0, 2.0], &[1.0], 0.0, 1.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_theil_sen_identity() {
+        // y = x
+        let x = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let y = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let (new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
+        assert!((new_shift - 0.0).abs() < 1e-6, "shift={}", new_shift);
+        assert!((new_scale - 1.0).abs() < 1e-6, "scale={}", new_scale);
+    }
+
+    #[test]
+    fn test_theil_sen_with_slope() {
+        // y = 2x + 1
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let y = vec![1.0, 3.0, 5.0, 7.0];
+        let (new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
+        // median_slope = 2.0 (all slopes are exactly 2)
+        // shift_est = -intercept/slope = -1.0/2.0 = -0.5
+        // scale_est = 1/2 = 0.5
+        // new_shift = 0.0 + (-0.5 * 1.0) = -0.5
+        // new_scale = 1.0 * 0.5 = 0.5
+        assert!((new_shift - (-0.5)).abs() < 1e-6, "shift={}", new_shift);
+        assert!((new_scale - 0.5).abs() < 1e-6, "scale={}", new_scale);
+    }
+
+    #[test]
+    fn test_theil_sen_robust_to_outlier() {
+        // y = x with one outlier
+        let x = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let y = vec![0.0, 1.0, 2.0, 100.0, 4.0, 5.0, 6.0]; // outlier at index 3
+        let (_new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
+        // With the outlier, median slope should still be close to 1.0
+        assert!((new_scale - 1.0).abs() < 0.5, "scale should be near 1.0, got {}", new_scale);
+    }
+
+    #[test]
+    fn test_theil_sen_length_mismatch() {
+        let result = theil_sen(&[1.0, 2.0], &[1.0], 0.0, 1.0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_median_sorted_odd() {
+        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!((median_sorted(&v).unwrap() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sorted_even() {
+        let v = vec![1.0, 2.0, 3.0, 4.0];
+        assert!((median_sorted(&v).unwrap() - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sorted_single() {
+        let v = vec![42.0];
+        assert!((median_sorted(&v).unwrap() - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sorted_empty() {
+        let result = median_sorted(&[]);
+        assert!(result.is_err());
+    }
+}
