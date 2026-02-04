@@ -20,6 +20,7 @@ use sam::alignment::record::data::field::Tag;
 use sam::alignment::record_buf::data::field::value::Array;
 use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
+use sam::header::record::value::map::{program::tag as pg_tag, Map, Program};
 
 use crate::progress::create_spinner;
 use crate::style;
@@ -58,19 +59,46 @@ pub struct ResquiggleArgs {
     #[arg(long, default_value = "theil-sen", value_parser = parse_rescale)]
     pub rescale: RescaleAlgo,
 
-    /// Apply MAD normalization to kmer levels
-    #[arg(long)]
-    pub normalize_levels: bool,
+    /// Target dwell time per base for dwell-penalty algorithm (0 = auto from move table)
+    #[arg(long, default_value = "0")]
+    pub dwell_target: f32,
+
+    /// Dwell penalty weight for dwell-penalty algorithm
+    #[arg(long, default_value = "0.5")]
+    pub dwell_weight: f32,
+
+    /// Normalization mode for kmer levels (e.g., 'mad')
+    #[arg(long, value_parser = parse_normalize, value_name = "MODE")]
+    pub normalize: Option<NormalizeMode>,
 
     /// Number of threads for parallel processing
     #[arg(short = 'j', long)]
     pub threads: Option<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum NormalizeMode {
+    Mad,
+}
+
+fn parse_normalize(s: &str) -> Result<NormalizeMode, String> {
+    match s {
+        "mad" => Ok(NormalizeMode::Mad),
+        _ => Err(format!(
+            "unknown normalization mode '{}', expected 'mad'",
+            s
+        )),
+    }
+}
+
 fn parse_algo(s: &str) -> Result<RefineAlgo, String> {
     match s {
         "viterbi" => Ok(RefineAlgo::Viterbi),
-        "dwell-penalty" => Ok(RefineAlgo::default()),
+        // target/weight are placeholders; overridden by --dwell-target/--dwell-weight
+        "dwell-penalty" => Ok(RefineAlgo::DwellPenalty {
+            target: 0.0,
+            weight: 0.5,
+        }),
         _ => Err(format!(
             "unknown algorithm '{}', expected 'viterbi' or 'dwell-penalty'",
             s
@@ -104,14 +132,23 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             .ok(); // Ignore error if pool is already initialized
     }
 
+    // Apply --dwell-target and --dwell-weight to the algo if dwell-penalty was chosen
+    let algo = match args.algo {
+        RefineAlgo::DwellPenalty { .. } => RefineAlgo::DwellPenalty {
+            target: args.dwell_target,
+            weight: args.dwell_weight,
+        },
+        other => other,
+    };
+
     let settings = RefineSettings {
-        refinement_algo: args.algo.clone(),
+        refinement_algo: algo,
         n_refinement_iters: args.iterations,
         half_bandwidth: args.half_bandwidth,
         adjust_band_min_size: 2,
         rescale_algo: args.rescale.clone(),
         rough_rescale_algo: RoughRescaleAlgo::default(),
-        normalize_levels: args.normalize_levels,
+        normalize_levels: args.normalize == Some(NormalizeMode::Mad),
     };
 
     // --- Phase 1: Load kmer table ---
@@ -162,6 +199,11 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         "{} reads indexed from POD5",
         style::count(pod5_reads.len())
     ));
+    eprintln!(
+        "[resquiggle] {} reads indexed from {} POD5 file(s)",
+        pod5_reads.len(),
+        pod5_files.len()
+    );
 
     // Create signal extractors (one per reader) for parallel on-demand extraction
     let signal_extractors: Vec<_> = pod5_readers
@@ -178,7 +220,40 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         .unwrap_or(std::num::NonZeroUsize::MIN);
     let decoder = bgzf::io::MultithreadedReader::with_worker_count(worker_count, file);
     let mut bam_reader = bam::io::Reader::from(decoder);
-    let header = bam_reader.read_header()?;
+    let mut header = bam_reader.read_header()?;
+
+    // Add @PG record with resquiggle parameters
+    let normalize_str = match &args.normalize {
+        Some(NormalizeMode::Mad) => " --normalize mad",
+        None => "",
+    };
+    let dwell_str = match &settings.refinement_algo {
+        RefineAlgo::DwellPenalty { target, weight } => {
+            format!(" --dwell-target {} --dwell-weight {}", target, weight)
+        }
+        RefineAlgo::Viterbi => String::new(),
+    };
+    let command_line = format!(
+        "escpod resquiggle --algo {} --iterations {} --half-bandwidth {} --rescale {}{}{}",
+        match &settings.refinement_algo {
+            RefineAlgo::Viterbi => "viterbi",
+            RefineAlgo::DwellPenalty { .. } => "dwell-penalty",
+        },
+        settings.n_refinement_iters,
+        settings.half_bandwidth,
+        match &settings.rescale_algo {
+            RescaleAlgo::TheilSen { .. } => "theil-sen",
+            RescaleAlgo::LeastSquares { .. } => "least-squares",
+        },
+        dwell_str,
+        normalize_str,
+    );
+    let pg = Map::<Program>::builder()
+        .insert(pg_tag::NAME, "escpod")
+        .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
+        .insert(pg_tag::COMMAND_LINE, command_line)
+        .build()?;
+    header.programs_mut().add("escpod-resquiggle", pg)?;
 
     let stats = RefineStats::new();
 
@@ -246,6 +321,10 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
                 style::count(matched),
                 style::count(total_bam)
             ));
+            eprintln!(
+                "[resquiggle] {} matched / {} scanned from BAM",
+                matched, total_bam
+            );
         }
 
         if chunk.len() >= CHUNK_SIZE {
@@ -281,6 +360,10 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         style::count(matched),
         style::count(total_bam)
     ));
+    eprintln!(
+        "[resquiggle] processing complete: {} matched / {} scanned from BAM",
+        matched, total_bam
+    );
 
     // Wait for writer to finish
     let written = writer_handle
