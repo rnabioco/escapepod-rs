@@ -240,7 +240,11 @@ mod tests {
 
         // Monotonicity: start is non-decreasing, end is non-increasing
         for i in 1..10 {
-            assert!(band.start[i] >= band.start[i - 1], "start not monotonic at {}", i);
+            assert!(
+                band.start[i] >= band.start[i - 1],
+                "start not monotonic at {}",
+                i
+            );
             assert!(band.end[i] <= band.end[i.min(8)], "end not non-increasing");
         }
 
@@ -287,7 +291,10 @@ mod tests {
 
         // Sequence band boundaries
         assert_eq!(band.start[0], 0, "sequence band start[0] must be 0");
-        assert_eq!(band.end[3], 20, "sequence band end[last] must be signal_len");
+        assert_eq!(
+            band.end[3], 20,
+            "sequence band end[last] must be signal_len"
+        );
 
         // All regions have positive width
         for i in 0..4 {
