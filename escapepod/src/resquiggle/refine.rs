@@ -171,7 +171,7 @@ fn refinement_step(
                 &settings.refinement_algo,
             )
         }
-        BandingAlgo::Adaptive { bandwidth } => {
+        BandingAlgo::Adaptive { bandwidth, x_drop } => {
             // Adaptive banding uses the initial map directly
             adaptive_banded_dp(
                 signal_trimmed,
@@ -179,6 +179,7 @@ fn refinement_step(
                 *bandwidth,
                 &map_zeroed,
                 &settings.refinement_algo,
+                *x_drop,
             )
         }
     };
@@ -195,10 +196,7 @@ fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
     if seq_to_signal_map.len() < 2 {
         return 1.0;
     }
-    let mut dwells: Vec<usize> = seq_to_signal_map
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .collect();
+    let mut dwells: Vec<usize> = seq_to_signal_map.windows(2).map(|w| w[1] - w[0]).collect();
     dwells.sort_unstable();
     let n = dwells.len();
     if n % 2 == 1 {
@@ -210,8 +208,8 @@ fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{RescaleAlgo, RoughRescaleAlgo};
+    use super::*;
 
     #[test]
     fn test_median_dwell_odd() {
@@ -315,7 +313,9 @@ mod tests {
             assert!(
                 diff <= settings.half_bandwidth,
                 "boundary {} deviated by {} (expected ~{})",
-                i, diff, expected
+                i,
+                diff,
+                expected
             );
         }
     }
@@ -402,8 +402,7 @@ mod tests {
             banding_algo: BandingAlgo::Fixed,
         };
 
-        let result =
-            refine_signal_map(&settings, &signal, &map, &levels, scale, shift).unwrap();
+        let result = refine_signal_map(&settings, &signal, &map, &levels, scale, shift).unwrap();
 
         // Path should be valid
         assert_eq!(result.seq_to_signal_map[0], 0);

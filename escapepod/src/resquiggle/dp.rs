@@ -61,6 +61,30 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
     path
 }
 
+/// Reusable temporary buffers for the Viterbi DP step (phases 1 & 2).
+pub struct ViterbiBuffers {
+    base_scores: Vec<f32>,
+    move_scores: Vec<f32>,
+}
+
+impl ViterbiBuffers {
+    /// Create buffers sized for the given bandwidth.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            base_scores: vec![0.0f32; capacity],
+            move_scores: vec![f32::INFINITY; capacity],
+        }
+    }
+
+    /// Ensure buffers are at least `len` elements.
+    fn prepare(&mut self, len: usize) {
+        if self.base_scores.len() < len {
+            self.base_scores.resize(len, 0.0);
+            self.move_scores.resize(len, f32::INFINITY);
+        }
+    }
+}
+
 /// Reusable temporary buffers for the dwell penalty DP step.
 struct StepBuffers {
     base_scores: Vec<f32>,
@@ -190,6 +214,10 @@ fn forward_pass(
 }
 
 /// Forward step using the Viterbi algorithm (no dwell penalty).
+///
+/// Convenience wrapper that allocates scratch buffers internally.  For hot
+/// loops (e.g. adaptive DP), prefer [`dp_step_buffered`] with pre-allocated
+/// [`ViterbiBuffers`].
 pub fn dp_step(
     current_scores: &mut [f32],
     current_traceback: &mut [i32],
@@ -198,45 +226,73 @@ pub fn dp_step(
     current_signal: &[f32],
     prev_band_offset: usize,
 ) {
-    // Handle start position
-    if prev_band_offset == 0 {
-        current_scores[0] = INVALID_PENALTY + previous_scores[previous_scores.len() - 1];
-        current_traceback[0] = -1;
-    } else {
-        let base_score = score(current_level, current_signal[0]);
-        current_scores[0] = previous_scores[prev_band_offset - 1] + base_score;
-        current_traceback[0] = 0;
+    let mut buf = ViterbiBuffers::new(current_scores.len());
+    dp_step_buffered(
+        current_scores,
+        current_traceback,
+        previous_scores,
+        current_level,
+        current_signal,
+        prev_band_offset,
+        &mut buf,
+    );
+}
+
+/// Forward step using the Viterbi algorithm with pre-allocated scratch buffers.
+///
+/// The inner loop is split into three phases so that LLVM can auto-vectorize
+/// the first two (base_scores and move_scores are element-wise independent).
+/// Only the final sequential scan carries a horizontal dependency.
+pub fn dp_step_buffered(
+    current_scores: &mut [f32],
+    current_traceback: &mut [i32],
+    previous_scores: &[f32],
+    current_level: f32,
+    current_signal: &[f32],
+    prev_band_offset: usize,
+    buf: &mut ViterbiBuffers,
+) {
+    let len = current_scores.len();
+    buf.prepare(len);
+
+    let base_scores = &mut buf.base_scores[..len];
+    let move_scores = &mut buf.move_scores[..len];
+
+    // Phase 1: base_scores — independent, auto-vectorizable
+    for i in 0..len {
+        let d = current_level - current_signal[i];
+        base_scores[i] = d * d;
     }
 
     let previous_scores_slice = &previous_scores[prev_band_offset..];
+    // Number of positions (1..=process_len) with valid move transitions.
+    // Capped at len-1 because move_scores/base_scores have length len.
+    let process_len = previous_scores_slice.len().min(len - 1);
 
-    let process_len = if previous_scores_slice.len() == current_scores.len() {
-        previous_scores_slice.len() - 1
+    // Phase 2: move_scores — independent, auto-vectorizable
+    move_scores.fill(f32::INFINITY);
+    if prev_band_offset == 0 {
+        move_scores[0] = INVALID_PENALTY + previous_scores[previous_scores.len() - 1];
     } else {
-        previous_scores_slice.len()
-    };
-
-    // Overlapping region: both move and stay transitions possible
-    for band_pos in 1..=process_len {
-        let base_score = score(current_level, current_signal[band_pos]);
-        let move_score = previous_scores_slice[band_pos - 1] + base_score;
-        let stay_score = current_scores[band_pos - 1] + base_score;
-
-        if move_score < stay_score {
-            current_scores[band_pos] = move_score;
-            current_traceback[band_pos] = 0;
-        } else {
-            current_scores[band_pos] = stay_score;
-            current_traceback[band_pos] = current_traceback[band_pos - 1] + 1;
-        }
+        move_scores[0] = previous_scores[prev_band_offset - 1] + base_scores[0];
+    }
+    for i in 1..=process_len {
+        move_scores[i] = previous_scores_slice[i - 1] + base_scores[i];
     }
 
-    // Remaining: only stay transitions
-    for band_pos in (process_len + 1)..current_scores.len() {
-        let base_score = score(current_level, current_signal[band_pos]);
-        let stay_score = current_scores[band_pos - 1] + base_score;
-        current_scores[band_pos] = stay_score;
-        current_traceback[band_pos] = current_traceback[band_pos - 1] + 1;
+    // Phase 3: sequential scan — stay vs move (horizontal dependency)
+    current_scores[0] = move_scores[0];
+    current_traceback[0] = if prev_band_offset == 0 { -1 } else { 0 };
+
+    for i in 1..len {
+        let stay = current_scores[i - 1] + base_scores[i];
+        if move_scores[i] <= stay {
+            current_scores[i] = move_scores[i];
+            current_traceback[i] = 0;
+        } else {
+            current_scores[i] = stay;
+            current_traceback[i] = current_traceback[i - 1] + 1;
+        }
     }
 }
 
@@ -407,7 +463,11 @@ pub fn banded_traceback(
 }
 
 #[cfg(test)]
-#[allow(clippy::excessive_precision, clippy::useless_vec)]
+#[allow(
+    clippy::excessive_precision,
+    clippy::useless_vec,
+    clippy::needless_range_loop
+)]
 mod tests {
     use super::*;
 
@@ -423,11 +483,17 @@ mod tests {
 
         // Below target: quadratic penalty
         let p0 = dwell_penalty(0, target, weight);
-        assert!((p0 - weight * target * target).abs() < 1e-6, "dwell=0 should be weight*target^2");
+        assert!(
+            (p0 - weight * target * target).abs() < 1e-6,
+            "dwell=0 should be weight*target^2"
+        );
 
         let p10 = dwell_penalty(10, target, weight);
         let p20 = dwell_penalty(20, target, weight);
-        assert!(p0 > p10 && p10 > p20, "penalty should decrease as dwell approaches target");
+        assert!(
+            p0 > p10 && p10 > p20,
+            "penalty should decrease as dwell approaches target"
+        );
 
         // At target: logarithmic penalty = weight * ln(2)
         let p_target = dwell_penalty(36, target, weight);
@@ -444,7 +510,10 @@ mod tests {
 
         // Short-side penalty at target-5 should be much stronger than 50x long dwell
         let p_short = dwell_penalty(31, target, weight);
-        assert!(p_short > p_50x, "short dwell penalty should exceed 50x long dwell penalty");
+        assert!(
+            p_short > p_50x,
+            "short dwell penalty should exceed 50x long dwell penalty"
+        );
     }
 
     #[test]
@@ -698,7 +767,13 @@ mod tests {
         for i in 0..=n_bases {
             let expected = i * samples_per_base;
             let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
-            assert!(diff <= half_bw + 1, "path[{}]={} far from expected {}", i, path[i], expected);
+            assert!(
+                diff <= half_bw + 1,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
         }
     }
 
@@ -744,7 +819,13 @@ mod tests {
         for i in 0..=n_bases {
             let expected = i * samples_per_base;
             let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
-            assert!(diff <= half_bw + 1, "path[{}]={} far from expected {}", i, path[i], expected);
+            assert!(
+                diff <= half_bw + 1,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
         }
     }
 
@@ -787,7 +868,12 @@ mod tests {
         // Dwell penalty path should have no base with extremely short dwell
         for w in dwell_path.windows(2) {
             let dwell = w[1] - w[0];
-            assert!(dwell >= 2, "dwell penalty produced dwell of {} at {:?}", dwell, dwell_path);
+            assert!(
+                dwell >= 2,
+                "dwell penalty produced dwell of {} at {:?}",
+                dwell,
+                dwell_path
+            );
         }
     }
 
@@ -833,7 +919,9 @@ mod tests {
             assert!(
                 diff <= 2,
                 "paths diverge at boundary {}: viterbi={}, dwell={}",
-                i, viterbi_path[i], dwell_path[i]
+                i,
+                viterbi_path[i],
+                dwell_path[i]
             );
         }
     }
