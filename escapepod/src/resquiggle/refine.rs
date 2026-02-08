@@ -171,7 +171,7 @@ fn refinement_step(
                 &settings.refinement_algo,
             )
         }
-        BandingAlgo::Adaptive { bandwidth } => {
+        BandingAlgo::Adaptive { bandwidth, x_drop } => {
             // Adaptive banding uses the initial map directly
             adaptive_banded_dp(
                 signal_trimmed,
@@ -179,6 +179,7 @@ fn refinement_step(
                 *bandwidth,
                 &map_zeroed,
                 &settings.refinement_algo,
+                *x_drop,
             )
         }
     };

@@ -113,6 +113,10 @@ pub enum BandingAlgo {
     Adaptive {
         /// Full bandwidth (number of signal positions per base in the band).
         bandwidth: usize,
+        /// Optional X-drop threshold for early termination.  When the best
+        /// per-base score exceeds the global best by more than this value the
+        /// DP bails out and returns the initial map.
+        x_drop: Option<f32>,
     },
 }
 
