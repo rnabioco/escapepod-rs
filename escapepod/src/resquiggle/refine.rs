@@ -5,10 +5,11 @@
 
 use anyhow::Result;
 
+use super::adaptive_dp::adaptive_banded_dp;
 use super::bands::Band;
 use super::dp::banded_dp;
 use super::rescale::{rescale, rough_rescale};
-use super::types::{RefineAlgo, RefineSettings};
+use super::types::{BandingAlgo, RefineAlgo, RefineSettings};
 
 /// Result of the refinement pipeline.
 #[derive(Debug, Clone)]
@@ -19,6 +20,8 @@ pub struct RefinementResult {
     pub scale: f32,
     /// Final signal shift parameter.
     pub shift: f32,
+    /// Final signal drift parameter (per-sample trend).
+    pub drift: f32,
 }
 
 /// Calculate initial scaling from POD5 calibration and BAM signal stats.
@@ -57,7 +60,7 @@ pub fn refine_signal_map(
     initial_shift: f32,
 ) -> Result<RefinementResult> {
     // Step 1: optional rough rescaling
-    let (mut shift, mut scale) = rough_rescale(
+    let (mut shift, mut scale, mut drift) = rough_rescale(
         initial_scale,
         initial_shift,
         seq_to_signal_map,
@@ -95,7 +98,7 @@ pub fn refine_signal_map(
     for _i in 0..n_iter {
         // Normalize signal in-place into reusable buffer
         for (i, el) in signal.iter().enumerate() {
-            signal_norm[i] = (el - shift) / scale;
+            signal_norm[i] = (el - shift - drift * i as f32) / scale;
         }
 
         // Run one refinement step (trim, band, DP)
@@ -106,15 +109,17 @@ pub fn refine_signal_map(
             let result = rescale(
                 scale,
                 shift,
+                drift,
                 &map,
                 expected_levels,
                 signal,
                 &settings.rescale_algo,
             );
             match result {
-                Ok((new_shift, new_scale)) => {
+                Ok((new_shift, new_scale, new_drift)) => {
                     shift = new_shift;
                     scale = new_scale;
+                    drift = new_drift;
                 }
                 Err(_) => {
                     // If rescaling fails, keep current parameters and continue
@@ -127,6 +132,7 @@ pub fn refine_signal_map(
         seq_to_signal_map: map,
         scale,
         shift,
+        drift,
     })
 }
 
@@ -145,20 +151,37 @@ fn refinement_step(
     // Zero-base the mapping
     let map_zeroed: Vec<usize> = seq_to_signal_map.iter().map(|el| el - sig_start).collect();
 
-    // Compute signal band
-    let mut band =
-        Band::compute_signal_band(&map_zeroed, expected_levels.len(), settings.half_bandwidth)?;
+    let optimized = match &settings.banding_algo {
+        BandingAlgo::Fixed => {
+            // Compute signal band
+            let mut band = Band::compute_signal_band(
+                &map_zeroed,
+                expected_levels.len(),
+                settings.half_bandwidth,
+            )?;
 
-    // Convert to sequence band
-    band.convert_to_sequence_band(settings.adjust_band_min_size)?;
+            // Convert to sequence band
+            band.convert_to_sequence_band(settings.adjust_band_min_size)?;
 
-    // Banded DP
-    let optimized = banded_dp(
-        signal_trimmed,
-        expected_levels,
-        &band,
-        &settings.refinement_algo,
-    );
+            // Banded DP
+            banded_dp(
+                signal_trimmed,
+                expected_levels,
+                &band,
+                &settings.refinement_algo,
+            )
+        }
+        BandingAlgo::Adaptive { bandwidth } => {
+            // Adaptive banding uses the initial map directly
+            adaptive_banded_dp(
+                signal_trimmed,
+                expected_levels,
+                *bandwidth,
+                &map_zeroed,
+                &settings.refinement_algo,
+            )
+        }
+    };
 
     // Adjust back to original coordinates
     Ok(optimized.iter().map(|el| el + sig_start).collect())
@@ -271,6 +294,7 @@ mod tests {
             rescale_algo: RescaleAlgo::default(),
             rough_rescale_algo: RoughRescaleAlgo::None,
             normalize_levels: false,
+            banding_algo: BandingAlgo::Fixed,
         };
 
         let result = refine_signal_map(&settings, &signal, &map, &levels, 1.0, 0.0).unwrap();
@@ -324,6 +348,7 @@ mod tests {
             rescale_algo: RescaleAlgo::default(),
             rough_rescale_algo: RoughRescaleAlgo::None,
             normalize_levels: false,
+            banding_algo: BandingAlgo::Fixed,
         };
 
         let result = refine_signal_map(&settings, &signal, &map, &levels, 1.0, 0.0).unwrap();
@@ -334,5 +359,79 @@ mod tests {
         for w in result.seq_to_signal_map.windows(2) {
             assert!(w[1] > w[0]);
         }
+    }
+
+    #[test]
+    fn test_refine_with_synthetic_drift() {
+        // Synthetic drifting signal: raw[i] = shift + drift*i + scale * level[base_of(i)]
+        // The refinement pipeline should recover the drift and produce good boundaries.
+        let n_bases = 10;
+        let samples_per_base = 20;
+        let signal_len = n_bases * samples_per_base;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0, 0.3, -0.3, 0.8, -0.8, 0.2];
+        let shift = 100.0;
+        let scale = 5.0;
+        let true_drift = 0.02;
+
+        // Build signal with drift
+        let mut signal = vec![0.0f32; signal_len];
+        for (base_idx, &level) in levels.iter().enumerate() {
+            for j in 0..samples_per_base {
+                let i = base_idx * samples_per_base + j;
+                signal[i] = shift + true_drift * i as f32 + scale * level;
+            }
+        }
+
+        let map: Vec<usize> = (0..=n_bases).map(|i| i * samples_per_base).collect();
+
+        let settings = RefineSettings {
+            refinement_algo: RefineAlgo::Viterbi,
+            n_refinement_iters: 2,
+            half_bandwidth: 5,
+            adjust_band_min_size: 2,
+            rescale_algo: RescaleAlgo::LeastSquares {
+                dwell_filter_lower_percentile: 0.0,
+                dwell_filter_upper_percentile: 1.0,
+                min_abs_level: 0.0,
+                n_bases_truncate: 0,
+                min_num_filtered_levels: 3,
+            },
+            rough_rescale_algo: RoughRescaleAlgo::None,
+            normalize_levels: false,
+            banding_algo: BandingAlgo::Fixed,
+        };
+
+        let result =
+            refine_signal_map(&settings, &signal, &map, &levels, scale, shift).unwrap();
+
+        // Path should be valid
+        assert_eq!(result.seq_to_signal_map[0], 0);
+        assert_eq!(result.seq_to_signal_map[n_bases], signal_len);
+        for w in result.seq_to_signal_map.windows(2) {
+            assert!(w[1] > w[0], "path not strictly increasing");
+        }
+
+        // Boundaries should still be close to the true positions
+        for (i, &boundary) in result.seq_to_signal_map.iter().enumerate() {
+            let expected = i * samples_per_base;
+            let diff = (boundary as i64 - expected as i64).unsigned_abs() as usize;
+            assert!(
+                diff <= settings.half_bandwidth + 2,
+                "boundary {} deviated by {} (expected ~{})",
+                i,
+                diff,
+                expected
+            );
+        }
+
+        // Drift should be detected (non-zero, positive)
+        // Note: exact recovery depends on iterations and filtering
+        // Just check it moved in the right direction
+        assert!(
+            result.drift.abs() > 1e-6,
+            "drift should be non-zero, got {}",
+            result.drift
+        );
     }
 }

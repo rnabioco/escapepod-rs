@@ -7,6 +7,7 @@
 //! banded dynamic programming for refining basecaller signal-to-base mappings
 //! against a kmer level model.
 
+pub mod adaptive_dp;
 pub mod bands;
 pub mod dp;
 pub mod kmer_table;
@@ -16,4 +17,4 @@ pub mod types;
 
 pub use kmer_table::KmerTable;
 pub use refine::{calculate_initial_scaling, refine_signal_map, RefinementResult};
-pub use types::{RefineAlgo, RefineSettings, RescaleAlgo, RoughRescaleAlgo};
+pub use types::{BandingAlgo, RefineAlgo, RefineSettings, RescaleAlgo, RoughRescaleAlgo};
