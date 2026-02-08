@@ -102,6 +102,20 @@ impl RoughRescaleAlgo {
     }
 }
 
+/// Algorithm for computing the DP band.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum BandingAlgo {
+    /// Fixed band computed from the initial signal-to-sequence map.
+    #[default]
+    Fixed,
+    /// Adaptive banding (Suzuki & Kasahara, 2017): band center shifts during
+    /// the forward pass based on edge score comparisons.
+    Adaptive {
+        /// Full bandwidth (number of signal positions per base in the band).
+        bandwidth: usize,
+    },
+}
+
 /// Settings for the refinement pipeline.
 #[derive(Debug, Clone)]
 pub struct RefineSettings {
@@ -119,6 +133,8 @@ pub struct RefineSettings {
     pub rough_rescale_algo: RoughRescaleAlgo,
     /// Whether to normalize kmer levels with MAD.
     pub normalize_levels: bool,
+    /// Algorithm for computing the DP band.
+    pub banding_algo: BandingAlgo,
 }
 
 impl Default for RefineSettings {
@@ -131,6 +147,7 @@ impl Default for RefineSettings {
             rescale_algo: RescaleAlgo::default(),
             rough_rescale_algo: RoughRescaleAlgo::default(),
             normalize_levels: false,
+            banding_algo: BandingAlgo::default(),
         }
     }
 }

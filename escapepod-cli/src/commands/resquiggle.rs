@@ -10,8 +10,8 @@ use rayon::prelude::*;
 
 use escapepod::parse_uuid_flexible;
 use escapepod::resquiggle::{
-    calculate_initial_scaling, refine_signal_map, KmerTable, RefineAlgo, RefineSettings,
-    RescaleAlgo, RoughRescaleAlgo,
+    calculate_initial_scaling, refine_signal_map, BandingAlgo, KmerTable, RefineAlgo,
+    RefineSettings, RescaleAlgo, RoughRescaleAlgo,
 };
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
@@ -71,6 +71,10 @@ pub struct ResquiggleArgs {
     #[arg(long, value_parser = parse_normalize, value_name = "MODE")]
     pub normalize: Option<NormalizeMode>,
 
+    /// Banding algorithm: 'fixed' (default) or 'adaptive'
+    #[arg(long, default_value = "fixed", value_parser = parse_banding)]
+    pub banding: BandingAlgo,
+
     /// Number of threads for parallel processing
     #[arg(short = 'j', long)]
     pub threads: Option<usize>,
@@ -106,6 +110,19 @@ fn parse_algo(s: &str) -> Result<RefineAlgo, String> {
     }
 }
 
+fn parse_banding(s: &str) -> Result<BandingAlgo, String> {
+    match s {
+        "fixed" => Ok(BandingAlgo::Fixed),
+        "adaptive" => Ok(BandingAlgo::Adaptive {
+            bandwidth: 0, // sentinel: will use half_bandwidth * 2
+        }),
+        _ => Err(format!(
+            "unknown banding algorithm '{}', expected 'fixed' or 'adaptive'",
+            s
+        )),
+    }
+}
+
 fn parse_rescale(s: &str) -> Result<RescaleAlgo, String> {
     match s {
         "theil-sen" => Ok(RescaleAlgo::default()),
@@ -132,6 +149,14 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             .ok(); // Ignore error if pool is already initialized
     }
 
+    // Resolve adaptive bandwidth from half_bandwidth if sentinel value
+    let banding = match args.banding {
+        BandingAlgo::Adaptive { bandwidth: 0 } => BandingAlgo::Adaptive {
+            bandwidth: args.half_bandwidth * 2,
+        },
+        other => other,
+    };
+
     // Apply --dwell-target and --dwell-weight to the algo if dwell-penalty was chosen
     let algo = match args.algo {
         RefineAlgo::DwellPenalty { .. } => RefineAlgo::DwellPenalty {
@@ -149,6 +174,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         rescale_algo: args.rescale.clone(),
         rough_rescale_algo: RoughRescaleAlgo::default(),
         normalize_levels: args.normalize == Some(NormalizeMode::Mad),
+        banding_algo: banding,
     };
 
     // --- Phase 1: Load kmer table ---
@@ -607,11 +633,14 @@ fn refine_single_read(
         .map(|&x| (x + signal_start) as u32)
         .collect();
 
+    let rd_tag = Tag::new(b'r', b'd');
+
     record
         .data_mut()
         .insert(rs_tag, Value::Array(Array::UInt32(boundaries)));
     record.data_mut().insert(rc_tag, Value::Float(result.scale));
     record.data_mut().insert(ro_tag, Value::Float(result.shift));
+    record.data_mut().insert(rd_tag, Value::Float(result.drift));
 
     Ok(true)
 }
