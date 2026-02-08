@@ -22,23 +22,23 @@ pub struct TrainSvmArgs {
     pub output: PathBuf,
 
     /// RBF kernel gamma parameter
-    #[arg(long, default_value = "1.0", value_name = "VALUE")]
+    #[arg(long, default_value = "1.0", value_name = "VALUE", help_heading = "Advanced Options")]
     pub gamma: f64,
 
     /// Power to raise distances before exponential
-    #[arg(long, default_value = "1.0", value_name = "VALUE")]
+    #[arg(long, default_value = "1.0", value_name = "VALUE", help_heading = "Advanced Options")]
     pub power: f64,
 
     /// SVM regularization parameter C
-    #[arg(long, default_value = "1.0", value_name = "VALUE")]
+    #[arg(long, default_value = "1.0", value_name = "VALUE", help_heading = "Advanced Options")]
     pub c: f64,
 
     /// DTW window constraint (Sakoe-Chiba band)
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub window: Option<usize>,
 
     /// Per-class confidence thresholds (comma-separated)
-    #[arg(long, value_name = "VALUES")]
+    #[arg(long, value_name = "VALUES", help_heading = "Advanced Options")]
     pub thresholds: Option<String>,
 }
 

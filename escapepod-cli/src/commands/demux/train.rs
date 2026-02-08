@@ -33,31 +33,31 @@ pub struct TrainArgs {
     pub output: PathBuf,
 
     /// Start sample for fingerprint region
-    #[arg(long, default_value = "1000", value_name = "N")]
+    #[arg(long, default_value = "1000", value_name = "N", help_heading = "Advanced Options")]
     pub segment_start: usize,
 
     /// End sample for fingerprint region
-    #[arg(long, default_value = "2000", value_name = "N")]
+    #[arg(long, default_value = "2000", value_name = "N", help_heading = "Advanced Options")]
     pub segment_end: usize,
 
     /// Number of segments for fingerprinting
-    #[arg(long, default_value = "10", value_name = "N")]
+    #[arg(long, default_value = "10", value_name = "N", help_heading = "Advanced Options")]
     pub num_segments: usize,
 
     /// Window width for t-test segmentation
-    #[arg(long, default_value = "5", value_name = "N")]
+    #[arg(long, default_value = "5", value_name = "N", help_heading = "Advanced Options")]
     pub window_width: usize,
 
     /// Normalization method (zscore, minmax, median, none)
-    #[arg(long, default_value = "zscore", value_name = "METHOD")]
+    #[arg(long, default_value = "zscore", value_name = "METHOD", help_heading = "Advanced Options")]
     pub normalize: String,
 
     /// Minimum observations for adapter segment
-    #[arg(long, default_value = "200", value_name = "N")]
+    #[arg(long, default_value = "200", value_name = "N", help_heading = "Advanced Options")]
     pub min_adapter: usize,
 
     /// Border trim size for adapter detection
-    #[arg(long, default_value = "50", value_name = "N")]
+    #[arg(long, default_value = "50", value_name = "N", help_heading = "Advanced Options")]
     pub border_trim: usize,
 
     /// Number of threads for parallel processing

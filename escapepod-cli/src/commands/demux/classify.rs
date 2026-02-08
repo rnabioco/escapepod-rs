@@ -34,15 +34,15 @@ pub struct ClassifyArgs {
     pub output: PathBuf,
 
     /// DTW window constraint (Sakoe-Chiba band width)
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub window: Option<usize>,
 
     /// Minimum distance ratio for confident classification (CSV mode only)
-    #[arg(long, default_value = "0.8", value_name = "RATIO")]
+    #[arg(long, default_value = "0.8", value_name = "RATIO", help_heading = "Advanced Options")]
     pub min_ratio: f32,
 
     /// Output per-class probabilities (SVM model only)
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced Options")]
     pub probabilities: bool,
 }
 

@@ -44,41 +44,41 @@ pub struct ResquiggleArgs {
     pub output: PathBuf,
 
     /// Refinement algorithm
-    #[arg(long, default_value = "dwell-penalty", value_parser = parse_algo)]
+    #[arg(long, default_value = "dwell-penalty", value_parser = parse_algo, help_heading = "Advanced Options")]
     pub algo: RefineAlgo,
 
     /// Number of refinement iterations
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "2", help_heading = "Advanced Options")]
     pub iterations: usize,
 
     /// Half bandwidth for banded DP
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "5", help_heading = "Advanced Options")]
     pub half_bandwidth: usize,
 
     /// Rescale algorithm
-    #[arg(long, default_value = "theil-sen", value_parser = parse_rescale)]
+    #[arg(long, default_value = "theil-sen", value_parser = parse_rescale, help_heading = "Advanced Options")]
     pub rescale: RescaleAlgo,
 
     /// Target dwell time per base for dwell-penalty algorithm (0 = auto from move table)
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "0", help_heading = "Advanced Options")]
     pub dwell_target: f32,
 
     /// Dwell penalty weight for dwell-penalty algorithm
-    #[arg(long, default_value = "0.5")]
+    #[arg(long, default_value = "0.5", help_heading = "Advanced Options")]
     pub dwell_weight: f32,
 
     /// Normalization mode for kmer levels (e.g., 'mad')
-    #[arg(long, value_parser = parse_normalize, value_name = "MODE")]
+    #[arg(long, value_parser = parse_normalize, value_name = "MODE", help_heading = "Advanced Options")]
     pub normalize: Option<NormalizeMode>,
 
     /// Banding algorithm: 'fixed' (default) or 'adaptive'
-    #[arg(long, default_value = "fixed", value_parser = parse_banding)]
+    #[arg(long, default_value = "fixed", value_parser = parse_banding, help_heading = "Advanced Options")]
     pub banding: BandingAlgo,
 
     /// X-drop threshold for adaptive banding early termination (optional).
     /// When the best per-base DP score exceeds the global best by more than
     /// this value, the DP bails out and returns the initial map.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced Options")]
     pub x_drop: Option<f32>,
 
     /// Number of threads for parallel processing
