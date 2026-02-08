@@ -75,6 +75,12 @@ pub struct ResquiggleArgs {
     #[arg(long, default_value = "fixed", value_parser = parse_banding)]
     pub banding: BandingAlgo,
 
+    /// X-drop threshold for adaptive banding early termination (optional).
+    /// When the best per-base DP score exceeds the global best by more than
+    /// this value, the DP bails out and returns the initial map.
+    #[arg(long)]
+    pub x_drop: Option<f32>,
+
     /// Number of threads for parallel processing
     #[arg(short = 'j', long)]
     pub threads: Option<usize>,
@@ -115,6 +121,7 @@ fn parse_banding(s: &str) -> Result<BandingAlgo, String> {
         "fixed" => Ok(BandingAlgo::Fixed),
         "adaptive" => Ok(BandingAlgo::Adaptive {
             bandwidth: 0, // sentinel: will use half_bandwidth * 2
+            x_drop: None, // sentinel: will use --x-drop flag
         }),
         _ => Err(format!(
             "unknown banding algorithm '{}', expected 'fixed' or 'adaptive'",
@@ -151,8 +158,9 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
 
     // Resolve adaptive bandwidth from half_bandwidth if sentinel value
     let banding = match args.banding {
-        BandingAlgo::Adaptive { bandwidth: 0 } => BandingAlgo::Adaptive {
+        BandingAlgo::Adaptive { bandwidth: 0, .. } => BandingAlgo::Adaptive {
             bandwidth: args.half_bandwidth * 2,
+            x_drop: args.x_drop,
         },
         other => other,
     };

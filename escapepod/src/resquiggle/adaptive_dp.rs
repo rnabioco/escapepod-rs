@@ -7,14 +7,20 @@
 //! bandwidth.
 
 use super::bands::Band;
-use super::dp::{banded_traceback, dp_step};
+use super::dp::{banded_traceback, dp_step_buffered, ViterbiBuffers};
 use super::types::RefineAlgo;
 
 /// Run adaptive banded DP.
 ///
-/// The band center is seeded from `initial_map` and then steered during the
-/// forward pass: if the lower edge of the band has a better score than the
-/// upper edge, the band shifts down for the next base, and vice versa.
+/// The band center is seeded from `initial_map` for base 0 only, then steered
+/// purely by edge-score comparison for all subsequent bases.  Steering
+/// magnitude is proportional to the edge score imbalance (capped at
+/// `half_bw / 2`).
+///
+/// If `x_drop` is `Some(threshold)`, the DP terminates early when the best
+/// per-base minimum score exceeds the global best by more than `threshold`,
+/// returning `initial_map` as the path (the DP is failing, so the initial map
+/// is safer).
 ///
 /// Returns a signal-position path of length `levels.len() + 1`.
 pub fn adaptive_banded_dp(
@@ -23,6 +29,7 @@ pub fn adaptive_banded_dp(
     bandwidth: usize,
     initial_map: &[usize],
     _method: &RefineAlgo,
+    x_drop: Option<f32>,
 ) -> Vec<usize> {
     let n_bases = levels.len();
     let signal_len = signal.len();
@@ -32,6 +39,7 @@ pub fn adaptive_banded_dp(
     }
 
     let half_bw = bandwidth / 2;
+    let avg_advance = signal_len / n_bases;
 
     // We need to record band boundaries and traceback for the final path
     let mut band_starts: Vec<usize> = Vec::with_capacity(n_bases);
@@ -43,6 +51,12 @@ pub fn adaptive_banded_dp(
     let mut prev_scores = vec![f32::INFINITY; max_bw];
     let mut curr_scores = vec![f32::INFINITY; max_bw];
     let mut curr_traceback = vec![0i32; max_bw];
+
+    // X-drop tracking
+    let mut best_min_score = f32::INFINITY;
+
+    // Pre-allocated scratch buffers for dp_step (reused across all bases)
+    let mut viterbi_buf = ViterbiBuffers::new(max_bw);
 
     // --- First base ---
     // Band for base 0: centered around initial_map midpoint, starts at 0
@@ -70,14 +84,22 @@ pub fn adaptive_banded_dp(
     curr_scores[..bw0].fill(f32::INFINITY);
     curr_traceback[..bw0].fill(-1);
 
-    dp_step(
+    dp_step_buffered(
         &mut curr_scores[..bw0],
         &mut curr_traceback[..bw0],
         &prev_scores[..bw0],
         levels[0],
         &signal[bs0..be0],
         1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
-        );
+        &mut viterbi_buf,
+    );
+
+    // X-drop: track best minimum score
+    let current_min = curr_scores[..bw0]
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    best_min_score = best_min_score.min(current_min);
 
     all_traceback.push(curr_traceback[..bw0].to_vec());
     std::mem::swap(&mut prev_scores, &mut curr_scores);
@@ -86,20 +108,28 @@ pub fn adaptive_banded_dp(
     let mut prev_bw = bw0;
 
     // --- Remaining bases ---
+    #[allow(clippy::needless_range_loop)]
     for base_idx in 1..n_bases {
         // Steer: compare lower and upper edge scores of the previous band
         let lower_score = prev_scores[0];
         let upper_score = prev_scores[prev_bw.saturating_sub(1)];
 
-        // Seed center from initial map
-        let mid = (initial_map[base_idx] + initial_map[base_idx + 1]) / 2;
-        let mut center = mid.min(signal_len.saturating_sub(1));
+        // Pure steering: advance from previous band center by avg_advance
+        let prev_center = prev_bs + prev_bw / 2;
+        let mut center = (prev_center + avg_advance).min(signal_len.saturating_sub(1));
 
-        // Apply steering
-        if lower_score < upper_score {
-            center = center.saturating_sub(1);
-        } else if upper_score < lower_score {
-            center = (center + 1).min(signal_len.saturating_sub(1));
+        // Proportional steering: scale magnitude by edge score ratio
+        let max_steer = (half_bw / 2).max(1);
+        if lower_score < upper_score && upper_score.is_finite() {
+            // Lower edge better → band too far right → shift left
+            let ratio = (upper_score - lower_score) / upper_score.max(1e-6);
+            let steer = ((ratio * max_steer as f32).ceil() as usize).min(max_steer);
+            center = center.saturating_sub(steer);
+        } else if upper_score < lower_score && lower_score.is_finite() {
+            // Upper edge better → band too far left → shift right
+            let ratio = (lower_score - upper_score) / lower_score.max(1e-6);
+            let steer = ((ratio * max_steer as f32).ceil() as usize).min(max_steer);
+            center = (center + steer).min(signal_len.saturating_sub(1));
         }
 
         let (mut bs, mut be) = band_for_center(center, half_bw, signal_len);
@@ -143,14 +173,27 @@ pub fn adaptive_banded_dp(
 
         let prev_band_offset = bs - prev_bs;
 
-        dp_step(
+        dp_step_buffered(
             &mut curr_scores[..bw],
             &mut curr_traceback[..bw],
             &prev_scores[..prev_bw],
             levels[base_idx],
             &signal[bs..be],
             prev_band_offset,
+            &mut viterbi_buf,
         );
+
+        // X-drop: check for early termination
+        let current_min = curr_scores[..bw]
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        best_min_score = best_min_score.min(current_min);
+        if let Some(threshold) = x_drop {
+            if current_min > best_min_score + threshold {
+                return initial_map.to_vec();
+            }
+        }
 
         all_traceback.push(curr_traceback[..bw].to_vec());
         std::mem::swap(&mut prev_scores, &mut curr_scores);
@@ -209,7 +252,7 @@ mod tests {
         let bandwidth = 10; // half_bw = 5
 
         let path =
-            adaptive_banded_dp(&signal, &levels, bandwidth, &initial_map, &RefineAlgo::Viterbi);
+            adaptive_banded_dp(&signal, &levels, bandwidth, &initial_map, &RefineAlgo::Viterbi, None);
 
         assert_eq!(path.len(), n_bases + 1);
         assert_eq!(path[0], 0);
@@ -264,6 +307,7 @@ mod tests {
             bandwidth,
             &initial_map,
             &RefineAlgo::Viterbi,
+            None,
         );
 
         assert_eq!(path.len(), n_bases + 1);
@@ -301,6 +345,7 @@ mod tests {
             bandwidth,
             &initial_map,
             &RefineAlgo::Viterbi,
+            None,
         );
 
         // Fixed path using standard banded DP
@@ -351,6 +396,7 @@ mod tests {
             bandwidth,
             &initial_map,
             &RefineAlgo::Viterbi,
+            None,
         );
 
         assert_eq!(path.len(), levels.len() + 1);
@@ -396,6 +442,7 @@ mod tests {
             bandwidth,
             &initial_map,
             &RefineAlgo::Viterbi,
+            None,
         );
 
         assert_eq!(path.len(), n_bases + 1);
@@ -405,5 +452,167 @@ mod tests {
         for w in path.windows(2) {
             assert!(w[1] > w[0], "path not strictly increasing: {:?}", path);
         }
+    }
+
+    #[test]
+    fn test_adaptive_pure_steering_recovers() {
+        // Pure steering (no initial_map re-seeding) should still produce a
+        // valid path on a clean signal with a good initial map.
+        let n_bases = 8;
+        let spb = 12;
+        let signal_len = n_bases * spb;
+
+        let levels: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, -1.0, 0.3, -0.3, 0.8];
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..spb {
+                signal[i * spb + j] = level;
+            }
+        }
+
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| i * spb).collect();
+        let bandwidth = 12;
+
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            bandwidth,
+            &initial_map,
+            &RefineAlgo::Viterbi,
+            None,
+        );
+
+        assert_eq!(path.len(), n_bases + 1);
+        assert_eq!(path[0], 0);
+        assert_eq!(path[n_bases], signal_len);
+
+        for w in path.windows(2) {
+            assert!(w[1] > w[0], "path not strictly increasing: {:?}", path);
+        }
+
+        // Boundaries should be near truth
+        for i in 0..=n_bases {
+            let expected = i * spb;
+            let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
+            assert!(
+                diff <= bandwidth / 2 + 2,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_proportional_steering_wide_band() {
+        // With a wide band, proportional steering should not overshoot.
+        let n_bases = 5;
+        let spb = 10;
+        let signal_len = n_bases * spb;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0];
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..spb {
+                signal[i * spb + j] = level;
+            }
+        }
+
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| i * spb).collect();
+        let bandwidth = 20; // wide — max_steer = 5
+
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            bandwidth,
+            &initial_map,
+            &RefineAlgo::Viterbi,
+            None,
+        );
+
+        assert_eq!(path.len(), n_bases + 1);
+        assert_eq!(path[0], 0);
+        assert_eq!(path[n_bases], signal_len);
+
+        for w in path.windows(2) {
+            assert!(w[1] > w[0], "path not strictly increasing: {:?}", path);
+        }
+
+        for i in 0..=n_bases {
+            let expected = i * spb;
+            let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
+            assert!(
+                diff <= bandwidth / 2 + 2,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_x_drop_early_termination() {
+        // Garbage signal should trigger X-drop and return initial_map.
+        let n_bases = 5;
+        let spb = 10;
+        let signal_len = n_bases * spb;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0];
+        // Signal is random garbage that doesn't match levels at all — large
+        // monotonically growing values to ensure scores blow up.
+        let signal: Vec<f32> = (0..signal_len).map(|i| 100.0 + i as f32 * 10.0).collect();
+
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| i * spb).collect();
+        let bandwidth = 10;
+        let x_drop = Some(50.0); // tight threshold
+
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            bandwidth,
+            &initial_map,
+            &RefineAlgo::Viterbi,
+            x_drop,
+        );
+
+        // X-drop should bail to initial_map
+        assert_eq!(path, initial_map);
+    }
+
+    #[test]
+    fn test_x_drop_does_not_trigger_on_clean_signal() {
+        // Clean signal should NOT trigger X-drop.
+        let n_bases = 5;
+        let spb = 10;
+        let signal_len = n_bases * spb;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0];
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..spb {
+                signal[i * spb + j] = level;
+            }
+        }
+
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| i * spb).collect();
+        let bandwidth = 10;
+        let x_drop = Some(100.0); // generous threshold
+
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            bandwidth,
+            &initial_map,
+            &RefineAlgo::Viterbi,
+            x_drop,
+        );
+
+        // Should NOT bail — path should differ from initial_map (DP refines it)
+        assert_eq!(path.len(), n_bases + 1);
+        assert_eq!(path[0], 0);
+        assert_eq!(path[n_bases], signal_len);
+        assert_ne!(path, initial_map, "X-drop should not have triggered on clean signal");
     }
 }
