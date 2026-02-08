@@ -463,7 +463,7 @@ pub fn banded_traceback(
 }
 
 #[cfg(test)]
-#[allow(clippy::excessive_precision, clippy::useless_vec)]
+#[allow(clippy::excessive_precision, clippy::useless_vec, clippy::needless_range_loop)]
 mod tests {
     use super::*;
 

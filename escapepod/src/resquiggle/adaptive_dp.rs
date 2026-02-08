@@ -229,6 +229,7 @@ fn band_for_center(center: usize, half_bw: usize, signal_len: usize) -> (usize, 
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::super::dp::banded_dp;
     use super::*;
