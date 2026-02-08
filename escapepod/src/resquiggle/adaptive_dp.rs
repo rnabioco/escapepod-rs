@@ -230,8 +230,8 @@ fn band_for_center(center: usize, half_bw: usize, signal_len: usize) -> (usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::dp::banded_dp;
+    use super::*;
 
     #[test]
     fn test_adaptive_dp_clean_signal() {
@@ -251,8 +251,14 @@ mod tests {
         let initial_map: Vec<usize> = (0..=n_bases).map(|i| i * spb).collect();
         let bandwidth = 10; // half_bw = 5
 
-        let path =
-            adaptive_banded_dp(&signal, &levels, bandwidth, &initial_map, &RefineAlgo::Viterbi, None);
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            bandwidth,
+            &initial_map,
+            &RefineAlgo::Viterbi,
+            None,
+        );
 
         assert_eq!(path.len(), n_bases + 1);
         assert_eq!(path[0], 0);
@@ -293,9 +299,8 @@ mod tests {
         }
 
         // Shift map left by 5 (but keep first at 0 and last at signal_len)
-        let mut initial_map: Vec<usize> = (0..=n_bases)
-            .map(|i| (i * spb).saturating_sub(5))
-            .collect();
+        let mut initial_map: Vec<usize> =
+            (0..=n_bases).map(|i| (i * spb).saturating_sub(5)).collect();
         initial_map[0] = 0;
         initial_map[n_bases] = signal_len;
 
@@ -367,8 +372,7 @@ mod tests {
 
         // Paths should be within a few samples of each other
         for i in 0..=n_bases {
-            let diff =
-                (adaptive_path[i] as i64 - fixed_path[i] as i64).unsigned_abs() as usize;
+            let diff = (adaptive_path[i] as i64 - fixed_path[i] as i64).unsigned_abs() as usize;
             assert!(
                 diff <= half_bw + 2,
                 "paths diverge at boundary {}: adaptive={}, fixed={}",
@@ -613,6 +617,9 @@ mod tests {
         assert_eq!(path.len(), n_bases + 1);
         assert_eq!(path[0], 0);
         assert_eq!(path[n_bases], signal_len);
-        assert_ne!(path, initial_map, "X-drop should not have triggered on clean signal");
+        assert_ne!(
+            path, initial_map,
+            "X-drop should not have triggered on clean signal"
+        );
     }
 }

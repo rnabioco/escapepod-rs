@@ -479,11 +479,17 @@ mod tests {
 
         // Below target: quadratic penalty
         let p0 = dwell_penalty(0, target, weight);
-        assert!((p0 - weight * target * target).abs() < 1e-6, "dwell=0 should be weight*target^2");
+        assert!(
+            (p0 - weight * target * target).abs() < 1e-6,
+            "dwell=0 should be weight*target^2"
+        );
 
         let p10 = dwell_penalty(10, target, weight);
         let p20 = dwell_penalty(20, target, weight);
-        assert!(p0 > p10 && p10 > p20, "penalty should decrease as dwell approaches target");
+        assert!(
+            p0 > p10 && p10 > p20,
+            "penalty should decrease as dwell approaches target"
+        );
 
         // At target: logarithmic penalty = weight * ln(2)
         let p_target = dwell_penalty(36, target, weight);
@@ -500,7 +506,10 @@ mod tests {
 
         // Short-side penalty at target-5 should be much stronger than 50x long dwell
         let p_short = dwell_penalty(31, target, weight);
-        assert!(p_short > p_50x, "short dwell penalty should exceed 50x long dwell penalty");
+        assert!(
+            p_short > p_50x,
+            "short dwell penalty should exceed 50x long dwell penalty"
+        );
     }
 
     #[test]
@@ -754,7 +763,13 @@ mod tests {
         for i in 0..=n_bases {
             let expected = i * samples_per_base;
             let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
-            assert!(diff <= half_bw + 1, "path[{}]={} far from expected {}", i, path[i], expected);
+            assert!(
+                diff <= half_bw + 1,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
         }
     }
 
@@ -800,7 +815,13 @@ mod tests {
         for i in 0..=n_bases {
             let expected = i * samples_per_base;
             let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
-            assert!(diff <= half_bw + 1, "path[{}]={} far from expected {}", i, path[i], expected);
+            assert!(
+                diff <= half_bw + 1,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
         }
     }
 
@@ -843,7 +864,12 @@ mod tests {
         // Dwell penalty path should have no base with extremely short dwell
         for w in dwell_path.windows(2) {
             let dwell = w[1] - w[0];
-            assert!(dwell >= 2, "dwell penalty produced dwell of {} at {:?}", dwell, dwell_path);
+            assert!(
+                dwell >= 2,
+                "dwell penalty produced dwell of {} at {:?}",
+                dwell,
+                dwell_path
+            );
         }
     }
 
@@ -889,7 +915,9 @@ mod tests {
             assert!(
                 diff <= 2,
                 "paths diverge at boundary {}: viterbi={}, dwell={}",
-                i, viterbi_path[i], dwell_path[i]
+                i,
+                viterbi_path[i],
+                dwell_path[i]
             );
         }
     }

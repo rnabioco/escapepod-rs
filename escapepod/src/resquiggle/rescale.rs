@@ -444,8 +444,8 @@ fn least_squares_with_drift(
 
     // Normal equations: [n, sx, st; sx, sxx, sxt; st, sxt, stt] [a; b; c] = [sy; sxy; sty]
     // Solve with Cramer's rule
-    let det = nf * (sxx * stt - sxt * sxt) - sx * (sx * stt - sxt * st)
-        + st * (sx * sxt - sxx * st);
+    let det =
+        nf * (sxx * stt - sxt * sxt) - sx * (sx * stt - sxt * st) + st * (sx * sxt - sxx * st);
 
     if det.abs() < 1e-12 {
         // Degenerate: fall back to 2-param (no drift update)
@@ -455,18 +455,15 @@ fn least_squares_with_drift(
         };
     }
 
-    let a =
-        (sy * (sxx * stt - sxt * sxt) - sx * (sxy * stt - sxt * sty)
-            + st * (sxy * sxt - sxx * sty))
-            / det;
-    let b =
-        (nf * (sxy * stt - sxt * sty) - sy * (sx * stt - sxt * st)
-            + st * (sx * sty - sxy * st))
-            / det;
-    let c =
-        (nf * (sxx * sty - sxt * sxy) - sx * (sx * sty - sxy * st)
-            + sy * (sx * sxt - sxx * st))
-            / det;
+    let a = (sy * (sxx * stt - sxt * sxt) - sx * (sxy * stt - sxt * sty)
+        + st * (sxy * sxt - sxx * sty))
+        / det;
+    let b = (nf * (sxy * stt - sxt * sty) - sy * (sx * stt - sxt * st)
+        + st * (sx * sty - sxy * st))
+        / det;
+    let c = (nf * (sxx * sty - sxt * sxy) - sx * (sx * sty - sxy * st)
+        + sy * (sx * sxt - sxx * st))
+        / det;
 
     let b = b as f32;
     let a = a as f32;
@@ -668,7 +665,11 @@ mod tests {
         let y = vec![0.0, 1.0, 2.0, 100.0, 4.0, 5.0, 6.0]; // outlier at index 3
         let (_new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
         // With the outlier, median slope should still be close to 1.0
-        assert!((new_scale - 1.0).abs() < 0.5, "scale should be near 1.0, got {}", new_scale);
+        assert!(
+            (new_scale - 1.0).abs() < 0.5,
+            "scale should be near 1.0, got {}",
+            new_scale
+        );
     }
 
     #[test]
@@ -722,11 +723,7 @@ mod tests {
             "scale={}, expected 1.0",
             new_scale
         );
-        assert!(
-            new_drift.abs() < 1e-4,
-            "drift={}, expected ~0.0",
-            new_drift
-        );
+        assert!(new_drift.abs() < 1e-4, "drift={}, expected ~0.0", new_drift);
     }
 
     #[test]
@@ -789,8 +786,7 @@ mod tests {
         let levels = vec![0.0, 1.0, 0.5, -0.5, -1.0, 0.3, -0.3, 0.8];
         let time: Vec<f32> = (0..8).map(|i| i as f32 * 50.0).collect();
 
-        let (_, _, drift) =
-            least_squares_with_drift(&norm, &levels, &time, 0.0, 1.0, 0.0).unwrap();
+        let (_, _, drift) = least_squares_with_drift(&norm, &levels, &time, 0.0, 1.0, 0.0).unwrap();
 
         assert!(
             drift.abs() < 1e-4,
