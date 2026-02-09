@@ -1,8 +1,13 @@
 //! Utility functions for the CLI.
 
 use escapepod::Reader;
+use noodles_bam as bam;
+use noodles_csi::binning_index::ReferenceSequence as _;
+use noodles_csi::BinningIndex;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+use crate::style;
 
 /// Resolve input path to a list of POD5 files.
 ///
@@ -107,6 +112,71 @@ pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> Open
             }
         }
     }
+}
+
+/// Ensure a BAI index exists for the given BAM file, creating one if necessary.
+///
+/// Returns the path to the BAI file (either existing or newly created).
+pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
+    // noodles expects the index at path.bam.bai
+    let bai_path = bam_path.with_extension("bam.bai");
+
+    if bai_path.exists() {
+        return Ok(bai_path);
+    }
+
+    // Also check for path.bai (alternative naming convention)
+    let alt_bai_path = bam_path.with_extension("bai");
+    if alt_bai_path.exists() {
+        eprintln!(
+            "{} Found index at {} but noodles expects {}",
+            style::note_label("Note:"),
+            style::path(alt_bai_path.display()),
+            style::path(bai_path.display())
+        );
+    }
+
+    eprintln!(
+        "{} BAI index not found, creating {}...",
+        style::info("Info:"),
+        style::path(bai_path.display())
+    );
+
+    // Build the index from the BAM file
+    let index = bam::fs::index(bam_path)?;
+
+    // Write the index to file
+    bam::bai::fs::write(&bai_path, &index)?;
+
+    eprintln!(
+        "{} Created BAI index: {}",
+        style::action("Done:"),
+        style::path(bai_path.display())
+    );
+
+    Ok(bai_path)
+}
+
+/// Count total records in a BAM file using its BAI index.
+///
+/// Creates the BAI index if it does not already exist.
+/// Returns the total number of records (mapped + unmapped).
+pub fn count_bam_records(bam_path: &Path) -> anyhow::Result<u64> {
+    let bai_path = ensure_bai_index(bam_path)?;
+    let index = bam::bai::fs::read(&bai_path)?;
+
+    let mut total: u64 = 0;
+    for ref_seq in index.reference_sequences() {
+        if let Some(metadata) = ref_seq.metadata() {
+            total += metadata.mapped_record_count();
+            total += metadata.unmapped_record_count();
+        }
+    }
+    if let Some(count) = index.unplaced_unmapped_record_count() {
+        total += count;
+    }
+
+    Ok(total)
 }
 
 /// Get a reads iterator with appropriate error handling for directory mode.

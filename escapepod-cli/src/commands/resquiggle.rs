@@ -22,9 +22,9 @@ use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
 use sam::header::record::value::map::{program::tag as pg_tag, Map, Program};
 
-use crate::progress::create_spinner;
+use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
-use crate::util::resolve_pod5_inputs;
+use crate::util::{count_bam_records, resolve_pod5_inputs};
 
 #[derive(Args)]
 pub struct ResquiggleArgs {
@@ -250,6 +250,9 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         .collect::<escapepod::Result<_>>()?;
 
     // --- Phase 3: Stream BAM, refine in parallel, write asynchronously ---
+    let bam_total = count_bam_records(&args.bam)?;
+    eprintln!("[resquiggle] BAM contains {} records", bam_total);
+
     let file = std::fs::File::open(&args.bam)?;
     let worker_count = args
         .threads
@@ -330,7 +333,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     // Stream BAM records, filter against POD5 index, and process in chunks
     // Each chunk entry carries the pre-parsed UUID to avoid double parsing.
     const CHUNK_SIZE: usize = 10_000;
-    let stream_spinner = create_spinner("Processing")?;
+    let progress_bar = create_progress_bar(bam_total, "Processing")?;
     let mut chunk: Vec<(uuid::Uuid, RecordBuf)> = Vec::with_capacity(CHUNK_SIZE);
     let mut total_bam: usize = 0;
     let mut matched: usize = 0;
@@ -361,17 +364,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         matched += 1;
         chunk.push((read_id, record_buf));
 
-        if total_bam % 50_000 == 0 {
-            stream_spinner.set_message(format!(
-                "{} matched / {} scanned from BAM",
-                style::count(matched),
-                style::count(total_bam)
-            ));
-            eprintln!(
-                "[resquiggle] {} matched / {} scanned from BAM",
-                matched, total_bam
-            );
-        }
+        progress_bar.set_position(total_bam as u64);
 
         if chunk.len() >= CHUNK_SIZE {
             refine_and_send_chunk(&mut chunk, &ctx, &tx)?;
@@ -385,15 +378,11 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     }
     drop(tx);
 
-    stream_spinner.finish_with_message(format!(
-        "{} matched / {} scanned from BAM",
+    progress_bar.finish_with_message(format!(
+        "{} matched / {} scanned",
         style::count(matched),
         style::count(total_bam)
     ));
-    eprintln!(
-        "[resquiggle] processing complete: {} matched / {} scanned from BAM",
-        matched, total_bam
-    );
 
     // Wait for writer to finish
     let written = writer_handle

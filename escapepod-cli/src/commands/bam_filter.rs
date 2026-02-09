@@ -6,7 +6,7 @@
 
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
-use crate::util::resolve_pod5_inputs;
+use crate::util::{ensure_bai_index, resolve_pod5_inputs};
 use bstr::ByteSlice;
 use escapepod::operations::{filter_files, FilterOptions};
 use escapepod::parse_uuid_flexible;
@@ -14,7 +14,7 @@ use noodles_bam as bam;
 use noodles_core::Region;
 use std::collections::HashSet;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Run the bam-filter command.
@@ -178,51 +178,6 @@ fn read_ids_from_bam(
     }
 
     Ok((ids, records_scanned))
-}
-
-/// Ensure a BAI index exists for the given BAM file, creating one if necessary.
-///
-/// Returns the path to the BAI file (either existing or newly created).
-fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
-    // noodles expects the index at path.bam.bai
-    let bai_path = bam_path.with_extension("bam.bai");
-
-    if bai_path.exists() {
-        return Ok(bai_path);
-    }
-
-    // Also check for path.bai (alternative naming convention)
-    let alt_bai_path = bam_path.with_extension("bai");
-    if alt_bai_path.exists() {
-        // noodles indexed_reader expects .bam.bai, so we need to create it
-        // or we could copy/symlink, but creating is safer
-        eprintln!(
-            "{} Found index at {} but noodles expects {}",
-            style::note_label("Note:"),
-            style::path(alt_bai_path.display()),
-            style::path(bai_path.display())
-        );
-    }
-
-    eprintln!(
-        "{} BAI index not found, creating {}...",
-        style::info("Info:"),
-        style::path(bai_path.display())
-    );
-
-    // Build the index from the BAM file
-    let index = bam::fs::index(bam_path)?;
-
-    // Write the index to file
-    bam::bai::fs::write(&bai_path, &index)?;
-
-    eprintln!(
-        "{} Created BAI index: {}",
-        style::action("Done:"),
-        style::path(bai_path.display())
-    );
-
-    Ok(bai_path)
 }
 
 /// Read IDs from BAM using indexed region query.
