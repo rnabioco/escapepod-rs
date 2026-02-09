@@ -24,15 +24,30 @@ pub struct DetectArgs {
     pub output: PathBuf,
 
     /// Minimum observations for adapter segment
-    #[arg(long, default_value = "200", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "200",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub min_adapter: usize,
 
     /// Border trim size
-    #[arg(long, default_value = "50", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "50",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub border_trim: usize,
 
     /// Downscale factor for signal processing (1 = no downscaling, 10 = WarpDemuX-compatible)
-    #[arg(long, default_value = "1", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub downscale: usize,
 
     /// Number of threads for parallel processing

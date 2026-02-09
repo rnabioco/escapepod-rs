@@ -22,15 +22,30 @@ pub struct TrainSvmArgs {
     pub output: PathBuf,
 
     /// RBF kernel gamma parameter
-    #[arg(long, default_value = "1.0", value_name = "VALUE", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "1.0",
+        value_name = "VALUE",
+        help_heading = "Advanced Options"
+    )]
     pub gamma: f64,
 
     /// Power to raise distances before exponential
-    #[arg(long, default_value = "1.0", value_name = "VALUE", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "1.0",
+        value_name = "VALUE",
+        help_heading = "Advanced Options"
+    )]
     pub power: f64,
 
     /// SVM regularization parameter C
-    #[arg(long, default_value = "1.0", value_name = "VALUE", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "1.0",
+        value_name = "VALUE",
+        help_heading = "Advanced Options"
+    )]
     pub c: f64,
 
     /// DTW window constraint (Sakoe-Chiba band)
@@ -106,7 +121,9 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
 ///
 /// Expected format: read_id,barcode,feat1,feat2,...,featN
 /// Returns: (fingerprints, labels, barcode_names)
-fn load_fingerprints(path: &PathBuf) -> anyhow::Result<(Vec<Vec<f64>>, Vec<i32>, Vec<String>)> {
+type FingerprintData = (Vec<Vec<f64>>, Vec<i32>, Vec<String>);
+
+fn load_fingerprints(path: &PathBuf) -> anyhow::Result<FingerprintData> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 

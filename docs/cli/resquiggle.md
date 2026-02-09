@@ -56,6 +56,7 @@ escapepod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
 | `--dwell-target <N>` | Target dwell time per base for dwell-penalty (default: 0 = auto from move table) |
 | `--dwell-weight <W>` | Dwell penalty weight (default: 0.5) |
 | `--normalize <MODE>` | Normalization mode for kmer levels (e.g., `mad`) |
+| `--rna` | RNA mode: reverse raw signal to match basecaller's 5'→3' orientation |
 | `-j, --threads <N>` | Number of threads for parallel processing |
 | `-h, --help` | Print help |
 
@@ -165,8 +166,26 @@ The output BAM file contains all input records with refined signal-to-base mappi
 | `rs` | `B:I` (uint32 array) | Refined signal boundaries per base (in full-signal coordinates) |
 | `rc` | `f` (float) | Refined calibration scale |
 | `ro` | `f` (float) | Refined calibration offset |
+| `rd` | `f` (float) | Refined calibration drift (per-sample trend) |
+| `ri` | `C` (uint8) | RNA indicator (1 = RNA mode, signal was reversed); only present with `--rna` |
 
 Records that could not be refined (missing POD5 data, no move table, etc.) are written through unchanged.
+
+### RNA mode
+
+For RNA data, the raw nanopore signal is acquired 3'→5', but the basecaller
+reverses it to 5'→3' before basecalling. The BAM move table (`mv`) remains in
+raw signal order (3'→5'), opposite to the sequence direction. When `--rna` is
+specified, the CLI reverses the trimmed signal and inverts the query-to-signal
+map so the DP operates in the same 5'→3' orientation as the basecaller.
+
+The `rs` boundaries are offset so they index directly into the **full reversed
+raw signal** (matching fishnet's convention). To recover per-base signal:
+1. Read the full raw signal from POD5
+2. Reverse it
+3. Use `rs` boundaries directly: `reversed_raw[rs[i]..rs[i+1]]`
+
+The `ri:C:1` tag signals to downstream tools that RNA reversal was applied.
 
 ## Processing Phases
 
@@ -340,6 +359,16 @@ escapepod resquiggle reads.pod5 \
     --algo dwell-penalty \
     --dwell-target 36 \
     --dwell-weight 0.3
+```
+
+### RNA Data
+
+```bash
+escapepod resquiggle rna_reads.pod5 \
+    -b rna_basecalls.bam \
+    -k rna004_9mer_levels_v1.txt \
+    -o rna_refined.bam \
+    --rna
 ```
 
 ### Using Multiple Threads

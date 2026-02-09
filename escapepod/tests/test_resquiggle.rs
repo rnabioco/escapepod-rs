@@ -30,7 +30,8 @@ use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
 
 use escapepod::resquiggle::{
-    calculate_initial_scaling, refine_signal_map, KmerTable, RefineSettings,
+    calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map, KmerTable,
+    RefineSettings,
 };
 use escapepod::{parse_uuid_flexible, Reader};
 
@@ -124,14 +125,6 @@ fn build_query_to_signal_map(
         seq_len + 1
     );
     map
-}
-
-/// Reverse a query-to-signal map for RNA signal reversal.
-///
-/// Matches fishnet's `align_query_to_signal` reversal (query_to_signal.rs:49-55):
-///   map = map.iter().rev().map(|el| signal_len - el).collect()
-fn reverse_query_to_signal_map(map: &[usize], signal_len: usize) -> Vec<usize> {
-    map.iter().rev().map(|&el| signal_len - el).collect()
 }
 
 /// Compare escapepod resquiggle output against fishnet reference on yeast tRNA data.

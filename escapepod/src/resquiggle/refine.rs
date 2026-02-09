@@ -46,6 +46,18 @@ pub fn calculate_initial_scaling(
     (scale, shift)
 }
 
+/// Reverse a query-to-signal map for RNA signal reversal.
+///
+/// For RNA data, the raw signal is acquired 3'→5' but basecalling operates on the
+/// reversed (5'→3') signal. This function reverses the boundary map so that it
+/// corresponds to the reversed signal coordinates.
+///
+/// Given a forward map `[b0, b1, ..., bn]` and `signal_len`, produces
+/// `[signal_len - bn, ..., signal_len - b1, signal_len - b0]`.
+pub fn reverse_query_to_signal_map(map: &[usize], signal_len: usize) -> Vec<usize> {
+    map.iter().rev().map(|&el| signal_len - el).collect()
+}
+
 /// Run the full refinement pipeline.
 ///
 /// 1. Optional rough rescaling
@@ -264,6 +276,24 @@ mod tests {
         // shift = 0.5 * 3.0 - 10.0 = 1.5 - 10.0 = -8.5
         assert!((scale - 0.5).abs() < 1e-6);
         assert!((shift - (-8.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reverse_query_to_signal_map() {
+        // Forward map: boundaries [0, 10, 25, 40, 50] with signal_len=50
+        let map = vec![0, 10, 25, 40, 50];
+        let reversed = reverse_query_to_signal_map(&map, 50);
+        // Expected: [50-50, 50-40, 50-25, 50-10, 50-0] = [0, 10, 25, 40, 50]
+        assert_eq!(reversed, vec![0, 10, 25, 40, 50]);
+
+        // Asymmetric map: [0, 5, 30, 100] with signal_len=100
+        let map = vec![0, 5, 30, 100];
+        let reversed = reverse_query_to_signal_map(&map, 100);
+        assert_eq!(reversed, vec![0, 70, 95, 100]);
+
+        // Verify first=0 and last=signal_len for valid maps
+        assert_eq!(reversed[0], 0);
+        assert_eq!(reversed[reversed.len() - 1], 100);
     }
 
     #[test]

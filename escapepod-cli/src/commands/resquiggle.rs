@@ -10,8 +10,8 @@ use rayon::prelude::*;
 
 use escapepod::parse_uuid_flexible;
 use escapepod::resquiggle::{
-    calculate_initial_scaling, refine_signal_map, BandingAlgo, KmerTable, RefineAlgo,
-    RefineSettings, RescaleAlgo, RoughRescaleAlgo,
+    calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map, BandingAlgo,
+    KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RoughRescaleAlgo,
 };
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
@@ -80,6 +80,10 @@ pub struct ResquiggleArgs {
     /// this value, the DP bails out and returns the initial map.
     #[arg(long, help_heading = "Advanced Options")]
     pub x_drop: Option<f32>,
+
+    /// RNA mode: reverse raw signal to match basecaller's 5'→3' orientation
+    #[arg(long)]
+    pub rna: bool,
 
     /// Number of threads for parallel processing
     #[arg(short = 'j', long)]
@@ -267,8 +271,9 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         }
         RefineAlgo::Viterbi => String::new(),
     };
+    let rna_str = if args.rna { " --rna" } else { "" };
     let command_line = format!(
-        "escpod resquiggle --algo {} --iterations {} --half-bandwidth {} --rescale {}{}{}",
+        "escpod resquiggle --algo {} --iterations {} --half-bandwidth {} --rescale {}{}{}{}",
         match &settings.refinement_algo {
             RefineAlgo::Viterbi => "viterbi",
             RefineAlgo::DwellPenalty { .. } => "dwell-penalty",
@@ -281,6 +286,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         },
         dwell_str,
         normalize_str,
+        rna_str,
     );
     let pg = Map::<Program>::builder()
         .insert(pg_tag::NAME, "escpod")
@@ -289,7 +295,13 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         .build()?;
     header.programs_mut().add("escpod-resquiggle", pg)?;
 
-    let stats = RefineStats::new();
+    let ctx = RefineContext::new(
+        &pod5_reads,
+        &signal_extractors,
+        &kmer_table,
+        &settings,
+        args.rna,
+    );
 
     // Spawn writer thread — receives ordered chunks via channel
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<RecordBuf>>(2);
@@ -362,30 +374,14 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         }
 
         if chunk.len() >= CHUNK_SIZE {
-            refine_and_send_chunk(
-                &mut chunk,
-                &pod5_reads,
-                &signal_extractors,
-                &kmer_table,
-                &settings,
-                &stats,
-                &tx,
-            )?;
+            refine_and_send_chunk(&mut chunk, &ctx, &tx)?;
             chunk = Vec::with_capacity(CHUNK_SIZE);
         }
     }
 
     // Flush remaining records
     if !chunk.is_empty() {
-        refine_and_send_chunk(
-            &mut chunk,
-            &pod5_reads,
-            &signal_extractors,
-            &kmer_table,
-            &settings,
-            &stats,
-            &tx,
-        )?;
+        refine_and_send_chunk(&mut chunk, &ctx, &tx)?;
     }
     drop(tx);
 
@@ -404,10 +400,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
 
-    let refined = stats
-        .refined_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let errors = stats.error_count.load(std::sync::atomic::Ordering::Relaxed);
+    let refined = ctx.refined_count.load(std::sync::atomic::Ordering::Relaxed);
+    let errors = ctx.error_count.load(std::sync::atomic::Ordering::Relaxed);
 
     println!(
         "{} {} refined, {} errors, {} written to {}",
@@ -418,7 +412,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         style::path(args.output.display())
     );
     if errors > 0 {
-        let reasons = stats.skip_reasons.lock().unwrap();
+        let reasons = ctx.skip_reasons.lock().unwrap();
         for (reason, count) in reasons.iter() {
             eprintln!("  error ({}x): {}", count, reason);
         }
@@ -427,16 +421,32 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Counters for tracking refinement progress and errors.
-struct RefineStats {
+/// Shared context for parallel refinement of BAM records.
+struct RefineContext<'a> {
+    pod5_reads: &'a HashMap<uuid::Uuid, Pod5ReadInfo>,
+    signal_extractors: &'a [escapepod::SignalExtractor<'a>],
+    kmer_table: &'a KmerTable,
+    settings: &'a RefineSettings,
+    rna: bool,
     refined_count: std::sync::atomic::AtomicUsize,
     error_count: std::sync::atomic::AtomicUsize,
     skip_reasons: std::sync::Mutex<HashMap<String, usize>>,
 }
 
-impl RefineStats {
-    fn new() -> Self {
+impl<'a> RefineContext<'a> {
+    fn new(
+        pod5_reads: &'a HashMap<uuid::Uuid, Pod5ReadInfo>,
+        signal_extractors: &'a [escapepod::SignalExtractor<'a>],
+        kmer_table: &'a KmerTable,
+        settings: &'a RefineSettings,
+        rna: bool,
+    ) -> Self {
         Self {
+            pod5_reads,
+            signal_extractors,
+            kmer_table,
+            settings,
+            rna,
             refined_count: std::sync::atomic::AtomicUsize::new(0),
             error_count: std::sync::atomic::AtomicUsize::new(0),
             skip_reasons: std::sync::Mutex::new(HashMap::new()),
@@ -447,35 +457,21 @@ impl RefineStats {
 /// Refine a chunk of BAM records in parallel and send to the writer thread.
 fn refine_and_send_chunk(
     chunk: &mut Vec<(uuid::Uuid, RecordBuf)>,
-    pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
-    signal_extractors: &[escapepod::SignalExtractor<'_>],
-    kmer_table: &KmerTable,
-    settings: &RefineSettings,
-    stats: &RefineStats,
+    ctx: &RefineContext<'_>,
     tx: &std::sync::mpsc::SyncSender<Vec<RecordBuf>>,
 ) -> anyhow::Result<()> {
     chunk.par_iter_mut().for_each(|(read_id, record)| {
-        match refine_single_read(
-            *read_id,
-            record,
-            pod5_reads,
-            signal_extractors,
-            kmer_table,
-            settings,
-        ) {
+        match refine_single_read(*read_id, record, ctx) {
             Ok(true) => {
-                stats
-                    .refined_count
+                ctx.refined_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(false) => {}
             Err(e) => {
-                stats
-                    .error_count
+                ctx.error_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reason = format!("{}", e);
-                stats
-                    .skip_reasons
+                ctx.skip_reasons
                     .lock()
                     .unwrap()
                     .entry(reason)
@@ -503,13 +499,10 @@ struct Pod5ReadInfo {
 fn refine_single_read(
     read_id: uuid::Uuid,
     record: &mut RecordBuf,
-    pod5_reads: &HashMap<uuid::Uuid, Pod5ReadInfo>,
-    signal_extractors: &[escapepod::SignalExtractor<'_>],
-    kmer_table: &KmerTable,
-    settings: &RefineSettings,
+    ctx: &RefineContext<'_>,
 ) -> anyhow::Result<bool> {
     // Look up POD5 read (UUID already parsed by caller)
-    let pod5_info = match pod5_reads.get(&read_id) {
+    let pod5_info = match ctx.pod5_reads.get(&read_id) {
         Some(info) => info,
         None => bail!("no matching POD5 read"),
     };
@@ -545,11 +538,9 @@ fn refine_single_read(
         bail!("empty sequence");
     }
 
-    // Build initial query-to-signal map from move table
-    let seq_to_signal = build_query_to_signal_map(&moves, stride, sequence.len())?;
-
     // Extract signal on-demand (parallel decompression) — kept as i16
-    let signal_i16 = signal_extractors[pod5_info.reader_idx].get_signal(&pod5_info.signal_rows)?;
+    let signal_i16 =
+        ctx.signal_extractors[pod5_info.reader_idx].get_signal(&pod5_info.signal_rows)?;
 
     // Compute signal trimming bounds on the i16 signal (no conversion yet)
     let sp_tag = Tag::new(b's', b'p');
@@ -576,10 +567,53 @@ fn refine_single_read(
     }
 
     // Convert only the trimmed range from i16 to f32
-    let signal_f32: Vec<f32> = signal_i16[signal_start..signal_end]
+    let mut signal_f32: Vec<f32> = signal_i16[signal_start..signal_end]
         .iter()
         .map(|&s| s as f32)
         .collect();
+
+    // For RNA, reverse the signal to match basecaller's 5'→3' orientation
+    if ctx.rna {
+        signal_f32.reverse();
+    }
+
+    // For RNA, validate move table length matches trimmed signal
+    // (matching fishnet's query_to_signal.rs:61 check)
+    if ctx.rna && moves.len() != signal_f32.len() / stride {
+        bail!(
+            "RNA move table length mismatch: moves.len()={} but signal_len/stride={}",
+            moves.len(),
+            signal_f32.len() / stride
+        );
+    }
+
+    // Build initial query-to-signal map from move table.
+    // For RNA, use the actual trimmed signal length as the final boundary
+    // (matching fishnet's behavior), then reverse the map.
+    let signal_len_override = if ctx.rna {
+        Some(signal_f32.len())
+    } else {
+        None
+    };
+    let seq_to_signal = {
+        let forward_map =
+            build_query_to_signal_map(&moves, stride, sequence.len(), signal_len_override)?;
+        if ctx.rna {
+            let reversed = reverse_query_to_signal_map(&forward_map, signal_f32.len());
+            // Validate reversed map boundaries
+            if reversed[0] != 0 || reversed[reversed.len() - 1] != signal_f32.len() {
+                bail!(
+                    "RNA reversed map invalid: first={}, last={}, signal_len={}",
+                    reversed[0],
+                    reversed[reversed.len() - 1],
+                    signal_f32.len()
+                );
+            }
+            reversed
+        } else {
+            forward_map
+        }
+    };
 
     // Get initial scaling from POD5 calibration + BAM sm/sd tags
     let sm_tag = Tag::new(b's', b'm');
@@ -595,7 +629,7 @@ fn refine_single_read(
     );
 
     // Extract expected levels from kmer table
-    let levels = match kmer_table.extract_levels(sequence) {
+    let levels = match ctx.kmer_table.extract_levels(sequence) {
         Ok(l) => l,
         Err(e) => bail!("kmer levels: {}", e),
     };
@@ -618,7 +652,7 @@ fn refine_single_read(
 
     // Run refinement on trimmed signal
     let result = match refine_signal_map(
-        settings,
+        ctx.settings,
         &signal_f32,
         &seq_to_signal,
         &levels,
@@ -630,15 +664,22 @@ fn refine_single_read(
     };
 
     // Insert refined tags into the BAM record
-    // Add signal_start offset back so boundaries are in full-signal coordinates
+    // For DNA: offset by signal_start so rs indexes into raw POD5 signal.
+    // For RNA: offset by (total_samples - signal_end) so rs indexes into the
+    // full reversed raw signal (matching fishnet's aligned_read.rs:180-181).
     let rs_tag = Tag::new(b'r', b's');
     let rc_tag = Tag::new(b'r', b'c');
     let ro_tag = Tag::new(b'r', b'o');
 
+    let signal_offset = if ctx.rna {
+        signal_i16.len() - signal_end
+    } else {
+        signal_start
+    };
     let boundaries: Vec<u32> = result
         .seq_to_signal_map
         .iter()
-        .map(|&x| (x + signal_start) as u32)
+        .map(|&x| (x + signal_offset) as u32)
         .collect();
 
     let rd_tag = Tag::new(b'r', b'd');
@@ -650,6 +691,12 @@ fn refine_single_read(
     record.data_mut().insert(ro_tag, Value::Float(result.shift));
     record.data_mut().insert(rd_tag, Value::Float(result.drift));
 
+    // Add RNA indicator tag when in RNA mode
+    if ctx.rna {
+        let ri_tag = Tag::new(b'r', b'i');
+        record.data_mut().insert(ri_tag, Value::UInt8(1));
+    }
+
     Ok(true)
 }
 
@@ -657,10 +704,15 @@ fn refine_single_read(
 ///
 /// The move table has one entry per stride-sized signal block.
 /// A value of 1 means "move to next base", 0 means "stay".
+///
+/// When `signal_len` is `Some(n)`, the final boundary uses `n` instead of
+/// `moves.len() * stride`. This is needed for RNA where the trimmed signal
+/// length may differ from `moves.len() * stride`.
 fn build_query_to_signal_map(
     moves: &[u8],
     stride: usize,
     seq_len: usize,
+    signal_len: Option<usize>,
 ) -> anyhow::Result<Vec<usize>> {
     let mut map = Vec::with_capacity(seq_len + 1);
 
@@ -671,7 +723,7 @@ fn build_query_to_signal_map(
     }
 
     // End boundary
-    map.push(moves.len() * stride);
+    map.push(signal_len.unwrap_or(moves.len() * stride));
 
     if map.len() != seq_len + 1 {
         bail!(

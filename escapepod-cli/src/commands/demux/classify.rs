@@ -38,7 +38,12 @@ pub struct ClassifyArgs {
     pub window: Option<usize>,
 
     /// Minimum distance ratio for confident classification (CSV mode only)
-    #[arg(long, default_value = "0.8", value_name = "RATIO", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "0.8",
+        value_name = "RATIO",
+        help_heading = "Advanced Options"
+    )]
     pub min_ratio: f32,
 
     /// Output per-class probabilities (SVM model only)

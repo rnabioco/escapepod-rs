@@ -29,23 +29,48 @@ pub struct FingerprintArgs {
     pub output: PathBuf,
 
     /// Start sample offset within adapter region for fingerprinting
-    #[arg(long, default_value = "1000", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "1000",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub segment_start: usize,
 
     /// End sample offset within adapter region for fingerprinting
-    #[arg(long, default_value = "2000", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "2000",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub segment_end: usize,
 
     /// Number of segments for fingerprint
-    #[arg(long, default_value = "10", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "10",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub num_segments: usize,
 
     /// Window width for t-test segmentation
-    #[arg(long, default_value = "5", value_name = "N", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "5",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub window_width: usize,
 
     /// Normalization method (zscore, minmax, median, none)
-    #[arg(long, default_value = "zscore", value_name = "METHOD", help_heading = "Advanced Options")]
+    #[arg(
+        long,
+        default_value = "zscore",
+        value_name = "METHOD",
+        help_heading = "Advanced Options"
+    )]
     pub normalize: String,
 
     /// Number of threads for parallel processing
