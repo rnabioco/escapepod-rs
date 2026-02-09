@@ -103,10 +103,9 @@ impl RoughRescaleAlgo {
 }
 
 /// Algorithm for computing the DP band.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BandingAlgo {
     /// Fixed band computed from the initial signal-to-sequence map.
-    #[default]
     Fixed,
     /// Adaptive banding (Suzuki & Kasahara, 2017): band center shifts during
     /// the forward pass based on edge score comparisons.
@@ -118,6 +117,15 @@ pub enum BandingAlgo {
         /// DP bails out and returns the initial map.
         x_drop: Option<f32>,
     },
+}
+
+impl Default for BandingAlgo {
+    fn default() -> Self {
+        Self::Adaptive {
+            bandwidth: 10,
+            x_drop: None,
+        }
+    }
 }
 
 /// Settings for the refinement pipeline.

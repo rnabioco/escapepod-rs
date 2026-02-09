@@ -71,8 +71,8 @@ pub struct ResquiggleArgs {
     #[arg(long, value_parser = parse_normalize, value_name = "MODE", help_heading = "Advanced Options")]
     pub normalize: Option<NormalizeMode>,
 
-    /// Banding algorithm: 'fixed' (default) or 'adaptive'
-    #[arg(long, default_value = "fixed", value_parser = parse_banding, help_heading = "Advanced Options")]
+    /// Banding algorithm: 'adaptive' (default) or 'fixed'
+    #[arg(long, default_value = "adaptive", value_parser = parse_banding, help_heading = "Advanced Options")]
     pub banding: BandingAlgo,
 
     /// X-drop threshold for adaptive banding early termination (optional).
