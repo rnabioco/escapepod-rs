@@ -1,0 +1,2353 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Rust library and CLI for Oxford Nanopore POD5 files">
+      
+      
+      
+        <link rel="canonical" href="https://rnabioco.github.io/escapepod-rs/cli/resquiggle/">
+      
+      
+        <link rel="prev" href="../demux/">
+      
+      
+        <link rel="next" href="../../library/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
+    
+    
+      
+        <title>resquiggle - escapepod-rs</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#escapepod-resquiggle" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="escapepod-rs" class="md-header__button md-logo" aria-label="escapepod-rs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            escapepod-rs
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              resquiggle
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/rnabioco/escapepod-rs" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    rnabioco/escapepod-rs
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="escapepod-rs" class="md-nav__button md-logo" aria-label="escapepod-rs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    escapepod-rs
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/rnabioco/escapepod-rs" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    rnabioco/escapepod-rs
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    CLI Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../summary/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    summary
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../view/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    view
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../inspect/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    inspect
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../merge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    merge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../filter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    filter
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bam-filter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    bam-filter
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../repack/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    repack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../subset/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    subset
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../demux/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    demux
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    resquiggle
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    resquiggle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Usage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#arguments" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Arguments
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Options
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#input-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Input Requirements
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Input Requirements">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pod5-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        POD5 File
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bam-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        BAM File
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kmer-level-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Kmer Level Table
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Kmer Level Table">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#from-sequence-to-expected-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        From sequence to expected levels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-expected-levels-drive-the-dp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How expected levels drive the DP
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Output
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Output">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rna-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RNA mode
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#processing-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Processing Phases
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#algorithms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Algorithms
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Algorithms">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#banded-dynamic-programming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Banded Dynamic Programming
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#refinement-algo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Refinement (--algo)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rescaling-rescale" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rescaling (--rescale)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Examples
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Examples">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#basic-resquiggle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Basic Resquiggle
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#with-multiple-iterations-and-normalization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        With Multiple Iterations and Normalization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tuning-bandwidth-and-algorithm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tuning Bandwidth and Algorithm
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#custom-dwell-penalty-parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom Dwell Penalty Parameters
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rna-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RNA Data
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#using-multiple-threads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Using Multiple Threads
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#algorithm-references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Algorithm References
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../library/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Library
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Library
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../library/reading/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reading Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../library/writing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Writing Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../library/types/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Types
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../format/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    File Format
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    File Format
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../format/container/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Container Structure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../format/compression/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Signal Compression
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Usage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#arguments" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Arguments
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Options
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#input-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Input Requirements
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Input Requirements">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pod5-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        POD5 File
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bam-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        BAM File
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kmer-level-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Kmer Level Table
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Kmer Level Table">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#from-sequence-to-expected-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        From sequence to expected levels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-expected-levels-drive-the-dp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How expected levels drive the DP
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Output
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Output">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rna-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RNA mode
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#processing-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Processing Phases
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#algorithms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Algorithms
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Algorithms">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#banded-dynamic-programming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Banded Dynamic Programming
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#refinement-algo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Refinement (--algo)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rescaling-rescale" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rescaling (--rescale)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Examples
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Examples">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#basic-resquiggle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Basic Resquiggle
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#with-multiple-iterations-and-normalization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        With Multiple Iterations and Normalization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tuning-bandwidth-and-algorithm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tuning Bandwidth and Algorithm
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#custom-dwell-penalty-parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom Dwell Penalty Parameters
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rna-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RNA Data
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#using-multiple-threads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Using Multiple Threads
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#algorithm-references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Algorithm References
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="escapepod-resquiggle">escapepod resquiggle<a class="headerlink" href="#escapepod-resquiggle" title="Permanent link">&para;</a></h1>
+<p>Refine signal-to-base mapping using banded dynamic programming. Takes an input POD5 file (raw signal) and a BAM file with basecaller move tables, then produces a new BAM file with refined signal boundaries stored in auxiliary tags.</p>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>Nanopore basecallers produce a <strong>move table</strong> that maps signal blocks to bases, but
+this mapping is coarse (one decision per stride block). Resquiggle refines these
+boundaries to sample-level resolution by aligning the raw signal against expected
+kmer levels using banded dynamic programming.</p>
+<div class="highlight"><pre><span></span><code>  Raw signal (from POD5)
+  ┌──────────────────────────────────────────────────────┐
+  │  ╱╲    ╱╲╱╲      ╱╲                                 │
+  │ ╱  ╲  ╱    ╲    ╱  ╲    ╱╲  ╱╲╱╲                   │
+  │╱    ╲╱      ╲──╱    ╲──╱  ╲╱    ╲──╲╱╲──            │
+  └──────────────────────────────────────────────────────┘
+        ▲            ▲           ▲          ▲
+  Move table      (coarse boundaries from basecaller)
+
+        ▼  resquiggle refinement  ▼
+
+  ┌──────────────────────────────────────────────────────┐
+  │  ╱╲    ╱╲╱╲      ╱╲                                 │
+  │ ╱  ╲  ╱    ╲    ╱  ╲    ╱╲  ╱╲╱╲                   │
+  │╱    ╲╱      ╲──╱    ╲──╱  ╲╱    ╲──╲╱╲──            │
+  └──────────────────────────────────────────────────────┘
+       ▲           ▲          ▲          ▲
+  Refined       (sample-level boundaries from DP)
+</code></pre></div>
+<h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>&lt;INPUT&gt;<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-k<span class="w"> </span>&lt;KMER_TABLE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</code></pre></div>
+<h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Argument</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;INPUT&gt;</code></td>
+<td>Input POD5 file or directory</td>
+</tr>
+</tbody>
+</table>
+<h2 id="options">Options<a class="headerlink" href="#options" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-b, --bam &lt;FILE&gt;</code></td>
+<td>Input BAM file with move table (<code>mv</code> tag) (required)</td>
+</tr>
+<tr>
+<td><code>-k, --kmer-table &lt;FILE&gt;</code></td>
+<td>Tab-delimited kmer level table file (required)</td>
+</tr>
+<tr>
+<td><code>-o, --output &lt;FILE&gt;</code></td>
+<td>Output BAM file (required)</td>
+</tr>
+<tr>
+<td><code>--algo &lt;ALGO&gt;</code></td>
+<td>Refinement algorithm: <code>dwell-penalty</code> (default) or <code>viterbi</code></td>
+</tr>
+<tr>
+<td><code>--iterations &lt;N&gt;</code></td>
+<td>Number of refinement iterations (default: 1)</td>
+</tr>
+<tr>
+<td><code>--half-bandwidth &lt;N&gt;</code></td>
+<td>Half bandwidth for banded DP (default: 5)</td>
+</tr>
+<tr>
+<td><code>--rescale &lt;ALGO&gt;</code></td>
+<td>Rescale algorithm: <code>theil-sen</code> (default) or <code>least-squares</code></td>
+</tr>
+<tr>
+<td><code>--dwell-target &lt;N&gt;</code></td>
+<td>Target dwell time per base for dwell-penalty (default: 0 = auto from move table)</td>
+</tr>
+<tr>
+<td><code>--dwell-weight &lt;W&gt;</code></td>
+<td>Dwell penalty weight (default: 0.5)</td>
+</tr>
+<tr>
+<td><code>--normalize &lt;MODE&gt;</code></td>
+<td>Normalization mode for kmer levels (e.g., <code>mad</code>)</td>
+</tr>
+<tr>
+<td><code>--rna</code></td>
+<td>RNA mode: reverse raw signal to match basecaller's 5'→3' orientation</td>
+</tr>
+<tr>
+<td><code>-j, --threads &lt;N&gt;</code></td>
+<td>Number of threads for parallel processing</td>
+</tr>
+<tr>
+<td><code>-h, --help</code></td>
+<td>Print help</td>
+</tr>
+</tbody>
+</table>
+<h2 id="input-requirements">Input Requirements<a class="headerlink" href="#input-requirements" title="Permanent link">&para;</a></h2>
+<h3 id="pod5-file">POD5 File<a class="headerlink" href="#pod5-file" title="Permanent link">&para;</a></h3>
+<p>The input POD5 file (or directory of POD5 files) must contain the raw signal data for the reads present in the BAM file.</p>
+<h3 id="bam-file">BAM File<a class="headerlink" href="#bam-file" title="Permanent link">&para;</a></h3>
+<p>The BAM file must contain:</p>
+<ul>
+<li><strong>Read names</strong> that are UUIDs matching POD5 read IDs</li>
+<li><strong><code>mv</code> tag</strong> (move table) from the basecaller, encoding stride and per-block move decisions</li>
+<li><strong>Sequence</strong> from basecalling</li>
+</ul>
+<p>The following optional BAM tags are used when present:</p>
+<table>
+<thead>
+<tr>
+<th>Tag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sm</code></td>
+<td>Signal mean (scaling)</td>
+</tr>
+<tr>
+<td><code>sd</code></td>
+<td>Signal standard deviation (scaling)</td>
+</tr>
+<tr>
+<td><code>sp</code></td>
+<td>Parent signal offset</td>
+</tr>
+<tr>
+<td><code>ts</code></td>
+<td>Trimmed signal length</td>
+</tr>
+<tr>
+<td><code>ns</code></td>
+<td>Subread signal length</td>
+</tr>
+</tbody>
+</table>
+<h3 id="kmer-level-table">Kmer Level Table<a class="headerlink" href="#kmer-level-table" title="Permanent link">&para;</a></h3>
+<p>A tab-delimited file mapping kmers to expected signal levels. Each row contains
+a kmer sequence and its expected pA level. The kmer size must be odd (e.g., 9).</p>
+<div class="highlight"><pre><span></span><code>  Kmer table file (TSV):
+
+  AAAAAAAAA    0.958
+  AAAAAAAAC    1.023
+  AAAAAAAAG    0.912
+  ...          ...
+  UUUUUUUUU    0.445
+</code></pre></div>
+<p>The table is loaded into a flat lookup array indexed by 2-bit encoding
+(A=0, C=1, G=2, T/U=3) for O(1) per-kmer lookup.</p>
+<h4 id="from-sequence-to-expected-levels">From sequence to expected levels<a class="headerlink" href="#from-sequence-to-expected-levels" title="Permanent link">&para;</a></h4>
+<p>A sliding window of size k extracts the kmer at each position. Each kmer maps
+to an expected signal level from the table. The level is assigned to the
+<strong>dominant base</strong> position within the kmer (determined automatically by a
+Kruskal-Wallis H test over all table entries to find which position most
+influences the level).</p>
+<div class="highlight"><pre><span></span><code>  Basecalled sequence (from BAM):
+
+  Position:   0   1   2   3   4   5   6   7   8   9  10  11
+  Base:       A   C   G   U   A   G   C   U   A   G   C   A
+
+  Sliding 9-mer window (k=9):
+                                                     dominant
+  pos 0:    [ A C G U A G C U A ]  ──▶  level[0]  ─▶  base
+  pos 1:      [ C G U A G C U A G ]  ──▶  level[1]     pos
+  pos 2:        [ G U A G C U A G C ]  ──▶  level[2]    │
+  pos 3:          [ U A G C U A G C A ]  ──▶  level[3]  │
+                                                        ▼
+  Expected                                      (e.g., center
+  levels:   L0  L1  L2  L3  L4  L5  L6  L7 ...   of the kmer)
+</code></pre></div>
+<h4 id="how-expected-levels-drive-the-dp">How expected levels drive the DP<a class="headerlink" href="#how-expected-levels-drive-the-dp" title="Permanent link">&para;</a></h4>
+<p>The DP aligns the raw signal against the expected level sequence. At each
+candidate boundary, the cost is the squared error between the measured signal
+samples and the expected level for that base. The DP finds the set of
+boundaries that minimizes total squared error (plus any dwell penalty).</p>
+<div class="highlight"><pre><span></span><code>  signal ▲
+         │    ╱╲
+         │   ╱  ╲       ╱╲          expected level
+   L0    │──╱────╲─────╱──╲── ─ ─ ─ ─ ─ ─ ─ ─ ─
+         │ ╱      ╲   ╱    ╲
+         │╱        ╲─╱      ╲
+         │          ╲         ╲           ╱╲
+   L1    │─ ─ ─ ─ ─ ╲─ ─ ─ ─ ╲─ ─ ─ ─ ╱──╲─ ─
+         │            ╲        ╲       ╱    ╲
+         │             ╲        ╲─────╱      ╲
+   L2    │─ ─ ─ ─ ─ ─ ─╲─ ─ ─ ─╲─ ─ ─ ─ ─ ─╲─
+         │               ╲       ╲╱            ╲
+         └────────┬───────┬───────┬──────────┬──▶ time
+                base 0  base 1  base 2     base 3
+
+         cost = sum of (signal - expected_level)^2 within each base
+</code></pre></div>
+<p>When <code>--normalize mad</code> is used, the kmer levels are MAD-normalized before
+alignment: <code>(level - median) / (MAD * 1.4826)</code>, centering them at zero with
+unit dispersion.</p>
+<h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
+<p>The output BAM file contains all input records with refined signal-to-base mapping stored in auxiliary tags:</p>
+<table>
+<thead>
+<tr>
+<th>Tag</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rs</code></td>
+<td><code>B:I</code> (uint32 array)</td>
+<td>Refined signal boundaries per base (in full-signal coordinates)</td>
+</tr>
+<tr>
+<td><code>rc</code></td>
+<td><code>f</code> (float)</td>
+<td>Refined calibration scale</td>
+</tr>
+<tr>
+<td><code>ro</code></td>
+<td><code>f</code> (float)</td>
+<td>Refined calibration offset</td>
+</tr>
+<tr>
+<td><code>rd</code></td>
+<td><code>f</code> (float)</td>
+<td>Refined calibration drift (per-sample trend)</td>
+</tr>
+<tr>
+<td><code>ri</code></td>
+<td><code>C</code> (uint8)</td>
+<td>RNA indicator (1 = RNA mode, signal was reversed); only present with <code>--rna</code></td>
+</tr>
+</tbody>
+</table>
+<p>Records that could not be refined (missing POD5 data, no move table, etc.) are written through unchanged.</p>
+<h3 id="rna-mode">RNA mode<a class="headerlink" href="#rna-mode" title="Permanent link">&para;</a></h3>
+<p>For RNA data, the raw nanopore signal is acquired 3'→5', but the basecaller
+reverses it to 5'→3' before basecalling. The BAM move table (<code>mv</code>) remains in
+raw signal order (3'→5'), opposite to the sequence direction. When <code>--rna</code> is
+specified, the CLI reverses the trimmed signal and inverts the query-to-signal
+map so the DP operates in the same 5'→3' orientation as the basecaller.</p>
+<p>The <code>rs</code> boundaries are offset so they index directly into the <strong>full reversed
+raw signal</strong> (matching fishnet's convention). To recover per-base signal:
+1. Read the full raw signal from POD5
+2. Reverse it
+3. Use <code>rs</code> boundaries directly: <code>reversed_raw[rs[i]..rs[i+1]]</code></p>
+<p>The <code>ri:C:1</code> tag signals to downstream tools that RNA reversal was applied.</p>
+<h2 id="processing-phases">Processing Phases<a class="headerlink" href="#processing-phases" title="Permanent link">&para;</a></h2>
+<p>The command runs in three phases:</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────┐
+│                        Phase 1: LOAD                            │
+│                                                                 │
+│  ┌──────────┐   ┌───────────────┐   ┌──────────────────────┐   │
+│  │ kmer     │   │ BAM           │   │ POD5                 │   │
+│  │ table    │   │ read IDs +    │   │ signal extraction    │   │
+│  │          │   │ move tables   │   │ (bulk, by read ID)   │   │
+│  └────┬─────┘   └───────┬───────┘   └──────────┬───────────┘   │
+│       │                 │                       │               │
+│       ▼                 ▼                       ▼               │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              Matched reads (POD5 ∩ BAM)                  │   │
+│  └──────────────────────────┬───────────────────────────────┘   │
+└─────────────────────────────┼───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Phase 2: REFINE (parallel)                   │
+│                                                                 │
+│  For each matched read:                                         │
+│                                                                 │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  1. Initial scaling from POD5 calibration + BAM tags   │     │
+│  │  2. Rough rescale (Theil-Sen on quantiles)             │     │
+│  │  3. Iterative DP refinement + rescale loop:            │     │
+│  │     ┌────────────────────────────────────────────┐     │     │
+│  │     │  normalize signal ──▶ banded DP ──▶ rescale│──┐  │     │
+│  │     └────────────────────────────────────────────┘  │  │     │
+│  │              ▲                                      │  │     │
+│  │              └──────────── repeat N iterations ─────┘  │     │
+│  └────────────────────────────────────────────────────────┘     │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Phase 3: WRITE                            │
+│                                                                 │
+│  Output BAM with rs/rc/ro tags added to refined records         │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+<h2 id="algorithms">Algorithms<a class="headerlink" href="#algorithms" title="Permanent link">&para;</a></h2>
+<h3 id="banded-dynamic-programming">Banded Dynamic Programming<a class="headerlink" href="#banded-dynamic-programming" title="Permanent link">&para;</a></h3>
+<p>The DP operates within a band around the initial move-table alignment to avoid
+exploring the entire signal x sequence space. The <code>--half-bandwidth</code> parameter
+controls how far from the initial alignment the DP can search.</p>
+<div class="highlight"><pre><span></span><code>  Signal position ──▶
+  0         10        20        30        40        50
+  ├─────────┼─────────┼─────────┼─────────┼─────────┤
+
+  B  ░░░░░▓▓▓▓░░░░░
+  a       ░░░░░▓▓▓▓░░░░░
+  s            ░░░░░▓▓▓▓░░░░░
+  e                 ░░░░░▓▓▓▓░░░░░
+  ▼                      ░░░░░▓▓▓▓░░░░░
+
+  ░ = band (allowed search region)
+  ▓ = initial alignment from move table
+  half_bandwidth = 5 in this example
+</code></pre></div>
+<p>The DP finds the lowest-cost path through the band, where cost is the squared
+error between the measured signal and the expected kmer level at each position.</p>
+<h3 id="refinement-algo">Refinement (<code>--algo</code>)<a class="headerlink" href="#refinement-algo" title="Permanent link">&para;</a></h3>
+<ul>
+<li>
+<p><strong><code>dwell-penalty</code></strong> (default) -- Banded DP with an asymmetric dwell penalty.
+  Short dwells get a strong quadratic penalty to prevent degenerate single-sample
+  bases; long dwells get a gentle logarithmic nudge that is easily overcome by
+  good signal fit, preserving genuine long dwells.</p>
+</li>
+<li>
+<p><strong><code>viterbi</code></strong> -- Standard Viterbi-style banded DP without dwell penalty.</p>
+</li>
+</ul>
+<div class="highlight"><pre><span></span><code>  Dwell penalty (asymmetric)
+
+  penalty
+  ▲
+  │▓
+  │▓
+  │ ▓                    quadratic        │    logarithmic
+  │ ▓                   (short dwell)     │   (long dwell)
+  │  ▓                                   │
+  │  ▓                                   │
+  │   ▓                                  │
+  │    ▓▓                                │
+  │      ▓▓▓                             │
+  │         ▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▶
+  └──────────────┬───────────────────────────────────────▶ dwell
+                target
+</code></pre></div>
+<p>When <code>--dwell-target 0</code> (the default), the target is automatically set to the
+median dwell time from the move table, adapting to the read's actual
+signal-to-base ratio.</p>
+<h3 id="rescaling-rescale">Rescaling (<code>--rescale</code>)<a class="headerlink" href="#rescaling-rescale" title="Permanent link">&para;</a></h3>
+<p>After each DP iteration, the signal scale and shift are re-estimated to correct
+for calibration drift between the basecaller model and the kmer level table.</p>
+<ul>
+<li><strong><code>theil-sen</code></strong> (default) -- Robust Theil-Sen regression for estimating signal scale and shift, resistant to outliers.</li>
+<li><strong><code>least-squares</code></strong> -- Least-squares regression with dwell filtering and level truncation.</li>
+</ul>
+<div class="highlight"><pre><span></span><code>  Rescaling: fit measured signal to expected levels
+
+  measured ▲
+  signal   │            ╱
+           │          ╱  ○        ○ = per-base mean signal
+           │        ╱ ○            vs expected kmer level
+           │   ○  ╱
+           │    ╱ ○
+           │  ╱○               slope  = new scale
+           │╱  ○               offset = new shift
+           └──────────────────▶
+                expected level
+</code></pre></div>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<h3 id="basic-resquiggle">Basic Resquiggle<a class="headerlink" href="#basic-resquiggle" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>refined.bam
+</code></pre></div>
+<h3 id="with-multiple-iterations-and-normalization">With Multiple Iterations and Normalization<a class="headerlink" href="#with-multiple-iterations-and-normalization" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>pod5_dir/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--iterations<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--normalize<span class="w"> </span>mad
+</code></pre></div>
+<h3 id="tuning-bandwidth-and-algorithm">Tuning Bandwidth and Algorithm<a class="headerlink" href="#tuning-bandwidth-and-algorithm" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--algo<span class="w"> </span>viterbi<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--half-bandwidth<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rescale<span class="w"> </span>least-squares
+</code></pre></div>
+<h3 id="custom-dwell-penalty-parameters">Custom Dwell Penalty Parameters<a class="headerlink" href="#custom-dwell-penalty-parameters" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--algo<span class="w"> </span>dwell-penalty<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dwell-target<span class="w"> </span><span class="m">36</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dwell-weight<span class="w"> </span><span class="m">0</span>.3
+</code></pre></div>
+<h3 id="rna-data">RNA Data<a class="headerlink" href="#rna-data" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>rna_reads.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-b<span class="w"> </span>rna_basecalls.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-k<span class="w"> </span>rna004_9mer_levels_v1.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>rna_refined.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rna
+</code></pre></div>
+<h3 id="using-multiple-threads">Using Multiple Threads<a class="headerlink" href="#using-multiple-threads" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-j<span class="w"> </span><span class="m">8</span>
+</code></pre></div>
+<h2 id="algorithm-references">Algorithm References<a class="headerlink" href="#algorithm-references" title="Permanent link">&para;</a></h2>
+<p>The resquiggle algorithms are inspired by:</p>
+<ul>
+<li><strong>Banded DP refinement and signal rescaling</strong>: Inspired by <a href="https://www.researchsquare.com/article/rs-8345719/v1">fishnet</a> by Brickner et al., licensed under GPL-3.0.</li>
+</ul>
+<h2 id="notes">Notes<a class="headerlink" href="#notes" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Only reads present in both the BAM and POD5 input are refined; all BAM records are still written to the output.</li>
+<li>Signal data is bulk-extracted before the parallel refinement phase, so POD5 files are not accessed during refinement.</li>
+<li>Error diagnostics are printed at the end, showing aggregated counts of skip reasons.</li>
+<li>The <code>--half-bandwidth</code> parameter controls the width of the DP band around the initial move-table alignment. Larger values allow more deviation from the basecaller's initial mapping but increase computation.</li>
+<li>A <code>@PG</code> header record is added to the output BAM with the resquiggle command line parameters.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2025 RNA Bioscience Initiative
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/rnabioco/escapepod-rs" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.sections", "navigation.expand", "navigation.top", "navigation.indexes", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
