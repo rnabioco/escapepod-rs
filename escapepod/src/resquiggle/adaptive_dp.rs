@@ -7,7 +7,10 @@
 //! bandwidth.
 
 use super::bands::Band;
-use super::dp::{banded_traceback, dp_step_buffered, ViterbiBuffers};
+use super::dp::{
+    banded_traceback, build_dwell_penalty_table, dp_step_buffered, dp_step_with_dwell_penalty,
+    StepBuffers, ViterbiBuffers,
+};
 use super::types::RefineAlgo;
 
 /// Run adaptive banded DP.
@@ -28,7 +31,7 @@ pub fn adaptive_banded_dp(
     levels: &[f32],
     bandwidth: usize,
     initial_map: &[usize],
-    _method: &RefineAlgo,
+    method: &RefineAlgo,
     x_drop: Option<f32>,
 ) -> Vec<usize> {
     let n_bases = levels.len();
@@ -40,6 +43,16 @@ pub fn adaptive_banded_dp(
 
     let half_bw = bandwidth / 2;
     let avg_advance = signal_len / n_bases;
+
+    // Precompute dwell penalty table if needed
+    let (penalty_table, dwell_target, dwell_weight) = match method {
+        RefineAlgo::DwellPenalty { target, weight } => (
+            Some(build_dwell_penalty_table(*target, *weight)),
+            *target,
+            *weight,
+        ),
+        RefineAlgo::Viterbi => (None, 0.0, 0.0),
+    };
 
     // We need to record band boundaries and traceback for the final path
     let mut band_starts: Vec<usize> = Vec::with_capacity(n_bases);
@@ -57,6 +70,7 @@ pub fn adaptive_banded_dp(
 
     // Pre-allocated scratch buffers for dp_step (reused across all bases)
     let mut viterbi_buf = ViterbiBuffers::new(max_bw);
+    let mut step_buf = penalty_table.as_ref().map(|_| StepBuffers::new(max_bw));
 
     // --- First base ---
     // Band for base 0: centered around initial_map midpoint, starts at 0
@@ -84,15 +98,30 @@ pub fn adaptive_banded_dp(
     curr_scores[..bw0].fill(f32::INFINITY);
     curr_traceback[..bw0].fill(-1);
 
-    dp_step_buffered(
-        &mut curr_scores[..bw0],
-        &mut curr_traceback[..bw0],
-        &prev_scores[..bw0],
-        levels[0],
-        &signal[bs0..be0],
-        1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
-        &mut viterbi_buf,
-    );
+    if let Some(ref table) = penalty_table {
+        dp_step_with_dwell_penalty(
+            &mut curr_scores[..bw0],
+            &mut curr_traceback[..bw0],
+            &prev_scores[..bw0],
+            levels[0],
+            &signal[bs0..be0],
+            1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
+            table,
+            dwell_target,
+            dwell_weight,
+            step_buf.as_mut().unwrap(),
+        );
+    } else {
+        dp_step_buffered(
+            &mut curr_scores[..bw0],
+            &mut curr_traceback[..bw0],
+            &prev_scores[..bw0],
+            levels[0],
+            &signal[bs0..be0],
+            1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
+            &mut viterbi_buf,
+        );
+    }
 
     // X-drop: track best minimum score
     let current_min = curr_scores[..bw0]
@@ -173,15 +202,30 @@ pub fn adaptive_banded_dp(
 
         let prev_band_offset = bs - prev_bs;
 
-        dp_step_buffered(
-            &mut curr_scores[..bw],
-            &mut curr_traceback[..bw],
-            &prev_scores[..prev_bw],
-            levels[base_idx],
-            &signal[bs..be],
-            prev_band_offset,
-            &mut viterbi_buf,
-        );
+        if let Some(ref table) = penalty_table {
+            dp_step_with_dwell_penalty(
+                &mut curr_scores[..bw],
+                &mut curr_traceback[..bw],
+                &prev_scores[..prev_bw],
+                levels[base_idx],
+                &signal[bs..be],
+                prev_band_offset,
+                table,
+                dwell_target,
+                dwell_weight,
+                step_buf.as_mut().unwrap(),
+            );
+        } else {
+            dp_step_buffered(
+                &mut curr_scores[..bw],
+                &mut curr_traceback[..bw],
+                &prev_scores[..prev_bw],
+                levels[base_idx],
+                &signal[bs..be],
+                prev_band_offset,
+                &mut viterbi_buf,
+            );
+        }
 
         // X-drop: check for early termination
         let current_min = curr_scores[..bw]
@@ -622,5 +666,60 @@ mod tests {
             path, initial_map,
             "X-drop should not have triggered on clean signal"
         );
+    }
+
+    #[test]
+    fn test_adaptive_dp_dwell_penalty() {
+        // Same setup as test_adaptive_dp_clean_signal but with DwellPenalty
+        let n_bases = 5;
+        let spb = 10;
+        let signal_len = n_bases * spb;
+
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5, 0.5, -1.0];
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..spb {
+                signal[i * spb + j] = level;
+            }
+        }
+
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| i * spb).collect();
+        let bandwidth = 10; // half_bw = 5
+
+        let method = RefineAlgo::DwellPenalty {
+            target: spb as f32,
+            weight: 0.5,
+        };
+
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            bandwidth,
+            &initial_map,
+            &method,
+            None,
+        );
+
+        assert_eq!(path.len(), n_bases + 1);
+        assert_eq!(path[0], 0);
+        assert_eq!(path[n_bases], signal_len);
+
+        // Strictly increasing
+        for w in path.windows(2) {
+            assert!(w[1] > w[0], "path not strictly increasing: {:?}", path);
+        }
+
+        // Boundaries should be near the true boundaries
+        for i in 0..=n_bases {
+            let expected = i * spb;
+            let diff = (path[i] as i64 - expected as i64).unsigned_abs() as usize;
+            assert!(
+                diff <= bandwidth / 2 + 1,
+                "path[{}]={} far from expected {}",
+                i,
+                path[i],
+                expected
+            );
+        }
     }
 }

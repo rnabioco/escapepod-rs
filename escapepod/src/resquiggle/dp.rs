@@ -86,13 +86,13 @@ impl ViterbiBuffers {
 }
 
 /// Reusable temporary buffers for the dwell penalty DP step.
-struct StepBuffers {
+pub(super) struct StepBuffers {
     base_scores: Vec<f32>,
     base_traceback: Vec<i32>,
 }
 
 impl StepBuffers {
-    fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize) -> Self {
         Self {
             base_scores: vec![0.0f32; capacity],
             base_traceback: vec![0i32; capacity],
@@ -303,7 +303,7 @@ pub fn dp_step_buffered(
 /// For positions beyond the check horizon, falls back to baseline Viterbi
 /// scores, preserving O(max_check · B) complexity instead of O(B²).
 #[allow(clippy::too_many_arguments)]
-fn dp_step_with_dwell_penalty(
+pub(super) fn dp_step_with_dwell_penalty(
     current_scores: &mut [f32],
     current_traceback: &mut [i32],
     previous_scores: &[f32],
@@ -423,10 +423,10 @@ pub fn dwell_penalty(dwell: usize, target: f32, weight: f32) -> f32 {
 }
 
 /// Maximum precomputed table size for dwell penalties.
-const DWELL_TABLE_SIZE: usize = 256;
+pub(super) const DWELL_TABLE_SIZE: usize = 256;
 
 /// Build a precomputed penalty lookup table for dwells 0..DWELL_TABLE_SIZE.
-fn build_dwell_penalty_table(target: f32, weight: f32) -> Vec<f32> {
+pub(super) fn build_dwell_penalty_table(target: f32, weight: f32) -> Vec<f32> {
     (0..DWELL_TABLE_SIZE)
         .map(|i| dwell_penalty(i, target, weight))
         .collect()
