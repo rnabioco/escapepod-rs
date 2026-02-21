@@ -209,6 +209,27 @@ impl Writer {
         })
     }
 
+    /// Apply MINKNOW schema metadata to an Arrow schema.
+    fn schema_with_metadata(
+        &self,
+        schema: arrow::datatypes::Schema,
+    ) -> arrow::datatypes::Schema {
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(
+            "MINKNOW:file_identifier".to_string(),
+            self.file_id.to_string(),
+        );
+        metadata.insert(
+            "MINKNOW:software".to_string(),
+            self.options.software.clone(),
+        );
+        metadata.insert(
+            "MINKNOW:pod5_version".to_string(),
+            POD5_VERSION.to_string(),
+        );
+        schema.with_metadata(metadata)
+    }
+
     /// Get the current signal row count (for tracking offsets during batch-level copying).
     pub fn current_signal_row(&self) -> u64 {
         self.current_signal_row
@@ -376,7 +397,7 @@ impl Writer {
         // Flush any pending signal first
         self.flush_signal_batch()?;
 
-        let schema = Arc::new(signal_schema());
+        let schema = Arc::new(self.schema_with_metadata(signal_schema()));
         let row_count = batch.num_rows();
         let first_row = self.current_signal_row;
 
@@ -574,7 +595,7 @@ impl Writer {
             return Ok(());
         }
 
-        let schema = Arc::new(signal_schema());
+        let schema = Arc::new(self.schema_with_metadata(signal_schema()));
         let num_chunks = self.pending_signal.len();
         let total_signal_bytes: usize = self.pending_signal.iter().map(|c| c.data.len()).sum();
 
@@ -617,7 +638,7 @@ impl Writer {
             return Ok(());
         }
 
-        let schema = Arc::new(reads_schema());
+        let schema = Arc::new(self.schema_with_metadata(reads_schema()));
         let num_reads = self.pending_reads.len();
 
         // Build arrays - iterate directly without collecting to intermediate Vec
@@ -625,35 +646,40 @@ impl Writer {
         let signal_field = Arc::new(arrow::datatypes::Field::new(
             "item",
             arrow::datatypes::DataType::UInt64,
-            false,
+            true,
         ));
         let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
+        // V0 builders
+        let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
+        let mut start_builder = UInt64Builder::with_capacity(num_reads);
+        let mut median_before_builder = Float32Builder::with_capacity(num_reads);
+        // V1 builders
+        let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
+        let mut tracked_scaling_scale_builder = Float32Builder::with_capacity(num_reads);
+        let mut tracked_scaling_shift_builder = Float32Builder::with_capacity(num_reads);
+        let mut predicted_scaling_scale_builder = Float32Builder::with_capacity(num_reads);
+        let mut predicted_scaling_shift_builder = Float32Builder::with_capacity(num_reads);
+        let mut num_reads_since_mux_change_builder = UInt32Builder::with_capacity(num_reads);
+        let mut time_since_mux_change_builder = Float32Builder::with_capacity(num_reads);
+        // V2 builders
+        let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
+        // V3 builders
         let mut channel_builder = UInt16Builder::with_capacity(num_reads);
         let mut well_builder = UInt8Builder::with_capacity(num_reads);
-
-        // Create dictionary builders with predefined dictionaries if available
-        // This ensures consistent dictionary indices across batches
         let pore_type_dict =
             StringArray::from_iter_values(self.pore_types.iter().map(|s| s.as_str()));
         let mut pore_type_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new_with_dictionary(num_reads, &pore_type_dict)?;
-
         let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
         let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
-        let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
-        let mut start_builder = UInt64Builder::with_capacity(num_reads);
-        let mut median_before_builder = Float32Builder::with_capacity(num_reads);
-
         let end_reason_dict =
             StringArray::from_iter_values(self.end_reasons.iter().map(|s| s.as_str()));
         let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new_with_dictionary(num_reads, &end_reason_dict)?;
-
         let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
         let mut run_info_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new();
-        let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
-        let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
+        // V4 builders
         let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
 
         for pending in self.pending_reads.drain(..) {
@@ -668,45 +694,64 @@ impl Writer {
             }
             signal_builder.append(true);
 
+            // V0
+            read_number_builder.append_value(read.read_number);
+            start_builder.append_value(read.start_sample);
+            median_before_builder.append_value(read.median_before);
+            // V1
+            num_minknow_events_builder.append_value(read.num_minknow_events);
+            tracked_scaling_scale_builder.append_value(read.tracked_scaling_scale);
+            tracked_scaling_shift_builder.append_value(read.tracked_scaling_shift);
+            predicted_scaling_scale_builder.append_value(read.predicted_scaling_scale);
+            predicted_scaling_shift_builder.append_value(read.predicted_scaling_shift);
+            num_reads_since_mux_change_builder.append_value(read.num_reads_since_mux_change);
+            time_since_mux_change_builder.append_value(read.time_since_mux_change);
+            // V2
+            num_samples_builder.append_value(read.num_samples);
+            // V3
             channel_builder.append_value(read.channel);
             well_builder.append_value(read.well);
             pore_type_builder.append_value(&read.pore_type);
             calibration_offset_builder.append_value(read.calibration_offset);
             calibration_scale_builder.append_value(read.calibration_scale);
-            read_number_builder.append_value(read.read_number);
-            start_builder.append_value(read.start_sample);
-            median_before_builder.append_value(read.median_before);
             end_reason_builder.append_value(read.end_reason.as_str());
             end_reason_forced_builder.append_value(read.end_reason_forced);
-
-            // Run info - use acquisition_id as the dictionary value
             if let Some(run_info) = self.run_infos.get(read.run_info_index as usize) {
                 run_info_builder.append_value(&run_info.acquisition_id);
             } else {
                 run_info_builder.append_value("");
             }
-
-            num_minknow_events_builder.append_value(read.num_minknow_events);
-            num_samples_builder.append_value(read.num_samples);
+            // V4
             open_pore_level_builder.append_value(read.open_pore_level);
         }
 
         let arrays: Vec<ArrayRef> = vec![
+            // V0
             Arc::new(read_id_builder.finish()),
             Arc::new(signal_builder.finish()),
+            Arc::new(read_number_builder.finish()),
+            Arc::new(start_builder.finish()),
+            Arc::new(median_before_builder.finish()),
+            // V1
+            Arc::new(num_minknow_events_builder.finish()),
+            Arc::new(tracked_scaling_scale_builder.finish()),
+            Arc::new(tracked_scaling_shift_builder.finish()),
+            Arc::new(predicted_scaling_scale_builder.finish()),
+            Arc::new(predicted_scaling_shift_builder.finish()),
+            Arc::new(num_reads_since_mux_change_builder.finish()),
+            Arc::new(time_since_mux_change_builder.finish()),
+            // V2
+            Arc::new(num_samples_builder.finish()),
+            // V3
             Arc::new(channel_builder.finish()),
             Arc::new(well_builder.finish()),
             Arc::new(pore_type_builder.finish()),
             Arc::new(calibration_offset_builder.finish()),
             Arc::new(calibration_scale_builder.finish()),
-            Arc::new(read_number_builder.finish()),
-            Arc::new(start_builder.finish()),
-            Arc::new(median_before_builder.finish()),
             Arc::new(end_reason_builder.finish()),
             Arc::new(end_reason_forced_builder.finish()),
             Arc::new(run_info_builder.finish()),
-            Arc::new(num_minknow_events_builder.finish()),
-            Arc::new(num_samples_builder.finish()),
+            // V4
             Arc::new(open_pore_level_builder.finish()),
         ];
 
@@ -728,7 +773,7 @@ impl Writer {
     fn build_run_info_table(&self) -> Result<Vec<u8>> {
         if self.run_infos.is_empty() {
             // Return empty Arrow IPC file
-            let schema = Arc::new(run_info_schema());
+            let schema = Arc::new(self.schema_with_metadata(run_info_schema()));
             let mut buffer = Vec::new();
             {
                 let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
@@ -737,10 +782,10 @@ impl Writer {
             return Ok(buffer);
         }
 
-        let schema = Arc::new(run_info_schema());
+        let schema = Arc::new(self.schema_with_metadata(run_info_schema()));
 
         let mut acquisition_id_builder = StringBuilder::new();
-        let mut acquisition_start_time_builder = TimestampMillisecondBuilder::new();
+        let mut acquisition_start_time_builder = TimestampMillisecondBuilder::new().with_timezone("UTC");
         let mut adc_max_builder = Int16Builder::new();
         let mut adc_min_builder = Int16Builder::new();
         let map_field_names = Some(MapFieldNames {
@@ -758,7 +803,7 @@ impl Writer {
         let mut flow_cell_product_code_builder = StringBuilder::new();
         let mut protocol_name_builder = StringBuilder::new();
         let mut protocol_run_id_builder = StringBuilder::new();
-        let mut protocol_start_time_builder = TimestampMillisecondBuilder::new();
+        let mut protocol_start_time_builder = TimestampMillisecondBuilder::new().with_timezone("UTC");
         let mut sample_id_builder = StringBuilder::new();
         let mut sample_rate_builder = UInt16Builder::new();
         let mut sequencing_kit_builder = StringBuilder::new();
@@ -841,138 +886,58 @@ impl Writer {
         Ok(buffer)
     }
 
-    /// Build the FlatBuffer footer.
+    /// Build the FlatBuffer footer using the generated FlatBuffer types.
     fn build_flatbuffer_footer(&self, embedded_files: &[EmbeddedFileInfo]) -> Result<Vec<u8>> {
-        self.build_simple_footer(embedded_files)
-    }
-
-    /// Helper function to write a string to a cursor with FlatBuffer format.
-    fn write_flatbuffer_string(data: &mut std::io::Cursor<Vec<u8>>, s: &str) -> Result<usize> {
-        // Align to 4
-        while data.position() % 4 != 0 {
-            data.write_all(&[0u8])?;
-        }
-        let pos = data.position() as usize;
-        data.write_all(&(s.len() as u32).to_le_bytes())?;
-        data.write_all(s.as_bytes())?;
-        // Pad
-        while data.position() % 4 != 0 {
-            data.write_all(&[0u8])?;
-        }
-        Ok(pos)
-    }
-
-    /// Build a simple footer structure.
-    fn build_simple_footer(&self, embedded_files: &[EmbeddedFileInfo]) -> Result<Vec<u8>> {
-        use std::io::Cursor;
+        use crate::flatbuffers_gen::{
+            ContentType, EmbeddedFile, EmbeddedFileArgs, Footer, FooterArgs, Format,
+        };
 
         let file_id = self.file_id.to_string();
         let software = &self.options.software;
         let version = POD5_VERSION;
 
-        // We'll build a minimal FlatBuffer by hand
-        // Layout: [root_offset:4][vtable][table][strings][vectors]
+        let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(256);
 
-        // Simpler approach: build everything into a buffer, then prepend root offset
-        let mut data = Cursor::new(Vec::<u8>::new());
-
-        // Skip 4 bytes for root offset
-        data.write_all(&[0u8; 4])?;
-
-        // Write vtable for Footer table
-        let vtable_pos = data.position() as usize;
-        data.write_all(&12u16.to_le_bytes())?; // vtable size (6 entries * 2 = 12, + 4 header = 16... let's try 12)
-        data.write_all(&20u16.to_le_bytes())?; // table size
-        data.write_all(&4u16.to_le_bytes())?; // field 0 (file_identifier) offset
-        data.write_all(&8u16.to_le_bytes())?; // field 1 (software) offset
-        data.write_all(&12u16.to_le_bytes())?; // field 2 (pod5_version) offset
-        data.write_all(&16u16.to_le_bytes())?; // field 3 (contents) offset
-
-        // Write table
-        let table_pos = data.position() as usize;
-        let soffset = (table_pos - vtable_pos) as i32;
-        data.write_all(&soffset.to_le_bytes())?; // soffset to vtable
-
-        // Placeholder offsets for strings and vector
-        let field0_pos = data.position() as usize;
-        data.write_all(&[0u8; 4])?; // file_identifier offset placeholder
-        let field1_pos = data.position() as usize;
-        data.write_all(&[0u8; 4])?; // software offset placeholder
-        let field2_pos = data.position() as usize;
-        data.write_all(&[0u8; 4])?; // pod5_version offset placeholder
-        let field3_pos = data.position() as usize;
-        data.write_all(&[0u8; 4])?; // contents offset placeholder
-
-        // Write strings using the helper function
-        let str0_pos = Self::write_flatbuffer_string(&mut data, &file_id)?;
-        let str1_pos = Self::write_flatbuffer_string(&mut data, software)?;
-        let str2_pos = Self::write_flatbuffer_string(&mut data, version)?;
-
-        // Write contents vector (embedded files)
-        while data.position() % 4 != 0 {
-            data.write_all(&[0u8])?;
-        }
-        let vec_pos = data.position() as usize;
-        data.write_all(&(embedded_files.len() as u32).to_le_bytes())?;
-
-        // Write offsets to each embedded file table
-        let offsets_start = data.position() as usize;
-        for _ in embedded_files {
-            data.write_all(&[0u8; 4])?; // placeholder
-        }
-
-        // Write embedded file tables
-        let mut file_positions = Vec::new();
+        // Create embedded file entries
+        let mut entries = Vec::with_capacity(embedded_files.len());
         for file in embedded_files {
-            while data.position() % 4 != 0 {
-                data.write_all(&[0u8])?;
-            }
-
-            // vtable for EmbeddedFile
-            let ef_vtable_pos = data.position() as usize;
-            data.write_all(&14u16.to_le_bytes())?; // vtable size
-            data.write_all(&24u16.to_le_bytes())?; // table size
-            data.write_all(&4u16.to_le_bytes())?; // offset at +4
-            data.write_all(&12u16.to_le_bytes())?; // length at +12
-            data.write_all(&20u16.to_le_bytes())?; // format at +20
-            data.write_all(&22u16.to_le_bytes())?; // content_type at +22
-
-            // table
-            let ef_table_pos = data.position() as usize;
-            file_positions.push(ef_table_pos);
-            let ef_soffset = (ef_table_pos - ef_vtable_pos) as i32;
-            data.write_all(&ef_soffset.to_le_bytes())?;
-            data.write_all(&file.offset.to_le_bytes())?;
-            data.write_all(&file.length.to_le_bytes())?;
-            data.write_all(&0i16.to_le_bytes())?; // format = FeatherV2
-            data.write_all(&(file.content_type as i16).to_le_bytes())?;
+            let content_type = match file.content_type {
+                0 => ContentType::ReadsTable,
+                1 => ContentType::SignalTable,
+                4 => ContentType::RunInfoTable,
+                _ => ContentType::ReadsTable,
+            };
+            let entry = EmbeddedFile::create(
+                &mut fbb,
+                &EmbeddedFileArgs {
+                    offset: file.offset,
+                    length: file.length,
+                    format: Format::FeatherV2,
+                    content_type,
+                },
+            );
+            entries.push(entry);
         }
 
-        // Fill in the offsets
-        let mut result = data.into_inner();
+        let contents = fbb.create_vector(&entries);
 
-        // Fill string offsets (relative from field position)
-        let str0_rel = (str0_pos - field0_pos) as u32;
-        result[field0_pos..field0_pos + 4].copy_from_slice(&str0_rel.to_le_bytes());
-        let str1_rel = (str1_pos - field1_pos) as u32;
-        result[field1_pos..field1_pos + 4].copy_from_slice(&str1_rel.to_le_bytes());
-        let str2_rel = (str2_pos - field2_pos) as u32;
-        result[field2_pos..field2_pos + 4].copy_from_slice(&str2_rel.to_le_bytes());
-        let vec_rel = (vec_pos - field3_pos) as u32;
-        result[field3_pos..field3_pos + 4].copy_from_slice(&vec_rel.to_le_bytes());
+        let file_id_str = fbb.create_string(&file_id);
+        let software_str = fbb.create_string(software);
+        let version_str = fbb.create_string(version);
 
-        // Fill embedded file offsets
-        for (i, &pos) in file_positions.iter().enumerate() {
-            let offset_loc = offsets_start + i * 4;
-            let rel = (pos - offset_loc) as u32;
-            result[offset_loc..offset_loc + 4].copy_from_slice(&rel.to_le_bytes());
-        }
+        let footer = Footer::create(
+            &mut fbb,
+            &FooterArgs {
+                file_identifier: Some(file_id_str),
+                software: Some(software_str),
+                pod5_version: Some(version_str),
+                contents: Some(contents),
+            },
+        );
 
-        // Fill root offset
-        let root_rel = table_pos as u32;
-        result[0..4].copy_from_slice(&root_rel.to_le_bytes());
+        fbb.finish(footer, None);
 
-        Ok(result)
+        Ok(fbb.finished_data().to_vec())
     }
 
     /// Finalize the file and write the footer.
@@ -1027,7 +992,6 @@ impl Writer {
         while file.stream_position()? % 8 != 0 {
             file.write_all(&[0u8])?;
         }
-        self.section_marker = Uuid::new_v4();
         file.write_all(self.section_marker.as_bytes())?;
 
         // Write reads table from memory buffer
@@ -1050,7 +1014,6 @@ impl Writer {
         while file.stream_position()? % 8 != 0 {
             file.write_all(&[0u8])?;
         }
-        self.section_marker = Uuid::new_v4();
         file.write_all(self.section_marker.as_bytes())?;
 
         // Write FOOTER magic
@@ -1065,7 +1028,6 @@ impl Writer {
         file.write_all(&footer_len.to_le_bytes())?;
 
         // Write final section marker
-        self.section_marker = Uuid::new_v4();
         file.write_all(self.section_marker.as_bytes())?;
 
         // Write signature
@@ -1128,6 +1090,12 @@ mod tests {
             end_reason_forced: false,
             run_info_index: run_info_idx,
             num_minknow_events: 100,
+            tracked_scaling_scale: 1.0,
+            tracked_scaling_shift: 0.0,
+            predicted_scaling_scale: 1.0,
+            predicted_scaling_shift: 0.0,
+            num_reads_since_mux_change: 0,
+            time_since_mux_change: 0.0,
             num_samples,
             open_pore_level: 220.0,
             signal_rows: Vec::new(),
@@ -1193,6 +1161,12 @@ mod tests {
             end_reason_forced: false,
             run_info_index: run_info_idx,
             num_minknow_events: 100,
+            tracked_scaling_scale: 1.0,
+            tracked_scaling_shift: 0.0,
+            predicted_scaling_scale: 1.0,
+            predicted_scaling_shift: 0.0,
+            num_reads_since_mux_change: 0,
+            time_since_mux_change: 0.0,
             num_samples: 1000,
             open_pore_level: 220.0,
             signal_rows: Vec::new(), // Populated by writer
@@ -1283,6 +1257,12 @@ mod tests {
                 end_reason_forced: false,
                 run_info_index: run_info_idx,
                 num_minknow_events: 100,
+                tracked_scaling_scale: 1.0,
+                tracked_scaling_shift: 0.0,
+                predicted_scaling_scale: 1.0,
+                predicted_scaling_shift: 0.0,
+                num_reads_since_mux_change: 0,
+                time_since_mux_change: 0.0,
                 num_samples: 500,
                 open_pore_level: 220.0,
                 signal_rows: Vec::new(),

@@ -138,6 +138,18 @@ pub struct ReadData {
     pub run_info_index: u32,
     /// Number of MinKNOW events in this read.
     pub num_minknow_events: u64,
+    /// Tracked scaling scale.
+    pub tracked_scaling_scale: f32,
+    /// Tracked scaling shift.
+    pub tracked_scaling_shift: f32,
+    /// Predicted scaling scale.
+    pub predicted_scaling_scale: f32,
+    /// Predicted scaling shift.
+    pub predicted_scaling_shift: f32,
+    /// Number of reads since last mux change.
+    pub num_reads_since_mux_change: u32,
+    /// Time since last mux change (seconds).
+    pub time_since_mux_change: f32,
     /// Total number of samples in this read's signal.
     pub num_samples: u64,
     /// Estimated open pore current level.
@@ -162,6 +174,12 @@ impl Default for ReadData {
             end_reason_forced: false,
             run_info_index: 0,
             num_minknow_events: 0,
+            tracked_scaling_scale: 1.0,
+            tracked_scaling_shift: 0.0,
+            predicted_scaling_scale: 1.0,
+            predicted_scaling_shift: 0.0,
+            num_reads_since_mux_change: 0,
+            time_since_mux_change: 0.0,
             num_samples: 0,
             open_pore_level: 0.0,
             signal_rows: Vec::new(),
@@ -189,6 +207,12 @@ impl ReadData {
             end_reason_forced: self.end_reason_forced,
             run_info_index: new_run_info_index,
             num_minknow_events: self.num_minknow_events,
+            tracked_scaling_scale: self.tracked_scaling_scale,
+            tracked_scaling_shift: self.tracked_scaling_shift,
+            predicted_scaling_scale: self.predicted_scaling_scale,
+            predicted_scaling_shift: self.predicted_scaling_shift,
+            num_reads_since_mux_change: self.num_reads_since_mux_change,
+            time_since_mux_change: self.time_since_mux_change,
             num_samples: self.num_samples,
             open_pore_level: self.open_pore_level,
             signal_rows: Vec::new(),

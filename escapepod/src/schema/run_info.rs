@@ -8,10 +8,13 @@ pub fn run_info_schema() -> Schema {
     Schema::new(vec![
         // acquisition_id: unique run identifier
         Field::new("acquisition_id", DataType::Utf8, false),
-        // acquisition_start_time: milliseconds since epoch
+        // acquisition_start_time: milliseconds since epoch (UTC)
         Field::new(
             "acquisition_start_time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Millisecond,
+                Some("UTC".into()),
+            ),
             false,
         ),
         // adc_max: maximum ADC value
@@ -47,10 +50,13 @@ pub fn run_info_schema() -> Schema {
         Field::new("protocol_name", DataType::Utf8, false),
         // protocol_run_id
         Field::new("protocol_run_id", DataType::Utf8, false),
-        // protocol_start_time: milliseconds since epoch
+        // protocol_start_time: milliseconds since epoch (UTC)
         Field::new(
             "protocol_start_time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Millisecond,
+                Some("UTC".into()),
+            ),
             false,
         ),
         // sample_id

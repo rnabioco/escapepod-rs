@@ -7,7 +7,9 @@ use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{EndReason, ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
 use crate::utils::parse_uuid_flexible;
-use crate::utils::table_builders::{build_pod5_footer, build_reads_table, build_run_info_table};
+use crate::utils::table_builders::{
+    build_pod5_footer, build_reads_table, build_run_info_table, SchemaMetadata,
+};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -291,6 +293,8 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     // 2. Run info table (deduplicated)
     // 3. Reads table with remapped signal rows
 
+    let schema_meta = SchemaMetadata::new();
+
     let file = File::create(output_path.as_ref())?;
     let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
 
@@ -308,6 +312,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         &signal_data_arcs,
         &all_signal_chunks,
         options.signal_batch_size,
+        &schema_meta,
     )?;
     file.write_all(&signal_table_bytes)?;
 
@@ -319,8 +324,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         file.write_all(&[0u8])?;
     }
 
-    // Write section marker
-    let section_marker = Uuid::new_v4();
+    // Write section marker (reuse same UUID throughout file)
     file.write_all(section_marker.as_bytes())?;
 
     // Build deduplicated run_info table
@@ -338,7 +342,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     }
 
     let run_info_offset = file.stream_position()? as i64;
-    let run_info_bytes = build_run_info_table(&all_run_infos)?;
+    let run_info_bytes = build_run_info_table(&all_run_infos, &schema_meta)?;
     file.write_all(&run_info_bytes)?;
     let run_info_length = run_info_bytes.len() as i64;
 
@@ -346,7 +350,6 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     while file.stream_position()? % 8 != 0 {
         file.write_all(&[0u8])?;
     }
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
     // Build reads table with new signal row indices
@@ -378,7 +381,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         }
     }
 
-    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos)?;
+    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos, &schema_meta)?;
     file.write_all(&reads_bytes)?;
     let reads_length = reads_bytes.len() as i64;
 
@@ -386,7 +389,6 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     while file.stream_position()? % 8 != 0 {
         file.write_all(&[0u8])?;
     }
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
     // Write POD5 footer
@@ -402,13 +404,13 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         run_info_length,
         reads_offset,
         reads_length,
+        &schema_meta,
     )?;
     file.write_all(&pod5_footer)?;
 
     let footer_len = pod5_footer.len() as i64;
     file.write_all(&footer_len.to_le_bytes())?;
 
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
     file.write_all(&POD5_SIGNATURE)?;
 
@@ -428,17 +430,14 @@ fn build_raw_signal_table(
     signal_data: &[Arc<[u8]>],
     chunks: &[(usize, u64, u32)], // (data_idx, _signal_row, samples)
     batch_size: u32,
+    meta: &SchemaMetadata,
 ) -> Result<(Vec<u8>, Vec<BatchBlock>)> {
+    use crate::schema::signal_schema;
     use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
-    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::FileWriter;
     use arrow::record_batch::RecordBatch;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("read_id", DataType::FixedSizeBinary(16), false),
-        Field::new("signal", DataType::LargeBinary, false),
-        Field::new("samples", DataType::UInt32, false),
-    ]));
+    let schema = Arc::new(meta.apply(signal_schema()));
 
     let mut output = Vec::new();
     let mut writer = FileWriter::try_new(&mut output, &schema)?;

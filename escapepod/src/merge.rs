@@ -9,6 +9,7 @@ use crate::reader::Reader;
 use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
 use crate::utils::table_builders::{
     build_arrow_ipc_footer, build_pod5_footer, build_reads_table, build_run_info_table,
+    SchemaMetadata,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -174,6 +175,10 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     use std::sync::mpsc;
     use std::thread;
 
+    // Create a single section marker UUID to reuse at all section boundaries
+    let section_marker = Uuid::new_v4();
+    let schema_meta = SchemaMetadata::new();
+
     let (mut file, signal_end, signal_rows) =
         thread::scope(|scope| -> Result<(File, usize, u64)> {
             // Channel for sending byte slices to writer thread
@@ -189,7 +194,6 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
 
                 // Write POD5 header
                 file.write_all(&POD5_SIGNATURE)?;
-                let section_marker = Uuid::new_v4();
                 file.write_all(section_marker.as_bytes())?;
 
                 // Write all signal data from channel
@@ -280,7 +284,6 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     // Write section marker
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
     // Build and write run_info table
@@ -298,7 +301,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     let run_info_offset = file.stream_position()? as i64;
-    let run_info_bytes = build_run_info_table(&all_run_infos)?;
+    let run_info_bytes = build_run_info_table(&all_run_infos, &schema_meta)?;
     file.write_all(&run_info_bytes)?;
     let run_info_length = run_info_bytes.len() as i64;
 
@@ -306,7 +309,6 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     while file.stream_position()? % 8 != 0 {
         file.write_all(&[0u8])?;
     }
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
     // Build and write reads table
@@ -377,7 +379,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let total_reads = processed_reads.len() as u64;
 
-    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos)?;
+    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos, &schema_meta)?;
     file.write_all(&reads_bytes)?;
     let reads_length = reads_bytes.len() as i64;
 
@@ -385,7 +387,6 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     while file.stream_position()? % 8 != 0 {
         file.write_all(&[0u8])?;
     }
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
     // Write POD5 footer
@@ -401,13 +402,13 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         run_info_length,
         reads_offset,
         reads_length,
+        &schema_meta,
     )?;
     file.write_all(&pod5_footer)?;
 
     let footer_len = pod5_footer.len() as i64;
     file.write_all(&footer_len.to_le_bytes())?;
 
-    let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
     file.write_all(&POD5_SIGNATURE)?;
 
