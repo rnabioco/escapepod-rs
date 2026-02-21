@@ -28,36 +28,62 @@ impl Default for RefineAlgo {
     }
 }
 
-/// Algorithm for precise signal rescaling.
+/// Shared filter parameters for rescaling algorithms.
 #[derive(Debug, Clone, PartialEq)]
-pub enum RescaleAlgo {
-    /// Least-squares regression-based rescaling.
-    LeastSquares {
-        dwell_filter_lower_percentile: f32,
-        dwell_filter_upper_percentile: f32,
-        min_abs_level: f32,
-        n_bases_truncate: usize,
-        min_num_filtered_levels: usize,
-    },
-    /// Theil-Sen estimator-based rescaling.
-    TheilSen {
-        dwell_filter_lower_percentile: f32,
-        dwell_filter_upper_percentile: f32,
-        min_abs_level: f32,
-        n_bases_truncate: usize,
-        min_num_filtered_levels: usize,
-        max_points: usize,
-    },
+pub struct RescaleFilterParams {
+    pub dwell_filter_lower_percentile: f32,
+    pub dwell_filter_upper_percentile: f32,
+    pub min_abs_level: f32,
+    pub n_bases_truncate: usize,
+    pub min_num_filtered_levels: usize,
 }
 
-impl Default for RescaleAlgo {
+impl Default for RescaleFilterParams {
     fn default() -> Self {
-        Self::TheilSen {
+        Self {
             dwell_filter_lower_percentile: 0.1,
             dwell_filter_upper_percentile: 0.9,
             min_abs_level: 0.2,
             n_bases_truncate: 10,
             min_num_filtered_levels: 10,
+        }
+    }
+}
+
+/// Algorithm for precise signal rescaling.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RescaleAlgo {
+    /// Least-squares regression-based rescaling.
+    LeastSquares { filter: RescaleFilterParams },
+    /// Theil-Sen estimator-based rescaling.
+    TheilSen {
+        filter: RescaleFilterParams,
+        max_points: usize,
+    },
+}
+
+impl RescaleAlgo {
+    /// Access the shared filter parameters.
+    pub fn filter_params(&self) -> &RescaleFilterParams {
+        match self {
+            Self::LeastSquares { filter } => filter,
+            Self::TheilSen { filter, .. } => filter,
+        }
+    }
+
+    /// Maximum random subset size (only meaningful for Theil-Sen; returns 0 for LeastSquares).
+    pub fn max_points(&self) -> usize {
+        match self {
+            Self::TheilSen { max_points, .. } => *max_points,
+            Self::LeastSquares { .. } => 0,
+        }
+    }
+}
+
+impl Default for RescaleAlgo {
+    fn default() -> Self {
+        Self::TheilSen {
+            filter: RescaleFilterParams::default(),
             max_points: 1000,
         }
     }

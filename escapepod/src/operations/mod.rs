@@ -3,6 +3,7 @@
 //! This module provides functions for common POD5 operations like
 //! filtering reads by ID, repacking files, and parsing CSV mappings for subsetting.
 
+pub(crate) mod csv_utils;
 mod filter;
 mod repack;
 mod split;

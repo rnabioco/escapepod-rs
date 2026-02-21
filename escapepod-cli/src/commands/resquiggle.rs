@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use escapepod::parse_uuid_flexible;
 use escapepod::resquiggle::{
     calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map, BandingAlgo,
-    KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RoughRescaleAlgo,
+    KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams, RoughRescaleAlgo,
 };
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
@@ -138,11 +138,7 @@ fn parse_rescale(s: &str) -> Result<RescaleAlgo, String> {
     match s {
         "theil-sen" => Ok(RescaleAlgo::default()),
         "least-squares" => Ok(RescaleAlgo::LeastSquares {
-            dwell_filter_lower_percentile: 0.1,
-            dwell_filter_upper_percentile: 0.9,
-            min_abs_level: 0.2,
-            n_bases_truncate: 10,
-            min_num_filtered_levels: 10,
+            filter: RescaleFilterParams::default(),
         }),
         _ => Err(format!(
             "unknown rescale algorithm '{}', expected 'theil-sen' or 'least-squares'",
@@ -334,6 +330,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     // Each chunk entry carries the pre-parsed UUID to avoid double parsing.
     const CHUNK_SIZE: usize = 10_000;
     let progress_bar = create_progress_bar(bam_total, "Processing")?;
+    let log_interval: usize = if progress_bar.is_hidden() { 10_000 } else { 0 };
     let mut chunk: Vec<(uuid::Uuid, RecordBuf)> = Vec::with_capacity(CHUNK_SIZE);
     let mut total_bam: usize = 0;
     let mut matched: usize = 0;
@@ -365,6 +362,12 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         chunk.push((read_id, record_buf));
 
         progress_bar.set_position(total_bam as u64);
+        if log_interval > 0 && total_bam % log_interval == 0 {
+            eprintln!(
+                "[resquiggle] processed {} / {} records ({} matched)",
+                total_bam, bam_total, matched
+            );
+        }
 
         if chunk.len() >= CHUNK_SIZE {
             refine_and_send_chunk(&mut chunk, &ctx, &tx)?;

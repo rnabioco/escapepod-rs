@@ -7,10 +7,7 @@
 //! bandwidth.
 
 use super::bands::Band;
-use super::dp::{
-    banded_traceback, build_dwell_penalty_table, dp_step_buffered, dp_step_with_dwell_penalty,
-    StepBuffers, ViterbiBuffers,
-};
+use super::dp::{banded_traceback, DpContext};
 use super::types::RefineAlgo;
 
 /// Run adaptive banded DP.
@@ -44,16 +41,6 @@ pub fn adaptive_banded_dp(
     let half_bw = bandwidth / 2;
     let avg_advance = signal_len / n_bases;
 
-    // Precompute dwell penalty table if needed
-    let (penalty_table, dwell_target, dwell_weight) = match method {
-        RefineAlgo::DwellPenalty { target, weight } => (
-            Some(build_dwell_penalty_table(*target, *weight)),
-            *target,
-            *weight,
-        ),
-        RefineAlgo::Viterbi => (None, 0.0, 0.0),
-    };
-
     // We need to record band boundaries and traceback for the final path
     let mut band_starts: Vec<usize> = Vec::with_capacity(n_bases);
     let mut band_ends: Vec<usize> = Vec::with_capacity(n_bases);
@@ -68,9 +55,8 @@ pub fn adaptive_banded_dp(
     // X-drop tracking
     let mut best_min_score = f32::INFINITY;
 
-    // Pre-allocated scratch buffers for dp_step (reused across all bases)
-    let mut viterbi_buf = ViterbiBuffers::new(max_bw);
-    let mut step_buf = penalty_table.as_ref().map(|_| StepBuffers::new(max_bw));
+    // DP context: owns penalty tables and scratch buffers
+    let mut ctx = DpContext::new(method, max_bw);
 
     // --- First base ---
     // Band for base 0: centered around initial_map midpoint, starts at 0
@@ -98,30 +84,14 @@ pub fn adaptive_banded_dp(
     curr_scores[..bw0].fill(f32::INFINITY);
     curr_traceback[..bw0].fill(-1);
 
-    if let Some(ref table) = penalty_table {
-        dp_step_with_dwell_penalty(
-            &mut curr_scores[..bw0],
-            &mut curr_traceback[..bw0],
-            &prev_scores[..bw0],
-            levels[0],
-            &signal[bs0..be0],
-            1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
-            table,
-            dwell_target,
-            dwell_weight,
-            step_buf.as_mut().unwrap(),
-        );
-    } else {
-        dp_step_buffered(
-            &mut curr_scores[..bw0],
-            &mut curr_traceback[..bw0],
-            &prev_scores[..bw0],
-            levels[0],
-            &signal[bs0..be0],
-            1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
-            &mut viterbi_buf,
-        );
-    }
+    ctx.step(
+        &mut curr_scores[..bw0],
+        &mut curr_traceback[..bw0],
+        &prev_scores[..bw0],
+        levels[0],
+        &signal[bs0..be0],
+        1, // prev_band_offset = 1 (initial point at position 0, band also starts at 0)
+    );
 
     // X-drop: track best minimum score
     let current_min = curr_scores[..bw0]
@@ -202,30 +172,14 @@ pub fn adaptive_banded_dp(
 
         let prev_band_offset = bs - prev_bs;
 
-        if let Some(ref table) = penalty_table {
-            dp_step_with_dwell_penalty(
-                &mut curr_scores[..bw],
-                &mut curr_traceback[..bw],
-                &prev_scores[..prev_bw],
-                levels[base_idx],
-                &signal[bs..be],
-                prev_band_offset,
-                table,
-                dwell_target,
-                dwell_weight,
-                step_buf.as_mut().unwrap(),
-            );
-        } else {
-            dp_step_buffered(
-                &mut curr_scores[..bw],
-                &mut curr_traceback[..bw],
-                &prev_scores[..prev_bw],
-                levels[base_idx],
-                &signal[bs..be],
-                prev_band_offset,
-                &mut viterbi_buf,
-            );
-        }
+        ctx.step(
+            &mut curr_scores[..bw],
+            &mut curr_traceback[..bw],
+            &prev_scores[..prev_bw],
+            levels[base_idx],
+            &signal[bs..be],
+            prev_band_offset,
+        );
 
         // X-drop: check for early termination
         let current_min = curr_scores[..bw]

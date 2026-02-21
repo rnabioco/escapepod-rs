@@ -9,6 +9,77 @@ use super::types::RefineAlgo;
 /// Penalty score for invalid or out-of-band transitions.
 const INVALID_PENALTY: f32 = 100.0;
 
+/// Encapsulates DP method dispatch and its associated buffers/tables.
+///
+/// Created once per DP run, this struct owns the penalty table (if needed),
+/// dwell parameters, and pre-allocated scratch buffers.  The [`step`] method
+/// dispatches to the correct DP step implementation.
+pub(super) struct DpContext {
+    penalty_table: Option<Vec<f32>>,
+    dwell_target: f32,
+    dwell_weight: f32,
+    viterbi_buf: ViterbiBuffers,
+    step_buf: Option<StepBuffers>,
+}
+
+impl DpContext {
+    /// Build a context from the refinement algorithm and maximum expected bandwidth.
+    pub(super) fn new(method: &RefineAlgo, max_bandwidth: usize) -> Self {
+        match method {
+            RefineAlgo::DwellPenalty { target, weight } => Self {
+                penalty_table: Some(build_dwell_penalty_table(*target, *weight)),
+                dwell_target: *target,
+                dwell_weight: *weight,
+                viterbi_buf: ViterbiBuffers::new(max_bandwidth),
+                step_buf: Some(StepBuffers::new(max_bandwidth)),
+            },
+            RefineAlgo::Viterbi => Self {
+                penalty_table: None,
+                dwell_target: 0.0,
+                dwell_weight: 0.0,
+                viterbi_buf: ViterbiBuffers::new(max_bandwidth),
+                step_buf: None,
+            },
+        }
+    }
+
+    /// Execute one DP step, dispatching to the correct implementation.
+    pub(super) fn step(
+        &mut self,
+        current_scores: &mut [f32],
+        current_traceback: &mut [i32],
+        previous_scores: &[f32],
+        current_level: f32,
+        current_signal: &[f32],
+        prev_band_offset: usize,
+    ) {
+        if let Some(ref table) = self.penalty_table {
+            dp_step_with_dwell_penalty(
+                current_scores,
+                current_traceback,
+                previous_scores,
+                current_level,
+                current_signal,
+                prev_band_offset,
+                table,
+                self.dwell_target,
+                self.dwell_weight,
+                self.step_buf.as_mut().unwrap(),
+            );
+        } else {
+            dp_step_buffered(
+                current_scores,
+                current_traceback,
+                previous_scores,
+                current_level,
+                current_signal,
+                prev_band_offset,
+                &mut self.viterbi_buf,
+            );
+        }
+    }
+}
+
 /// Squared error score between expected and measured signal levels.
 #[inline]
 pub fn score(expected: f32, measured: f32) -> f32 {
@@ -38,11 +109,7 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
     let mut all_scores = vec![f32::INFINITY; band_len];
     let mut traceback = vec![0i32; band_len];
 
-    // Pre-allocate dwell penalty buffers (reused across all bases)
-    let mut dp_buf = match method {
-        RefineAlgo::DwellPenalty { .. } => Some(StepBuffers::new(max_bandwidth)),
-        RefineAlgo::Viterbi => None,
-    };
+    let mut ctx = DpContext::new(method, max_bandwidth);
 
     forward_pass(
         &mut all_scores,
@@ -51,8 +118,7 @@ pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlg
         levels,
         band,
         &base_offsets,
-        method,
-        &mut dp_buf,
+        &mut ctx,
     );
 
     let mut path = vec![0usize; levels.len() + 1];
@@ -111,7 +177,6 @@ impl StepBuffers {
 }
 
 /// Forward pass of banded DP.
-#[allow(clippy::too_many_arguments)]
 fn forward_pass(
     all_scores: &mut [f32],
     traceback: &mut [i32],
@@ -119,22 +184,8 @@ fn forward_pass(
     expected_levels: &[f32],
     band: &Band,
     base_offsets: &[usize],
-    method: &RefineAlgo,
-    dp_buf: &mut Option<StepBuffers>,
+    ctx: &mut DpContext,
 ) {
-    let mut penalty_table = Vec::new();
-    let mut dwell_target = 0.0f32;
-    let mut dwell_weight = 0.0f32;
-    let use_dwell_penalty = match method {
-        RefineAlgo::DwellPenalty { target, weight } => {
-            dwell_target = *target;
-            dwell_weight = *weight;
-            penalty_table = build_dwell_penalty_table(*target, *weight);
-            true
-        }
-        RefineAlgo::Viterbi => false,
-    };
-
     let seq_band_start = &band.start;
     let seq_band_end = &band.end;
 
@@ -143,29 +194,14 @@ fn forward_pass(
     let mut previous_scores = vec![f32::INFINITY; current_bandwidth];
     previous_scores[0] = 0.0;
 
-    if use_dwell_penalty {
-        dp_step_with_dwell_penalty(
-            &mut all_scores[0..current_bandwidth],
-            &mut traceback[0..current_bandwidth],
-            &previous_scores,
-            expected_levels[0],
-            &signal[0..current_bandwidth],
-            1,
-            &penalty_table,
-            dwell_target,
-            dwell_weight,
-            dp_buf.as_mut().unwrap(),
-        );
-    } else {
-        dp_step(
-            &mut all_scores[0..current_bandwidth],
-            &mut traceback[0..current_bandwidth],
-            &previous_scores,
-            expected_levels[0],
-            &signal[0..current_bandwidth],
-            1,
-        );
-    }
+    ctx.step(
+        &mut all_scores[0..current_bandwidth],
+        &mut traceback[0..current_bandwidth],
+        &previous_scores,
+        expected_levels[0],
+        &signal[0..current_bandwidth],
+        1,
+    );
 
     let mut previous_band_start = 0;
     let mut previous_offset = 0;
@@ -184,29 +220,14 @@ fn forward_pass(
         // Split the scores array to get non-overlapping mutable slices
         let (scores_prev_slice, scores_current_slice) = all_scores.split_at_mut(current_offset);
 
-        if use_dwell_penalty {
-            dp_step_with_dwell_penalty(
-                &mut scores_current_slice[0..current_bandwidth],
-                &mut traceback[current_offset..current_slice_end],
-                &scores_prev_slice[previous_offset..],
-                expected_levels[base_idx],
-                &signal[current_band_start..current_band_end],
-                prev_band_offset,
-                &penalty_table,
-                dwell_target,
-                dwell_weight,
-                dp_buf.as_mut().unwrap(),
-            );
-        } else {
-            dp_step(
-                &mut scores_current_slice[0..current_bandwidth],
-                &mut traceback[current_offset..current_slice_end],
-                &scores_prev_slice[previous_offset..],
-                expected_levels[base_idx],
-                &signal[current_band_start..current_band_end],
-                prev_band_offset,
-            );
-        }
+        ctx.step(
+            &mut scores_current_slice[0..current_bandwidth],
+            &mut traceback[current_offset..current_slice_end],
+            &scores_prev_slice[previous_offset..],
+            expected_levels[base_idx],
+            &signal[current_band_start..current_band_end],
+            prev_band_offset,
+        );
 
         previous_band_start = current_band_start;
         previous_offset = current_offset;

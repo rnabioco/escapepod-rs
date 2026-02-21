@@ -259,38 +259,13 @@ pub fn rescale(
         );
     }
 
-    let (dwell_lower, dwell_upper, min_abs_level, n_trunc, min_filtered, max_points) =
-        match *rescale_algo {
-            RescaleAlgo::TheilSen {
-                dwell_filter_lower_percentile,
-                dwell_filter_upper_percentile,
-                min_abs_level,
-                n_bases_truncate,
-                min_num_filtered_levels,
-                max_points,
-            } => (
-                dwell_filter_lower_percentile,
-                dwell_filter_upper_percentile,
-                min_abs_level,
-                n_bases_truncate,
-                min_num_filtered_levels,
-                max_points,
-            ),
-            RescaleAlgo::LeastSquares {
-                dwell_filter_lower_percentile,
-                dwell_filter_upper_percentile,
-                min_abs_level,
-                n_bases_truncate,
-                min_num_filtered_levels,
-            } => (
-                dwell_filter_lower_percentile,
-                dwell_filter_upper_percentile,
-                min_abs_level,
-                n_bases_truncate,
-                min_num_filtered_levels,
-                0,
-            ),
-        };
+    let fp = rescale_algo.filter_params();
+    let dwell_lower = fp.dwell_filter_lower_percentile;
+    let dwell_upper = fp.dwell_filter_upper_percentile;
+    let min_abs_level = fp.min_abs_level;
+    let n_trunc = fp.n_bases_truncate;
+    let min_filtered = fp.min_num_filtered_levels;
+    let max_points = rescale_algo.max_points();
 
     // Calculate dwell times
     let dwells: Vec<f32> = seq_to_signal_map

@@ -19,4 +19,6 @@ pub use kmer_table::KmerTable;
 pub use refine::{
     calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map, RefinementResult,
 };
-pub use types::{BandingAlgo, RefineAlgo, RefineSettings, RescaleAlgo, RoughRescaleAlgo};
+pub use types::{
+    BandingAlgo, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams, RoughRescaleAlgo,
+};

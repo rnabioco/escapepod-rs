@@ -220,7 +220,7 @@ fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{RescaleAlgo, RoughRescaleAlgo};
+    use super::super::types::{RescaleAlgo, RescaleFilterParams, RoughRescaleAlgo};
     use super::*;
 
     #[test]
@@ -421,11 +421,13 @@ mod tests {
             half_bandwidth: 5,
             adjust_band_min_size: 2,
             rescale_algo: RescaleAlgo::LeastSquares {
-                dwell_filter_lower_percentile: 0.0,
-                dwell_filter_upper_percentile: 1.0,
-                min_abs_level: 0.0,
-                n_bases_truncate: 0,
-                min_num_filtered_levels: 3,
+                filter: RescaleFilterParams {
+                    dwell_filter_lower_percentile: 0.0,
+                    dwell_filter_upper_percentile: 1.0,
+                    min_abs_level: 0.0,
+                    n_bases_truncate: 0,
+                    min_num_filtered_levels: 3,
+                },
             },
             rough_rescale_algo: RoughRescaleAlgo::None,
             normalize_levels: false,

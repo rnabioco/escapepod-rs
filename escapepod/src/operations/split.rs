@@ -2,13 +2,12 @@
 //!
 //! Reads a CSV file with barcode classifications and splits reads into separate POD5 files.
 
-use crate::utils::parse_uuid_flexible;
-use crate::{Error, Result};
+use crate::Result;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
+
+use super::csv_utils::parse_csv_uuid_mapping;
 
 /// Parse a CSV file mapping read IDs to barcodes.
 ///
@@ -43,62 +42,8 @@ use uuid::Uuid;
 /// b2c3d4e5f6a78901bcdef12345678901,barcode02,0.2345,0.6789,0.3456,false
 /// ```
 pub fn parse_barcode_mapping(csv_path: impl AsRef<Path>) -> Result<HashMap<Uuid, String>> {
-    let file = File::open(csv_path.as_ref())?;
-    let reader = BufReader::new(file);
-    let mut csv_reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .trim(csv::Trim::All)
-        .from_reader(reader);
-
-    let mut mapping = HashMap::new();
-
-    // Check headers
-    let headers = csv_reader
-        .headers()
-        .map_err(|e| Error::Parse(format!("CSV header error: {}", e)))?
-        .clone();
-
-    let read_id_col = headers
-        .iter()
-        .position(|h| h == "read_id")
-        .ok_or_else(|| Error::Parse("CSV must have a 'read_id' column".to_string()))?;
-
-    let barcode_col = headers
-        .iter()
-        .position(|h| h == "barcode")
-        .ok_or_else(|| Error::Parse("CSV must have a 'barcode' column".to_string()))?;
-
-    for (line_num, result) in csv_reader.records().enumerate() {
-        let record = result
-            .map_err(|e| Error::Parse(format!("CSV error on line {}: {}", line_num + 2, e)))?;
-
-        let read_id_str = record
-            .get(read_id_col)
-            .ok_or_else(|| Error::Parse(format!("Missing read_id on line {}", line_num + 2)))?;
-
-        let barcode = record
-            .get(barcode_col)
-            .ok_or_else(|| Error::Parse(format!("Missing barcode on line {}", line_num + 2)))?;
-
-        if read_id_str.is_empty() {
-            continue;
-        }
-
-        // Parse UUID (handle both with and without dashes)
-        let uuid = parse_uuid_flexible(read_id_str).map_err(|_| {
-            Error::Parse(format!(
-                "Invalid UUID '{}' on line {}",
-                read_id_str,
-                line_num + 2
-            ))
-        })?;
-
-        // Store barcode (can be empty for unclassified)
-        mapping.insert(uuid, barcode.to_string());
-    }
-
-    Ok(mapping)
+    // skip_empty_values=false: empty barcode means "unclassified", which is valid
+    parse_csv_uuid_mapping(csv_path, "barcode", false)
 }
 
 #[cfg(test)]
