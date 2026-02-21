@@ -691,14 +691,7 @@ mod tests {
             weight: 0.5,
         };
 
-        let path = adaptive_banded_dp(
-            &signal,
-            &levels,
-            bandwidth,
-            &initial_map,
-            &method,
-            None,
-        );
+        let path = adaptive_banded_dp(&signal, &levels, bandwidth, &initial_map, &method, None);
 
         assert_eq!(path.len(), n_bases + 1);
         assert_eq!(path[0], 0);
