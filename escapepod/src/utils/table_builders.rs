@@ -115,7 +115,8 @@ pub(crate) fn build_run_info_table(
     }
 
     let mut acquisition_id_builder = StringBuilder::new();
-    let mut acquisition_start_time_builder = TimestampMillisecondBuilder::new().with_timezone("UTC");
+    let mut acquisition_start_time_builder =
+        TimestampMillisecondBuilder::new().with_timezone("UTC");
     let mut adc_max_builder = Int16Builder::new();
     let mut adc_min_builder = Int16Builder::new();
     let map_field_names = Some(MapFieldNames {

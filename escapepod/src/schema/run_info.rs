@@ -11,10 +11,7 @@ pub fn run_info_schema() -> Schema {
         // acquisition_start_time: milliseconds since epoch (UTC)
         Field::new(
             "acquisition_start_time",
-            DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Millisecond,
-                Some("UTC".into()),
-            ),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, Some("UTC".into())),
             false,
         ),
         // adc_max: maximum ADC value
@@ -53,10 +50,7 @@ pub fn run_info_schema() -> Schema {
         // protocol_start_time: milliseconds since epoch (UTC)
         Field::new(
             "protocol_start_time",
-            DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Millisecond,
-                Some("UTC".into()),
-            ),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, Some("UTC".into())),
             false,
         ),
         // sample_id

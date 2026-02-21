@@ -210,10 +210,7 @@ impl Writer {
     }
 
     /// Apply MINKNOW schema metadata to an Arrow schema.
-    fn schema_with_metadata(
-        &self,
-        schema: arrow::datatypes::Schema,
-    ) -> arrow::datatypes::Schema {
+    fn schema_with_metadata(&self, schema: arrow::datatypes::Schema) -> arrow::datatypes::Schema {
         let mut metadata = schema.metadata().clone();
         metadata.insert(
             "MINKNOW:file_identifier".to_string(),
@@ -223,10 +220,7 @@ impl Writer {
             "MINKNOW:software".to_string(),
             self.options.software.clone(),
         );
-        metadata.insert(
-            "MINKNOW:pod5_version".to_string(),
-            POD5_VERSION.to_string(),
-        );
+        metadata.insert("MINKNOW:pod5_version".to_string(), POD5_VERSION.to_string());
         schema.with_metadata(metadata)
     }
 
@@ -785,7 +779,8 @@ impl Writer {
         let schema = Arc::new(self.schema_with_metadata(run_info_schema()));
 
         let mut acquisition_id_builder = StringBuilder::new();
-        let mut acquisition_start_time_builder = TimestampMillisecondBuilder::new().with_timezone("UTC");
+        let mut acquisition_start_time_builder =
+            TimestampMillisecondBuilder::new().with_timezone("UTC");
         let mut adc_max_builder = Int16Builder::new();
         let mut adc_min_builder = Int16Builder::new();
         let map_field_names = Some(MapFieldNames {
@@ -803,7 +798,8 @@ impl Writer {
         let mut flow_cell_product_code_builder = StringBuilder::new();
         let mut protocol_name_builder = StringBuilder::new();
         let mut protocol_run_id_builder = StringBuilder::new();
-        let mut protocol_start_time_builder = TimestampMillisecondBuilder::new().with_timezone("UTC");
+        let mut protocol_start_time_builder =
+            TimestampMillisecondBuilder::new().with_timezone("UTC");
         let mut sample_id_builder = StringBuilder::new();
         let mut sample_rate_builder = UInt16Builder::new();
         let mut sequencing_kit_builder = StringBuilder::new();
