@@ -42,8 +42,11 @@ use super::csv_utils::parse_csv_uuid_mapping;
 /// b2c3d4e5f6a78901bcdef12345678901,barcode02,0.2345,0.6789,0.3456,false
 /// ```
 pub fn parse_barcode_mapping(csv_path: impl AsRef<Path>) -> Result<HashMap<Uuid, String>> {
-    // skip_empty_values=false: empty barcode means "unclassified", which is valid
-    parse_csv_uuid_mapping(csv_path, "barcode", false)
+    // Try "barcode" first (DTW classify output), then "predicted_barcode" (SVM classify output)
+    match parse_csv_uuid_mapping(csv_path.as_ref(), "barcode", false) {
+        Ok(mapping) => Ok(mapping),
+        Err(_) => parse_csv_uuid_mapping(csv_path, "predicted_barcode", false),
+    }
 }
 
 #[cfg(test)]
