@@ -6,6 +6,7 @@ use super::utils::{
 };
 use crate::progress::create_progress_bar;
 use crate::style;
+use escapepod::dtw::NormMethod;
 use escapepod::Reader;
 use rayon::prelude::*;
 use std::fs::File;
@@ -64,7 +65,7 @@ pub struct FingerprintArgs {
     )]
     pub window_width: usize,
 
-    /// Normalization method (zscore, minmax, median, none)
+    /// Normalization method (zscore, minmax, median, mean, none)
     #[arg(
         long,
         default_value = "zscore",
@@ -73,6 +74,12 @@ pub struct FingerprintArgs {
     )]
     pub normalize: String,
 
+    /// WarpDemuX-compatible fingerprinting mode.
+    /// Uses full adapter region, 110 t-test events (window=12, min_sep=6),
+    /// keeps last 25 segment means, and applies mean normalization.
+    #[arg(long, help_heading = "Advanced Options")]
+    pub warpdemux_compat: bool,
+
     /// Number of threads for parallel processing
     #[arg(short = 'j', long, default_value = "4", value_name = "N")]
     pub threads: usize,
@@ -80,6 +87,28 @@ pub struct FingerprintArgs {
 
 /// Run the fingerprint subcommand.
 pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
+    // Resolve effective parameters (WarpDemuX-compat overrides defaults)
+    let (num_segments, window_width, norm_method, min_separation, keep_last, use_full_adapter) =
+        if args.warpdemux_compat {
+            (
+                111_usize,                   // 110 changepoints → 111 segments (WDX num_events=110)
+                12_usize,                    // running_stat_width=12
+                NormMethod::ZScore,          // WarpDemuX "mean" norm = z-score (mean/std)
+                Some(6_usize),               // min_obs_per_base=6
+                Some(25_usize),              // keep last 25 segment means
+                true,                        // use full adapter region
+            )
+        } else {
+            (
+                args.num_segments,
+                args.window_width,
+                parse_norm_method(&args.normalize)?,
+                None,
+                None,
+                false,
+            )
+        };
+
     println!("{} barcode fingerprints", style::action("Extracting"));
     println!(
         "{} {} POD5 file(s)",
@@ -96,14 +125,17 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
         style::label("Output:"),
         style::path(args.output.display())
     );
-
-    // Parse normalization method
-    let norm_method = parse_norm_method(&args.normalize)?;
+    if args.warpdemux_compat {
+        println!(
+            "{} WarpDemuX-compatible (110 events, window=12, keep_last=25, zscore norm)",
+            style::label("Mode:"),
+        );
+    }
 
     // Set thread pool size
     configure_thread_pool(args.threads);
 
-    // Read boundaries CSV
+    // Read boundaries CSV (auto-detects escapepod vs WarpDemuX format)
     let boundaries_map = parse_boundaries_csv(&args.boundaries)?;
 
     println!(
@@ -148,9 +180,16 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     let fingerprints: Vec<ReadFingerprint> = reads_to_process
         .par_iter()
         .filter_map(|(read_id, adapter_start, adapter_end, signal)| {
-            // Compute the region within the adapter for fingerprinting
-            let region_start = adapter_start + args.segment_start;
-            let region_end = (adapter_start + args.segment_end).min(*adapter_end);
+            // Compute the region for fingerprinting
+            let (region_start, region_end) = if use_full_adapter {
+                // WarpDemuX-compat: use full adapter region (start=0 means adapter_start itself)
+                (*adapter_start, *adapter_end)
+            } else {
+                // Default: use a fixed window within the adapter
+                let start = adapter_start + args.segment_start;
+                let end = (adapter_start + args.segment_end).min(*adapter_end);
+                (start, end)
+            };
 
             if region_end <= region_start {
                 progress_bar.inc(1);
@@ -161,10 +200,12 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                 signal,
                 region_start,
                 region_end,
-                args.num_segments,
-                args.window_width,
+                num_segments,
+                window_width,
                 norm_method,
                 *read_id,
+                min_separation,
+                keep_last,
             );
 
             progress_bar.inc(1);

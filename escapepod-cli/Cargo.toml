@@ -18,6 +18,7 @@ chrono = "0.4"
 clap = { workspace = true }
 csv = "1"
 escapepod = { workspace = true }
+flate2 = "1"
 indicatif = { workspace = true }
 # BAM file support
 noodles-bam = "0.85"

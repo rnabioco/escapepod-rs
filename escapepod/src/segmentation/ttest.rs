@@ -129,26 +129,42 @@ pub fn find_changepoints(
         return Vec::new();
     }
 
-    // Get indices sorted by t-score (descending)
-    let mut candidates: Vec<usize> = (0..t_scores.len()).collect();
-    candidates.sort_by(|&a, &b| t_scores[b].partial_cmp(&t_scores[a]).unwrap());
+    // Step 1: Find local maxima (peaks) in the t-scores.
+    // A peak at position i means t_scores[i] >= neighbors.
+    // This matches scipy.signal.find_peaks behavior used by WarpDemuX.
+    let mut peaks: Vec<usize> = Vec::new();
+    for i in 0..t_scores.len() {
+        let left_ok = i == 0 || t_scores[i] >= t_scores[i - 1];
+        let right_ok = i + 1 >= t_scores.len() || t_scores[i] >= t_scores[i + 1];
+        if left_ok && right_ok && t_scores[i] > 0.0 {
+            peaks.push(i);
+        }
+    }
+
+    // Step 2: Sort peaks by score (descending) and select top N
+    // with minimum distance constraint (matching scipy find_peaks distance param).
+    peaks.sort_by(|&a, &b| {
+        t_scores[b]
+            .partial_cmp(&t_scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut changepoints = Vec::new();
     let mut blacklist = std::collections::HashSet::new();
 
-    for &cand_pos in &candidates {
+    for &peak_pos in &peaks {
         if changepoints.len() >= num_changepoints {
             break;
         }
 
-        if !blacklist.contains(&cand_pos) {
+        if !blacklist.contains(&peak_pos) {
             // Adjust position to be at the boundary between windows
-            let adjusted_pos = cand_pos + window_width;
+            let adjusted_pos = peak_pos + window_width;
             changepoints.push(adjusted_pos);
 
-            // Blacklist nearby positions
-            let start = cand_pos.saturating_sub(min_separation - 1);
-            let end = (cand_pos + min_separation).min(t_scores.len());
+            // Blacklist nearby positions (enforce min_separation between peaks)
+            let start = peak_pos.saturating_sub(min_separation - 1);
+            let end = (peak_pos + min_separation).min(t_scores.len());
             for pos in start..end {
                 blacklist.insert(pos);
             }

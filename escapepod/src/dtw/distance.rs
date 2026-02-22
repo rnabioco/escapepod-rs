@@ -83,7 +83,8 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         let mut row_min = f32::INFINITY;
 
         for j in j_start..=j_end {
-            let cost = (a[i - 1] - b[j - 1]).abs();
+            let diff = a[i - 1] - b[j - 1];
+            let cost = diff * diff;
             let min_prev = prev[j - 1].min(prev[j]).min(curr[j - 1]);
             curr[j] = cost + min_prev;
             row_min = row_min.min(curr[j]);
@@ -97,7 +98,7 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         std::mem::swap(&mut prev, &mut curr);
     }
 
-    prev[m]
+    prev[m].sqrt()
 }
 
 /// Compute the full DTW distance matrix between query sequences and reference sequences.
@@ -242,11 +243,11 @@ mod tests {
         let distance = dtw_distance(&a, &b, None);
         assert_eq!(distance, 1.0);
 
-        // [0, 0] vs [1, 1] should give distance of 2
+        // [0, 0] vs [1, 1]: accumulated squared cost = 1+1 = 2, sqrt(2)
         let a = vec![0.0, 0.0];
         let b = vec![1.0, 1.0];
         let distance = dtw_distance(&a, &b, None);
-        assert_eq!(distance, 2.0);
+        assert!((distance - 2.0_f32.sqrt()).abs() < 1e-6);
     }
 
     #[test]

@@ -4,10 +4,11 @@ use super::types::{BarcodeFingerprint, ReadBoundaries, ReadFingerprint};
 use escapepod::dtw::{normalize_fingerprint, Fingerprint, NormMethod};
 use escapepod::segmentation::{mad_normalize, segment_signal};
 use escapepod::Reader;
+use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Parse a normalization method string into a NormMethod enum.
@@ -18,9 +19,10 @@ pub fn parse_norm_method(s: &str) -> anyhow::Result<NormMethod> {
         "zscore" => Ok(NormMethod::ZScore),
         "minmax" => Ok(NormMethod::MinMax),
         "median" => Ok(NormMethod::Median),
+        "mean" => Ok(NormMethod::Mean),
         "none" => Ok(NormMethod::None),
         _ => anyhow::bail!(
-            "Invalid normalization method: {}. Use zscore, minmax, median, or none",
+            "Invalid normalization method: {}. Use zscore, minmax, median, mean, or none",
             s
         ),
     }
@@ -37,28 +39,60 @@ pub fn configure_thread_pool(num_threads: usize) {
 }
 
 /// Parse a boundaries CSV file into a map of read_id -> ReadBoundaries.
+///
+/// Auto-detects the format by examining the header line:
+/// - escapepod format: `read_id,num_samples,adapter_start,adapter_end`
+/// - WarpDemuX format: `read_id,signal_len,...,adapter_start,adapter_end,...` (55+ columns)
+///
+/// Supports both plain CSV and gzip-compressed (.gz) files.
 pub fn parse_boundaries_csv(path: &PathBuf) -> anyhow::Result<HashMap<Uuid, ReadBoundaries>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader: Box<dyn BufRead> = open_csv_reader(path)?;
+    let mut lines = reader.lines();
+
+    // Read header to detect format
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Empty boundaries file"))??;
+
+    // Skip WarpDemuX comment header (starts with #)
+    let header = if header.starts_with('#') {
+        header[1..].to_string()
+    } else {
+        header
+    };
+
+    let columns: Vec<&str> = header.split(',').collect();
+
+    // Detect format by finding column indices
+    let (read_id_col, num_samples_col, adapter_start_col, adapter_end_col) =
+        detect_boundary_columns(&columns)?;
 
     let mut boundaries_map = HashMap::new();
-    let mut line_count = 0;
 
-    for line in reader.lines() {
+    for line in lines {
         let line = line?;
-        line_count += 1;
-
-        // Skip header
-        if line_count == 1 {
+        // Skip comment lines
+        if line.starts_with('#') {
             continue;
         }
 
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 4 {
-            if let Ok(read_id) = Uuid::parse_str(parts[0]) {
-                let num_samples = parts[1].parse::<u64>().unwrap_or(0);
-                let adapter_start = parts[2].parse::<usize>().unwrap_or(0);
-                let adapter_end = parts[3].parse::<usize>().unwrap_or(0);
+        let max_col = [read_id_col, num_samples_col, adapter_start_col, adapter_end_col]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+
+        if parts.len() > max_col {
+            if let Ok(read_id) = Uuid::parse_str(parts[read_id_col]) {
+                let num_samples = parts[num_samples_col].parse::<u64>().unwrap_or(0);
+                let adapter_start = parts[adapter_start_col]
+                    .parse::<f64>()
+                    .map(|v| v as usize)
+                    .unwrap_or(0);
+                let adapter_end = parts[adapter_end_col]
+                    .parse::<f64>()
+                    .map(|v| v as usize)
+                    .unwrap_or(0);
 
                 let boundaries = ReadBoundaries {
                     read_id,
@@ -75,6 +109,51 @@ pub fn parse_boundaries_csv(path: &PathBuf) -> anyhow::Result<HashMap<Uuid, Read
     }
 
     Ok(boundaries_map)
+}
+
+/// Open a CSV file, auto-detecting gzip compression from the .gz extension.
+fn open_csv_reader(path: &Path) -> anyhow::Result<Box<dyn BufRead>> {
+    let file = File::open(path)?;
+    if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        let decoder = GzDecoder::new(file);
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+/// Detect column indices for boundary fields by examining the CSV header.
+///
+/// Returns (read_id_col, num_samples_col, adapter_start_col, adapter_end_col).
+fn detect_boundary_columns(columns: &[&str]) -> anyhow::Result<(usize, usize, usize, usize)> {
+    // Try to find columns by name
+    let find_col = |names: &[&str]| -> Option<usize> {
+        for name in names {
+            if let Some(idx) = columns.iter().position(|c| c.trim() == *name) {
+                return Some(idx);
+            }
+        }
+        None
+    };
+
+    let read_id_col = find_col(&["read_id"])
+        .ok_or_else(|| anyhow::anyhow!("No 'read_id' column found in boundaries CSV"))?;
+
+    let num_samples_col = find_col(&["num_samples", "signal_len"]).unwrap_or(1);
+
+    let adapter_start_col = find_col(&["adapter_start"]).ok_or_else(|| {
+        anyhow::anyhow!("No 'adapter_start' column found in boundaries CSV")
+    })?;
+
+    let adapter_end_col = find_col(&["adapter_end"])
+        .ok_or_else(|| anyhow::anyhow!("No 'adapter_end' column found in boundaries CSV"))?;
+
+    Ok((
+        read_id_col,
+        num_samples_col,
+        adapter_start_col,
+        adapter_end_col,
+    ))
 }
 
 /// Parse a reference fingerprints CSV into barcode fingerprints.
@@ -171,6 +250,12 @@ pub fn downscale_signal(signal: &[f32], factor: usize) -> Vec<f32> {
 /// Extract a fingerprint from an adapter region of a signal.
 ///
 /// Returns None if the region is too small or segmentation fails.
+///
+/// When `keep_last` is set (WarpDemuX-compat mode), normalization is applied
+/// to ALL segment means before truncation, matching WarpDemuX's behavior where
+/// z-score is computed over all 110 events then last 25 are retained.
+/// In this mode, the signal is NOT pre-normalized (WarpDemuX segments raw pA values).
+#[allow(clippy::too_many_arguments)]
 pub fn extract_fingerprint_from_signal(
     signal: &[i16],
     adapter_start: usize,
@@ -179,6 +264,8 @@ pub fn extract_fingerprint_from_signal(
     window_width: usize,
     norm_method: NormMethod,
     read_id: Uuid,
+    min_separation: Option<usize>,
+    keep_last: Option<usize>,
 ) -> Option<ReadFingerprint> {
     let end = adapter_end.min(signal.len());
 
@@ -186,18 +273,34 @@ pub fn extract_fingerprint_from_signal(
         return None;
     }
 
-    // Convert to f32
-    let adapter_signal: Vec<f32> = signal[adapter_start..end]
-        .iter()
-        .map(|&s| s as f32)
-        .collect();
+    // Convert to f32. When keep_last is set (WarpDemuX-compat), don't pre-normalize
+    // — WarpDemuX segments raw pA values and normalizes event means afterwards.
+    // For the default mode, MAD-normalize for consistency with existing behavior.
+    let adapter_signal: Vec<f32> = if keep_last.is_some() {
+        signal[adapter_start..end]
+            .iter()
+            .map(|&s| s as f32)
+            .collect()
+    } else {
+        let raw: Vec<f32> = signal[adapter_start..end]
+            .iter()
+            .map(|&s| s as f32)
+            .collect();
+        if raw.len() > 10 {
+            mad_normalize(&raw)
+        } else {
+            raw
+        }
+    };
+
+    let sep = min_separation.unwrap_or(window_width);
 
     // Segment the adapter region
     let segments = segment_signal(
         &adapter_signal,
         window_width,
         num_segments.saturating_sub(1),
-        window_width,
+        sep,
     );
 
     if segments.is_empty() {
@@ -205,9 +308,28 @@ pub fn extract_fingerprint_from_signal(
     }
 
     // Extract segment means as fingerprint
-    let fingerprint_values: Vec<f32> = segments.iter().map(|(_, _, mean)| *mean as f32).collect();
+    let mut fingerprint_values: Vec<f32> =
+        segments.iter().map(|(_, _, mean)| *mean as f32).collect();
 
-    // Normalize the fingerprint
+    if let Some(n) = keep_last {
+        // WarpDemuX-compat: normalize ALL event means first, then truncate.
+        // WarpDemuX's "mean" normalization is actually z-score (mean/std).
+        let mut all_fp = Fingerprint::new(fingerprint_values, read_id);
+        normalize_fingerprint(&mut all_fp, norm_method);
+        fingerprint_values = all_fp.values;
+
+        // Keep only the last N segments
+        if fingerprint_values.len() > n {
+            fingerprint_values = fingerprint_values[fingerprint_values.len() - n..].to_vec();
+        }
+
+        return Some(ReadFingerprint::new(
+            read_id,
+            fingerprint_values.iter().map(|&v| v as f64).collect(),
+        ));
+    }
+
+    // Default mode: normalize the fingerprint after extraction
     let mut fp = Fingerprint::new(fingerprint_values, read_id);
     normalize_fingerprint(&mut fp, norm_method);
 
@@ -322,6 +444,10 @@ mod tests {
         assert!(matches!(
             parse_norm_method("median").unwrap(),
             NormMethod::Median
+        ));
+        assert!(matches!(
+            parse_norm_method("mean").unwrap(),
+            NormMethod::Mean
         ));
         assert!(matches!(
             parse_norm_method("none").unwrap(),
@@ -518,6 +644,8 @@ mod tests {
             5, // window_width larger than signal
             NormMethod::ZScore,
             read_id,
+            None,
+            None,
         );
         assert!(result.is_none());
     }
@@ -527,8 +655,9 @@ mod tests {
         // Create a signal with enough samples
         let signal: Vec<i16> = (0..1000).map(|i| (i as i16) % 1000).collect();
         let read_id = Uuid::new_v4();
-        let result =
-            extract_fingerprint_from_signal(&signal, 0, 500, 10, 5, NormMethod::None, read_id);
+        let result = extract_fingerprint_from_signal(
+            &signal, 0, 500, 10, 5, NormMethod::None, read_id, None, None,
+        );
         assert!(result.is_some());
         let fp = result.unwrap();
         assert_eq!(fp.read_id, read_id);

@@ -14,6 +14,8 @@ pub enum NormMethod {
     MinMax,
     /// Median normalization: (x - median) / mad (median absolute deviation)
     Median,
+    /// Mean normalization: (x - mean), no scaling
+    Mean,
     /// No normalization
     None,
 }
@@ -182,6 +184,12 @@ pub fn normalize_fingerprint(fp: &mut Fingerprint, method: NormMethod) {
                 for val in &mut fp.values {
                     *val = (*val - median) / mad;
                 }
+            }
+        }
+        NormMethod::Mean => {
+            let mean = compute_mean(&fp.values);
+            for val in &mut fp.values {
+                *val -= mean;
             }
         }
         NormMethod::None => {

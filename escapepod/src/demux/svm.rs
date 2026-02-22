@@ -149,25 +149,51 @@ impl<'a> SvmPredictor<'a> {
             return decisions;
         }
 
-        // Use real SVM dual coefficients
+        // Use real SVM dual coefficients (libsvm OvO layout)
+        //
+        // For pairwise classifier (class_i, class_j) with i < j:
+        //   - SVs of class i: use dual_coef[j-1][sv_idx]
+        //   - SVs of class j: use dual_coef[i][sv_idx]
+        //   - Other SVs: don't contribute
         let mut decisions = vec![0.0; n_pairs];
-        let mut pair_idx = 0;
 
+        // Build class index lookup: label -> class index
+        let label_to_class: std::collections::HashMap<i32, usize> = self
+            .model
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(idx, &label)| (label, idx))
+            .collect();
+
+        let mut pair_idx = 0;
         for i in 0..n_classes {
             for j in (i + 1)..n_classes {
-                // Decision function: sum over support vectors
                 let mut sum = self.model.intercept[pair_idx];
 
-                for (sv_local_idx, &sv_global_idx) in self.model.support_indices.iter().enumerate()
+                for (sv_local_idx, &sv_global_idx) in
+                    self.model.support_indices.iter().enumerate()
                 {
-                    let coef = if sv_local_idx < self.model.dual_coef[0].len() {
-                        let row_idx = (i + j - 1) % self.model.dual_coef.len();
-                        self.model.dual_coef[row_idx]
-                            .get(sv_local_idx)
-                            .copied()
-                            .unwrap_or(0.0)
-                    } else {
-                        0.0
+                    // Determine which class this SV belongs to
+                    let sv_label = self.model.training_labels[sv_global_idx];
+                    let sv_class = label_to_class.get(&sv_label).copied();
+
+                    let coef = match sv_class {
+                        Some(c) if c == i => {
+                            // SV of class i: use dual_coef[j-1]
+                            self.model.dual_coef[j - 1]
+                                .get(sv_local_idx)
+                                .copied()
+                                .unwrap_or(0.0)
+                        }
+                        Some(c) if c == j => {
+                            // SV of class j: use dual_coef[i]
+                            self.model.dual_coef[i]
+                                .get(sv_local_idx)
+                                .copied()
+                                .unwrap_or(0.0)
+                        }
+                        _ => 0.0, // SV of other class: doesn't contribute
                     };
 
                     sum += coef * kernel_values[sv_global_idx];
@@ -266,65 +292,71 @@ impl<'a> SvmPredictor<'a> {
 
     /// Couple pairwise probabilities to class probabilities.
     ///
-    /// Implements the coupling algorithm from Wu et al. (2004).
-    #[allow(clippy::needless_range_loop)] // Matrix filling requires index access pattern
+    /// Implements libsvm's `multiclass_probability` (Wu et al. 2004).
+    /// This matches sklearn's internal probability coupling exactly.
+    #[allow(clippy::needless_range_loop)]
     fn couple_probabilities(&self, pair_probs: &[f64]) -> Vec<f64> {
-        let n_classes = self.model.n_classes;
+        let k = self.model.n_classes;
 
-        // Build pairwise probability matrix
-        let mut r = vec![vec![0.0; n_classes]; n_classes];
+        // Build pairwise probability matrix r[i][j]
+        let mut r = vec![vec![0.0; k]; k];
         let mut pair_idx = 0;
-        for i in 0..n_classes {
-            for j in (i + 1)..n_classes {
-                r[i][j] = pair_probs[pair_idx];
-                r[j][i] = 1.0 - pair_probs[pair_idx];
+        for i in 0..k {
+            for j in (i + 1)..k {
+                r[i][j] = pair_probs[pair_idx].max(1e-7).min(1.0 - 1e-7);
+                r[j][i] = 1.0 - r[i][j];
                 pair_idx += 1;
             }
         }
 
-        // Initialize with uniform probabilities
-        let mut p = vec![1.0 / n_classes as f64; n_classes];
-
-        // Iterative refinement (simplified)
-        for _ in 0..100 {
-            let mut new_p = vec![0.0; n_classes];
-            let mut sum = 0.0;
-
-            for i in 0..n_classes {
-                let mut numerator = 0.0;
-                let mut denominator = 0.0;
-
-                for j in 0..n_classes {
-                    if i != j {
-                        numerator += r[i][j] * p[j];
-                        denominator += p[j];
-                    }
+        // Build Q matrix: Q[t][t] = sum_{j!=t} r[j][t]^2
+        //                  Q[t][j] = -r[j][t] * r[t][j]  (j != t)
+        let mut q = vec![vec![0.0; k]; k];
+        for t in 0..k {
+            q[t][t] = 0.0;
+            for j in 0..k {
+                if j != t {
+                    q[t][t] += r[j][t] * r[j][t];
+                    q[t][j] = -r[j][t] * r[t][j];
                 }
-
-                new_p[i] = if denominator > 0.0 {
-                    numerator / denominator
-                } else {
-                    1.0 / n_classes as f64
-                };
-                sum += new_p[i];
             }
+        }
 
-            // Normalize
-            if sum > 0.0 {
-                new_p.iter_mut().for_each(|v| *v /= sum);
+        // Initialize uniform probabilities
+        let mut p = vec![1.0 / k as f64; k];
+        let eps = 0.005 / k as f64;
+        let max_iter = 100.max(k);
+
+        for _ in 0..max_iter {
+            // Compute Qp and pQp
+            let mut qp = vec![0.0; k];
+            let mut p_qp = 0.0;
+            for t in 0..k {
+                for j in 0..k {
+                    qp[t] += q[t][j] * p[j];
+                }
+                p_qp += p[t] * qp[t];
             }
 
             // Check convergence
-            let max_diff: f64 = p
-                .iter()
-                .zip(new_p.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f64::max);
-
-            p = new_p;
-
-            if max_diff < 1e-7 {
+            let max_error = (0..k)
+                .map(|t| (qp[t] - p_qp).abs())
+                .fold(0.0_f64, f64::max);
+            if max_error < eps {
                 break;
+            }
+
+            // Update each p[t]
+            for t in 0..k {
+                let diff = (-qp[t] + p_qp) / q[t][t];
+                p[t] += diff;
+                p_qp = (p_qp + diff * (diff * q[t][t] + 2.0 * qp[t]))
+                    / (1.0 + diff)
+                    / (1.0 + diff);
+                for j in 0..k {
+                    qp[j] = (qp[j] + diff * q[t][j]) / (1.0 + diff);
+                    p[j] /= 1.0 + diff;
+                }
             }
         }
 

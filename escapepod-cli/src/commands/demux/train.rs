@@ -351,6 +351,8 @@ fn extract_training_fingerprint(
         args.window_width,
         norm_method,
         read_id,
+        None,
+        None,
     )?;
 
     Some(fp.values.iter().map(|&v| v as f32).collect())
