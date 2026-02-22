@@ -1,4 +1,4 @@
-# VHS tape for escapepod summary command
+# VHS tape for escpod summary command
 Output docs/images/summary.gif
 
 Set Shell "bash"
@@ -14,6 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "escapepod summary data/drna/yeast_trna_reads.pod5"
+Type "escpod summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 5s

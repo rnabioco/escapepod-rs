@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod resquiggle - escapepod-rs</title>
+        <title>escpod resquiggle - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-resquiggle" class="md-skip">
+        <a href="#escpod-resquiggle" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod resquiggle
+              escpod resquiggle
             
           </span>
         </div>
@@ -1811,7 +1811,7 @@
   
 
 
-<h1 id="escapepod-resquiggle">escapepod resquiggle<a class="headerlink" href="#escapepod-resquiggle" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-resquiggle">escpod resquiggle<a class="headerlink" href="#escpod-resquiggle" title="Permanent link">&para;</a></h1>
 <p>Refine signal-to-base mapping using banded dynamic programming. Takes an input POD5 file (raw signal) and a BAM file with basecaller move tables, then produces a new BAM file with refined signal boundaries stored in auxiliary tags.</p>
 <h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
 <p>Nanopore basecallers produce a <strong>move table</strong> that maps signal blocks to bases, but
@@ -1838,7 +1838,7 @@ kmer levels using banded dynamic programming.</p>
   Refined       (sample-level boundaries from DP)
 </code></pre></div>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>&lt;INPUT&gt;<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-k<span class="w"> </span>&lt;KMER_TABLE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>&lt;INPUT&gt;<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-k<span class="w"> </span>&lt;KMER_TABLE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
@@ -2186,13 +2186,13 @@ for calibration drift between the basecaller model and the kmer level table.</p>
 </code></pre></div>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-resquiggle">Basic Resquiggle<a class="headerlink" href="#basic-resquiggle" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-o<span class="w"> </span>refined.bam
 </code></pre></div>
 <h3 id="with-multiple-iterations-and-normalization">With Multiple Iterations and Normalization<a class="headerlink" href="#with-multiple-iterations-and-normalization" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>pod5_dir/<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>pod5_dir/<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
@@ -2200,7 +2200,7 @@ for calibration drift between the basecaller model and the kmer level table.</p>
 <span class="w">    </span>--normalize<span class="w"> </span>mad
 </code></pre></div>
 <h3 id="tuning-bandwidth-and-algorithm">Tuning Bandwidth and Algorithm<a class="headerlink" href="#tuning-bandwidth-and-algorithm" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
@@ -2209,7 +2209,7 @@ for calibration drift between the basecaller model and the kmer level table.</p>
 <span class="w">    </span>--rescale<span class="w"> </span>least-squares
 </code></pre></div>
 <h3 id="custom-dwell-penalty-parameters">Custom Dwell Penalty Parameters<a class="headerlink" href="#custom-dwell-penalty-parameters" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>
@@ -2218,14 +2218,14 @@ for calibration drift between the basecaller model and the kmer level table.</p>
 <span class="w">    </span>--dwell-weight<span class="w"> </span><span class="m">0</span>.3
 </code></pre></div>
 <h3 id="rna-data">RNA Data<a class="headerlink" href="#rna-data" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>rna_reads.pod5<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>rna_reads.pod5<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-b<span class="w"> </span>rna_basecalls.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-k<span class="w"> </span>rna004_9mer_levels_v1.txt<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-o<span class="w"> </span>rna_refined.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--rna
 </code></pre></div>
 <h3 id="using-multiple-threads">Using Multiple Threads<a class="headerlink" href="#using-multiple-threads" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>resquiggle<span class="w"> </span>reads.pod5<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-b<span class="w"> </span>basecalls.bam<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-k<span class="w"> </span>kmer_levels.tsv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-o<span class="w"> </span>refined.bam<span class="w"> </span><span class="se">\</span>

@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod filter - escapepod-rs</title>
+        <title>escpod filter - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-filter" class="md-skip">
+        <a href="#escpod-filter" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod filter
+              escpod filter
             
           </span>
         </div>
@@ -1445,11 +1445,11 @@
   
 
 
-<h1 id="escapepod-filter">escapepod filter<a class="headerlink" href="#escapepod-filter" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-filter">escpod filter<a class="headerlink" href="#escpod-filter" title="Permanent link">&para;</a></h1>
 <p>Extract specific reads from a POD5 file based on read IDs.</p>
-<p><img alt="escapepod filter" src="../../images/filter.gif" /></p>
+<p><img alt="escpod filter" src="../../images/filter.gif" /></p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>&lt;IDS_FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span>&lt;INPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>&lt;IDS_FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span>&lt;INPUT&gt;
 </code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
@@ -1511,7 +1511,7 @@ c3d4e5f6-a7b8-9012-cdef-123456789012
 <span class="s">EOF</span>
 </code></pre></div>
 <p>Filter the POD5 file:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>interesting_reads.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>interesting_reads.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="filter-from-basecalling-results">Filter from Basecalling Results<a class="headerlink" href="#filter-from-basecalling-results" title="Permanent link">&para;</a></h3>
 <p>If you have basecalling results with read IDs of interest:</p>
@@ -1519,12 +1519,12 @@ c3d4e5f6-a7b8-9012-cdef-123456789012
 samtools<span class="w"> </span>view<span class="w"> </span>aligned.bam<span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-f1<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>mapped_reads.txt
 
 <span class="c1"># Filter POD5 to only mapped reads</span>
-escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>mapped_reads.txt<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>experiment.pod5
+escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>mapped_reads.txt<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="filter-using-another-pod5-file">Filter Using Another POD5 File<a class="headerlink" href="#filter-using-another-pod5-file" title="Permanent link">&para;</a></h3>
 <p>Extract reads that exist in another file:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>reference.pod5<span class="w"> </span>&gt;<span class="w"> </span>reference_ids.txt
-escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>reference_ids.txt<span class="w"> </span>-o<span class="w"> </span>matching.pod5<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>reference.pod5<span class="w"> </span>&gt;<span class="w"> </span>reference_ids.txt
+escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>reference_ids.txt<span class="w"> </span>-o<span class="w"> </span>matching.pod5<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints filtering statistics:</p>

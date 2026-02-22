@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod view - escapepod-rs</title>
+        <title>escpod view - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-view" class="md-skip">
+        <a href="#escpod-view" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod view
+              escpod view
             
           </span>
         </div>
@@ -1411,11 +1411,11 @@
   
 
 
-<h1 id="escapepod-view">escapepod view<a class="headerlink" href="#escapepod-view" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-view">escpod view<a class="headerlink" href="#escpod-view" title="Permanent link">&para;</a></h1>
 <p>Display reads from a POD5 file as a formatted table.</p>
-<p><img alt="escapepod view" src="../../images/view.gif" /></p>
+<p><img alt="escpod view" src="../../images/view.gif" /></p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>view<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
 </code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
@@ -1517,7 +1517,7 @@
 </table>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-usage">Basic Usage<a class="headerlink" href="#basic-usage" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>view<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <p>Output:
 <div class="highlight"><pre><span></span><code>read_id                               channel  well  read_number  num_samples
@@ -1527,7 +1527,7 @@ c3d4e5f6-a7b8-9012-cdef-123456789012  2        1     1            62000
 ...
 </code></pre></div></p>
 <h3 id="show-only-read-ids">Show Only Read IDs<a class="headerlink" href="#show-only-read-ids" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <p>Output:
 <div class="highlight"><pre><span></span><code>a1b2c3d4-e5f6-7890-abcd-ef1234567890
@@ -1535,17 +1535,17 @@ b2c3d4e5-f6a7-8901-bcde-f12345678901
 c3d4e5f6-a7b8-9012-cdef-123456789012
 </code></pre></div></p>
 <h3 id="save-to-file">Save to File<a class="headerlink" href="#save-to-file" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.tsv
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>view<span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.tsv
 </code></pre></div>
 <h3 id="select-specific-fields">Select Specific Fields<a class="headerlink" href="#select-specific-fields" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span>--include<span class="w"> </span>read_id,channel,num_samples<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>view<span class="w"> </span>--include<span class="w"> </span>read_id,channel,num_samples<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="csv-output">CSV Output<a class="headerlink" href="#csv-output" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># Use comma separator for CSV format</span>
-escapepod<span class="w"> </span>view<span class="w"> </span>--separator<span class="w"> </span><span class="s1">&#39;,&#39;</span><span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.csv
+escpod<span class="w"> </span>view<span class="w"> </span>--separator<span class="w"> </span><span class="s1">&#39;,&#39;</span><span class="w"> </span>experiment.pod5<span class="w"> </span>-o<span class="w"> </span>reads.csv
 
 <span class="c1"># Without header for piping</span>
-escapepod<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>--no-header<span class="w"> </span>experiment.pod5<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">10</span>
+escpod<span class="w"> </span>view<span class="w"> </span>--ids<span class="w"> </span>--no-header<span class="w"> </span>experiment.pod5<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">10</span>
 </code></pre></div>
 
 

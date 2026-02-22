@@ -1363,13 +1363,13 @@
 <h2 id="quick-example">Quick Example<a class="headerlink" href="#quick-example" title="Permanent link">&para;</a></h2>
 <h3 id="cli">CLI<a class="headerlink" href="#cli" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># View reads in a POD5 file</span>
-escapepod<span class="w"> </span>view<span class="w"> </span>experiment.pod5
+escpod<span class="w"> </span>view<span class="w"> </span>experiment.pod5
 
 <span class="c1"># Merge multiple files</span>
-escapepod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
+escpod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
 
 <span class="c1"># Filter by read IDs</span>
-escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>interesting_reads.txt<span class="w"> </span>-o<span class="w"> </span>subset.pod5<span class="w"> </span>experiment.pod5
+escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>interesting_reads.txt<span class="w"> </span>-o<span class="w"> </span>subset.pod5<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="library">Library<a class="headerlink" href="#library" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">escapepod</span><span class="p">::</span><span class="n">Reader</span><span class="p">;</span>

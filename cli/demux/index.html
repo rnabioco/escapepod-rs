@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod demux - escapepod-rs</title>
+        <title>escpod demux - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-demux" class="md-skip">
+        <a href="#escpod-demux" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod demux
+              escpod demux
             
           </span>
         </div>
@@ -2441,7 +2441,7 @@
   
 
 
-<h1 id="escapepod-demux">escapepod demux<a class="headerlink" href="#escapepod-demux" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-demux">escpod demux<a class="headerlink" href="#escpod-demux" title="Permanent link">&para;</a></h1>
 <p>Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.</p>
 <h2 id="comparison-with-warpdemux">Comparison with WarpDemuX<a class="headerlink" href="#comparison-with-warpdemux" title="Permanent link">&para;</a></h2>
 <p>Escapepod demux is a pure Rust reimplementation of the signal-level barcode demultiplexing algorithms from <a href="https://github.com/KleistLab/WarpDemuX">WarpDemuX</a> and <a href="https://github.com/KleistLab/ADAPTed">ADAPTed</a>. The key differences are:</p>
@@ -2509,7 +2509,7 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Note:</strong> For best classification accuracy, use WarpDemuX pre-trained models via the <code>classify --model</code> option. The escapepod training workflow is experimental and may not generalize well to new samples.</p>
+<p><strong>Note:</strong> For best classification accuracy, use WarpDemuX pre-trained models via the <code>classify --model</code> option. The escpod training workflow is experimental and may not generalize well to new samples.</p>
 <h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
 <p>The demux workflow analyzes the raw nanopore signal to detect adapter regions, extract barcode fingerprints, classify reads, and optionally split them into separate files.</p>
 <div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────────┐
@@ -2610,7 +2610,7 @@ For each candidate position i:
 The position with maximum gain indicates the best split point.
 </code></pre></div>
 <h3 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>&lt;FILES&gt;...<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>&lt;FILES&gt;...<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
 </code></pre></div>
 <h3 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h3>
 <table>
@@ -2695,7 +2695,7 @@ b2c3d4e5-...,48000,1200,3800
 </tbody>
 </table>
 <h3 id="example">Example<a class="headerlink" href="#example" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>boundaries.csv<span class="w"> </span>--min-adapter<span class="w"> </span><span class="m">200</span><span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>boundaries.csv<span class="w"> </span>--min-adapter<span class="w"> </span><span class="m">200</span><span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
 </code></pre></div>
 <hr />
 <h2 id="fingerprint">fingerprint<a class="headerlink" href="#fingerprint" title="Permanent link">&para;</a></h2>
@@ -2776,7 +2776,7 @@ Fingerprint = [mean₀, mean₁, mean₂, mean₃, mean₄, mean₅, mean₆, me
             = [-0.82,  1.23, -0.15,  0.95, -0.71,  0.12, -0.45,  1.08, ...]
 </code></pre></div>
 <h3 id="usage_1">Usage<a class="headerlink" href="#usage_1" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>&lt;FILES&gt;...<span class="w"> </span>--boundaries<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>&lt;FILES&gt;...<span class="w"> </span>--boundaries<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
 </code></pre></div>
 <h3 id="arguments_1">Arguments<a class="headerlink" href="#arguments_1" title="Permanent link">&para;</a></h3>
 <table>
@@ -2847,8 +2847,8 @@ a1b2c3d4-...,-0.823451,1.234567,-0.156789,0.951234,...
 b2c3d4e5-...,-0.712345,0.987654,-0.234567,1.123456,...
 </code></pre></div>
 <h3 id="example_1">Example<a class="headerlink" href="#example_1" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fingerprints.csv
-escapepod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fp.csv<span class="w"> </span>--num-segments<span class="w"> </span><span class="m">12</span><span class="w"> </span>--normalize<span class="w"> </span>median
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fingerprints.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fp.csv<span class="w"> </span>--num-segments<span class="w"> </span><span class="m">12</span><span class="w"> </span>--normalize<span class="w"> </span>median
 </code></pre></div>
 <hr />
 <h2 id="classify">classify<a class="headerlink" href="#classify" title="Permanent link">&para;</a></h2>
@@ -2910,8 +2910,8 @@ Else:
   → Mark as &quot;unclassified&quot; (ambiguous)
 </code></pre></div>
 <h3 id="usage_2">Usage<a class="headerlink" href="#usage_2" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>--reference<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>--model<span class="w"> </span>&lt;JSON&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>--reference<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>--model<span class="w"> </span>&lt;JSON&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
 </code></pre></div>
 <h3 id="arguments_2">Arguments<a class="headerlink" href="#arguments_2" title="Permanent link">&para;</a></h3>
 <table>
@@ -3005,19 +3005,19 @@ c3d4e5f6-...,unclassified,0.912,0.345,0.378
 </table>
 <h3 id="example_2">Example<a class="headerlink" href="#example_2" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># Using reference fingerprints</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.csv<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.csv<span class="w"> </span>-o<span class="w"> </span>classifications.csv
 
 <span class="c1"># Using WarpDemuX model</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model<span class="w"> </span>warpdemux.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv<span class="w"> </span>--window<span class="w"> </span><span class="m">10</span>
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model<span class="w"> </span>warpdemux.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv<span class="w"> </span>--window<span class="w"> </span><span class="m">10</span>
 
 <span class="c1"># With custom threshold</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.csv<span class="w"> </span>-o<span class="w"> </span>out.csv<span class="w"> </span>--threshold<span class="w"> </span><span class="m">0</span>.7
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.csv<span class="w"> </span>-o<span class="w"> </span>out.csv<span class="w"> </span>--threshold<span class="w"> </span><span class="m">0</span>.7
 </code></pre></div>
 <hr />
 <h2 id="split">split<a class="headerlink" href="#split" title="Permanent link">&para;</a></h2>
 <p>Split reads into separate POD5 files based on barcode classification.</p>
 <h3 id="usage_3">Usage<a class="headerlink" href="#usage_3" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>&lt;FILES&gt;...<span class="w"> </span>--classifications<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>--output-dir<span class="w"> </span>&lt;DIR&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>&lt;FILES&gt;...<span class="w"> </span>--classifications<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>--output-dir<span class="w"> </span>&lt;DIR&gt;
 </code></pre></div>
 <h3 id="arguments_3">Arguments<a class="headerlink" href="#arguments_3" title="Permanent link">&para;</a></h3>
 <table>
@@ -3078,8 +3078,8 @@ escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span clas
 └── unclassified.pod5  (if --unclassified)
 </code></pre></div>
 <h3 id="example_3">Example<a class="headerlink" href="#example_3" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>*.pod5<span class="w"> </span>--classifications<span class="w"> </span>classifications.csv<span class="w"> </span>-d<span class="w"> </span>demuxed/
-escapepod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>experiment.pod5<span class="w"> </span>--classifications<span class="w"> </span>class.csv<span class="w"> </span>-d<span class="w"> </span>out/<span class="w"> </span>--prefix<span class="w"> </span>exp1_<span class="w"> </span>--unclassified
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>*.pod5<span class="w"> </span>--classifications<span class="w"> </span>classifications.csv<span class="w"> </span>-d<span class="w"> </span>demuxed/
+escpod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>experiment.pod5<span class="w"> </span>--classifications<span class="w"> </span>class.csv<span class="w"> </span>-d<span class="w"> </span>out/<span class="w"> </span>--prefix<span class="w"> </span>exp1_<span class="w"> </span>--unclassified
 </code></pre></div>
 <hr />
 <h2 id="train">train<a class="headerlink" href="#train" title="Permanent link">&para;</a></h2>
@@ -3132,8 +3132,8 @@ Output: reference.json
 }
 </code></pre></div>
 <h3 id="usage_4">Usage<a class="headerlink" href="#usage_4" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--input-dir<span class="w"> </span>&lt;DIR&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
-escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--assignments<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--input-dir<span class="w"> </span>&lt;DIR&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
+escpod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--assignments<span class="w"> </span>&lt;CSV&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;
 </code></pre></div>
 <h3 id="options_4">Options<a class="headerlink" href="#options_4" title="Permanent link">&para;</a></h3>
 <table>
@@ -3207,23 +3207,23 @@ escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="
 <span class="w">  </span><span class="nt">&quot;params&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;segment_start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;segment_end&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2000</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;num_segments&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="p">}</span>
 <span class="p">}</span>
 </code></pre></div>
-<p><strong>Note:</strong> For best classification accuracy, we recommend using WarpDemuX pre-trained models instead of training your own. The escapepod training workflow produces consensus fingerprints that may not generalize as well as WarpDemuX's SVM-based models.</p>
+<p><strong>Note:</strong> For best classification accuracy, we recommend using WarpDemuX pre-trained models instead of training your own. The escpod training workflow produces consensus fingerprints that may not generalize as well as WarpDemuX's SVM-based models.</p>
 <h3 id="example_4">Example<a class="headerlink" href="#example_4" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># From directory structure</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--input-dir<span class="w"> </span>training_samples/<span class="w"> </span>-o<span class="w"> </span>reference.json
+escpod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--input-dir<span class="w"> </span>training_samples/<span class="w"> </span>-o<span class="w"> </span>reference.json
 
 <span class="c1"># From assignments CSV</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--assignments<span class="w"> </span>known_barcodes.csv<span class="w"> </span>-o<span class="w"> </span>reference.json
+escpod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--assignments<span class="w"> </span>known_barcodes.csv<span class="w"> </span>-o<span class="w"> </span>reference.json
 
 <span class="c1"># Use trained reference for classification</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
 </code></pre></div>
 <hr />
 <h2 id="train-svm">train-svm<a class="headerlink" href="#train-svm" title="Permanent link">&para;</a></h2>
 <p>Train an SVM model from labeled fingerprints for probabilistic barcode classification. This command requires the <code>train</code> feature to be enabled.</p>
 <p><strong>Note:</strong> This creates a DTW-SVM model that provides probability outputs for each class, enabling more nuanced confidence thresholds.</p>
 <h3 id="usage_5">Usage<a class="headerlink" href="#usage_5" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>&lt;FINGERPRINTS&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </code></pre></div>
 <h3 id="options_5">Options<a class="headerlink" href="#options_5" title="Permanent link">&para;</a></h3>
 <table>
@@ -3277,13 +3277,13 @@ c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
 </code></pre></div>
 <h3 id="example_5">Example<a class="headerlink" href="#example_5" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># Train SVM with default parameters</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>fingerprints.csv<span class="w"> </span>-o<span class="w"> </span>model.json
+escpod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>fingerprints.csv<span class="w"> </span>-o<span class="w"> </span>model.json
 
 <span class="c1"># Train with custom hyperparameters</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>fingerprints.csv<span class="w"> </span>-o<span class="w"> </span>model.json<span class="w"> </span>--gamma<span class="w"> </span><span class="m">0</span>.5<span class="w"> </span>--c<span class="w"> </span><span class="m">10</span>.0<span class="w"> </span>--window<span class="w"> </span><span class="m">10</span>
+escpod<span class="w"> </span>demux<span class="w"> </span>train-svm<span class="w"> </span>-f<span class="w"> </span>fingerprints.csv<span class="w"> </span>-o<span class="w"> </span>model.json<span class="w"> </span>--gamma<span class="w"> </span><span class="m">0</span>.5<span class="w"> </span>--c<span class="w"> </span><span class="m">10</span>.0<span class="w"> </span>--window<span class="w"> </span><span class="m">10</span>
 
 <span class="c1"># Use trained SVM model for classification (with classify --model-svm)</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model-svm<span class="w"> </span>model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model-svm<span class="w"> </span>model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
 </code></pre></div>
 <h3 id="building-with-train-feature">Building with train feature<a class="headerlink" href="#building-with-train-feature" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--features<span class="w"> </span>train
@@ -3292,16 +3292,16 @@ escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span clas
 <h2 id="complete-workflow-example">Complete Workflow Example<a class="headerlink" href="#complete-workflow-example" title="Permanent link">&para;</a></h2>
 <h3 id="basic-workflow-with-pre-trained-model">Basic Workflow (with pre-trained model)<a class="headerlink" href="#basic-workflow-with-pre-trained-model" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># 1. Detect adapter boundaries in all POD5 files</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>boundaries.csv<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
+escpod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>boundaries.csv<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
 
 <span class="c1"># 2. Extract fingerprints from adapter regions</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fingerprints.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fingerprints.csv
 
 <span class="c1"># 3. Classify reads using a pre-trained model</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model<span class="w"> </span>warpdemux_model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model<span class="w"> </span>warpdemux_model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
 
 <span class="c1"># 4. Split into separate files</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>*.pod5<span class="w"> </span>--classifications<span class="w"> </span>classifications.csv<span class="w"> </span>-d<span class="w"> </span>demuxed/<span class="w"> </span>--unclassified
+escpod<span class="w"> </span>demux<span class="w"> </span>split<span class="w"> </span>*.pod5<span class="w"> </span>--classifications<span class="w"> </span>classifications.csv<span class="w"> </span>-d<span class="w"> </span>demuxed/<span class="w"> </span>--unclassified
 
 <span class="c1"># View classification summary</span>
 cut<span class="w"> </span>-d,<span class="w"> </span>-f2<span class="w"> </span>classifications.csv<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span><span class="p">|</span><span class="w"> </span>uniq<span class="w"> </span>-c<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-rn
@@ -3317,12 +3317,12 @@ cat<span class="w"> </span>&gt;<span class="w"> </span>assignments.csv<span clas
 <span class="s">EOF</span>
 
 <span class="c1"># Train reference fingerprints</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--assignments<span class="w"> </span>assignments.csv<span class="w"> </span>-o<span class="w"> </span>reference.json<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
+escpod<span class="w"> </span>demux<span class="w"> </span>train<span class="w"> </span>--assignments<span class="w"> </span>assignments.csv<span class="w"> </span>-o<span class="w"> </span>reference.json<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
 
 <span class="c1"># Use the trained reference for classification</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>boundaries.csv<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fingerprints.csv
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>detect<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>boundaries.csv<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
+escpod<span class="w"> </span>demux<span class="w"> </span>fingerprint<span class="w"> </span>*.pod5<span class="w"> </span>--boundaries<span class="w"> </span>boundaries.csv<span class="w"> </span>-o<span class="w"> </span>fingerprints.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--reference<span class="w"> </span>reference.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
 </code></pre></div>
 <p><strong>Note:</strong> For production use, we recommend using WarpDemuX pre-trained models which provide significantly better generalization.</p>
 <h3 id="using-warpdemux-models">Using WarpDemuX Models<a class="headerlink" href="#using-warpdemux-models" title="Permanent link">&para;</a></h3>
@@ -3331,7 +3331,7 @@ escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span clas
 python<span class="w"> </span>scripts/export_warpdemux_model.py<span class="w"> </span>path/to/warpdemux_model.pkl<span class="w"> </span>-o<span class="w"> </span>model.json
 
 <span class="c1"># Use the exported model</span>
-escapepod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model<span class="w"> </span>model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
+escpod<span class="w"> </span>demux<span class="w"> </span>classify<span class="w"> </span>fingerprints.csv<span class="w"> </span>--model<span class="w"> </span>model.json<span class="w"> </span>-o<span class="w"> </span>classifications.csv
 </code></pre></div>
 <h2 id="algorithm-references">Algorithm References<a class="headerlink" href="#algorithm-references" title="Permanent link">&para;</a></h2>
 <p>The demux algorithms are based on:</p>

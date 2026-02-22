@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod bam-filter - escapepod-rs</title>
+        <title>escpod bam-filter - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-bam-filter" class="md-skip">
+        <a href="#escpod-bam-filter" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod bam-filter
+              escpod bam-filter
             
           </span>
         </div>
@@ -1455,11 +1455,11 @@
   
 
 
-<h1 id="escapepod-bam-filter">escapepod bam-filter<a class="headerlink" href="#escapepod-bam-filter" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-bam-filter">escpod bam-filter<a class="headerlink" href="#escpod-bam-filter" title="Permanent link">&para;</a></h1>
 <p>Filter reads from a POD5 file based on a paired BAM file. Supports filtering by mapped status, genomic region, and mapping quality.</p>
-<p><img alt="escapepod filter" src="../../images/bam-filter.gif" /></p>
+<p><img alt="escpod filter" src="../../images/bam-filter.gif" /></p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>&lt;BAM&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
 </code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
@@ -1514,31 +1514,31 @@
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="extract-mapped-reads">Extract Mapped Reads<a class="headerlink" href="#extract-mapped-reads" title="Permanent link">&para;</a></h3>
 <p>Keep only reads that mapped to the reference:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>--mapped<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>mapped.pod5<span class="w"> </span>--mapped<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="filter-by-region">Filter by Region<a class="headerlink" href="#filter-by-region" title="Permanent link">&para;</a></h3>
 <p>Extract reads mapping to a specific chromosome or region:</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># All reads on chromosome 1</span>
-escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>chr1.pod5<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>experiment.pod5
+escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>chr1.pod5<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>experiment.pod5
 
 <span class="c1"># Reads in a specific region</span>
-escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>region.pod5<span class="w"> </span>--region<span class="w"> </span>chr1:1000000-2000000<span class="w"> </span>experiment.pod5
+escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>region.pod5<span class="w"> </span>--region<span class="w"> </span>chr1:1000000-2000000<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="filter-by-mapping-quality">Filter by Mapping Quality<a class="headerlink" href="#filter-by-mapping-quality" title="Permanent link">&para;</a></h3>
 <p>Keep only high-quality alignments:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>high_quality.pod5<span class="w"> </span>-q<span class="w"> </span><span class="m">30</span><span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>high_quality.pod5<span class="w"> </span>-q<span class="w"> </span><span class="m">30</span><span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="combined-filters">Combined Filters<a class="headerlink" href="#combined-filters" title="Permanent link">&para;</a></h3>
 <p>Combine multiple filter criteria:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mapped<span class="w"> </span>--region<span class="w"> </span>chr1<span class="w"> </span>-q<span class="w"> </span><span class="m">20</span><span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="process-a-directory">Process a Directory<a class="headerlink" href="#process-a-directory" title="Permanent link">&para;</a></h3>
 <p>Filter all POD5 files in a directory:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>pod5_directory/
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>bam-filter<span class="w"> </span>-b<span class="w"> </span>aligned.bam<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>pod5_directory/
 </code></pre></div>
 <h2 id="bam-index">BAM Index<a class="headerlink" href="#bam-index" title="Permanent link">&para;</a></h2>
-<p>Region queries require a BAM index (<code>.bai</code> file). If the index doesn't exist, <code>escapepod</code> will automatically create one:</p>
+<p>Region queries require a BAM index (<code>.bai</code> file). If the index doesn't exist, <code>escpod</code> will automatically create one:</p>
 <div class="highlight"><pre><span></span><code>Info: BAI index not found, creating aligned.bam.bai...
 Done: Created BAI index: aligned.bam.bai
 </code></pre></div>

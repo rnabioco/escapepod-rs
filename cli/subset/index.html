@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod subset - escapepod-rs</title>
+        <title>escpod subset - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-subset" class="md-skip">
+        <a href="#escpod-subset" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod subset
+              escpod subset
             
           </span>
         </div>
@@ -1467,11 +1467,11 @@
   
 
 
-<h1 id="escapepod-subset">escapepod subset<a class="headerlink" href="#escapepod-subset" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-subset">escpod subset<a class="headerlink" href="#escpod-subset" title="Permanent link">&para;</a></h1>
 <p>Split reads from a POD5 file into multiple output files based on a CSV mapping.</p>
-<p><img alt="escapepod subset" src="../../images/subset.gif" /></p>
+<p><img alt="escpod subset" src="../../images/subset.gif" /></p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>subset<span class="w"> </span>--csv<span class="w"> </span>&lt;FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>subset<span class="w"> </span>--csv<span class="w"> </span>&lt;FILE&gt;<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;INPUT&gt;
 </code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
@@ -1545,16 +1545,16 @@ c3d4e5f6-a7b8-9012-cdef-123456789012,sample2.pod5
 <span class="s">EOF</span>
 </code></pre></div>
 <p>Split the POD5 file:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>subset<span class="w"> </span>experiment.pod5<span class="w"> </span>--csv<span class="w"> </span>mapping.csv<span class="w"> </span>-o<span class="w"> </span>demultiplexed/
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>subset<span class="w"> </span>experiment.pod5<span class="w"> </span>--csv<span class="w"> </span>mapping.csv<span class="w"> </span>-o<span class="w"> </span>demultiplexed/
 </code></pre></div>
 <h3 id="demultiplexing-by-barcode">Demultiplexing by Barcode<a class="headerlink" href="#demultiplexing-by-barcode" title="Permanent link">&para;</a></h3>
 <p>If you have demultiplexing results from basecalling:</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># Assuming you have a CSV from your demultiplexing pipeline</span>
-escapepod<span class="w"> </span>subset<span class="w"> </span>multiplexed.pod5<span class="w"> </span>--csv<span class="w"> </span>barcode_assignments.csv<span class="w"> </span>-o<span class="w"> </span>demux/
+escpod<span class="w"> </span>subset<span class="w"> </span>multiplexed.pod5<span class="w"> </span>--csv<span class="w"> </span>barcode_assignments.csv<span class="w"> </span>-o<span class="w"> </span>demux/
 </code></pre></div>
 <h3 id="splitting-by-sample">Splitting by Sample<a class="headerlink" href="#splitting-by-sample" title="Permanent link">&para;</a></h3>
 <p>Split reads into per-sample files:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>subset<span class="w"> </span>pooled.pod5<span class="w"> </span>--csv<span class="w"> </span>sample_mapping.csv<span class="w"> </span>-o<span class="w"> </span>samples/
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>subset<span class="w"> </span>pooled.pod5<span class="w"> </span>--csv<span class="w"> </span>sample_mapping.csv<span class="w"> </span>-o<span class="w"> </span>samples/
 </code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints a summary of the subsetting operation:</p>

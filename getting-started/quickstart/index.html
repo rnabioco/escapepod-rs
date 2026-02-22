@@ -1428,12 +1428,12 @@
 <h2 id="cli-quick-start">CLI Quick Start<a class="headerlink" href="#cli-quick-start" title="Permanent link">&para;</a></h2>
 <h3 id="viewing-pod5-files">Viewing POD5 Files<a class="headerlink" href="#viewing-pod5-files" title="Permanent link">&para;</a></h3>
 <p>The simplest way to explore a POD5 file is with the <code>view</code> command:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>view<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>view<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <p>This displays a table of reads with key information like read ID, channel, and sample count.</p>
 <h3 id="inspecting-file-details">Inspecting File Details<a class="headerlink" href="#inspecting-file-details" title="Permanent link">&para;</a></h3>
 <p>Get a summary of the file:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <p>Output:
 <div class="highlight"><pre><span></span><code>File: experiment.pod5
@@ -1442,11 +1442,11 @@ Run info entries: 1
 File size: 1.2 GB
 </code></pre></div></p>
 <p>List all reads:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h3 id="merging-files">Merging Files<a class="headerlink" href="#merging-files" title="Permanent link">&para;</a></h3>
 <p>Combine multiple POD5 files from a sequencing run:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>file1.pod5<span class="w"> </span>file2.pod5<span class="w"> </span>file3.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>file1.pod5<span class="w"> </span>file2.pod5<span class="w"> </span>file3.pod5
 </code></pre></div>
 <h3 id="filtering-reads">Filtering Reads<a class="headerlink" href="#filtering-reads" title="Permanent link">&para;</a></h3>
 <p>Create a file with read IDs you want to extract (one UUID per line):</p>
@@ -1454,7 +1454,7 @@ File size: 1.2 GB
 b2c3d4e5-f6a7-8901-bcde-f12345678901
 </code></pre></div>
 <p>Then filter:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>read_ids.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>read_ids.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>experiment.pod5
 </code></pre></div>
 <h2 id="library-quick-start">Library Quick Start<a class="headerlink" href="#library-quick-start" title="Permanent link">&para;</a></h2>
 <h3 id="reading-a-pod5-file">Reading a POD5 File<a class="headerlink" href="#reading-a-pod5-file" title="Permanent link">&para;</a></h3>

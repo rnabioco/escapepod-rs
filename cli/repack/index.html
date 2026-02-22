@@ -27,7 +27,7 @@
     
     
       
-        <title>escapepod repack - escapepod-rs</title>
+        <title>escpod repack - escapepod-rs</title>
       
     
     
@@ -83,7 +83,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#escapepod-repack" class="md-skip">
+        <a href="#escpod-repack" class="md-skip">
           Skip to content
         </a>
       
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              escapepod repack
+              escpod repack
             
           </span>
         </div>
@@ -1411,11 +1411,11 @@
   
 
 
-<h1 id="escapepod-repack">escapepod repack<a class="headerlink" href="#escapepod-repack" title="Permanent link">&para;</a></h1>
+<h1 id="escpod-repack">escpod repack<a class="headerlink" href="#escpod-repack" title="Permanent link">&para;</a></h1>
 <p>Repack POD5 files to optimize storage and apply current compression settings.</p>
-<p><img alt="escapepod repack" src="../../images/repack.gif" /></p>
+<p><img alt="escpod repack" src="../../images/repack.gif" /></p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>repack<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;FILES&gt;...
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>repack<span class="w"> </span>-o<span class="w"> </span>&lt;OUTPUT_DIR&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>&lt;FILES&gt;...
 </code></pre></div>
 <h2 id="arguments">Arguments<a class="headerlink" href="#arguments" title="Permanent link">&para;</a></h2>
 <table>
@@ -1457,17 +1457,17 @@
 </table>
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="repack-a-single-file">Repack a Single File<a class="headerlink" href="#repack-a-single-file" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>repack<span class="w"> </span>input.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>repack<span class="w"> </span>input.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
 </code></pre></div>
 <h3 id="repack-multiple-files">Repack Multiple Files<a class="headerlink" href="#repack-multiple-files" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/
 </code></pre></div>
 <h3 id="overwrite-existing-files">Overwrite Existing Files<a class="headerlink" href="#overwrite-existing-files" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/<span class="w"> </span>--force
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>repack<span class="w"> </span>*.pod5<span class="w"> </span>-o<span class="w"> </span>repacked/<span class="w"> </span>--force
 </code></pre></div>
 <h3 id="in-place-repacking">In-Place Repacking<a class="headerlink" href="#in-place-repacking" title="Permanent link">&para;</a></h3>
 <p>You can safely repack files in place (output to the same directory as input). The command uses temporary files to prevent data corruption:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>repack<span class="w"> </span>data/*.pod5<span class="w"> </span>-o<span class="w"> </span>data/<span class="w"> </span>--force
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>repack<span class="w"> </span>data/*.pod5<span class="w"> </span>-o<span class="w"> </span>data/<span class="w"> </span>--force
 </code></pre></div>
 <h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
 <p>The command prints progress and summary:</p>

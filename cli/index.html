@@ -1215,9 +1215,9 @@
 
 
 <h1 id="cli-reference">CLI Reference<a class="headerlink" href="#cli-reference" title="Permanent link">&para;</a></h1>
-<p>The <code>escapepod</code> command-line tool provides utilities for working with POD5 files.</p>
+<p>The <code>escpod</code> command-line tool provides utilities for working with POD5 files.</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>&lt;COMMAND&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>&lt;COMMAND&gt;<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </code></pre></div>
 <h2 id="commands">Commands<a class="headerlink" href="#commands" title="Permanent link">&para;</a></h2>
 <table>
@@ -1277,17 +1277,17 @@
 <h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
 <h3 id="basic-workflow">Basic Workflow<a class="headerlink" href="#basic-workflow" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="c1"># 1. Inspect what&#39;s in your files</span>
-escapepod<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run1.pod5
-escapepod<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run2.pod5
+escpod<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run1.pod5
+escpod<span class="w"> </span>inspect<span class="w"> </span>summary<span class="w"> </span>run2.pod5
 
 <span class="c1"># 2. View the reads</span>
-escapepod<span class="w"> </span>view<span class="w"> </span>run1.pod5
+escpod<span class="w"> </span>view<span class="w"> </span>run1.pod5
 
 <span class="c1"># 3. Merge files from a run</span>
-escapepod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
+escpod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>combined.pod5<span class="w"> </span>run1.pod5<span class="w"> </span>run2.pod5
 
 <span class="c1"># 4. Extract interesting reads</span>
-escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>selected_reads.txt<span class="w"> </span>-o<span class="w"> </span>subset.pod5<span class="w"> </span>combined.pod5
+escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>selected_reads.txt<span class="w"> </span>-o<span class="w"> </span>subset.pod5<span class="w"> </span>combined.pod5
 </code></pre></div>
 <h3 id="working-with-multiple-files">Working with Multiple Files<a class="headerlink" href="#working-with-multiple-files" title="Permanent link">&para;</a></h3>
 <p>Process all POD5 files in a directory:</p>
@@ -1295,14 +1295,14 @@ escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"
 ls<span class="w"> </span>*.pod5
 
 <span class="c1"># Merge all files</span>
-escapepod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>all_data.pod5<span class="w"> </span>*.pod5
+escpod<span class="w"> </span>merge<span class="w"> </span>-o<span class="w"> </span>all_data.pod5<span class="w"> </span>*.pod5
 </code></pre></div>
 <h3 id="extracting-read-ids">Extracting Read IDs<a class="headerlink" href="#extracting-read-ids" title="Permanent link">&para;</a></h3>
 <p>To get a list of read IDs from a file:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>experiment.pod5<span class="w"> </span>&gt;<span class="w"> </span>read_ids.txt
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>inspect<span class="w"> </span>reads<span class="w"> </span>experiment.pod5<span class="w"> </span>&gt;<span class="w"> </span>read_ids.txt
 </code></pre></div>
 <p>Then filter another file:</p>
-<div class="highlight"><pre><span></span><code>escapepod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>read_ids.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>other_experiment.pod5
+<div class="highlight"><pre><span></span><code>escpod<span class="w"> </span>filter<span class="w"> </span>-i<span class="w"> </span>read_ids.txt<span class="w"> </span>-o<span class="w"> </span>filtered.pod5<span class="w"> </span>other_experiment.pod5
 </code></pre></div>
 
 
