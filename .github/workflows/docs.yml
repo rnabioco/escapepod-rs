@@ -24,10 +24,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install mkdocs-material
+        run: pip install zensical
 
       - name: Build documentation
-        run: mkdocs build --strict
+        run: zensical build --strict
 
       - name: Deploy to GitHub Pages
         if: github.ref == 'refs/heads/main'

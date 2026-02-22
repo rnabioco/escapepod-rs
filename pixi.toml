@@ -20,3 +20,17 @@ curl -L https://cdn.oxfordnanoportal.com/software/analysis/dorado-$DORADO_VERSIO
 tar -xz -C $DORADO_DIR
 """
 install-pod5 = "pip install 'pod5>=0.3.36,<0.4'"
+
+# Documentation feature
+[feature.docs.dependencies]
+python = ">=3.10"
+
+[feature.docs.pypi-dependencies]
+zensical = "*"
+
+[feature.docs.tasks]
+docs-build = "zensical build"
+docs-serve = "zensical serve"
+
+[environments]
+docs = { features = ["docs"], solve-group = "default" }
