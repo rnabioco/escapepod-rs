@@ -45,9 +45,7 @@ pub fn parse_csv_uuid_mapping(
     let value_col = headers
         .iter()
         .position(|h| h == value_column)
-        .ok_or_else(|| {
-            Error::Parse(format!("CSV must have a '{}' column", value_column))
-        })?;
+        .ok_or_else(|| Error::Parse(format!("CSV must have a '{}' column", value_column)))?;
 
     for (line_num, result) in csv_reader.records().enumerate() {
         let record = result
@@ -57,11 +55,9 @@ pub fn parse_csv_uuid_mapping(
             .get(read_id_col)
             .ok_or_else(|| Error::Parse(format!("Missing read_id on line {}", line_num + 2)))?;
 
-        let value = record
-            .get(value_col)
-            .ok_or_else(|| {
-                Error::Parse(format!("Missing {} on line {}", value_column, line_num + 2))
-            })?;
+        let value = record.get(value_col).ok_or_else(|| {
+            Error::Parse(format!("Missing {} on line {}", value_column, line_num + 2))
+        })?;
 
         if read_id_str.is_empty() {
             continue;

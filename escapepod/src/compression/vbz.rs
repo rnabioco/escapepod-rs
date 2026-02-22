@@ -39,14 +39,12 @@ pub fn compress_signal(samples: &[i16]) -> Result<Vec<u8>> {
     // library (lib_pod5, Dorado) requires this field to be present.
     let mut encoder = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL)
         .map_err(|e| Error::Compression(format!("ZSTD encoder init failed: {}", e)))?;
-    encoder.include_contentsize(true).map_err(|e| {
-        Error::Compression(format!("ZSTD set content size failed: {}", e))
-    })?;
+    encoder
+        .include_contentsize(true)
+        .map_err(|e| Error::Compression(format!("ZSTD set content size failed: {}", e)))?;
     encoder
         .set_pledged_src_size(Some(svb_encoded.len() as u64))
-        .map_err(|e| {
-            Error::Compression(format!("ZSTD set pledged src size failed: {}", e))
-        })?;
+        .map_err(|e| Error::Compression(format!("ZSTD set pledged src size failed: {}", e)))?;
     std::io::copy(&mut svb_encoded.as_slice(), &mut encoder)
         .map_err(|e| Error::Compression(format!("ZSTD compression failed: {}", e)))?;
     let compressed = encoder
