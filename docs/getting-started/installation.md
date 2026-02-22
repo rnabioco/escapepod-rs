@@ -17,19 +17,19 @@ cd escapepod-rs
 cargo build --release
 ```
 
-The binary will be at `target/release/escapepod`. You can copy it to a directory in your PATH:
+The binary will be at `target/release/escpod`. You can copy it to a directory in your PATH:
 
 ```bash
-cp target/release/escapepod ~/.local/bin/
+cp target/release/escpod ~/.local/bin/
 # or
-sudo cp target/release/escapepod /usr/local/bin/
+sudo cp target/release/escpod /usr/local/bin/
 ```
 
 ### Verify Installation
 
 ```bash
-escapepod --version
-escapepod --help
+escpod --version
+escpod --help
 ```
 
 ## Using the Library

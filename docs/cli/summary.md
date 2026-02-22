@@ -1,13 +1,13 @@
-# escapepod summary
+# escpod summary
 
 Generate a comprehensive summary of POD5 file(s) including read statistics, QC metrics, and run metadata.
 
-![escapepod summary](../images/summary.gif)
+![escpod summary](../images/summary.gif)
 
 ## Usage
 
 ```bash
-escapepod summary <INPUT> [--json]
+escpod summary <INPUT> [--json]
 ```
 
 ## Arguments
@@ -36,19 +36,19 @@ escapepod summary <INPUT> [--json]
 ### Single File
 
 ```bash
-escapepod summary experiment.pod5
+escpod summary experiment.pod5
 ```
 
 ### Directory of Files
 
 ```bash
-escapepod summary pod5_pass/
+escpod summary pod5_pass/
 ```
 
 ### JSON Output
 
 ```bash
-escapepod summary experiment.pod5 --json
+escpod summary experiment.pod5 --json
 ```
 
 ## Output

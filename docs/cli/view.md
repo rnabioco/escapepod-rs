@@ -1,13 +1,13 @@
-# escapepod view
+# escpod view
 
 Display reads from a POD5 file as a formatted table.
 
-![escapepod view](../images/view.gif)
+![escpod view](../images/view.gif)
 
 ## Usage
 
 ```bash
-escapepod view [OPTIONS] <INPUT>
+escpod view [OPTIONS] <INPUT>
 ```
 
 ## Arguments
@@ -48,7 +48,7 @@ The default output includes:
 ### Basic Usage
 
 ```bash
-escapepod view experiment.pod5
+escpod view experiment.pod5
 ```
 
 Output:
@@ -63,7 +63,7 @@ c3d4e5f6-a7b8-9012-cdef-123456789012  2        1     1            62000
 ### Show Only Read IDs
 
 ```bash
-escapepod view --ids experiment.pod5
+escpod view --ids experiment.pod5
 ```
 
 Output:
@@ -76,21 +76,21 @@ c3d4e5f6-a7b8-9012-cdef-123456789012
 ### Save to File
 
 ```bash
-escapepod view experiment.pod5 -o reads.tsv
+escpod view experiment.pod5 -o reads.tsv
 ```
 
 ### Select Specific Fields
 
 ```bash
-escapepod view --include read_id,channel,num_samples experiment.pod5
+escpod view --include read_id,channel,num_samples experiment.pod5
 ```
 
 ### CSV Output
 
 ```bash
 # Use comma separator for CSV format
-escapepod view --separator ',' experiment.pod5 -o reads.csv
+escpod view --separator ',' experiment.pod5 -o reads.csv
 
 # Without header for piping
-escapepod view --ids --no-header experiment.pod5 | head -n 10
+escpod view --ids --no-header experiment.pod5 | head -n 10
 ```

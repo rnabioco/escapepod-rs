@@ -25,13 +25,13 @@ escapepod-rs provides a fast, memory-efficient Rust implementation for working w
 
 ```bash
 # View reads in a POD5 file
-escapepod view experiment.pod5
+escpod view experiment.pod5
 
 # Merge multiple files
-escapepod merge -o combined.pod5 run1.pod5 run2.pod5
+escpod merge -o combined.pod5 run1.pod5 run2.pod5
 
 # Filter by read IDs
-escapepod filter -i interesting_reads.txt -o subset.pod5 experiment.pod5
+escpod filter -i interesting_reads.txt -o subset.pod5 experiment.pod5
 ```
 
 ### Library

@@ -1,4 +1,4 @@
-# escapepod demux
+# escpod demux
 
 Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.
 
@@ -24,7 +24,7 @@ Tested on RNA004 data with 5 barcodes (1000 reads total), 4 threads:
 | **Full pipeline** | ~0.5s | ~2.4s |
 | **Throughput** | ~2000 reads/sec | ~400 reads/sec |
 
-**Note:** For best classification accuracy, use WarpDemuX pre-trained models via the `classify --model` option. The escapepod training workflow is experimental and may not generalize well to new samples.
+**Note:** For best classification accuracy, use WarpDemuX pre-trained models via the `classify --model` option. The escpod training workflow is experimental and may not generalize well to new samples.
 
 ## Overview
 
@@ -118,7 +118,7 @@ The position with maximum gain indicates the best split point.
 ### Usage
 
 ```bash
-escapepod demux detect <FILES>... -o <OUTPUT>
+escpod demux detect <FILES>... -o <OUTPUT>
 ```
 
 ### Arguments
@@ -158,7 +158,7 @@ b2c3d4e5-...,48000,1200,3800
 ### Example
 
 ```bash
-escapepod demux detect *.pod5 -o boundaries.csv --min-adapter 200 -j 8
+escpod demux detect *.pod5 -o boundaries.csv --min-adapter 200 -j 8
 ```
 
 ---
@@ -255,7 +255,7 @@ Fingerprint = [mean₀, mean₁, mean₂, mean₃, mean₄, mean₅, mean₆, me
 ### Usage
 
 ```bash
-escapepod demux fingerprint <FILES>... --boundaries <CSV> -o <OUTPUT>
+escpod demux fingerprint <FILES>... --boundaries <CSV> -o <OUTPUT>
 ```
 
 ### Arguments
@@ -291,8 +291,8 @@ b2c3d4e5-...,-0.712345,0.987654,-0.234567,1.123456,...
 ### Example
 
 ```bash
-escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
-escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fp.csv --num-segments 12 --normalize median
+escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
+escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fp.csv --num-segments 12 --normalize median
 ```
 
 ---
@@ -366,8 +366,8 @@ Else:
 ### Usage
 
 ```bash
-escapepod demux classify <FINGERPRINTS> --reference <CSV> -o <OUTPUT>
-escapepod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
+escpod demux classify <FINGERPRINTS> --reference <CSV> -o <OUTPUT>
+escpod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
 ```
 
 ### Arguments
@@ -409,13 +409,13 @@ c3d4e5f6-...,unclassified,0.912,0.345,0.378
 
 ```bash
 # Using reference fingerprints
-escapepod demux classify fingerprints.csv --reference reference.csv -o classifications.csv
+escpod demux classify fingerprints.csv --reference reference.csv -o classifications.csv
 
 # Using WarpDemuX model
-escapepod demux classify fingerprints.csv --model warpdemux.json -o classifications.csv --window 10
+escpod demux classify fingerprints.csv --model warpdemux.json -o classifications.csv --window 10
 
 # With custom threshold
-escapepod demux classify fingerprints.csv --reference reference.csv -o out.csv --threshold 0.7
+escpod demux classify fingerprints.csv --reference reference.csv -o out.csv --threshold 0.7
 ```
 
 ---
@@ -427,7 +427,7 @@ Split reads into separate POD5 files based on barcode classification.
 ### Usage
 
 ```bash
-escapepod demux split <FILES>... --classifications <CSV> --output-dir <DIR>
+escpod demux split <FILES>... --classifications <CSV> --output-dir <DIR>
 ```
 
 ### Arguments
@@ -461,8 +461,8 @@ output_dir/
 ### Example
 
 ```bash
-escapepod demux split *.pod5 --classifications classifications.csv -d demuxed/
-escapepod demux split experiment.pod5 --classifications class.csv -d out/ --prefix exp1_ --unclassified
+escpod demux split *.pod5 --classifications classifications.csv -d demuxed/
+escpod demux split experiment.pod5 --classifications class.csv -d out/ --prefix exp1_ --unclassified
 ```
 
 ---
@@ -524,8 +524,8 @@ Output: reference.json
 ### Usage
 
 ```bash
-escapepod demux train --input-dir <DIR> -o <OUTPUT>
-escapepod demux train --assignments <CSV> -o <OUTPUT>
+escpod demux train --input-dir <DIR> -o <OUTPUT>
+escpod demux train --assignments <CSV> -o <OUTPUT>
 ```
 
 ### Options
@@ -562,19 +562,19 @@ The train command outputs a JSON file with consensus fingerprints for each barco
 }
 ```
 
-**Note:** For best classification accuracy, we recommend using WarpDemuX pre-trained models instead of training your own. The escapepod training workflow produces consensus fingerprints that may not generalize as well as WarpDemuX's SVM-based models.
+**Note:** For best classification accuracy, we recommend using WarpDemuX pre-trained models instead of training your own. The escpod training workflow produces consensus fingerprints that may not generalize as well as WarpDemuX's SVM-based models.
 
 ### Example
 
 ```bash
 # From directory structure
-escapepod demux train --input-dir training_samples/ -o reference.json
+escpod demux train --input-dir training_samples/ -o reference.json
 
 # From assignments CSV
-escapepod demux train --assignments known_barcodes.csv -o reference.json
+escpod demux train --assignments known_barcodes.csv -o reference.json
 
 # Use trained reference for classification
-escapepod demux classify fingerprints.csv --reference reference.json -o classifications.csv
+escpod demux classify fingerprints.csv --reference reference.json -o classifications.csv
 ```
 
 ---
@@ -588,7 +588,7 @@ Train an SVM model from labeled fingerprints for probabilistic barcode classific
 ### Usage
 
 ```bash
-escapepod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
+escpod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
 ```
 
 ### Options
@@ -619,13 +619,13 @@ c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
 
 ```bash
 # Train SVM with default parameters
-escapepod demux train-svm -f fingerprints.csv -o model.json
+escpod demux train-svm -f fingerprints.csv -o model.json
 
 # Train with custom hyperparameters
-escapepod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --c 10.0 --window 10
+escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --c 10.0 --window 10
 
 # Use trained SVM model for classification (with classify --model-svm)
-escapepod demux classify fingerprints.csv --model-svm model.json -o classifications.csv
+escpod demux classify fingerprints.csv --model-svm model.json -o classifications.csv
 ```
 
 ### Building with train feature
@@ -642,16 +642,16 @@ cargo build --release --features train
 
 ```bash
 # 1. Detect adapter boundaries in all POD5 files
-escapepod demux detect *.pod5 -o boundaries.csv -j 8
+escpod demux detect *.pod5 -o boundaries.csv -j 8
 
 # 2. Extract fingerprints from adapter regions
-escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
+escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
 
 # 3. Classify reads using a pre-trained model
-escapepod demux classify fingerprints.csv --model warpdemux_model.json -o classifications.csv
+escpod demux classify fingerprints.csv --model warpdemux_model.json -o classifications.csv
 
 # 4. Split into separate files
-escapepod demux split *.pod5 --classifications classifications.csv -d demuxed/ --unclassified
+escpod demux split *.pod5 --classifications classifications.csv -d demuxed/ --unclassified
 
 # View classification summary
 cut -d, -f2 classifications.csv | sort | uniq -c | sort -rn
@@ -671,12 +671,12 @@ c3d4e5f6-...,BC01,sample2.pod5
 EOF
 
 # Train reference fingerprints
-escapepod demux train --assignments assignments.csv -o reference.json -j 8
+escpod demux train --assignments assignments.csv -o reference.json -j 8
 
 # Use the trained reference for classification
-escapepod demux detect *.pod5 -o boundaries.csv -j 8
-escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
-escapepod demux classify fingerprints.csv --reference reference.json -o classifications.csv
+escpod demux detect *.pod5 -o boundaries.csv -j 8
+escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
+escpod demux classify fingerprints.csv --reference reference.json -o classifications.csv
 ```
 
 **Note:** For production use, we recommend using WarpDemuX pre-trained models which provide significantly better generalization.
@@ -690,7 +690,7 @@ You can export WarpDemuX models using the provided script:
 python scripts/export_warpdemux_model.py path/to/warpdemux_model.pkl -o model.json
 
 # Use the exported model
-escapepod demux classify fingerprints.csv --model model.json -o classifications.csv
+escpod demux classify fingerprints.csv --model model.json -o classifications.csv
 ```
 
 ## Algorithm References

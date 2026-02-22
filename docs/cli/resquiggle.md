@@ -1,4 +1,4 @@
-# escapepod resquiggle
+# escpod resquiggle
 
 Refine signal-to-base mapping using banded dynamic programming. Takes an input POD5 file (raw signal) and a BAM file with basecaller move tables, then produces a new BAM file with refined signal boundaries stored in auxiliary tags.
 
@@ -33,7 +33,7 @@ kmer levels using banded dynamic programming.
 ## Usage
 
 ```bash
-escapepod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
+escpod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
 ```
 
 ## Arguments
@@ -320,7 +320,7 @@ for calibration drift between the basecaller model and the kmer level table.
 ### Basic Resquiggle
 
 ```bash
-escapepod resquiggle reads.pod5 \
+escpod resquiggle reads.pod5 \
     -b basecalls.bam \
     -k kmer_levels.tsv \
     -o refined.bam
@@ -329,7 +329,7 @@ escapepod resquiggle reads.pod5 \
 ### With Multiple Iterations and Normalization
 
 ```bash
-escapepod resquiggle pod5_dir/ \
+escpod resquiggle pod5_dir/ \
     -b basecalls.bam \
     -k kmer_levels.tsv \
     -o refined.bam \
@@ -340,7 +340,7 @@ escapepod resquiggle pod5_dir/ \
 ### Tuning Bandwidth and Algorithm
 
 ```bash
-escapepod resquiggle reads.pod5 \
+escpod resquiggle reads.pod5 \
     -b basecalls.bam \
     -k kmer_levels.tsv \
     -o refined.bam \
@@ -352,7 +352,7 @@ escapepod resquiggle reads.pod5 \
 ### Custom Dwell Penalty Parameters
 
 ```bash
-escapepod resquiggle reads.pod5 \
+escpod resquiggle reads.pod5 \
     -b basecalls.bam \
     -k kmer_levels.tsv \
     -o refined.bam \
@@ -364,7 +364,7 @@ escapepod resquiggle reads.pod5 \
 ### RNA Data
 
 ```bash
-escapepod resquiggle rna_reads.pod5 \
+escpod resquiggle rna_reads.pod5 \
     -b rna_basecalls.bam \
     -k rna004_9mer_levels_v1.txt \
     -o rna_refined.bam \
@@ -374,7 +374,7 @@ escapepod resquiggle rna_reads.pod5 \
 ### Using Multiple Threads
 
 ```bash
-escapepod resquiggle reads.pod5 \
+escpod resquiggle reads.pod5 \
     -b basecalls.bam \
     -k kmer_levels.tsv \
     -o refined.bam \

@@ -1,4 +1,4 @@
-# VHS tape for escapepod filter command
+# VHS tape for escpod filter command
 Output docs/images/filter.gif
 
 Set Shell "bash"
@@ -18,7 +18,7 @@ Type "# First, get some read IDs"
 Enter
 Sleep 500ms
 
-Type "escapepod view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"
+Type "escpod view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"
 Enter
 Sleep 1s
 
@@ -30,6 +30,6 @@ Type "# Now filter to just those reads"
 Enter
 Sleep 500ms
 
-Type "escapepod filter data/drna/yeast_trna_reads.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
+Type "escpod filter data/drna/yeast_trna_reads.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
 Enter
 Sleep 5s

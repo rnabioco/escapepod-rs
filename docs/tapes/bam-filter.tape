@@ -1,4 +1,4 @@
-# VHS tape for escapepod bam-filter command
+# VHS tape for escpod bam-filter command
 Output docs/images/bam-filter.gif
 
 Set Shell "bash"
@@ -22,7 +22,7 @@ Type "# Keep only mapped reads with quality >= 10"
 Enter
 Sleep 500ms
 
-Type "escapepod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
+Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
 Enter
 Sleep 5s
 
@@ -30,6 +30,6 @@ Type "# Check the result"
 Enter
 Sleep 500ms
 
-Type "escapepod inspect summary /tmp/filtered.pod5"
+Type "escpod inspect summary /tmp/filtered.pod5"
 Enter
 Sleep 3s

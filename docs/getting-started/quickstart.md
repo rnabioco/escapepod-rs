@@ -9,7 +9,7 @@ This guide will help you get started with escapepod-rs in just a few minutes.
 The simplest way to explore a POD5 file is with the `view` command:
 
 ```bash
-escapepod view experiment.pod5
+escpod view experiment.pod5
 ```
 
 This displays a table of reads with key information like read ID, channel, and sample count.
@@ -19,7 +19,7 @@ This displays a table of reads with key information like read ID, channel, and s
 Get a summary of the file:
 
 ```bash
-escapepod inspect summary experiment.pod5
+escpod inspect summary experiment.pod5
 ```
 
 Output:
@@ -33,7 +33,7 @@ File size: 1.2 GB
 List all reads:
 
 ```bash
-escapepod inspect reads experiment.pod5
+escpod inspect reads experiment.pod5
 ```
 
 ### Merging Files
@@ -41,7 +41,7 @@ escapepod inspect reads experiment.pod5
 Combine multiple POD5 files from a sequencing run:
 
 ```bash
-escapepod merge -o combined.pod5 file1.pod5 file2.pod5 file3.pod5
+escpod merge -o combined.pod5 file1.pod5 file2.pod5 file3.pod5
 ```
 
 ### Filtering Reads
@@ -56,7 +56,7 @@ b2c3d4e5-f6a7-8901-bcde-f12345678901
 Then filter:
 
 ```bash
-escapepod filter -i read_ids.txt -o filtered.pod5 experiment.pod5
+escpod filter -i read_ids.txt -o filtered.pod5 experiment.pod5
 ```
 
 ## Library Quick Start

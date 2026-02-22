@@ -1,4 +1,4 @@
-# VHS tape for escapepod repack command
+# VHS tape for escpod repack command
 Output docs/images/repack.gif
 
 Set Shell "bash"
@@ -14,6 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "escapepod repack data/drna/yeast_trna_reads.pod5 -o /tmp/repacked/"
+Type "escpod repack data/drna/yeast_trna_reads.pod5 -o /tmp/repacked/"
 Enter
 Sleep 5s
