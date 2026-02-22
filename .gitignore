@@ -33,5 +33,8 @@ flamegraph.svg
 /benchmarks/*.json
 /benchmarks/*.pod5
 
+# Built documentation
+site/
+
 # External data
 data/
