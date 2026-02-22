@@ -130,8 +130,9 @@ pub fn find_changepoints(
     }
 
     // Step 1: Find local maxima (peaks) in the t-scores.
-    // A peak at position i means t_scores[i] >= neighbors.
-    // This matches scipy.signal.find_peaks behavior used by WarpDemuX.
+    // Uses non-strict inequality (>=) for peak detection, which produces more
+    // stable fingerprints than strict inequality when combined with the
+    // "keep last N segments" approach used for barcode fingerprinting.
     let mut peaks: Vec<usize> = Vec::new();
     for i in 0..t_scores.len() {
         let left_ok = i == 0 || t_scores[i] >= t_scores[i - 1];

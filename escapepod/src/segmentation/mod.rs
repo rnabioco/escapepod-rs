@@ -54,7 +54,7 @@ pub mod ttest;
 // Re-export main types and functions for convenience
 pub use llr::{detect_adapter, LlrTrace};
 pub use normalize::{
-    downscale, mad_normalize, mad_normalize_with_clipping, normalize_dwell_times,
+    clip_outliers, downscale, mad_normalize, mad_normalize_with_clipping, normalize_dwell_times,
     normalize_dwell_times_mad,
 };
 pub use ttest::{

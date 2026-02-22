@@ -2,7 +2,7 @@
 
 use super::types::{BarcodeFingerprint, ReadBoundaries, ReadFingerprint};
 use escapepod::dtw::{normalize_fingerprint, Fingerprint, NormMethod};
-use escapepod::segmentation::{mad_normalize, segment_signal};
+use escapepod::segmentation::{clip_outliers, mad_normalize, segment_signal};
 use escapepod::Reader;
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
@@ -277,10 +277,13 @@ pub fn extract_fingerprint_from_signal(
     // — WarpDemuX segments raw pA values and normalizes event means afterwards.
     // For the default mode, MAD-normalize for consistency with existing behavior.
     let adapter_signal: Vec<f32> = if keep_last.is_some() {
-        signal[adapter_start..end]
+        let raw: Vec<f32> = signal[adapter_start..end]
             .iter()
             .map(|&s| s as f32)
-            .collect()
+            .collect();
+        // WarpDemuX clips outliers (median ± 5*MAD) before t-test segmentation
+        // to prevent extreme values from distorting changepoint detection.
+        clip_outliers(&raw, 5.0)
     } else {
         let raw: Vec<f32> = signal[adapter_start..end]
             .iter()

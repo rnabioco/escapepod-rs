@@ -102,6 +102,38 @@ pub fn mad_normalize_with_clipping(signal: &[f32], clip_sigma: f32) -> Vec<f32> 
         .collect()
 }
 
+/// Clip signal outliers using median ± threshold × MAD, without normalizing.
+///
+/// This matches WarpDemuX's outlier clipping behavior where extreme values are
+/// clamped before segmentation. The signal values are clipped but not rescaled.
+///
+/// # Arguments
+/// * `signal` - The raw signal values to clip
+/// * `clip_sigma` - Number of MADs from the median for clipping bounds
+///
+/// # Returns
+/// A new vector with outlier values clipped. Returns the original signal
+/// unchanged if MAD is zero (constant signal).
+pub fn clip_outliers(signal: &[f32], clip_sigma: f32) -> Vec<f32> {
+    if signal.len() < 2 {
+        return signal.to_vec();
+    }
+
+    let (med, mad_val) = median_and_mad(signal);
+
+    if mad_val == 0.0 {
+        return signal.to_vec();
+    }
+
+    let lower_bound = med - clip_sigma * mad_val;
+    let upper_bound = med + clip_sigma * mad_val;
+
+    signal
+        .iter()
+        .map(|&x| x.max(lower_bound).min(upper_bound))
+        .collect()
+}
+
 /// Normalize dwell times using log-transform followed by z-score normalization.
 ///
 /// Dwell times are inherently right-skewed (most are short, few are long),
