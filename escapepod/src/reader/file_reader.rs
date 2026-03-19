@@ -1006,9 +1006,14 @@ impl Reader {
 
         let count = u32::from_le_bytes([header[21], header[22], header[23], header[24]]) as usize;
 
-        // Read entries: each is 24 bytes (UUID 16 + batch_idx u32 + row_idx u32)
-        let mut buf = vec![0u8; count * 24];
-        file.read_exact(&mut buf).ok()?;
+        // Read remaining bytes and zstd-decompress to get the entries
+        let mut compressed = Vec::new();
+        file.read_to_end(&mut compressed).ok()?;
+        let buf = zstd::decode_all(compressed.as_slice()).ok()?;
+
+        if buf.len() != count * 24 {
+            return None;
+        }
 
         let mut index = HashMap::with_capacity(count);
         for i in 0..count {
@@ -1054,7 +1059,7 @@ impl Reader {
 
         let mut file = File::create(output.as_ref())?;
 
-        // Header
+        // Header (uncompressed — allows validation before decompressing)
         file.write_all(P5I_MAGIC)?;
         file.write_all(&[P5I_VERSION])?;
         let file_id = Uuid::parse_str(self.file_identifier())
@@ -1062,15 +1067,21 @@ impl Reader {
         file.write_all(file_id.as_bytes())?;
         file.write_all(&(count as u32).to_le_bytes())?;
 
-        // Entries — sorted by (batch_idx, row_idx) for cache-friendly access
+        // Entries — sorted by (batch_idx, row_idx) for compression locality
         let mut entries: Vec<_> = index.iter().collect();
         entries.sort_by_key(|&(_, &(batch, row))| (batch, row));
 
+        let mut raw = Vec::with_capacity(count * 24);
         for (&uuid, &(batch_idx, row_idx)) in &entries {
-            file.write_all(uuid.as_bytes())?;
-            file.write_all(&(batch_idx as u32).to_le_bytes())?;
-            file.write_all(&(row_idx as u32).to_le_bytes())?;
+            raw.extend_from_slice(uuid.as_bytes());
+            raw.extend_from_slice(&(batch_idx as u32).to_le_bytes());
+            raw.extend_from_slice(&(row_idx as u32).to_le_bytes());
         }
+
+        // Zstd-compress the entry block
+        let compressed = zstd::encode_all(raw.as_slice(), 3)
+            .map_err(|e| Error::Compression(format!("zstd compress failed: {e}")))?;
+        file.write_all(&compressed)?;
 
         file.flush()?;
         Ok(count)
