@@ -3,6 +3,7 @@
 pub mod bam_filter;
 pub mod demux;
 pub mod filter;
+pub mod index;
 pub mod inspect;
 pub mod merge;
 pub mod repack;

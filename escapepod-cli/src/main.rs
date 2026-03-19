@@ -251,6 +251,24 @@ Examples:
 
     /// Refine signal-to-base mapping using banded DP
     Resquiggle(commands::resquiggle::ResquiggleArgs),
+
+    /// Build .p5i read index for fast UUID lookup
+    #[command(after_help = "\
+Examples:
+  escapepod index input.pod5                   Index one file
+  escapepod index *.pod5                       Index all POD5 files
+  escapepod index data_dir/                    Index directory recursively
+  escapepod index input.pod5 --force           Overwrite existing index
+")]
+    Index {
+        /// Input POD5 file(s) or directory
+        #[arg(required = true, value_name = "FILES")]
+        inputs: Vec<PathBuf>,
+
+        /// Overwrite existing .p5i files
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -354,5 +372,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Demux(args) => commands::demux::run(args),
 
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
+
+        Commands::Index { inputs, force } => commands::index::run(inputs, force),
     }
 }
