@@ -45,7 +45,7 @@ pub fn configure_thread_pool(num_threads: usize) {
 /// - WarpDemuX format: `read_id,signal_len,...,adapter_start,adapter_end,...` (55+ columns)
 ///
 /// Supports both plain CSV and gzip-compressed (.gz) files.
-pub fn parse_boundaries_csv(path: &PathBuf) -> anyhow::Result<HashMap<Uuid, ReadBoundaries>> {
+pub fn parse_boundaries_csv(path: &Path) -> anyhow::Result<HashMap<Uuid, ReadBoundaries>> {
     let reader: Box<dyn BufRead> = open_csv_reader(path)?;
     let mut lines = reader.lines();
 
@@ -55,11 +55,10 @@ pub fn parse_boundaries_csv(path: &PathBuf) -> anyhow::Result<HashMap<Uuid, Read
         .ok_or_else(|| anyhow::anyhow!("Empty boundaries file"))??;
 
     // Skip WarpDemuX comment header (starts with #)
-    let header = if header.starts_with('#') {
-        header[1..].to_string()
-    } else {
-        header
-    };
+    let header = header
+        .strip_prefix('#')
+        .map(|s| s.to_string())
+        .unwrap_or(header);
 
     let columns: Vec<&str> = header.split(',').collect();
 
@@ -77,10 +76,15 @@ pub fn parse_boundaries_csv(path: &PathBuf) -> anyhow::Result<HashMap<Uuid, Read
         }
 
         let parts: Vec<&str> = line.split(',').collect();
-        let max_col = [read_id_col, num_samples_col, adapter_start_col, adapter_end_col]
-            .into_iter()
-            .max()
-            .unwrap_or(0);
+        let max_col = [
+            read_id_col,
+            num_samples_col,
+            adapter_start_col,
+            adapter_end_col,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
 
         if parts.len() > max_col {
             if let Ok(read_id) = Uuid::parse_str(parts[read_id_col]) {
@@ -141,9 +145,8 @@ fn detect_boundary_columns(columns: &[&str]) -> anyhow::Result<(usize, usize, us
 
     let num_samples_col = find_col(&["num_samples", "signal_len"]).unwrap_or(1);
 
-    let adapter_start_col = find_col(&["adapter_start"]).ok_or_else(|| {
-        anyhow::anyhow!("No 'adapter_start' column found in boundaries CSV")
-    })?;
+    let adapter_start_col = find_col(&["adapter_start"])
+        .ok_or_else(|| anyhow::anyhow!("No 'adapter_start' column found in boundaries CSV"))?;
 
     let adapter_end_col = find_col(&["adapter_end"])
         .ok_or_else(|| anyhow::anyhow!("No 'adapter_end' column found in boundaries CSV"))?;
@@ -659,7 +662,15 @@ mod tests {
         let signal: Vec<i16> = (0..1000).map(|i| (i as i16) % 1000).collect();
         let read_id = Uuid::new_v4();
         let result = extract_fingerprint_from_signal(
-            &signal, 0, 500, 10, 5, NormMethod::None, read_id, None, None,
+            &signal,
+            0,
+            500,
+            10,
+            5,
+            NormMethod::None,
+            read_id,
+            None,
+            None,
         );
         assert!(result.is_some());
         let fp = result.unwrap();

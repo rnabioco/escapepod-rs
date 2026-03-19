@@ -6,7 +6,7 @@ use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod::operations::parse_csv_mapping;
 use escapepod::{Reader, RunInfoData, Writer, WriterOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub fn run(
@@ -73,18 +73,18 @@ pub fn run(
         write_counts.insert(output_name.clone(), 0);
     }
 
-    // Set up progress
-    let read_count = reader.read_count()?;
-    let progress = create_progress_bar(read_count as u64, "Subsetting")?;
+    // Use reads_by_ids() to only deserialize matching reads
+    let target_ids: HashSet<_> = mapping.keys().copied().collect();
+    let total_read_count = reader.read_count()? as u64;
+    let matching_reads = reader.reads_by_ids(&target_ids)?;
+
+    let progress = create_progress_bar(matching_reads.len() as u64, "Subsetting")?;
     progress.set_message("reads");
 
     let mut matched = 0u64;
-    let mut unmatched = 0u64;
 
-    // Process reads
-    for read_result in reader.reads()? {
-        let read = read_result?;
-
+    // Process only matching reads
+    for read in &matching_reads {
         if let Some(output_name) = mapping.get(&read.read_id) {
             // Use compressed signal to avoid decompress/recompress overhead
             let compressed_signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
@@ -97,12 +97,12 @@ pub fn run(
             }
 
             matched += 1;
-        } else {
-            unmatched += 1;
         }
 
         progress.inc(1);
     }
+
+    let unmatched = total_read_count.saturating_sub(matched);
 
     progress.finish_with_message("done");
 

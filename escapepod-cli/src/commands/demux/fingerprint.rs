@@ -91,12 +91,12 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     let (num_segments, window_width, norm_method, min_separation, keep_last, use_full_adapter) =
         if args.warpdemux_compat {
             (
-                111_usize,                   // 110 changepoints → 111 segments (WDX num_events=110)
-                12_usize,                    // running_stat_width=12
-                NormMethod::ZScore,          // WarpDemuX "mean" norm = z-score (mean/std)
-                Some(6_usize),               // min_obs_per_base=6
-                Some(25_usize),              // keep last 25 segment means
-                true,                        // use full adapter region
+                111_usize,          // 110 changepoints → 111 segments (WDX num_events=110)
+                12_usize,           // running_stat_width=12
+                NormMethod::ZScore, // WarpDemuX "mean" norm = z-score (mean/std)
+                Some(6_usize),      // min_obs_per_base=6
+                Some(25_usize),     // keep last 25 segment means
+                true,               // use full adapter region
             )
         } else {
             (

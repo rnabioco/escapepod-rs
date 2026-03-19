@@ -171,8 +171,7 @@ impl<'a> SvmPredictor<'a> {
             for j in (i + 1)..n_classes {
                 let mut sum = self.model.intercept[pair_idx];
 
-                for (sv_local_idx, &sv_global_idx) in
-                    self.model.support_indices.iter().enumerate()
+                for (sv_local_idx, &sv_global_idx) in self.model.support_indices.iter().enumerate()
                 {
                     // Determine which class this SV belongs to
                     let sv_label = self.model.training_labels[sv_global_idx];
@@ -303,7 +302,7 @@ impl<'a> SvmPredictor<'a> {
         let mut pair_idx = 0;
         for i in 0..k {
             for j in (i + 1)..k {
-                r[i][j] = pair_probs[pair_idx].max(1e-7).min(1.0 - 1e-7);
+                r[i][j] = pair_probs[pair_idx].clamp(1e-7, 1.0 - 1e-7);
                 r[j][i] = 1.0 - r[i][j];
                 pair_idx += 1;
             }
@@ -339,9 +338,7 @@ impl<'a> SvmPredictor<'a> {
             }
 
             // Check convergence
-            let max_error = (0..k)
-                .map(|t| (qp[t] - p_qp).abs())
-                .fold(0.0_f64, f64::max);
+            let max_error = (0..k).map(|t| (qp[t] - p_qp).abs()).fold(0.0_f64, f64::max);
             if max_error < eps {
                 break;
             }
@@ -350,9 +347,7 @@ impl<'a> SvmPredictor<'a> {
             for t in 0..k {
                 let diff = (-qp[t] + p_qp) / q[t][t];
                 p[t] += diff;
-                p_qp = (p_qp + diff * (diff * q[t][t] + 2.0 * qp[t]))
-                    / (1.0 + diff)
-                    / (1.0 + diff);
+                p_qp = (p_qp + diff * (diff * q[t][t] + 2.0 * qp[t])) / (1.0 + diff) / (1.0 + diff);
                 for j in 0..k {
                     qp[j] = (qp[j] + diff * q[t][j]) / (1.0 + diff);
                     p[j] /= 1.0 + diff;

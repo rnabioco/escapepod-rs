@@ -73,6 +73,17 @@ impl FilterCriteria {
         true
     }
 
+    /// Returns true if the only active criterion is a read-ID set
+    /// (no sample-count or end-reason filters). When true, the
+    /// accelerated `reads_by_ids()` path can be used.
+    pub fn is_uuid_only(&self) -> bool {
+        self.read_ids.is_some()
+            && self.min_samples.is_none()
+            && self.max_samples.is_none()
+            && self.include_end_reasons.is_none()
+            && self.exclude_end_reasons.is_none()
+    }
+
     /// Returns true if no criteria are set (matches all reads).
     pub fn is_empty(&self) -> bool {
         self.read_ids.is_none()
@@ -133,10 +144,10 @@ struct FileMetadata {
     reader: Reader,
     signal_footer: ArrowIpcFooter,
     run_infos: Vec<RunInfoData>,
-    /// All reads from this file.
-    reads: Vec<ReadData>,
-    /// Indices of reads that match the filter.
-    matching_read_indices: Vec<usize>,
+    /// Only reads that match the filter criteria.
+    matching_reads: Vec<ReadData>,
+    /// Total number of reads in the file (for statistics).
+    total_read_count: usize,
 }
 
 /// Filter reads from POD5 files based on a set of read IDs.
@@ -191,29 +202,32 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
             let signal_bytes = reader.signal_table_bytes()?;
             let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
             let run_infos = reader.run_infos().to_vec();
-            let reads: Vec<ReadData> = reader
-                .reads()?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            // Find matching reads using the criteria
-            let matching_read_indices: Vec<usize> = reads
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, read)| {
-                    if criteria.matches(read) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // Fast path: when only filtering by UUID, use reads_by_ids()
+            // to skip non-matching batches entirely.
+            let (matching_reads, total_read_count) = if criteria.is_uuid_only() {
+                let total = reader.read_count()?;
+                let target_ids = criteria.read_ids.as_ref().unwrap();
+                let matching = reader.reads_by_ids(target_ids)?;
+                (matching, total)
+            } else {
+                let all_reads: Vec<ReadData> = reader
+                    .reads()?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let total = all_reads.len();
+                let matching = all_reads
+                    .into_iter()
+                    .filter(|read| criteria.matches(read))
+                    .collect();
+                (matching, total)
+            };
 
             Ok(FileMetadata {
                 reader,
                 signal_footer,
                 run_infos,
-                reads,
-                matching_read_indices,
+                matching_reads,
+                total_read_count,
             })
         })
         .collect();
@@ -222,10 +236,13 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
 
     // Count total reads for statistics
-    let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
+    let total_read_count: u64 = file_metadata
+        .iter()
+        .map(|m| m.total_read_count as u64)
+        .sum();
     let matching_count: u64 = file_metadata
         .iter()
-        .map(|m| m.matching_read_indices.len() as u64)
+        .map(|m| m.matching_reads.len() as u64)
         .sum();
 
     // Phase 2: Extract signal data in parallel across files
@@ -238,7 +255,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let extractions: Vec<Result<FileSignalExtraction>> = file_metadata
         .par_iter()
         .map(|metadata| {
-            if metadata.matching_read_indices.is_empty() {
+            if metadata.matching_reads.is_empty() {
                 return Ok(FileSignalExtraction { chunks: Vec::new() });
             }
 
@@ -246,9 +263,9 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
 
             // Collect all signal rows needed from this file
             let signal_row_indices: Vec<u64> = metadata
-                .matching_read_indices
+                .matching_reads
                 .iter()
-                .flat_map(|&read_idx| metadata.reads[read_idx].signal_rows.iter().copied())
+                .flat_map(|read| read.signal_rows.iter().copied())
                 .collect();
 
             // Extract all signal rows in batch
@@ -359,9 +376,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let mut signal_row_cursor: u64 = 0;
 
     for metadata in &file_metadata {
-        for &read_idx in &metadata.matching_read_indices {
-            let read = &metadata.reads[read_idx];
-
+        for read in &metadata.matching_reads {
             // New signal rows are sequential starting from signal_row_cursor
             let num_signal_rows = read.signal_rows.len();
             let new_signal_rows: Vec<u64> =
@@ -562,6 +577,34 @@ mod tests {
             ..Default::default()
         };
         assert!(!criteria.is_empty());
+    }
+
+    #[test]
+    fn test_filter_criteria_is_uuid_only() {
+        // UUID-only: should be true
+        let criteria = FilterCriteria {
+            read_ids: Some(HashSet::new()),
+            ..Default::default()
+        };
+        assert!(criteria.is_uuid_only());
+
+        // No criteria at all: not UUID-only
+        assert!(!FilterCriteria::default().is_uuid_only());
+
+        // UUID + min_samples: not UUID-only
+        let criteria = FilterCriteria {
+            read_ids: Some(HashSet::new()),
+            min_samples: Some(100),
+            ..Default::default()
+        };
+        assert!(!criteria.is_uuid_only());
+
+        // Only min_samples, no UUIDs: not UUID-only
+        let criteria = FilterCriteria {
+            min_samples: Some(100),
+            ..Default::default()
+        };
+        assert!(!criteria.is_uuid_only());
     }
 
     #[test]
