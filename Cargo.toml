@@ -13,7 +13,7 @@ license = "MIT"
 # Error handling
 anyhow = "1"
 # Arrow ecosystem
-arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow = { version = "58", default-features = false, features = ["ipc"] }
 byteorder = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }

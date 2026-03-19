@@ -219,7 +219,7 @@ fn theil_sen(
 
 /// Random subset of indices.
 fn random_subset(vec_len: usize, downsampled_len: usize) -> Vec<usize> {
-    (0..vec_len).choose_multiple(&mut rand::thread_rng(), downsampled_len)
+    (0..vec_len).sample(&mut rand::rng(), downsampled_len)
 }
 
 /// Median of a sorted slice.

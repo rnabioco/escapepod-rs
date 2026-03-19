@@ -22,7 +22,7 @@ const STYLES: Styles = Styles::styled()
 #[command(
     long_about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data).\n\n\
 POD5 is the native file format for Oxford Nanopore sequencing devices. This tool \
-provides commands for viewing, inspecting, merging, filtering, and repacking POD5 files."
+provides commands for viewing, inspecting, merging, filtering, and subsetting POD5 files."
 )]
 #[command(after_help = "\
 Examples:
@@ -187,6 +187,7 @@ At least one filter criterion must be specified.
     },
 
     /// Repack POD5 files to optimize storage
+    #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
   escapepod repack input.pod5 -o output_dir/
@@ -241,6 +242,7 @@ Examples:
     Summary(commands::summary::SummaryArgs),
 
     /// Barcode demultiplexing workflow
+    #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
   escapepod demux detect input.pod5 -o boundaries.csv
@@ -250,6 +252,7 @@ Examples:
     Demux(commands::demux::DemuxArgs),
 
     /// Refine signal-to-base mapping using banded DP
+    #[cfg(feature = "experimental")]
     Resquiggle(commands::resquiggle::ResquiggleArgs),
 
     /// Build .p5i read index for fast UUID lookup
@@ -354,6 +357,7 @@ fn main() -> anyhow::Result<()> {
             quality,
         } => commands::bam_filter::run(input, bam, output, mapped, region, quality),
 
+        #[cfg(feature = "experimental")]
         Commands::Repack {
             inputs,
             output_dir,
@@ -369,8 +373,10 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Summary(args) => commands::summary::run(args),
 
+        #[cfg(feature = "experimental")]
         Commands::Demux(args) => commands::demux::run(args),
 
+        #[cfg(feature = "experimental")]
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
 
         Commands::Index { inputs, force } => commands::index::run(inputs, force),

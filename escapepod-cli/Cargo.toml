@@ -21,11 +21,11 @@ escapepod = { workspace = true }
 flate2 = "1"
 indicatif = { workspace = true }
 # BAM file support
-noodles-bam = "0.85"
-noodles-bgzf = "0.45"
-noodles-core = "0.18"
-noodles-csi = "0.53"
-noodles-sam = "0.81"
+noodles-bam = "0.87"
+noodles-bgzf = "0.46"
+noodles-core = "0.19"
+noodles-csi = "0.55"
+noodles-sam = "0.83"
 owo-colors = "4"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
@@ -37,4 +37,5 @@ walkdir = "2"
 
 [features]
 default = []
-train = ["escapepod/train"]
+experimental = []
+train = ["escapepod/train", "experimental"]
