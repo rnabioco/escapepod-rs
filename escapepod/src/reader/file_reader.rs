@@ -1268,12 +1268,13 @@ impl Reader {
                 })?;
             for row in 0..batch.num_rows() {
                 if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
-                    && target_ids.contains(&uuid) {
-                        results.push(extract_read_from_batch(&batch, row, true)?);
-                        if results.len() == n {
-                            return Ok(results);
-                        }
+                    && target_ids.contains(&uuid)
+                {
+                    results.push(extract_read_from_batch(&batch, row, true)?);
+                    if results.len() == n {
+                        return Ok(results);
                     }
+                }
             }
         }
         Ok(results)
@@ -1445,21 +1446,22 @@ impl Reader {
                 })?;
             for row in 0..batch.num_rows() {
                 if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
-                    && target_ids.contains(&uuid) {
-                        let values = signal_col.value(row);
-                        let u64_arr =
-                            values
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .ok_or_else(|| Error::InvalidField {
-                                    field: "signal".to_string(),
-                                    message: "Expected UInt64Array values".to_string(),
-                                })?;
-                        results.push((uuid, u64_arr.values().to_vec()));
-                        if results.len() == n {
-                            return Ok(results);
-                        }
+                    && target_ids.contains(&uuid)
+                {
+                    let values = signal_col.value(row);
+                    let u64_arr =
+                        values
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or_else(|| Error::InvalidField {
+                                field: "signal".to_string(),
+                                message: "Expected UInt64Array values".to_string(),
+                            })?;
+                    results.push((uuid, u64_arr.values().to_vec()));
+                    if results.len() == n {
+                        return Ok(results);
                     }
+                }
             }
         }
         Ok(results)
@@ -1517,26 +1519,27 @@ impl Reader {
                 })?;
             for row in 0..batch.num_rows() {
                 if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
-                    && target_ids.contains(&uuid) {
-                        let values = signal_col.value(row);
-                        let u64_arr =
-                            values
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .ok_or_else(|| Error::InvalidField {
-                                    field: "signal".to_string(),
-                                    message: "Expected UInt64Array values".to_string(),
-                                })?;
-                        results.push((
-                            uuid,
-                            u64_arr.values().to_vec(),
-                            cal_offset_col.value(row),
-                            cal_scale_col.value(row),
-                        ));
-                        if results.len() == n {
-                            return Ok(results);
-                        }
+                    && target_ids.contains(&uuid)
+                {
+                    let values = signal_col.value(row);
+                    let u64_arr =
+                        values
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or_else(|| Error::InvalidField {
+                                field: "signal".to_string(),
+                                message: "Expected UInt64Array values".to_string(),
+                            })?;
+                    results.push((
+                        uuid,
+                        u64_arr.values().to_vec(),
+                        cal_offset_col.value(row),
+                        cal_scale_col.value(row),
+                    ));
+                    if results.len() == n {
+                        return Ok(results);
                     }
+                }
             }
         }
         Ok(results)
@@ -1670,13 +1673,14 @@ impl Reader {
                     .column(1)
                     .as_any()
                     .downcast_ref::<StringArray>(),
-            ) {
-                for i in 0..struct_array.len() {
-                    if !keys.is_null(i) && !values.is_null(i) {
-                        result.insert(keys.value(i).to_string(), values.value(i).to_string());
-                    }
+            )
+        {
+            for i in 0..struct_array.len() {
+                if !keys.is_null(i) && !values.is_null(i) {
+                    result.insert(keys.value(i).to_string(), values.value(i).to_string());
                 }
             }
+        }
 
         result
     }

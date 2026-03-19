@@ -171,7 +171,8 @@ impl LlrTrace {
 
         for i in (search_start..search_end).step_by(self.stride) {
             // Check for early stopping
-            if i >= search_start + early_stop_window && (i - search_start).is_multiple_of(early_stop_stride)
+            if i >= search_start + early_stop_window
+                && (i - search_start).is_multiple_of(early_stop_stride)
             {
                 // Compute mean derivative over the window
                 let window_start = i - early_stop_window;

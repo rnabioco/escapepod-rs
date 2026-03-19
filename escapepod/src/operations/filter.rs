@@ -37,33 +37,38 @@ impl FilterCriteria {
     pub fn matches(&self, read: &ReadData) -> bool {
         // Check read ID filter
         if let Some(ref ids) = self.read_ids
-            && !ids.contains(&read.read_id) {
-                return false;
-            }
+            && !ids.contains(&read.read_id)
+        {
+            return false;
+        }
 
         // Check min samples
         if let Some(min) = self.min_samples
-            && read.num_samples < min {
-                return false;
-            }
+            && read.num_samples < min
+        {
+            return false;
+        }
 
         // Check max samples
         if let Some(max) = self.max_samples
-            && read.num_samples > max {
-                return false;
-            }
+            && read.num_samples > max
+        {
+            return false;
+        }
 
         // Check include end reasons (if specified, read must have one of these)
         if let Some(ref include) = self.include_end_reasons
-            && !include.contains(&read.end_reason) {
-                return false;
-            }
+            && !include.contains(&read.end_reason)
+        {
+            return false;
+        }
 
         // Check exclude end reasons
         if let Some(ref exclude) = self.exclude_end_reasons
-            && exclude.contains(&read.end_reason) {
-                return false;
-            }
+            && exclude.contains(&read.end_reason)
+        {
+            return false;
+        }
 
         true
     }
