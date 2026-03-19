@@ -17,6 +17,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
+/// Result type for signal-row + calibration lookups, used by
+/// `find_signal_rows_with_calibration_by_ids` and helpers.
+type SignalCalibrationResult = Vec<(Uuid, Vec<u64>, f32, f32)>;
+
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
 
@@ -24,6 +28,36 @@ const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
 const P5I_MAGIC: &[u8; 4] = b"P5IX";
 /// Current `.p5i` format version.
 const P5I_VERSION: u8 = 1;
+
+/// Sorted read index for O(log n) UUID → (batch, row) lookup.
+pub struct ReadIndex {
+    /// (uuid_bytes, batch_idx, row_idx) sorted by UUID for binary search.
+    entries: Vec<([u8; 16], u32, u32)>,
+}
+
+impl ReadIndex {
+    /// Look up a UUID, returning `(batch_idx, row_idx)` if found.
+    pub fn get(&self, uuid: &Uuid) -> Option<(usize, usize)> {
+        let key = *uuid.as_bytes();
+        self.entries
+            .binary_search_by_key(&key, |&(k, _, _)| k)
+            .ok()
+            .map(|i| {
+                let (_, batch, row) = self.entries[i];
+                (batch as usize, row as usize)
+            })
+    }
+
+    /// Number of entries in the index.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// Metadata about signal table batches for efficient lookup.
 #[derive(Debug, Clone)]
@@ -125,7 +159,7 @@ pub struct Reader {
     signal_cache: RwLock<SignalBatchCache>,
     /// Cached read UUID index: UUID → (batch_idx, row_within_batch).
     /// Lazily built on first lookup via `.p5i` sidecar or column-projected scan.
-    read_index: OnceLock<HashMap<Uuid, (usize, usize)>>,
+    read_index: OnceLock<ReadIndex>,
     /// Path to the POD5 file (for locating `.p5i` sidecar).
     file_path: Option<PathBuf>,
 }
@@ -947,7 +981,7 @@ impl Reader {
     /// Build the read index from a column-projected scan of the reads table.
     ///
     /// Projects only column 0 (read_id) to avoid parsing all 22 columns.
-    fn build_read_index_from_scan(&self) -> Result<HashMap<Uuid, (usize, usize)>> {
+    fn build_read_index_from_scan(&self) -> Result<ReadIndex> {
         use arrow::array::{Array, FixedSizeBinaryArray};
 
         let embedded = self
@@ -957,7 +991,7 @@ impl Reader {
 
         let reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0]))?;
 
-        let mut index = HashMap::new();
+        let mut entries = Vec::new();
         for (batch_idx, batch_result) in reader.enumerate() {
             let batch = batch_result?;
             let col = batch
@@ -969,79 +1003,108 @@ impl Reader {
                     message: "Expected FixedSizeBinaryArray".to_string(),
                 })?;
             for row in 0..col.len() {
-                if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
-                    index.insert(uuid, (batch_idx, row));
+                let bytes = col.value(row);
+                if bytes.len() == 16 {
+                    let uuid_bytes: [u8; 16] = bytes.try_into().unwrap();
+                    entries.push((uuid_bytes, batch_idx as u32, row as u32));
                 }
             }
         }
-        Ok(index)
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Ok(ReadIndex { entries })
     }
 
     /// Try to load the read index from a `.p5i` sidecar file.
     ///
-    /// Returns `None` if the sidecar doesn't exist or is invalid/stale.
-    fn load_p5i_index(&self) -> Option<HashMap<Uuid, (usize, usize)>> {
+    /// Returns `Ok(None)` if the sidecar doesn't exist.
+    /// Returns `Err` if the sidecar exists but is invalid or stale.
+    fn load_p5i_index(&self) -> Result<Option<ReadIndex>> {
         use std::io::Read as _;
 
-        let p5i_path = self.p5i_path()?;
-        let mut file = File::open(&p5i_path).ok()?;
+        let p5i_path = match self.p5i_path() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let mut file = match File::open(&p5i_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::from(e)),
+        };
 
-        // Read header: magic (4) + version (1) + file_identifier UUID (16) + count (u32 LE, 4)
-        let mut header = [0u8; 25];
-        file.read_exact(&mut header).ok()?;
+        // Header: magic (4) + version (1) + file_id (16) + file_size (8) + count (4) = 33
+        let mut header = [0u8; 33];
+        file.read_exact(&mut header)
+            .map_err(|_| Error::InvalidFooter("truncated .p5i header".to_string()))?;
 
         if &header[0..4] != P5I_MAGIC {
-            return None;
+            return Err(Error::InvalidFooter("invalid .p5i magic bytes".to_string()));
         }
         if header[4] != P5I_VERSION {
-            return None;
+            return Err(Error::InvalidFooter(format!(
+                ".p5i version {} unsupported (expected {}); rebuild with `escpod index`",
+                header[4], P5I_VERSION
+            )));
         }
 
         // Validate file identifier matches
-        let stored_file_id = Uuid::from_slice(&header[5..21]).ok()?;
-        let our_file_id = Uuid::parse_str(self.file_identifier()).ok()?;
-        if stored_file_id != our_file_id {
-            return None;
+        let stored_file_id = Uuid::from_slice(&header[5..21])
+            .map_err(|e| Error::InvalidUuid(e.to_string()))?;
+        let our_file_id = Uuid::parse_str(self.file_identifier())
+            .map_err(|e| Error::InvalidUuid(e.to_string()))?;
+        let stored_size = u64::from_le_bytes(header[21..29].try_into().unwrap());
+        let actual_size = self.mmap.len() as u64;
+        if stored_file_id != our_file_id || stored_size != actual_size {
+            return Err(Error::InvalidFooter(
+                ".p5i does not match POD5 file; rebuild with `escpod index`"
+                    .to_string(),
+            ));
         }
 
-        let count = u32::from_le_bytes([header[21], header[22], header[23], header[24]]) as usize;
+        let count =
+            u32::from_le_bytes(header[29..33].try_into().unwrap()) as usize;
 
         // Read remaining bytes and zstd-decompress to get the entries
         let mut compressed = Vec::new();
-        file.read_to_end(&mut compressed).ok()?;
-        let buf = zstd::decode_all(compressed.as_slice()).ok()?;
+        file.read_to_end(&mut compressed)?;
+        let buf = zstd::decode_all(compressed.as_slice())
+            .map_err(|e| Error::Compression(format!(".p5i decompression failed: {e}")))?;
 
         if buf.len() != count * 24 {
-            return None;
+            return Err(Error::InvalidFooter(format!(
+                ".p5i entry block corrupt: expected {} bytes, got {}",
+                count * 24,
+                buf.len()
+            )));
         }
 
-        let mut index = HashMap::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
         for i in 0..count {
             let offset = i * 24;
-            let uuid = Uuid::from_slice(&buf[offset..offset + 16]).ok()?;
-            let batch_idx =
-                u32::from_le_bytes([buf[offset + 16], buf[offset + 17], buf[offset + 18], buf[offset + 19]])
-                    as usize;
-            let row_idx =
-                u32::from_le_bytes([buf[offset + 20], buf[offset + 21], buf[offset + 22], buf[offset + 23]])
-                    as usize;
-            index.insert(uuid, (batch_idx, row_idx));
+            let uuid_bytes: [u8; 16] = buf[offset..offset + 16].try_into().unwrap();
+            let batch_idx = u32::from_le_bytes(
+                buf[offset + 16..offset + 20].try_into().unwrap(),
+            );
+            let row_idx = u32::from_le_bytes(
+                buf[offset + 20..offset + 24].try_into().unwrap(),
+            );
+            entries.push((uuid_bytes, batch_idx, row_idx));
         }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        Some(index)
+        Ok(Some(ReadIndex { entries }))
     }
 
     /// Get or lazily build the read UUID index.
     ///
     /// Checks for a `.p5i` sidecar file first; falls back to a
     /// column-projected scan of the reads table.
-    pub fn read_index(&self) -> Result<&HashMap<Uuid, (usize, usize)>> {
+    pub fn read_index(&self) -> Result<&ReadIndex> {
         if let Some(idx) = self.read_index.get() {
             return Ok(idx);
         }
         // Build outside the lock — may race with another thread, but
         // get_or_init will discard the extra copy.
-        let index = match self.load_p5i_index() {
+        let index = match self.load_p5i_index()? {
             Some(index) => index,
             None => self.build_read_index_from_scan()?,
         };
@@ -1065,17 +1128,18 @@ impl Reader {
         let file_id = Uuid::parse_str(self.file_identifier())
             .map_err(|e| Error::InvalidUuid(e.to_string()))?;
         file.write_all(file_id.as_bytes())?;
+        file.write_all(&(self.mmap.len() as u64).to_le_bytes())?;
         file.write_all(&(count as u32).to_le_bytes())?;
 
         // Entries — sorted by (batch_idx, row_idx) for compression locality
-        let mut entries: Vec<_> = index.iter().collect();
-        entries.sort_by_key(|&(_, &(batch, row))| (batch, row));
+        let mut disk_entries = index.entries.clone();
+        disk_entries.sort_unstable_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
 
         let mut raw = Vec::with_capacity(count * 24);
-        for (&uuid, &(batch_idx, row_idx)) in &entries {
-            raw.extend_from_slice(uuid.as_bytes());
-            raw.extend_from_slice(&(batch_idx as u32).to_le_bytes());
-            raw.extend_from_slice(&(row_idx as u32).to_le_bytes());
+        for (uuid_bytes, batch_idx, row_idx) in &disk_entries {
+            raw.extend_from_slice(uuid_bytes);
+            raw.extend_from_slice(&batch_idx.to_le_bytes());
+            raw.extend_from_slice(&row_idx.to_le_bytes());
         }
 
         // Zstd-compress the entry block
@@ -1098,8 +1162,7 @@ impl Reader {
             return true;
         }
         // Peek for sidecar without loading it yet
-        self.p5i_path()
-            .is_some_and(|p| p.exists())
+        self.p5i_path().is_some_and(|p| p.exists())
     }
 
     /// Look up signal rows for a set of target UUIDs.
@@ -1126,12 +1189,101 @@ impl Reader {
     pub fn find_signal_rows_with_calibration_by_ids(
         &self,
         target_ids: &HashSet<Uuid>,
-    ) -> Result<Vec<(Uuid, Vec<u64>, f32, f32)>> {
+    ) -> Result<SignalCalibrationResult> {
         if self.has_index() {
             self.find_signal_rows_with_calibration_indexed(target_ids)
         } else {
             self.find_signal_rows_with_calibration_scan(target_ids)
         }
+    }
+
+    /// Retrieve full `ReadData` for a set of target UUIDs.
+    ///
+    /// **Indexed path** (when `.p5i` sidecar or in-memory index exists):
+    /// groups targets by batch, opens a full-column reader, and seeks
+    /// directly to each target batch — only the batches that contain
+    /// target UUIDs are deserialized.
+    ///
+    /// **Scan path** (no index): iterates all batches but checks the
+    /// UUID column first and only deserializes matching rows. Terminates
+    /// early once all targets are found.
+    pub fn reads_by_ids(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
+        if target_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.has_index() {
+            self.reads_by_ids_indexed(target_ids)
+        } else {
+            self.reads_by_ids_scan(target_ids)
+        }
+    }
+
+    fn reads_by_ids_indexed(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
+        let index = self.read_index()?;
+
+        let mut batch_targets: BTreeMap<usize, Vec<(Uuid, usize)>> = BTreeMap::new();
+        for uuid in target_ids {
+            if let Some((batch_idx, row_idx)) = index.get(uuid) {
+                batch_targets
+                    .entry(batch_idx)
+                    .or_default()
+                    .push((*uuid, row_idx));
+            }
+        }
+
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+        let mut reader = self.create_arrow_reader(embedded)?;
+
+        let mut results = Vec::with_capacity(target_ids.len());
+        for (batch_idx, targets) in batch_targets {
+            reader.set_index(batch_idx)?;
+            let batch = reader.next().ok_or_else(|| Error::BatchIndexOutOfBounds {
+                index: batch_idx,
+                max: reader.num_batches(),
+            })??;
+            for (_uuid, row) in targets {
+                results.push(extract_read_from_batch(&batch, row, true)?);
+            }
+        }
+        Ok(results)
+    }
+
+    fn reads_by_ids_scan(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
+        use arrow::array::{Array, FixedSizeBinaryArray};
+
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+        let reader = self.create_arrow_reader(embedded)?;
+
+        let n = target_ids.len();
+        let mut results = Vec::with_capacity(n);
+        for batch_result in reader {
+            let batch = batch_result?;
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "read_id".to_string(),
+                    message: "Expected FixedSizeBinaryArray".to_string(),
+                })?;
+            for row in 0..batch.num_rows() {
+                if let Ok(uuid) = Uuid::from_slice(id_col.value(row)) {
+                    if target_ids.contains(&uuid) {
+                        results.push(extract_read_from_batch(&batch, row, true)?);
+                        if results.len() == n {
+                            return Ok(results);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     // ---- Indexed path (two-pass: index lookup → targeted batch fetch) ----
@@ -1146,7 +1298,7 @@ impl Reader {
 
         let mut batch_targets: BTreeMap<usize, Vec<(Uuid, usize)>> = BTreeMap::new();
         for uuid in target_ids {
-            if let Some(&(batch_idx, row_idx)) = index.get(uuid) {
+            if let Some((batch_idx, row_idx)) = index.get(uuid) {
                 batch_targets
                     .entry(batch_idx)
                     .or_default()
@@ -1158,36 +1310,35 @@ impl Reader {
             .footer
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1]))?;
+        let mut reader =
+            self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1]))?;
 
         let mut results = Vec::with_capacity(target_ids.len());
-        for (batch_idx, batch_result) in reader.enumerate() {
-            if let Some(targets) = batch_targets.remove(&batch_idx) {
-                let batch = batch_result?;
-                let signal_col = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
-                for (uuid, row) in targets {
-                    let values = signal_col.value(row);
-                    let u64_arr = values
+        for (batch_idx, targets) in batch_targets {
+            reader.set_index(batch_idx)?;
+            let batch = reader.next().ok_or_else(|| Error::BatchIndexOutOfBounds {
+                index: batch_idx,
+                max: reader.num_batches(),
+            })??;
+            let signal_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected ListArray".to_string(),
+                })?;
+            for (uuid, row) in targets {
+                let values = signal_col.value(row);
+                let u64_arr =
+                    values
                         .as_any()
                         .downcast_ref::<UInt64Array>()
                         .ok_or_else(|| Error::InvalidField {
                             field: "signal".to_string(),
                             message: "Expected UInt64Array values".to_string(),
                         })?;
-                    results.push((uuid, u64_arr.values().to_vec()));
-                }
-            } else {
-                let _ = batch_result;
-            }
-            if batch_targets.is_empty() {
-                break;
+                results.push((uuid, u64_arr.values().to_vec()));
             }
         }
         Ok(results)
@@ -1196,14 +1347,14 @@ impl Reader {
     fn find_signal_rows_with_calibration_indexed(
         &self,
         target_ids: &HashSet<Uuid>,
-    ) -> Result<Vec<(Uuid, Vec<u64>, f32, f32)>> {
+    ) -> Result<SignalCalibrationResult> {
         use arrow::array::{Array, Float32Array, ListArray, UInt64Array};
 
         let index = self.read_index()?;
 
         let mut batch_targets: BTreeMap<usize, Vec<(Uuid, usize)>> = BTreeMap::new();
         for uuid in target_ids {
-            if let Some(&(batch_idx, row_idx)) = index.get(uuid) {
+            if let Some((batch_idx, row_idx)) = index.get(uuid) {
                 batch_targets
                     .entry(batch_idx)
                     .or_default()
@@ -1215,46 +1366,50 @@ impl Reader {
             .footer
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let reader =
+        let mut reader =
             self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1, 16, 17]))?;
 
         let mut results = Vec::with_capacity(target_ids.len());
-        for (batch_idx, batch_result) in reader.enumerate() {
-            if let Some(targets) = batch_targets.remove(&batch_idx) {
-                let batch = batch_result?;
-                let signal_col = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
-                let cal_offset_col = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "calibration_offset".to_string(),
-                        message: "Expected Float32Array".to_string(),
-                    })?;
-                let cal_scale_col = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "calibration_scale".to_string(),
-                        message: "Expected Float32Array".to_string(),
-                    })?;
-                for (uuid, row) in targets {
-                    let values = signal_col.value(row);
-                    let u64_arr = values
+        for (batch_idx, targets) in batch_targets {
+            reader.set_index(batch_idx)?;
+            let batch = reader.next().ok_or_else(|| Error::BatchIndexOutOfBounds {
+                index: batch_idx,
+                max: reader.num_batches(),
+            })??;
+            let signal_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected ListArray".to_string(),
+                })?;
+            let cal_offset_col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "calibration_offset".to_string(),
+                    message: "Expected Float32Array".to_string(),
+                })?;
+            let cal_scale_col = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "calibration_scale".to_string(),
+                    message: "Expected Float32Array".to_string(),
+                })?;
+            for (uuid, row) in targets {
+                let values = signal_col.value(row);
+                let u64_arr =
+                    values
                         .as_any()
                         .downcast_ref::<UInt64Array>()
                         .ok_or_else(|| Error::InvalidField {
                             field: "signal".to_string(),
                             message: "Expected UInt64Array values".to_string(),
-                        })?;
+                            })?;
                     results.push((
                         uuid,
                         u64_arr.values().to_vec(),
@@ -1262,22 +1417,13 @@ impl Reader {
                         cal_scale_col.value(row),
                     ));
                 }
-            } else {
-                let _ = batch_result;
-            }
-            if batch_targets.is_empty() {
-                break;
-            }
         }
         Ok(results)
     }
 
     // ---- Single-pass path (no index — column-projected scan with inline filter) ----
 
-    fn find_signal_rows_scan(
-        &self,
-        target_ids: &HashSet<Uuid>,
-    ) -> Result<Vec<(Uuid, Vec<u64>)>> {
+    fn find_signal_rows_scan(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<(Uuid, Vec<u64>)>> {
         use arrow::array::{Array, FixedSizeBinaryArray, ListArray, UInt64Array};
 
         let embedded = self
@@ -1311,13 +1457,14 @@ impl Reader {
                 if let Ok(uuid) = Uuid::from_slice(id_col.value(row)) {
                     if target_ids.contains(&uuid) {
                         let values = signal_col.value(row);
-                        let u64_arr = values
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or_else(|| Error::InvalidField {
-                                field: "signal".to_string(),
-                                message: "Expected UInt64Array values".to_string(),
-                            })?;
+                        let u64_arr =
+                            values
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .ok_or_else(|| Error::InvalidField {
+                                    field: "signal".to_string(),
+                                    message: "Expected UInt64Array values".to_string(),
+                                })?;
                         results.push((uuid, u64_arr.values().to_vec()));
                         if results.len() == n {
                             return Ok(results);
@@ -1332,7 +1479,7 @@ impl Reader {
     fn find_signal_rows_with_calibration_scan(
         &self,
         target_ids: &HashSet<Uuid>,
-    ) -> Result<Vec<(Uuid, Vec<u64>, f32, f32)>> {
+    ) -> Result<SignalCalibrationResult> {
         use arrow::array::{Array, FixedSizeBinaryArray, Float32Array, ListArray, UInt64Array};
 
         let embedded = self
@@ -1383,13 +1530,14 @@ impl Reader {
                 if let Ok(uuid) = Uuid::from_slice(id_col.value(row)) {
                     if target_ids.contains(&uuid) {
                         let values = signal_col.value(row);
-                        let u64_arr = values
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or_else(|| Error::InvalidField {
-                                field: "signal".to_string(),
-                                message: "Expected UInt64Array values".to_string(),
-                            })?;
+                        let u64_arr =
+                            values
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .ok_or_else(|| Error::InvalidField {
+                                    field: "signal".to_string(),
+                                    message: "Expected UInt64Array values".to_string(),
+                                })?;
                         results.push((
                             uuid,
                             u64_arr.values().to_vec(),
