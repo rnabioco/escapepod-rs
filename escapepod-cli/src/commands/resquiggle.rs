@@ -10,17 +10,17 @@ use rayon::prelude::*;
 
 use escapepod::parse_uuid_flexible;
 use escapepod::resquiggle::{
-    calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map, BandingAlgo,
-    KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams, RoughRescaleAlgo,
+    BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
+    RoughRescaleAlgo, calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map,
 };
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
 use noodles_sam as sam;
-use sam::alignment::record::data::field::Tag;
-use sam::alignment::record_buf::data::field::value::Array;
-use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::RecordBuf;
-use sam::header::record::value::map::{program::tag as pg_tag, Map, Program};
+use sam::alignment::record::data::field::Tag;
+use sam::alignment::record_buf::data::field::Value;
+use sam::alignment::record_buf::data::field::value::Array;
+use sam::header::record::value::map::{Map, Program, program::tag as pg_tag};
 
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;

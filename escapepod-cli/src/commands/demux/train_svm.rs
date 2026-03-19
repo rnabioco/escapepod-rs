@@ -4,7 +4,7 @@
 //! with probability output. Only available with the `train` feature.
 
 use crate::style;
-use escapepod::demux::{train_svm, TrainConfig};
+use escapepod::demux::{TrainConfig, train_svm};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

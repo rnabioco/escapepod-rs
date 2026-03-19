@@ -3,7 +3,7 @@
 
 //! Signal band and sequence band computation for banded dynamic programming.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// A band constraining the DP search space.
 ///

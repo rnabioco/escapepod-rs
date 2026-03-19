@@ -43,14 +43,14 @@ pub mod types;
 pub mod writer;
 
 // Re-export CLI-facing utilities
-pub use fields::{determine_fields, get_field_value, FieldError, ALL_FIELDS, DEFAULT_FIELDS};
+pub use fields::{ALL_FIELDS, DEFAULT_FIELDS, FieldError, determine_fields, get_field_value};
 pub use utils::parse_uuid_flexible;
-pub use utils::{compute_n50, compute_statistics, Statistics};
+pub use utils::{Statistics, compute_n50, compute_statistics};
 
 // Re-export commonly used types
 pub use error::{Error, Result};
-pub use merge::{merge_files, MergeOptions, MergePhase, MergeProgress, MergeResult};
-pub use operations::{repack_files, RepackOptions, RepackResult};
+pub use merge::{MergeOptions, MergePhase, MergeProgress, MergeResult, merge_files};
+pub use operations::{RepackOptions, RepackResult, repack_files};
 pub use reader::ReadIndex;
 pub use reader::Reader;
 pub use reader::SignalExtractor;

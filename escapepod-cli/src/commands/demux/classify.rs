@@ -2,7 +2,7 @@
 
 use super::utils::parse_reference_csv;
 use crate::style;
-use escapepod::demux::{classify_with_svm, load_svm_model, DtwSvmModel};
+use escapepod::demux::{DtwSvmModel, classify_with_svm, load_svm_model};
 use escapepod::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
 use std::fs::File;

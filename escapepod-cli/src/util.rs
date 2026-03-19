@@ -3,9 +3,9 @@
 use escapepod::Reader;
 use noodles_bam as bam;
 #[cfg(feature = "experimental")]
-use noodles_csi::binning_index::ReferenceSequence as _;
-#[cfg(feature = "experimental")]
 use noodles_csi::BinningIndex;
+#[cfg(feature = "experimental")]
+use noodles_csi::binning_index::ReferenceSequence as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 

@@ -1,11 +1,11 @@
 //! Main POD5 file reader.
 
+use crate::CompressedSignalChunk;
 use crate::arrow_helpers::BatchFieldExtractor;
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
-use crate::types::{ReadData, RunInfoData, Uuid, POD5_SIGNATURE};
-use crate::CompressedSignalChunk;
+use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
@@ -1047,21 +1047,19 @@ impl Reader {
         }
 
         // Validate file identifier matches
-        let stored_file_id = Uuid::from_slice(&header[5..21])
-            .map_err(|e| Error::InvalidUuid(e.to_string()))?;
+        let stored_file_id =
+            Uuid::from_slice(&header[5..21]).map_err(|e| Error::InvalidUuid(e.to_string()))?;
         let our_file_id = Uuid::parse_str(self.file_identifier())
             .map_err(|e| Error::InvalidUuid(e.to_string()))?;
         let stored_size = u64::from_le_bytes(header[21..29].try_into().unwrap());
         let actual_size = self.mmap.len() as u64;
         if stored_file_id != our_file_id || stored_size != actual_size {
             return Err(Error::InvalidFooter(
-                ".p5i does not match POD5 file; rebuild with `escpod index`"
-                    .to_string(),
+                ".p5i does not match POD5 file; rebuild with `escpod index`".to_string(),
             ));
         }
 
-        let count =
-            u32::from_le_bytes(header[29..33].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(header[29..33].try_into().unwrap()) as usize;
 
         // Read remaining bytes and zstd-decompress to get the entries
         let mut compressed = Vec::new();
@@ -1081,12 +1079,8 @@ impl Reader {
         for i in 0..count {
             let offset = i * 24;
             let uuid_bytes: [u8; 16] = buf[offset..offset + 16].try_into().unwrap();
-            let batch_idx = u32::from_le_bytes(
-                buf[offset + 16..offset + 20].try_into().unwrap(),
-            );
-            let row_idx = u32::from_le_bytes(
-                buf[offset + 20..offset + 24].try_into().unwrap(),
-            );
+            let batch_idx = u32::from_le_bytes(buf[offset + 16..offset + 20].try_into().unwrap());
+            let row_idx = u32::from_le_bytes(buf[offset + 20..offset + 24].try_into().unwrap());
             entries.push((uuid_bytes, batch_idx, row_idx));
         }
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1310,8 +1304,7 @@ impl Reader {
             .footer
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let mut reader =
-            self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1]))?;
+        let mut reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1]))?;
 
         let mut results = Vec::with_capacity(target_ids.len());
         for (batch_idx, targets) in batch_targets {
@@ -1330,14 +1323,13 @@ impl Reader {
                 })?;
             for (uuid, row) in targets {
                 let values = signal_col.value(row);
-                let u64_arr =
-                    values
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::InvalidField {
-                            field: "signal".to_string(),
-                            message: "Expected UInt64Array values".to_string(),
-                        })?;
+                let u64_arr = values
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "signal".to_string(),
+                        message: "Expected UInt64Array values".to_string(),
+                    })?;
                 results.push((uuid, u64_arr.values().to_vec()));
             }
         }
@@ -1402,21 +1394,20 @@ impl Reader {
                 })?;
             for (uuid, row) in targets {
                 let values = signal_col.value(row);
-                let u64_arr =
-                    values
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::InvalidField {
-                            field: "signal".to_string(),
-                            message: "Expected UInt64Array values".to_string(),
-                            })?;
-                    results.push((
-                        uuid,
-                        u64_arr.values().to_vec(),
-                        cal_offset_col.value(row),
-                        cal_scale_col.value(row),
-                    ));
-                }
+                let u64_arr = values
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "signal".to_string(),
+                        message: "Expected UInt64Array values".to_string(),
+                    })?;
+                results.push((
+                    uuid,
+                    u64_arr.values().to_vec(),
+                    cal_offset_col.value(row),
+                    cal_scale_col.value(row),
+                ));
+            }
         }
         Ok(results)
     }

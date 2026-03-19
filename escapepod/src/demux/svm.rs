@@ -12,7 +12,7 @@
 use crate::dtw::dtw_distance;
 
 use super::model::{DtwSvmModel, KernelParams};
-use super::probability::{process_probabilities, ProbabilityResult};
+use super::probability::{ProbabilityResult, process_probabilities};
 
 // Re-export SvmModel as an alias for DtwSvmModel for backwards compatibility
 pub type SvmModel = DtwSvmModel;

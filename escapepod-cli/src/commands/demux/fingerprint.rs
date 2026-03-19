@@ -6,8 +6,8 @@ use super::utils::{
 };
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod::dtw::NormMethod;
 use escapepod::Reader;
+use escapepod::dtw::NormMethod;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};

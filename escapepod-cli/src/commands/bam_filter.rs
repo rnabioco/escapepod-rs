@@ -8,7 +8,7 @@ use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{ensure_bai_index, resolve_pod5_inputs};
 use bstr::ByteSlice;
-use escapepod::operations::{filter_files, FilterOptions};
+use escapepod::operations::{FilterOptions, filter_files};
 use escapepod::parse_uuid_flexible;
 use noodles_bam as bam;
 use noodles_core::Region;

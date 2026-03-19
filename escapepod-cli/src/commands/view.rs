@@ -3,7 +3,7 @@
 //! Produces a tabular summary of reads from POD5 files.
 
 use crate::util::{
-    get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs, OpenResult,
+    OpenResult, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
 };
 use escapepod::{determine_fields, get_field_value};
 use std::fs::File;
@@ -74,7 +74,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use escapepod::{determine_fields, ALL_FIELDS, DEFAULT_FIELDS};
+    use escapepod::{ALL_FIELDS, DEFAULT_FIELDS, determine_fields};
 
     #[test]
     fn test_determine_fields_default() {
@@ -146,10 +146,12 @@ mod tests {
         let exclude = DEFAULT_FIELDS.join(",");
         let result = determine_fields(None, Some(&exclude), false);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No fields selected"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No fields selected")
+        );
     }
 
     #[test]

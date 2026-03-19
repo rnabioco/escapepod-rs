@@ -10,9 +10,9 @@ mod split;
 mod subset;
 
 pub use filter::{
-    filter_files, filter_files_with_criteria, read_ids_from_file, FilterCriteria, FilterOptions,
-    FilterResult,
+    FilterCriteria, FilterOptions, FilterResult, filter_files, filter_files_with_criteria,
+    read_ids_from_file,
 };
-pub use repack::{repack_files, RepackOptions, RepackResult};
+pub use repack::{RepackOptions, RepackResult, repack_files};
 pub use split::parse_barcode_mapping;
 pub use subset::parse_csv_mapping;

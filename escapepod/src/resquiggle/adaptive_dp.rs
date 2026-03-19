@@ -7,7 +7,7 @@
 //! bandwidth.
 
 use super::bands::Band;
-use super::dp::{banded_traceback, DpContext};
+use super::dp::{DpContext, banded_traceback};
 use super::types::RefineAlgo;
 
 /// Run adaptive banded DP.

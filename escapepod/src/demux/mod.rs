@@ -57,16 +57,16 @@ mod svm;
 mod train;
 
 // Legacy exports (distance-based classifier)
-pub use classify::{classify_read, ClassificationResult};
-pub use model::{load_model, KernelParams, WarpDemuxModel};
+pub use classify::{ClassificationResult, classify_read};
+pub use model::{KernelParams, WarpDemuxModel, load_model};
 
 // New SVM exports
-pub use model::{load_svm_model, DtwSvmModel};
+pub use model::{DtwSvmModel, load_svm_model};
 pub use probability::{
-    confidence_margin, format_probability_columns, process_probabilities, softmax,
-    ProbabilityResult,
+    ProbabilityResult, confidence_margin, format_probability_columns, process_probabilities,
+    softmax,
 };
-pub use svm::{classify_with_svm, compute_distances, distances_to_kernel, SvmModel, SvmPredictor};
+pub use svm::{SvmModel, SvmPredictor, classify_with_svm, compute_distances, distances_to_kernel};
 
 // Training exports (feature-gated)
 #[cfg(feature = "train")]

@@ -137,11 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t0 = Instant::now();
         let matched = reader.reads_by_ids(&target_ids)?;
         let elapsed = t0.elapsed();
-        println!(
-            "  Found {} reads in {:.2?}",
-            matched.len(),
-            elapsed,
-        );
+        println!("  Found {} reads in {:.2?}", matched.len(), elapsed,);
 
         println!("\n=== reads().collect() + filter ===");
         let reader = Reader::open(pod5_path)?;

@@ -6,10 +6,10 @@
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use escapepod::{repack_files, RepackOptions};
+use escapepod::{RepackOptions, repack_files};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Result<()> {
     if inputs.is_empty() {

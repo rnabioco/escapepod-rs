@@ -1,15 +1,15 @@
 //! Main POD5 file writer.
 
+use crate::CompressedSignalChunk;
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::schema::{reads_schema, run_info_schema, signal_schema};
-use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION};
-use crate::CompressedSignalChunk;
+use crate::types::{FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION, ReadData, RunInfoData, Uuid};
 use arrow::array::{
     ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder,
     LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StringDictionaryBuilder, TimestampMillisecondBuilder, UInt16Builder, UInt32Builder,
-    UInt64Builder, UInt8Builder,
+    StringDictionaryBuilder, TimestampMillisecondBuilder, UInt8Builder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::Int16Type;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;

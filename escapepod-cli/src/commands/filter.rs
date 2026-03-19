@@ -8,7 +8,7 @@ use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
 use escapepod::operations::{
-    filter_files_with_criteria, read_ids_from_file, FilterCriteria, FilterOptions,
+    FilterCriteria, FilterOptions, filter_files_with_criteria, read_ids_from_file,
 };
 use escapepod::types::EndReason;
 use std::collections::HashSet;

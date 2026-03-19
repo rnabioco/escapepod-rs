@@ -5,7 +5,7 @@
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use escapepod::{merge_files, MergeOptions, MergePhase, MergeProgress};
+use escapepod::{MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

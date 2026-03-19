@@ -6,10 +6,10 @@
 use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
-use crate::types::{ReadData, RunInfoData, Uuid, FOOTER_MAGIC, POD5_SIGNATURE};
+use crate::types::{FOOTER_MAGIC, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::table_builders::{
-    build_arrow_ipc_footer, build_pod5_footer, build_reads_table, build_run_info_table,
-    SchemaMetadata,
+    SchemaMetadata, build_arrow_ipc_footer, build_pod5_footer, build_reads_table,
+    build_run_info_table,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};

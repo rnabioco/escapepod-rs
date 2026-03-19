@@ -39,7 +39,9 @@ pub const DEFAULT_FIELDS: &[&str] = &[
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum FieldError {
     /// An unknown field was specified.
-    #[error("Unknown field '{0}'. Available fields: read_id, channel, well, pore_type, read_number, start_sample, median_before, end_reason, end_reason_forced, num_samples, num_minknow_events, calibration_offset, calibration_scale, run_info, open_pore_level")]
+    #[error(
+        "Unknown field '{0}'. Available fields: read_id, channel, well, pore_type, read_number, start_sample, median_before, end_reason, end_reason_forced, num_samples, num_minknow_events, calibration_offset, calibration_scale, run_info, open_pore_level"
+    )]
     UnknownField(String),
 
     /// No fields were selected for output.

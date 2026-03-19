@@ -6,13 +6,13 @@
 use crate::arrow_ipc::BatchBlock;
 use crate::error::Result;
 use crate::schema::{reads_schema, run_info_schema};
-use crate::types::{ReadData, RunInfoData, Uuid, POD5_VERSION};
+use crate::types::{POD5_VERSION, ReadData, RunInfoData, Uuid};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, FixedSizeBinaryArray,
     FixedSizeBinaryBuilder, Float32Array, Float32Builder, Int16Array, Int16Builder, ListArray,
     ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    TimestampMillisecondBuilder, UInt16Array, UInt16Builder, UInt32Array, UInt32Builder,
-    UInt64Array, UInt64Builder, UInt8Array, UInt8Builder,
+    TimestampMillisecondBuilder, UInt8Array, UInt8Builder, UInt16Array, UInt16Builder, UInt32Array,
+    UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::compute::concat;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;

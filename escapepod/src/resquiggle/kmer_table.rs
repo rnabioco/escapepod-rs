@@ -3,7 +3,7 @@
 
 //! Kmer table loading and level extraction.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use flate2::read::GzDecoder;
 use std::collections::HashSet;
 use std::fs::File;

@@ -5,8 +5,8 @@
 use crate::{Reader, Result, Writer, WriterOptions};
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::NamedTempFile;
 
 /// Options for the repack operation.

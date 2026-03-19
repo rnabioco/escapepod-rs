@@ -678,7 +678,10 @@ impl<'a> ParsedBatch<'a> {
         if read_id_data.is_empty() || signal_offsets.is_empty() || samples_data.is_empty() {
             return Err(Error::InvalidArrowIpc(format!(
                 "Could not locate all required buffers. Found: read_id={}, offsets={}, signal={}, samples={}",
-                read_id_data.len(), signal_offsets.len(), signal_data.len(), samples_data.len()
+                read_id_data.len(),
+                signal_offsets.len(),
+                signal_data.len(),
+                samples_data.len()
             )));
         }
 

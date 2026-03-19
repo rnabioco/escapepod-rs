@@ -3,7 +3,7 @@
 
 //! Signal rescaling algorithms (least squares and Theil-Sen).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rand::seq::IteratorRandom;
 
 use super::types::{RescaleAlgo, RoughRescaleAlgo};

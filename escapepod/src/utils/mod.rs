@@ -10,5 +10,5 @@ pub(crate) mod table_builders;
 mod uuid;
 
 // Public re-exports (exposed through lib.rs)
-pub use statistics::{compute_n50, compute_statistics, Statistics};
+pub use statistics::{Statistics, compute_n50, compute_statistics};
 pub use uuid::parse_uuid_flexible;

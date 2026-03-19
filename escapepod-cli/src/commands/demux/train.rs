@@ -7,8 +7,8 @@ use super::utils::{
 };
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod::segmentation::detect_adapter;
 use escapepod::Reader;
+use escapepod::segmentation::detect_adapter;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

@@ -7,8 +7,8 @@ use crate::error::{Error, Result};
 use crate::types::Uuid;
 use arrow::array::{
     Array, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, Int16Array,
-    ListArray, StringArray, TimestampMillisecondArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    ListArray, StringArray, TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::Int16Type;
 use arrow::record_batch::RecordBatch;
