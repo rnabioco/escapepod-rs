@@ -25,7 +25,7 @@ pub(crate) mod schema;
 
 // Modules with some public re-exports (implementation details hidden)
 mod fields;
-#[allow(unused_imports, dead_code, clippy::all)]
+#[allow(unused_imports, dead_code, clippy::all, unsafe_op_in_unsafe_fn)]
 mod flatbuffers_gen;
 mod utils;
 

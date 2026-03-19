@@ -294,7 +294,7 @@ impl WarpDemuxModel {
         // Build reverse map inline - for frequent lookups, consider caching
         self.label_map
             .iter()
-            .find(|(_, &id)| id == label_id)
+            .find(|&(_, &id)| id == label_id)
             .map(|(name, _)| name.clone())
             .unwrap_or_else(|| format!("unknown_{}", label_id))
     }

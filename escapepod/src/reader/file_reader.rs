@@ -356,7 +356,7 @@ impl Reader {
             .signal_metadata
             .get_or_init(|| Self::load_signal_metadata(&self.mmap, &self.footer).unwrap_or(None));
 
-        if let Some(ref metadata) = metadata {
+        if let Some(metadata) = metadata {
             return self.get_signal_optimized(signal_rows, metadata);
         }
 
@@ -661,7 +661,7 @@ impl Reader {
             .signal_metadata
             .get_or_init(|| Self::load_signal_metadata(&self.mmap, &self.footer).unwrap_or(None));
 
-        if let Some(ref metadata) = metadata {
+        if let Some(metadata) = metadata {
             return self.get_compressed_signal_optimized(signal_rows, metadata);
         }
 
