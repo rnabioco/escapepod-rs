@@ -64,21 +64,21 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/dist
-          tar czvf ../../../escapepod-${{ github.ref_name }}-${{ matrix.target }}.tar.gz escapepod
+          tar czvf ../../../escpod-${{ github.ref_name }}-${{ matrix.target }}.tar.gz escpod
           cd ../../..
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/dist
-          7z a ../../../escapepod-${{ github.ref_name }}-${{ matrix.target }}.zip escapepod.exe
+          7z a ../../../escpod-${{ github.ref_name }}-${{ matrix.target }}.zip escpod.exe
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: escapepod-${{ matrix.target }}
-          path: escapepod-${{ github.ref_name }}-${{ matrix.target }}.*
+          name: escpod-${{ matrix.target }}
+          path: escpod-${{ github.ref_name }}-${{ matrix.target }}.*
 
   release:
     name: Create Release
@@ -96,7 +96,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum escapepod-* > SHA256SUMS.txt
+          sha256sum escpod-* > SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
