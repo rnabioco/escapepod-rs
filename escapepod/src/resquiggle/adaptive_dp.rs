@@ -187,11 +187,10 @@ pub fn adaptive_banded_dp(
             .copied()
             .fold(f32::INFINITY, f32::min);
         best_min_score = best_min_score.min(current_min);
-        if let Some(threshold) = x_drop {
-            if current_min > best_min_score + threshold {
+        if let Some(threshold) = x_drop
+            && current_min > best_min_score + threshold {
                 return initial_map.to_vec();
             }
-        }
 
         all_traceback.push(curr_traceback[..bw].to_vec());
         std::mem::swap(&mut prev_scores, &mut curr_scores);

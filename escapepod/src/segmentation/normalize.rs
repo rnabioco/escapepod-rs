@@ -10,7 +10,7 @@
 #[inline]
 fn median_sorted(sorted: &[f32]) -> f32 {
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]

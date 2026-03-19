@@ -171,7 +171,7 @@ impl LlrTrace {
 
         for i in (search_start..search_end).step_by(self.stride) {
             // Check for early stopping
-            if i >= search_start + early_stop_window && (i - search_start) % early_stop_stride == 0
+            if i >= search_start + early_stop_window && (i - search_start).is_multiple_of(early_stop_stride)
             {
                 // Compute mean derivative over the window
                 let window_start = i - early_stop_window;
@@ -347,7 +347,7 @@ fn median_slice(data: &[f32]) -> f32 {
     // This is O(N) average case vs O(N log N) for full sort
     buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
 
-    if buf.len() % 2 == 0 && mid > 0 {
+    if buf.len().is_multiple_of(2) && mid > 0 {
         // For even length, need to also find max of left partition for true median
         // Since we're only using this for comparisons, approximate with lower middle
         // To get exact even-length median:

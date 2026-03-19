@@ -228,7 +228,7 @@ fn median_sorted(sorted: &[f32]) -> Result<f32> {
         bail!("median of empty slice");
     }
     let len = sorted.len();
-    Ok(if len % 2 == 0 {
+    Ok(if len.is_multiple_of(2) {
         (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
     } else {
         sorted[len / 2]

@@ -62,7 +62,7 @@ pub fn compute_statistics(values: &mut [u64]) -> Statistics {
     let max = *values.last().unwrap_or(&0);
     let mean = total as f64 / count as f64;
 
-    let median = if values.len() % 2 == 0 {
+    let median = if values.len().is_multiple_of(2) {
         let mid = values.len() / 2;
         (values[mid - 1] + values[mid]) / 2
     } else {

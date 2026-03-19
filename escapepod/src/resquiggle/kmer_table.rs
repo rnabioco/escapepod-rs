@@ -76,7 +76,7 @@ impl KmerTable {
             if kmer.is_empty() {
                 bail!("empty kmer");
             }
-            if kmer.len() % 2 == 0 {
+            if kmer.len().is_multiple_of(2) {
                 bail!("even kmer length {} (odd expected)", kmer.len());
             }
 

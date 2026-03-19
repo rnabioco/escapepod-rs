@@ -1267,14 +1267,13 @@ impl Reader {
                     message: "Expected FixedSizeBinaryArray".to_string(),
                 })?;
             for row in 0..batch.num_rows() {
-                if let Ok(uuid) = Uuid::from_slice(id_col.value(row)) {
-                    if target_ids.contains(&uuid) {
+                if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
+                    && target_ids.contains(&uuid) {
                         results.push(extract_read_from_batch(&batch, row, true)?);
                         if results.len() == n {
                             return Ok(results);
                         }
                     }
-                }
             }
         }
         Ok(results)
@@ -1445,8 +1444,8 @@ impl Reader {
                     message: "Expected ListArray".to_string(),
                 })?;
             for row in 0..batch.num_rows() {
-                if let Ok(uuid) = Uuid::from_slice(id_col.value(row)) {
-                    if target_ids.contains(&uuid) {
+                if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
+                    && target_ids.contains(&uuid) {
                         let values = signal_col.value(row);
                         let u64_arr =
                             values
@@ -1461,7 +1460,6 @@ impl Reader {
                             return Ok(results);
                         }
                     }
-                }
             }
         }
         Ok(results)
@@ -1518,8 +1516,8 @@ impl Reader {
                     message: "Expected Float32Array".to_string(),
                 })?;
             for row in 0..batch.num_rows() {
-                if let Ok(uuid) = Uuid::from_slice(id_col.value(row)) {
-                    if target_ids.contains(&uuid) {
+                if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
+                    && target_ids.contains(&uuid) {
                         let values = signal_col.value(row);
                         let u64_arr =
                             values
@@ -1539,7 +1537,6 @@ impl Reader {
                             return Ok(results);
                         }
                     }
-                }
             }
         }
         Ok(results)
@@ -1663,8 +1660,8 @@ impl Reader {
             return HashMap::new();
         };
 
-        if struct_array.num_columns() >= 2 {
-            if let (Some(keys), Some(values)) = (
+        if struct_array.num_columns() >= 2
+            && let (Some(keys), Some(values)) = (
                 struct_array
                     .column(0)
                     .as_any()
@@ -1680,7 +1677,6 @@ impl Reader {
                     }
                 }
             }
-        }
 
         result
     }

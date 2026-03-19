@@ -221,11 +221,10 @@ fn read_ids_from_bam_region(
         let record = result?;
         *records_scanned += 1;
 
-        if should_include_record(&record, mapped_only, min_quality)? {
-            if let Some(uuid) = extract_read_id(&record)? {
+        if should_include_record(&record, mapped_only, min_quality)?
+            && let Some(uuid) = extract_read_id(&record)? {
                 ids.insert(uuid);
             }
-        }
     }
 
     Ok(())
@@ -248,11 +247,10 @@ fn read_ids_from_bam_full(
         let record = result?;
         *records_scanned += 1;
 
-        if should_include_record(&record, mapped_only, min_quality)? {
-            if let Some(uuid) = extract_read_id(&record)? {
+        if should_include_record(&record, mapped_only, min_quality)?
+            && let Some(uuid) = extract_read_id(&record)? {
                 ids.insert(uuid);
             }
-        }
     }
 
     // Silence unused variable warning

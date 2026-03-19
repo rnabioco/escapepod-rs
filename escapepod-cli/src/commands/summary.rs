@@ -147,12 +147,11 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
         let batch_count = reader.read_batch_count().unwrap_or(0);
 
         // Get run info from first file
-        if run_info.is_none() {
-            if let Some(ri) = reader.run_infos().first() {
+        if run_info.is_none()
+            && let Some(ri) = reader.run_infos().first() {
                 run_info = Some(ri.clone());
                 sample_rate = ri.sample_rate;
             }
-        }
 
         // Count reads and collect stats
         let mut file_read_count = 0u64;

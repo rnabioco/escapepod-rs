@@ -73,7 +73,7 @@ pub fn distance_to_kernel_auto(distances: &Array2<f32>, power: f32) -> (Array2<f
     }
 
     dist_vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = if dist_vec.len() % 2 == 0 {
+    let median = if dist_vec.len().is_multiple_of(2) {
         let mid = dist_vec.len() / 2;
         (dist_vec[mid - 1] + dist_vec[mid]) / 2.0
     } else {
