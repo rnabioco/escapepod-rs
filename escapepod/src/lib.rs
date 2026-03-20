@@ -27,7 +27,7 @@ pub(crate) mod schema;
 mod fields;
 #[allow(unused_imports, dead_code, clippy::all, unsafe_op_in_unsafe_fn)]
 mod flatbuffers_gen;
-mod utils;
+pub mod utils;
 
 // Public modules
 pub mod compression;

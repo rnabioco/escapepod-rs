@@ -5,6 +5,7 @@
 //! - Statistics computation
 //! - Table building for POD5 output
 
+pub mod dictionary;
 mod statistics;
 pub(crate) mod table_builders;
 mod uuid;

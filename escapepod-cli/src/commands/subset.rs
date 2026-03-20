@@ -1,13 +1,14 @@
 //! Subset command implementation.
 //!
 //! Splits reads into multiple output files based on a CSV mapping.
+//! Uses the optimized filter_files() path for each output group.
 
-use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod::operations::parse_csv_mapping;
-use escapepod::{Reader, RunInfoData, Writer, WriterOptions};
+use escapepod::operations::{FilterOptions, filter_files, parse_csv_mapping};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 pub fn run(
     input: PathBuf,
@@ -22,17 +23,23 @@ pub fn run(
         anyhow::bail!("No valid mappings found in CSV file");
     }
 
-    // Get unique output files
-    let output_files: Vec<&String> = mapping
-        .values()
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+    // Group read IDs by output file
+    let mut groups: HashMap<String, HashSet<Uuid>> = HashMap::new();
+    for (read_id, output_name) in &mapping {
+        groups
+            .entry(output_name.clone())
+            .or_default()
+            .insert(*read_id);
+    }
+
+    let num_groups = groups.len();
+    let total_reads = mapping.len();
+
     println!(
         "{} {} reads into {} output file(s)",
         style::action("Subsetting"),
-        style::count(mapping.len()),
-        style::value(output_files.len())
+        style::count(total_reads),
+        style::value(num_groups)
     );
 
     // Ensure output directory exists
@@ -40,7 +47,7 @@ pub fn run(
 
     // Check for existing files if not forcing
     if !force {
-        for output_name in &output_files {
+        for output_name in groups.keys() {
             let output_path = output_dir.join(output_name);
             if output_path.exists() {
                 anyhow::bail!(
@@ -51,69 +58,41 @@ pub fn run(
         }
     }
 
-    // Open reader
-    let reader = Reader::open(&input)?;
-    let run_infos: Vec<RunInfoData> = reader.run_infos().to_vec();
+    let options = FilterOptions {
+        signal_batch_size: 1_000,
+        read_batch_size: 10_000,
+    };
 
-    // Create writers for each output file
-    let mut writers: HashMap<String, Writer> = HashMap::new();
-    let mut write_counts: HashMap<String, u64> = HashMap::new();
-    let options = WriterOptions::default();
+    // Process all output groups in parallel using the optimized filter path
+    let group_list: Vec<_> = groups.into_iter().collect();
+    let results: Vec<anyhow::Result<(String, u64)>> = group_list
+        .par_iter()
+        .map(|(output_name, group_ids)| {
+            let output_path = output_dir.join(output_name);
+            let input_files = [&input];
+            let result =
+                filter_files(&input_files, &output_path, group_ids, options.clone(), None)?;
+            Ok((output_name.clone(), result.matched_reads))
+        })
+        .collect();
 
-    for output_name in output_files {
-        let output_path = output_dir.join(output_name);
-        let mut writer = Writer::create(&output_path, options.clone())?;
-
-        // Add all run infos to each writer
-        for run_info in &run_infos {
-            writer.add_run_info(run_info.clone())?;
-        }
-
-        writers.insert(output_name.clone(), writer);
-        write_counts.insert(output_name.clone(), 0);
+    let mut total_matched = 0u64;
+    for result in results {
+        let (name, matched) = result?;
+        let output_path = output_dir.join(&name);
+        println!(
+            "  {} ({} reads)",
+            style::path(output_path.display()),
+            style::count(matched)
+        );
+        total_matched += matched;
     }
 
-    // Use reads_by_ids() to only deserialize matching reads
-    let target_ids: HashSet<_> = mapping.keys().copied().collect();
-    let total_read_count = reader.read_count()? as u64;
-    let matching_reads = reader.reads_by_ids(&target_ids)?;
-
-    let progress = create_progress_bar(matching_reads.len() as u64, "Subsetting")?;
-    progress.set_message("reads");
-
-    let mut matched = 0u64;
-
-    // Process only matching reads
-    for read in &matching_reads {
-        if let Some(output_name) = mapping.get(&read.read_id) {
-            // Use compressed signal to avoid decompress/recompress overhead
-            let compressed_signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
-
-            let new_read = read.for_writing_same_run();
-
-            if let Some(writer) = writers.get_mut(output_name) {
-                writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
-                *write_counts.get_mut(output_name).unwrap() += 1;
-            }
-
-            matched += 1;
-        }
-
-        progress.inc(1);
-    }
-
-    let unmatched = total_read_count.saturating_sub(matched);
-
-    progress.finish_with_message("done");
-
-    // Finalize all writers
-    for (_name, writer) in writers {
-        writer.finish()?;
-    }
+    let unmatched = (total_reads as u64).saturating_sub(total_matched);
 
     // Print summary
     println!("\n{}", style::header("Subset summary:"));
-    println!("  Matched reads: {}", style::count(matched));
+    println!("  Matched reads: {}", style::count(total_matched));
     println!(
         "  Unmatched reads: {}",
         if unmatched > 0 {
@@ -122,15 +101,6 @@ pub fn run(
             unmatched.to_string()
         }
     );
-    println!("\n{}", style::label("Output files:"));
-    for (name, count) in &write_counts {
-        let path = output_dir.join(name);
-        println!(
-            "  {} ({} reads)",
-            style::path(path.display()),
-            style::count(count)
-        );
-    }
 
     Ok(())
 }

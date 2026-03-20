@@ -45,40 +45,40 @@ pub enum DemuxCommand {
     /// Detect adapter boundaries in reads using LLR algorithm
     #[command(after_help = "\
 Examples:
-  escapepod demux detect input.pod5 -o boundaries.csv
-  escapepod demux detect *.pod5 -o boundaries.csv --min-adapter 200 -j 8
+  escpod demux detect input.pod5 -o boundaries.csv
+  escpod demux detect *.pod5 -o boundaries.csv --min-adapter 200 -j 8
 ")]
     Detect(DetectArgs),
 
     /// Extract barcode fingerprints from adapter regions
     #[command(after_help = "\
 Examples:
-  escapepod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
-  escapepod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
+  escpod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
+  escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
 ")]
     Fingerprint(FingerprintArgs),
 
     /// Classify reads by barcode using DTW distance
     #[command(after_help = "\
 Examples:
-  escapepod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
-  escapepod demux classify fingerprints.csv --reference barcodes.csv -o out.csv --window 10
+  escpod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
+  escpod demux classify fingerprints.csv --reference barcodes.csv -o out.csv --window 10
 ")]
     Classify(ClassifyArgs),
 
     /// Split reads into separate POD5 files by barcode
     #[command(after_help = "\
 Examples:
-  escapepod demux split input.pod5 --classifications classifications.csv --output-dir demuxed/
-  escapepod demux split *.pod5 --classifications classifications.csv -d out/ --prefix bc
+  escpod demux split input.pod5 --classifications classifications.csv --output-dir demuxed/
+  escpod demux split *.pod5 --classifications classifications.csv -d out/ --prefix bc
 ")]
     Split(SplitArgs),
 
     /// Train reference barcode fingerprints from known samples
     #[command(after_help = "\
 Examples:
-  escapepod demux train --input-dir barcodes/ -o reference.json
-  escapepod demux train --assignments assignments.csv -o reference.json
+  escpod demux train --input-dir barcodes/ -o reference.json
+  escpod demux train --assignments assignments.csv -o reference.json
 ")]
     Train(TrainArgs),
 
@@ -88,8 +88,8 @@ Examples:
         name = "train-svm",
         after_help = "\
 Examples:
-  escapepod demux train-svm -f fingerprints.csv -o model.json
-  escapepod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
+  escpod demux train-svm -f fingerprints.csv -o model.json
+  escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
 "
     )]
     TrainSvm(TrainSvmArgs),

@@ -16,7 +16,7 @@ const STYLES: Styles = Styles::styled()
     .placeholder(AnsiColor::Cyan.on_default());
 
 #[derive(Parser)]
-#[command(name = "escapepod")]
+#[command(name = "escpod")]
 #[command(author, version, styles = STYLES)]
 #[command(about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data)")]
 #[command(
@@ -26,12 +26,12 @@ provides commands for viewing, inspecting, merging, filtering, and subsetting PO
 )]
 #[command(after_help = "\
 Examples:
-  escapepod view input.pod5                    View all reads as TSV
-  escapepod view input.pod5 --ids              Extract just read IDs
-  escapepod inspect summary input.pod5         Show file summary
-  escapepod merge *.pod5 -o merged.pod5        Merge multiple files
-  escapepod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
-  escapepod summary input.pod5                 Comprehensive statistics
+  escpod view input.pod5                    View all reads as TSV
+  escpod view input.pod5 --ids              Extract just read IDs
+  escpod inspect summary input.pod5         Show file summary
+  escpod merge *.pod5 -o merged.pod5        Merge multiple files
+  escpod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
+  escpod summary input.pod5                 Comprehensive statistics
 ")]
 struct Cli {
     #[command(subcommand)]
@@ -43,12 +43,12 @@ enum Commands {
     /// View read summaries from a POD5 file as TSV
     #[command(after_help = "\
 Examples:
-  escapepod view input.pod5                      Output all fields as TSV
-  escapepod view input.pod5 --ids                Output only read IDs
-  escapepod view input.pod5 --include read_id,channel
-  escapepod view input.pod5 --exclude signal_rows,pore_type
-  escapepod view input.pod5 -o reads.tsv         Write to file
-  escapepod view input.pod5 --separator ','      Use comma separator
+  escpod view input.pod5                      Output all fields as TSV
+  escpod view input.pod5 --ids                Output only read IDs
+  escpod view input.pod5 --include read_id,channel
+  escpod view input.pod5 --exclude signal_rows,pore_type
+  escpod view input.pod5 -o reads.tsv         Write to file
+  escpod view input.pod5 --separator ','      Use comma separator
 ")]
     View {
         /// Input POD5 file
@@ -82,9 +82,9 @@ Examples:
     /// Inspect POD5 file contents
     #[command(after_help = "\
 Examples:
-  escapepod inspect summary input.pod5           Show file summary
-  escapepod inspect reads input.pod5             List all read IDs
-  escapepod inspect read input.pod5 <READ_ID>    Show details for one read
+  escpod inspect summary input.pod5           Show file summary
+  escpod inspect reads input.pod5             List all read IDs
+  escpod inspect read input.pod5 <READ_ID>    Show details for one read
 ")]
     Inspect {
         #[command(subcommand)]
@@ -94,9 +94,9 @@ Examples:
     /// Merge multiple POD5 files into one
     #[command(after_help = "\
 Examples:
-  escapepod merge *.pod5 -o merged.pod5          Merge all POD5 files
-  escapepod merge a.pod5 b.pod5 -o out.pod5      Merge specific files
-  escapepod merge *.pod5 -o out.pod5 --duplicate-ok
+  escpod merge *.pod5 -o merged.pod5          Merge all POD5 files
+  escpod merge a.pod5 b.pod5 -o out.pod5      Merge specific files
+  escpod merge *.pod5 -o out.pod5 --duplicate-ok
 ")]
     Merge {
         /// Input POD5 files
@@ -123,11 +123,11 @@ Examples:
     /// Filter reads by various criteria
     #[command(after_help = "\
 Examples:
-  escapepod filter input.pod5 -i ids.txt -o filtered.pod5
-  escapepod filter input.pod5 --min-samples 4000 -o long_reads.pod5
-  escapepod filter input.pod5 --exclude-end-reason unblock_mux_change -o no_rejects.pod5
-  escapepod filter input.pod5 --end-reason signal_positive,signal_negative -o normal.pod5
-  cat ids.txt | escapepod filter input.pod5 -i - -o filtered.pod5
+  escpod filter input.pod5 -i ids.txt -o filtered.pod5
+  escpod filter input.pod5 --min-samples 4000 -o long_reads.pod5
+  escpod filter input.pod5 --exclude-end-reason unblock_mux_change -o no_rejects.pod5
+  escpod filter input.pod5 --end-reason signal_positive,signal_negative -o normal.pod5
+  cat ids.txt | escpod filter input.pod5 -i - -o filtered.pod5
 
 At least one filter criterion must be specified.
 ")]
@@ -190,8 +190,8 @@ At least one filter criterion must be specified.
     #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
-  escapepod repack input.pod5 -o output_dir/
-  escapepod repack *.pod5 -o repacked/ --force
+  escpod repack input.pod5 -o output_dir/
+  escpod repack *.pod5 -o repacked/ --force
 ")]
     Repack {
         /// Input POD5 files
@@ -210,7 +210,7 @@ Examples:
     /// Subset reads into multiple files based on CSV mapping
     #[command(after_help = "\
 Examples:
-  escapepod subset input.pod5 --csv mapping.csv -o output_dir/
+  escpod subset input.pod5 --csv mapping.csv -o output_dir/
 
 The CSV file should have columns: read_id,output
 Each unique 'output' value creates a separate POD5 file.
@@ -235,9 +235,9 @@ Each unique 'output' value creates a separate POD5 file.
     /// Show comprehensive summary of POD5 file(s)
     #[command(after_help = "\
 Examples:
-  escapepod summary input.pod5                   Summary for one file
-  escapepod summary *.pod5                       Summary across all files
-  escapepod summary input.pod5 --json            Output as JSON
+  escpod summary input.pod5                   Summary for one file
+  escpod summary *.pod5                       Summary across all files
+  escpod summary input.pod5 --json            Output as JSON
 ")]
     Summary(commands::summary::SummaryArgs),
 
@@ -245,9 +245,9 @@ Examples:
     #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
-  escapepod demux detect input.pod5 -o boundaries.csv
-  escapepod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
-  escapepod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
+  escpod demux detect input.pod5 -o boundaries.csv
+  escpod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
+  escpod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
 ")]
     Demux(commands::demux::DemuxArgs),
 
@@ -258,10 +258,10 @@ Examples:
     /// Build .p5i read index for fast UUID lookup
     #[command(after_help = "\
 Examples:
-  escapepod index input.pod5                   Index one file
-  escapepod index *.pod5                       Index all POD5 files
-  escapepod index data_dir/                    Index directory recursively
-  escapepod index input.pod5 --force           Overwrite existing index
+  escpod index input.pod5                   Index one file
+  escpod index *.pod5                       Index all POD5 files
+  escpod index data_dir/                    Index directory recursively
+  escpod index input.pod5 --force           Overwrite existing index
 ")]
     Index {
         /// Input POD5 file(s) or directory

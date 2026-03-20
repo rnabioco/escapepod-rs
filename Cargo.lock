@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bstr",

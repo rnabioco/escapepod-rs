@@ -1,53 +1,50 @@
 # Benchmark Results
 
-Comparison of `escapepod-rs` vs the official Python `pod5` tool.
+Comparison of `escapepod-rs` vs the official Python `pod5` tool (v0.3.36).
 
 ## Test Environment
 
-- **CPU**: Apple M3 Pro
-- **Memory**: 18 GB
-- **OS**: macOS (Darwin 25.1.0)
-- **Date**: 2025-12-16
+- **CPU**: Intel Xeon Gold 6240R @ 2.40GHz (96 cores)
+- **Memory**: 753 GB
+- **OS**: Linux (RHEL 9)
+- **Storage**: NFS
+- **Date**: 2026-03-20
 
 ## Test Data
 
 | File | Size | Reads |
 |------|------|-------|
-| FBC74904_90b682e0_e09f0700_0.pod5 | 897 MB | 23,123 |
-| FBC74904_90b682e0_e09f0700_1.pod5 | 2.5 GB | 783 |
-| FBC74904_90b682e0_e09f0700_10.pod5 | 3.1 GB | 1,020 |
-| **Total** | **6.5 GB** | **24,926** |
+| PAY38817_82d9df02_82c8ff31_0.pod5 | 1.5 GB | 159,673 |
+| PAY38817_82d9df02_82c8ff31_1.pod5 | 1.5 GB | 153,075 |
+| **Total** | **3.0 GB** | **312,748** |
 
 ## Results Summary
 
 | Command | escapepod | pod5 (Python/C++) | Speedup |
 |---------|-----------|---------------|---------|
-| inspect summary | 5 ms | 225 ms | **43x faster** |
-| view | 18 ms | 458 ms | **25x faster** |
-| merge (3 files, 6.5 GB) | 1.3 s | 4.6 s | **3.6x faster** |
-| filter (10% of reads) | 66 ms | 539 ms | **8x faster** |
+| inspect summary | 36 ms | 1.7 s | **47x faster** |
+| view | 238 ms | 4.5 s | **19x faster** |
+| merge (1 thread, 2 files, 3 GB) | 4.1 s | 4.1 s | ~1x |
+| merge (4 threads) | 3.0 s | 4.1 s | **1.4x faster** |
+| filter (10% of reads) | 513 ms | 4.7 s | **9x faster** |
+| subset (2 groups) | 2.8 s | 8.3 s | **3x faster** |
 
 ## Analysis
 
 ### Where escapepod excels
 
-- **Read-only operations**: `inspect` and `view` commands are dramatically faster (25-43x) due to:
+- **Read-only operations**: `inspect` and `view` commands are dramatically faster (19-47x) due to:
   - No Python interpreter startup overhead
   - Memory-mapped file I/O
   - Efficient Arrow table iteration
 
-- **Merge operations**: `merge` is **3.6x faster** than pod5 thanks to:
-  - Parallel file reading with rayon
-  - Raw Arrow IPC batch copying without deserialization
-  - Zero-copy async I/O via scoped threads
-  - Memory-mapped input files
-  - 16 MB buffered sequential writes
-
-- **Filter operations**: `filter` is **8x faster** than pod5 due to:
-  - Batch-level parallelism with rayon
+- **Filter and subset operations**: `filter` is **9x faster** and `subset` is **3x faster** than pod5 due to:
+  - Parallel group processing with rayon
   - Block-level signal copying (preserves compression)
-  - Efficient read ID lookup with HashSet
-  - Streaming writes without intermediate buffering
+  - Indexed batch lookup via `.p5i` or `reads_by_ids()` fast path
+  - Single-pass signal extraction per output group
+
+- **Merge operations**: At 1 thread, both tools are ~equal (I/O-bound on NFS). With 4 threads, escapepod is **1.4x faster** thanks to parallel metadata loading and zero-copy signal forwarding.
 
 ## Running Benchmarks
 
@@ -61,5 +58,5 @@ cargo build --release
 
 ### Requirements
 
-- `hyperfine`: `brew install hyperfine`
-- `pod5`: `pip install pod5` (in `~/.venv/bin/pod5`)
+- `hyperfine`: `cargo install hyperfine` or system package manager
+- `pod5`: `pip install pod5` or `pixi add pod5`

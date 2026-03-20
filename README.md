@@ -11,7 +11,7 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 ## Highlights
 
-- **Fast** - Up to 43x faster than Python pod5 tools
+- **Fast** - Up to 47x faster than Python pod5 tools
 - **Memory efficient** - Memory-mapped I/O for large files
 - **Full featured** - View, inspect, merge, filter, subset, and repack
 - **Barcode demultiplexing** - DTW-based classification with SVM support
@@ -21,10 +21,11 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 | Command | escapepod | pod5 | Speedup |
 |---------|-----------|------|---------|
-| inspect | 5 ms | 225 ms | **43x** |
-| view | 18 ms | 458 ms | **25x** |
-| merge | 1.3 s | 4.6 s | **3.6x** |
-| filter | 66 ms | 539 ms | **8x** |
+| inspect | 36 ms | 1.7 s | **47x** |
+| view | 238 ms | 4.5 s | **19x** |
+| filter | 513 ms | 4.7 s | **9x** |
+| subset | 2.8 s | 8.3 s | **3x** |
+| merge | 3.0 s | 4.1 s | **1.4x** |
 
 ## Barcode Demultiplexing
 
