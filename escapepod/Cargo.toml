@@ -6,6 +6,9 @@ rust-version.workspace = true
 description = "Core library for reading and writing POD5 files (Oxford Nanopore)"
 repository.workspace = true
 license.workspace = true
+readme = "../README.md"
+keywords = ["nanopore", "pod5", "sequencing", "bioinformatics"]
+categories = ["science", "parser-implementations"]
 
 [dependencies]
 anyhow = { workspace = true }

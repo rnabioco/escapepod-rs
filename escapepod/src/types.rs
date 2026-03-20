@@ -12,7 +12,7 @@ pub const POD5_SIGNATURE: [u8; 8] = [0x8B, b'P', b'O', b'D', b'\r', b'\n', 0x1A,
 pub const FOOTER_MAGIC: [u8; 8] = *b"FOOTER\0\0";
 
 /// Current POD5 specification version.
-/// See: https://pod5-file-format.readthedocs.io/en/latest/SPECIFICATION.html
+/// See: <https://pod5-file-format.readthedocs.io/en/latest/SPECIFICATION.html>
 pub const POD5_VERSION: &str = "0.3.10";
 
 /// Length of section marker UUIDs in bytes.

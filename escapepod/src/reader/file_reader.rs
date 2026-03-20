@@ -1178,7 +1178,7 @@ impl Reader {
 
     /// Look up signal rows and calibration data for a set of target UUIDs.
     ///
-    /// Same strategy as [`find_signal_rows_by_ids`]: indexed path when
+    /// Same strategy as [`Self::find_signal_rows_by_ids`]: indexed path when
     /// an index exists, single-pass scan otherwise.
     pub fn find_signal_rows_with_calibration_by_ids(
         &self,

@@ -6,6 +6,9 @@ rust-version.workspace = true
 description = "CLI tools for working with POD5 files (Oxford Nanopore)"
 repository.workspace = true
 license.workspace = true
+readme = "../README.md"
+keywords = ["nanopore", "pod5", "sequencing", "bioinformatics", "cli"]
+categories = ["science", "command-line-utilities"]
 
 [[bin]]
 name = "escpod"

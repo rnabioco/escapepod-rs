@@ -90,7 +90,7 @@ pub fn score(expected: f32, measured: f32) -> f32 {
 /// Perform banded DP to find optimal sequence-to-signal alignment.
 ///
 /// Returns a vector of signal indices (length = levels.len() + 1) where
-/// path[i] is the signal position where base i starts, and path[last]
+/// path\[i\] is the signal position where base i starts, and path\[last\]
 /// is the end of the last base.
 pub fn banded_dp(signal: &[f32], levels: &[f32], band: &Band, method: &RefineAlgo) -> Vec<usize> {
     // Build base offsets for flattened score array
