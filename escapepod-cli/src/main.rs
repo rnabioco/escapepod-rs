@@ -271,6 +271,10 @@ Examples:
         /// Overwrite existing .p5i files
         #[arg(short, long)]
         force: bool,
+
+        /// Number of threads for parallel processing (default: all CPUs)
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
     },
 }
 
@@ -379,6 +383,10 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "experimental")]
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
 
-        Commands::Index { inputs, force } => commands::index::run(inputs, force),
+        Commands::Index {
+            inputs,
+            force,
+            threads,
+        } => commands::index::run(inputs, force, threads),
     }
 }
