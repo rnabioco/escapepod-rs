@@ -11,6 +11,11 @@ use crate::read_data::{PyReadData, PyRunInfo};
 ///
 /// Provides access to read metadata and signal data with optimized
 /// lookup paths for single and batch read retrieval.
+///
+/// Can be used as a context manager:
+///
+///     with Reader("reads.pod5") as reader:
+///         reads = reader.get_reads(ids)
 #[pyclass(name = "Reader")]
 pub struct PyReader {
     inner: escapepod::Reader,
@@ -30,6 +35,31 @@ impl PyReader {
         })
     }
 
+    // -- File metadata properties ------------------------------------------
+
+    /// File path this reader was opened from.
+    #[getter]
+    fn path(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    /// File identifier string from the POD5 footer.
+    fn file_identifier(&self) -> &str {
+        self.inner.file_identifier()
+    }
+
+    /// Software that wrote this POD5 file (e.g. "MinKNOW 5.x").
+    fn software(&self) -> &str {
+        self.inner.software()
+    }
+
+    /// POD5 format version string.
+    fn pod5_version(&self) -> &str {
+        self.inner.pod5_version()
+    }
+
+    // -- Read/batch counts -------------------------------------------------
+
     /// Number of reads in the file.
     fn read_count(&self) -> PyResult<usize> {
         self.inner.read_count().map_err(to_py_err)
@@ -40,6 +70,13 @@ impl PyReader {
         self.inner.read_batch_count().map_err(to_py_err)
     }
 
+    /// Total number of signal rows across all batches.
+    fn signal_row_count(&self) -> PyResult<u64> {
+        self.inner.signal_row_count().map_err(to_py_err)
+    }
+
+    // -- Run info ----------------------------------------------------------
+
     /// Get all run info records.
     fn run_infos(&self) -> Vec<PyRunInfo> {
         self.inner
@@ -48,6 +85,8 @@ impl PyReader {
             .map(|ri| PyRunInfo { inner: ri.clone() })
             .collect()
     }
+
+    // -- Read access -------------------------------------------------------
 
     /// Get all read IDs as strings (fast column-projected scan).
     fn read_ids(&self) -> PyResult<Vec<String>> {
@@ -101,6 +140,8 @@ impl PyReader {
             .map(|inner| PyReadData { inner })
             .collect())
     }
+
+    // -- Signal access -----------------------------------------------------
 
     /// Get raw ADC signal for a read as a numpy int16 array.
     ///
@@ -158,6 +199,56 @@ impl PyReader {
             .collect()
     }
 
+    /// Get calibrated pA signal for multiple reads in parallel.
+    ///
+    /// Returns a list of (read_id, signal_pa) tuples. Uses rayon for
+    /// parallel VBZ decompression, then applies per-read calibration.
+    fn get_signals_pa<'py>(
+        &self,
+        py: Python<'py>,
+        reads: Vec<PyRef<'_, PyReadData>>,
+    ) -> PyResult<Vec<(String, Bound<'py, PyArray1<f32>>)>> {
+        let inputs: Vec<(String, Vec<u64>, f32, f32)> = reads
+            .iter()
+            .map(|r| {
+                (
+                    r.inner.read_id.to_string(),
+                    r.inner.signal_rows.clone(),
+                    r.inner.calibration_offset,
+                    r.inner.calibration_scale,
+                )
+            })
+            .collect();
+
+        let bulk_inputs: Vec<(String, Vec<u64>)> = inputs
+            .iter()
+            .map(|(id, rows, _, _)| (id.clone(), rows.clone()))
+            .collect();
+
+        let raw_results =
+            py.detach(|| self.inner.get_signal_bulk(&bulk_inputs).map_err(to_py_err))?;
+
+        // Build calibration lookup
+        let cal: std::collections::HashMap<&str, (f32, f32)> = inputs
+            .iter()
+            .map(|(id, _, offset, scale)| (id.as_str(), (*offset, *scale)))
+            .collect();
+
+        raw_results
+            .into_iter()
+            .map(|(id, raw_signal)| {
+                let (offset, scale) = cal.get(id.as_str()).copied().unwrap_or((0.0, 1.0));
+                let pa: Vec<f32> = raw_signal
+                    .iter()
+                    .map(|&adc| (f32::from(adc) + offset) * scale)
+                    .collect();
+                Ok((id, PyArray1::from_vec(py, pa)))
+            })
+            .collect()
+    }
+
+    // -- Index management --------------------------------------------------
+
     /// Check if a .p5i sidecar index exists for this file.
     fn has_index(&self) -> bool {
         let mut p5i = self.path.as_os_str().to_owned();
@@ -179,5 +270,37 @@ impl PyReader {
     /// Advise the OS to prefetch signal data into memory.
     fn prefetch_signal(&self) {
         self.inner.prefetch_signal();
+    }
+
+    // -- Context manager protocol ------------------------------------------
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[allow(unused_variables)]
+    fn __exit__(
+        &self,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        // mmap-based, no cleanup needed; return false to not suppress exceptions
+        false
+    }
+
+    // -- Display -----------------------------------------------------------
+
+    fn __repr__(&self) -> PyResult<String> {
+        let n = self.inner.read_count().map_err(to_py_err)?;
+        Ok(format!(
+            "Reader('{}', reads={})",
+            self.path.display(),
+            n
+        ))
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        self.inner.read_count().map_err(to_py_err)
     }
 }
