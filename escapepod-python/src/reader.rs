@@ -293,11 +293,7 @@ impl PyReader {
 
     fn __repr__(&self) -> PyResult<String> {
         let n = self.inner.read_count().map_err(to_py_err)?;
-        Ok(format!(
-            "Reader('{}', reads={})",
-            self.path.display(),
-            n
-        ))
+        Ok(format!("Reader('{}', reads={})", self.path.display(), n))
     }
 
     fn __len__(&self) -> PyResult<usize> {
