@@ -1,0 +1,16 @@
+[package]
+name = "escapepod-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "escapepod_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+escapepod = { workspace = true }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
