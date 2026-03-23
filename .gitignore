@@ -27,6 +27,7 @@ flamegraph.svg
 # Test artifacts
 *.bak
 *.tmp
+__pycache__/
 
 # Benchmark temp files (but track scripts)
 !/benchmarks/
