@@ -28,6 +28,9 @@ cargo test test_round_trip_single_read
 # Run clippy lints
 cargo clippy
 
+# Build optimized for the current CPU (enables AVX2, etc.)
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
 # Run the CLI (after building)
 ./target/release/escpod <command>
 ```

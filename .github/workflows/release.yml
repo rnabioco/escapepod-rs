@@ -19,15 +19,19 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            rustflags: "-C target-cpu=haswell"
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            rustflags: ""
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            rustflags: "-C target-cpu=haswell"
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            rustflags: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +60,7 @@ jobs:
         run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Package
         run: |
