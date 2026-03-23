@@ -24,14 +24,13 @@ fn extract_dict_values(
     col_name: &str,
     values: &mut BTreeSet<String>,
 ) {
-    if let Some(col) = batch.column_by_name(col_name) {
-        if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
-            if let Some(dict_values) = dict.values().as_any().downcast_ref::<StringArray>() {
-                for i in 0..dict_values.len() {
-                    if !dict_values.is_null(i) {
-                        values.insert(dict_values.value(i).to_string());
-                    }
-                }
+    if let Some(col) = batch.column_by_name(col_name)
+        && let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int16Type>>()
+        && let Some(dict_values) = dict.values().as_any().downcast_ref::<StringArray>()
+    {
+        for i in 0..dict_values.len() {
+            if !dict_values.is_null(i) {
+                values.insert(dict_values.value(i).to_string());
             }
         }
     }
