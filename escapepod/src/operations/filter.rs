@@ -246,7 +246,8 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         .sum();
 
     // Phase 2: Extract signal data in parallel across files
-    // Each file's mmap is independent, so extraction can be parallelized
+    // Uses pread (direct file I/O) on Unix to avoid mmap page faults on
+    // network filesystems. Falls back to mmap on other platforms.
     struct FileSignalExtraction {
         /// Extracted signal chunks (Arc to avoid copying)
         chunks: Vec<(Arc<[u8]>, u32)>, // (signal_data, samples)
@@ -259,8 +260,6 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 return Ok(FileSignalExtraction { chunks: Vec::new() });
             }
 
-            let signal_bytes = metadata.reader.signal_table_bytes()?;
-
             // Collect all signal rows needed from this file
             let signal_row_indices: Vec<u64> = metadata
                 .matching_reads
@@ -268,18 +267,43 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 .flat_map(|read| read.signal_rows.iter().copied())
                 .collect();
 
-            // Extract all signal rows in batch
-            let raw_chunks = metadata
-                .signal_footer
-                .extract_signal_rows(&signal_row_indices, signal_bytes)?;
+            // On Unix, use pread for direct I/O (avoids mmap page faults on NFS)
+            #[cfg(unix)]
+            {
+                let path = metadata
+                    .reader
+                    .file_path()
+                    .ok_or_else(|| Error::InvalidState("Reader has no file path".into()))?;
+                let file = File::open(path)?;
+                let offset = metadata.reader.signal_table_offset()?;
 
-            // Store as Arc to avoid copying signal bytes
-            let chunks: Vec<(Arc<[u8]>, u32)> = raw_chunks
-                .into_iter()
-                .map(|chunk| (Arc::from(chunk.signal), chunk.samples))
-                .collect();
+                let owned_chunks = metadata
+                    .signal_footer
+                    .extract_signal_rows_from_file(&signal_row_indices, &file, offset)?;
 
-            Ok(FileSignalExtraction { chunks })
+                let chunks: Vec<(Arc<[u8]>, u32)> = owned_chunks
+                    .into_iter()
+                    .map(|chunk| (Arc::from(chunk.signal.as_slice()), chunk.samples))
+                    .collect();
+
+                Ok(FileSignalExtraction { chunks })
+            }
+
+            // Non-Unix fallback: use mmap path
+            #[cfg(not(unix))]
+            {
+                let signal_bytes = metadata.reader.signal_table_bytes()?;
+                let raw_chunks = metadata
+                    .signal_footer
+                    .extract_signal_rows(&signal_row_indices, signal_bytes)?;
+
+                let chunks: Vec<(Arc<[u8]>, u32)> = raw_chunks
+                    .into_iter()
+                    .map(|chunk| (Arc::from(chunk.signal), chunk.samples))
+                    .collect();
+
+                Ok(FileSignalExtraction { chunks })
+            }
         })
         .collect();
 

@@ -604,6 +604,32 @@ impl Reader {
         })
     }
 
+    /// Get the byte offset of the signal table within the POD5 file.
+    ///
+    /// Used by the pread-based filter path to compute absolute file offsets
+    /// for signal batch reads.
+    pub fn signal_table_offset(&self) -> Result<u64> {
+        let embedded = self
+            .footer
+            .signal_table()
+            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
+        Ok(embedded.offset as u64)
+    }
+
+    /// Get the path to the underlying POD5 file (if opened from a path).
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        self.file_path.as_deref()
+    }
+
+    /// Parse the Arrow IPC footer from the signal table.
+    ///
+    /// This only touches the last few KB of the signal table (via mmap),
+    /// which is fine even on network filesystems.
+    pub fn parse_signal_footer(&self) -> Result<crate::arrow_ipc::ArrowIpcFooter> {
+        let signal_bytes = self.signal_table_bytes()?;
+        crate::arrow_ipc::ArrowIpcFooter::parse(signal_bytes)
+    }
+
     /// Prefetch signal table pages using madvise (if supported).
     /// This hints to the OS to read pages ahead, improving sequential read performance.
     pub fn prefetch_signal(&self) {

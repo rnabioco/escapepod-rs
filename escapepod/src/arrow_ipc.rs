@@ -4,6 +4,9 @@
 //! raw byte copying of record batches without full deserialization.
 
 use crate::error::{Error, Result};
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 /// Magic bytes at start and end of Arrow IPC files.
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
@@ -557,6 +560,97 @@ impl ArrowIpcFooter {
         // Convert to vec, filtering out any missing
         Ok(results.into_iter().flatten().collect())
     }
+
+    /// Extract multiple signal rows using direct file I/O (pread) instead of mmap.
+    ///
+    /// This avoids scattered page faults on network filesystems by reading each
+    /// needed batch with an explicit, sized `pread()` call. The batch-grouping
+    /// logic is identical to [`extract_signal_rows`].
+    ///
+    /// # Arguments
+    /// * `signal_rows` — row indices into the signal table
+    /// * `file` — open file handle for the POD5 file
+    /// * `signal_table_offset` — byte offset of the signal table within the file
+    #[cfg(unix)]
+    pub fn extract_signal_rows_from_file(
+        &self,
+        signal_rows: &[u64],
+        file: &File,
+        signal_table_offset: u64,
+    ) -> Result<Vec<OwnedSignalChunk>> {
+        // Group rows by batch for efficiency (same as mmap path)
+        let mut batch_rows: std::collections::BTreeMap<usize, Vec<(usize, u64)>> =
+            std::collections::BTreeMap::new();
+
+        for (result_idx, &row) in signal_rows.iter().enumerate() {
+            if let Some((batch_idx, local_row)) = self.batch_for_row(row) {
+                batch_rows
+                    .entry(batch_idx)
+                    .or_default()
+                    .push((result_idx, local_row));
+            }
+        }
+
+        let mut results: Vec<Option<OwnedSignalChunk>> = vec![None; signal_rows.len()];
+
+        for (batch_idx, rows) in batch_rows {
+            let batch = &self.record_batches[batch_idx];
+            let range = batch.byte_range();
+            let batch_len = range.end - range.start;
+
+            // Read this batch from file using pread
+            let mut batch_bytes = vec![0u8; batch_len];
+            let file_offset = signal_table_offset + range.start as u64;
+            file.read_exact_at(&mut batch_bytes, file_offset)
+                .map_err(|e| Error::Io(e))?;
+
+            let num_rows = batch.row_count as usize;
+            let parsed =
+                ParsedBatch::parse(&batch_bytes, batch.metadata_length as usize, num_rows)?;
+
+            for (result_idx, local_row) in rows {
+                let row = local_row as usize;
+
+                // Extract read_id
+                let read_id_offset = row * 16;
+                let read_id_bytes: [u8; 16] = parsed.read_id_data
+                    [read_id_offset..read_id_offset + 16]
+                    .try_into()
+                    .map_err(|_| Error::InvalidState("Invalid read_id".into()))?;
+
+                // Extract signal offsets
+                let offset_start = row * 8;
+                let offset_end = (row + 1) * 8;
+                let signal_start = i64::from_le_bytes(
+                    parsed.signal_offsets[offset_start..offset_start + 8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let signal_end = i64::from_le_bytes(
+                    parsed.signal_offsets[offset_end..offset_end + 8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let signal_bytes = parsed.signal_data[signal_start..signal_end].to_vec();
+
+                // Extract samples count
+                let samples_offset = row * 4;
+                let samples = u32::from_le_bytes(
+                    parsed.samples_data[samples_offset..samples_offset + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+
+                results[result_idx] = Some(OwnedSignalChunk {
+                    read_id: read_id_bytes,
+                    signal: signal_bytes,
+                    samples,
+                });
+            }
+        }
+
+        Ok(results.into_iter().flatten().collect())
+    }
 }
 
 /// A raw signal chunk extracted directly from IPC bytes (no deserialization).
@@ -566,6 +660,21 @@ pub struct RawSignalChunk<'a> {
     pub read_id: [u8; 16],
     /// The compressed VBZ signal data (borrowed from mmap).
     pub signal: &'a [u8],
+    /// Number of samples in this chunk.
+    pub samples: u32,
+}
+
+/// A signal chunk with owned data (for pread-based extraction).
+///
+/// Unlike [`RawSignalChunk`] which borrows from an mmap, this type owns
+/// the signal bytes. Used by the pread path to avoid mmap page faults
+/// on network filesystems.
+#[derive(Debug, Clone)]
+pub struct OwnedSignalChunk {
+    /// The read ID (16 bytes UUID).
+    pub read_id: [u8; 16],
+    /// The compressed VBZ signal data (owned).
+    pub signal: Vec<u8>,
     /// Number of samples in this chunk.
     pub samples: u32,
 }
