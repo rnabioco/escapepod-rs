@@ -1,6 +1,6 @@
 site_name: escapepod-rs
 site_description: Rust library and CLI for Oxford Nanopore POD5 files
-site_url: https://rnabioco.github.io/escapepod-rs
+site_url: https://escapepod-rs.netlify.app
 repo_url: https://github.com/rnabioco/escapepod-rs
 repo_name: rnabioco/escapepod-rs
 
