@@ -52,18 +52,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
-          mkdir -p /opt/musl-cross
-          wget -q --retry-connrefused --timeout=30 -O /tmp/aarch64-musl-cross.tgz \
-            https://more.musl.cc/14.2.0/x86_64-linux-musl/aarch64-linux-musl-cross.tgz || \
-          wget -q --retry-connrefused --timeout=30 -O /tmp/aarch64-musl-cross.tgz \
-            https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf /tmp/aarch64-musl-cross.tgz -C /opt/musl-cross --strip-components=1
-          echo "/opt/musl-cross/bin" >> $GITHUB_PATH
 
       - name: Build
         run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Package
