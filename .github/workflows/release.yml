@@ -20,18 +20,22 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             rustflags: "-C target-cpu=haswell"
+            use_cross: false
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
             rustflags: ""
+            use_cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
             rustflags: "-C target-cpu=haswell"
+            use_cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
             rustflags: ""
+            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -47,16 +51,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - name: Install musl cross-compiler (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --profile dist --target ${{ matrix.target }} -p escapepod-cli
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
         run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Package
