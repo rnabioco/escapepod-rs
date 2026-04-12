@@ -51,10 +51,14 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf aarch64-linux-musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          mkdir -p /opt/musl-cross
+          wget -q --retry-connrefused --timeout=30 -O /tmp/aarch64-musl-cross.tgz \
+            https://more.musl.cc/14.2.0/x86_64-linux-musl/aarch64-linux-musl-cross.tgz || \
+          wget -q --retry-connrefused --timeout=30 -O /tmp/aarch64-musl-cross.tgz \
+            https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar xzf /tmp/aarch64-musl-cross.tgz -C /opt/musl-cross --strip-components=1
+          echo "/opt/musl-cross/bin" >> $GITHUB_PATH
 
       - name: Build
         run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
