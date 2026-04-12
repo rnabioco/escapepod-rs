@@ -41,8 +41,7 @@ pub struct RepackResult {
     pub files_skipped: usize,
 }
 
-/// Callback for reporting progress during repacking.
-pub type ProgressCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
+use crate::progress::{Progress, ProgressCallback};
 
 /// Repack a single POD5 file using block-level signal copying.
 ///
@@ -143,7 +142,10 @@ pub fn repack_files<P: AsRef<Path> + Sync, Q: AsRef<Path> + Sync>(
             files_skipped.fetch_add(1, Ordering::Relaxed);
             if let Some(ref cb) = progress {
                 let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                cb(done as usize, total_files);
+                cb(Progress {
+                    current: done,
+                    total: total_files as u64,
+                });
             }
             return;
         }
@@ -159,7 +161,10 @@ pub fn repack_files<P: AsRef<Path> + Sync, Q: AsRef<Path> + Sync>(
 
         if let Some(ref cb) = progress {
             let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-            cb(done as usize, total_files);
+            cb(Progress {
+                current: done,
+                total: total_files as u64,
+            });
         }
     });
 

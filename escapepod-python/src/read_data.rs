@@ -120,6 +120,17 @@ impl PyReadData {
         self.inner.signal_rows.clone()
     }
 
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner.read_id == other.inner.read_id
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.inner.read_id.as_bytes().hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn __repr__(&self) -> String {
         format!("{}", self.inner)
     }

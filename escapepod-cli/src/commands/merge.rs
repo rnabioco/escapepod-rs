@@ -4,7 +4,7 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::resolve_pod5_inputs;
+use crate::util::collect_pod5_inputs;
 use escapepod::{MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -25,20 +25,7 @@ pub fn run(
             .ok(); // Ignore error if pool already initialized
     }
 
-    if inputs.is_empty() {
-        anyhow::bail!("No input files specified");
-    }
-
-    // Expand any directories to individual POD5 files
-    let mut all_files = Vec::new();
-    for input in &inputs {
-        let files = resolve_pod5_inputs(input)?;
-        all_files.extend(files);
-    }
-
-    if all_files.is_empty() {
-        anyhow::bail!("No POD5 files found in specified inputs");
-    }
+    let all_files = collect_pod5_inputs(&inputs)?;
 
     let num_files = all_files.len();
     eprintln!(

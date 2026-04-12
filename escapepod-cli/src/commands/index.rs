@@ -7,7 +7,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::style;
-use crate::util::resolve_pod5_inputs;
+use crate::util::collect_pod5_inputs;
 
 /// Build `.p5i` read index for one or more POD5 files.
 ///
@@ -24,14 +24,7 @@ pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow:
             .ok(); // Ignore error if pool already initialized
     }
 
-    let mut files = Vec::new();
-    for input in &inputs {
-        files.extend(resolve_pod5_inputs(input)?);
-    }
-
-    if files.is_empty() {
-        anyhow::bail!("No POD5 files found");
-    }
+    let files = collect_pod5_inputs(&inputs)?;
 
     let total = files.len();
     eprintln!(

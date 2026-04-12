@@ -40,6 +40,27 @@ pub fn resolve_pod5_inputs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
     anyhow::bail!("Path does not exist: {}", path.display())
 }
 
+/// Resolve multiple input paths to a flat list of POD5 files.
+///
+/// Each input can be a file or directory. Directories are expanded recursively.
+/// Returns an error if no POD5 files are found.
+pub fn collect_pod5_inputs(inputs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    if inputs.is_empty() {
+        anyhow::bail!("No input files specified");
+    }
+
+    let mut all_files = Vec::new();
+    for input in inputs {
+        all_files.extend(resolve_pod5_inputs(input)?);
+    }
+
+    if all_files.is_empty() {
+        anyhow::bail!("No POD5 files found in specified inputs");
+    }
+
+    Ok(all_files)
+}
+
 /// Format a byte count as a human-readable string (e.g., "1.2 GB").
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;

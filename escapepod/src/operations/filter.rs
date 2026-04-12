@@ -5,13 +5,14 @@
 use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
-use crate::types::{EndReason, FOOTER_MAGIC, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
+use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::parse_uuid_flexible;
-use crate::utils::table_builders::{
-    SchemaMetadata, build_pod5_footer, build_reads_table, build_run_info_table,
+use crate::utils::pod5_assembler::{
+    SourceFileMetadata, deduplicate_run_infos, remap_read, write_post_signal_sections,
 };
+use crate::utils::table_builders::SchemaMetadata;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::Path;
@@ -136,8 +137,7 @@ impl FilterResult {
     }
 }
 
-/// Callback for reporting progress during filtering.
-pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
+use crate::progress::{Progress, ProgressCallback};
 
 /// Collected metadata from a single file for filtering.
 struct FileMetadata {
@@ -300,15 +300,14 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         }
 
         if let Some(ref cb) = progress {
-            cb(file_idx as u64 + 1, num_files as u64);
+            cb(Progress {
+                current: file_idx as u64 + 1,
+                total: num_files as u64,
+            });
         }
     }
 
     // Phase 3: Build output file
-    // We need to write:
-    // 1. Signal table with extracted chunks
-    // 2. Run info table (deduplicated)
-    // 3. Reads table with remapped signal rows
 
     let schema_meta = SchemaMetadata::new();
 
@@ -320,11 +319,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
-    // Build signal table - we need to create new Arrow IPC batches
-    // For simplicity, put all signal in one batch
-    let _signal_table_start = file.stream_position()? as i64;
-
-    // Build the signal table using raw bytes
+    // Build and write signal table
     let (signal_table_bytes, _signal_batches) = build_raw_signal_table(
         &signal_data_arcs,
         &all_signal_chunks,
@@ -335,101 +330,37 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
 
     let signal_end = file.stream_position()? as usize;
 
-    // Pad to 8-byte alignment
-    let padding_needed = (8 - (signal_end % 8)) % 8;
-    for _ in 0..padding_needed {
-        file.write_all(&[0u8])?;
-    }
+    // Build source metadata for run info dedup
+    let source_metadata: Vec<SourceFileMetadata> = file_metadata
+        .iter()
+        .map(|m| SourceFileMetadata {
+            run_infos: m.run_infos.clone(),
+        })
+        .collect();
 
-    // Write section marker (reuse same UUID throughout file)
-    file.write_all(section_marker.as_bytes())?;
-
-    // Build deduplicated run_info table
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
-    let mut all_run_infos: Vec<RunInfoData> = Vec::new();
-
-    for metadata in &file_metadata {
-        for run_info in &metadata.run_infos {
-            if !run_info_map.contains_key(&run_info.acquisition_id) {
-                let idx = all_run_infos.len() as u32;
-                run_info_map.insert(run_info.acquisition_id.clone(), idx);
-                all_run_infos.push(run_info.clone());
-            }
-        }
-    }
-
-    let run_info_offset = file.stream_position()? as i64;
-    let run_info_bytes = build_run_info_table(&all_run_infos, &schema_meta)?;
-    file.write_all(&run_info_bytes)?;
-    let run_info_length = run_info_bytes.len() as i64;
-
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
-    file.write_all(section_marker.as_bytes())?;
-
-    // Build reads table with new signal row indices
-    let reads_offset = file.stream_position()? as i64;
-
+    // Remap reads with deduplicated run info indices and sequential signal rows
+    let (_all_run_infos, run_info_map) = deduplicate_run_infos(&source_metadata);
     let mut processed_reads: Vec<(ReadData, Vec<u64>)> = Vec::new();
     let mut signal_row_cursor: u64 = 0;
 
     for metadata in &file_metadata {
         for read in &metadata.matching_reads {
-            // New signal rows are sequential starting from signal_row_cursor
-            let num_signal_rows = read.signal_rows.len();
-            let new_signal_rows: Vec<u64> =
-                (signal_row_cursor..signal_row_cursor + num_signal_rows as u64).collect();
-            signal_row_cursor += num_signal_rows as u64;
-
-            // Update run_info index
-            let original_run_info = metadata.run_infos.get(read.run_info_index as usize);
-            let new_run_info_idx = if let Some(ri) = original_run_info {
-                *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
-            } else {
-                0
-            };
-
-            let new_read = read.for_writing(new_run_info_idx);
+            let (new_read, new_signal_rows, new_cursor) =
+                remap_read(read, &metadata.run_infos, &run_info_map, signal_row_cursor);
+            signal_row_cursor = new_cursor;
             processed_reads.push((new_read, new_signal_rows));
         }
     }
 
-    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos, &schema_meta)?;
-    file.write_all(&reads_bytes)?;
-    let reads_length = reads_bytes.len() as i64;
-
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
-    file.write_all(section_marker.as_bytes())?;
-
-    // Write POD5 footer
-    file.write_all(&FOOTER_MAGIC)?;
-
-    let signal_offset_val = 24i64; // POD5 header size
-    let signal_length = signal_end as i64 - 24;
-
-    let pod5_footer = build_pod5_footer(
-        signal_offset_val,
-        signal_length,
-        run_info_offset,
-        run_info_length,
-        reads_offset,
-        reads_length,
+    // Write post-signal sections (run info, reads, footer)
+    write_post_signal_sections(
+        &mut file,
+        &section_marker,
         &schema_meta,
+        signal_end,
+        &source_metadata,
+        &processed_reads,
     )?;
-    file.write_all(&pod5_footer)?;
-
-    let footer_len = pod5_footer.len() as i64;
-    file.write_all(&footer_len.to_le_bytes())?;
-
-    file.write_all(section_marker.as_bytes())?;
-    file.write_all(&POD5_SIGNATURE)?;
-
-    file.flush()?;
 
     Ok(FilterResult {
         total_reads: total_read_count,

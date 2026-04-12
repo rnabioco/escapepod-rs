@@ -17,133 +17,23 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
-/// Result type for signal-row + calibration lookups, used by
+use super::read_index::{P5I_MAGIC, P5I_VERSION, ReadIndex};
+use super::read_iter::{ReadIterator, extract_read_from_batch};
+use super::signal_cache::{SignalBatchCache, SignalBatchMetadata};
+use super::signal_extractor::SignalExtractor;
+
+/// Signal-row + calibration data for a single read, returned by
 /// `find_signal_rows_with_calibration_by_ids` and helpers.
-type SignalCalibrationResult = Vec<(Uuid, Vec<u64>, f32, f32)>;
+#[allow(dead_code)]
+pub(crate) struct SignalCalibration {
+    pub read_id: Uuid,
+    pub signal_rows: Vec<u64>,
+    pub calibration_offset: f32,
+    pub calibration_scale: f32,
+}
 
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
-
-/// Magic bytes for the `.p5i` sidecar index file.
-const P5I_MAGIC: &[u8; 4] = b"P5IX";
-/// Current `.p5i` format version.
-const P5I_VERSION: u8 = 1;
-
-/// Sorted read index for O(log n) UUID → (batch, row) lookup.
-pub struct ReadIndex {
-    /// (uuid_bytes, batch_idx, row_idx) sorted by UUID for binary search.
-    entries: Vec<([u8; 16], u32, u32)>,
-}
-
-impl ReadIndex {
-    /// Look up a UUID, returning `(batch_idx, row_idx)` if found.
-    pub fn get(&self, uuid: &Uuid) -> Option<(usize, usize)> {
-        let key = *uuid.as_bytes();
-        self.entries
-            .binary_search_by_key(&key, |&(k, _, _)| k)
-            .ok()
-            .map(|i| {
-                let (_, batch, row) = self.entries[i];
-                (batch as usize, row as usize)
-            })
-    }
-
-    /// Number of entries in the index.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the index is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-/// Metadata about signal table batches for efficient lookup.
-#[derive(Debug, Clone)]
-struct SignalBatchMetadata {
-    /// Number of rows per batch (assumed uniform, determined from batch 0).
-    batch_size: usize,
-    /// Total number of signal batches.
-    num_batches: usize,
-}
-
-/// A cached signal batch with access tracking for LRU eviction.
-struct CachedSignalBatch {
-    batch: RecordBatch,
-    last_access: u64,
-}
-
-/// LRU cache for signal batches.
-struct SignalBatchCache {
-    /// Cached batches indexed by batch number.
-    batches: HashMap<usize, CachedSignalBatch>,
-    /// Maximum number of batches to cache.
-    max_size: usize,
-    /// Access counter for LRU tracking.
-    access_counter: u64,
-}
-
-impl SignalBatchCache {
-    /// Create a new signal batch cache with the given maximum size.
-    fn new(max_size: usize) -> Self {
-        Self {
-            batches: HashMap::with_capacity(max_size),
-            max_size,
-            access_counter: 0,
-        }
-    }
-
-    /// Get a batch from the cache, updating access time.
-    fn get(&mut self, batch_idx: usize) -> Option<&RecordBatch> {
-        if let Some(cached) = self.batches.get_mut(&batch_idx) {
-            self.access_counter += 1;
-            cached.last_access = self.access_counter;
-            Some(&cached.batch)
-        } else {
-            None
-        }
-    }
-
-    /// Insert a batch into the cache, evicting old entries if necessary.
-    fn insert(&mut self, batch_idx: usize, batch: RecordBatch) {
-        // Evict if at capacity
-        if self.batches.len() >= self.max_size && !self.batches.contains_key(&batch_idx) {
-            self.evict_oldest();
-        }
-
-        self.access_counter += 1;
-        self.batches.insert(
-            batch_idx,
-            CachedSignalBatch {
-                batch,
-                last_access: self.access_counter,
-            },
-        );
-    }
-
-    /// Evict approximately 20% of the oldest entries (like C++ implementation).
-    fn evict_oldest(&mut self) {
-        if self.batches.is_empty() {
-            return;
-        }
-
-        let to_evict = std::cmp::max(1, self.batches.len() / 5);
-
-        // Collect entries sorted by access time
-        let mut entries: Vec<_> = self
-            .batches
-            .iter()
-            .map(|(&idx, cached)| (idx, cached.last_access))
-            .collect();
-        entries.sort_by_key(|&(_, access)| access);
-
-        // Remove oldest entries
-        for (idx, _) in entries.into_iter().take(to_evict) {
-            self.batches.remove(&idx);
-        }
-    }
-}
 
 /// A reader for POD5 files.
 pub struct Reader {
@@ -1180,10 +1070,11 @@ impl Reader {
     ///
     /// Same strategy as [`Self::find_signal_rows_by_ids`]: indexed path when
     /// an index exists, single-pass scan otherwise.
-    pub fn find_signal_rows_with_calibration_by_ids(
+    #[allow(dead_code)]
+    pub(crate) fn find_signal_rows_with_calibration_by_ids(
         &self,
         target_ids: &HashSet<Uuid>,
-    ) -> Result<SignalCalibrationResult> {
+    ) -> Result<Vec<SignalCalibration>> {
         if self.has_index() {
             self.find_signal_rows_with_calibration_indexed(target_ids)
         } else {
@@ -1339,7 +1230,7 @@ impl Reader {
     fn find_signal_rows_with_calibration_indexed(
         &self,
         target_ids: &HashSet<Uuid>,
-    ) -> Result<SignalCalibrationResult> {
+    ) -> Result<Vec<SignalCalibration>> {
         use arrow::array::{Array, Float32Array, ListArray, UInt64Array};
 
         let index = self.read_index()?;
@@ -1401,12 +1292,12 @@ impl Reader {
                         field: "signal".to_string(),
                         message: "Expected UInt64Array values".to_string(),
                     })?;
-                results.push((
-                    uuid,
-                    u64_arr.values().to_vec(),
-                    cal_offset_col.value(row),
-                    cal_scale_col.value(row),
-                ));
+                results.push(SignalCalibration {
+                    read_id: uuid,
+                    signal_rows: u64_arr.values().to_vec(),
+                    calibration_offset: cal_offset_col.value(row),
+                    calibration_scale: cal_scale_col.value(row),
+                });
             }
         }
         Ok(results)
@@ -1470,7 +1361,7 @@ impl Reader {
     fn find_signal_rows_with_calibration_scan(
         &self,
         target_ids: &HashSet<Uuid>,
-    ) -> Result<SignalCalibrationResult> {
+    ) -> Result<Vec<SignalCalibration>> {
         use arrow::array::{Array, FixedSizeBinaryArray, Float32Array, ListArray, UInt64Array};
 
         let embedded = self
@@ -1530,12 +1421,12 @@ impl Reader {
                                 field: "signal".to_string(),
                                 message: "Expected UInt64Array values".to_string(),
                             })?;
-                    results.push((
-                        uuid,
-                        u64_arr.values().to_vec(),
-                        cal_offset_col.value(row),
-                        cal_scale_col.value(row),
-                    ));
+                    results.push(SignalCalibration {
+                        read_id: uuid,
+                        signal_rows: u64_arr.values().to_vec(),
+                        calibration_offset: cal_offset_col.value(row),
+                        calibration_scale: cal_scale_col.value(row),
+                    });
                     if results.len() == n {
                         return Ok(results);
                     }
@@ -1684,152 +1575,4 @@ impl Reader {
 
         result
     }
-}
-
-/// Thread-safe signal extractor for parallel per-read signal extraction.
-///
-/// Holds an immutable reference to the memory-mapped signal table bytes and
-/// a pre-parsed Arrow IPC footer. Because it contains only immutable data,
-/// it is `Send + Sync` and can be shared across rayon threads.
-pub struct SignalExtractor<'a> {
-    signal_bytes: &'a [u8],
-    footer: crate::arrow_ipc::ArrowIpcFooter,
-}
-
-impl<'a> SignalExtractor<'a> {
-    /// Extract and decompress signal for a single read's signal rows.
-    ///
-    /// Thread-safe: no shared mutable state.
-    pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
-        use crate::compression::vbz::decompress_signal;
-
-        let raw_chunks = self
-            .footer
-            .extract_signal_rows(signal_rows, self.signal_bytes)?;
-        let total_samples: usize = raw_chunks.iter().map(|c| c.samples as usize).sum();
-        let mut result = Vec::with_capacity(total_samples);
-
-        for chunk in &raw_chunks {
-            let decompressed = decompress_signal(chunk.signal, chunk.samples as usize)?;
-            result.extend_from_slice(&decompressed);
-        }
-
-        Ok(result)
-    }
-}
-
-/// Iterator over reads in a POD5 file.
-pub struct ReadIterator<'a> {
-    #[allow(dead_code)]
-    pod5_reader: &'a Reader,
-    arrow_reader: ArrowFileReader<Cursor<&'a [u8]>>,
-    current_batch: Option<RecordBatch>,
-    batch_row: usize,
-}
-
-impl<'a> Iterator for ReadIterator<'a> {
-    type Item = Result<ReadData>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Check if we need a new batch
-            let need_new_batch = match &self.current_batch {
-                None => true,
-                Some(batch) => self.batch_row >= batch.num_rows(),
-            };
-
-            if need_new_batch {
-                match self.arrow_reader.next() {
-                    Some(Ok(batch)) => {
-                        self.current_batch = Some(batch);
-                        self.batch_row = 0;
-                    }
-                    Some(Err(e)) => return Some(Err(Error::from(e))),
-                    None => return None,
-                }
-            }
-
-            // Extract read from current batch
-            if let Some(batch) = &self.current_batch {
-                let row = self.batch_row;
-                self.batch_row += 1;
-                return Some(Self::read_from_batch(batch, row));
-            }
-        }
-    }
-}
-
-impl<'a> ReadIterator<'a> {
-    fn read_from_batch(batch: &RecordBatch, row: usize) -> Result<ReadData> {
-        extract_read_from_batch(batch, row, false)
-    }
-}
-
-/// Extract a read from a record batch at the given row.
-///
-/// This is the shared implementation used by both `Reader::read_from_batch`
-/// and `ReadIterator::read_from_batch`.
-///
-/// The `try_alternate_field_names` parameter controls whether to try alternate
-/// field names for compatibility with different POD5 versions:
-/// - `start_sample` vs `start`
-/// - `predicted_scaling_open_pore_level` vs `open_pore_level`
-fn extract_read_from_batch(
-    batch: &RecordBatch,
-    row: usize,
-    try_alternate_field_names: bool,
-) -> Result<ReadData> {
-    let ext = BatchFieldExtractor::new(batch, row);
-
-    // Handle start_sample field name variations
-    let start_sample = if try_alternate_field_names {
-        ext.get_u64("start_sample")
-            .or_else(|_| ext.get_u64("start"))?
-    } else {
-        ext.get_u64("start")?
-    };
-
-    // Handle open_pore_level field name variations
-    let open_pore_level = if try_alternate_field_names {
-        ext.get_f32("predicted_scaling_open_pore_level")
-            .or_else(|_| ext.get_f32("open_pore_level"))
-            .unwrap_or(0.0)
-    } else {
-        ext.get_f32("open_pore_level").unwrap_or(0.0)
-    };
-
-    // Get run_info index from dictionary key
-    let run_info_index = ext
-        .get_dict_index("run_info")
-        .map(|idx| idx as u32)
-        .unwrap_or(0);
-
-    // Parse end_reason - use FromStr which returns Infallible
-    let end_reason_str = ext.get_dict_string("end_reason").unwrap_or_default();
-    let end_reason = end_reason_str.parse().unwrap_or_default();
-
-    Ok(ReadData {
-        read_id: ext.get_uuid("read_id")?,
-        read_number: ext.get_u32("read_number")?,
-        start_sample,
-        channel: ext.get_u16("channel")?,
-        well: ext.get_u8("well")?,
-        pore_type: ext.get_dict_string("pore_type").unwrap_or_default(),
-        calibration_offset: ext.get_f32("calibration_offset")?,
-        calibration_scale: ext.get_f32("calibration_scale")?,
-        median_before: ext.get_f32("median_before")?,
-        end_reason,
-        end_reason_forced: ext.get_bool("end_reason_forced")?,
-        run_info_index,
-        num_minknow_events: ext.get_u64("num_minknow_events")?,
-        tracked_scaling_scale: ext.get_f32("tracked_scaling_scale").unwrap_or(1.0),
-        tracked_scaling_shift: ext.get_f32("tracked_scaling_shift").unwrap_or(0.0),
-        predicted_scaling_scale: ext.get_f32("predicted_scaling_scale").unwrap_or(1.0),
-        predicted_scaling_shift: ext.get_f32("predicted_scaling_shift").unwrap_or(0.0),
-        num_reads_since_mux_change: ext.get_u32("num_reads_since_mux_change").unwrap_or(0),
-        time_since_mux_change: ext.get_f32("time_since_mux_change").unwrap_or(0.0),
-        num_samples: ext.get_u64("num_samples")?,
-        open_pore_level,
-        signal_rows: ext.get_signal_rows()?,
-    })
 }

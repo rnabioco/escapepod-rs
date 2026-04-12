@@ -128,11 +128,10 @@ pub fn run(
     let bar_for_callback = filter_bar.clone();
 
     // Create progress callback
-    let progress: Box<dyn Fn(u64, u64) + Send + Sync> =
-        Box::new(move |current: u64, total: u64| {
-            bar_for_callback.set_length(total);
-            bar_for_callback.set_position(current);
-        });
+    let progress: escapepod::ProgressCallback = Box::new(move |p: escapepod::Progress| {
+        bar_for_callback.set_length(p.total);
+        bar_for_callback.set_position(p.current);
+    });
 
     // Use the core library's parallel filter
     let options = FilterOptions {

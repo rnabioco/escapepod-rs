@@ -6,17 +6,20 @@
 use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
-use crate::types::{FOOTER_MAGIC, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
-use crate::utils::table_builders::{
-    SchemaMetadata, build_arrow_ipc_footer, build_pod5_footer, build_reads_table,
-    build_run_info_table,
+use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
+use crate::utils::pod5_assembler::{
+    SourceFileMetadata, deduplicate_run_infos, write_post_signal_sections,
 };
+use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Write buffer size for the merge output file (128 MiB).
+const MERGE_WRITE_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 
 /// Options for merge operations.
 #[derive(Debug, Clone)]
@@ -189,8 +192,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             let output_path = output.as_ref();
             let writer_handle = scope.spawn(move || -> std::io::Result<(File, usize)> {
                 let file = File::create(output_path)?;
-                // 128MB buffer for better throughput on large files
-                let mut file = BufWriter::with_capacity(128 * 1024 * 1024, file);
+                let mut file = BufWriter::with_capacity(MERGE_WRITE_BUFFER_SIZE, file);
 
                 // Write POD5 header
                 file.write_all(&POD5_SIGNATURE)?;
@@ -275,44 +277,17 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             Ok((file, final_pos, current_signal_row))
         })?;
 
-    // Phase 3: Write remaining sections (file is already buffered)
+    // Phase 3: Write remaining sections (run info, reads, footer)
 
-    // Pad to 8-byte alignment
-    let padding_needed = (8 - (signal_end % 8)) % 8;
-    for _ in 0..padding_needed {
-        file.write_all(&[0u8])?;
-    }
+    // Build source metadata for run info dedup
+    let source_metadata: Vec<SourceFileMetadata> = file_metadata
+        .iter()
+        .map(|m| SourceFileMetadata {
+            run_infos: m.run_infos.clone(),
+        })
+        .collect();
 
-    // Write section marker
-    file.write_all(section_marker.as_bytes())?;
-
-    // Build and write run_info table
-    let mut run_info_map: HashMap<String, u32> = HashMap::new();
-    let mut all_run_infos: Vec<RunInfoData> = Vec::new();
-
-    for metadata in &file_metadata {
-        for run_info in &metadata.run_infos {
-            if !run_info_map.contains_key(&run_info.acquisition_id) {
-                let idx = all_run_infos.len() as u32;
-                run_info_map.insert(run_info.acquisition_id.clone(), idx);
-                all_run_infos.push(run_info.clone());
-            }
-        }
-    }
-
-    let run_info_offset = file.stream_position()? as i64;
-    let run_info_bytes = build_run_info_table(&all_run_infos, &schema_meta)?;
-    file.write_all(&run_info_bytes)?;
-    let run_info_length = run_info_bytes.len() as i64;
-
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
-    file.write_all(section_marker.as_bytes())?;
-
-    // Build and write reads table
-    let reads_offset = file.stream_position()? as i64;
+    let (_all_run_infos, run_info_map) = deduplicate_run_infos(&source_metadata);
 
     // Notify start of reads phase
     if let Some(cb) = progress_callback {
@@ -323,8 +298,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         });
     }
 
-    // Phase 3a: Transform reads in parallel (signal row adjustment, run_info remapping)
-    // Each file's reads are processed independently
+    // Transform reads in parallel (signal row adjustment, run_info remapping)
     let per_file_reads: Vec<Vec<(Uuid, ReadData, Vec<u64>)>> = file_metadata
         .par_iter()
         .zip(signal_offsets.par_iter())
@@ -353,7 +327,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         })
         .collect();
 
-    // Phase 3b: Sequential duplicate filtering (requires ordered access to seen_reads)
+    // Sequential duplicate filtering (requires ordered access to seen_reads)
     let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
         HashSet::new()
     } else {
@@ -379,40 +353,15 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let total_reads = processed_reads.len() as u64;
 
-    let reads_bytes = build_reads_table(&processed_reads, &all_run_infos, &schema_meta)?;
-    file.write_all(&reads_bytes)?;
-    let reads_length = reads_bytes.len() as i64;
-
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
-    file.write_all(section_marker.as_bytes())?;
-
-    // Write POD5 footer
-    file.write_all(&FOOTER_MAGIC)?;
-
-    let signal_offset_val = 24i64; // POD5 header size
-    let signal_length = signal_end as i64 - 24;
-
-    let pod5_footer = build_pod5_footer(
-        signal_offset_val,
-        signal_length,
-        run_info_offset,
-        run_info_length,
-        reads_offset,
-        reads_length,
+    // Write post-signal sections (run info, reads, footer)
+    write_post_signal_sections(
+        &mut file,
+        &section_marker,
         &schema_meta,
+        signal_end,
+        &source_metadata,
+        &processed_reads,
     )?;
-    file.write_all(&pod5_footer)?;
-
-    let footer_len = pod5_footer.len() as i64;
-    file.write_all(&footer_len.to_le_bytes())?;
-
-    file.write_all(section_marker.as_bytes())?;
-    file.write_all(&POD5_SIGNATURE)?;
-
-    file.flush()?;
 
     Ok(MergeResult {
         reads_written: total_reads,

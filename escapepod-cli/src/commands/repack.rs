@@ -5,27 +5,14 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::resolve_pod5_inputs;
+use crate::util::collect_pod5_inputs;
 use escapepod::{RepackOptions, repack_files};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Result<()> {
-    if inputs.is_empty() {
-        anyhow::bail!("No input files specified");
-    }
-
-    // Expand any directories to individual POD5 files
-    let mut all_files = Vec::new();
-    for input in &inputs {
-        let files = resolve_pod5_inputs(input)?;
-        all_files.extend(files);
-    }
-
-    if all_files.is_empty() {
-        anyhow::bail!("No POD5 files found in specified inputs");
-    }
+    let all_files = collect_pod5_inputs(&inputs)?;
 
     // Ensure output directory exists
     std::fs::create_dir_all(&output_dir)?;
@@ -74,13 +61,12 @@ pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Re
     // Create progress callback
     let bar = overall_bar.clone();
     let progress_counter = bar_progress.clone();
-    let progress_callback: Box<dyn Fn(usize, usize) + Send + Sync> =
-        Box::new(move |done: usize, _total: usize| {
-            let prev = progress_counter.swap(done as u64, Ordering::Relaxed);
-            if done as u64 > prev {
-                bar.inc((done as u64) - prev);
-            }
-        });
+    let progress_callback: escapepod::ProgressCallback = Box::new(move |p: escapepod::Progress| {
+        let prev = progress_counter.swap(p.current, Ordering::Relaxed);
+        if p.current > prev {
+            bar.inc(p.current - prev);
+        }
+    });
 
     // Process files in parallel using the new operation
     let result = repack_files(&file_pairs, options, Some(progress_callback));

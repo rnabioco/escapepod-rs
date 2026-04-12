@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use escapepod::RecordBatch;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
@@ -25,9 +26,10 @@ pub struct PyReader {
 #[pymethods]
 impl PyReader {
     /// Open a POD5 file for reading.
+    ///
+    /// Accepts a string path or any os.PathLike object (e.g. pathlib.Path).
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
-        let path = PathBuf::from(path);
+    fn new(path: PathBuf) -> PyResult<Self> {
         let reader = escapepod::Reader::open(&path).map_err(to_py_err)?;
         Ok(Self {
             inner: reader,
@@ -94,14 +96,43 @@ impl PyReader {
         Ok(ids.into_iter().map(|id| id.to_string()).collect())
     }
 
-    /// Get all reads (materializes the full read list).
-    fn reads(&self) -> PyResult<Vec<PyReadData>> {
-        let mut result = Vec::new();
-        for read_result in self.inner.reads().map_err(to_py_err)? {
-            let inner = read_result.map_err(to_py_err)?;
-            result.push(PyReadData { inner });
+    /// Get reads from the file, optionally filtered by read IDs.
+    ///
+    /// Parameters
+    /// ----------
+    /// selection : list[str], optional
+    ///     Read IDs to retrieve. If None, returns all reads.
+    ///
+    /// Returns
+    /// -------
+    /// list[ReadData]
+    #[pyo3(signature = (selection=None))]
+    fn reads(&self, selection: Option<Vec<String>>) -> PyResult<Vec<PyReadData>> {
+        match selection {
+            Some(read_ids) => {
+                let target_ids: HashSet<escapepod::Uuid> = read_ids
+                    .iter()
+                    .map(|s| {
+                        escapepod::utils::parse_uuid_flexible(s)
+                            .map_err(|e| to_py_err(escapepod::Error::InvalidUuid(e.to_string())))
+                    })
+                    .collect::<PyResult<_>>()?;
+
+                let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
+                Ok(reads
+                    .into_iter()
+                    .map(|inner| PyReadData { inner })
+                    .collect())
+            }
+            None => {
+                let mut result = Vec::new();
+                for read_result in self.inner.reads().map_err(to_py_err)? {
+                    let inner = read_result.map_err(to_py_err)?;
+                    result.push(PyReadData { inner });
+                }
+                Ok(result)
+            }
         }
-        Ok(result)
     }
 
     /// Look up a single read by UUID string.
@@ -298,5 +329,71 @@ impl PyReader {
 
     fn __len__(&self) -> PyResult<usize> {
         self.inner.read_count().map_err(to_py_err)
+    }
+
+    /// Iterate over all reads in the file.
+    ///
+    /// Yields ReadData objects one at a time without materializing
+    /// the full list. Useful for large files.
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PyReadIterator> {
+        let num_batches = slf.inner.read_batch_count().map_err(to_py_err)?;
+        Ok(PyReadIterator {
+            reader: slf.into(),
+            num_batches,
+            batch_idx: 0,
+            current_batch: None,
+            batch_row: 0,
+            batch_num_rows: 0,
+        })
+    }
+}
+
+/// Iterator over reads in a POD5 file (Python protocol).
+///
+/// Iterates batch-by-batch to avoid lifetime issues between
+/// the Rust reader and the Python GC.
+#[pyclass]
+struct PyReadIterator {
+    reader: Py<PyReader>,
+    num_batches: usize,
+    batch_idx: usize,
+    current_batch: Option<RecordBatch>,
+    batch_row: usize,
+    batch_num_rows: usize,
+}
+
+#[pymethods]
+impl PyReadIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyReadData>> {
+        loop {
+            // If we have rows left in the current batch, yield one
+            if self.batch_row < self.batch_num_rows {
+                let batch = self.current_batch.as_ref().unwrap();
+                let row = self.batch_row;
+                self.batch_row += 1;
+                let inner = escapepod::Reader::read_from_batch(batch, row).map_err(to_py_err)?;
+                return Ok(Some(PyReadData { inner }));
+            }
+
+            // Load next batch
+            if self.batch_idx >= self.num_batches {
+                return Ok(None);
+            }
+
+            let batch = self
+                .reader
+                .borrow(py)
+                .inner
+                .read_batch(self.batch_idx)
+                .map_err(to_py_err)?;
+            self.batch_num_rows = batch.num_rows();
+            self.current_batch = Some(batch);
+            self.batch_row = 0;
+            self.batch_idx += 1;
+        }
     }
 }
