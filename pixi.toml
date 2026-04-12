@@ -21,6 +21,19 @@ tar -xz -C $DORADO_DIR
 """
 install-pod5 = "pip install 'pod5>=0.3.36,<0.4'"
 
+# Python bindings test feature
+[feature.python-test.dependencies]
+python = ">=3.10"
+numpy = "*"
+
+[feature.python-test.pypi-dependencies]
+maturin = ">=1.8,<2"
+pytest = "*"
+
+[feature.python-test.tasks]
+build-python = "maturin develop --manifest-path escapepod-python/Cargo.toml"
+test-python = { cmd = "pytest tests/python/ -v", depends-on = ["build-python"] }
+
 # Documentation feature
 [feature.docs.dependencies]
 python = ">=3.10"
@@ -33,4 +46,5 @@ docs-build = "zensical build"
 docs-serve = "zensical serve"
 
 [environments]
+python-test = { features = ["python-test"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
