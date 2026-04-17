@@ -17,7 +17,7 @@ const STYLES: Styles = Styles::styled()
 
 #[derive(Parser)]
 #[command(name = "escpod")]
-#[command(author, version, styles = STYLES)]
+#[command(author, version = env!("ESCPOD_VERSION"), styles = STYLES)]
 #[command(about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data)")]
 #[command(
     long_about = "A fast, pure-Rust toolkit for POD5 files (Oxford Nanopore sequencing data).\n\n\
