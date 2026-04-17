@@ -1,0 +1,85 @@
+[project]
+site_name = "escapepod-rs"
+site_description = "Rust library and CLI for Oxford Nanopore POD5 files"
+site_url = "https://escapepod-rs.netlify.app"
+repo_url = "https://github.com/rnabioco/escapepod-rs"
+repo_name = "rnabioco/escapepod-rs"
+copyright = "Copyright &copy; 2025 RNA Bioscience Initiative"
+
+nav = [
+  {"Home" = "index.md"},
+  {"Getting Started" = [
+    {"Installation" = "getting-started/installation.md"},
+    {"Quick Start" = "getting-started/quickstart.md"},
+  ]},
+  {"CLI Reference" = [
+    {"Overview" = "cli/index.md"},
+    {"summary" = "cli/summary.md"},
+    {"view" = "cli/view.md"},
+    {"inspect" = "cli/inspect.md"},
+    {"merge" = "cli/merge.md"},
+    {"filter" = "cli/filter.md"},
+    {"bam-filter" = "cli/bam-filter.md"},
+    {"repack" = "cli/repack.md"},
+    {"subset" = "cli/subset.md"},
+    {"demux" = "cli/demux.md"},
+    {"resquiggle" = "cli/resquiggle.md"},
+  ]},
+  {"Library" = [
+    {"Overview" = "library/index.md"},
+    {"Reading Files" = "library/reading.md"},
+    {"Writing Files" = "library/writing.md"},
+    {"Data Types" = "library/types.md"},
+  ]},
+  {"File Format" = [
+    {"Overview" = "format/index.md"},
+    {"Container Structure" = "format/container.md"},
+    {"Signal Compression" = "format/compression.md"},
+  ]},
+  {"API Reference" = "api/index.md"},
+]
+
+[project.theme]
+features = [
+  "navigation.sections",
+  "navigation.expand",
+  "navigation.top",
+  "navigation.indexes",
+  "search.suggest",
+  "search.highlight",
+  "content.code.copy",
+  "content.code.annotate",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[project.markdown_extensions.pymdownx.highlight]
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.snippets]
+[project.markdown_extensions.pymdownx.superfences]
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.tables]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/rnabioco/escapepod-rs"
