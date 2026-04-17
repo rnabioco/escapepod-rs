@@ -30,32 +30,20 @@ Tested on RNA004 data with 5 barcodes (1000 reads total), 4 threads:
 
 The demux workflow analyzes the raw nanopore signal to detect adapter regions, extract barcode fingerprints, classify reads, and optionally split them into separate files.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        DEMUX WORKFLOW OVERVIEW                               │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    pod5([POD5 Files]) --> detect
+    detect["<b>detect</b><br/><i>LLR-based</i>"] --> fingerprint["<b>fingerprint</b><br/><i>t-test seg</i>"]
+    fingerprint --> classify["<b>classify</b><br/><i>DTW distance</i>"]
+    classify --> split["<b>split</b><br/><i>by barcode</i>"]
+    split --> demuxed([Demuxed POD5s])
 
-      POD5 Files                                             Demuxed POD5s
-          │                                                       ▲
-          ▼                                                       │
-  ┌───────────────┐    ┌───────────────┐    ┌───────────────┐    │
-  │    detect     │───▶│  fingerprint  │───▶│   classify    │────┤
-  │  (LLR-based)  │    │ (t-test seg)  │    │ (DTW distance)│    │
-  └───────────────┘    └───────────────┘    └───────────────┘    │
-          │                    │                    │             │
-          ▼                    ▼                    ▼             │
-    boundaries.csv      fingerprints.csv   classifications.csv   │
-                                                   │              │
-                                                   ▼              │
-                                           ┌───────────────┐      │
-                                           │     split     │──────┘
-                                           │ (by barcode)  │
-                                           └───────────────┘
+    detect -.-> boundaries[boundaries.csv]
+    fingerprint -.-> fingerprints[fingerprints.csv]
+    classify -.-> classifications[classifications.csv]
 
-  ┌───────────────┐
-  │     train     │──▶ reference.json (for classify --reference)
-  │ (from known)  │
-  └───────────────┘
+    train["<b>train</b><br/><i>from known</i>"] -.-> reference[reference.json]
+    reference -. "--reference" .-> classify
 ```
 
 ## Subcommands
