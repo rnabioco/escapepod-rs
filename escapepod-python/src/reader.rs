@@ -8,6 +8,16 @@ use pyo3::prelude::*;
 use crate::error::to_py_err;
 use crate::read_data::{PyReadData, PyRunInfo};
 
+/// Convert raw ADC samples to picoamperes: `(adc + offset) * scale`.
+///
+/// Uses `mul_add` so LLVM can emit FMA on AVX2+ and keep the loop tight.
+fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
+    let bias = offset * scale;
+    raw.iter()
+        .map(|&adc| f32::from(adc).mul_add(scale, bias))
+        .collect()
+}
+
 /// Reader for POD5 files.
 ///
 /// Provides access to read metadata and signal data with optimized
@@ -46,16 +56,19 @@ impl PyReader {
     }
 
     /// File identifier string from the POD5 footer.
+    #[getter]
     fn file_identifier(&self) -> &str {
         self.inner.file_identifier()
     }
 
     /// Software that wrote this POD5 file (e.g. "MinKNOW 5.x").
+    #[getter]
     fn software(&self) -> &str {
         self.inner.software()
     }
 
     /// POD5 format version string.
+    #[getter]
     fn pod5_version(&self) -> &str {
         self.inner.pod5_version()
     }
@@ -63,16 +76,19 @@ impl PyReader {
     // -- Read/batch counts -------------------------------------------------
 
     /// Number of reads in the file.
+    #[getter]
     fn read_count(&self) -> PyResult<usize> {
         self.inner.read_count().map_err(to_py_err)
     }
 
     /// Number of read batches in the file.
+    #[getter]
     fn read_batch_count(&self) -> PyResult<usize> {
         self.inner.read_batch_count().map_err(to_py_err)
     }
 
     /// Total number of signal rows across all batches.
+    #[getter]
     fn signal_row_count(&self) -> PyResult<u64> {
         self.inner.signal_row_count().map_err(to_py_err)
     }
@@ -80,6 +96,7 @@ impl PyReader {
     // -- Run info ----------------------------------------------------------
 
     /// Get all run info records.
+    #[getter]
     fn run_infos(&self) -> Vec<PyRunInfo> {
         self.inner
             .run_infos()
@@ -202,12 +219,7 @@ impl PyReader {
         let scale = read.inner.calibration_scale;
 
         let raw = py.detach(|| self.inner.get_signal(&signal_rows).map_err(to_py_err))?;
-
-        let pa: Vec<f32> = raw
-            .iter()
-            .map(|&adc| (f32::from(adc) + offset) * scale)
-            .collect();
-        Ok(PyArray1::from_vec(py, pa))
+        Ok(PyArray1::from_vec(py, adc_to_pa(&raw, offset, scale)))
     }
 
     /// Get raw ADC signal for multiple reads in parallel.
@@ -241,41 +253,26 @@ impl PyReader {
         py: Python<'py>,
         reads: Vec<PyRef<'_, PyReadData>>,
     ) -> PyResult<Vec<(String, Bound<'py, PyArray1<f32>>)>> {
-        let inputs: Vec<(String, Vec<u64>, f32, f32)> = reads
+        let inputs: Vec<(String, Vec<u64>)> = reads
             .iter()
-            .map(|r| {
-                (
-                    r.inner.read_id.to_string(),
-                    r.inner.signal_rows.clone(),
-                    r.inner.calibration_offset,
-                    r.inner.calibration_scale,
-                )
-            })
+            .map(|r| (r.inner.read_id.to_string(), r.inner.signal_rows.clone()))
+            .collect();
+        let cal: Vec<(f32, f32)> = reads
+            .iter()
+            .map(|r| (r.inner.calibration_offset, r.inner.calibration_scale))
             .collect();
 
-        let bulk_inputs: Vec<(String, Vec<u64>)> = inputs
-            .iter()
-            .map(|(id, rows, _, _)| (id.clone(), rows.clone()))
-            .collect();
-
-        let raw_results =
-            py.detach(|| self.inner.get_signal_bulk(&bulk_inputs).map_err(to_py_err))?;
-
-        // Build calibration lookup
-        let cal: std::collections::HashMap<&str, (f32, f32)> = inputs
-            .iter()
-            .map(|(id, _, offset, scale)| (id.as_str(), (*offset, *scale)))
-            .collect();
+        // get_signal_bulk preserves input order, so we can zip with `cal` directly.
+        let raw_results = py.detach(|| self.inner.get_signal_bulk(&inputs).map_err(to_py_err))?;
 
         raw_results
             .into_iter()
-            .map(|(id, raw_signal)| {
-                let (offset, scale) = cal.get(id.as_str()).copied().unwrap_or((0.0, 1.0));
-                let pa: Vec<f32> = raw_signal
-                    .iter()
-                    .map(|&adc| (f32::from(adc) + offset) * scale)
-                    .collect();
-                Ok((id, PyArray1::from_vec(py, pa)))
+            .zip(cal)
+            .map(|((id, raw_signal), (offset, scale))| {
+                Ok((
+                    id,
+                    PyArray1::from_vec(py, adc_to_pa(&raw_signal, offset, scale)),
+                ))
             })
             .collect()
     }
@@ -283,6 +280,7 @@ impl PyReader {
     // -- Index management --------------------------------------------------
 
     /// Check if a .p5i sidecar index exists for this file.
+    #[getter]
     fn has_index(&self) -> bool {
         let mut p5i = self.path.as_os_str().to_owned();
         p5i.push(".p5i");

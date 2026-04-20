@@ -69,7 +69,7 @@ class TestReader:
         if not TEST_POD5.exists():
             pytest.skip("Test POD5 not found")
         with escapepod.Reader(str(TEST_POD5)) as r:
-            assert r.read_count() > 0
+            assert r.read_count > 0
 
     def test_repr(self, reader):
         r = repr(reader)
@@ -77,30 +77,30 @@ class TestReader:
         assert "reads=" in r
 
     def test_len(self, reader):
-        assert len(reader) == reader.read_count()
+        assert len(reader) == reader.read_count
         assert len(reader) > 0
 
     def test_metadata(self, reader):
         assert isinstance(reader.path, str)
-        assert isinstance(reader.file_identifier(), str)
-        assert isinstance(reader.software(), str)
-        assert isinstance(reader.pod5_version(), str)
+        assert isinstance(reader.file_identifier, str)
+        assert isinstance(reader.software, str)
+        assert isinstance(reader.pod5_version, str)
 
     def test_read_count(self, reader):
-        assert reader.read_count() > 0
+        assert reader.read_count > 0
 
     def test_read_batch_count(self, reader):
-        assert reader.read_batch_count() > 0
+        assert reader.read_batch_count > 0
 
     def test_signal_row_count(self, reader):
-        assert reader.signal_row_count() > 0
+        assert reader.signal_row_count > 0
 
 
 class TestReadIds:
     def test_read_ids(self, reader):
         ids = reader.read_ids()
         assert isinstance(ids, list)
-        assert len(ids) == reader.read_count()
+        assert len(ids) == reader.read_count
         # Each ID should be a UUID string
         assert all(len(uid) == 36 for uid in ids)
 
@@ -108,7 +108,7 @@ class TestReadIds:
 class TestReads:
     def test_all_reads(self, reader):
         reads = reader.reads()
-        assert len(reads) == reader.read_count()
+        assert len(reads) == reader.read_count
 
     def test_reads_with_selection(self, reader):
         ids = reader.read_ids()
@@ -181,11 +181,11 @@ class TestReadData:
 
 class TestRunInfo:
     def test_run_infos(self, reader):
-        run_infos = reader.run_infos()
+        run_infos = reader.run_infos
         assert len(run_infos) > 0
 
     def test_properties(self, reader):
-        ri = reader.run_infos()[0]
+        ri = reader.run_infos[0]
 
         assert isinstance(ri.acquisition_id, str)
         assert isinstance(ri.acquisition_start_time, int)
@@ -196,7 +196,7 @@ class TestRunInfo:
         assert isinstance(ri.tracking_id, dict)
 
     def test_repr(self, reader):
-        ri = reader.run_infos()[0]
+        ri = reader.run_infos[0]
         assert isinstance(repr(ri), str)
 
 
@@ -245,7 +245,7 @@ class TestIterator:
         for read in reader:
             assert isinstance(read, escapepod.ReadData)
             count += 1
-        assert count == reader.read_count()
+        assert count == reader.read_count
 
     def test_iter_twice(self, reader):
         """Iterator should work correctly on multiple calls."""
@@ -316,7 +316,7 @@ class TestWriter:
 
             # Read it back
             with escapepod.Reader(path) as reader:
-                assert reader.read_count() == 1
+                assert reader.read_count == 1
                 read = reader.reads()[0]
                 assert read.read_id == read_id
                 assert read.channel == 42
@@ -327,7 +327,7 @@ class TestWriter:
                 np.testing.assert_array_equal(recovered_signal, signal)
 
                 # Check run info
-                run_infos = reader.run_infos()
+                run_infos = reader.run_infos
                 assert len(run_infos) == 1
                 assert run_infos[0].acquisition_id == "test-acq-001"
                 assert run_infos[0].sample_rate == 4000
@@ -348,7 +348,7 @@ class TestWriter:
             with escapepod.Reader(str(TEST_POD5)) as src:
                 original_read = src.reads()[0]
                 original_signal = src.get_signal(original_read)
-                original_run_info = src.run_infos()[0]
+                original_run_info = src.run_infos[0]
 
             # Write it to a new file
             with escapepod.Writer(path) as writer:
@@ -357,7 +357,7 @@ class TestWriter:
 
             # Read back and verify
             with escapepod.Reader(path) as reader:
-                assert reader.read_count() == 1
+                assert reader.read_count == 1
                 read = reader.reads()[0]
                 assert read.read_id == original_read.read_id
                 signal = reader.get_signal(read)
@@ -407,7 +407,7 @@ class TestCreateRunInfo:
 class TestIndex:
     def test_has_index(self, reader):
         # May or may not have one
-        assert isinstance(reader.has_index(), bool)
+        assert isinstance(reader.has_index, bool)
 
     def test_build_index(self):
         if not TEST_POD5.exists():
@@ -422,5 +422,5 @@ class TestIndex:
 
             reader = escapepod.Reader(str(tmp_pod5))
             count = reader.build_index()
-            assert count == reader.read_count()
-            assert reader.has_index()
+            assert count == reader.read_count
+            assert reader.has_index

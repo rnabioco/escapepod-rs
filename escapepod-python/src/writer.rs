@@ -158,6 +158,8 @@ impl PyWriter {
         let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
             .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
 
+        let parsed_end_reason = parse_end_reason(end_reason)?;
+
         let signal_vec: Vec<i16> = signal.to_vec()?;
         let sample_count = num_samples.unwrap_or(signal_vec.len() as u64);
 
@@ -171,7 +173,7 @@ impl PyWriter {
             calibration_offset,
             calibration_scale,
             median_before,
-            end_reason: end_reason.parse().unwrap_or_default(),
+            end_reason: parsed_end_reason,
             end_reason_forced,
             run_info_index,
             num_minknow_events,
@@ -234,6 +236,34 @@ impl PyWriter {
         self.inner
             .as_mut()
             .ok_or_else(|| to_py_err(escapepod_signal::Error::WriterFinalized))
+    }
+}
+
+/// Parse an end-reason string and reject unknown values.
+///
+/// `EndReason::from_str` is infallible and silently maps unknowns to
+/// `Unknown`, which would let callers write misspelled metadata without
+/// noticing. Here we validate against the known set and raise a
+/// `ValueError` for anything else.
+fn parse_end_reason(s: &str) -> PyResult<escapepod_signal::EndReason> {
+    const VALID: &[&str] = &[
+        "unknown",
+        "mux_change",
+        "unblock_mux_change",
+        "data_service_unblock_mux_change",
+        "signal_positive",
+        "signal_negative",
+        "api_request",
+        "device_data_error",
+        "analysis_config_change",
+        "paused",
+    ];
+    if VALID.contains(&s) {
+        Ok(s.parse().unwrap_or_default())
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Invalid end_reason '{s}'. Valid values: {VALID:?}"
+        )))
     }
 }
 
