@@ -27,11 +27,11 @@ escapepod-signal = { workspace = true }
 flate2 = "1"
 indicatif = { workspace = true }
 # BAM file support
-noodles-bam = "0.87"
+noodles-bam = "0.88"
 noodles-bgzf = "0.46"
 noodles-core = "0.19"
 noodles-csi = "0.55"
-noodles-sam = "0.83"
+noodles-sam = "0.84"
 owo-colors = "4"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
