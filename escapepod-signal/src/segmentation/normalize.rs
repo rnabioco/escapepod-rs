@@ -70,6 +70,34 @@ pub fn mad_normalize(signal: &[f32]) -> Vec<f32> {
     signal.iter().map(|&x| (x - med) / mad_val).collect()
 }
 
+/// Normalize signal using median-MAD with the Gaussian scale factor (1.4826).
+///
+/// Transforms the signal to: `(signal - median) / (1.4826 * MAD)`.
+///
+/// The 1.4826 factor rescales MAD to a consistent estimator of the standard
+/// deviation for normally distributed data, matching the convention used by
+/// Remora and other nanopore tools. When MAD is essentially zero (constant
+/// signal), returns `signal - median` without dividing (no panic).
+///
+/// # Arguments
+/// * `signal` - The raw signal values to normalize
+///
+/// # Returns
+/// A new vector containing the normalized signal values. Returns an empty
+/// vector when `signal` is empty.
+pub fn mad_normalize_robust(signal: &[f32]) -> Vec<f32> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+
+    let (med, mad_val) = median_and_mad(signal);
+    let scale = mad_val * 1.4826;
+    if scale < 1e-10 {
+        return signal.iter().map(|&x| x - med).collect();
+    }
+    signal.iter().map(|&x| (x - med) / scale).collect()
+}
+
 /// Normalize signal using MAD with optional outlier clipping.
 ///
 /// Clips values beyond `clip_sigma` MAD units from the median before normalizing.

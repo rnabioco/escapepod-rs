@@ -10,11 +10,13 @@
 pub mod adaptive_dp;
 pub mod bands;
 pub mod dp;
+pub mod dp_raw_penalty;
 pub mod kmer_table;
 pub mod refine;
 pub mod rescale;
 pub mod types;
 
+pub use dp_raw_penalty::banded_dp_with_penalty_table;
 pub use kmer_table::KmerTable;
 pub use refine::{
     RefinementResult, calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map,
