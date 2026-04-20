@@ -1,7 +1,7 @@
 //! Classification logic for barcode demultiplexing.
 
 use super::model::WarpDemuxModel;
-use crate::dtw::dtw_distance;
+use crate::dtw::dtw_distance_bounded;
 
 /// Compute distance ratio confidence.
 ///
@@ -108,29 +108,82 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
             .unwrap_or(0),
     );
 
-    // Compute DTW distances to all training fingerprints
-    let mut distances: Vec<(usize, f32)> = model
-        .training_fingerprints
-        .iter()
-        .enumerate()
-        .map(|(i, train_fp)| {
-            train_scratch.clear();
-            train_scratch.extend(train_fp.iter().map(|&x| x as f32));
-            let dist = dtw_distance(&query_f32, &train_scratch, None);
-            (i, dist)
-        })
-        .collect();
+    // Track the running top-2 so we can pass the second-best squared distance
+    // as an upper bound to `dtw_distance_bounded`. A candidate that cannot
+    // beat the current second-best cannot change the top-2, so dropping it
+    // to `INF` early is safe for both `ratio` and `kernel` threshold paths.
+    let mut best_idx: usize = 0;
+    let mut best_dist: f32 = f32::INFINITY;
+    let mut second_best_dist: f32 = f32::INFINITY;
 
-    // Sort by distance (ascending)
-    distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, train_fp) in model.training_fingerprints.iter().enumerate() {
+        train_scratch.clear();
+        train_scratch.extend(train_fp.iter().map(|&x| x as f32));
 
-    // Get best and second-best matches (with bounds check)
-    let (best_idx, best_dist) = match distances.first() {
-        Some(&pair) => pair,
-        None => return ClassificationResult::unclassified(f64::INFINITY, f64::INFINITY),
-    };
-    let second_best_dist = distances.get(1).map(|&(_, d)| d).unwrap_or(f32::INFINITY);
+        // `dtw_distance_bounded` compares its running row-min (accumulated
+        // squared cost) against `upper_bound`, so we pass `second_best^2`.
+        // INF^2 is still INF, which means "never abandon" for the first
+        // couple of iterations before we have a real second-best.
+        let upper = second_best_dist * second_best_dist;
+        let d = dtw_distance_bounded(&query_f32, &train_scratch, None, upper);
 
+        if d < best_dist {
+            second_best_dist = best_dist;
+            best_dist = d;
+            best_idx = i;
+        } else if d < second_best_dist {
+            second_best_dist = d;
+        }
+    }
+
+    if best_dist.is_infinite() && model.training_fingerprints.is_empty() {
+        return ClassificationResult::unclassified(f64::INFINITY, f64::INFINITY);
+    }
+
+    classify_top2(model, best_idx, best_dist, second_best_dist)
+}
+
+/// Apply a `WarpDemuXModel`'s thresholding logic to a pre-computed row of
+/// DTW distances.
+///
+/// `distances[i]` must be the DTW distance from the query to
+/// `model.training_fingerprints[i]`. This is the second half of
+/// [`classify_read`], split out so the distance computation can be swapped
+/// (e.g. replaced by a batched GPU matrix via
+/// [`crate::dtw::dtw_distance_matrix_gpu`] when the `gpu` feature is enabled).
+pub fn classify_from_distances(model: &WarpDemuxModel, distances: &[f32]) -> ClassificationResult {
+    if distances.is_empty() {
+        return ClassificationResult::unclassified(f64::INFINITY, f64::INFINITY);
+    }
+
+    // Single linear scan for argmin + second argmin — cheaper than a
+    // full sort when only the top two matter.
+    let mut best_idx: usize = 0;
+    let mut best_dist: f32 = f32::INFINITY;
+    let mut second_best_dist: f32 = f32::INFINITY;
+    for (i, &d) in distances.iter().enumerate() {
+        if d < best_dist {
+            second_best_dist = best_dist;
+            best_dist = d;
+            best_idx = i;
+        } else if d < second_best_dist {
+            second_best_dist = d;
+        }
+    }
+
+    classify_top2(model, best_idx, best_dist, second_best_dist)
+}
+
+/// Apply the model's threshold logic to a pre-computed top-2. Shared
+/// between [`classify_read`] (which resolves the top-2 inline with
+/// `dtw_distance_bounded` and early abandonment) and
+/// [`classify_from_distances`] (which scans a full distances row).
+fn classify_top2(
+    model: &WarpDemuxModel,
+    best_idx: usize,
+    best_dist: f32,
+    second_best_dist: f32,
+) -> ClassificationResult {
     let best_dist_f64 = best_dist as f64;
     let second_best_dist_f64 = second_best_dist as f64;
 
@@ -165,6 +218,61 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
     } else {
         ClassificationResult::unclassified(best_dist_f64, second_best_dist_f64)
     }
+}
+
+/// Classify a batch of query fingerprints on the GPU.
+///
+/// Runs one batched DTW distance-matrix kernel on the device, then applies
+/// [`classify_from_distances`] to each row. Prefer this over calling
+/// [`classify_read`] in a loop when you have many queries — kernel launch
+/// and NVRTC compile costs amortize across the entire batch.
+///
+/// Only available with the `gpu` feature.
+#[cfg(feature = "gpu")]
+pub fn classify_reads_gpu(
+    model: &WarpDemuxModel,
+    fingerprints: &[Vec<f64>],
+) -> Result<Vec<ClassificationResult>, crate::dtw::GpuDtwError> {
+    let ctx = crate::dtw::GpuDtwContext::new()?;
+    classify_reads_gpu_with_ctx(&ctx, model, fingerprints)
+}
+
+/// Same as [`classify_reads_gpu`] but reuses an existing
+/// [`crate::dtw::GpuDtwContext`].
+///
+/// Build the context once and reuse it across multiple batches — NVRTC
+/// compilation plus module load costs roughly 100 ms the first time.
+#[cfg(feature = "gpu")]
+pub fn classify_reads_gpu_with_ctx(
+    ctx: &crate::dtw::GpuDtwContext,
+    model: &WarpDemuxModel,
+    fingerprints: &[Vec<f64>],
+) -> Result<Vec<ClassificationResult>, crate::dtw::GpuDtwError> {
+    if fingerprints.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let queries: Vec<Vec<f32>> = fingerprints
+        .iter()
+        .map(|fp| fp.iter().map(|&x| x as f32).collect())
+        .collect();
+    let refs: Vec<Vec<f32>> = model
+        .training_fingerprints
+        .iter()
+        .map(|fp| fp.iter().map(|&x| x as f32).collect())
+        .collect();
+
+    let dist = ctx.distance_matrix(&queries, &refs, None)?;
+
+    let results: Vec<ClassificationResult> = (0..fingerprints.len())
+        .map(|i| {
+            let row = dist.row(i);
+            let slice = row.as_slice().expect("Array2 rows are contiguous");
+            classify_from_distances(model, slice)
+        })
+        .collect();
+
+    Ok(results)
 }
 
 #[cfg(test)]

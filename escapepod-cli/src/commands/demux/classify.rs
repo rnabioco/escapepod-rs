@@ -50,9 +50,33 @@ pub struct ClassifyArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub probabilities: bool,
 
+    /// Run DTW on the GPU (requires build with `--features gpu` and a CUDA device).
+    ///
+    /// Applies to all three classification modes: `--reference`, `--model`, and
+    /// `--svm-model`. Only the DTW distance step moves to GPU; SVM kernel /
+    /// decision / probability math stays on CPU.
+    #[cfg(feature = "gpu")]
+    #[arg(long, help_heading = "Advanced Options")]
+    pub gpu: bool,
+
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
     pub profile: bool,
+}
+
+/// Whether the user requested the GPU path. Expands to `false` in builds
+/// compiled without the `gpu` feature.
+#[inline]
+fn gpu_requested(args: &ClassifyArgs) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        args.gpu
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = args;
+        false
+    }
 }
 
 /// Classification result for output.
@@ -161,22 +185,48 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
         anyhow::bail!("No valid query fingerprints found");
     }
 
-    // Classify each query in parallel
-    println!("{} reads with SVM...", style::action("Classifying"));
-
-    let results: Vec<SvmClassifyResult> = query_fps
-        .par_iter()
-        .map(|(read_id, fingerprint)| {
-            let (probs, result) = classify_with_svm(&model, fingerprint);
-            SvmClassifyResult {
-                read_id: *read_id,
-                predicted_barcode: result.predicted_barcode,
-                confidence: result.confidence,
-                is_confident: result.is_confident,
-                probabilities: probs,
-            }
-        })
-        .collect();
+    // Classify each query (GPU batched if requested, else parallel CPU).
+    let results: Vec<SvmClassifyResult> = if gpu_requested(&args) {
+        #[cfg(feature = "gpu")]
+        {
+            use escapepod_signal::demux::classify_with_svm_batch_gpu;
+            println!("{} reads with SVM on GPU...", style::action("Classifying"));
+            let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
+            let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
+            let gpu_results = classify_with_svm_batch_gpu(&model, &fps)
+                .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
+            gpu_results
+                .into_iter()
+                .zip(read_ids)
+                .map(|((probs, result), read_id)| SvmClassifyResult {
+                    read_id,
+                    predicted_barcode: result.predicted_barcode,
+                    confidence: result.confidence,
+                    is_confident: result.is_confident,
+                    probabilities: probs,
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+        }
+    } else {
+        println!("{} reads with SVM...", style::action("Classifying"));
+        query_fps
+            .par_iter()
+            .map(|(read_id, fingerprint)| {
+                let (probs, result) = classify_with_svm(&model, fingerprint);
+                SvmClassifyResult {
+                    read_id: *read_id,
+                    predicted_barcode: result.predicted_barcode,
+                    confidence: result.confidence,
+                    is_confident: result.is_confident,
+                    probabilities: probs,
+                }
+            })
+            .collect()
+    };
 
     // Write output
     write_svm_classifications(&args.output, &results, &model, args.probabilities)?;
@@ -249,23 +299,50 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
         anyhow::bail!("No valid query fingerprints found");
     }
 
-    // Classify each query in parallel
-    println!("{} reads...", style::action("Classifying"));
-
-    let results: Vec<ClassifyResult> = query_fps
-        .par_iter()
-        .map(|(read_id, fingerprint)| {
-            let result = classify_read(&model, fingerprint);
-            ClassifyResult {
-                read_id: *read_id,
-                barcode: result.barcode,
-                confidence: result.confidence,
-                best_distance: result.best_distance,
-                second_best_distance: result.second_best_distance,
-                is_confident: result.is_confident,
-            }
-        })
-        .collect();
+    // Classify each query (GPU if requested, else parallel CPU).
+    let results: Vec<ClassifyResult> = if gpu_requested(&args) {
+        #[cfg(feature = "gpu")]
+        {
+            use escapepod_signal::demux::classify_reads_gpu;
+            println!("{} reads on GPU...", style::action("Classifying"));
+            let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
+            let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
+            let gpu_results = classify_reads_gpu(&model, &fps)
+                .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
+            gpu_results
+                .into_iter()
+                .zip(read_ids)
+                .map(|(result, read_id)| ClassifyResult {
+                    read_id,
+                    barcode: result.barcode,
+                    confidence: result.confidence,
+                    best_distance: result.best_distance,
+                    second_best_distance: result.second_best_distance,
+                    is_confident: result.is_confident,
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+        }
+    } else {
+        println!("{} reads...", style::action("Classifying"));
+        query_fps
+            .par_iter()
+            .map(|(read_id, fingerprint)| {
+                let result = classify_read(&model, fingerprint);
+                ClassifyResult {
+                    read_id: *read_id,
+                    barcode: result.barcode,
+                    confidence: result.confidence,
+                    best_distance: result.best_distance,
+                    second_best_distance: result.second_best_distance,
+                    is_confident: result.is_confident,
+                }
+            })
+            .collect()
+    };
 
     // Write output
     write_model_classifications(&args.output, &results)?;
@@ -344,10 +421,22 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     let query_values: Vec<Vec<f32>> = query_fps.iter().map(|(_, v)| v.clone()).collect();
     let ref_values: Vec<Vec<f32>> = reference_fps.iter().map(|fp| fp.values.clone()).collect();
 
-    println!("{} DTW distances...", style::action("Computing"));
-
-    // Compute distance matrix
-    let distances = dtw_distance_matrix(&query_values, &ref_values, args.window);
+    let distances = if gpu_requested(&args) {
+        #[cfg(feature = "gpu")]
+        {
+            use escapepod_signal::dtw::dtw_distance_matrix_gpu;
+            println!("{} DTW distances on GPU...", style::action("Computing"));
+            dtw_distance_matrix_gpu(&query_values, &ref_values, args.window)
+                .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+        }
+    } else {
+        println!("{} DTW distances...", style::action("Computing"));
+        dtw_distance_matrix(&query_values, &ref_values, args.window)
+    };
 
     // Classify each query
     let results: Vec<ClassifyResult> = query_fps

@@ -94,6 +94,54 @@ pub fn distance_to_kernel_matrix(distances: &Array2<f64>, gamma: f64, power: f64
     distances.mapv(|d| (-gamma * d.powf(power)).exp())
 }
 
+/// GPU variant of [`compute_distance_matrix`].
+///
+/// Runs a single all-pairs DTW batch on the device. The result is
+/// mathematically symmetric up to floating-point summation order; we
+/// symmetrize the upper triangle before returning so downstream code sees
+/// the same bit-exact symmetry the CPU path produces.
+#[cfg(feature = "gpu")]
+pub fn compute_distance_matrix_gpu(
+    fingerprints: &[Vec<f64>],
+    window: Option<usize>,
+) -> Result<Array2<f64>, crate::dtw::GpuDtwError> {
+    let ctx = crate::dtw::GpuDtwContext::new()?;
+    compute_distance_matrix_gpu_with_ctx(&ctx, fingerprints, window)
+}
+
+/// Same as [`compute_distance_matrix_gpu`] but reuses an existing
+/// [`crate::dtw::GpuDtwContext`].
+#[cfg(feature = "gpu")]
+pub fn compute_distance_matrix_gpu_with_ctx(
+    ctx: &crate::dtw::GpuDtwContext,
+    fingerprints: &[Vec<f64>],
+    window: Option<usize>,
+) -> Result<Array2<f64>, crate::dtw::GpuDtwError> {
+    let n = fingerprints.len();
+    if n == 0 {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+
+    let f32_fps: Vec<Vec<f32>> = fingerprints
+        .iter()
+        .map(|fp| fp.iter().map(|&x| x as f32).collect())
+        .collect();
+
+    let dist_f32 = ctx.distance_matrix(&f32_fps, &f32_fps, window)?;
+
+    // Promote to f64 and symmetrize: use the upper triangle as canonical,
+    // zero the diagonal. CPU `compute_distance_matrix` does the same.
+    let mut out = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = dist_f32[[i, j]] as f64;
+            out[[i, j]] = d;
+            out[[j, i]] = d;
+        }
+    }
+    Ok(out)
+}
+
 /// Train a DTW-SVM model.
 ///
 /// This trains an SVM using DTW distances as the kernel.
@@ -114,6 +162,32 @@ pub fn train_svm(
     labels: Vec<i32>,
     config: &TrainConfig,
 ) -> Result<DtwSvmModel, anyhow::Error> {
+    let distance_matrix = compute_distance_matrix(&fingerprints, config.window);
+    train_svm_from_distances(fingerprints, labels, distance_matrix, config)
+}
+
+/// GPU variant of [`train_svm`]: computes the DTW distance matrix on the GPU,
+/// then runs the existing CPU kernel + SVM training logic.
+#[cfg(feature = "gpu")]
+pub fn train_svm_gpu(
+    fingerprints: Vec<Vec<f64>>,
+    labels: Vec<i32>,
+    config: &TrainConfig,
+) -> Result<DtwSvmModel, anyhow::Error> {
+    let distance_matrix = compute_distance_matrix_gpu(&fingerprints, config.window)
+        .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
+    train_svm_from_distances(fingerprints, labels, distance_matrix, config)
+}
+
+/// Shared back half of training: given a precomputed DTW distance matrix,
+/// build the RBF kernel, fit the SVM (binary or OvO multiclass), and package
+/// the model. Used by both [`train_svm`] (CPU DTW) and [`train_svm_gpu`].
+pub fn train_svm_from_distances(
+    fingerprints: Vec<Vec<f64>>,
+    labels: Vec<i32>,
+    distance_matrix: Array2<f64>,
+    config: &TrainConfig,
+) -> Result<DtwSvmModel, anyhow::Error> {
     if fingerprints.len() != labels.len() {
         anyhow::bail!(
             "Mismatch: {} fingerprints but {} labels",
@@ -124,6 +198,16 @@ pub fn train_svm(
 
     if fingerprints.is_empty() {
         anyhow::bail!("No training data provided");
+    }
+
+    if distance_matrix.nrows() != fingerprints.len()
+        || distance_matrix.ncols() != fingerprints.len()
+    {
+        anyhow::bail!(
+            "Distance matrix shape {:?} does not match {} fingerprints",
+            distance_matrix.shape(),
+            fingerprints.len()
+        );
     }
 
     // Get unique classes
@@ -149,9 +233,6 @@ pub fn train_svm(
         .enumerate()
         .map(|(idx, &label)| (label, idx))
         .collect();
-
-    // Compute DTW distance matrix
-    let distance_matrix = compute_distance_matrix(&fingerprints, config.window);
 
     // Convert to kernel matrix
     let kernel_matrix = distance_to_kernel_matrix(&distance_matrix, config.gamma, config.power);

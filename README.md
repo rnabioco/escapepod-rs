@@ -19,6 +19,10 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 Experimental features (barcode demultiplexing, resquiggling) live behind
 Cargo feature flags and ship separately — see the [docs](https://rnabioco.github.io/escapepod-rs/) for status and build instructions.
 
+GPU-accelerated DTW for demux classify is available via `--features gpu`
+(opt-in, experimental). Uses NVRTC to compile a CUDA kernel at runtime —
+no `nvcc` needed at build time, only the CUDA driver + libnvrtc at run.
+
 ## Performance
 
 | Command | escapepod | pod5 | Speedup |

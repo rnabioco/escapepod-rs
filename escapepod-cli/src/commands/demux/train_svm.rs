@@ -56,9 +56,29 @@ pub struct TrainSvmArgs {
     #[arg(long, value_name = "VALUES", help_heading = "Advanced Options")]
     pub thresholds: Option<String>,
 
+    /// Run the DTW distance matrix on the GPU (requires `--features gpu`).
+    #[cfg(feature = "gpu")]
+    #[arg(long, help_heading = "Advanced Options")]
+    pub gpu: bool,
+
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
     pub profile: bool,
+}
+
+/// Whether the user requested the GPU path. Expands to `false` in builds
+/// compiled without the `gpu` feature.
+#[inline]
+fn gpu_requested(args: &TrainSvmArgs) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        args.gpu
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = args;
+        false
+    }
 }
 
 /// Run the train-svm subcommand.
@@ -104,9 +124,26 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
         config.c
     );
 
-    // Train the SVM
-    println!("{} DTW distance matrix...", style::action("Computing"));
-    let model = train_svm(fingerprints, labels, &config)?;
+    // Train the SVM — GPU path for the all-pairs DTW when requested, CPU
+    // otherwise.
+    let model = if gpu_requested(&args) {
+        #[cfg(feature = "gpu")]
+        {
+            use escapepod_signal::demux::train_svm_gpu;
+            println!(
+                "{} DTW distance matrix on GPU...",
+                style::action("Computing")
+            );
+            train_svm_gpu(fingerprints, labels, &config)?
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+        }
+    } else {
+        println!("{} DTW distance matrix...", style::action("Computing"));
+        train_svm(fingerprints, labels, &config)?
+    };
 
     // Save the model
     model.save(&args.output)?;

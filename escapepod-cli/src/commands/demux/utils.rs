@@ -273,9 +273,23 @@ pub fn extract_fingerprint_from_signal(
     min_separation: Option<usize>,
     keep_last: Option<usize>,
 ) -> Option<ReadFingerprint> {
-    let end = adapter_end.min(signal.len());
+    // In WarpDemuX-compat mode, extend the adapter region by
+    // `sig_extract.padding = 100` samples on each side before clipping and
+    // segmenting (matches `extract_adapter` in WarpDemuX's `sig_proc.py`).
+    // This is load-bearing — changes to this offset shift every changepoint
+    // and the final 25 segment means retained for the fingerprint.
+    let (slice_start, slice_end) = if keep_last.is_some() {
+        const WARPDEMUX_PADDING: usize = 100;
+        let ss = adapter_start.saturating_sub(WARPDEMUX_PADDING);
+        let se = adapter_end
+            .saturating_add(WARPDEMUX_PADDING)
+            .min(signal.len());
+        (ss, se)
+    } else {
+        (adapter_start, adapter_end.min(signal.len()))
+    };
 
-    if end <= adapter_start || end - adapter_start < window_width * 2 {
+    if slice_end <= slice_start || slice_end - slice_start < window_width * 2 {
         return None;
     }
 
@@ -283,7 +297,7 @@ pub fn extract_fingerprint_from_signal(
     // — WarpDemuX segments raw pA values and normalizes event means afterwards.
     // For the default mode, MAD-normalize for consistency with existing behavior.
     let adapter_signal: Vec<f32> = if keep_last.is_some() {
-        let raw: Vec<f32> = signal[adapter_start..end]
+        let raw: Vec<f32> = signal[slice_start..slice_end]
             .iter()
             .map(|&s| s as f32)
             .collect();
@@ -291,7 +305,7 @@ pub fn extract_fingerprint_from_signal(
         // to prevent extreme values from distorting changepoint detection.
         clip_outliers(&raw, 5.0)
     } else {
-        let raw: Vec<f32> = signal[adapter_start..end]
+        let raw: Vec<f32> = signal[slice_start..slice_end]
             .iter()
             .map(|&s| s as f32)
             .collect();

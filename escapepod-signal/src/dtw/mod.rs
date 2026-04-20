@@ -9,8 +9,14 @@ mod distance;
 mod fingerprint;
 mod kernel;
 
+#[cfg(feature = "gpu")]
+pub mod cuda;
+
 pub use distance::{
     dtw_distance, dtw_distance_bounded, dtw_distance_matrix, dtw_distance_matrix_blocked,
 };
 pub use fingerprint::{Fingerprint, NormMethod, normalize_fingerprint};
 pub use kernel::{distance_to_kernel, distance_to_kernel_auto};
+
+#[cfg(feature = "gpu")]
+pub use cuda::{GpuDtwContext, GpuDtwError, dtw_distance_matrix_gpu};

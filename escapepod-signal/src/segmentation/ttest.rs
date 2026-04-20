@@ -129,52 +129,94 @@ pub fn find_changepoints(
         return Vec::new();
     }
 
-    // Step 1: Find local maxima (peaks) in the t-scores.
-    // Uses non-strict inequality (>=) for peak detection, which produces more
-    // stable fingerprints than strict inequality when combined with the
-    // "keep last N segments" approach used for barcode fingerprinting.
-    let mut peaks: Vec<usize> = Vec::new();
-    for i in 0..t_scores.len() {
-        let left_ok = i == 0 || t_scores[i] >= t_scores[i - 1];
-        let right_ok = i + 1 >= t_scores.len() || t_scores[i] >= t_scores[i + 1];
-        if left_ok && right_ok && t_scores[i] > 0.0 {
-            peaks.push(i);
-        }
-    }
+    // Step 1: Find local maxima with scipy.signal.find_peaks semantics —
+    // strict `>` on both sides, with plateaus collapsed to a single peak at
+    // the midpoint. (The older `>=` + `t_scores[i] > 0` filter produced
+    // different peak sets than WarpDemuX on real data — see
+    // benchmarks/README.md.)
+    let peaks = local_maxima_scipy(&t_scores);
 
-    // Step 2: Sort peaks by score (descending) and select top N
-    // with minimum distance constraint (matching scipy find_peaks distance param).
-    peaks.sort_by(|&a, &b| {
-        t_scores[b]
-            .partial_cmp(&t_scores[a])
+    // Step 2: Greedy top-N selection by score with a `< min_separation`
+    // distance constraint — functionally identical to scipy's
+    // `_select_by_peak_distance` followed by a top-N by score, since the
+    // latter picks greedily from highest priority down and kills in-range
+    // neighbors each round.
+    let mut peak_order: Vec<usize> = (0..peaks.len()).collect();
+    peak_order.sort_by(|&a, &b| {
+        t_scores[peaks[b]]
+            .partial_cmp(&t_scores[peaks[a]])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let mut changepoints = Vec::new();
-    let mut blacklist = std::collections::HashSet::new();
+    let mut kept = vec![false; peaks.len()];
+    let mut changepoints = Vec::with_capacity(num_changepoints);
 
-    for &peak_pos in &peaks {
+    for &idx in &peak_order {
         if changepoints.len() >= num_changepoints {
             break;
         }
+        let pos = peaks[idx];
 
-        if !blacklist.contains(&peak_pos) {
-            // Adjust position to be at the boundary between windows
-            let adjusted_pos = peak_pos + window_width;
-            changepoints.push(adjusted_pos);
-
-            // Blacklist nearby positions (enforce min_separation between peaks)
-            let start = peak_pos.saturating_sub(min_separation - 1);
-            let end = (peak_pos + min_separation).min(t_scores.len());
-            for pos in start..end {
-                blacklist.insert(pos);
+        // Reject if a previously-kept peak is within `min_separation` samples.
+        // Scan outward from `idx`; with peaks sorted ascending by position,
+        // we can stop as soon as distance exceeds the threshold.
+        let too_close_left = (0..idx).rev().any(|k| {
+            if pos.saturating_sub(peaks[k]) >= min_separation {
+                return false;
             }
+            kept[k]
+        });
+        let too_close_right = ((idx + 1)..peaks.len()).any(|k| {
+            if peaks[k].saturating_sub(pos) >= min_separation {
+                return false;
+            }
+            kept[k]
+        });
+        if too_close_left || too_close_right {
+            continue;
         }
+
+        kept[idx] = true;
+        // Shift to the window boundary — WarpDemuX's
+        // `valid_cpts = peaks[...] + running_stat_width` convention.
+        changepoints.push(pos + window_width);
     }
 
-    // Sort changepoints by position
     changepoints.sort_unstable();
     changepoints
+}
+
+/// 1-D local maxima with `scipy.signal._local_maxima_1d` semantics:
+/// returns indices of peaks where `x[i-1] < x[i]` and `x[i] > x[j]` for the
+/// first index `j > i` with a different value. Plateaus (runs of equal
+/// values bounded by strictly-lower neighbours) collapse to a single peak
+/// at the midpoint. Returns positions in ascending order.
+fn local_maxima_scipy(x: &[f64]) -> Vec<usize> {
+    let n = x.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let mut peaks = Vec::new();
+    let mut i = 1;
+    let i_max = n - 1;
+    while i < i_max {
+        if x[i - 1] < x[i] {
+            // Walk to the end of a plateau (values equal to x[i]).
+            let mut i_ahead = i + 1;
+            while i_ahead < i_max && x[i_ahead] == x[i] {
+                i_ahead += 1;
+            }
+            if x[i_ahead] < x[i] {
+                // Genuine maximum — plateau midpoint (left side on ties).
+                let mid = (i + i_ahead - 1) / 2;
+                peaks.push(mid);
+                i = i_ahead;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    peaks
 }
 
 /// Segment a signal using changepoints and compute mean signal per segment.

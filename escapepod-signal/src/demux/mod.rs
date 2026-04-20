@@ -57,7 +57,10 @@ mod svm;
 mod train;
 
 // Legacy exports (distance-based classifier)
-pub use classify::{ClassificationResult, classify_read};
+pub use classify::{ClassificationResult, classify_from_distances, classify_read};
+
+#[cfg(feature = "gpu")]
+pub use classify::{classify_reads_gpu, classify_reads_gpu_with_ctx};
 pub use model::{KernelParams, WarpDemuxModel, load_model};
 
 // New SVM exports
@@ -67,6 +70,9 @@ pub use probability::{
     softmax,
 };
 pub use svm::{SvmModel, SvmPredictor, classify_with_svm, compute_distances, distances_to_kernel};
+
+#[cfg(feature = "gpu")]
+pub use svm::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx};
 
 // Training exports (feature-gated)
 #[cfg(feature = "train")]

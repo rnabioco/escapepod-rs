@@ -58,6 +58,15 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         return f32::INFINITY;
     }
 
+    // Classical Sakoe-Chiba: the endpoint `(n, m)` itself has to lie in the
+    // band. If `|n - m| > w` no alignment is possible and the DP would
+    // otherwise return a stale value left over from an earlier in-band row.
+    if let Some(w) = window
+        && n.abs_diff(m) > w
+    {
+        return f32::INFINITY;
+    }
+
     // Use two rows for memory efficiency (current and previous)
     let mut prev = vec![f32::INFINITY; m + 1];
     let mut curr = vec![f32::INFINITY; m + 1];
@@ -78,6 +87,17 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         } else {
             m
         };
+
+        // Classical Sakoe-Chiba treats cells outside the band as unreachable
+        // (INF). `curr[j_start - 1]` still holds whatever a prior row wrote,
+        // which can be a finite value and would let the DP cheat by using an
+        // out-of-band predecessor. Re-seed it to INF before we compute the
+        // row so the `curr[j-1]` read below is correct for j == j_start.
+        // Only needed when the inner loop actually runs and is reading from
+        // a non-zero-indexed boundary.
+        if j_start <= j_end && j_start > 1 {
+            curr[j_start - 1] = f32::INFINITY;
+        }
 
         // Track minimum value in this row for early abandonment
         let mut row_min = f32::INFINITY;
