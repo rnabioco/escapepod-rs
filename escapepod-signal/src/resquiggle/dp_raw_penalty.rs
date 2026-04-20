@@ -293,7 +293,8 @@ mod tests {
             .collect();
 
         let pen = [0.0f32; 0];
-        let path = banded_dp_with_penalty_table(&signal, &levels, &band_start, &band_end, &pen, false);
+        let path =
+            banded_dp_with_penalty_table(&signal, &levels, &band_start, &band_end, &pen, false);
 
         assert_eq!(path.len(), n_bases + 1);
         assert_eq!(path[0], 0);
@@ -330,8 +331,10 @@ mod tests {
             .collect();
 
         let pen: [f32; 0] = [];
-        let vit = banded_dp_with_penalty_table(&signal, &levels, &band_start, &band_end, &pen, false);
-        let dwp = banded_dp_with_penalty_table(&signal, &levels, &band_start, &band_end, &pen, true);
+        let vit =
+            banded_dp_with_penalty_table(&signal, &levels, &band_start, &band_end, &pen, false);
+        let dwp =
+            banded_dp_with_penalty_table(&signal, &levels, &band_start, &band_end, &pen, true);
         assert_eq!(vit, dwp);
     }
 }
