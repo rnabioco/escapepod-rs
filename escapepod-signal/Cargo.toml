@@ -31,6 +31,10 @@ linfa-svm = { version = "0.8", optional = true }
 cudarc = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 
+# CNN adapter detection (opt-in via `cnn-detect` feature). Pure-Rust ONNX
+# runtime; user supplies the model file at runtime (weights are CC BY-NC).
+tract-onnx = { workspace = true, optional = true }
+
 [features]
 default = []
 # Barcode demultiplexing (WarpDemuX-style DTW/SVM classification).
@@ -41,6 +45,9 @@ train = ["demux", "linfa", "linfa-svm"]
 # GPU-accelerated DTW distance matrix (requires CUDA driver at runtime).
 # Implies `demux` — the GPU path only benefits the demux classifier today.
 gpu = ["demux", "dep:cudarc", "dep:thiserror"]
+# CNN-based adapter detection via ONNX (requires a local ADAPTed-exported
+# `.onnx` model at runtime; weights are CC BY-NC, not bundled).
+cnn-detect = ["dep:tract-onnx", "dep:thiserror"]
 
 [dev-dependencies]
 arrow = { workspace = true }

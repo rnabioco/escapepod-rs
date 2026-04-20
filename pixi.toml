@@ -86,6 +86,11 @@ grpcio = "*"
 pod5 = ">=0.3.36,<0.4"
 dtaidistance = "*"
 vbz-h5py-plugin = "*"
+# Required by `torch.onnx.export` on torch 2.x (ONNX exporter moved to
+# onnxscript-backed tracing); also onnxruntime for the post-export smoke
+# test inside scripts/export_adapter_cnn_to_onnx.py.
+onnxscript = "*"
+onnxruntime = "*"
 
 [feature.warpdemux-bench.tasks]
 # The sed step patches ADAPTed's SigProcConfig, which uses mutable class

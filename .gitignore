@@ -33,6 +33,10 @@ __pycache__/
 !/benchmarks/
 /benchmarks/*.json
 /benchmarks/*.pod5
+# ADAPTed CNN weights are CC BY-NC 4.0; export locally via
+# scripts/export_adapter_cnn_to_onnx.py, never commit.
+/benchmarks/*.onnx
+/benchmarks/*.pth
 /.bench_data/
 /.bench_output/
 

@@ -39,6 +39,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
 cudarc = { version = "0.12", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12020"] }
+# Pure-Rust ONNX runtime for the CNN adapter detector (opt-in via `cnn-detect`).
+tract-onnx = "0.21"
 
 # Optimized release build: LTO + single codegen unit for maximum performance.
 [profile.release]

@@ -49,3 +49,6 @@ demux = ["escapepod-signal/demux"]
 train = ["demux", "escapepod-signal/train"]
 # GPU-accelerated DTW for demux classify (requires CUDA driver at runtime).
 gpu = ["demux", "escapepod-signal/gpu"]
+# CNN-based adapter detection (requires a local ADAPTed-exported .onnx model
+# at runtime; weights are CC BY-NC 4.0 and not bundled).
+cnn-detect = ["demux", "escapepod-signal/cnn-detect"]
