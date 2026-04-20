@@ -1,7 +1,7 @@
 //! Classification logic for barcode demultiplexing.
 
 use super::model::WarpDemuxModel;
-use crate::dtw::dtw_distance;
+use crate::dtw::dtw_distance_bounded;
 
 /// Compute distance ratio confidence.
 ///
@@ -108,17 +108,39 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
             .unwrap_or(0),
     );
 
-    let distances: Vec<f32> = model
-        .training_fingerprints
-        .iter()
-        .map(|train_fp| {
-            train_scratch.clear();
-            train_scratch.extend(train_fp.iter().map(|&x| x as f32));
-            dtw_distance(&query_f32, &train_scratch, None)
-        })
-        .collect();
+    // Track the running top-2 so we can pass the second-best squared distance
+    // as an upper bound to `dtw_distance_bounded`. A candidate that cannot
+    // beat the current second-best cannot change the top-2, so dropping it
+    // to `INF` early is safe for both `ratio` and `kernel` threshold paths.
+    let mut best_idx: usize = 0;
+    let mut best_dist: f32 = f32::INFINITY;
+    let mut second_best_dist: f32 = f32::INFINITY;
 
-    classify_from_distances(model, &distances)
+    for (i, train_fp) in model.training_fingerprints.iter().enumerate() {
+        train_scratch.clear();
+        train_scratch.extend(train_fp.iter().map(|&x| x as f32));
+
+        // `dtw_distance_bounded` compares its running row-min (accumulated
+        // squared cost) against `upper_bound`, so we pass `second_best^2`.
+        // INF^2 is still INF, which means "never abandon" for the first
+        // couple of iterations before we have a real second-best.
+        let upper = second_best_dist * second_best_dist;
+        let d = dtw_distance_bounded(&query_f32, &train_scratch, None, upper);
+
+        if d < best_dist {
+            second_best_dist = best_dist;
+            best_dist = d;
+            best_idx = i;
+        } else if d < second_best_dist {
+            second_best_dist = d;
+        }
+    }
+
+    if best_dist.is_infinite() && model.training_fingerprints.is_empty() {
+        return ClassificationResult::unclassified(f64::INFINITY, f64::INFINITY);
+    }
+
+    classify_top2(model, best_idx, best_dist, second_best_dist)
 }
 
 /// Apply a `WarpDemuXModel`'s thresholding logic to a pre-computed row of
@@ -149,6 +171,19 @@ pub fn classify_from_distances(model: &WarpDemuxModel, distances: &[f32]) -> Cla
         }
     }
 
+    classify_top2(model, best_idx, best_dist, second_best_dist)
+}
+
+/// Apply the model's threshold logic to a pre-computed top-2. Shared
+/// between [`classify_read`] (which resolves the top-2 inline with
+/// `dtw_distance_bounded` and early abandonment) and
+/// [`classify_from_distances`] (which scans a full distances row).
+fn classify_top2(
+    model: &WarpDemuxModel,
+    best_idx: usize,
+    best_dist: f32,
+    second_best_dist: f32,
+) -> ClassificationResult {
     let best_dist_f64 = best_dist as f64;
     let second_best_dist_f64 = second_best_dist as f64;
 

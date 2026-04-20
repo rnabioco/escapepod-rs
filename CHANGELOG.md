@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- GPU-accelerated DTW for demux, opt-in via `--features gpu` on
+  `escapepod-signal` and `escapepod-cli`. Wires up `escpod demux classify
+  --gpu` (WarpDemuX model, CSV reference, and SVM model paths) and
+  `escpod demux train-svm --gpu`. CUDA kernel is NVRTC-compiled at
+  runtime, so no `nvcc` is required at build time — only the CUDA driver
+  and `libnvrtc` at run time. On the lab cluster, `pixi run -e gpu …`
+  provisions `cuda-nvrtc` via conda-forge and sets `LD_LIBRARY_PATH`.
+  Anti-diagonal kernel with shared-memory-cached fingerprints; single-
+  warp blocks with `__syncwarp()` and `__launch_bounds__(32, 64)`.
+  Measured ~7.7× speedup over CPU rayon on A30 at 1024×40×110 and
+  8192×40×110 workloads (criterion, band w=10).
+- `GpuDtwContext`, `dtw_distance_matrix_gpu`, `classify_reads_gpu`,
+  `classify_with_svm_batch_gpu`, `compute_distance_matrix_gpu`,
+  `train_svm_gpu` public API on `escapepod-signal` (all `gpu`-gated).
+- CPU `classify_read` now uses `dtw_distance_bounded` with the running
+  second-best squared distance as an upper bound, skipping DTW work for
+  training fingerprints that cannot change the top-2. Safe for both
+  ratio and kernel threshold paths.
+
+### Fixed
+
+- **Behavior change for windowed DTW.** The 2-row banded DP in
+  `dtw_distance` / `dtw_distance_bounded` was leaving stale
+  `curr[j_start - 1]` values from earlier rows, letting the recurrence
+  read an out-of-band predecessor and occasionally find a shorter-than-
+  valid path. The classical Sakoe-Chiba band treats those cells as
+  unreachable; we now re-seed the boundary to `INF` at the top of each
+  row and also short-circuit to `INF` when `|n − m| > w` (the endpoint
+  itself is outside the band and the DP would otherwise propagate a
+  stale in-band value through the trailing empty rows). Only affects
+  callers that pass `Some(window)`; unwindowed DTW is unchanged. In
+  practice the difference is small but non-zero on real data — any
+  downstream classify output produced with a band constraint may shift
+  slightly, with GPU and CPU now agreeing bit-for-bit up to f32
+  summation order.
+
 ## 0.2.0 (2026-04-20)
 
 ### Breaking
