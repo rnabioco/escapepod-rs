@@ -71,6 +71,9 @@ pub use probability::{
 };
 pub use svm::{SvmModel, SvmPredictor, classify_with_svm, compute_distances, distances_to_kernel};
 
+#[cfg(feature = "gpu")]
+pub use svm::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx};
+
 // Training exports (feature-gated)
 #[cfg(feature = "train")]
 pub use train::*;

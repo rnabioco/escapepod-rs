@@ -423,6 +423,67 @@ pub fn classify_with_svm(model: &SvmModel, fingerprint: &[f64]) -> (Vec<f64>, Pr
     predictor.predict(fingerprint)
 }
 
+/// Classify a batch of fingerprints with an SVM model on the GPU.
+///
+/// Runs a single batched DTW distance-matrix kernel on the device, then runs
+/// the RBF-kernel / SVM decision / Platt-scaling pipeline on CPU per query.
+/// Prefer this over calling [`classify_with_svm`] in a loop when you have
+/// many queries — kernel launch and NVRTC compile costs amortize across the
+/// whole batch.
+///
+/// Only available with the `gpu` feature.
+#[cfg(feature = "gpu")]
+pub fn classify_with_svm_batch_gpu(
+    model: &SvmModel,
+    fingerprints: &[Vec<f64>],
+) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, crate::dtw::GpuDtwError> {
+    let ctx = crate::dtw::GpuDtwContext::new()?;
+    classify_with_svm_batch_gpu_with_ctx(&ctx, model, fingerprints)
+}
+
+/// Same as [`classify_with_svm_batch_gpu`] but reuses an existing
+/// [`crate::dtw::GpuDtwContext`].
+#[cfg(feature = "gpu")]
+pub fn classify_with_svm_batch_gpu_with_ctx(
+    ctx: &crate::dtw::GpuDtwContext,
+    model: &SvmModel,
+    fingerprints: &[Vec<f64>],
+) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, crate::dtw::GpuDtwError> {
+    if fingerprints.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let queries_f32: Vec<Vec<f32>> = fingerprints
+        .iter()
+        .map(|fp| fp.iter().map(|&x| x as f32).collect())
+        .collect();
+    let refs_f32: Vec<Vec<f32>> = model
+        .training_fingerprints
+        .iter()
+        .map(|fp| fp.iter().map(|&x| x as f32).collect())
+        .collect();
+
+    let dist = ctx.distance_matrix(&queries_f32, &refs_f32, model.window)?;
+
+    let predictor = SvmPredictor::new(model);
+    let mut out = Vec::with_capacity(fingerprints.len());
+    for i in 0..fingerprints.len() {
+        let row = dist.row(i);
+        let distances_f64: Vec<f64> = row.iter().map(|&d| d as f64).collect();
+        let kernel_values = distances_to_kernel(&distances_f64, &model.kernel_params);
+        let decisions = predictor.decision_function(&kernel_values);
+        let probabilities = predictor.decision_to_probabilities(&decisions);
+        let result = process_probabilities(
+            &probabilities,
+            &model.label_mapper,
+            model.thresholds.as_deref(),
+        );
+        out.push((probabilities, result));
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

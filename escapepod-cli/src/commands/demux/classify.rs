@@ -52,8 +52,9 @@ pub struct ClassifyArgs {
 
     /// Run DTW on the GPU (requires build with `--features gpu` and a CUDA device).
     ///
-    /// Applies to `--reference` and `--model` classification modes. The `--svm-model`
-    /// path still runs on the CPU in this release.
+    /// Applies to all three classification modes: `--reference`, `--model`, and
+    /// `--svm-model`. Only the DTW distance step moves to GPU; SVM kernel /
+    /// decision / probability math stays on CPU.
     #[cfg(feature = "gpu")]
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
@@ -184,22 +185,48 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
         anyhow::bail!("No valid query fingerprints found");
     }
 
-    // Classify each query in parallel
-    println!("{} reads with SVM...", style::action("Classifying"));
-
-    let results: Vec<SvmClassifyResult> = query_fps
-        .par_iter()
-        .map(|(read_id, fingerprint)| {
-            let (probs, result) = classify_with_svm(&model, fingerprint);
-            SvmClassifyResult {
-                read_id: *read_id,
-                predicted_barcode: result.predicted_barcode,
-                confidence: result.confidence,
-                is_confident: result.is_confident,
-                probabilities: probs,
-            }
-        })
-        .collect();
+    // Classify each query (GPU batched if requested, else parallel CPU).
+    let results: Vec<SvmClassifyResult> = if gpu_requested(&args) {
+        #[cfg(feature = "gpu")]
+        {
+            use escapepod_signal::demux::classify_with_svm_batch_gpu;
+            println!("{} reads with SVM on GPU...", style::action("Classifying"));
+            let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
+            let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
+            let gpu_results = classify_with_svm_batch_gpu(&model, &fps)
+                .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
+            gpu_results
+                .into_iter()
+                .zip(read_ids)
+                .map(|((probs, result), read_id)| SvmClassifyResult {
+                    read_id,
+                    predicted_barcode: result.predicted_barcode,
+                    confidence: result.confidence,
+                    is_confident: result.is_confident,
+                    probabilities: probs,
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+        }
+    } else {
+        println!("{} reads with SVM...", style::action("Classifying"));
+        query_fps
+            .par_iter()
+            .map(|(read_id, fingerprint)| {
+                let (probs, result) = classify_with_svm(&model, fingerprint);
+                SvmClassifyResult {
+                    read_id: *read_id,
+                    predicted_barcode: result.predicted_barcode,
+                    confidence: result.confidence,
+                    is_confident: result.is_confident,
+                    probabilities: probs,
+                }
+            })
+            .collect()
+    };
 
     // Write output
     write_svm_classifications(&args.output, &results, &model, args.probabilities)?;
