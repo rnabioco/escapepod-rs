@@ -6,7 +6,7 @@ use super::utils::{
 };
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod::segmentation::detect_adapter;
+use escapepod_signal::segmentation::detect_adapter;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};

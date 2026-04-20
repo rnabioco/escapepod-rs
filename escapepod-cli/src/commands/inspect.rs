@@ -2,7 +2,7 @@
 
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use escapepod::Reader;
+use escapepod_signal::Reader;
 use std::path::PathBuf;
 
 pub fn summary(input: PathBuf) -> anyhow::Result<()> {

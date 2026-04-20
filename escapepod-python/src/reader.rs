@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use escapepod::RecordBatch;
+use escapepod_signal::RecordBatch;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
@@ -19,7 +19,7 @@ use crate::read_data::{PyReadData, PyRunInfo};
 ///         reads = reader.get_reads(ids)
 #[pyclass(name = "Reader")]
 pub struct PyReader {
-    inner: escapepod::Reader,
+    inner: escapepod_signal::Reader,
     path: PathBuf,
 }
 
@@ -30,7 +30,7 @@ impl PyReader {
     /// Accepts a string path or any os.PathLike object (e.g. pathlib.Path).
     #[new]
     fn new(path: PathBuf) -> PyResult<Self> {
-        let reader = escapepod::Reader::open(&path).map_err(to_py_err)?;
+        let reader = escapepod_signal::Reader::open(&path).map_err(to_py_err)?;
         Ok(Self {
             inner: reader,
             path,
@@ -110,11 +110,12 @@ impl PyReader {
     fn reads(&self, selection: Option<Vec<String>>) -> PyResult<Vec<PyReadData>> {
         match selection {
             Some(read_ids) => {
-                let target_ids: HashSet<escapepod::Uuid> = read_ids
+                let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
                     .iter()
                     .map(|s| {
-                        escapepod::utils::parse_uuid_flexible(s)
-                            .map_err(|e| to_py_err(escapepod::Error::InvalidUuid(e.to_string())))
+                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
+                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
+                        })
                     })
                     .collect::<PyResult<_>>()?;
 
@@ -139,16 +140,17 @@ impl PyReader {
     ///
     /// Uses the ReadIndex for O(log n) lookup when a .p5i sidecar exists.
     fn get_read(&self, read_id: &str) -> PyResult<PyReadData> {
-        let uuid = escapepod::utils::parse_uuid_flexible(read_id)
-            .map_err(|e| to_py_err(escapepod::Error::InvalidUuid(e.to_string())))?;
+        let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
+            .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
 
         let index = self.inner.read_index().map_err(to_py_err)?;
         let (batch_idx, row_idx) = index
             .get(&uuid)
-            .ok_or_else(|| to_py_err(escapepod::Error::ReadNotFound(uuid)))?;
+            .ok_or_else(|| to_py_err(escapepod_signal::Error::ReadNotFound(uuid)))?;
 
         let batch = self.inner.read_batch(batch_idx).map_err(to_py_err)?;
-        let inner = escapepod::Reader::read_from_batch(&batch, row_idx).map_err(to_py_err)?;
+        let inner =
+            escapepod_signal::Reader::read_from_batch(&batch, row_idx).map_err(to_py_err)?;
         Ok(PyReadData { inner })
     }
 
@@ -157,11 +159,11 @@ impl PyReader {
     /// Uses indexed batch-skipping when a .p5i sidecar exists,
     /// otherwise falls back to a single-pass scan with early exit.
     fn get_reads(&self, read_ids: Vec<String>) -> PyResult<Vec<PyReadData>> {
-        let target_ids: HashSet<escapepod::Uuid> = read_ids
+        let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
             .iter()
             .map(|s| {
-                escapepod::utils::parse_uuid_flexible(s)
-                    .map_err(|e| to_py_err(escapepod::Error::InvalidUuid(e.to_string())))
+                escapepod_signal::utils::parse_uuid_flexible(s)
+                    .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))
             })
             .collect::<PyResult<_>>()?;
 
@@ -375,7 +377,8 @@ impl PyReadIterator {
                 let batch = self.current_batch.as_ref().unwrap();
                 let row = self.batch_row;
                 self.batch_row += 1;
-                let inner = escapepod::Reader::read_from_batch(batch, row).map_err(to_py_err)?;
+                let inner =
+                    escapepod_signal::Reader::read_from_batch(batch, row).map_err(to_py_err)?;
                 return Ok(Some(PyReadData { inner }));
             }
 

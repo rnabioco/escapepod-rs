@@ -1,6 +1,6 @@
 //! Utility functions for the CLI.
 
-use escapepod::Reader;
+use escapepod_signal::Reader;
 use noodles_bam as bam;
 #[cfg(feature = "experimental")]
 use noodles_csi::BinningIndex;
@@ -208,7 +208,7 @@ pub fn get_reads_iter_with_warning<'a>(
     reader: &'a Reader,
     file_path: &Path,
     is_directory: bool,
-) -> OpenResult<impl Iterator<Item = escapepod::Result<escapepod::ReadData>> + 'a> {
+) -> OpenResult<impl Iterator<Item = escapepod_signal::Result<escapepod_signal::ReadData>> + 'a> {
     match reader.reads() {
         Ok(iter) => OpenResult::Ok(iter),
         Err(e) => {

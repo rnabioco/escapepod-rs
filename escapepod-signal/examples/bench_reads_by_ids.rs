@@ -4,7 +4,7 @@
 //!
 //! Temporarily hides the .p5i sidecar to measure the scan path separately.
 
-use escapepod::Reader;
+use escapepod_signal::Reader;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;

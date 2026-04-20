@@ -29,7 +29,7 @@ impl LlrTrace {
     ///
     /// # Example
     /// ```
-    /// use escapepod::segmentation::LlrTrace;
+    /// use escapepod_signal::segmentation::LlrTrace;
     ///
     /// let signal = vec![1.0, 2.0, 3.0, 4.0, 5.0];
     /// let trace = LlrTrace::new(&signal, 1);
@@ -273,7 +273,7 @@ impl LlrTrace {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::detect_adapter;
+/// use escapepod_signal::segmentation::detect_adapter;
 ///
 /// let signal = vec![120.0; 100]; // Simplified example
 /// let (start, end) = detect_adapter(&signal, 10, 5);

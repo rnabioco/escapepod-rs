@@ -19,7 +19,7 @@
 //! ## Example (Legacy Model)
 //!
 //! ```no_run
-//! use escapepod::demux::{load_model, classify_read};
+//! use escapepod_signal::demux::{load_model, classify_read};
 //! use std::path::Path;
 //!
 //! let model = load_model(Path::new("model.json"))?;
@@ -34,7 +34,7 @@
 //! ## Example (SVM Model with Probabilities)
 //!
 //! ```no_run
-//! use escapepod::demux::{load_svm_model, classify_with_svm};
+//! use escapepod_signal::demux::{load_svm_model, classify_with_svm};
 //! use std::path::Path;
 //!
 //! let model = load_svm_model(Path::new("svm_model.json"))?;

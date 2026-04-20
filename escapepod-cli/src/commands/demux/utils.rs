@@ -1,9 +1,9 @@
 //! Shared utilities for demux subcommands.
 
 use super::types::{BarcodeFingerprint, ReadBoundaries, ReadFingerprint};
-use escapepod::Reader;
-use escapepod::dtw::{Fingerprint, NormMethod, normalize_fingerprint};
-use escapepod::segmentation::{clip_outliers, mad_normalize, segment_signal};
+use escapepod_signal::Reader;
+use escapepod_signal::dtw::{Fingerprint, NormMethod, normalize_fingerprint};
+use escapepod_signal::segmentation::{clip_outliers, mad_normalize, segment_signal};
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::fs::File;

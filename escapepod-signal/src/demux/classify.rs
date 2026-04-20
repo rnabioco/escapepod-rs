@@ -79,7 +79,7 @@ impl ClassificationResult {
 /// # Example
 ///
 /// ```no_run
-/// use escapepod::demux::{load_model, classify_read};
+/// use escapepod_signal::demux::{load_model, classify_read};
 /// use std::path::Path;
 ///
 /// let model = load_model(Path::new("model.json"))?;

@@ -139,7 +139,7 @@ impl Fingerprint {
 /// # Example
 ///
 /// ```
-/// use escapepod::dtw::{Fingerprint, normalize_fingerprint, NormMethod};
+/// use escapepod_signal::dtw::{Fingerprint, normalize_fingerprint, NormMethod};
 /// use uuid::Uuid;
 ///
 /// let mut fp = Fingerprint::new(vec![1.0, 2.0, 3.0, 4.0, 5.0], Uuid::nil());

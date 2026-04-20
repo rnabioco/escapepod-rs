@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 /// A single read's metadata from a POD5 file.
 #[pyclass(name = "ReadData", frozen)]
 pub struct PyReadData {
-    pub(crate) inner: escapepod::ReadData,
+    pub(crate) inner: escapepod_signal::ReadData,
 }
 
 #[pymethods]
@@ -139,7 +139,7 @@ impl PyReadData {
 /// Run information metadata from a POD5 file.
 #[pyclass(name = "RunInfo", frozen)]
 pub struct PyRunInfo {
-    pub(crate) inner: escapepod::RunInfoData,
+    pub(crate) inner: escapepod_signal::RunInfoData,
 }
 
 #[pymethods]

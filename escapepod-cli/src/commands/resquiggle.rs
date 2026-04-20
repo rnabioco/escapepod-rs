@@ -8,8 +8,8 @@ use bstr::ByteSlice;
 use clap::Args;
 use rayon::prelude::*;
 
-use escapepod::parse_uuid_flexible;
-use escapepod::resquiggle::{
+use escapepod_signal::parse_uuid_flexible;
+use escapepod_signal::resquiggle::{
     BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
     RoughRescaleAlgo, calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map,
 };
@@ -211,10 +211,10 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     ));
 
     let mut pod5_reads: HashMap<uuid::Uuid, Pod5ReadInfo> = HashMap::new();
-    let mut pod5_readers: Vec<escapepod::Reader> = Vec::new();
+    let mut pod5_readers: Vec<escapepod_signal::Reader> = Vec::new();
 
     for (reader_idx, path) in pod5_files.iter().enumerate() {
-        let reader = escapepod::Reader::open(path)?;
+        let reader = escapepod_signal::Reader::open(path)?;
         for read_result in reader.reads()? {
             let read = read_result?;
             pod5_reads.insert(
@@ -243,7 +243,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     let signal_extractors: Vec<_> = pod5_readers
         .iter()
         .map(|r| r.signal_extractor())
-        .collect::<escapepod::Result<_>>()?;
+        .collect::<escapepod_signal::Result<_>>()?;
 
     // --- Phase 3: Stream BAM, refine in parallel, write asynchronously ---
     let bam_total = count_bam_records(&args.bam)?;
@@ -416,7 +416,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
 /// Shared context for parallel refinement of BAM records.
 struct RefineContext<'a> {
     pod5_reads: &'a HashMap<uuid::Uuid, Pod5ReadInfo>,
-    signal_extractors: &'a [escapepod::SignalExtractor<'a>],
+    signal_extractors: &'a [escapepod_signal::SignalExtractor<'a>],
     kmer_table: &'a KmerTable,
     settings: &'a RefineSettings,
     rna: bool,
@@ -428,7 +428,7 @@ struct RefineContext<'a> {
 impl<'a> RefineContext<'a> {
     fn new(
         pod5_reads: &'a HashMap<uuid::Uuid, Pod5ReadInfo>,
-        signal_extractors: &'a [escapepod::SignalExtractor<'a>],
+        signal_extractors: &'a [escapepod_signal::SignalExtractor<'a>],
         kmer_table: &'a KmerTable,
         settings: &'a RefineSettings,
         rna: bool,

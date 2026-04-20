@@ -3,7 +3,7 @@
 //! These tests verify end-to-end workflows including reading, writing,
 //! merging, and filtering POD5 files.
 
-use escapepod::{EndReason, ReadData, Reader, RunInfoData, Writer, WriterOptions};
+use escapepod_signal::{EndReason, ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -70,7 +70,7 @@ fn generate_test_signal(num_samples: usize, offset: i16) -> Vec<i16> {
 }
 
 #[test]
-fn test_full_round_trip() -> escapepod::Result<()> {
+fn test_full_round_trip() -> escapepod_signal::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 
@@ -124,7 +124,7 @@ fn test_full_round_trip() -> escapepod::Result<()> {
 }
 
 #[test]
-fn test_read_with_context_tags_and_tracking_id() -> escapepod::Result<()> {
+fn test_read_with_context_tags_and_tracking_id() -> escapepod_signal::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 
@@ -175,7 +175,7 @@ fn test_read_with_context_tags_and_tracking_id() -> escapepod::Result<()> {
 }
 
 #[test]
-fn test_large_signal_chunking() -> escapepod::Result<()> {
+fn test_large_signal_chunking() -> escapepod_signal::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 
@@ -217,7 +217,7 @@ fn test_large_signal_chunking() -> escapepod::Result<()> {
 }
 
 #[test]
-fn test_all_end_reasons() -> escapepod::Result<()> {
+fn test_all_end_reasons() -> escapepod_signal::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 

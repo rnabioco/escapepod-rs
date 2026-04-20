@@ -29,11 +29,11 @@ use sam::alignment::record::data::field::Tag;
 use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::record_buf::data::field::value::Array as SamArray;
 
-use escapepod::resquiggle::{
+use escapepod_signal::resquiggle::{
     KmerTable, RefineSettings, calculate_initial_scaling, refine_signal_map,
     reverse_query_to_signal_map,
 };
-use escapepod::{Reader, parse_uuid_flexible};
+use escapepod_signal::{Reader, parse_uuid_flexible};
 
 /// POD5 read metadata needed for refinement.
 struct Pod5Info {

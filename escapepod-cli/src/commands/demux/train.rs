@@ -7,8 +7,8 @@ use super::utils::{
 };
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod::Reader;
-use escapepod::segmentation::detect_adapter;
+use escapepod_signal::Reader;
+use escapepod_signal::segmentation::detect_adapter;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -276,7 +276,7 @@ fn group_reads_by_file(
 fn extract_fingerprints(
     reads_by_file: &HashMap<PathBuf, Vec<(Uuid, String)>>,
     args: &TrainArgs,
-    norm_method: escapepod::dtw::NormMethod,
+    norm_method: escapepod_signal::dtw::NormMethod,
 ) -> anyhow::Result<HashMap<Uuid, Vec<f32>>> {
     let total_reads: usize = reads_by_file.values().map(|v| v.len()).sum();
     let progress_bar = create_progress_bar(total_reads as u64, "Processing")?;
@@ -320,7 +320,7 @@ fn extract_fingerprints(
 fn extract_training_fingerprint(
     signal: &[i16],
     args: &TrainArgs,
-    norm_method: escapepod::dtw::NormMethod,
+    norm_method: escapepod_signal::dtw::NormMethod,
     read_id: Uuid,
 ) -> Option<Vec<f32>> {
     // Normalize signal

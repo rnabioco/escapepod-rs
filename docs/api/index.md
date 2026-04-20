@@ -58,7 +58,7 @@ The command-line interface binary.
 ### Opening Files
 
 ```rust
-use escapepod::Reader;
+use escapepod_signal::Reader;
 
 let reader = Reader::open("file.pod5")?;
 ```
@@ -66,7 +66,7 @@ let reader = Reader::open("file.pod5")?;
 ### Creating Files
 
 ```rust
-use escapepod::{Writer, WriterOptions};
+use escapepod_signal::{Writer, WriterOptions};
 
 let writer = Writer::create("output.pod5", WriterOptions::default())?;
 ```
@@ -103,7 +103,7 @@ writer.finish()?;
 ## Error Handling
 
 ```rust
-use escapepod::Error;
+use escapepod_signal::Error;
 
 match result {
     Ok(value) => { /* success */ }

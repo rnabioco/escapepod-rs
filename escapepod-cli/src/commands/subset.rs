@@ -5,7 +5,7 @@
 
 use crate::commands::profile::PhaseTimer;
 use crate::style;
-use escapepod::operations::{FilterOptions, filter_files, parse_csv_mapping};
+use escapepod_signal::operations::{FilterOptions, filter_files, parse_csv_mapping};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -115,8 +115,8 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use escapepod::operations::parse_csv_mapping;
-    use escapepod::parse_uuid_flexible;
+    use escapepod_signal::operations::parse_csv_mapping;
+    use escapepod_signal::parse_uuid_flexible;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use uuid::Uuid;

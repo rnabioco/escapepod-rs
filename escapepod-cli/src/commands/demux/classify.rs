@@ -2,8 +2,8 @@
 
 use super::utils::parse_reference_csv;
 use crate::style;
-use escapepod::demux::{DtwSvmModel, classify_with_svm, load_svm_model};
-use escapepod::dtw::dtw_distance_matrix;
+use escapepod_signal::demux::{DtwSvmModel, classify_with_svm, load_svm_model};
+use escapepod_signal::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -189,7 +189,7 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
 
 /// Run classification using a trained WarpDemuX model.
 fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()> {
-    use escapepod::demux::{classify_read, load_model};
+    use escapepod_signal::demux::{classify_read, load_model};
 
     println!(
         "{} reads using WarpDemuX model",

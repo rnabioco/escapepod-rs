@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-escapepod-rs is a pure Rust implementation for reading and writing POD5 files, the native file format for Oxford Nanopore sequencing data. The project provides both a library crate (`escapepod`) and a CLI tool (`escapepod-cli`).
+escapepod-rs is a pure Rust implementation for reading and writing POD5 files, the native file format for Oxford Nanopore sequencing data. The workspace splits the library into two layers — `escapepod-pod5` for format I/O and `escapepod-signal` for signal-processing algorithms — plus a CLI tool (`escapepod-cli`) and Python bindings (`escapepod-python`).
 
 ## Requirements
 
@@ -48,7 +48,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ### Microbenchmarks (criterion)
 
-`escapepod/benches/hot_paths.rs` covers the audit hot paths: DTW, resquiggle DP, fingerprint MAD, VBZ encode/decode, DTW matrix.
+`escapepod-signal/benches/hot_paths.rs` covers the audit hot paths: DTW, resquiggle DP, fingerprint MAD, VBZ encode/decode, DTW matrix.
 
 ```bash
 # Full run
@@ -92,7 +92,7 @@ The CLI is wired to `tracing` with stderr output. Control the level via CLI flag
 ```bash
 escpod -v inspect summary file.pod5      # info
 escpod -vv merge *.pod5 -o out.pod5      # debug
-RUST_LOG=escapepod::reader=trace escpod view file.pod5   # module-scoped
+RUST_LOG=escapepod_signal::reader=trace escpod view file.pod5   # module-scoped
 escpod -q merge …                         # errors only
 ```
 
@@ -100,8 +100,10 @@ escpod -q merge …                         # errors only
 
 ### Workspace Structure
 
-- **escapepod**: Core library for reading/writing POD5 files
-- **escapepod-cli**: CLI binary that uses escapepod
+- **escapepod-pod5**: POD5 format I/O layer — reader, writer, VBZ compression, footer parsing, block-level merge/filter/repack/subset operations.
+- **escapepod-signal**: Signal-processing algorithms (DTW, demux, resquiggle, segmentation) layered on top of `escapepod-pod5`. Re-exports the pod5 surface so downstream consumers can depend on a single crate.
+- **escapepod-cli**: CLI binary (`escpod`) built on `escapepod-signal`.
+- **escapepod-python**: pyo3 bindings.
 
 ### POD5 File Format
 
@@ -120,7 +122,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 <POD5 signature>
 ```
 
-### Core Library (escapepod)
+### Format layer (escapepod-pod5)
 
 - **reader/file_reader.rs**: Memory-mapped file reader using `memmap2`. Opens POD5 files, parses the FlatBuffer footer, and provides iterators over reads and signal data.
 - **writer/file_writer.rs**: Buffered writer that constructs POD5 files. Handles signal chunking, VBZ compression, and batching of Arrow record batches.
@@ -137,6 +139,9 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
   - `filter.rs`: Filter reads by criteria (ID list, sample count, end reason)
   - `repack.rs`: Repack files with new compression settings
   - `subset.rs`: Split reads into multiple files by barcode or CSV mapping
+
+### Signal layer (escapepod-signal)
+
 - **demux/**: Barcode demultiplexing module
   - `mod.rs`: Main demux API with WarpDemuX model loading
   - `svm.rs`: SVM-based classification with probability output
@@ -149,6 +154,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
   - `llr.rs`: Log-Likelihood Ratio boundary detection
   - `ttest.rs`: T-test based changepoint segmentation
   - `normalize.rs`: MAD, z-score, and min-max normalization
+- **resquiggle/**: Signal-to-base alignment refinement (banded DP, rescaling, drift correction)
 
 ### CLI Commands
 
@@ -179,15 +185,20 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 
 ## Dependencies
 
-### Core Library (escapepod)
+### Format crate (escapepod-pod5)
 - **arrow**: Arrow IPC file reading/writing
 - **memmap2**: Memory-mapped file I/O
 - **zstd**: ZSTD compression for VBZ
 - **flatbuffers**: FlatBuffer footer parsing
 - **uuid**: Read ID handling
-- **ndarray**: Array operations for signal processing
 - **csv**: CSV parsing for filter IDs and barcode mappings
-- **serde/serde_json**: JSON model serialization
+- **byteorder**, **thiserror**, **tempfile**, **rayon**
+
+### Signal crate (escapepod-signal)
+- **escapepod-pod5**: re-exported as `pod5` plus the full type surface
+- **ndarray**: Array operations for signal processing
+- **rand**, **flate2**: resquiggle internals
+- **serde/serde_json**: JSON model serialization (demux)
 - **linfa/linfa-svm**: SVM training (optional, requires `train` feature)
 
 ### CLI (escapepod-cli)

@@ -2,7 +2,7 @@
 
 use super::utils::configure_thread_pool;
 use crate::style;
-use escapepod::operations::{FilterOptions, filter_files, parse_barcode_mapping};
+use escapepod_signal::operations::{FilterOptions, filter_files, parse_barcode_mapping};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;

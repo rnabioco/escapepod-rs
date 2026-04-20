@@ -25,7 +25,7 @@ use ndarray::Array2;
 /// # Example
 ///
 /// ```
-/// use escapepod::dtw::{dtw_distance_matrix, distance_to_kernel};
+/// use escapepod_signal::dtw::{dtw_distance_matrix, distance_to_kernel};
 ///
 /// let queries = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
 /// let references = vec![vec![1.0, 2.0, 3.0], vec![7.0, 8.0, 9.0]];

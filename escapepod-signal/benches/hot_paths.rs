@@ -22,9 +22,9 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use escapepod::compression::vbz;
-use escapepod::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
-use escapepod::resquiggle::dp::{ViterbiBuffers, dp_step_buffered};
+use escapepod_signal::compression::vbz;
+use escapepod_signal::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
+use escapepod_signal::resquiggle::dp::{ViterbiBuffers, dp_step_buffered};
 
 /// Read ESCAPEPOD_BENCH_THREADS and pre-configure the rayon global pool.
 /// No-op if the env var isn't set or rayon has already been initialized.
@@ -130,7 +130,7 @@ fn bench_fingerprint_mad(c: &mut Criterion) {
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |bench, _| {
             bench.iter_batched(
-                || Fingerprint::new(values.clone(), escapepod::types::Uuid::nil()),
+                || Fingerprint::new(values.clone(), escapepod_signal::types::Uuid::nil()),
                 |mut fp| {
                     normalize_fingerprint(black_box(&mut fp), NormMethod::Median);
                     fp
@@ -163,7 +163,7 @@ fn bench_vbz_roundtrip(c: &mut Criterion) {
 }
 
 fn bench_dtw_matrix(c: &mut Criterion) {
-    use escapepod::dtw::dtw_distance_matrix;
+    use escapepod_signal::dtw::dtw_distance_matrix;
     configure_rayon();
     let mut group = c.benchmark_group("dtw_distance_matrix");
     group.sample_size(bench_sample_size(50));

@@ -1,11 +1,11 @@
 //! Merge command implementation.
 //!
-//! Thin wrapper around escapepod::merge_files.
+//! Thin wrapper around escapepod_signal::merge_files.
 
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::collect_pod5_inputs;
-use escapepod::{MergeOptions, MergePhase, MergeProgress, merge_files};
+use escapepod_signal::{MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

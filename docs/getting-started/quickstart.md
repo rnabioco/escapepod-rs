@@ -64,7 +64,7 @@ escpod filter -i read_ids.txt -o filtered.pod5 experiment.pod5
 ### Reading a POD5 File
 
 ```rust
-use escapepod::{Reader, Result};
+use escapepod_signal::{Reader, Result};
 
 fn main() -> Result<()> {
     // Open a POD5 file
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
 ### Accessing Run Information
 
 ```rust
-use escapepod::Reader;
+use escapepod_signal::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
 
@@ -118,9 +118,9 @@ for run_info in reader.run_infos() {
 ### Writing a POD5 File
 
 ```rust
-use escapepod::{Writer, WriterOptions, ReadData, RunInfoData};
+use escapepod_signal::{Writer, WriterOptions, ReadData, RunInfoData};
 
-fn main() -> escapepod::Result<()> {
+fn main() -> escapepod_signal::Result<()> {
     // Create a new POD5 file
     let mut writer = Writer::create("output.pod5", WriterOptions::default())?;
 

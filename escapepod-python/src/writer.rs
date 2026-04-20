@@ -16,7 +16,7 @@ use crate::read_data::PyRunInfo;
 ///         writer.add_read(read_data_dict, signal)
 #[pyclass(name = "Writer")]
 pub struct PyWriter {
-    inner: Option<escapepod::Writer>,
+    inner: Option<escapepod_signal::Writer>,
 }
 
 #[pymethods]
@@ -54,7 +54,7 @@ impl PyWriter {
         compress_signal: Option<bool>,
         software: Option<String>,
     ) -> PyResult<Self> {
-        let mut opts = escapepod::WriterOptions::default();
+        let mut opts = escapepod_signal::WriterOptions::default();
         if let Some(v) = max_signal_chunk_size {
             opts.max_signal_chunk_size = v;
         }
@@ -71,7 +71,7 @@ impl PyWriter {
             opts.software = v;
         }
 
-        let writer = escapepod::Writer::create(&path, opts).map_err(to_py_err)?;
+        let writer = escapepod_signal::Writer::create(&path, opts).map_err(to_py_err)?;
         Ok(Self {
             inner: Some(writer),
         })
@@ -155,13 +155,13 @@ impl PyWriter {
         signal: &Bound<'_, PyArray1<i16>>,
         num_samples: Option<u64>,
     ) -> PyResult<()> {
-        let uuid = escapepod::utils::parse_uuid_flexible(read_id)
-            .map_err(|e| to_py_err(escapepod::Error::InvalidUuid(e.to_string())))?;
+        let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
+            .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
 
         let signal_vec: Vec<i16> = signal.to_vec()?;
         let sample_count = num_samples.unwrap_or(signal_vec.len() as u64);
 
-        let read = escapepod::ReadData {
+        let read = escapepod_signal::ReadData {
             read_id: uuid,
             read_number,
             start_sample,
@@ -230,10 +230,10 @@ impl PyWriter {
 }
 
 impl PyWriter {
-    fn writer_mut(&mut self) -> PyResult<&mut escapepod::Writer> {
+    fn writer_mut(&mut self) -> PyResult<&mut escapepod_signal::Writer> {
         self.inner
             .as_mut()
-            .ok_or_else(|| to_py_err(escapepod::Error::WriterFinalized))
+            .ok_or_else(|| to_py_err(escapepod_signal::Error::WriterFinalized))
     }
 }
 
@@ -287,7 +287,7 @@ pub fn create_run_info(
     tracking_id: Option<HashMap<String, String>>,
 ) -> PyRunInfo {
     PyRunInfo {
-        inner: escapepod::RunInfoData {
+        inner: escapepod_signal::RunInfoData {
             acquisition_id: acquisition_id.to_string(),
             acquisition_start_time,
             adc_max,

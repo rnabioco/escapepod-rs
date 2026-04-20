@@ -10,10 +10,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use escapepod::{EndReason, ReadData, RunInfoData, Writer, WriterOptions};
+use escapepod_signal::{EndReason, ReadData, RunInfoData, Writer, WriterOptions};
 use uuid::Uuid;
 
-fn main() -> escapepod::Result<()> {
+fn main() -> escapepod_signal::Result<()> {
     let output_path: PathBuf = std::env::args()
         .nth(1)
         .unwrap_or_else(|| {

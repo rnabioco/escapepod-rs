@@ -6,7 +6,7 @@
 //! 3. Build a distance matrix for multiple fingerprints
 //! 4. Convert distances to a kernel matrix for classification
 
-use escapepod::dtw::{
+use escapepod_signal::dtw::{
     distance_to_kernel, distance_to_kernel_auto, dtw_distance, dtw_distance_matrix, Fingerprint,
     NormMethod,
 };

@@ -5,7 +5,7 @@
 use crate::progress::create_progress_bar;
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
 use chrono::{TimeZone, Utc};
-use escapepod::{Reader, RunInfoData};
+use escapepod_signal::{Reader, RunInfoData};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -313,7 +313,7 @@ fn compute_statistics(stats: &mut ReadStats) -> StatisticsSummary {
     }
 
     // Use core statistics function
-    let core_stats = escapepod::compute_statistics(&mut stats.lengths);
+    let core_stats = escapepod_signal::compute_statistics(&mut stats.lengths);
 
     StatisticsSummary {
         total_samples: stats.total_samples,

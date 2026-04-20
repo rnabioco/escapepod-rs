@@ -56,7 +56,7 @@ pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow:
             }
 
             let t0 = Instant::now();
-            let reader = match escapepod::Reader::open(pod5_path) {
+            let reader = match escapepod_signal::Reader::open(pod5_path) {
                 Ok(r) => r,
                 Err(e) => return Some(anyhow::Error::from(e)),
             };

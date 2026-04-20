@@ -21,7 +21,7 @@
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::windowed_ttest;
+/// use escapepod_signal::segmentation::windowed_ttest;
 ///
 /// let signal = vec![1.0; 50];
 /// let scores = windowed_ttest(&signal, 10);
@@ -112,7 +112,7 @@ pub fn windowed_ttest(signal: &[f32], window_width: usize) -> Vec<f64> {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::find_changepoints;
+/// use escapepod_signal::segmentation::find_changepoints;
 ///
 /// let signal = vec![1.0; 100];
 /// let changepoints = find_changepoints(&signal, 10, 3, 15);
@@ -192,7 +192,7 @@ pub fn find_changepoints(
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::compute_segment_means;
+/// use escapepod_signal::segmentation::compute_segment_means;
 ///
 /// let signal = vec![1.0, 1.0, 5.0, 5.0, 5.0, 2.0, 2.0];
 /// let changepoints = vec![2, 5];
@@ -245,7 +245,7 @@ pub fn compute_segment_means(signal: &[f32], changepoints: &[usize]) -> Vec<(usi
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::segment_signal;
+/// use escapepod_signal::segmentation::segment_signal;
 ///
 /// let signal = vec![50.0; 20];
 /// let segments = segment_signal(&signal, 5, 2, 10);
@@ -306,7 +306,7 @@ impl SegmentationResult {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::segment_signal_with_dwell;
+/// use escapepod_signal::segmentation::segment_signal_with_dwell;
 ///
 /// let signal = vec![50.0; 100];
 /// let result = segment_signal_with_dwell(&signal, 10, 5, 15);

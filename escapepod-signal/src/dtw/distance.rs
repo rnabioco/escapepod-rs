@@ -23,7 +23,7 @@ use rayon::prelude::*;
 /// # Example
 ///
 /// ```
-/// use escapepod::dtw::dtw_distance;
+/// use escapepod_signal::dtw::dtw_distance;
 ///
 /// let a = vec![1.0, 2.0, 3.0, 4.0];
 /// let b = vec![1.0, 2.0, 3.0, 4.0];
@@ -124,7 +124,7 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
 /// # Example
 ///
 /// ```
-/// use escapepod::dtw::dtw_distance_matrix;
+/// use escapepod_signal::dtw::dtw_distance_matrix;
 ///
 /// let queries = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
 /// let references = vec![vec![1.0, 2.0, 3.0], vec![7.0, 8.0, 9.0]];

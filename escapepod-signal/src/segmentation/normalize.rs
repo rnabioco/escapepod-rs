@@ -55,7 +55,7 @@ fn median_and_mad(data: &[f32]) -> (f32, f32) {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::mad_normalize;
+/// use escapepod_signal::segmentation::mad_normalize;
 ///
 /// let signal = vec![100.0, 102.0, 98.0, 101.0, 99.0];
 /// let normalized = mad_normalize(&signal);
@@ -152,7 +152,7 @@ pub fn clip_outliers(signal: &[f32], clip_sigma: f32) -> Vec<f32> {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::normalize_dwell_times;
+/// use escapepod_signal::segmentation::normalize_dwell_times;
 ///
 /// let dwells = vec![30.0, 45.0, 32.0, 100.0, 28.0];
 /// let normalized = normalize_dwell_times(&dwells);
@@ -195,7 +195,7 @@ pub fn normalize_dwell_times(dwell_times: &[f32]) -> Vec<f32> {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::normalize_dwell_times_mad;
+/// use escapepod_signal::segmentation::normalize_dwell_times_mad;
 ///
 /// let dwells = vec![30.0, 45.0, 32.0, 500.0, 28.0];  // 500 is outlier
 /// let normalized = normalize_dwell_times_mad(&dwells);
@@ -238,7 +238,7 @@ pub fn normalize_dwell_times_mad(dwell_times: &[f32]) -> Vec<f32> {
 ///
 /// # Example
 /// ```
-/// use escapepod::segmentation::downscale;
+/// use escapepod_signal::segmentation::downscale;
 ///
 /// let signal = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 /// let downscaled = downscale(&signal, 2);

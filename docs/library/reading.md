@@ -5,7 +5,7 @@ The `Reader` struct provides efficient access to POD5 file contents.
 ## Opening a File
 
 ```rust
-use escapepod::Reader;
+use escapepod_signal::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
 ```

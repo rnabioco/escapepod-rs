@@ -3,19 +3,19 @@
 //! This crate layers signal-processing algorithms (DTW, barcode demultiplexing,
 //! resquiggle, segmentation) on top of the POD5 format I/O provided by
 //! [`escapepod_pod5`]. Format types and operations are re-exported here so
-//! existing consumers can depend solely on `escapepod`.
+//! consumers can depend on a single crate for both layers.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use escapepod::Reader;
+//! use escapepod_signal::Reader;
 //!
 //! let reader = Reader::open("example.pod5")?;
 //! for read_result in reader.reads()? {
 //!     let read = read_result?;
 //!     println!("Read: {}", read.read_id);
 //! }
-//! # Ok::<(), escapepod::Error>(())
+//! # Ok::<(), escapepod_signal::Error>(())
 //! ```
 
 // Signal-processing modules live in this crate.
@@ -25,7 +25,7 @@ pub mod resquiggle;
 pub mod segmentation;
 
 // Format layer (POD5 I/O) lives in escapepod-pod5. Re-export its modules and
-// types so consumers that depend on `escapepod` keep working unchanged.
+// types so downstream consumers can pull in both layers via this crate.
 pub use escapepod_pod5 as pod5;
 
 pub use escapepod_pod5::{

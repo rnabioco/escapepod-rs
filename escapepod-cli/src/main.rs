@@ -33,7 +33,7 @@ where
         write!(writer, " {:>5}", event.metadata().level())?;
 
         let target = event.metadata().target();
-        if let Some(module) = target.strip_prefix("escapepod::") {
+        if let Some(module) = target.strip_prefix("escapepod_signal::") {
             write!(writer, " [{module}]")?;
         } else if target != "escapepod_cli" && target != "escapepod" {
             write!(writer, " [{target}]")?;

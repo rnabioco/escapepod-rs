@@ -8,8 +8,8 @@ use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{ensure_bai_index, resolve_pod5_inputs};
 use bstr::ByteSlice;
-use escapepod::operations::{FilterOptions, filter_files};
-use escapepod::parse_uuid_flexible;
+use escapepod_signal::operations::{FilterOptions, filter_files};
+use escapepod_signal::parse_uuid_flexible;
 use noodles_bam as bam;
 use noodles_core::Region;
 use std::collections::HashSet;
@@ -86,10 +86,11 @@ pub fn run(
     let bar_for_callback = filter_bar.clone();
 
     // Create progress callback
-    let progress: escapepod::ProgressCallback = Box::new(move |p: escapepod::Progress| {
-        bar_for_callback.set_length(p.total);
-        bar_for_callback.set_position(p.current);
-    });
+    let progress: escapepod_signal::ProgressCallback =
+        Box::new(move |p: escapepod_signal::Progress| {
+            bar_for_callback.set_length(p.total);
+            bar_for_callback.set_position(p.current);
+        });
 
     // Use the core library's optimized filter
     let options = FilterOptions {

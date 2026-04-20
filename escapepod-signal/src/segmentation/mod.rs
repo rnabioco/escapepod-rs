@@ -15,7 +15,7 @@
 //! ## MAD Normalization
 //!
 //! ```
-//! use escapepod::segmentation::mad_normalize;
+//! use escapepod_signal::segmentation::mad_normalize;
 //!
 //! let signal = vec![100.0, 102.0, 98.0, 101.0, 99.0];
 //! let normalized = mad_normalize(&signal);
@@ -24,7 +24,7 @@
 //! ## LLR Adapter Detection
 //!
 //! ```
-//! use escapepod::segmentation::{LlrTrace, detect_adapter};
+//! use escapepod_signal::segmentation::{LlrTrace, detect_adapter};
 //!
 //! let signal = vec![120.0; 100]; // Your signal here
 //! let (adapter_start, adapter_end) = detect_adapter(&signal, 10, 5);
@@ -37,7 +37,7 @@
 //! ## T-test Segmentation
 //!
 //! ```
-//! use escapepod::segmentation::segment_signal;
+//! use escapepod_signal::segmentation::segment_signal;
 //!
 //! let signal = vec![50.0; 100]; // Your signal here
 //! let segments = segment_signal(&signal, 10, 5, 15);

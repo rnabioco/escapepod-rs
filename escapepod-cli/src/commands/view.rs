@@ -5,7 +5,7 @@
 use crate::util::{
     OpenResult, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
 };
-use escapepod::{determine_fields, get_field_value};
+use escapepod_signal::{determine_fields, get_field_value};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -74,7 +74,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use escapepod::{ALL_FIELDS, DEFAULT_FIELDS, determine_fields};
+    use escapepod_signal::{ALL_FIELDS, DEFAULT_FIELDS, determine_fields};
 
     #[test]
     fn test_determine_fields_default() {

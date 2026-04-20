@@ -8,10 +8,10 @@ use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use escapepod::operations::{
+use escapepod_signal::operations::{
     FilterCriteria, FilterOptions, filter_files_with_criteria, read_ids_from_file,
 };
-use escapepod::types::EndReason;
+use escapepod_signal::types::EndReason;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -135,10 +135,11 @@ pub fn run(
     let bar_for_callback = filter_bar.clone();
 
     // Create progress callback
-    let progress: escapepod::ProgressCallback = Box::new(move |p: escapepod::Progress| {
-        bar_for_callback.set_length(p.total);
-        bar_for_callback.set_position(p.current);
-    });
+    let progress: escapepod_signal::ProgressCallback =
+        Box::new(move |p: escapepod_signal::Progress| {
+            bar_for_callback.set_length(p.total);
+            bar_for_callback.set_position(p.current);
+        });
 
     // Use the core library's parallel filter
     let options = FilterOptions {
