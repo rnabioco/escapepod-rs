@@ -43,24 +43,40 @@ speedup on the kernel in isolation.
 
 ### Classification agreement (`compare_demux_results.py`)
 
-Using the **same** SVM model (`WDX4_rna004_v1_0`) and our own LLR
-boundaries:
+Using the **same** SVM model (`WDX4_rna004_v1_0`). Three layered tests
+to localise the gap:
 
-- Overall agreement: **23.2 %** (880 / 3786 common reads)
-- Most disagreements: escpod classifies as "unclassified" reads that
-  WarpDemuX confidently calls as a specific barcode
-- Boundary comparison: median `|adapter_start|` diff = 0 samples,
-  median `|adapter_end|` diff = 12 samples, 95th percentile = 77
-  samples
+| Experiment | Input | Agreement vs WDX |
+|---|---|---:|
+| Layer A: WDX boundaries + WDX fingerprints → `escpod classify` | `barcode_fpts_0.npz` decoded to CSV | **97.14 %** (100 % on conf ≥ 0.5) |
+| Layer A': WDX boundaries → `escpod fingerprint` + `escpod classify` | `detected_boundaries_0.csv.gz` | **54.1 %** |
+| Layer B: escpod detect + fingerprint + classify | — | 23.2 % |
 
-**This is a real compat gap, not a benchmark artefact.** The
-`--warpdemux-compat` fingerprint flag matches WarpDemuX's 110-event /
-mean-normalised fingerprint shape, but classifications still diverge —
-the prime suspects are (a) fingerprint ordering / segment selection
-and (b) DTW window differences (WDX4 uses window=15, escpod's CLI
-`classify --svm-model` currently ignores the model's embedded window
-and uses `None`). Worth investigating before shipping escpod as a
-drop-in.
+**The SVM classify path itself is correct** (97 % Layer A with `r =
+0.9958` confidence correlation against WDX). The gap is fingerprint
+extraction, not DTW / SVM / thresholds.
+
+Two contributors to the Layer A → B drop, roughly equal weight:
+
+1. **Adapter boundaries.** WDX4 uses a CNN-based detector (`cnn_detect
+   = true` in `rna004_130bps@v1.0.toml`); escpod has LLR only.
+   Boundary diffs: median `|adapter_end|` 12 samples, 95th percentile
+   77 samples.
+2. **T-test segmentation.** Even with identical boundaries (Layer A'),
+   per-read fingerprint Pearson correlation is only 0.57. Root cause:
+   `escapepod_signal::segmentation::find_changepoints` uses non-strict
+   `>=` local-max detection and filters out peaks with `t_score <= 0`;
+   WarpDemuX uses `scipy.signal.find_peaks` (strict `>`, no value
+   filter). For typical signals the two algorithms pick different
+   peak sets when scores are close together, shifting the 110
+   change points by a few samples and the 25 retained segment means
+   with them.
+
+Neither is a benchmarking artefact — both are real compatibility gaps
+worth closing before shipping escpod as a drop-in WDX replacement. The
+diagnostic harness (run `warpdemux demux --save_fpts true` and feed
+`.npz` through `scripts/compare_demux_results.py --escapepod-a …`)
+reproduces the Layer A number on demand.
 
 ### Reproducing
 
