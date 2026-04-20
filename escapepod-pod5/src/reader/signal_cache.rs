@@ -5,11 +5,43 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Metadata about signal table batches for efficient lookup.
+///
+/// Stores cumulative row counts so signal-row → (batch_idx, local_row) lookups
+/// work correctly even when batches have non-uniform sizes (e.g. files produced
+/// by `merge_files`, which concatenates each source file's signal batches
+/// verbatim and so inherits whatever row counts those sources used).
 pub(super) struct SignalBatchMetadata {
-    /// Number of rows per batch (assumed uniform, determined from batch 0).
-    pub batch_size: usize,
-    /// Total number of signal batches.
-    pub num_batches: usize,
+    /// Cumulative row counts. Length is `num_batches + 1`; `cumulative_rows[i]`
+    /// is the first signal row belonging to batch `i`, and `cumulative_rows[n]`
+    /// is the total row count.
+    pub cumulative_rows: Vec<u64>,
+}
+
+impl SignalBatchMetadata {
+    /// Number of batches described by this metadata.
+    pub fn num_batches(&self) -> usize {
+        self.cumulative_rows.len().saturating_sub(1)
+    }
+
+    /// Locate the `(batch_idx, local_row)` for an absolute signal row.
+    ///
+    /// Uses binary search over `cumulative_rows`. Returns `None` when `row`
+    /// is past the end of the table.
+    pub fn locate(&self, row: u64) -> Option<(usize, usize)> {
+        if self.cumulative_rows.len() < 2 {
+            return None;
+        }
+        let total = *self.cumulative_rows.last().unwrap();
+        if row >= total {
+            return None;
+        }
+        let batch_idx = match self.cumulative_rows.binary_search(&row) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        let local = row - self.cumulative_rows[batch_idx];
+        Some((batch_idx, local as usize))
+    }
 }
 
 /// A cached signal batch with access tracking for LRU eviction.

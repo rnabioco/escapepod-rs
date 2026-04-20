@@ -61,7 +61,17 @@ impl SchemaMetadata {
 }
 
 /// Build Arrow IPC footer from batch blocks.
-pub(crate) fn build_arrow_ipc_footer(batches: &[BatchBlock]) -> Result<Vec<u8>> {
+///
+/// The footer's `schema` field is what Arrow's `ArrowFileReader` trusts when
+/// it decodes batches — an empty schema here makes every batch come back with
+/// zero columns, which silently breaks any consumer that looks up columns by
+/// name (e.g. `Reader::get_signal`, which calls `column_by_name("signal")`).
+/// Pass the real Arrow schema of the batches so the footer matches the
+/// schema message embedded in the file header.
+pub(crate) fn build_arrow_ipc_footer(
+    batches: &[BatchBlock],
+    schema: &arrow::datatypes::Schema,
+) -> Result<Vec<u8>> {
     let mut fbb = FlatBufferBuilder::with_capacity(256 + batches.len() * 24);
 
     let blocks: Vec<Block> = batches
@@ -71,22 +81,13 @@ pub(crate) fn build_arrow_ipc_footer(batches: &[BatchBlock]) -> Result<Vec<u8>> 
 
     let record_batches = fbb.create_vector(&blocks);
 
-    let schema_fields = fbb.create_vector::<flatbuffers::ForwardsUOffset<arrow::ipc::Field>>(&[]);
-    let schema = arrow::ipc::Schema::create(
-        &mut fbb,
-        &arrow::ipc::SchemaArgs {
-            endianness: arrow::ipc::Endianness::Little,
-            fields: Some(schema_fields),
-            custom_metadata: None,
-            features: None,
-        },
-    );
+    let schema_offset = arrow::ipc::convert::schema_to_fb_offset(&mut fbb, schema);
 
     let footer = arrow::ipc::Footer::create(
         &mut fbb,
         &arrow::ipc::FooterArgs {
             version: MetadataVersion::V5,
-            schema: Some(schema),
+            schema: Some(schema_offset),
             dictionaries: None,
             recordBatches: Some(record_batches),
             custom_metadata: None,

@@ -88,11 +88,14 @@ impl Reader {
         })
     }
 
-    /// Load signal batch metadata for O(1) batch lookup.
+    /// Load signal batch metadata for efficient batch lookup.
     ///
     /// Uses the Arrow IPC footer (a few KB at the end of the signal table)
-    /// to extract batch count and row counts, avoiding deserialization of
-    /// the first signal batch (which can be 50-100MB on large files).
+    /// to extract per-batch row counts, avoiding deserialization of the first
+    /// signal batch (which can be 50-100MB on large files). Storing the full
+    /// cumulative-rows prefix lets lookups handle non-uniform batch sizes —
+    /// critical for files produced by `merge_files`, where each source file
+    /// contributes its own batches verbatim.
     fn load_signal_metadata(mmap: &Mmap, footer: &Footer) -> Result<Option<SignalBatchMetadata>> {
         use crate::arrow_ipc::ArrowIpcFooter;
 
@@ -113,21 +116,19 @@ impl Reader {
         let slice = &mmap[start..end];
         let ipc_footer = ArrowIpcFooter::parse(slice)?;
 
-        let num_batches = ipc_footer.record_batches.len();
-        if num_batches == 0 {
+        if ipc_footer.record_batches.is_empty() || ipc_footer.total_rows == 0 {
             return Ok(None);
         }
 
-        // Use the row count from batch 0 as the uniform batch size
-        let batch_size = ipc_footer.record_batches[0].row_count as usize;
-        if batch_size == 0 {
-            return Ok(None);
+        let mut cumulative_rows = Vec::with_capacity(ipc_footer.record_batches.len() + 1);
+        cumulative_rows.push(0u64);
+        let mut running = 0u64;
+        for batch in &ipc_footer.record_batches {
+            running += batch.row_count;
+            cumulative_rows.push(running);
         }
 
-        Ok(Some(SignalBatchMetadata {
-            batch_size,
-            num_batches,
-        }))
+        Ok(Some(SignalBatchMetadata { cumulative_rows }))
     }
 
     /// Get the file identifier (UUID).
@@ -268,16 +269,13 @@ impl Reader {
         let mut all_samples = Vec::new();
 
         for &row_idx in signal_rows {
-            // O(1) batch lookup: batch_idx = row / batch_size
-            let batch_idx = (row_idx as usize) / metadata.batch_size;
-            let local_row = (row_idx as usize) % metadata.batch_size;
-
-            if batch_idx >= metadata.num_batches {
-                return Err(Error::BatchIndexOutOfBounds {
-                    index: batch_idx,
-                    max: metadata.num_batches,
-                });
-            }
+            let (batch_idx, local_row) =
+                metadata
+                    .locate(row_idx)
+                    .ok_or_else(|| Error::BatchIndexOutOfBounds {
+                        index: row_idx as usize,
+                        max: metadata.num_batches(),
+                    })?;
 
             // Try a shared read lock first — cache hits dominate and the
             // atomic access counter lets us update LRU without an exclusive
@@ -579,16 +577,13 @@ impl Reader {
         let mut result = Vec::with_capacity(signal_rows.len());
 
         for &row_idx in signal_rows {
-            // O(1) batch lookup
-            let batch_idx = (row_idx as usize) / metadata.batch_size;
-            let local_row = (row_idx as usize) % metadata.batch_size;
-
-            if batch_idx >= metadata.num_batches {
-                return Err(Error::BatchIndexOutOfBounds {
-                    index: batch_idx,
-                    max: metadata.num_batches,
-                });
-            }
+            let (batch_idx, local_row) =
+                metadata
+                    .locate(row_idx)
+                    .ok_or_else(|| Error::BatchIndexOutOfBounds {
+                        index: row_idx as usize,
+                        max: metadata.num_batches(),
+                    })?;
 
             // Shared read lock on the hit path; upgrade to write only on miss.
             let chunk = {

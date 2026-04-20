@@ -474,8 +474,10 @@ impl Writer {
     pub fn finish_raw_signal(
         &mut self,
         footer: &crate::arrow_ipc::ArrowIpcFooter,
-        current_offset: usize,
+        _current_offset: usize,
     ) -> Result<()> {
+        use crate::utils::table_builders::build_arrow_ipc_footer;
+
         if self.finalized {
             return Err(Error::WriterFinalized);
         }
@@ -485,74 +487,22 @@ impl Writer {
             ));
         }
 
+        // The footer must carry the real signal schema — Arrow's reader uses
+        // the footer's schema (not the header's) when decoding batches, so an
+        // empty one silently strips every column.
+        let schema = self.schema_with_metadata(signal_schema());
+        let footer_bytes = build_arrow_ipc_footer(&footer.record_batches, &schema)?;
+
         let file = self.file.as_mut().ok_or(Error::WriterFinalized)?;
 
-        // Build a simple Arrow IPC footer
-        // For now, we'll write a minimal footer that points to the batches
-        // This is a simplified approach - we just need the file to be valid
-        let footer_bytes = Self::build_arrow_ipc_footer(&footer.record_batches, current_offset)?;
-
-        // Write footer
         file.write_all(&footer_bytes)?;
 
-        // Write footer length (4 bytes, little-endian)
         let footer_len = footer_bytes.len() as i32;
         file.write_all(&footer_len.to_le_bytes())?;
 
-        // Write trailing magic
         file.write_all(b"ARROW1")?;
 
         Ok(())
-    }
-
-    /// Build Arrow IPC footer using Arrow's FlatBuffer types.
-    fn build_arrow_ipc_footer(
-        batches: &[crate::arrow_ipc::BatchBlock],
-        _offset_adjustment: usize,
-    ) -> Result<Vec<u8>> {
-        use arrow::ipc::{Block, MetadataVersion};
-        use flatbuffers::FlatBufferBuilder;
-
-        let mut fbb = FlatBufferBuilder::with_capacity(256 + batches.len() * 24);
-
-        // Create Block structs for record batches
-        let blocks: Vec<Block> = batches
-            .iter()
-            .map(|b| Block::new(b.offset, b.metadata_length, b.body_length))
-            .collect();
-
-        // Create the vector of blocks
-        let record_batches = fbb.create_vector(&blocks);
-
-        // Build the footer using Arrow's generated builder
-        // We need to build a minimal schema - just use an empty one
-        let schema_fields =
-            fbb.create_vector::<flatbuffers::ForwardsUOffset<arrow::ipc::Field>>(&[]);
-        let schema = arrow::ipc::Schema::create(
-            &mut fbb,
-            &arrow::ipc::SchemaArgs {
-                endianness: arrow::ipc::Endianness::Little,
-                fields: Some(schema_fields),
-                custom_metadata: None,
-                features: None,
-            },
-        );
-
-        // Build the footer
-        let footer = arrow::ipc::Footer::create(
-            &mut fbb,
-            &arrow::ipc::FooterArgs {
-                version: MetadataVersion::V5,
-                schema: Some(schema),
-                dictionaries: None,
-                recordBatches: Some(record_batches),
-                custom_metadata: None,
-            },
-        );
-
-        fbb.finish(footer, None);
-
-        Ok(fbb.finished_data().to_vec())
     }
 
     /// Add a read with pre-computed signal row indices (for batch-level copying).

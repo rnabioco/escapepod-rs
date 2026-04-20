@@ -102,41 +102,45 @@ fn merge_preserves_distinct_run_infos() {
 #[test]
 fn merge_preserves_signal_bytewise() {
     // Block-level merge must keep every compressed signal chunk unchanged.
-    // Verify via the thread-safe SignalExtractor path so we exercise
-    // signal decompression on the merged layout.
+    // Sizes are deliberately different between sources so the resulting file
+    // has non-uniform signal-batch sizes — exercises the row-to-batch lookup
+    // on the reader side.
     let tmp = TempDir::new().expect("tempdir");
     let a = tmp.path().join("a.pod5");
     let b = tmp.path().join("b.pod5");
     let merged = tmp.path().join("merged.pod5");
 
     let fa = write_fixture(&a, "acq_a", 5, 800);
-    let fb = write_fixture(&b, "acq_b", 5, 800);
+    let fb = write_fixture(&b, "acq_b", 9, 800);
 
-    // Capture original signals keyed by UUID.
     let mut original: HashMap<Uuid, Vec<i16>> = HashMap::new();
     for path in [&a, &b] {
         let reader = Reader::open(path).unwrap();
-        let extractor = reader.signal_extractor().unwrap();
         for r in reader.reads().unwrap() {
             let r = r.unwrap();
-            let sig = extractor.get_signal(&r.signal_rows).unwrap();
+            let sig = reader.get_signal(&r.signal_rows).unwrap();
             original.insert(r.read_id, sig);
         }
     }
 
     merge_files(&[a, b], &merged, &MergeOptions::default(), None).expect("merge_files");
 
+    // Exercise both the sequential get_signal path (hits the SignalBatchMetadata
+    // lookup) and the parallel SignalExtractor path (uses ArrowIpcFooter). Both
+    // must agree with the pre-merge signals.
     let reader = Reader::open(&merged).unwrap();
     let extractor = reader.signal_extractor().unwrap();
     let mut checked = 0;
     for read_result in reader.reads().unwrap() {
         let read = read_result.unwrap();
-        let sig = extractor.get_signal(&read.signal_rows).unwrap();
+        let sig_sequential = reader.get_signal(&read.signal_rows).unwrap();
+        let sig_parallel = extractor.get_signal(&read.signal_rows).unwrap();
+        assert_eq!(sig_sequential, sig_parallel);
         let expected = original
             .get(&read.read_id)
             .expect("read ID missing in original");
         assert_eq!(
-            sig, *expected,
+            sig_sequential, *expected,
             "merged signal differs from original for read {}",
             read.read_id
         );
