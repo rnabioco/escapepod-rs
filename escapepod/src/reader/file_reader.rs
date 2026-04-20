@@ -899,7 +899,7 @@ impl Reader {
                 }
             }
         }
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_unstable_by_key(|e| e.0);
         Ok(ReadIndex { entries })
     }
 
@@ -972,7 +972,7 @@ impl Reader {
             let row_idx = u32::from_le_bytes(buf[offset + 20..offset + 24].try_into().unwrap());
             entries.push((uuid_bytes, batch_idx, row_idx));
         }
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_unstable_by_key(|e| e.0);
 
         Ok(Some(ReadIndex { entries }))
     }
@@ -1016,7 +1016,7 @@ impl Reader {
 
         // Entries — sorted by (batch_idx, row_idx) for compression locality
         let mut disk_entries = index.entries.clone();
-        disk_entries.sort_unstable_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+        disk_entries.sort_unstable_by_key(|e| (e.1, e.2));
 
         let mut raw = Vec::with_capacity(count * 24);
         for (uuid_bytes, batch_idx, row_idx) in &disk_entries {

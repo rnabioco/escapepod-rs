@@ -114,24 +114,18 @@ mod tests {
         // key = 0xff: all 8 samples are 2 bytes each (16 bytes total).
         // Straight LE copy.
         let shuf = DECODE_SHUFFLE[0xff];
-        for i in 0..16 {
-            assert_eq!(shuf[i], i as u8);
+        for (i, &b) in shuf.iter().enumerate() {
+            assert_eq!(b, i as u8);
         }
     }
 
     #[test]
     fn encode_shuffle_length_matches_decoded_len() {
-        for k in 0..256 {
+        for (k, row) in ENCODE_SHUFFLE.iter().enumerate() {
             let len = DECODED_LEN[k] as usize;
             // The first `len` output positions must index into [0, 16).
-            for p in 0..len {
-                assert!(
-                    ENCODE_SHUFFLE[k][p] < 16,
-                    "key={:02x} out_pos={} idx={:02x}",
-                    k,
-                    p,
-                    ENCODE_SHUFFLE[k][p]
-                );
+            for (p, &idx) in row[..len].iter().enumerate() {
+                assert!(idx < 16, "key={:02x} out_pos={} idx={:02x}", k, p, idx);
             }
         }
     }
