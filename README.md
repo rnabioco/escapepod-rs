@@ -14,8 +14,10 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **Fast** - Up to 47x faster than Python pod5 tools
 - **Memory efficient** - Memory-mapped I/O for large files
 - **Full featured** - View, inspect, merge, filter, subset, and repack
-- **Barcode demultiplexing** - DTW-based classification with SVM support
 - **BAM integration** - Filter reads by alignment status
+
+Experimental features (barcode demultiplexing, resquiggling) live behind
+Cargo feature flags and ship separately — see the [docs](https://rnabioco.github.io/escapepod-rs/) for status and build instructions.
 
 ## Performance
 
@@ -26,26 +28,6 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 | filter | 513 ms | 4.7 s | **9x** |
 | subset | 2.8 s | 8.3 s | **3x** |
 | merge | 3.0 s | 4.1 s | **1.4x** |
-
-## Barcode Demultiplexing
-
-escapepod includes a complete barcode demultiplexing workflow using Dynamic Time Warping (DTW) distance-based classification, compatible with WarpDemuX models.
-
-```bash
-# Detect adapter boundaries
-escpod demux detect *.pod5 -o boundaries.csv
-
-# Extract signal fingerprints
-escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
-
-# Classify reads by barcode
-escpod demux classify fingerprints.csv --model model.json -o classifications.csv
-
-# Split reads into per-barcode files
-escpod demux split *.pod5 --classifications classifications.csv -d demuxed/
-```
-
-See the [demux documentation](https://rnabioco.github.io/escapepod-rs/cli/demux/) for details on training custom models and SVM-based classification.
 
 ## Install
 

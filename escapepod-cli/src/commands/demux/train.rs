@@ -244,12 +244,12 @@ fn collect_assignments_from_csv(
         }
 
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 3 {
-            if let Ok(read_id) = Uuid::parse_str(parts[0]) {
-                let barcode = parts[1].to_string();
-                let pod5_file = PathBuf::from(parts[2]);
-                assignments.insert(read_id, (barcode, pod5_file));
-            }
+        if parts.len() >= 3
+            && let Ok(read_id) = Uuid::parse_str(parts[0])
+        {
+            let barcode = parts[1].to_string();
+            let pod5_file = PathBuf::from(parts[2]);
+            assignments.insert(read_id, (barcode, pod5_file));
         }
     }
 
@@ -287,23 +287,19 @@ fn extract_fingerprints(
             let mut fingerprints = Vec::new();
             let read_ids: HashSet<Uuid> = read_list.iter().map(|(id, _)| *id).collect();
 
-            if let Ok(reader) = Reader::open(pod5_path) {
-                if let Ok(reads) = reader.reads() {
-                    for read in reads.flatten() {
-                        if read_ids.contains(&read.read_id) && !read.signal_rows.is_empty() {
-                            if let Ok(signal) = reader.get_signal(&read.signal_rows) {
-                                if let Some(fp) = extract_training_fingerprint(
-                                    &signal,
-                                    args,
-                                    norm_method,
-                                    read.read_id,
-                                ) {
-                                    fingerprints.push((read.read_id, fp));
-                                }
-                            }
-                        }
-                        progress_bar.inc(1);
+            if let Ok(reader) = Reader::open(pod5_path)
+                && let Ok(reads) = reader.reads()
+            {
+                for read in reads.flatten() {
+                    if read_ids.contains(&read.read_id)
+                        && !read.signal_rows.is_empty()
+                        && let Ok(signal) = reader.get_signal(&read.signal_rows)
+                        && let Some(fp) =
+                            extract_training_fingerprint(&signal, args, norm_method, read.read_id)
+                    {
+                        fingerprints.push((read.read_id, fp));
                     }
+                    progress_bar.inc(1);
                 }
             }
 

@@ -298,8 +298,8 @@ Examples:
 ")]
     Summary(commands::summary::SummaryArgs),
 
-    /// Barcode demultiplexing workflow
-    #[cfg(feature = "experimental")]
+    /// Barcode demultiplexing workflow (experimental; build with `--features demux`)
+    #[cfg(feature = "demux")]
     #[command(after_help = "\
 Examples:
   escpod demux detect input.pod5 -o boundaries.csv
@@ -454,7 +454,7 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Summary(args) => commands::summary::run(args),
 
-        #[cfg(feature = "experimental")]
+        #[cfg(feature = "demux")]
         Commands::Demux(args) => commands::demux::run(args),
 
         #[cfg(feature = "experimental")]

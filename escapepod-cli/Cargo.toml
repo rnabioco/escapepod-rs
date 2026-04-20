@@ -43,4 +43,7 @@ walkdir = "2"
 [features]
 default = []
 experimental = []
-train = ["escapepod-signal/train", "experimental"]
+# Barcode demultiplexing commands. Experimental — opt in with `--features demux`.
+demux = ["escapepod-signal/demux"]
+# Training support for demux SVM models (implies `demux`).
+train = ["demux", "escapepod-signal/train"]

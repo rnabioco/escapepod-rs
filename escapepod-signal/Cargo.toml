@@ -3,7 +3,7 @@ name = "escapepod-signal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Signal-processing algorithms (DTW, demux, resquiggle, segmentation) for Oxford Nanopore POD5 data"
+description = "Signal-processing algorithms (DTW, resquiggle, segmentation; opt-in barcode demux) for Oxford Nanopore POD5 data"
 repository.workspace = true
 license.workspace = true
 readme = "../README.md"
@@ -17,17 +17,23 @@ flate2 = "1"
 ndarray = "0.16"
 rand = "0.10"
 rayon = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 uuid = { workspace = true }
 
-# Training dependencies (optional)
+# Demux dependencies (opt-in via `demux` feature)
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+# Training dependencies (opt-in via `train` feature; implies `demux`)
 linfa = { version = "0.8", optional = true }
 linfa-svm = { version = "0.8", optional = true }
 
 [features]
 default = []
-train = ["linfa", "linfa-svm"]
+# Barcode demultiplexing (WarpDemuX-style DTW/SVM classification).
+# Experimental — opt in with `--features demux`.
+demux = ["dep:serde", "dep:serde_json"]
+# Training support for demux models (requires `demux`).
+train = ["demux", "linfa", "linfa-svm"]
 
 [dev-dependencies]
 arrow = { workspace = true }

@@ -20,8 +20,8 @@ escpod <COMMAND> [OPTIONS]
 | [bam-filter](bam-filter.md) | Filter reads based on paired BAM file |
 | [repack](repack.md) | Repack POD5 files to optimize storage |
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
-| [demux](demux.md) | Barcode demultiplexing (detect, fingerprint, classify, split, train) |
-| [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP |
+| [demux](demux.md) | Barcode demultiplexing (detect, fingerprint, classify, split, train) — **experimental**, requires `--features demux` |
+| [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP — **experimental**, requires `--features experimental` |
 
 ## Global Options
 

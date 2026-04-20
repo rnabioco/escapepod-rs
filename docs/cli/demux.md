@@ -1,5 +1,16 @@
 # escpod demux
 
+!!! warning "Experimental — opt-in feature"
+    Barcode demultiplexing is under active development and lives outside the
+    default build. Enable it per-invocation:
+
+    ```bash
+    cargo build --release --features demux                 # library + CLI
+    cargo install --git https://github.com/rnabioco/escapepod-rs --features demux
+    ```
+
+    Stability, API, and classification accuracy are all subject to change.
+
 Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.
 
 ## Comparison with WarpDemuX

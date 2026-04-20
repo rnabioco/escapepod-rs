@@ -86,28 +86,28 @@ pub fn parse_boundaries_csv(path: &Path) -> anyhow::Result<HashMap<Uuid, ReadBou
         .max()
         .unwrap_or(0);
 
-        if parts.len() > max_col {
-            if let Ok(read_id) = Uuid::parse_str(parts[read_id_col]) {
-                let num_samples = parts[num_samples_col].parse::<u64>().unwrap_or(0);
-                let adapter_start = parts[adapter_start_col]
-                    .parse::<f64>()
-                    .map(|v| v as usize)
-                    .unwrap_or(0);
-                let adapter_end = parts[adapter_end_col]
-                    .parse::<f64>()
-                    .map(|v| v as usize)
-                    .unwrap_or(0);
+        if parts.len() > max_col
+            && let Ok(read_id) = Uuid::parse_str(parts[read_id_col])
+        {
+            let num_samples = parts[num_samples_col].parse::<u64>().unwrap_or(0);
+            let adapter_start = parts[adapter_start_col]
+                .parse::<f64>()
+                .map(|v| v as usize)
+                .unwrap_or(0);
+            let adapter_end = parts[adapter_end_col]
+                .parse::<f64>()
+                .map(|v| v as usize)
+                .unwrap_or(0);
 
-                let boundaries = ReadBoundaries {
-                    read_id,
-                    num_samples,
-                    adapter_start,
-                    adapter_end,
-                };
+            let boundaries = ReadBoundaries {
+                read_id,
+                num_samples,
+                adapter_start,
+                adapter_end,
+            };
 
-                if boundaries.has_valid_adapter() {
-                    boundaries_map.insert(read_id, boundaries);
-                }
+            if boundaries.has_valid_adapter() {
+                boundaries_map.insert(read_id, boundaries);
             }
         }
     }
@@ -203,10 +203,10 @@ pub fn collect_reads_with_signals(
         if let Ok(reads) = reader.reads() {
             for read_result in reads {
                 let read = read_result?;
-                if !read.signal_rows.is_empty() {
-                    if let Ok(signal) = reader.get_signal(&read.signal_rows) {
-                        all_reads.push((read.read_id, read.num_samples, signal));
-                    }
+                if !read.signal_rows.is_empty()
+                    && let Ok(signal) = reader.get_signal(&read.signal_rows)
+                {
+                    all_reads.push((read.read_id, read.num_samples, signal));
                 }
             }
         }
@@ -380,7 +380,7 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
         let mut values: Vec<f32> = filtered.iter().map(|fp| fp[i]).collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let median = if values.len() % 2 == 0 {
+        let median = if values.len().is_multiple_of(2) {
             let mid = values.len() / 2;
             (values[mid - 1] + values[mid]) / 2.0
         } else {
@@ -483,7 +483,7 @@ mod tests {
         .unwrap();
         temp_file.flush().unwrap();
 
-        let result = parse_boundaries_csv(&temp_file.path().to_path_buf()).unwrap();
+        let result = parse_boundaries_csv(temp_file.path()).unwrap();
 
         assert_eq!(result.len(), 2);
 
@@ -507,7 +507,7 @@ mod tests {
         .unwrap();
         temp_file.flush().unwrap();
 
-        let result = parse_boundaries_csv(&temp_file.path().to_path_buf()).unwrap();
+        let result = parse_boundaries_csv(temp_file.path()).unwrap();
         assert_eq!(result.len(), 0);
     }
 

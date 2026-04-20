@@ -152,17 +152,16 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
         if let Ok(reads) = reader.reads() {
             for read_result in reads {
                 let read = read_result?;
-                if let Some(boundaries) = boundaries_map.get(&read.read_id) {
-                    if !read.signal_rows.is_empty() {
-                        if let Ok(signal) = reader.get_signal(&read.signal_rows) {
-                            reads_to_process.push((
-                                read.read_id,
-                                boundaries.adapter_start,
-                                boundaries.adapter_end,
-                                signal,
-                            ));
-                        }
-                    }
+                if let Some(boundaries) = boundaries_map.get(&read.read_id)
+                    && !read.signal_rows.is_empty()
+                    && let Ok(signal) = reader.get_signal(&read.signal_rows)
+                {
+                    reads_to_process.push((
+                        read.read_id,
+                        boundaries.adapter_start,
+                        boundaries.adapter_end,
+                        signal,
+                    ));
                 }
             }
         }

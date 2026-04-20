@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 pub mod bam_filter;
-#[cfg(feature = "experimental")]
+#[cfg(feature = "demux")]
 pub mod demux;
 pub mod filter;
 pub mod index;

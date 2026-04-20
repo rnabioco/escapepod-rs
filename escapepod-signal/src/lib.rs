@@ -1,9 +1,12 @@
 //! Signal-processing algorithms for Oxford Nanopore POD5 data.
 //!
-//! This crate layers signal-processing algorithms (DTW, barcode demultiplexing,
-//! resquiggle, segmentation) on top of the POD5 format I/O provided by
+//! This crate layers signal-processing algorithms (DTW, resquiggle,
+//! segmentation) on top of the POD5 format I/O provided by
 //! [`escapepod_pod5`]. Format types and operations are re-exported here so
 //! consumers can depend on a single crate for both layers.
+//!
+//! Barcode demultiplexing is experimental and opt-in via the `demux` feature;
+//! SVM training additionally requires the `train` feature.
 //!
 //! # Example
 //!
@@ -19,10 +22,13 @@
 //! ```
 
 // Signal-processing modules live in this crate.
-pub mod demux;
 pub mod dtw;
 pub mod resquiggle;
 pub mod segmentation;
+
+// Barcode demultiplexing — experimental, opt-in via the `demux` feature.
+#[cfg(feature = "demux")]
+pub mod demux;
 
 // Format layer (POD5 I/O) lives in escapepod-pod5. Re-export its modules and
 // types so downstream consumers can pull in both layers via this crate.

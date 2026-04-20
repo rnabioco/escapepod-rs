@@ -427,15 +427,15 @@ where
         }
 
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 2 {
-            if let Ok(read_id) = Uuid::parse_str(parts[0]) {
-                let values: Vec<T> = parts[1..]
-                    .iter()
-                    .filter_map(|s| s.parse::<T>().ok())
-                    .collect();
-                if !values.is_empty() {
-                    fingerprints.push((read_id, values));
-                }
+        if parts.len() >= 2
+            && let Ok(read_id) = Uuid::parse_str(parts[0])
+        {
+            let values: Vec<T> = parts[1..]
+                .iter()
+                .filter_map(|s| s.parse::<T>().ok())
+                .collect();
+            if !values.is_empty() {
+                fingerprints.push((read_id, values));
             }
         }
     }
