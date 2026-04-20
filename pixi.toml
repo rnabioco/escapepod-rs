@@ -9,6 +9,9 @@ pysam = "*"
 pandas = "*"
 pyarrow = ">=22,<23"
 pip = "*"
+clang = ">=18"
+clangxx = ">=18"
+libclang = ">=18"
 
 [activation]
 env = { DORADO_VERSION = "1.4.0", DORADO_DIR = "$PIXI_PROJECT_ROOT/.pixi/tools", PATH = "$DORADO_DIR/dorado-$DORADO_VERSION-linux-x64/bin:$PATH" }

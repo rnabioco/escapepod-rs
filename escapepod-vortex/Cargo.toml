@@ -1,0 +1,37 @@
+[package]
+name = "escapepod-vortex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Experimental Vortex-format converter and benchmarks for POD5 data"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+arrow = { workspace = true }
+escapepod = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util"] }
+uuid = { workspace = true }
+vortex = { version = "0.68", default-features = true, features = ["tokio"] }
+vortex-array = "0.68"
+vortex-btrblocks = { version = "0.68", features = ["pco", "zstd"] }
+vortex-buffer = "0.68"
+vortex-compressor = "0.68"
+vortex-error = "0.68"
+vortex-fastlanes = "0.68"
+vortex-file = { version = "0.68", features = ["tokio"] }
+vortex-io = "0.68"
+vortex-layout = "0.68"
+vortex-pco = "0.68"
+vortex-session = "0.68"
+vortex-zigzag = "0.68"
+futures = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.10"
+tempfile = "3"
+
