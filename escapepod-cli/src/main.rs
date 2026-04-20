@@ -260,7 +260,8 @@ created automatically if not present (written as <bam>.bai).
         profile: bool,
     },
 
-    /// Repack POD5 files to optimize storage
+    /// Repack POD5 files to optimize storage (experimental; requires `--features experimental`)
+    #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
   escpod repack input.pod5 -o output_dir/
@@ -282,6 +283,14 @@ Examples:
         /// Print per-phase timing breakdown after completion
         #[arg(long)]
         profile: bool,
+    },
+
+    /// Repack POD5 files to optimize storage (rebuild with `--features experimental` to enable)
+    #[cfg(not(feature = "experimental"))]
+    Repack {
+        /// Repack arguments (ignored; feature not enabled)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARGS")]
+        args: Vec<String>,
     },
 
     /// Subset reads into multiple files based on CSV mapping
@@ -504,12 +513,16 @@ fn main() -> anyhow::Result<()> {
             profile,
         } => commands::bam_filter::run(input, bam, output, mapped, region, quality, force, profile),
 
+        #[cfg(feature = "experimental")]
         Commands::Repack {
             inputs,
             output_dir,
             force,
             profile,
         } => commands::repack::run(inputs, output_dir, force, profile),
+
+        #[cfg(not(feature = "experimental"))]
+        Commands::Repack { .. } => feature_disabled("repack", "experimental"),
 
         Commands::Subset {
             input,
