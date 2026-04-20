@@ -725,6 +725,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "byteorder",
+ "criterion",
  "csv",
  "flatbuffers",
  "memmap2",

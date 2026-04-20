@@ -1,0 +1,66 @@
+name: Benchmark regression
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep criterion output stable and less noisy in CI.
+  CRITERION_HOME: /tmp/criterion
+  # Small sample counts to keep CI wall time bounded. Real perf work should
+  # run benches locally with defaults.
+  ESCAPEPOD_BENCH_SAMPLES: "15"
+  ESCAPEPOD_BENCH_READS: "80"
+
+jobs:
+  bench:
+    name: criterion baseline vs. main
+    runs-on: ubuntu-latest
+    # Don't gate the whole PR on bench noise; surface regressions via the
+    # check output but keep the job non-blocking until we have a stable
+    # baseline.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so we can check out `main` as a baseline.
+          fetch-depth: 0
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bench main (baseline)
+        run: |
+          git fetch origin main
+          git checkout origin/main
+          cargo bench --bench hot_paths -p escapepod-signal -- --save-baseline main
+          cargo bench --bench io_hot_paths -p escapepod-pod5 -- --save-baseline main
+
+      - name: Bench PR HEAD vs. baseline
+        run: |
+          git checkout ${{ github.event.pull_request.head.sha || github.sha }}
+          cargo bench --bench hot_paths -p escapepod-signal -- --baseline main | tee signal_bench.txt
+          cargo bench --bench io_hot_paths -p escapepod-pod5 -- --baseline main | tee pod5_bench.txt
+
+      - name: Flag regressions
+        run: |
+          set -e
+          # Criterion prints "regressed" on a line when a group shows
+          # statistically-significant slowdown. Surface these without failing
+          # the build so the PR author sees the hit.
+          if grep -E "Performance has regressed" signal_bench.txt pod5_bench.txt; then
+            echo "::warning::Criterion detected a regression — inspect the artifact."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-output
+          path: |
+            signal_bench.txt
+            pod5_bench.txt
+            /tmp/criterion
+          retention-days: 14
