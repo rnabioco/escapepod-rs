@@ -57,7 +57,10 @@ mod svm;
 mod train;
 
 // Legacy exports (distance-based classifier)
-pub use classify::{ClassificationResult, classify_read};
+pub use classify::{ClassificationResult, classify_from_distances, classify_read};
+
+#[cfg(feature = "gpu")]
+pub use classify::{classify_reads_gpu, classify_reads_gpu_with_ctx};
 pub use model::{KernelParams, WarpDemuxModel, load_model};
 
 // New SVM exports

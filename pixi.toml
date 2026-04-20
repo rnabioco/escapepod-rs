@@ -36,6 +36,18 @@ build-python = "maturin develop --manifest-path escapepod-python/Cargo.toml"
 test-python = { cmd = "pytest tests/python/ -v", depends-on = ["build-python"] }
 test-compat = "python tests/compat/test_pod5_compat.py"
 
+# GPU (CUDA) feature for escpod's `--features gpu` path. Provides the runtime
+# NVRTC library that cudarc dlopens on first use. Activate with
+# `pixi shell -e gpu` or `pixi run -e gpu cargo test --features gpu ...`.
+[feature.gpu.dependencies]
+cuda-nvrtc = ">=12"
+cuda-version = "12.*"
+
+# Make `$CONDA_PREFIX/lib` visible to cudarc's dlopen — the conda-forge
+# cuda-nvrtc package does not ship an activation hook that sets this.
+[feature.gpu.activation]
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+
 # Documentation feature
 [feature.docs.dependencies]
 python = ">=3.10"
@@ -50,3 +62,4 @@ docs-serve = "zensical serve"
 [environments]
 python-test = { features = ["python-test"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
+gpu = { features = ["gpu"], solve-group = "default" }

@@ -19,6 +19,21 @@ cargo build --release
 # Build with training support (enables SVM model training)
 cargo build --release --features train
 
+# Build with GPU-accelerated DTW (experimental, opt-in; needs the CUDA
+# driver + libnvrtc at runtime — no nvcc required at build time).
+# The pixi `gpu` env provides libnvrtc via conda-forge's cuda-nvrtc package
+# and sets LD_LIBRARY_PATH automatically:
+pixi run -e gpu cargo build --release --features gpu -p escapepod-cli
+
+# Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`):
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
+    pixi run -e gpu cargo test --features gpu -p escapepod-signal --test gpu_dtw
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
+    pixi run -e gpu cargo bench --features gpu --bench hot_paths_gpu
+
+# Use on a node with a visible GPU:
+escpod demux classify --model model.json reads.fp.csv --gpu -o out.tsv
+
 # Run tests
 cargo test
 

@@ -47,3 +47,5 @@ experimental = []
 demux = ["escapepod-signal/demux"]
 # Training support for demux SVM models (implies `demux`).
 train = ["demux", "escapepod-signal/train"]
+# GPU-accelerated DTW for demux classify (requires CUDA driver at runtime).
+gpu = ["demux", "escapepod-signal/gpu"]
