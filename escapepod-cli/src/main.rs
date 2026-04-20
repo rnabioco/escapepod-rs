@@ -289,7 +289,11 @@ Examples:
     #[cfg(not(feature = "experimental"))]
     Repack {
         /// Repack arguments (ignored; feature not enabled)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARGS")]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
         args: Vec<String>,
     },
 
