@@ -43,40 +43,38 @@ speedup on the kernel in isolation.
 
 ### Classification agreement (`compare_demux_results.py`)
 
-Using the **same** SVM model (`WDX4_rna004_v1_0`). Three layered tests
-to localise the gap:
+Using the **same** SVM model (`WDX4_rna004_v1_0`). Layered tests while
+closing the gap:
 
-| Experiment | Input | Agreement vs WDX |
+| Experiment | Input | Agreement |
 |---|---|---:|
-| Layer A: WDX boundaries + WDX fingerprints → `escpod classify` | `barcode_fpts_0.npz` decoded to CSV | **97.14 %** (100 % on conf ≥ 0.5) |
-| Layer A': WDX boundaries → `escpod fingerprint` + `escpod classify` | `detected_boundaries_0.csv.gz` | **54.1 %** |
-| Layer B: escpod detect + fingerprint + classify | — | 23.2 % |
+| Layer A: WDX boundaries + WDX fingerprints → `escpod classify` | `barcode_fpts_0.npz` → CSV | **97.14 %** (100 % on conf ≥ 0.5, r = 0.9958) |
+| Layer B, LLR detect (escpod default) | — | **93.37 %** |
+| Layer B, CNN detect (`--method cnn`) | — | **96.95 %** |
 
-**The SVM classify path itself is correct** (97 % Layer A with `r =
-0.9958` confidence correlation against WDX). The gap is fingerprint
-extraction, not DTW / SVM / thresholds.
+Layer A showed early that the SVM / DTW / kernel / Platt pipeline is
+faithful. Closing the original Layer-B gap (23 % → ~97 %) required
+three fixes, all in fingerprint extraction:
 
-Two contributors to the Layer A → B drop, roughly equal weight:
+1. **Extract padding.** WDX's `sig_extract.padding = 100` — the
+   adapter region fed to clipping + segmentation is
+   `signal[adapter_start-100 : adapter_end+100]`, not
+   `signal[adapter_start : adapter_end]`. Missing this shifted every
+   changepoint and the retained last-25 segment means. **Biggest
+   single contributor.**
+2. **scipy-matching `find_changepoints`.** Local-max detection switched
+   to strict `>` with scipy-style plateau-midpoint collapse; removed
+   the `t_score > 0.0` filter. Verified by direct Rust-vs-scipy
+   comparison: the two produce bit-identical peak sets on real
+   adapter signals.
+3. **CNN adapter detection (`--method cnn`).** Ports ADAPTed's
+   `BoundariesCNN` through tract-onnx. Closes most of the LLR vs CNN
+   boundary gap (CNN reaches Layer-A ceiling; LLR stops a few points
+   short because the LLR detector occasionally disagrees with the CNN
+   on adapter_end by ≥ 20 samples).
 
-1. **Adapter boundaries.** WDX4 uses a CNN-based detector (`cnn_detect
-   = true` in `rna004_130bps@v1.0.toml`); escpod has LLR only.
-   Boundary diffs: median `|adapter_end|` 12 samples, 95th percentile
-   77 samples.
-2. **T-test segmentation.** Even with identical boundaries (Layer A'),
-   per-read fingerprint Pearson correlation is only 0.57. Root cause:
-   `escapepod_signal::segmentation::find_changepoints` uses non-strict
-   `>=` local-max detection and filters out peaks with `t_score <= 0`;
-   WarpDemuX uses `scipy.signal.find_peaks` (strict `>`, no value
-   filter). For typical signals the two algorithms pick different
-   peak sets when scores are close together, shifting the 110
-   change points by a few samples and the 25 retained segment means
-   with them.
-
-Neither is a benchmarking artefact — both are real compatibility gaps
-worth closing before shipping escpod as a drop-in WDX replacement. The
-diagnostic harness (run `warpdemux demux --save_fpts true` and feed
-`.npz` through `scripts/compare_demux_results.py --escapepod-a …`)
-reproduces the Layer A number on demand.
+The remaining ~3 % on the LLR path and ~0.1 % on the CNN path trace to
+boundary-detection differences on hard reads — not a compat bug.
 
 ### Reproducing
 
