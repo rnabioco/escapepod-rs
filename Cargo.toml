@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["escapepod", "escapepod-cli", "escapepod-python", "escapepod-vortex"]
+members = ["escapepod", "escapepod-cli", "escapepod-python"]
 
 [workspace.package]
 version = "0.1.2"
