@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.3.0 (2026-04-20)
+
+### Breaking
+
+- Barcode demultiplexing moved out of `escapepod-signal` into a new
+  `escapepod-demux` crate. The `escapepod_signal::demux` module is gone;
+  downstream code should depend on `escapepod-demux` directly and
+  import from `escapepod_demux::...` (model loaders, `classify_read`,
+  SVM predictor/trainer, Platt scaling, GPU batch classify, ADAPTed
+  CNN adapter detection). The `escpod demux` CLI surface is unchanged,
+  but `escapepod-cli`'s `demux` Cargo feature now pulls in the new
+  crate; the `train`, `gpu`, and `cnn-detect` features forward to it.
+
 ### Added
 
 - GPU-accelerated DTW for demux, opt-in via `--features gpu` on
