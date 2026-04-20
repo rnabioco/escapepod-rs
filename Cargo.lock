@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-cli"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bstr",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-pod5"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-python"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "escapepod-signal",
  "numpy",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-signal"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
