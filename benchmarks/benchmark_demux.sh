@@ -1,334 +1,259 @@
 #!/bin/bash
-# Benchmark comparing escapepod demux vs ADAPTed and WarpDemuX
+# Benchmark `escpod demux` against WarpDemuX.
 #
-# Usage: ./benchmarks/benchmark_demux.sh [pod5_file]
+# Usage:
+#   ./benchmarks/benchmark_demux.sh [--gpu] [--no-srun] [pod5_file]
+#
+# SLURM: by default the script auto-dispatches itself onto a compute node
+#   via `srun` if not already inside a SLURM job (login node has 2 cores
+#   and would make the numbers noise). Partition/account:
+#     CPU  -> srun -p rna -A rbi     -c 16
+#     GPU  -> srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1
+#   Pass `--no-srun` to skip the re-exec (useful on workstations or when
+#   already inside an interactive `srun`/`salloc` session).
 #
 # Prerequisites:
-#   - cargo build --release
-#   - WarpDemuX venv at ext/WarpDemuX/.venv with adapted and warpdemux installed
-#   - hyperfine installed (brew install hyperfine)
+#   - Cloned ext/WarpDemuX and ext/ADAPTed (see docs/cli/demux.md)
+#   - `pixi install -e warpdemux-bench && pixi run -e warpdemux-bench install-warpdemux`
+#   - `cargo build --release -p escapepod-cli --features "demux train"` (CPU)
+#   - For --gpu: build with `--features "demux train gpu"` on a node with
+#     CUDA driver + libnvrtc (use `pixi run -e gpu cargo build ...`).
+#
+# Runs three comparisons on the same POD5:
+#
+#   Bench 1  Adapter detection: `escpod demux detect` vs `adapted detect --llr`
+#            (hyperfine, 3 runs each, one warm-up).
+#   Bench 2  End-to-end pipeline wall-clock:
+#              escpod:   detect -> fingerprint --warpdemux-compat -> classify --svm-model
+#              WarpDemuX: `warpdemux demux -m WDX4_rna004_v1_0`
+#            Reports total wall-clock; with --gpu, adds a third escpod variant
+#            that passes `--gpu` to classify.
+#   Bench 3  Classification agreement:
+#            Reuses Bench 2's outputs; runs `scripts/compare_demux_results.py`
+#            on escpod vs WarpDemuX predictions to report per-barcode F1,
+#            confusion matrix, and agreement by confidence bin.
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Default test file
-POD5_FILE="${1:-$PROJECT_ROOT/ext/WarpDemuX/test_data/demux/4000_rna004.pod5}"
+USE_GPU=0
+NO_SRUN=0
+POD5_FILE=""
+for arg in "$@"; do
+    case "$arg" in
+        --gpu)      USE_GPU=1 ;;
+        --no-srun)  NO_SRUN=1 ;;
+        *)          POD5_FILE="$arg" ;;
+    esac
+done
 
-# Tool paths
-ESCAPEPOD_BIN="$PROJECT_ROOT/target/release/escapepod"
-WARPDEMUX_VENV="$PROJECT_ROOT/ext/WarpDemuX/.venv"
-ADAPTED_BIN="$WARPDEMUX_VENV/bin/adapted"
-WARPDEMUX_BIN="$WARPDEMUX_VENV/bin/warpdemux"
+: "${POD5_FILE:=$PROJECT_ROOT/ext/WarpDemuX/test_data/demux/4000_rna004.pod5}"
+
+# Auto-dispatch onto a compute node unless already in SLURM or opted out.
+# srun replaces our PID, so this block either exec's away or falls through.
+if [ -z "${SLURM_JOB_ID:-}" ] && [ "$NO_SRUN" -eq 0 ]; then
+    if ! command -v srun >/dev/null 2>&1; then
+        echo "note: srun not found; continuing on the current host." >&2
+    else
+        if [ "$USE_GPU" -eq 1 ]; then
+            SRUN_ARGS=(-p gpu -A gpu_rbi -c 16 --gres=gpu:1)
+        else
+            SRUN_ARGS=(-p rna -A rbi -c 16)
+        fi
+        echo ">>> Re-dispatching under srun ${SRUN_ARGS[*]}"
+        # Preserve explicit arg set, add --no-srun so the child doesn't recurse.
+        child_args=("${@}")
+        child_args+=(--no-srun)
+        exec srun "${SRUN_ARGS[@]}" "$0" "${child_args[@]}"
+    fi
+fi
+
+# Thread count for in-process parallelism. Honour SLURM's allocation when
+# present, else assume interactive.
+THREADS="${SLURM_CPUS_PER_TASK:-${THREADS:-4}}"
+
+# Binaries / wrappers
+ESCAPEPOD_BIN="$PROJECT_ROOT/target/release/escpod"
+WDX_MODEL_JOBLIB="$PROJECT_ROOT/ext/WarpDemuX/warpdemux/models/model_files/WDX4_rna004_v1_0.joblib"
+WDX_MODEL_JSON="$PROJECT_ROOT/benchmarks/.wdx4_rna004.json"
+PIXI_WDX="pixi run -e warpdemux-bench --manifest-path $PROJECT_ROOT/pixi.toml"
 
 OUTPUT_DIR="/tmp/demux_benchmark"
 WARMUP=1
 RUNS=3
 
 echo "========================================"
-echo "Demux Benchmark Suite"
+echo "escpod demux vs WarpDemuX Benchmark"
 echo "========================================"
-echo ""
-echo "Input file: $POD5_FILE"
-echo "File size: $(du -h "$POD5_FILE" | cut -f1)"
+echo "Input:    $POD5_FILE"
+echo "Size:     $(du -h "$POD5_FILE" | cut -f1)"
+echo "GPU path: $([[ $USE_GPU -eq 1 ]] && echo enabled || echo disabled)"
+echo "Threads:  $THREADS (SLURM_JOB_ID=${SLURM_JOB_ID:-none})"
 echo ""
 
-# Check dependencies
-if ! command -v hyperfine &> /dev/null; then
-    echo "Error: hyperfine not found. Install with: brew install hyperfine"
-    exit 1
-fi
-
+# Sanity checks
 if [ ! -f "$ESCAPEPOD_BIN" ]; then
-    echo "Error: escapepod binary not found. Run: cargo build --release"
+    echo "error: $ESCAPEPOD_BIN not found." >&2
+    echo "       cargo build --release -p escapepod-cli --features 'demux train'$([[ $USE_GPU -eq 1 ]] && echo ' gpu')" >&2
     exit 1
 fi
-
-if [ ! -f "$ADAPTED_BIN" ]; then
-    echo "Error: adapted not found in WarpDemuX venv"
-    echo "Run: cd ext/WarpDemuX && uv venv .venv --python 3.11 && uv pip install -e . -e ../ADAPTed"
-    exit 1
-fi
-
 if [ ! -f "$POD5_FILE" ]; then
-    echo "Error: Test file not found: $POD5_FILE"
+    echo "error: POD5 not found: $POD5_FILE" >&2
+    exit 1
+fi
+if [ ! -f "$WDX_MODEL_JOBLIB" ]; then
+    echo "error: WarpDemuX bundled model not found: $WDX_MODEL_JOBLIB" >&2
+    echo "       did you git clone https://github.com/KleistLab/WarpDemuX ext/WarpDemuX ?" >&2
+    exit 1
+fi
+if ! command -v hyperfine >/dev/null 2>&1 && ! $PIXI_WDX which hyperfine >/dev/null 2>&1; then
+    echo "error: hyperfine not found on PATH nor in pixi warpdemux-bench env" >&2
     exit 1
 fi
 
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
+# Resolve hyperfine via pixi env (it's installed there per pixi.toml) so we
+# don't require a system install.
+HYPERFINE="$($PIXI_WDX which hyperfine 2>/dev/null || command -v hyperfine)"
 
-# Get read count for context
-echo "Getting read count..."
-READ_COUNT=$("$ESCAPEPOD_BIN" view "$POD5_FILE" --include read_id 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
-echo "Reads in file: $READ_COUNT"
+rm -rf "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR"/{escpod,wdx}
+
+# One-time model export (cheap, cache between runs).
+if [ ! -f "$WDX_MODEL_JSON" ]; then
+    echo ">>> Exporting WarpDemuX WDX4 model -> escpod SVM JSON"
+    $PIXI_WDX python "$PROJECT_ROOT/scripts/convert_warpdemux_model.py" \
+        "$WDX_MODEL_JOBLIB" "$WDX_MODEL_JSON" > /dev/null
+fi
+
+# ----------------------------------------------------------------------
+# Bench 1: Adapter detection (hyperfine)
+# ----------------------------------------------------------------------
 echo ""
+echo "=== Bench 1: Adapter Detection ==="
+DETECT_JSON="$OUTPUT_DIR/detect.hyperfine.json"
 
-# ========================================
-# Benchmark: Adapter Detection
-# ========================================
-echo "========================================"
-echo "Benchmark 1: Adapter Detection"
-echo "========================================"
-echo ""
-echo "Comparing:"
-echo "  - escapepod demux detect (LLR-based)"
-echo "  - adapted detect (LLR + CNN + fallback)"
-echo ""
-
-# Clean up before benchmark
-rm -rf "$OUTPUT_DIR/escapepod_detect" "$OUTPUT_DIR/adapted_detect"
-mkdir -p "$OUTPUT_DIR/escapepod_detect" "$OUTPUT_DIR/adapted_detect"
-
-hyperfine \
-    --warmup "$WARMUP" \
-    --runs "$RUNS" \
-    --export-json "$OUTPUT_DIR/detect_benchmark.json" \
-    --command-name "escapepod demux detect" \
-    "$ESCAPEPOD_BIN demux detect $POD5_FILE -o $OUTPUT_DIR/escapepod_detect/boundaries.csv -j 4" \
+"$HYPERFINE" \
+    --warmup "$WARMUP" --runs "$RUNS" \
+    --export-json "$DETECT_JSON" \
+    --command-name "escpod detect" \
+    "$ESCAPEPOD_BIN demux detect $POD5_FILE -o $OUTPUT_DIR/escpod/boundaries.csv -j $THREADS" \
     --command-name "adapted detect (LLR)" \
-    "$ADAPTED_BIN detect -i $POD5_FILE -o $OUTPUT_DIR/adapted_detect --chemistry RNA004 -j 4 2>/dev/null"
+    "$PIXI_WDX adapted detect -i $POD5_FILE -o $OUTPUT_DIR/wdx/adapted --chemistry RNA004 -j $THREADS" \
+    2>&1
 
+# ----------------------------------------------------------------------
+# Bench 2: End-to-end pipeline (wall-clock, not hyperfine — long-running)
+# ----------------------------------------------------------------------
 echo ""
-echo "Output comparison:"
-echo "  escapepod: $(wc -l < "$OUTPUT_DIR/escapepod_detect/boundaries.csv") lines"
-ADAPTED_OUT=$(find "$OUTPUT_DIR/adapted_detect" -name "detected_boundaries*.csv" | head -1)
-if [ -f "$ADAPTED_OUT" ]; then
-    echo "  adapted:   $(wc -l < "$ADAPTED_OUT") lines"
+echo "=== Bench 2: End-to-End Demux ==="
+
+# Fresh output dirs per variant.
+mkdir -p "$OUTPUT_DIR/escpod_cpu" "$OUTPUT_DIR/wdx_out"
+[ $USE_GPU -eq 1 ] && mkdir -p "$OUTPUT_DIR/escpod_gpu"
+
+run_escpod_pipeline() {
+    local tag="$1"
+    local outdir="$2"
+    local extra="$3"
+
+    echo ">>> escpod ($tag): detect | fingerprint | classify --svm-model"
+    local t0
+    t0=$(date +%s.%N)
+    "$ESCAPEPOD_BIN" demux detect "$POD5_FILE" \
+        -o "$outdir/boundaries.csv" -j $THREADS -q
+    "$ESCAPEPOD_BIN" demux fingerprint "$POD5_FILE" \
+        --boundaries "$outdir/boundaries.csv" \
+        --warpdemux-compat \
+        -o "$outdir/fingerprints.csv" -j $THREADS -q
+    "$ESCAPEPOD_BIN" demux classify "$outdir/fingerprints.csv" \
+        --svm-model "$WDX_MODEL_JSON" \
+        --probabilities \
+        $extra \
+        -o "$outdir/classifications.csv"
+    local t1
+    t1=$(date +%s.%N)
+    echo "$(echo "$t1 - $t0" | bc)"
+}
+
+ESCPOD_CPU_TIME=$(run_escpod_pipeline "CPU" "$OUTPUT_DIR/escpod_cpu" "" | tail -1)
+echo "    escpod CPU total:  ${ESCPOD_CPU_TIME}s"
+
+if [ $USE_GPU -eq 1 ]; then
+    # cudarc dlopen's libnvrtc; the conda-forge cuda-nvrtc package lives
+    # under the pixi `gpu` env's lib dir. Export it for the GPU run only.
+    GPU_ENV_LIB="$PROJECT_ROOT/.pixi/envs/gpu/lib"
+    if [ ! -f "$GPU_ENV_LIB/libnvrtc.so.12" ]; then
+        echo "error: libnvrtc not found under $GPU_ENV_LIB. Run \`pixi install -e gpu\` first." >&2
+        exit 1
+    fi
+    export LD_LIBRARY_PATH="$GPU_ENV_LIB:${LD_LIBRARY_PATH:-}"
+    ESCPOD_GPU_TIME=$(run_escpod_pipeline "GPU" "$OUTPUT_DIR/escpod_gpu" "--gpu" | tail -1)
+    echo "    escpod GPU total:  ${ESCPOD_GPU_TIME}s"
 fi
 
-# ========================================
-# Benchmark: Full Demux Pipeline (WarpDemuX only)
-# ========================================
+echo ">>> WarpDemuX: warpdemux demux -m WDX4_rna004_v1_0"
+t0=$(date +%s.%N)
+$PIXI_WDX warpdemux demux \
+    -i "$POD5_FILE" \
+    -o "$OUTPUT_DIR/wdx_out" \
+    -m WDX4_rna004_v1_0 \
+    --ncores "$THREADS" \
+    --save_boundaries true \
+    2>&1 | tail -5
+t1=$(date +%s.%N)
+WDX_TIME=$(echo "$t1 - $t0" | bc)
+echo "    WarpDemuX total:   ${WDX_TIME}s"
+
+# Locate WarpDemuX's timestamped output dir.
+WDX_RUN_DIR=$(find "$OUTPUT_DIR/wdx_out" -maxdepth 1 -type d -name "warpdemux_*" | head -1)
+
+# ----------------------------------------------------------------------
+# Bench 3: Classification agreement
+# ----------------------------------------------------------------------
 echo ""
-echo "========================================"
-echo "Benchmark 2: Full Demux Pipeline"
-echo "========================================"
-echo ""
-echo "Comparing WarpDemuX full pipeline (detect + fingerprint + classify)"
-echo "Note: escapepod demux requires separate steps, timing total workflow"
-echo ""
-
-# Clean up
-rm -rf "$OUTPUT_DIR/warpdemux_out" "$OUTPUT_DIR/escapepod_demux"
-mkdir -p "$OUTPUT_DIR/warpdemux_out" "$OUTPUT_DIR/escapepod_demux"
-
-# WarpDemuX full pipeline
-echo "Running WarpDemuX demux..."
-time_start=$(date +%s.%N)
-"$WARPDEMUX_BIN" demux "$POD5_FILE" -o "$OUTPUT_DIR/warpdemux_out" -m WDX4 -j 4 --save_boundaries 2>/dev/null || true
-time_end=$(date +%s.%N)
-warpdemux_time=$(echo "$time_end - $time_start" | bc)
-echo "WarpDemuX time: ${warpdemux_time}s"
-
-# Escapepod multi-step pipeline
-echo ""
-echo "Running escapepod demux pipeline..."
-time_start=$(date +%s.%N)
-
-# Step 1: Detect
-"$ESCAPEPOD_BIN" demux detect "$POD5_FILE" -o "$OUTPUT_DIR/escapepod_demux/boundaries.csv" -j 4
-
-# Step 2: Fingerprint
-"$ESCAPEPOD_BIN" demux fingerprint "$POD5_FILE" \
-    --boundaries "$OUTPUT_DIR/escapepod_demux/boundaries.csv" \
-    -o "$OUTPUT_DIR/escapepod_demux/fingerprints.csv" -j 4
-
-time_end=$(date +%s.%N)
-escapepod_time=$(echo "$time_end - $time_start" | bc)
-echo "Escapepod time (detect + fingerprint): ${escapepod_time}s"
-
-# ========================================
-# Benchmark: Classification Accuracy
-# ========================================
-echo ""
-echo "========================================"
-echo "Benchmark 3: Classification Accuracy"
-echo "========================================"
-echo ""
-echo "Testing escapepod demux accuracy against gold standard"
-echo "Using RNA004 test data with 5 barcodes (1000 reads total)"
-echo ""
-
-ACCURACY_DATA_DIR="$PROJECT_ROOT/ext/WarpDemuX/test_data/live_balancing"
-ACCURACY_OUTPUT_DIR="$OUTPUT_DIR/accuracy_test"
-
-# Check if accuracy test data exists
-if [ -d "$ACCURACY_DATA_DIR" ] && [ -f "$ACCURACY_DATA_DIR/small_pod5_0.pod5" ]; then
-    mkdir -p "$ACCURACY_OUTPUT_DIR"
-
-    # Step 1: Create assignments CSV from gold standard
-    echo "Creating assignments from gold standard..."
-    export ACCURACY_DATA_DIR ACCURACY_OUTPUT_DIR
-    python3 << 'PYEOF'
-import os
-
-data_dir = os.environ['ACCURACY_DATA_DIR']
-output_dir = os.environ['ACCURACY_OUTPUT_DIR']
-
-with open(f"{output_dir}/assignments.csv", 'w') as out:
-    out.write("read_id,barcode,pod5_file\n")
-    for i in range(5):
-        barcode = f"BC0{i}"
-        pod5_file = f"{data_dir}/small_pod5_{i}.pod5"
-        with open(f"{data_dir}/read_ids{i}.txt") as f:
-            for line in f:
-                read_id = line.strip()
-                if read_id:
-                    out.write(f"{read_id},{barcode},{pod5_file}\n")
-print("Created assignments.csv")
-PYEOF
-
-    # Step 2: Train KNN model
-    echo "Training KNN model..."
-    "$ESCAPEPOD_BIN" demux train \
-        --assignments "$ACCURACY_OUTPUT_DIR/assignments.csv" \
-        -o "$ACCURACY_OUTPUT_DIR/knn_model.json" \
-        --knn -j 4 2>/dev/null
-
-    # Step 3-5: Time the full pipeline (detect + fingerprint + classify)
-    echo "Running timed classification pipeline..."
-    accuracy_time_start=$(date +%s.%N)
-
-    # Step 3: Detect adapter boundaries
-    "$ESCAPEPOD_BIN" demux detect \
-        "$ACCURACY_DATA_DIR/small_pod5_0.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_1.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_2.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_3.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_4.pod5" \
-        -o "$ACCURACY_OUTPUT_DIR/boundaries.csv" -j 4 2>/dev/null
-
-    # Step 4: Extract fingerprints
-    "$ESCAPEPOD_BIN" demux fingerprint \
-        "$ACCURACY_DATA_DIR/small_pod5_0.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_1.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_2.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_3.pod5" \
-        "$ACCURACY_DATA_DIR/small_pod5_4.pod5" \
-        --boundaries "$ACCURACY_OUTPUT_DIR/boundaries.csv" \
-        -o "$ACCURACY_OUTPUT_DIR/fingerprints.csv" -j 4 2>/dev/null
-
-    # Step 5: Classify
-    "$ESCAPEPOD_BIN" demux classify \
-        "$ACCURACY_OUTPUT_DIR/fingerprints.csv" \
-        --model "$ACCURACY_OUTPUT_DIR/knn_model.json" \
-        -o "$ACCURACY_OUTPUT_DIR/classifications.csv" 2>/dev/null
-
-    accuracy_time_end=$(date +%s.%N)
-    accuracy_pipeline_time=$(echo "$accuracy_time_end - $accuracy_time_start" | bc)
-    accuracy_read_count=$(wc -l < "$ACCURACY_OUTPUT_DIR/classifications.csv" | tr -d ' ')
-    accuracy_read_count=$((accuracy_read_count - 1))  # subtract header
-    accuracy_throughput=$(echo "scale=0; $accuracy_read_count / $accuracy_pipeline_time" | bc)
-
-    echo ""
-    echo "=== Classification Timing ==="
-    echo "  Pipeline time: ${accuracy_pipeline_time}s"
-    echo "  Reads classified: ${accuracy_read_count}"
-    echo "  Throughput: ~${accuracy_throughput} reads/sec"
-
-    # Step 6: Calculate accuracy
-    echo ""
-    echo "=== Classification Results ==="
-    python3 << 'PYEOF'
-import os
-
-data_dir = os.environ['ACCURACY_DATA_DIR']
-output_dir = os.environ['ACCURACY_OUTPUT_DIR']
-
-# Load ground truth
-ground_truth = {}
-for i in range(5):
-    barcode = f"BC0{i}"
-    with open(f"{data_dir}/read_ids{i}.txt") as f:
-        for line in f:
-            read_id = line.strip()
-            if read_id:
-                ground_truth[read_id] = barcode
-
-# Load classifications
-correct = 0
-incorrect = 0
-confident_correct = 0
-confident_incorrect = 0
-barcode_counts = {f"BC0{i}": {"correct": 0, "total": 0} for i in range(5)}
-
-with open(f"{output_dir}/classifications.csv") as f:
-    next(f)  # skip header
-    for line in f:
-        parts = line.strip().split(',')
-        read_id = parts[0]
-        predicted = parts[1]
-        is_confident = parts[5].lower() == 'true'
-
-        if read_id in ground_truth:
-            actual = ground_truth[read_id]
-            barcode_counts[actual]["total"] += 1
-            if predicted == actual:
-                correct += 1
-                barcode_counts[actual]["correct"] += 1
-                if is_confident:
-                    confident_correct += 1
-            else:
-                incorrect += 1
-                if is_confident:
-                    confident_incorrect += 1
-
-total = correct + incorrect
-accuracy = correct / total * 100 if total > 0 else 0
-
-print(f"  Total classified: {total}")
-print(f"  Correct: {correct}")
-print(f"  Incorrect: {incorrect}")
-print(f"  Overall accuracy: {accuracy:.1f}%")
-print()
-print("  Per-barcode accuracy:")
-for bc in sorted(barcode_counts.keys()):
-    counts = barcode_counts[bc]
-    if counts["total"] > 0:
-        acc = counts["correct"] / counts["total"] * 100
-        print(f"    {bc}: {counts['correct']}/{counts['total']} = {acc:.1f}%")
-PYEOF
-
+echo "=== Bench 3: Classification Agreement ==="
+if [ -n "$WDX_RUN_DIR" ] && [ -d "$WDX_RUN_DIR/predictions" ]; then
+    $PIXI_WDX python "$PROJECT_ROOT/scripts/compare_demux_results.py" \
+        --escapepod-b "$OUTPUT_DIR/escpod_cpu/classifications.csv" \
+        --warpdemux "$WDX_RUN_DIR/predictions" \
+        --boundaries-escapepod "$OUTPUT_DIR/escpod_cpu/boundaries.csv" \
+        --boundaries-warpdemux "$WDX_RUN_DIR/boundaries"
 else
-    echo "  Skipping accuracy test (test data not found at $ACCURACY_DATA_DIR)"
+    echo "    skip: WarpDemuX predictions dir not found ($WDX_RUN_DIR)"
 fi
 
-# ========================================
+# ----------------------------------------------------------------------
 # Summary
-# ========================================
+# ----------------------------------------------------------------------
 echo ""
-echo "========================================"
-echo "Benchmark Summary"
-echo "========================================"
+echo "=========================================="
+echo "Summary"
+echo "=========================================="
+echo "Input:      $POD5_FILE"
 echo ""
-echo "Test file: $POD5_FILE"
-echo "Reads: $READ_COUNT"
-echo ""
-
-# Parse hyperfine results
-if [ -f "$OUTPUT_DIR/detect_benchmark.json" ]; then
-    echo "=== Adapter Detection (hyperfine) ==="
+echo "Detection (hyperfine means):"
+if [ -f "$DETECT_JSON" ]; then
     python3 -c "
 import json
-with open('$OUTPUT_DIR/detect_benchmark.json') as f:
-    data = json.load(f)
-for result in data['results']:
-    name = result['command']
-    mean = result['mean']
-    stddev = result['stddev']
-    print(f'  {name}: {mean:.3f}s ± {stddev:.3f}s')
-" 2>/dev/null || echo "  (could not parse results)"
+d = json.load(open('$DETECT_JSON'))
+for r in d['results']:
+    print(f\"    {r['command']:<30s} {r['mean']:.3f}s ± {r['stddev']:.3f}s\")
+"
 fi
-
 echo ""
-echo "=== Full Pipeline Timing ==="
-echo "  WarpDemuX (demux):              ${warpdemux_time:-N/A}s"
-echo "  Escapepod (detect+fingerprint): ${escapepod_time:-N/A}s"
-
+echo "End-to-end pipeline:"
+echo "    escpod CPU:        ${ESCPOD_CPU_TIME}s"
+[ $USE_GPU -eq 1 ] && echo "    escpod GPU:        ${ESCPOD_GPU_TIME}s"
+echo "    WarpDemuX:         ${WDX_TIME}s"
+if [ -n "$ESCPOD_CPU_TIME" ] && [ -n "$WDX_TIME" ]; then
+    speedup=$(python3 -c "print(f'{float($WDX_TIME) / float($ESCPOD_CPU_TIME):.2f}')")
+    echo "    Speedup (CPU):     ${speedup}x"
+    if [ $USE_GPU -eq 1 ] && [ -n "$ESCPOD_GPU_TIME" ]; then
+        gpu_speedup=$(python3 -c "print(f'{float($WDX_TIME) / float($ESCPOD_GPU_TIME):.2f}')")
+        echo "    Speedup (GPU):     ${gpu_speedup}x"
+    fi
+fi
 echo ""
-echo "Results saved to: $OUTPUT_DIR/"
-
-# Cleanup large files
-rm -rf "$OUTPUT_DIR/warpdemux_out" "$OUTPUT_DIR/adapted_detect" "$OUTPUT_DIR/escapepod_detect"
+echo "Raw outputs: $OUTPUT_DIR"

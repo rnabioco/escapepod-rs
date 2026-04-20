@@ -48,6 +48,55 @@ cuda-version = "12.*"
 [feature.gpu.activation]
 env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
 
+# WarpDemuX benchmark feature. Neither `warpdemux` nor `adapted` is on
+# PyPI, so we pip-install them editable from the cloned repos under
+# `ext/`. Build deps (numpy, cython) come from conda-forge to work
+# around ADAPTed's missing `[build-system]` block; runtime deps are
+# pre-resolved via conda-forge where possible to keep pip lightweight.
+# Run `pixi run -e warpdemux-bench install-warpdemux` once after cloning
+# the submodules to bootstrap; the benchmark script then invokes
+# `pixi run -e warpdemux-bench …` for the Python tools.
+[feature.warpdemux-bench.dependencies]
+# Pinned to 3.12: ADAPTed's `@dataclass` patterns with mutable defaults
+# break on Python 3.13's stricter checks.
+python = ">=3.11,<3.13"
+hyperfine = "*"
+pip = "*"
+numpy = "*"
+cython = "*"
+setuptools = "*"
+wheel = "*"
+scipy = "*"
+scikit-learn = "*"
+pandas = "*"
+tqdm = "*"
+bottleneck = "*"
+pytorch = "*"
+h5py = "*"
+toml = "*"
+psutil = "*"
+attrs = "*"
+matplotlib = "*"
+catboost = "*"
+joblib = "*"
+ruptures = "*"
+grpcio = "*"
+
+[feature.warpdemux-bench.pypi-dependencies]
+pod5 = ">=0.3.36,<0.4"
+dtaidistance = "*"
+vbz-h5py-plugin = "*"
+
+[feature.warpdemux-bench.tasks]
+# The sed step patches ADAPTed's SigProcConfig, which uses mutable class
+# instances as dataclass defaults — disallowed on modern Python. The
+# upstream repo hasn't released a fix, so we rewrite to
+# `field(default_factory=...)` in place before the editable install.
+install-warpdemux = """
+python scripts/patch_adapted_dataclass.py ext/ADAPTed/adapted/config && \
+pip install --no-build-isolation --no-deps -e ext/ADAPTed -e ext/WarpDemuX
+"""
+
 # Documentation feature
 [feature.docs.dependencies]
 python = ">=3.10"
@@ -63,3 +112,4 @@ docs-serve = "zensical serve"
 python-test = { features = ["python-test"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
 gpu = { features = ["gpu"], solve-group = "default" }
+warpdemux-bench = { features = ["warpdemux-bench"], solve-group = "default" }
