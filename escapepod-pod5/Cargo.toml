@@ -1,0 +1,24 @@
+[package]
+name = "escapepod-pod5"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "POD5 file format I/O (Oxford Nanopore) — reader, writer, VBZ compression"
+repository.workspace = true
+license.workspace = true
+readme = "../README.md"
+keywords = ["nanopore", "pod5", "sequencing", "bioinformatics"]
+categories = ["science", "parser-implementations"]
+
+[dependencies]
+anyhow = { workspace = true }
+arrow = { workspace = true }
+byteorder = { workspace = true }
+csv = "1"
+flatbuffers = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+tempfile = "3"
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zstd = { workspace = true }

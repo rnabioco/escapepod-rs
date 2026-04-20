@@ -23,13 +23,13 @@ use super::csv_utils::parse_csv_uuid_mapping;
 /// # Example
 ///
 /// ```no_run
-/// use escapepod::operations::parse_csv_mapping;
+/// use escapepod_pod5::operations::parse_csv_mapping;
 ///
 /// let mapping = parse_csv_mapping("mapping.csv")?;
 /// for (uuid, output) in &mapping {
 ///     println!("{} -> {}", uuid, output);
 /// }
-/// # Ok::<(), escapepod::Error>(())
+/// # Ok::<(), escapepod_pod5::Error>(())
 /// ```
 ///
 /// # CSV Format

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["escapepod", "escapepod-cli", "escapepod-python"]
+members = ["escapepod", "escapepod-cli", "escapepod-pod5", "escapepod-python"]
 
 [workspace.package]
 version = "0.1.3"
@@ -19,6 +19,7 @@ byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 # Workspace crates
 escapepod = { path = "escapepod", version = "0.1.3" }
+escapepod-pod5 = { path = "escapepod-pod5", version = "0.1.3" }
 # Serialization
 flatbuffers = "25"
 indicatif = "0.18"

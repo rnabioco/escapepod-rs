@@ -64,7 +64,7 @@ pub enum FieldError {
 /// # Example
 ///
 /// ```
-/// use escapepod::determine_fields;
+/// use escapepod_pod5::determine_fields;
 ///
 /// // Use defaults
 /// let fields = determine_fields(None, None, false).unwrap();
@@ -141,7 +141,7 @@ pub fn determine_fields(
 /// # Example
 ///
 /// ```no_run
-/// use escapepod::{Reader, get_field_value};
+/// use escapepod_pod5::{Reader, get_field_value};
 ///
 /// let reader = Reader::open("example.pod5")?;
 /// for read in reader.reads()?.flatten() {
@@ -149,7 +149,7 @@ pub fn determine_fields(
 ///     let channel = get_field_value(&read, "channel");
 ///     println!("{}\t{}", id, channel);
 /// }
-/// # Ok::<(), escapepod::Error>(())
+/// # Ok::<(), escapepod_pod5::Error>(())
 /// ```
 pub fn get_field_value(read: &ReadData, field: &str) -> String {
     match field {

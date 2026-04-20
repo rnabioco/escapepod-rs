@@ -19,7 +19,7 @@ use std::collections::HashMap;
 /// # Example
 ///
 /// ```ignore
-/// use escapepod::{Reader, Writer, WriterOptions};
+/// use escapepod_pod5::{Reader, Writer, WriterOptions};
 /// use std::collections::HashMap;
 ///
 /// let reader = Reader::open("input.pod5")?;
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 ///
 /// // Note: This is an internal utility function
 /// add_run_infos_deduplicated(&reader, &mut writer, &mut run_info_map)?;
-/// # Ok::<(), escapepod::Error>(())
+/// # Ok::<(), escapepod_pod5::Error>(())
 /// ```
 pub(crate) fn add_run_infos_deduplicated(
     reader: &Reader,

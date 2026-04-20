@@ -25,13 +25,13 @@ use super::csv_utils::parse_csv_uuid_mapping;
 /// # Example
 ///
 /// ```no_run
-/// use escapepod::operations::parse_barcode_mapping;
+/// use escapepod_pod5::operations::parse_barcode_mapping;
 ///
 /// let mapping = parse_barcode_mapping("classifications.csv")?;
 /// for (uuid, barcode) in &mapping {
 ///     println!("{} -> {}", uuid, barcode);
 /// }
-/// # Ok::<(), escapepod::Error>(())
+/// # Ok::<(), escapepod_pod5::Error>(())
 /// ```
 ///
 /// # CSV Format
