@@ -28,17 +28,17 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run tests with coverage
-        # Exclude escapepod-python (pyo3 bindings exercised only by the Python
-        # test harness, not by `cargo test`) and escapepod-cli (binary;
-        # command handlers are best covered end-to-end via compat tests).
-        # The gate applies to the two library crates that `cargo test` actually
-        # exercises: escapepod-pod5 and escapepod-signal.
+        # Library crates covered by `cargo test`: escapepod-pod5,
+        # escapepod-signal, escapepod-demux. escapepod-python (pyo3
+        # bindings exercised by the Python test harness) and escapepod-cli
+        # (binary; command handlers covered end-to-end via compat tests)
+        # are intentionally excluded from the lines gate.
         run: >
           cargo llvm-cov
-          --workspace
-          --exclude escapepod-python
-          --exclude escapepod-cli
-          --features demux
+          --package escapepod-pod5
+          --package escapepod-signal
+          --package escapepod-demux
+          --features escapepod-demux/train
           --lcov
           --output-path lcov.info
 
@@ -56,10 +56,10 @@ jobs:
         if: always()
         run: >
           cargo llvm-cov
-          --workspace
-          --exclude escapepod-python
-          --exclude escapepod-cli
-          --features demux
+          --package escapepod-pod5
+          --package escapepod-signal
+          --package escapepod-demux
+          --features escapepod-demux/train
           --html --output-dir coverage-html
 
       - uses: actions/upload-artifact@v4
