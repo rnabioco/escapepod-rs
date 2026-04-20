@@ -39,6 +39,15 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# `cargo bench` uses [profile.bench], which by default does NOT inherit from
+# [profile.release]. Pin it here so microbenchmarks measure the same codegen
+# (LTO, single codegen unit) that ships in the release binary. `strip` and
+# `panic = "abort"` are omitted: criterion needs symbols and unwinding.
+[profile.bench]
+inherits = "release"
+strip = false
+panic = "unwind"
+
 [profile.profiling]
 inherits = "release"
 debug = true
