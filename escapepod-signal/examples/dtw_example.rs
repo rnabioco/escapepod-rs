@@ -7,8 +7,8 @@
 //! 4. Convert distances to a kernel matrix for classification
 
 use escapepod_signal::dtw::{
-    distance_to_kernel, distance_to_kernel_auto, dtw_distance, dtw_distance_matrix, Fingerprint,
-    NormMethod,
+    Fingerprint, NormMethod, distance_to_kernel, distance_to_kernel_auto, dtw_distance,
+    dtw_distance_matrix,
 };
 use uuid::Uuid;
 
@@ -71,7 +71,8 @@ fn main() {
         vec![5.1, 4.1, 3.1, 4.1, 5.1], // Another barcode B reference
     ];
 
-    let distance_matrix = dtw_distance_matrix(&barcode_a_fingerprints, &barcode_b_fingerprints, None);
+    let distance_matrix =
+        dtw_distance_matrix(&barcode_a_fingerprints, &barcode_b_fingerprints, None);
 
     println!("Distance matrix shape: {:?}", distance_matrix.shape());
     println!("Distance matrix:");
@@ -102,16 +103,16 @@ fn main() {
 
     // Reference fingerprints for known barcodes
     let reference_barcodes = vec![
-        vec![1.0, 2.0, 3.0, 2.0, 1.0],  // Barcode 1
-        vec![5.0, 4.0, 3.0, 4.0, 5.0],  // Barcode 2
-        vec![2.0, 3.0, 4.0, 5.0, 6.0],  // Barcode 3
+        vec![1.0, 2.0, 3.0, 2.0, 1.0], // Barcode 1
+        vec![5.0, 4.0, 3.0, 4.0, 5.0], // Barcode 2
+        vec![2.0, 3.0, 4.0, 5.0, 6.0], // Barcode 3
     ];
 
     // Unknown read fingerprints to classify
     let unknown_reads = vec![
-        vec![1.1, 2.1, 3.0, 2.0, 1.1],  // Should match Barcode 1
-        vec![5.0, 4.1, 3.1, 4.0, 5.1],  // Should match Barcode 2
-        vec![2.0, 3.1, 4.1, 5.1, 5.9],  // Should match Barcode 3
+        vec![1.1, 2.1, 3.0, 2.0, 1.1], // Should match Barcode 1
+        vec![5.0, 4.1, 3.1, 4.0, 5.1], // Should match Barcode 2
+        vec![2.0, 3.1, 4.1, 5.1, 5.9], // Should match Barcode 3
     ];
 
     let distances = dtw_distance_matrix(&unknown_reads, &reference_barcodes, Some(2));
