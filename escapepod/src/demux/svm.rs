@@ -50,11 +50,18 @@ pub fn distances_to_kernel(distances: &[f64], params: &KernelParams) -> Vec<f64>
 pub fn compute_distances(query: &[f64], training: &[Vec<f64>], window: Option<usize>) -> Vec<f64> {
     let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
 
+    // Reused across training fingerprints to avoid a Vec allocation per
+    // support vector. The caller is typically already parallelized per
+    // read, so the inner loop stays serial to avoid rayon oversubscription.
+    let mut train_scratch: Vec<f32> =
+        Vec::with_capacity(training.first().map(Vec::len).unwrap_or(0));
+
     training
         .iter()
         .map(|train_fp| {
-            let train_f32: Vec<f32> = train_fp.iter().map(|&x| x as f32).collect();
-            dtw_distance(&query_f32, &train_f32, window) as f64
+            train_scratch.clear();
+            train_scratch.extend(train_fp.iter().map(|&x| x as f32));
+            dtw_distance(&query_f32, &train_scratch, window) as f64
         })
         .collect()
 }

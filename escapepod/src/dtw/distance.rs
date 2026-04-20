@@ -82,12 +82,17 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         // Track minimum value in this row for early abandonment
         let mut row_min = f32::INFINITY;
 
+        let ai = a[i - 1];
         for j in j_start..=j_end {
-            let diff = a[i - 1] - b[j - 1];
+            let diff = ai - b[j - 1];
             let cost = diff * diff;
-            let min_prev = prev[j - 1].min(prev[j]).min(curr[j - 1]);
-            curr[j] = cost + min_prev;
-            row_min = row_min.min(curr[j]);
+            // Split the chained min so LLVM can schedule the two
+            // independent pair-mins in parallel (shorter critical path).
+            let m1 = prev[j - 1].min(prev[j]);
+            let min_prev = m1.min(curr[j - 1]);
+            let v = cost + min_prev;
+            curr[j] = v;
+            row_min = row_min.min(v);
         }
 
         // Early abandonment: if minimum in row exceeds bound, can't beat best

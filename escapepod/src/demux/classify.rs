@@ -97,14 +97,26 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
     // Convert query fingerprint to f32 for DTW
     let query_f32: Vec<f32> = fingerprint.iter().map(|&x| x as f32).collect();
 
+    // Reuse a single scratch buffer across all training fingerprints to
+    // avoid a Vec allocation per support vector (caller is typically
+    // already parallelized per read, so nested rayon is not wanted here).
+    let mut train_scratch: Vec<f32> = Vec::with_capacity(
+        model
+            .training_fingerprints
+            .first()
+            .map(Vec::len)
+            .unwrap_or(0),
+    );
+
     // Compute DTW distances to all training fingerprints
     let mut distances: Vec<(usize, f32)> = model
         .training_fingerprints
         .iter()
         .enumerate()
         .map(|(i, train_fp)| {
-            let train_f32: Vec<f32> = train_fp.iter().map(|&x| x as f32).collect();
-            let dist = dtw_distance(&query_f32, &train_f32, None);
+            train_scratch.clear();
+            train_scratch.extend(train_fp.iter().map(|&x| x as f32));
+            let dist = dtw_distance(&query_f32, &train_scratch, None);
             (i, dist)
         })
         .collect();

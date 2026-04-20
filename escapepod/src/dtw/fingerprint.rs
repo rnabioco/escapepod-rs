@@ -177,8 +177,17 @@ pub fn normalize_fingerprint(fp: &mut Fingerprint, method: NormMethod) {
             }
         }
         NormMethod::Median => {
-            let median = compute_median(&fp.values);
-            let mad = compute_mad(&fp.values, median);
+            // Sort once for median, reuse the buffer for MAD to avoid a
+            // second to_vec allocation that compute_mad→compute_median would do.
+            let mut buf = fp.values.clone();
+            buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = median_of_sorted(&buf);
+
+            for (v, slot) in fp.values.iter().zip(buf.iter_mut()) {
+                *slot = (*v - median).abs();
+            }
+            buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mad = median_of_sorted(&buf);
 
             if mad > 0.0 {
                 for val in &mut fp.values {
@@ -215,15 +224,10 @@ fn compute_std(values: &[f32], mean: f32) -> f32 {
     variance.sqrt()
 }
 
-/// Compute the median of a slice.
-fn compute_median(values: &[f32]) -> f32 {
-    if values.is_empty() {
+fn median_of_sorted(sorted: &[f32]) -> f32 {
+    if sorted.is_empty() {
         return 0.0;
     }
-
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
     if sorted.len().is_multiple_of(2) {
         let mid = sorted.len() / 2;
         (sorted[mid - 1] + sorted[mid]) / 2.0
@@ -232,14 +236,18 @@ fn compute_median(values: &[f32]) -> f32 {
     }
 }
 
-/// Compute the median absolute deviation (MAD).
-fn compute_mad(values: &[f32], median: f32) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
+#[cfg(test)]
+fn compute_median(values: &[f32]) -> f32 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    median_of_sorted(&sorted)
+}
 
-    let deviations: Vec<f32> = values.iter().map(|&x| (x - median).abs()).collect();
-    compute_median(&deviations)
+#[cfg(test)]
+fn compute_mad(values: &[f32], median: f32) -> f32 {
+    let mut deviations: Vec<f32> = values.iter().map(|&x| (x - median).abs()).collect();
+    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    median_of_sorted(&deviations)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Metadata about signal table batches for efficient lookup.
 pub(super) struct SignalBatchMetadata {
@@ -14,7 +15,8 @@ pub(super) struct SignalBatchMetadata {
 /// A cached signal batch with access tracking for LRU eviction.
 struct CachedSignalBatch {
     batch: RecordBatch,
-    last_access: u64,
+    // AtomicU64 so cache hits can touch access time under a shared read lock.
+    last_access: AtomicU64,
 }
 
 /// LRU cache for signal batches.
@@ -24,7 +26,7 @@ pub(super) struct SignalBatchCache {
     /// Maximum number of batches to cache.
     max_size: usize,
     /// Access counter for LRU tracking.
-    access_counter: u64,
+    access_counter: AtomicU64,
 }
 
 impl SignalBatchCache {
@@ -33,19 +35,19 @@ impl SignalBatchCache {
         Self {
             batches: HashMap::with_capacity(max_size),
             max_size,
-            access_counter: 0,
+            access_counter: AtomicU64::new(0),
         }
     }
 
     /// Get a batch from the cache, updating access time.
-    pub fn get(&mut self, batch_idx: usize) -> Option<&RecordBatch> {
-        if let Some(cached) = self.batches.get_mut(&batch_idx) {
-            self.access_counter += 1;
-            cached.last_access = self.access_counter;
-            Some(&cached.batch)
-        } else {
-            None
-        }
+    ///
+    /// Takes `&self` so cache hits can proceed under a shared read lock —
+    /// `AtomicU64` makes the access-time update safe without exclusion.
+    pub fn get(&self, batch_idx: usize) -> Option<&RecordBatch> {
+        let cached = self.batches.get(&batch_idx)?;
+        let tick = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        cached.last_access.store(tick, Ordering::Relaxed);
+        Some(&cached.batch)
     }
 
     /// Insert a batch into the cache, evicting old entries if necessary.
@@ -55,12 +57,12 @@ impl SignalBatchCache {
             self.evict_oldest();
         }
 
-        self.access_counter += 1;
+        let tick = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
         self.batches.insert(
             batch_idx,
             CachedSignalBatch {
                 batch,
-                last_access: self.access_counter,
+                last_access: AtomicU64::new(tick),
             },
         );
     }
@@ -77,7 +79,7 @@ impl SignalBatchCache {
         let mut entries: Vec<_> = self
             .batches
             .iter()
-            .map(|(&idx, cached)| (idx, cached.last_access))
+            .map(|(&idx, cached)| (idx, cached.last_access.load(Ordering::Relaxed)))
             .collect();
         entries.sort_by_key(|&(_, access)| access);
 

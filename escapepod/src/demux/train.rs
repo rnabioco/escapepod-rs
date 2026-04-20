@@ -14,9 +14,10 @@ use std::collections::HashMap;
 use linfa::prelude::*;
 use linfa_svm::Svm;
 use ndarray::{Array1, Array2};
+use rayon::prelude::*;
 
 use super::model::{DtwSvmModel, KernelParams};
-use super::svm::compute_distances;
+use crate::dtw::dtw_distance;
 
 /// Training configuration for DTW-SVM.
 #[derive(Debug, Clone)]
@@ -54,17 +55,32 @@ impl Default for TrainConfig {
 /// Returns a symmetric matrix D where D[i,j] = DTW(fp_i, fp_j).
 pub fn compute_distance_matrix(fingerprints: &[Vec<f64>], window: Option<usize>) -> Array2<f64> {
     let n = fingerprints.len();
-    let mut distances = Array2::<f64>::zeros((n, n));
 
-    for i in 0..n {
-        for j in i..n {
-            if i == j {
-                distances[[i, j]] = 0.0;
-            } else {
-                let d = compute_distances(&fingerprints[i], &[fingerprints[j].clone()], window)[0];
-                distances[[i, j]] = d;
-                distances[[j, i]] = d;
-            }
+    // Pre-convert each fingerprint to f32 once (was previously done per
+    // DTW call, O(n^2) extra allocations).
+    let f32_fps: Vec<Vec<f32>> = fingerprints
+        .par_iter()
+        .map(|fp| fp.iter().map(|&x| x as f32).collect())
+        .collect();
+
+    // Compute upper triangle in parallel across rows. Each row returns
+    // only the strict upper part `(j > i)`; diagonal is zero.
+    let upper: Vec<Vec<f64>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let fi = &f32_fps[i];
+            (i + 1..n)
+                .map(|j| dtw_distance(fi, &f32_fps[j], window) as f64)
+                .collect()
+        })
+        .collect();
+
+    let mut distances = Array2::<f64>::zeros((n, n));
+    for (i, row) in upper.into_iter().enumerate() {
+        for (k, d) in row.into_iter().enumerate() {
+            let j = i + 1 + k;
+            distances[[i, j]] = d;
+            distances[[j, i]] = d;
         }
     }
 

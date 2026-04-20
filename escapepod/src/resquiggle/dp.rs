@@ -307,13 +307,14 @@ pub fn dp_step_buffered(
 
     for i in 1..len {
         let stay = current_scores[i - 1] + base_scores[i];
-        if move_scores[i] <= stay {
-            current_scores[i] = move_scores[i];
-            current_traceback[i] = 0;
-        } else {
-            current_scores[i] = stay;
-            current_traceback[i] = current_traceback[i - 1] + 1;
-        }
+        let mv = move_scores[i];
+        let prev_tb = current_traceback[i - 1];
+        // Branchless select: compute both candidates, then pick with a mask.
+        // On noisy signal the original branch mispredicts; this keeps the
+        // pipeline full at the cost of one always-taken addition.
+        let take_move = mv <= stay;
+        current_scores[i] = if take_move { mv } else { stay };
+        current_traceback[i] = if take_move { 0 } else { prev_tb + 1 };
     }
 }
 

@@ -46,6 +46,10 @@ pub struct ArrowIpcFooter {
     pub batches_end_offset: usize,
     /// Total number of rows across all batches.
     pub total_rows: u64,
+    /// Prefix sum of row counts: `cumulative_rows[i]` is the total rows in
+    /// batches `0..i`. Length `record_batches.len() + 1`. Enables O(log n)
+    /// row→batch lookup via binary search.
+    cumulative_rows: Vec<u64>,
 }
 
 impl ArrowIpcFooter {
@@ -243,13 +247,21 @@ impl ArrowIpcFooter {
             .last()
             .map(|b| (b.offset + b.total_length()) as usize)
             .unwrap_or(batches_start_offset);
-        let total_rows: u64 = record_batches.iter().map(|b| b.row_count).sum();
+        let mut cumulative_rows = Vec::with_capacity(record_batches.len() + 1);
+        cumulative_rows.push(0);
+        let mut running = 0u64;
+        for b in &record_batches {
+            running += b.row_count;
+            cumulative_rows.push(running);
+        }
+        let total_rows = running;
 
         Ok(ArrowIpcFooter {
             record_batches,
             batches_start_offset,
             batches_end_offset,
             total_rows,
+            cumulative_rows,
         })
     }
 
@@ -392,23 +404,21 @@ impl ArrowIpcFooter {
     /// Get the first signal row index for a given batch.
     /// Returns the cumulative row count before this batch.
     pub fn batch_first_row(&self, batch_idx: usize) -> u64 {
-        self.record_batches[..batch_idx]
-            .iter()
-            .map(|b| b.row_count)
-            .sum()
+        self.cumulative_rows[batch_idx]
     }
 
     /// Find which batch contains a given signal row.
-    /// Returns (batch_idx, row_within_batch).
+    /// Returns (batch_idx, row_within_batch). O(log n) via prefix-sum
+    /// binary search.
     pub fn batch_for_row(&self, signal_row: u64) -> Option<(usize, u64)> {
-        let mut cumulative = 0u64;
-        for (idx, batch) in self.record_batches.iter().enumerate() {
-            if signal_row < cumulative + batch.row_count {
-                return Some((idx, signal_row - cumulative));
-            }
-            cumulative += batch.row_count;
+        if signal_row >= self.total_rows {
+            return None;
         }
-        None
+        // Rightmost index with cumulative_rows[idx] <= signal_row.
+        // `partition_point` returns the first index where the predicate
+        // fails, so subtract 1 to get the containing batch.
+        let idx = self.cumulative_rows.partition_point(|&c| c <= signal_row) - 1;
+        Some((idx, signal_row - self.cumulative_rows[idx]))
     }
 
     /// Extract a single compressed signal chunk from raw IPC bytes.

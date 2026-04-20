@@ -279,20 +279,19 @@ impl Reader {
                 });
             }
 
-            // Try to get from cache first
+            // Try a shared read lock first — cache hits dominate and the
+            // atomic access counter lets us update LRU without an exclusive
+            // lock, removing contention among parallel readers.
             let samples = {
-                let mut cache = self.signal_cache.write().unwrap();
+                let cache = self.signal_cache.read().unwrap();
                 if let Some(batch) = cache.get(batch_idx) {
-                    // Cache hit - extract signal directly
                     self.extract_signal_from_batch(batch, local_row)?
                 } else {
-                    // Cache miss - need to load the batch
-                    drop(cache); // Release lock before loading
+                    drop(cache);
 
                     let batch = self.load_signal_batch(embedded, batch_idx)?;
                     let samples = self.extract_signal_from_batch(&batch, local_row)?;
 
-                    // Insert into cache
                     self.signal_cache.write().unwrap().insert(batch_idx, batch);
 
                     samples
@@ -591,9 +590,9 @@ impl Reader {
                 });
             }
 
-            // Try to get from cache first
+            // Shared read lock on the hit path; upgrade to write only on miss.
             let chunk = {
-                let mut cache = self.signal_cache.write().unwrap();
+                let cache = self.signal_cache.read().unwrap();
                 if let Some(batch) = cache.get(batch_idx) {
                     self.extract_single_compressed_chunk(batch, local_row)?
                 } else {

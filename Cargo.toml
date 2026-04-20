@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["escapepod", "escapepod-cli", "escapepod-python"]
+members = ["escapepod", "escapepod-cli", "escapepod-python", "escapepod-vortex"]
 
 [workspace.package]
 version = "0.1.2"
@@ -33,6 +33,12 @@ zstd = "0.13"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 numpy = "0.28"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
 [profile.profiling]
 inherits = "release"
 debug = true
@@ -43,7 +49,3 @@ debug = true
 
 [profile.dist]
 inherits = "release"
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
