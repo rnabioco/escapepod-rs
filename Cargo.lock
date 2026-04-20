@@ -816,6 +816,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "escapepod-demux",
  "escapepod-signal",
  "flate2",
  "indicatif",
@@ -834,6 +835,26 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "escapepod-demux"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "escapepod-pod5",
+ "escapepod-signal",
+ "linfa",
+ "linfa-svm",
+ "ndarray",
+ "rand 0.10.0",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tract-onnx",
+ "uuid",
 ]
 
 [[package]]
@@ -873,19 +894,14 @@ dependencies = [
  "cudarc",
  "escapepod-pod5",
  "flate2",
- "linfa",
- "linfa-svm",
  "ndarray",
  "noodles-bam",
  "noodles-sam",
  "parquet",
  "rand 0.10.0",
  "rayon",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "tract-onnx",
  "uuid",
 ]
 

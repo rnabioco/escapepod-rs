@@ -116,8 +116,9 @@ escpod -q merge …                         # errors only
 ### Workspace Structure
 
 - **escapepod-pod5**: POD5 format I/O layer — reader, writer, VBZ compression, footer parsing, block-level merge/filter/repack/subset operations.
-- **escapepod-signal**: Signal-processing algorithms (DTW, demux, resquiggle, segmentation) layered on top of `escapepod-pod5`. Re-exports the pod5 surface so downstream consumers can depend on a single crate.
-- **escapepod-cli**: CLI binary (`escpod`) built on `escapepod-signal`.
+- **escapepod-signal**: Signal-processing algorithms (DTW, resquiggle, segmentation) layered on top of `escapepod-pod5`. Re-exports the pod5 surface so downstream consumers can depend on a single crate.
+- **escapepod-demux**: WarpDemuX-compatible barcode demultiplexing — SVM model loaders, DTW+SVM classifier, Platt scaling, optional SVM training (`train`), GPU DTW batch classify (`gpu`), ADAPTed CNN adapter detection (`cnn-detect`). Depends on `escapepod-signal` for DTW and fingerprint primitives.
+- **escapepod-cli**: CLI binary (`escpod`). Demux commands require building with `--features demux` (pulls in `escapepod-demux`); forward features `train`, `gpu`, `cnn-detect` propagate to the demux crate.
 - **escapepod-python**: pyo3 bindings.
 
 ### POD5 File Format
@@ -157,19 +158,25 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 
 ### Signal layer (escapepod-signal)
 
-- **demux/**: Barcode demultiplexing module
-  - `mod.rs`: Main demux API with WarpDemuX model loading
-  - `svm.rs`: SVM-based classification with probability output
-  - `train.rs`: Model training from labeled fingerprints
 - **dtw/**: Dynamic Time Warping distance computation
   - `distance.rs`: DTW algorithm with Sakoe-Chiba band constraint
   - `fingerprint.rs`: Signal fingerprint representation
   - `kernel.rs`: DTW distance to kernel conversion for SVM
+  - `cuda/`: GPU-accelerated DTW distance matrix (opt-in `gpu` feature)
 - **segmentation/**: Signal segmentation algorithms
   - `llr.rs`: Log-Likelihood Ratio boundary detection
-  - `ttest.rs`: T-test based changepoint segmentation
+  - `ttest.rs`: T-test based changepoint segmentation (scipy-compatible peak detection)
   - `normalize.rs`: MAD, z-score, and min-max normalization
 - **resquiggle/**: Signal-to-base alignment refinement (banded DP, rescaling, drift correction)
+
+### Demux layer (escapepod-demux)
+
+- `model.rs`: `WarpDemuxModel` and `DtwSvmModel` JSON loaders.
+- `classify.rs`: Per-read DTW classifier (`classify_read`), shared top-2 threshold logic, optional batched GPU classifier.
+- `svm.rs`: Full SVM predictor — RBF kernel, OvO dual coefficients, Platt scaling, multiclass probability coupling, batched GPU classify.
+- `probability.rs`: softmax / coupling utilities.
+- `train.rs` (feature: `train`): SVM training via linfa-svm, optional GPU all-pairs DTW matrix.
+- `adapter_cnn.rs` (feature: `cnn-detect`): port of ADAPTed's `BoundariesCNN` through tract-onnx. Loads ADAPTed-exported ONNX model at runtime; weights are CC BY-NC 4.0 and are NOT bundled.
 
 ### CLI Commands
 

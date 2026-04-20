@@ -2,7 +2,7 @@
 
 use super::utils::parse_reference_csv;
 use crate::style;
-use escapepod_signal::demux::{DtwSvmModel, classify_with_svm, load_svm_model};
+use escapepod_demux::{DtwSvmModel, classify_with_svm, load_svm_model};
 use escapepod_signal::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
 use std::fs::File;
@@ -189,7 +189,7 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
     let results: Vec<SvmClassifyResult> = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
-            use escapepod_signal::demux::classify_with_svm_batch_gpu;
+            use escapepod_demux::classify_with_svm_batch_gpu;
             println!("{} reads with SVM on GPU...", style::action("Classifying"));
             let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
@@ -251,7 +251,7 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
 
 /// Run classification using a trained WarpDemuX model.
 fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()> {
-    use escapepod_signal::demux::{classify_read, load_model};
+    use escapepod_demux::{classify_read, load_model};
 
     println!(
         "{} reads using WarpDemuX model",
@@ -303,7 +303,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
     let results: Vec<ClassifyResult> = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
-            use escapepod_signal::demux::classify_reads_gpu;
+            use escapepod_demux::classify_reads_gpu;
             println!("{} reads on GPU...", style::action("Classifying"));
             let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();

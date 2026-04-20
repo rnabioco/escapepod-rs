@@ -30,13 +30,15 @@ jobs:
       - run: cargo test --workspace
 
   test-features:
-    name: Test (--features demux)
+    name: Test (escapepod-demux + train)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p escapepod-signal --features demux
+      # Exercise the full demux crate surface: default features cover
+      # classify + SVM predict, `train` pulls in linfa-svm.
+      - run: cargo test -p escapepod-demux --features train
 
   bench-build:
     name: Bench compile

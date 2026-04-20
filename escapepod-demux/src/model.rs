@@ -390,7 +390,7 @@ impl WarpDemuxModel {
 /// # Example
 ///
 /// ```no_run
-/// use escapepod_signal::demux::load_model;
+/// use escapepod_demux::load_model;
 /// use std::path::Path;
 ///
 /// let model = load_model(Path::new("model.json"))?;

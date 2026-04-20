@@ -16,8 +16,8 @@ use linfa_svm::Svm;
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 
-use super::model::{DtwSvmModel, KernelParams};
-use crate::dtw::dtw_distance;
+use crate::model::{DtwSvmModel, KernelParams};
+use escapepod_signal::dtw::dtw_distance;
 
 /// Training configuration for DTW-SVM.
 #[derive(Debug, Clone)]
@@ -104,19 +104,19 @@ pub fn distance_to_kernel_matrix(distances: &Array2<f64>, gamma: f64, power: f64
 pub fn compute_distance_matrix_gpu(
     fingerprints: &[Vec<f64>],
     window: Option<usize>,
-) -> Result<Array2<f64>, crate::dtw::GpuDtwError> {
-    let ctx = crate::dtw::GpuDtwContext::new()?;
+) -> Result<Array2<f64>, escapepod_signal::dtw::GpuDtwError> {
+    let ctx = escapepod_signal::dtw::GpuDtwContext::new()?;
     compute_distance_matrix_gpu_with_ctx(&ctx, fingerprints, window)
 }
 
 /// Same as [`compute_distance_matrix_gpu`] but reuses an existing
-/// [`crate::dtw::GpuDtwContext`].
+/// [`escapepod_signal::dtw::GpuDtwContext`].
 #[cfg(feature = "gpu")]
 pub fn compute_distance_matrix_gpu_with_ctx(
-    ctx: &crate::dtw::GpuDtwContext,
+    ctx: &escapepod_signal::dtw::GpuDtwContext,
     fingerprints: &[Vec<f64>],
     window: Option<usize>,
-) -> Result<Array2<f64>, crate::dtw::GpuDtwError> {
+) -> Result<Array2<f64>, escapepod_signal::dtw::GpuDtwError> {
     let n = fingerprints.len();
     if n == 0 {
         return Ok(Array2::<f64>::zeros((0, 0)));

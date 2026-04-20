@@ -233,7 +233,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 #[cfg(feature = "cnn-detect")]
 fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     use crate::commands::profile::PhaseTimer;
-    use escapepod_signal::segmentation::AdapterCnn;
+    use escapepod_demux::AdapterCnn;
 
     let mut timer = PhaseTimer::new();
     timer.phase("Detect adapters (CNN)");
