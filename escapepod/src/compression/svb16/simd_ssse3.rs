@@ -11,7 +11,7 @@
 
 use std::arch::x86_64::*;
 
-use super::tables::{DECODE_SHUFFLE, DECODED_LEN};
+use super::tables::{DECODE_SHUFFLE, DECODED_LEN, ENCODE_SHUFFLE};
 
 /// Decode exactly `sample_count` samples from `(keys, values)` into `out`.
 ///
@@ -124,6 +124,114 @@ pub unsafe fn decode(
     Ok(())
 }
 
+/// Encode `samples` into `(keys, data)`. Processes 8 samples per SIMD
+/// iteration; hands the tail to the scalar path.
+///
+/// Returns the number of bytes written to `data`.
+///
+/// # Safety
+/// Caller must ensure the CPU supports SSSE3. `keys` must have length
+/// `ceil(samples.len() / 8)`; `data` must have at least
+/// `samples.len() * 2 + 16` bytes available (the extra 16 lets the
+/// last block use a full 16-byte store without overflow — trailing
+/// bytes are garbage, truncated by the caller).
+#[target_feature(enable = "ssse3")]
+pub unsafe fn encode(samples: &[i16], keys: &mut [u8], data: &mut [u8]) -> usize {
+    debug_assert_eq!(keys.len(), samples.len().div_ceil(8));
+    debug_assert!(data.len() >= samples.len() * 2 + 16);
+
+    let full_blocks = samples.len() / 8;
+
+    let zero = _mm_setzero_si128();
+
+    let mut prev_u16: u16 = 0;
+    let mut out_offset: usize = 0;
+
+    for k in 0..full_blocks {
+        // SAFETY: k * 8 + 8 <= full_blocks * 8 <= samples.len(), so the
+        // 16-byte load is in bounds. i16 has the same byte layout as u16
+        // for the bit patterns we care about (delta via wrapping_sub).
+        let input = unsafe { _mm_loadu_si128(samples.as_ptr().add(k * 8) as *const __m128i) };
+
+        // Delta: current - [carry, v0, v1, …, v6]
+        // Build `prev_vec` = input shifted right by one u16 lane, with
+        // `prev_u16` spliced into lane 0.
+        //
+        // `_mm_bslli_si128::<2>` shifts the vector left in memory order
+        // (i.e. lane 0 gets zero, old lane 0 → lane 1). We then OR in
+        // prev_u16 at lane 0.
+        let shifted = _mm_bslli_si128::<2>(input);
+        let carry_lane = _mm_insert_epi16::<0>(shifted, prev_u16 as i32);
+        let deltas = _mm_sub_epi16(input, carry_lane);
+
+        // Zigzag encode: (v << 1) ^ (v >> 15)   [arithmetic shift for sign]
+        let shifted_left = _mm_slli_epi16::<1>(deltas);
+        let sign = _mm_srai_epi16::<15>(deltas);
+        let zz = _mm_xor_si128(shifted_left, sign);
+
+        // Key byte: bit i is set iff zz_i >= 256 (i.e. high byte non-zero).
+        // srli 8 bits → each lane holds [0, high_byte]. Compare > 0 (signed
+        // OK: high byte always 0..=255, sign bit clear after srli).
+        let high_bytes = _mm_srli_epi16::<8>(zz);
+        let mask = _mm_cmpgt_epi16(high_bytes, zero);
+        // Pack two u16 vectors → saturated i8 lanes. We only care about the
+        // lower 8 lanes of the result; duplicate mask into both halves.
+        let packed = _mm_packs_epi16(mask, mask);
+        let mmask = _mm_movemask_epi8(packed) as u32;
+        let key = (mmask & 0xff) as u8;
+        keys[k] = key;
+
+        let len = DECODED_LEN[key as usize] as usize;
+
+        // Compact the 16 bytes of zz into the output stream using the
+        // precomputed encode shuffle.
+        // SAFETY: ENCODE_SHUFFLE is a `const` 16-byte array.
+        let shuf =
+            unsafe { _mm_loadu_si128(ENCODE_SHUFFLE[key as usize].as_ptr() as *const __m128i) };
+        let packed_out = _mm_shuffle_epi8(zz, shuf);
+
+        // SAFETY: data.len() >= samples.len() * 2 + 16 and
+        // out_offset + 16 <= samples.len() * 2 + 16 because each block
+        // consumes at most 16 output bytes (checked below: out_offset
+        // only grows by `len` ≤ 16 per iteration, starting from 0, and
+        // total ≤ samples.len() * 2 ≤ data.len() - 16).
+        unsafe {
+            _mm_storeu_si128(
+                data.as_mut_ptr().add(out_offset) as *mut __m128i,
+                packed_out,
+            );
+        }
+
+        // Carry: last sample's u16 value becomes prev for next block.
+        // Extract lane 7 of the input (pre-zigzag).
+        prev_u16 = _mm_extract_epi16::<7>(input) as u16;
+
+        out_offset += len;
+    }
+
+    // Scalar tail for remaining samples (0..7).
+    for i in (full_blocks * 8)..samples.len() {
+        let current = samples[i] as u16;
+        let delta = current.wrapping_sub(prev_u16);
+        prev_u16 = current;
+        let zz = (delta.wrapping_shl(1)) ^ ((delta as i16).wrapping_shr(15) as u16);
+
+        let byte_idx = i / 8;
+        let bit_idx = i % 8;
+        if zz < 256 {
+            data[out_offset] = zz as u8;
+            out_offset += 1;
+        } else {
+            keys[byte_idx] |= 1 << bit_idx;
+            data[out_offset] = zz as u8;
+            data[out_offset + 1] = (zz >> 8) as u8;
+            out_offset += 2;
+        }
+    }
+
+    out_offset
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{decode_scalar, encode};
@@ -207,6 +315,92 @@ mod tests {
         unsafe { decode(keys, values, samples.len(), &mut simd_out).unwrap() };
         assert_eq!(simd_out, scalar);
         assert_eq!(simd_out, samples);
+    }
+
+    #[test]
+    fn encode_matches_scalar_short() {
+        if !ssse3() {
+            return;
+        }
+        let samples: Vec<i16> = (-50..50).collect();
+        let scalar_encoded = super::super::encode_scalar(&samples).unwrap();
+        let simd_encoded = super::super::encode(&samples).unwrap();
+        assert_eq!(simd_encoded, scalar_encoded);
+        // Roundtrip.
+        let decoded = decode_scalar(&simd_encoded, samples.len()).unwrap();
+        assert_eq!(decoded, samples);
+    }
+
+    #[test]
+    fn encode_matches_scalar_large() {
+        if !ssse3() {
+            return;
+        }
+        let mut samples = Vec::with_capacity(10_000);
+        let mut v: i16 = 500;
+        for i in 0..10_000 {
+            let noise = ((i * 7) % 20) as i16 - 10;
+            if i % 500 == 0 {
+                v = 400 + ((i / 500) % 3) as i16 * 100;
+            }
+            samples.push(v + noise);
+        }
+        let scalar_encoded = super::super::encode_scalar(&samples).unwrap();
+        let simd_encoded = super::super::encode(&samples).unwrap();
+        assert_eq!(simd_encoded, scalar_encoded);
+    }
+
+    #[test]
+    fn encode_matches_scalar_extreme_values() {
+        if !ssse3() {
+            return;
+        }
+        // Values that force 2-byte encoding and large deltas across block
+        // boundaries — stress the carry between blocks.
+        let samples = vec![
+            i16::MIN,
+            i16::MAX,
+            0,
+            -1,
+            1,
+            i16::MIN,
+            i16::MAX,
+            -32000,
+            32000,
+            -32767,
+            32766,
+            0,
+            0,
+            0,
+            0,
+            0,
+            123,
+            -456,
+            1000,
+            -1000,
+            2,
+            -2,
+            3,
+            -3,
+        ];
+        let scalar_encoded = super::super::encode_scalar(&samples).unwrap();
+        let simd_encoded = super::super::encode(&samples).unwrap();
+        assert_eq!(simd_encoded, scalar_encoded);
+        let decoded = super::super::decode(&simd_encoded, samples.len()).unwrap();
+        assert_eq!(decoded, samples);
+    }
+
+    #[test]
+    fn encode_matches_scalar_every_tail_size() {
+        if !ssse3() {
+            return;
+        }
+        for n in 1..=33 {
+            let samples: Vec<i16> = (0..n as i16).map(|i| (i * 37) ^ 0x2bad).collect();
+            let scalar_encoded = super::super::encode_scalar(&samples).unwrap();
+            let simd_encoded = super::super::encode(&samples).unwrap();
+            assert_eq!(simd_encoded, scalar_encoded, "mismatch at n={}", n);
+        }
     }
 
     #[test]

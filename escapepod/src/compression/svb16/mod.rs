@@ -49,8 +49,41 @@ fn zigzag_decode(val: u16) -> u16 {
 
 /// Encode samples using SVB16 with delta and zigzag encoding.
 ///
-/// Returns the encoded bytes.
+/// Runtime-dispatches to an SSSE3 implementation on capable x86_64 CPUs;
+/// otherwise uses the scalar fallback.
 pub fn encode(samples: &[i16]) -> Result<Vec<u8>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            return Ok(encode_ssse3(samples));
+        }
+    }
+
+    encode_scalar(samples)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn encode_ssse3(samples: &[i16]) -> Vec<u8> {
+    let keys_len = key_length(samples.len());
+    let max_size = max_encoded_size(samples.len());
+    // +16 slack lets the last SIMD block use a full 16-byte unaligned store
+    // without worrying about overrunning the buffer; we truncate at the end.
+    let mut output = vec![0u8; max_size + 16];
+    let (keys, data) = output.split_at_mut(keys_len);
+
+    // SAFETY: runtime SSSE3 check above.
+    let written = unsafe { simd_ssse3::encode(samples, keys, data) };
+    output.truncate(keys_len + written);
+    output
+}
+
+/// Scalar SVB16 encode. Always available; reference implementation used
+/// for fallback and correctness testing of the SIMD path.
+pub fn encode_scalar(samples: &[i16]) -> Result<Vec<u8>> {
     if samples.is_empty() {
         return Ok(Vec::new());
     }

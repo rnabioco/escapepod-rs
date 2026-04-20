@@ -32,6 +32,36 @@ const fn build_decoded_len_table() -> [u8; 256] {
 /// little-endian order.
 pub const DECODE_SHUFFLE: [[u8; 16]; 256] = build_decode_shuffle();
 
+/// Shuffle patterns for SVB16 encode. The input vector holds 8 zigzag
+/// u16 values in LE byte order: `[v0_lo, v0_hi, v1_lo, v1_hi, …]`. The
+/// shuffle gathers `v_i_lo` (always) and `v_i_hi` (only if key bit `i`
+/// is set), producing a packed byte stream of length `DECODED_LEN[key]`
+/// at the low end of the output vector. Bytes past that length are
+/// undefined and must be truncated by the caller.
+pub const ENCODE_SHUFFLE: [[u8; 16]; 256] = build_encode_shuffle();
+
+const fn build_encode_shuffle() -> [[u8; 16]; 256] {
+    // 0x80 sentinel zeroes trailing lanes (harmless — caller skips them
+    // by advancing only DECODED_LEN[key] bytes).
+    let mut table = [[0x80u8; 16]; 256];
+    let mut k = 0usize;
+    while k < 256 {
+        let mut out_pos: u8 = 0;
+        let mut i = 0usize;
+        while i < 8 {
+            table[k][out_pos as usize] = (2 * i) as u8; // low byte of lane i
+            out_pos += 1;
+            if (k >> i) & 1 == 1 {
+                table[k][out_pos as usize] = (2 * i + 1) as u8; // high byte
+                out_pos += 1;
+            }
+            i += 1;
+        }
+        k += 1;
+    }
+    table
+}
+
 const fn build_decode_shuffle() -> [[u8; 16]; 256] {
     // 0x80 (top bit set) tells pshufb to zero the destination lane.
     let mut table = [[0x80u8; 16]; 256];
@@ -86,6 +116,59 @@ mod tests {
         let shuf = DECODE_SHUFFLE[0xff];
         for i in 0..16 {
             assert_eq!(shuf[i], i as u8);
+        }
+    }
+
+    #[test]
+    fn encode_shuffle_length_matches_decoded_len() {
+        for k in 0..256 {
+            let len = DECODED_LEN[k] as usize;
+            // The first `len` output positions must index into [0, 16).
+            for p in 0..len {
+                assert!(
+                    ENCODE_SHUFFLE[k][p] < 16,
+                    "key={:02x} out_pos={} idx={:02x}",
+                    k,
+                    p,
+                    ENCODE_SHUFFLE[k][p]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_shuffle_roundtrip_with_decode_shuffle() {
+        // For each key, composing ENCODE_SHUFFLE and DECODE_SHUFFLE on the
+        // first `DECODED_LEN[key]` bytes should be the identity on the
+        // first 8 u16 lanes (16 bytes), modulo the zero-sentinel for
+        // 1-byte samples.
+        for k in 0..256 {
+            let enc = ENCODE_SHUFFLE[k];
+            let dec = DECODE_SHUFFLE[k];
+            for i in 0..8 {
+                let is_two = (k >> i) & 1 == 1;
+                // Low byte: encoded position that holds input byte 2i.
+                let enc_pos_lo = enc.iter().position(|&b| b == (2 * i) as u8).unwrap();
+                assert_eq!(
+                    dec[2 * i] as usize,
+                    enc_pos_lo,
+                    "key={:02x} lane={} lo",
+                    k,
+                    i
+                );
+                if is_two {
+                    let enc_pos_hi = enc.iter().position(|&b| b == (2 * i + 1) as u8).unwrap();
+                    assert_eq!(
+                        dec[2 * i + 1] as usize,
+                        enc_pos_hi,
+                        "key={:02x} lane={} hi",
+                        k,
+                        i
+                    );
+                } else {
+                    assert_eq!(dec[2 * i + 1], 0x80, "key={:02x} lane={} zero-hi", k, i);
+                }
+            }
         }
     }
 
