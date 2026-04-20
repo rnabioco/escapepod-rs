@@ -33,6 +33,8 @@ __pycache__/
 !/benchmarks/
 /benchmarks/*.json
 /benchmarks/*.pod5
+/.bench_data/
+/.bench_output/
 
 # Built documentation
 site/

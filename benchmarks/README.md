@@ -2,15 +2,47 @@
 
 Comparison of `escapepod-rs` vs the official Python `pod5` tool (v0.3.36).
 
-## Test Environment
+## 2026-04-19 run (post-SIMD, post-audit)
 
-- **CPU**: Intel Xeon Gold 6240R @ 2.40GHz (96 cores)
-- **Memory**: 753 GB
-- **OS**: Linux (RHEL 9)
-- **Storage**: NFS
-- **Date**: 2026-03-20
+Run on the 2026-04 perf branch with SSSE3 SIMD SVB16 + release LTO profile.
+Note: none of the benchmarked commands decompress signal (inspect/view are
+metadata-only; filter/subset use compressed-passthrough), so the SVB16
+SIMD wins are invisible to this suite — see `escapepod/benches/hot_paths.rs`
+for microbenchmarks that exercise decode/encode directly.
 
-## Test Data
+### Test Data
+
+| File | Size | Reads |
+|------|------|-------|
+| no_aaRS_caps_deacyl_b5.pod5 | 4.4 GB | 520,851 |
+
+### Results Summary
+
+| Command | escapepod-rs | pod5 (Python) | Speedup |
+|---------|-------------:|--------------:|--------:|
+| inspect summary | 47.9 ms ± 2.6 | 1.854 s ± 0.009 | **38.7×** |
+| view (→/dev/null) | 594 ms ± 7 | 5.873 s ± 0.009 | **9.9×** |
+| filter (10 % of reads) | 1.43 s ± 0.05 | 9.82 s ± 0.11 | **6.9×** |
+| subset (2 groups) | 19.1 s ± 0.9 | 26.8 s ± 0.4 | **1.4×** |
+| merge | skipped (single-file input) | | |
+
+### Microbenchmarks (criterion) — SVB16 SIMD vs scalar
+
+SSSE3 `_mm_shuffle_epi8` + prefix-sum delta decode. Measured with
+`cargo bench --bench hot_paths`, release profile with fat LTO.
+
+| Microbench | scalar | SSSE3 | Δ |
+|---|---:|---:|---:|
+| vbz/encode/1000 | 8.75 µs | 6.84 µs | −21.9 % |
+| vbz/encode/10000 | 44.9 µs | 25.3 µs | −43.4 % (~1.77×) |
+| vbz/encode/100000 | 365 µs | 170 µs | −53.3 % (~2.15×) |
+| vbz/decode/1000 | 4.97 µs | 3.15 µs | −36.5 % |
+| vbz/decode/10000 | 33.0 µs | 14.7 µs | −55.4 % (~2.24×) |
+| vbz/decode/100000 | 306 µs | 120 µs | −60.6 % (~2.54×) |
+
+## 2026-03-20 run (pre-audit)
+
+### Test Data
 
 | File | Size | Reads |
 |------|------|-------|
@@ -18,7 +50,7 @@ Comparison of `escapepod-rs` vs the official Python `pod5` tool (v0.3.36).
 | PAY38817_82d9df02_82c8ff31_1.pod5 | 1.5 GB | 153,075 |
 | **Total** | **3.0 GB** | **312,748** |
 
-## Results Summary
+### Results Summary
 
 | Command | escapepod | pod5 (Python/C++) | Speedup |
 |---------|-----------|---------------|---------|
