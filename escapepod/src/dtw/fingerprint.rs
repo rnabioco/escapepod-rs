@@ -3,7 +3,7 @@
 //! A barcode fingerprint is a normalized sequence of signal features (e.g., event means)
 //! that can be used for barcode identification via DTW distance computation.
 
-use crate::Uuid;
+use uuid::Uuid;
 
 /// Normalization method for fingerprints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

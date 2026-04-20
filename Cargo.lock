@@ -695,14 +695,11 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "arrow",
- "byteorder",
  "criterion",
- "csv",
- "flatbuffers",
+ "escapepod-pod5",
  "flate2",
  "linfa",
  "linfa-svm",
- "memmap2",
  "ndarray",
  "noodles-bam",
  "noodles-sam",
@@ -712,9 +709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "uuid",
- "zstd",
 ]
 
 [[package]]
@@ -744,6 +739,23 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "escapepod-pod5"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "byteorder",
+ "csv",
+ "flatbuffers",
+ "memmap2",
+ "rayon",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]

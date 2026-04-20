@@ -1,8 +1,9 @@
-//! POD5 file format library for Oxford Nanopore sequencing data.
+//! Signal-processing algorithms for Oxford Nanopore POD5 data.
 //!
-//! This crate provides functionality for reading and writing POD5 files,
-//! which store nanopore sequencing data including raw signal, read metadata,
-//! and run information.
+//! This crate layers signal-processing algorithms (DTW, barcode demultiplexing,
+//! resquiggle, segmentation) on top of the POD5 format I/O provided by
+//! [`escapepod_pod5`]. Format types and operations are re-exported here so
+//! existing consumers can depend solely on `escapepod`.
 //!
 //! # Example
 //!
@@ -17,61 +18,25 @@
 //! # Ok::<(), escapepod::Error>(())
 //! ```
 
-// Internal modules - not part of public API
-pub(crate) mod arrow_helpers;
-pub(crate) mod arrow_ipc;
-pub(crate) mod footer;
-pub(crate) mod schema;
-
-// Modules with some public re-exports (implementation details hidden)
-mod fields;
-#[allow(unused_imports, dead_code, clippy::all, unsafe_op_in_unsafe_fn)]
-mod flatbuffers_gen;
-pub mod utils;
-
-// Public modules
-pub mod compression;
+// Signal-processing modules live in this crate.
 pub mod demux;
 pub mod dtw;
-pub mod error;
-pub mod merge;
-pub mod operations;
-pub mod progress;
-pub mod reader;
 pub mod resquiggle;
 pub mod segmentation;
-pub mod types;
-pub mod writer;
 
-// Re-export CLI-facing utilities
-pub use fields::{ALL_FIELDS, DEFAULT_FIELDS, FieldError, determine_fields, get_field_value};
-pub use utils::parse_uuid_flexible;
-pub use utils::{Statistics, compute_n50, compute_statistics};
+// Format layer (POD5 I/O) lives in escapepod-pod5. Re-export its modules and
+// types so consumers that depend on `escapepod` keep working unchanged.
+pub use escapepod_pod5 as pod5;
 
-// Re-export commonly used types
-pub use error::{Error, Result};
-pub use merge::{MergeOptions, MergePhase, MergeProgress, MergeResult, merge_files};
-pub use operations::{RepackOptions, RepackResult, repack_files};
-pub use progress::{Progress, ProgressCallback};
-pub use reader::ReadIndex;
-pub use reader::Reader;
-pub use reader::SignalExtractor;
-pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
-pub use writer::{PredefinedDictionaries, Writer, WriterOptions};
+pub use escapepod_pod5::{
+    compression, error, merge, operations, progress, reader, types, utils, writer,
+};
 
-// Re-export Arrow types needed for batch-level operations
-pub use arrow::record_batch::RecordBatch;
-
-use std::sync::Arc;
-
-/// A compressed signal chunk for block-level copying.
-/// Uses Arc to avoid expensive clones during signal lookups.
-#[derive(Debug, Clone)]
-pub struct CompressedSignalChunk {
-    /// The read ID this chunk belongs to.
-    pub read_id: Uuid,
-    /// Number of samples in this chunk.
-    pub samples: u32,
-    /// Compressed signal data (VBZ format).
-    pub data: Arc<[u8]>,
-}
+pub use escapepod_pod5::{
+    ALL_FIELDS, CompressedSignalChunk, DEFAULT_FIELDS, EndReason, Error, FieldError, MergeOptions,
+    MergePhase, MergeProgress, MergeResult, PredefinedDictionaries, Progress, ProgressCallback,
+    ReadData, ReadIndex, Reader, RecordBatch, RepackOptions, RepackResult, Result, RunInfoData,
+    SignalExtractor, SignalType, Statistics, Uuid, Writer, WriterOptions, compute_n50,
+    compute_statistics, determine_fields, get_field_value, merge_files, parse_uuid_flexible,
+    repack_files,
+};
