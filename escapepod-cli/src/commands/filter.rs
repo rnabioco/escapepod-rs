@@ -4,6 +4,7 @@
 //! sample count (read length), and end reasons.
 //! Uses batch-level parallelism with rayon and block-level copying for maximum performance.
 
+use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
@@ -14,6 +15,7 @@ use escapepod::types::EndReason;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+#[allow(clippy::too_many_arguments)] // args mirror the CLI subcommand surface
 pub fn run(
     input: PathBuf,
     ids_file: Option<PathBuf>,
@@ -22,7 +24,11 @@ pub fn run(
     end_reason: Option<Vec<String>>,
     exclude_end_reason: Option<Vec<String>>,
     output: PathBuf,
+    profile: bool,
 ) -> anyhow::Result<()> {
+    let mut timer = PhaseTimer::new();
+    timer.phase("Resolve inputs");
+
     // Resolve input to list of POD5 files (supports directories)
     let files = resolve_pod5_inputs(&input)?;
     let is_directory = files.len() > 1;
@@ -32,6 +38,7 @@ pub fn run(
 
     // Load read IDs if specified
     if let Some(ref ids_path) = ids_file {
+        timer.phase("Load read IDs");
         let ids = read_ids_from_file(ids_path)?;
         if ids.is_empty() {
             anyhow::bail!("No read IDs found in {}", ids_path.display());
@@ -139,6 +146,7 @@ pub fn run(
         read_batch_size: 10_000,
     };
 
+    timer.phase("Filter & write");
     let result = filter_files_with_criteria(&files, &output, &criteria, options, Some(progress))?;
 
     filter_bar.finish_with_message(format!("{} matched", result.matched_reads));
@@ -180,6 +188,8 @@ pub fn run(
             style::error(result.signal_errors)
         );
     }
+
+    timer.report(profile);
 
     Ok(())
 }

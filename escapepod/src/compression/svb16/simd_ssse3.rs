@@ -8,6 +8,10 @@
 //! `is_x86_feature_detected!("ssse3")` check.
 
 #![cfg(target_arch = "x86_64")]
+// The SIMD loops use the index `k` / `i` to drive multiple arrays and
+// pointer-arithmetic offsets; replacing them with iterators is strictly
+// worse here.
+#![allow(clippy::needless_range_loop)]
 
 use std::arch::x86_64::*;
 

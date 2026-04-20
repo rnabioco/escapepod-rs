@@ -3,11 +3,47 @@
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 
 mod commands;
 mod progress;
 mod style;
 mod util;
+
+/// Terse event formatter for `escpod` logs: `YYYY-MM-DD HH:MM:SS  LEVEL [target] message`.
+/// Targets inside the `escapepod` library are shown without the crate prefix
+/// to keep lines short; external targets are printed verbatim.
+struct EscpodFormatter;
+
+impl<S, N> FormatEvent<S, N> for EscpodFormatter
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(writer, "{}", now.format("%Y-%m-%d %H:%M:%S"))?;
+        write!(writer, " {:>5}", event.metadata().level())?;
+
+        let target = event.metadata().target();
+        if let Some(module) = target.strip_prefix("escapepod::") {
+            write!(writer, " [{module}]")?;
+        } else if target != "escapepod_cli" && target != "escapepod" {
+            write!(writer, " [{target}]")?;
+        }
+
+        write!(writer, " ")?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
@@ -34,6 +70,15 @@ Examples:
   escpod summary input.pod5                 Comprehensive statistics
 ")]
 struct Cli {
+    /// Silence all output except errors. Overrides `--verbose`.
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
+
+    /// Increase log verbosity. `-v` = info, `-vv` = debug, `-vvv` = trace.
+    /// `RUST_LOG` takes precedence when set.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -158,6 +203,10 @@ At least one filter criterion must be specified.
         /// Output POD5 file
         #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
+
+        /// Print per-phase timing breakdown after completion
+        #[arg(long)]
+        profile: bool,
     },
 
     /// Filter reads based on paired BAM file
@@ -205,6 +254,10 @@ Examples:
         /// Overwrite existing files
         #[arg(short, long)]
         force: bool,
+
+        /// Print per-phase timing breakdown after completion
+        #[arg(long)]
+        profile: bool,
     },
 
     /// Subset reads into multiple files based on CSV mapping
@@ -230,6 +283,10 @@ Each unique 'output' value creates a separate POD5 file.
         /// Overwrite existing files
         #[arg(short, long)]
         force: bool,
+
+        /// Print per-phase timing breakdown after completion
+        #[arg(long)]
+        profile: bool,
     },
 
     /// Show comprehensive summary of POD5 file(s)
@@ -309,6 +366,22 @@ enum InspectCommands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Verbosity → log level. `RUST_LOG` always wins if set.
+    let filter = match (cli.quiet, cli.verbose) {
+        (true, _) => "error",
+        (_, 0) => "warn",
+        (_, 1) => "info",
+        (_, 2) => "debug",
+        _ => "trace",
+    };
+    tracing_subscriber::fmt()
+        .event_format(EscpodFormatter)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     match cli.command {
         Commands::View {
             input,
@@ -342,6 +415,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            profile,
         } => commands::filter::run(
             input,
             ids,
@@ -350,6 +424,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            profile,
         ),
 
         Commands::BamFilter {
@@ -366,14 +441,16 @@ fn main() -> anyhow::Result<()> {
             inputs,
             output_dir,
             force,
-        } => commands::repack::run(inputs, output_dir, force),
+            profile,
+        } => commands::repack::run(inputs, output_dir, force, profile),
 
         Commands::Subset {
             input,
             csv,
             output_dir,
             force,
-        } => commands::subset::run(input, csv, output_dir, force),
+            profile,
+        } => commands::subset::run(input, csv, output_dir, force, profile),
 
         Commands::Summary(args) => commands::summary::run(args),
 

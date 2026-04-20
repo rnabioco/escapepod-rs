@@ -3,6 +3,7 @@
 //! Splits reads into multiple output files based on a CSV mapping.
 //! Uses the optimized filter_files() path for each output group.
 
+use crate::commands::profile::PhaseTimer;
 use crate::style;
 use escapepod::operations::{FilterOptions, filter_files, parse_csv_mapping};
 use rayon::prelude::*;
@@ -15,7 +16,11 @@ pub fn run(
     csv_file: PathBuf,
     output_dir: PathBuf,
     force: bool,
+    profile: bool,
 ) -> anyhow::Result<()> {
+    let mut timer = PhaseTimer::new();
+    timer.phase("Parse CSV mapping");
+
     // Parse the CSV mapping file
     let mapping = parse_csv_mapping(&csv_file)?;
 
@@ -63,6 +68,7 @@ pub fn run(
         read_batch_size: 10_000,
     };
 
+    timer.phase("Filter & write groups");
     // Process all output groups in parallel using the optimized filter path
     let group_list: Vec<_> = groups.into_iter().collect();
     let results: Vec<anyhow::Result<(String, u64)>> = group_list
@@ -101,6 +107,8 @@ pub fn run(
             unmatched.to_string()
         }
     );
+
+    timer.report(profile);
 
     Ok(())
 }

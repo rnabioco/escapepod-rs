@@ -7,6 +7,7 @@ pub mod filter;
 pub mod index;
 pub mod inspect;
 pub mod merge;
+pub mod profile;
 #[cfg(feature = "experimental")]
 pub mod repack;
 #[cfg(feature = "experimental")]

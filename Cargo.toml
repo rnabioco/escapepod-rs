@@ -32,12 +32,18 @@ zstd = "0.13"
 # Python bindings
 pyo3 = { version = "0.28", features = ["extension-module"] }
 numpy = "0.28"
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Optimized release build: LTO + single codegen unit for maximum performance.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+opt-level = 3
 
 # `cargo bench` uses [profile.bench], which by default does NOT inherit from
 # [profile.release]. Pin it here so microbenchmarks measure the same codegen
@@ -48,13 +54,27 @@ inherits = "release"
 strip = false
 panic = "unwind"
 
+# Release-speed build with symbols preserved — for samply/perf recordings
+# where you want final codegen but readable stack traces.
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = 2
+
+# Profiling build: drops LTO and splits codegen so frames aren't inlined
+# away from profilers (valgrind, perf, samply). Slower than release, but
+# faithfully reports call graphs.
 [profile.profiling]
 inherits = "release"
-debug = true
+lto = false
+codegen-units = 16
 strip = false
-# Enable frame pointers for accurate call stacks
-[profile.profiling.build-override]
-debug = true
+debug = 2
+
+# Fast dev builds, but with optimized third-party crates so tests run
+# at a reasonable speed.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.dist]
 inherits = "release"

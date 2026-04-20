@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 bstr = "1"
-chrono = "0.4"
+chrono = { workspace = true }
 clap = { workspace = true }
 csv = "1"
 escapepod = { workspace = true }
@@ -35,6 +35,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tabled = { version = "0.20", features = ["ansi"] }
 tempfile = "3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 walkdir = "2"
 

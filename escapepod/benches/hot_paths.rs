@@ -10,6 +10,14 @@
 //! Run with:
 //!   cargo bench --bench hot_paths
 //!   cargo bench --bench hot_paths -- dtw          # subset
+//!
+//! Env vars:
+//!   ESCAPEPOD_BENCH_THREADS=N     Rayon pool size for the parallel bench
+//!                                 (dtw_distance_matrix). Defaults to the
+//!                                 number of physical cores seen by rayon.
+//!   ESCAPEPOD_BENCH_SAMPLES=N     Override criterion sample_size for the
+//!                                 slow groups (dtw_distance_matrix) where
+//!                                 the default 100 runs takes forever.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -17,6 +25,26 @@ use std::hint::black_box;
 use escapepod::compression::vbz;
 use escapepod::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
 use escapepod::resquiggle::dp::{ViterbiBuffers, dp_step_buffered};
+
+/// Read ESCAPEPOD_BENCH_THREADS and pre-configure the rayon global pool.
+/// No-op if the env var isn't set or rayon has already been initialized.
+fn configure_rayon() {
+    if let Some(n) = std::env::var("ESCAPEPOD_BENCH_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+    }
+}
+
+fn bench_sample_size(default: usize) -> usize {
+    std::env::var("ESCAPEPOD_BENCH_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 /// Build a deterministic pseudo-random float sequence (xorshift, seeded).
 fn pseudo_floats(n: usize, seed: u64) -> Vec<f32> {
@@ -136,7 +164,9 @@ fn bench_vbz_roundtrip(c: &mut Criterion) {
 
 fn bench_dtw_matrix(c: &mut Criterion) {
     use escapepod::dtw::dtw_distance_matrix;
+    configure_rayon();
     let mut group = c.benchmark_group("dtw_distance_matrix");
+    group.sample_size(bench_sample_size(50));
     // training workload shape: (n_queries x n_refs) with moderate fingerprint length.
     for &(q, r, l) in &[(8usize, 8usize, 150usize), (32, 32, 150)] {
         let queries: Vec<Vec<f32>> = (0..q).map(|i| pseudo_floats(l, 0x100 + i as u64)).collect();

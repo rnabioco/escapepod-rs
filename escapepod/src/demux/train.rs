@@ -275,7 +275,7 @@ fn train_multiclass_svm(
             let pair_indices: Vec<usize> = pair_mask
                 .iter()
                 .enumerate()
-                .filter(|(_, &m)| m)
+                .filter(|&(_, &m)| m)
                 .map(|(idx, _)| idx)
                 .collect();
 

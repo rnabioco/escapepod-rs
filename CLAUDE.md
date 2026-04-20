@@ -8,7 +8,7 @@ escapepod-rs is a pure Rust implementation for reading and writing POD5 files, t
 
 ## Requirements
 
-- Rust 1.85 or later
+- Rust 1.88 or later (matches `workspace.package.rust-version`)
 
 ## Build Commands
 
@@ -33,6 +33,67 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 # Run the CLI (after building)
 ./target/release/escpod <command>
+```
+
+## Benchmarking & Profiling
+
+### Build profiles
+
+- `release` — ship build: fat LTO, `codegen-units=1`, stripped, `panic=abort`.
+- `release-with-debug` — release speed with symbols retained (for `samply`/`perf`).
+- `bench` — inherits release; used by `cargo bench` so microbenchmarks match release codegen.
+- `profiling` — inherits release but turns LTO off and splits `codegen-units=16` so profilers see real call graphs instead of inlined soup.
+- `dist` — ship build for release artifacts.
+- `dev.package."*"` — dev dependencies compile at `opt-level = 2` so test iteration is fast.
+
+### Microbenchmarks (criterion)
+
+`escapepod/benches/hot_paths.rs` covers the audit hot paths: DTW, resquiggle DP, fingerprint MAD, VBZ encode/decode, DTW matrix.
+
+```bash
+# Full run
+cargo bench --bench hot_paths
+
+# Subset
+cargo bench --bench hot_paths -- vbz
+
+# A/B against a saved baseline
+cargo bench --bench hot_paths -- --save-baseline <name>
+cargo bench --bench hot_paths -- --baseline <name>     # compare future runs
+```
+
+Env overrides: `ESCAPEPOD_BENCH_THREADS=N` (rayon pool size for the matrix bench), `ESCAPEPOD_BENCH_SAMPLES=N` (criterion sample size for slow groups).
+
+### End-to-end (hyperfine vs. Python pod5)
+
+```bash
+cargo build --release
+./benchmarks/benchmark.sh /path/to/pod5/dir
+```
+
+Runs `inspect summary`, `view`, `merge`, `filter`, `subset` via hyperfine against Python `pod5` (installed in the pixi env). Results persist as JSON under `/tmp/escapepod_benchmark/`. Historical numbers are in `benchmarks/README.md`.
+
+### Profiling workflow
+
+```bash
+# 1. build with symbols kept
+cargo build --profile release-with-debug -p escapepod-cli
+# 2. record with samply (pixi-provided binary recommended)
+samply record target/release-with-debug/escpod <args>
+# 3. flamegraph-style view in browser
+```
+
+For perf/valgrind where inlining hides frames, swap `release-with-debug` for `profiling` (LTO off).
+
+### Runtime verbosity
+
+The CLI is wired to `tracing` with stderr output. Control the level via CLI flags or `RUST_LOG`:
+
+```bash
+escpod -v inspect summary file.pod5      # info
+escpod -vv merge *.pod5 -o out.pod5      # debug
+RUST_LOG=escapepod::reader=trace escpod view file.pod5   # module-scoped
+escpod -q merge …                         # errors only
 ```
 
 ## Architecture
@@ -64,7 +125,9 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 - **reader/file_reader.rs**: Memory-mapped file reader using `memmap2`. Opens POD5 files, parses the FlatBuffer footer, and provides iterators over reads and signal data.
 - **writer/file_writer.rs**: Buffered writer that constructs POD5 files. Handles signal chunking, VBZ compression, and batching of Arrow record batches.
 - **compression/**: VBZ signal compression (SVB16 + ZSTD pipeline)
-  - `svb16.rs`: StreamVByte encoding with delta and zigzag transforms
+  - `svb16/mod.rs`: Scalar SVB16 encode/decode + runtime dispatch to SIMD.
+  - `svb16/simd_ssse3.rs`: SSSE3 encode/decode (~2× vs scalar on x86_64 w/ SSSE3).
+  - `svb16/tables.rs`: `pshufb` shuffle + length tables for both directions.
   - `vbz.rs`: Full VBZ pipeline combining SVB16 with ZSTD compression
 - **footer.rs**: Manual FlatBuffer parsing for the POD5 footer (locates embedded Arrow tables)
 - **schema/**: Arrow schema definitions for reads, signal, and run_info tables

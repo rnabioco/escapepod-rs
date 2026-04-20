@@ -3,6 +3,7 @@
 //! Repacks POD5 files using block-level signal copying (no decompression/recompression).
 //! Files are processed in parallel using rayon. Supports directories as input.
 
+use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::collect_pod5_inputs;
@@ -11,7 +12,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Result<()> {
+pub fn run(
+    inputs: Vec<PathBuf>,
+    output_dir: PathBuf,
+    force: bool,
+    profile: bool,
+) -> anyhow::Result<()> {
+    let mut timer = PhaseTimer::new();
+    timer.phase("Resolve inputs");
     let all_files = collect_pod5_inputs(&inputs)?;
 
     // Ensure output directory exists
@@ -68,6 +76,7 @@ pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Re
         }
     });
 
+    timer.phase("Repack (parallel)");
     // Process files in parallel using the new operation
     let result = repack_files(&file_pairs, options, Some(progress_callback));
 
@@ -87,6 +96,8 @@ pub fn run(inputs: Vec<PathBuf>, output_dir: PathBuf, force: bool) -> anyhow::Re
             style::count(result.files_skipped as u64)
         );
     }
+
+    timer.report(profile);
 
     Ok(())
 }
