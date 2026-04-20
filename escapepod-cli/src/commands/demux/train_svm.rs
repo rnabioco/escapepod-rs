@@ -4,7 +4,7 @@
 //! with probability output. Only available with the `train` feature.
 
 use crate::style;
-use escapepod_signal::demux::{TrainConfig, train_svm};
+use escapepod_demux::{TrainConfig, train_svm};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -129,7 +129,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
     let model = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
-            use escapepod_signal::demux::train_svm_gpu;
+            use escapepod_demux::train_svm_gpu;
             println!(
                 "{} DTW distance matrix on GPU...",
                 style::action("Computing")

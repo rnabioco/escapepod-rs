@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["escapepod-cli", "escapepod-pod5", "escapepod-python", "escapepod-signal"]
+members = ["escapepod-cli", "escapepod-demux", "escapepod-pod5", "escapepod-python", "escapepod-signal"]
 
 [workspace.package]
 version = "0.2.0"
@@ -18,6 +18,7 @@ byteorder = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 # Workspace crates
+escapepod-demux = { path = "escapepod-demux", version = "0.2.0" }
 escapepod-pod5 = { path = "escapepod-pod5", version = "0.2.0" }
 escapepod-signal = { path = "escapepod-signal", version = "0.2.0" }
 # Serialization

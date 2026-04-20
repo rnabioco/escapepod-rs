@@ -1,7 +1,7 @@
 //! Classification logic for barcode demultiplexing.
 
-use super::model::WarpDemuxModel;
-use crate::dtw::dtw_distance_bounded;
+use crate::model::WarpDemuxModel;
+use escapepod_signal::dtw::dtw_distance_bounded;
 
 /// Compute distance ratio confidence.
 ///
@@ -79,7 +79,7 @@ impl ClassificationResult {
 /// # Example
 ///
 /// ```no_run
-/// use escapepod_signal::demux::{load_model, classify_read};
+/// use escapepod_demux::{load_model, classify_read};
 /// use std::path::Path;
 ///
 /// let model = load_model(Path::new("model.json"))?;
@@ -150,7 +150,7 @@ pub fn classify_read(model: &WarpDemuxModel, fingerprint: &[f64]) -> Classificat
 /// `model.training_fingerprints[i]`. This is the second half of
 /// [`classify_read`], split out so the distance computation can be swapped
 /// (e.g. replaced by a batched GPU matrix via
-/// [`crate::dtw::dtw_distance_matrix_gpu`] when the `gpu` feature is enabled).
+/// [`escapepod_signal::dtw::dtw_distance_matrix_gpu`] when the `gpu` feature is enabled).
 pub fn classify_from_distances(model: &WarpDemuxModel, distances: &[f32]) -> ClassificationResult {
     if distances.is_empty() {
         return ClassificationResult::unclassified(f64::INFINITY, f64::INFINITY);
@@ -232,22 +232,22 @@ fn classify_top2(
 pub fn classify_reads_gpu(
     model: &WarpDemuxModel,
     fingerprints: &[Vec<f64>],
-) -> Result<Vec<ClassificationResult>, crate::dtw::GpuDtwError> {
-    let ctx = crate::dtw::GpuDtwContext::new()?;
+) -> Result<Vec<ClassificationResult>, escapepod_signal::dtw::GpuDtwError> {
+    let ctx = escapepod_signal::dtw::GpuDtwContext::new()?;
     classify_reads_gpu_with_ctx(&ctx, model, fingerprints)
 }
 
 /// Same as [`classify_reads_gpu`] but reuses an existing
-/// [`crate::dtw::GpuDtwContext`].
+/// [`escapepod_signal::dtw::GpuDtwContext`].
 ///
 /// Build the context once and reuse it across multiple batches — NVRTC
 /// compilation plus module load costs roughly 100 ms the first time.
 #[cfg(feature = "gpu")]
 pub fn classify_reads_gpu_with_ctx(
-    ctx: &crate::dtw::GpuDtwContext,
+    ctx: &escapepod_signal::dtw::GpuDtwContext,
     model: &WarpDemuxModel,
     fingerprints: &[Vec<f64>],
-) -> Result<Vec<ClassificationResult>, crate::dtw::GpuDtwError> {
+) -> Result<Vec<ClassificationResult>, escapepod_signal::dtw::GpuDtwError> {
     if fingerprints.is_empty() {
         return Ok(Vec::new());
     }
@@ -278,7 +278,7 @@ pub fn classify_reads_gpu_with_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::demux::model::KernelParams;
+    use crate::model::KernelParams;
     use std::collections::HashMap;
 
     fn create_test_model() -> WarpDemuxModel {

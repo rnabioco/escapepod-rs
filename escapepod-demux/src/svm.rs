@@ -9,10 +9,10 @@
 //! 3. Apply SVM decision function using dual coefficients
 //! 4. Convert decision values to probabilities via Platt scaling
 
-use crate::dtw::dtw_distance;
+use escapepod_signal::dtw::dtw_distance;
 
-use super::model::{DtwSvmModel, KernelParams};
-use super::probability::{ProbabilityResult, process_probabilities};
+use crate::model::{DtwSvmModel, KernelParams};
+use crate::probability::{ProbabilityResult, process_probabilities};
 
 // Re-export SvmModel as an alias for DtwSvmModel for backwards compatibility
 pub type SvmModel = DtwSvmModel;
@@ -436,19 +436,19 @@ pub fn classify_with_svm(model: &SvmModel, fingerprint: &[f64]) -> (Vec<f64>, Pr
 pub fn classify_with_svm_batch_gpu(
     model: &SvmModel,
     fingerprints: &[Vec<f64>],
-) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, crate::dtw::GpuDtwError> {
-    let ctx = crate::dtw::GpuDtwContext::new()?;
+) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, escapepod_signal::dtw::GpuDtwError> {
+    let ctx = escapepod_signal::dtw::GpuDtwContext::new()?;
     classify_with_svm_batch_gpu_with_ctx(&ctx, model, fingerprints)
 }
 
 /// Same as [`classify_with_svm_batch_gpu`] but reuses an existing
-/// [`crate::dtw::GpuDtwContext`].
+/// [`escapepod_signal::dtw::GpuDtwContext`].
 #[cfg(feature = "gpu")]
 pub fn classify_with_svm_batch_gpu_with_ctx(
-    ctx: &crate::dtw::GpuDtwContext,
+    ctx: &escapepod_signal::dtw::GpuDtwContext,
     model: &SvmModel,
     fingerprints: &[Vec<f64>],
-) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, crate::dtw::GpuDtwError> {
+) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, escapepod_signal::dtw::GpuDtwError> {
     if fingerprints.is_empty() {
         return Ok(Vec::new());
     }

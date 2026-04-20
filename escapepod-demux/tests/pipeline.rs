@@ -1,15 +1,13 @@
 //! Integration tests for the demux pipeline orchestration.
 //!
-//! Exercises `classify_read` (distance-based) and the core SVM-adjacent helpers
-//! (`compute_distances`, `distances_to_kernel`, `softmax`) end-to-end on a
-//! synthetic `WarpDemuxModel`. Gated on the `demux` feature.
-
-#![cfg(feature = "demux")]
+//! Exercises `classify_read` (distance-based) and the core SVM-adjacent
+//! helpers (`compute_distances`, `distances_to_kernel`, `softmax`)
+//! end-to-end on a synthetic `WarpDemuxModel`.
 
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-use escapepod_signal::demux::{
+use escapepod_demux::{
     KernelParams, WarpDemuxModel, classify_read, compute_distances, distances_to_kernel,
     load_model, softmax,
 };

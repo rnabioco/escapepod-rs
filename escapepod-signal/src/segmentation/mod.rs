@@ -51,14 +51,8 @@ pub mod llr;
 pub mod normalize;
 pub mod ttest;
 
-#[cfg(feature = "cnn-detect")]
-pub mod adapter_cnn;
-
 // Re-export main types and functions for convenience
 pub use llr::{LlrTrace, detect_adapter};
-
-#[cfg(feature = "cnn-detect")]
-pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError};
 pub use normalize::{
     clip_outliers, downscale, mad_normalize, mad_normalize_with_clipping, normalize_dwell_times,
     normalize_dwell_times_mad,

@@ -1,0 +1,48 @@
+[package]
+name = "escapepod-demux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "WarpDemuX-compatible barcode demultiplexing for Oxford Nanopore POD5 data (DTW + SVM, optional CNN adapter detection and GPU acceleration)."
+repository.workspace = true
+license.workspace = true
+readme = "../README.md"
+keywords = ["nanopore", "pod5", "demultiplex", "barcode", "svm"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+anyhow = { workspace = true }
+escapepod-pod5 = { workspace = true }
+escapepod-signal = { workspace = true }
+ndarray = "0.16"
+rayon = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# SVM training (opt-in via `train`).
+linfa = { version = "0.8", optional = true }
+linfa-svm = { version = "0.8", optional = true }
+
+# CNN adapter detection (opt-in via `cnn-detect`). Pure-Rust ONNX runtime;
+# user supplies the model file at runtime (weights are CC BY-NC).
+tract-onnx = { workspace = true, optional = true }
+
+[features]
+default = []
+# Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
+train = ["dep:linfa", "dep:linfa-svm"]
+# Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
+# from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
+# time, not build time.
+gpu = ["escapepod-signal/gpu"]
+# CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
+# tract-onnx). Users supply an ONNX file produced by
+# `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC
+# 4.0 and must not be bundled with this crate.
+cnn-detect = ["dep:tract-onnx"]
+
+[dev-dependencies]
+rand = "0.10"
+tempfile = "3"
