@@ -82,7 +82,7 @@ echo "=== Step 2: Write synthetic POD5 ==="
 
 SYNTHETIC="$TMPDIR/synthetic.pod5"
 
-if cargo run --release -p escapepod --example write_pod5 -- "$SYNTHETIC" 2>/dev/null; then
+if cargo run --release -p escapepod-signal --example write_pod5 -- "$SYNTHETIC" 2>/dev/null; then
     log_pass "write_pod5 example produced $SYNTHETIC"
 else
     log_fail "write_pod5 example failed"
