@@ -94,10 +94,12 @@ impl GpuDtwContext {
             });
         }
 
-        let max_m: usize = references.iter().map(|r| r.len()).max().unwrap_or(0);
-        if max_m > i32::MAX as usize {
+        // v2 indexes the three diagonal buffers by query index i ∈ [0, n],
+        // so shared memory sizing scales with the longest query.
+        let max_n: usize = queries.iter().map(|q| q.len()).max().unwrap_or(0);
+        if max_n > i32::MAX as usize {
             return Err(GpuDtwError::InputTooLarge {
-                what: "reference length exceeds i32::MAX",
+                what: "query length exceeds i32::MAX",
             });
         }
 
@@ -122,17 +124,22 @@ impl GpuDtwContext {
             Some(w) => w as i32,
         };
 
-        // 2 rolling DP rows of length (max_m + 1) floats.
-        let shared_mem_bytes: u32 = (2u32)
-            .checked_mul((max_m as u32).saturating_add(1))
+        // Three rolling diagonal buffers of length (max_n + 1) floats.
+        let shared_mem_bytes: u32 = (3u32)
+            .checked_mul((max_n as u32).saturating_add(1))
             .and_then(|v| v.checked_mul(std::mem::size_of::<f32>() as u32))
             .ok_or(GpuDtwError::InputTooLarge {
                 what: "shared memory size overflowed u32",
             })?;
 
+        // 64 threads = 2 warps — enough ILP without over-budgeting registers.
+        // The kernel's inner loop strides by blockDim.x, so bands wider than
+        // 64 are handled correctly.
+        const THREADS: u32 = 64;
+
         let cfg = LaunchConfig {
             grid_dim: (n_q as u32, n_r as u32, 1),
-            block_dim: (1, 1, 1),
+            block_dim: (THREADS, 1, 1),
             shared_mem_bytes,
         };
 
@@ -151,7 +158,7 @@ impl GpuDtwContext {
                     &mut out_dev,
                     n_q as i32,
                     n_r as i32,
-                    max_m as i32,
+                    max_n as i32,
                     window_i32,
                 ),
             )?;

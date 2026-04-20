@@ -4,23 +4,23 @@
 //! string constant so the build has no compile-time dependency on `nvcc` or
 //! the CUDA toolkit.
 //!
-//! ## Kernel layout (v1)
+//! ## Kernel layout (v2, anti-diagonal)
 //!
 //! * Grid = `(n_queries, n_refs, 1)`. One block per (query, ref) pair.
-//! * Block = `(1, 1, 1)`. A single thread runs the classic two-row banded DP
-//!   for its pair. Grid-level parallelism saturates the device: with
-//!   thousands of pairs, one-thread-per-block is wasteful per-SM but the
-//!   aggregate throughput still dwarfs CPU rayon for the fingerprint sizes
-//!   we see in practice (~100–400 f32).
-//! * Dynamic shared memory: `2 * (max_ref_len + 1) * sizeof(float)`, holds
-//!   the two rolling DP rows.
+//! * Block = `(THREADS, 1, 1)`. Threads cooperate along each anti-diagonal
+//!   of the DP table; cells on the same diagonal `d = i + j` are independent
+//!   given diagonals `d-1` and `d-2`, so the inner loop over the diagonal's
+//!   cells is fully parallel (no cross-thread dependency within a row).
+//! * Dynamic shared memory: three rolling diagonal buffers, each indexed by
+//!   the query index `i ∈ [0, n]`. Size = `3 * (max_n + 1) * sizeof(float)`.
+//!   On diagonal `d`, cell `(i, j=d-i)` reads `d2[i-1]` (the `(i-1,j-1)`
+//!   predecessor), `d1[i-1]` (`(i-1,j)`), and `d1[i]` (`(i,j-1)`).
 //!
-//! A later revision can switch to anti-diagonal threading (one thread per
-//! band column) to better utilize each SM; the kernel signature and host
-//! bindings would not change.
+//! The older v1 implementation used a single thread per block and leaned on
+//! grid-level parallelism; this one actually uses each warp.
 
 pub const KERNEL_SRC: &str = r#"
-// NVRTC compiles without libc headers, so `dtw_inf_f()` is not defined. Bit-pattern
+// NVRTC compiles without libc headers, so INFINITY isn't available.
 // 0x7f800000 is +inf in IEEE-754 f32.
 __device__ __forceinline__ float dtw_inf_f() { return __int_as_float(0x7f800000); }
 
@@ -33,7 +33,7 @@ void dtw_matrix_kernel(
     float*       __restrict__ out,
     int n_q,
     int n_r,
-    int max_m,
+    int max_n,
     int window)
 {
     int qi = blockIdx.x;
@@ -58,49 +58,63 @@ void dtw_matrix_kernel(
     const float* a = queries + q_start;
     const float* b = refs    + r_start;
 
+    // Three rolling diagonal buffers, each indexed by `i ∈ [0, max_n]`.
     extern __shared__ float smem[];
-    float* prev = smem;                  // length max_m + 1
-    float* curr = smem + (max_m + 1);    // length max_m + 1
+    float* d2 = smem;                              // diagonal d-2
+    float* d1 = smem + (max_n + 1);                // diagonal d-1
+    float* d0 = smem + 2 * (max_n + 1);            // diagonal d (current)
 
-    // Only one thread does work in v1; others wait at syncthreads.
-    if (threadIdx.x != 0) return;
+    int tid = threadIdx.x;
+    int nth = blockDim.x;
+    float INF = dtw_inf_f();
 
-    // Init prev to INF with prev[0] = 0, curr to INF.
-    for (int j = 0; j <= m; ++j) {
-        prev[j] = dtw_inf_f();
-        curr[j] = dtw_inf_f();
-    }
-    prev[0] = 0.0f;
+    // Initialize d2 as diagonal 0: only D[0][0] = 0, the rest INF.
+    for (int i = tid; i <= n; i += nth) d2[i] = INF;
+    __syncthreads();
+    if (tid == 0) d2[0] = 0.0f;
 
-    int w = (window < 0) ? m : window;
+    // Initialize d1 as diagonal 1: D[0][1] and D[1][0] are both INF (base case).
+    for (int i = tid; i <= n; i += nth) d1[i] = INF;
+    __syncthreads();
 
-    for (int i = 1; i <= n; ++i) {
-        int j_start = (i > w) ? (i - w) : 1;
-        if (j_start < 1) j_start = 1;
-        int j_end = (i + w < m) ? (i + w) : m;
-        curr[0] = dtw_inf_f();
+    int w = (window < 0) ? (n + m) : window;
 
-        float ai = a[i - 1];
-        for (int j = j_start; j <= j_end; ++j) {
-            float diff = ai - b[j - 1];
+    // Walk diagonals d = 2..=n+m. Cells on diagonal d are (i, d-i) with
+    // 1 <= i <= n, 1 <= d-i <= m, and |i - (d-i)| = |2i - d| <= w. Each
+    // thread strides over candidate i values and runtime-checks the bounds
+    // — the band-bound arithmetic lives fine in Rust where it is easy to
+    // match the CPU implementation, but here we want the simplest correct
+    // mapping and let the compiler predicate the branch.
+    for (int d = 2; d <= n + m; ++d) {
+        // Clear the current-diagonal buffer so cells outside the band read
+        // as INF when they become predecessors on the next diagonal.
+        for (int i = tid; i <= n; i += nth) d0[i] = INF;
+        __syncthreads();
+
+        for (int i = 1 + tid; i <= n; i += nth) {
+            int j = d - i;
+            if (j < 1 || j > m) continue;
+            int delta = i - j;
+            if (delta < 0) delta = -delta;
+            if (delta > w) continue;
+
+            float diff = a[i - 1] - b[j - 1];
             float cost = diff * diff;
-            float m1 = fminf(prev[j - 1], prev[j]);
-            float mp = fminf(m1, curr[j - 1]);
-            curr[j] = cost + mp;
+            float m1 = fminf(d1[i - 1], d1[i]);
+            float mp = fminf(m1, d2[i - 1]);
+            d0[i] = cost + mp;
         }
+        __syncthreads();
 
-        // Clear the tail beyond j_end so subsequent rows that extend past
-        // the previous band don't reuse stale curr[] values via curr[j-1].
-        for (int j = j_end + 1; j <= m; ++j) {
-            curr[j] = dtw_inf_f();
-        }
-
-        // swap prev <-> curr
-        float* tmp = prev;
-        prev = curr;
-        curr = tmp;
+        // Rotate: d2 <- d1, d1 <- d0, d0 <- (old d2, will be overwritten).
+        float* tmp = d2;
+        d2 = d1;
+        d1 = d0;
+        d0 = tmp;
+        __syncthreads();
     }
 
-    *out_cell = sqrtf(prev[m]);
+    // After the last rotation, d1 holds diagonal n+m; D[n][m] lives at i=n.
+    if (tid == 0) *out_cell = sqrtf(d1[n]);
 }
 "#;
