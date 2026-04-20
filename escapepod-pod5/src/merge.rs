@@ -262,8 +262,12 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                 .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
                 .map_err(Error::Io)?;
 
-            // Write IPC footer directly (small data, no need for async)
-            let footer_bytes = build_arrow_ipc_footer(&all_batches)?;
+            // Write IPC footer directly (small data, no need for async).
+            // The footer must embed the real signal schema — Arrow's reader
+            // trusts the footer's schema when decoding batches, so an empty
+            // one silently strips every column.
+            let signal_schema = schema_meta.apply(crate::schema::signal_schema());
+            let footer_bytes = build_arrow_ipc_footer(&all_batches, &signal_schema)?;
             file.write_all(&footer_bytes).map_err(Error::Io)?;
 
             let footer_len = footer_bytes.len() as i32;

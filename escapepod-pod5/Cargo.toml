@@ -22,3 +22,10 @@ tempfile = "3"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "io_hot_paths"
+harness = false
