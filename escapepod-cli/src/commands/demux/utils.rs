@@ -30,12 +30,15 @@ pub fn parse_norm_method(s: &str) -> anyhow::Result<NormMethod> {
 
 /// Configure the rayon thread pool with the specified number of threads.
 ///
-/// Note: This should only be called once per process. Subsequent calls are ignored.
-pub fn configure_thread_pool(num_threads: usize) {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .ok();
+/// `None` leaves rayon's default (all available CPUs). Only the first call
+/// per process takes effect; subsequent calls are ignored.
+pub fn configure_thread_pool(num_threads: Option<usize>) {
+    if let Some(n) = num_threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .ok();
+    }
 }
 
 /// Parse a boundaries CSV file into a map of read_id -> ReadBoundaries.

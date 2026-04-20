@@ -50,13 +50,21 @@ pub struct DetectArgs {
     )]
     pub downscale: usize,
 
-    /// Number of threads for parallel processing
-    #[arg(short = 'j', long, default_value = "4", value_name = "N")]
-    pub threads: usize,
+    /// Number of threads for parallel processing (default: all CPUs)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Print per-phase timing breakdown after completion
+    #[arg(long)]
+    pub profile: bool,
 }
 
 /// Run the detect subcommand using LLR boundary detection.
 pub fn run(args: DetectArgs) -> anyhow::Result<()> {
+    use crate::commands::profile::PhaseTimer;
+    let mut timer = PhaseTimer::new();
+    timer.phase("Detect adapters");
+    let profile = args.profile;
     println!(
         "{} adapter boundaries using LLR algorithm",
         style::action("Detecting"),
@@ -159,16 +167,18 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
 
     writer.flush()?;
 
-    println!(
+    eprintln!(
         "{} boundaries written to {}",
         style::action("Detected"),
         style::path(args.output.display())
     );
-    println!(
+    eprintln!(
         "{} {} reads with detected adapters",
         style::label("Result:"),
         style::count(detected_count)
     );
+
+    timer.report(profile);
 
     Ok(())
 }

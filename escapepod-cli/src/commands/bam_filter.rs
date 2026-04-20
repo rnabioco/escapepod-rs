@@ -4,9 +4,10 @@
 //! Supports filtering by mapped status, region, and mapping quality.
 //! Uses the optimized filter_files() for maximum performance.
 
+use crate::commands::profile::PhaseTimer;
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
-use crate::util::{ensure_bai_index, resolve_pod5_inputs};
+use crate::util::{check_output_writable, ensure_bai_index, resolve_pod5_inputs};
 use bstr::ByteSlice;
 use escapepod_signal::operations::{FilterOptions, filter_files};
 use escapepod_signal::parse_uuid_flexible;
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Run the bam-filter command.
+#[allow(clippy::too_many_arguments)] // args mirror the CLI subcommand surface
 pub fn run(
     input: PathBuf,
     bam_path: PathBuf,
@@ -25,12 +27,19 @@ pub fn run(
     mapped_only: bool,
     region: Option<String>,
     min_quality: Option<u8>,
+    force: bool,
+    profile: bool,
 ) -> anyhow::Result<()> {
+    check_output_writable(&output, force)?;
+
+    let mut timer = PhaseTimer::new();
+    timer.phase("Resolve inputs");
+
     // Resolve input to list of POD5 files (supports directories)
     let files = resolve_pod5_inputs(&input)?;
     let is_directory = files.len() > 1;
 
-    println!(
+    eprintln!(
         "{} {} using BAM {}",
         style::action("Filtering"),
         if is_directory {
@@ -44,7 +53,7 @@ pub fn run(
         },
         style::path(bam_path.display())
     );
-    println!(
+    eprintln!(
         "{} {}",
         style::label("Output:"),
         style::path(output.display())
@@ -52,16 +61,17 @@ pub fn run(
 
     // Print filter criteria
     if mapped_only {
-        println!("  Filter: {}", style::value("mapped reads only"));
+        eprintln!("  Filter: {}", style::value("mapped reads only"));
     }
     if let Some(ref r) = region {
-        println!("  Filter: region {}", style::value(r));
+        eprintln!("  Filter: region {}", style::value(r));
     }
     if let Some(q) = min_quality {
-        println!("  Filter: MAPQ >= {}", style::value(q));
+        eprintln!("  Filter: MAPQ >= {}", style::value(q));
     }
 
     // Read IDs from BAM file
+    timer.phase("Scan BAM");
     let bam_spinner = create_spinner("Scanning")?;
     bam_spinner.set_message("BAM file...");
     let (ids, bam_records_scanned) =
@@ -98,6 +108,7 @@ pub fn run(
         read_batch_size: 10_000,
     };
 
+    timer.phase("Filter & write");
     let result = filter_files(&files, &output, &ids, options, Some(progress))?;
 
     filter_bar.finish_with_message(format!("{} matched", result.matched_reads));
@@ -114,7 +125,7 @@ pub fn run(
     }
 
     let percentage = result.match_percentage();
-    println!(
+    eprintln!(
         "{} {} reads from {} total ({})",
         style::action("Filtered"),
         style::count(result.matched_reads),
@@ -124,12 +135,14 @@ pub fn run(
 
     let not_found = (ids.len() as u64).saturating_sub(result.matched_reads);
     if not_found > 0 {
-        println!(
+        eprintln!(
             "{} {} BAM read IDs were not found in POD5 file(s)",
             style::note_label("Note:"),
             style::warning(not_found)
         );
     }
+
+    timer.report(profile);
 
     // Report any errors encountered
     if result.read_errors > 0 || result.signal_errors > 0 {

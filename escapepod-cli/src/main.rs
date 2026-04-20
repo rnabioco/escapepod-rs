@@ -160,6 +160,10 @@ Examples:
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
 
+        /// Overwrite the output file if it already exists
+        #[arg(short, long)]
+        force: bool,
+
         /// Print profiling information (phase timing, throughput)
         #[arg(long)]
         profile: bool,
@@ -204,22 +208,35 @@ At least one filter criterion must be specified.
         #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
 
+        /// Overwrite the output file if it already exists
+        #[arg(short, long)]
+        force: bool,
+
         /// Print per-phase timing breakdown after completion
         #[arg(long)]
         profile: bool,
     },
 
     /// Filter reads based on paired BAM file
+    #[command(after_help = "\
+Examples:
+  escpod bam-filter reads.pod5 -b aligned.bam -o mapped.pod5 --mapped
+  escpod bam-filter reads.pod5 -b aligned.bam -o chr1.pod5 --region chr1
+  escpod bam-filter reads.pod5 -b aligned.bam -o hq.pod5 --quality 20
+
+Region queries (`--region`) require a BAI index next to the BAM file; one is \
+created automatically if not present (written as <bam>.bai).
+")]
     BamFilter {
         /// Input POD5 file or directory
         input: PathBuf,
 
-        /// Input BAM file (requires .bai index for region queries)
-        #[arg(short, long, required = true)]
+        /// Input BAM file (auto-indexes BAM.bai if --region is used)
+        #[arg(short, long, required = true, value_name = "FILE")]
         bam: PathBuf,
 
         /// Output POD5 file
-        #[arg(short, long, required = true)]
+        #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
 
         /// Keep only mapped reads
@@ -227,16 +244,23 @@ At least one filter criterion must be specified.
         mapped: bool,
 
         /// Filter by region (chr or chr:start-end)
-        #[arg(long)]
+        #[arg(long, value_name = "REGION")]
         region: Option<String>,
 
         /// Minimum mapping quality
-        #[arg(short = 'q', long)]
+        #[arg(long, value_name = "N")]
         quality: Option<u8>,
+
+        /// Overwrite the output file if it already exists
+        #[arg(short, long)]
+        force: bool,
+
+        /// Print per-phase timing breakdown after completion
+        #[arg(long)]
+        profile: bool,
     },
 
     /// Repack POD5 files to optimize storage
-    #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
   escpod repack input.pod5 -o output_dir/
@@ -298,7 +322,7 @@ Examples:
 ")]
     Summary(commands::summary::SummaryArgs),
 
-    /// Barcode demultiplexing workflow (experimental; build with `--features demux`)
+    /// Barcode demultiplexing workflow (experimental; requires `--features demux`)
     #[cfg(feature = "demux")]
     #[command(after_help = "\
 Examples:
@@ -308,8 +332,19 @@ Examples:
 ")]
     Demux(commands::demux::DemuxArgs),
 
+    /// Barcode demultiplexing workflow (rebuild with `--features demux` to enable)
+    #[cfg(not(feature = "demux"))]
+    Demux {
+        /// Demux subcommand and arguments (ignored; feature not enabled)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+
     /// Refine signal-to-base mapping using banded DP
-    #[cfg(feature = "experimental")]
     Resquiggle(commands::resquiggle::ResquiggleArgs),
 
     /// Build .p5i read index for fast UUID lookup
@@ -338,29 +373,57 @@ Examples:
 #[derive(Subcommand)]
 enum InspectCommands {
     /// Show file summary (batches, reads, run info)
+    #[command(after_help = "\
+Examples:
+  escpod inspect summary input.pod5           Summary for one file
+  escpod inspect summary data_dir/            Aggregate summary across a directory
+")]
     Summary {
-        /// Input POD5 file
-        #[arg(value_name = "FILE")]
+        /// Input POD5 file or directory
+        #[arg(value_name = "INPUT")]
         input: PathBuf,
     },
 
     /// List all read IDs in the file
+    #[command(after_help = "\
+Examples:
+  escpod inspect reads input.pod5 | head      First rows as plain text
+  escpod inspect reads data_dir/ > all.tsv    Aggregate across a directory
+")]
     Reads {
-        /// Input POD5 file
-        #[arg(value_name = "FILE")]
+        /// Input POD5 file or directory
+        #[arg(value_name = "INPUT")]
         input: PathBuf,
     },
 
     /// Show detailed info for a specific read
+    #[command(after_help = "\
+Examples:
+  escpod inspect read input.pod5 a1b2c3d4-e5f6-7890-abcd-ef1234567890
+  escpod inspect read data_dir/ <READ_ID>     Search across a directory
+
+READ_ID accepts canonical UUID (8-4-4-4-12) or 32 hex chars without dashes.
+")]
     Read {
-        /// Input POD5 file
-        #[arg(value_name = "FILE")]
+        /// Input POD5 file or directory
+        #[arg(value_name = "INPUT")]
         input: PathBuf,
 
-        /// Read ID to inspect (UUID format)
+        /// Read ID (UUID with or without dashes; case-insensitive)
         #[arg(value_name = "READ_ID")]
         read_id: String,
     },
+}
+
+/// Emit a clear error when a subcommand was invoked in a build that
+/// didn't enable its feature flag.
+#[allow(dead_code)]
+fn feature_disabled(command: &str, feature: &str) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "The `{command}` command is not available in this build.\n\
+         Rebuild escpod with `--features {feature}` to enable it \
+         (e.g., `cargo install --features {feature} escapepod-cli`)."
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -404,8 +467,9 @@ fn main() -> anyhow::Result<()> {
             output,
             duplicate_ok,
             threads,
+            force,
             profile,
-        } => commands::merge::run(inputs, output, duplicate_ok, threads, profile),
+        } => commands::merge::run(inputs, output, duplicate_ok, threads, force, profile),
 
         Commands::Filter {
             input,
@@ -415,6 +479,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            force,
             profile,
         } => commands::filter::run(
             input,
@@ -424,6 +489,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            force,
             profile,
         ),
 
@@ -434,9 +500,10 @@ fn main() -> anyhow::Result<()> {
             mapped,
             region,
             quality,
-        } => commands::bam_filter::run(input, bam, output, mapped, region, quality),
+            force,
+            profile,
+        } => commands::bam_filter::run(input, bam, output, mapped, region, quality, force, profile),
 
-        #[cfg(feature = "experimental")]
         Commands::Repack {
             inputs,
             output_dir,
@@ -457,7 +524,9 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "demux")]
         Commands::Demux(args) => commands::demux::run(args),
 
-        #[cfg(feature = "experimental")]
+        #[cfg(not(feature = "demux"))]
+        Commands::Demux { .. } => feature_disabled("demux", "demux"),
+
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
 
         Commands::Index {

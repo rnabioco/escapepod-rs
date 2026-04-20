@@ -80,13 +80,21 @@ pub struct FingerprintArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub warpdemux_compat: bool,
 
-    /// Number of threads for parallel processing
-    #[arg(short = 'j', long, default_value = "4", value_name = "N")]
-    pub threads: usize,
+    /// Number of threads for parallel processing (default: all CPUs)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Print per-phase timing breakdown after completion
+    #[arg(long)]
+    pub profile: bool,
 }
 
 /// Run the fingerprint subcommand.
 pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
+    use crate::commands::profile::PhaseTimer;
+    let mut timer = PhaseTimer::new();
+    timer.phase("Fingerprint");
+    let profile = args.profile;
     // Resolve effective parameters (WarpDemuX-compat overrides defaults)
     let (num_segments, window_width, norm_method, min_separation, keep_last, use_full_adapter) =
         if args.warpdemux_compat {
@@ -217,12 +225,14 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     // Write fingerprints
     write_fingerprints_csv(&args.output, &fingerprints)?;
 
-    println!(
+    eprintln!(
         "{} {} fingerprints written to {}",
         style::action("Extracted"),
         style::count(fingerprints.len()),
         style::path(args.output.display())
     );
+
+    timer.report(profile);
 
     Ok(())
 }

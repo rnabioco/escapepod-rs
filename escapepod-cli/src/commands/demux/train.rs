@@ -95,13 +95,21 @@ pub struct TrainArgs {
     )]
     pub border_trim: usize,
 
-    /// Number of threads for parallel processing
-    #[arg(short = 'j', long, default_value = "4", value_name = "N")]
-    pub threads: usize,
+    /// Number of threads for parallel processing (default: all CPUs)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Print per-phase timing breakdown after completion
+    #[arg(long)]
+    pub profile: bool,
 }
 
 /// Run the train subcommand.
 pub fn run(args: TrainArgs) -> anyhow::Result<()> {
+    use crate::commands::profile::PhaseTimer;
+    let mut timer = PhaseTimer::new();
+    timer.phase("Train");
+    let profile = args.profile;
     println!(
         "{} reference barcode fingerprints",
         style::action("Training")
@@ -174,6 +182,8 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
         style::label("Total:"),
         style::count(training_output.barcodes.len())
     );
+
+    timer.report(profile);
 
     Ok(())
 }
