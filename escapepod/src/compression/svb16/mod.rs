@@ -8,6 +8,15 @@
 //! Format:
 //! - Keys section: 1 bit per sample (0 = 1-byte value, 1 = 2-byte value)
 //! - Data section: variable-length encoded values
+//!
+//! Decoding runtime-dispatches to an SSSE3 implementation on x86_64 CPUs
+//! that advertise the feature; otherwise the scalar implementation below
+//! is used.
+
+mod tables;
+
+#[cfg(target_arch = "x86_64")]
+mod simd_ssse3;
 
 use crate::error::{Error, Result};
 
@@ -87,10 +96,47 @@ pub fn encode(samples: &[i16]) -> Result<Vec<u8>> {
 
 /// Decode SVB16-encoded data back to samples.
 ///
+/// Runtime-dispatches to an SSSE3 implementation on capable x86_64 CPUs;
+/// otherwise uses the scalar fallback. The two paths are verified equivalent
+/// by the tests in `simd_ssse3`.
+///
 /// # Arguments
 /// * `data` - The encoded data (keys + variable-length values)
 /// * `sample_count` - The expected number of samples
 pub fn decode(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
+    if sample_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let keys_len = key_length(sample_count);
+    if data.len() < keys_len {
+        return Err(Error::Decompression(format!(
+            "SVB16 data too short: expected at least {} bytes for keys, got {}",
+            keys_len,
+            data.len()
+        )));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            let (keys, values) = data.split_at(keys_len);
+            let mut out: Vec<i16> = Vec::with_capacity(sample_count);
+            // SAFETY: is_x86_feature_detected verified at runtime.
+            unsafe {
+                simd_ssse3::decode(keys, values, sample_count, &mut out)
+                    .map_err(|e| Error::Decompression(e.to_string()))?;
+            }
+            return Ok(out);
+        }
+    }
+
+    decode_scalar(data, sample_count)
+}
+
+/// Scalar SVB16 decode. Always available; serves as the fallback and the
+/// reference implementation the SIMD path is tested against.
+pub fn decode_scalar(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     if sample_count == 0 {
         return Ok(Vec::new());
     }

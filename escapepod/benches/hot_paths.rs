@@ -58,15 +58,9 @@ fn bench_dtw(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |bench, _| {
             bench.iter(|| dtw_distance(black_box(&a), black_box(&b), black_box(None)));
         });
-        group.bench_with_input(
-            BenchmarkId::new("windowed", len),
-            &len,
-            |bench, _| {
-                bench.iter(|| {
-                    dtw_distance(black_box(&a), black_box(&b), black_box(Some(len / 10)))
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("windowed", len), &len, |bench, _| {
+            bench.iter(|| dtw_distance(black_box(&a), black_box(&b), black_box(Some(len / 10))));
+        });
     }
     group.finish();
 }
@@ -101,7 +95,10 @@ fn bench_dp_step(c: &mut Criterion) {
 fn bench_fingerprint_mad(c: &mut Criterion) {
     let mut group = c.benchmark_group("fingerprint_mad_normalize");
     for &len in &[64usize, 200, 1000] {
-        let values = pseudo_floats(len, 0xF1).into_iter().map(|v| v + 1.0).collect::<Vec<_>>();
+        let values = pseudo_floats(len, 0xF1)
+            .into_iter()
+            .map(|v| v + 1.0)
+            .collect::<Vec<_>>();
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |bench, _| {
             bench.iter_batched(
