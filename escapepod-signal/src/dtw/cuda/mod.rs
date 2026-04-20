@@ -94,12 +94,19 @@ impl GpuDtwContext {
             });
         }
 
-        // v2 indexes the three diagonal buffers by query index i ∈ [0, n],
-        // so shared memory sizing scales with the longest query.
+        // Shared memory sizing needs both dimensions: `a_s` + three rolling
+        // diagonal buffers are indexed by the query position `i`, while
+        // `b_s` caches the reference in shared memory.
         let max_n: usize = queries.iter().map(|q| q.len()).max().unwrap_or(0);
+        let max_m: usize = references.iter().map(|r| r.len()).max().unwrap_or(0);
         if max_n > i32::MAX as usize {
             return Err(GpuDtwError::InputTooLarge {
                 what: "query length exceeds i32::MAX",
+            });
+        }
+        if max_m > i32::MAX as usize {
+            return Err(GpuDtwError::InputTooLarge {
+                what: "reference length exceeds i32::MAX",
             });
         }
 
@@ -124,18 +131,27 @@ impl GpuDtwContext {
             Some(w) => w as i32,
         };
 
-        // Three rolling diagonal buffers of length (max_n + 1) floats.
-        let shared_mem_bytes: u32 = (3u32)
-            .checked_mul((max_n as u32).saturating_add(1))
-            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>() as u32))
+        // Shared memory: a_s[max_n] + b_s[max_m] + 3 * d_k[max_n + 1] floats.
+        let floats: u32 = (max_n as u32)
+            .checked_add(max_m as u32)
+            .and_then(|v| v.checked_add(3u32.checked_mul((max_n as u32).saturating_add(1))?))
+            .ok_or(GpuDtwError::InputTooLarge {
+                what: "shared memory size overflowed u32",
+            })?;
+        let shared_mem_bytes: u32 = floats
+            .checked_mul(std::mem::size_of::<f32>() as u32)
             .ok_or(GpuDtwError::InputTooLarge {
                 what: "shared memory size overflowed u32",
             })?;
 
-        // 64 threads = 2 warps — enough ILP without over-budgeting registers.
-        // The kernel's inner loop strides by blockDim.x, so bands wider than
-        // 64 are handled correctly.
-        const THREADS: u32 = 64;
+        // One warp per block — anti-diagonal DP cooperates within a single
+        // warp, so block-internal sync is `__syncwarp()` rather than the
+        // heavier `__syncthreads()`. Single-warp blocks also lift the
+        // resident-blocks-per-SM ceiling, which is what saturates
+        // grid-level parallelism when fingerprints are short (≤ a few
+        // hundred samples). The inner stride loop handles bands wider
+        // than the warp.
+        const THREADS: u32 = 32;
 
         let cfg = LaunchConfig {
             grid_dim: (n_q as u32, n_r as u32, 1),
@@ -159,6 +175,7 @@ impl GpuDtwContext {
                     n_q as i32,
                     n_r as i32,
                     max_n as i32,
+                    max_m as i32,
                     window_i32,
                 ),
             )?;

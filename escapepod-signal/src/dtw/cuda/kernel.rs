@@ -4,20 +4,23 @@
 //! string constant so the build has no compile-time dependency on `nvcc` or
 //! the CUDA toolkit.
 //!
-//! ## Kernel layout (v2, anti-diagonal)
+//! ## Kernel layout
 //!
 //! * Grid = `(n_queries, n_refs, 1)`. One block per (query, ref) pair.
-//! * Block = `(THREADS, 1, 1)`. Threads cooperate along each anti-diagonal
-//!   of the DP table; cells on the same diagonal `d = i + j` are independent
-//!   given diagonals `d-1` and `d-2`, so the inner loop over the diagonal's
-//!   cells is fully parallel (no cross-thread dependency within a row).
-//! * Dynamic shared memory: three rolling diagonal buffers, each indexed by
-//!   the query index `i ∈ [0, n]`. Size = `3 * (max_n + 1) * sizeof(float)`.
-//!   On diagonal `d`, cell `(i, j=d-i)` reads `d2[i-1]` (the `(i-1,j-1)`
-//!   predecessor), `d1[i-1]` (`(i-1,j)`), and `d1[i]` (`(i,j-1)`).
-//!
-//! The older v1 implementation used a single thread per block and leaned on
-//! grid-level parallelism; this one actually uses each warp.
+//! * Block = 32 threads (one warp). Anti-diagonal cooperation: cells on a
+//!   common `d = i + j` are independent given `d - 1` and `d - 2`, so the
+//!   inner loop is fully parallel within the warp. Single-warp blocks let
+//!   every block-internal sync be a cheap `__syncwarp()` instead of a full
+//!   `__syncthreads()`.
+//! * Shared memory layout (all `f32`):
+//!   `a_s[max_n]  b_s[max_m]  d2[max_n+1]  d1[max_n+1]  d0[max_n+1]` — the
+//!   query and reference fingerprints are pulled in once per block so the
+//!   DP loop reads from shared memory instead of hitting global memory
+//!   every diagonal.
+//! * `__launch_bounds__(32, 64)` tells the compiler to keep register usage
+//!   low enough to run 64 resident warps per SM (the hardware max on
+//!   Ampere), which is what saturates grid-level parallelism for short
+//!   fingerprints.
 
 pub const KERNEL_SRC: &str = r#"
 // NVRTC compiles without libc headers, so INFINITY isn't available.
@@ -25,6 +28,7 @@ pub const KERNEL_SRC: &str = r#"
 __device__ __forceinline__ float dtw_inf_f() { return __int_as_float(0x7f800000); }
 
 extern "C" __global__
+__launch_bounds__(32, 64)
 void dtw_matrix_kernel(
     const float* __restrict__ queries,
     const int*   __restrict__ q_offsets,
@@ -34,6 +38,7 @@ void dtw_matrix_kernel(
     int n_q,
     int n_r,
     int max_n,
+    int max_m,
     int window)
 {
     int qi = blockIdx.x;
@@ -49,47 +54,44 @@ void dtw_matrix_kernel(
     int m = r_end - r_start;
 
     float* out_cell = out + ((long)qi) * n_r + rj;
+    int tid = threadIdx.x;
+    int nth = blockDim.x;
 
     if (n == 0 || m == 0) {
-        if (threadIdx.x == 0) *out_cell = dtw_inf_f();
+        if (tid == 0) *out_cell = dtw_inf_f();
         return;
     }
 
-    const float* a = queries + q_start;
-    const float* b = refs    + r_start;
+    const float* a_glob = queries + q_start;
+    const float* b_glob = refs    + r_start;
 
-    // Three rolling diagonal buffers, each indexed by `i ∈ [0, max_n]`.
+    // Shared memory layout: a_s | b_s | d2 | d1 | d0.
     extern __shared__ float smem[];
-    float* d2 = smem;                              // diagonal d-2
-    float* d1 = smem + (max_n + 1);                // diagonal d-1
-    float* d0 = smem + 2 * (max_n + 1);            // diagonal d (current)
+    float* a_s = smem;
+    float* b_s = smem + max_n;
+    float* d2  = smem + max_n + max_m;
+    float* d1  = d2 + (max_n + 1);
+    float* d0  = d1 + (max_n + 1);
 
-    int tid = threadIdx.x;
-    int nth = blockDim.x;
-    float INF = dtw_inf_f();
-
-    // Initialize d2 as diagonal 0: only D[0][0] = 0, the rest INF.
-    for (int i = tid; i <= n; i += nth) d2[i] = INF;
-    __syncthreads();
+    // Co-load query and reference, and initialize d2 (diagonal 0) and d1
+    // (diagonal 1). Threads stride over each buffer; the warp-wide
+    // coalesced loads from global memory are why a_glob/b_glob are kept
+    // __restrict__.
+    for (int i = tid; i < n; i += nth)    a_s[i] = a_glob[i];
+    for (int j = tid; j < m; j += nth)    b_s[j] = b_glob[j];
+    for (int i = tid; i <= n; i += nth) { d2[i] = dtw_inf_f(); d1[i] = dtw_inf_f(); }
     if (tid == 0) d2[0] = 0.0f;
-
-    // Initialize d1 as diagonal 1: D[0][1] and D[1][0] are both INF (base case).
-    for (int i = tid; i <= n; i += nth) d1[i] = INF;
-    __syncthreads();
+    __syncwarp();
 
     int w = (window < 0) ? (n + m) : window;
 
-    // Walk diagonals d = 2..=n+m. Cells on diagonal d are (i, d-i) with
-    // 1 <= i <= n, 1 <= d-i <= m, and |i - (d-i)| = |2i - d| <= w. Each
-    // thread strides over candidate i values and runtime-checks the bounds
-    // — the band-bound arithmetic lives fine in Rust where it is easy to
-    // match the CPU implementation, but here we want the simplest correct
-    // mapping and let the compiler predicate the branch.
+    // Anti-diagonal DP. Each thread runtime-checks the band on its strided
+    // `i` — the band-bound arithmetic is fiddly enough that a straight
+    // runtime predicate is cheaper than precomputing bounds per diagonal.
     for (int d = 2; d <= n + m; ++d) {
-        // Clear the current-diagonal buffer so cells outside the band read
-        // as INF when they become predecessors on the next diagonal.
-        for (int i = tid; i <= n; i += nth) d0[i] = INF;
-        __syncthreads();
+        // Clear the new current-diagonal buffer so unreached cells stay INF.
+        for (int i = tid; i <= n; i += nth) d0[i] = dtw_inf_f();
+        __syncwarp();
 
         for (int i = 1 + tid; i <= n; i += nth) {
             int j = d - i;
@@ -98,23 +100,24 @@ void dtw_matrix_kernel(
             if (delta < 0) delta = -delta;
             if (delta > w) continue;
 
-            float diff = a[i - 1] - b[j - 1];
+            float diff = a_s[i - 1] - b_s[j - 1];
             float cost = diff * diff;
             float m1 = fminf(d1[i - 1], d1[i]);
             float mp = fminf(m1, d2[i - 1]);
             d0[i] = cost + mp;
         }
-        __syncthreads();
+        __syncwarp();
 
         // Rotate: d2 <- d1, d1 <- d0, d0 <- (old d2, will be overwritten).
+        // Pointers are per-thread; each thread rotates identically, so no
+        // sync is needed after this — the next iteration's clear will
+        // __syncwarp before any reads of the new `d1` (= old `d0`).
         float* tmp = d2;
         d2 = d1;
         d1 = d0;
         d0 = tmp;
-        __syncthreads();
     }
 
-    // After the last rotation, d1 holds diagonal n+m; D[n][m] lives at i=n.
     if (tid == 0) *out_cell = sqrtf(d1[n]);
 }
 "#;
