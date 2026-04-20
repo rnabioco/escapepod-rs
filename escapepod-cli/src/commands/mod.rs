@@ -8,9 +8,7 @@ pub mod index;
 pub mod inspect;
 pub mod merge;
 pub mod profile;
-#[cfg(feature = "experimental")]
 pub mod repack;
-#[cfg(feature = "experimental")]
 pub mod resquiggle;
 pub mod subset;
 pub mod summary;

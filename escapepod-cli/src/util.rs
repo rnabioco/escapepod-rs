@@ -2,9 +2,7 @@
 
 use escapepod_signal::Reader;
 use noodles_bam as bam;
-#[cfg(feature = "experimental")]
 use noodles_csi::BinningIndex;
-#[cfg(feature = "experimental")]
 use noodles_csi::binning_index::ReferenceSequence as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -37,7 +35,46 @@ pub fn resolve_pod5_inputs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
         return Ok(files);
     }
 
+    // Unquoted shell glob that didn't expand leaks through as a literal path
+    // (e.g. `*.pod5` when nullglob is off). Detect and explain.
+    if path_looks_like_glob(path) {
+        anyhow::bail!(
+            "No files matched the pattern: {}. \
+             If the pattern is quoted or your shell didn't expand it, \
+             check the directory contents or pass a directory instead.",
+            path.display()
+        );
+    }
+
     anyhow::bail!("Path does not exist: {}", path.display())
+}
+
+/// Heuristic: does this path look like an unexpanded shell glob?
+fn path_looks_like_glob(path: &Path) -> bool {
+    path.to_str()
+        .map(|s| s.contains('*') || s.contains('?') || s.contains('['))
+        .unwrap_or(false)
+}
+
+/// Validate that we can write to `output` before running a long operation.
+///
+/// Fails if the parent directory is missing, or if the file already exists
+/// and `force` is false. Call this before the expensive work so users don't
+/// have to wait for a merge/filter to finish just to hit a write error.
+pub fn check_output_writable(output: &Path, force: bool) -> anyhow::Result<()> {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        anyhow::bail!("Output directory does not exist: {}", parent.display());
+    }
+    if output.exists() && !force {
+        anyhow::bail!(
+            "Output file {} already exists. Use --force to overwrite.",
+            output.display()
+        );
+    }
+    Ok(())
 }
 
 /// Resolve multiple input paths to a flat list of POD5 files.
@@ -184,7 +221,6 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// Creates the BAI index if it does not already exist.
 /// Returns the total number of records (mapped + unmapped).
-#[cfg(feature = "experimental")]
 pub fn count_bam_records(bam_path: &Path) -> anyhow::Result<u64> {
     let bai_path = ensure_bai_index(bam_path)?;
     let index = bam::bai::fs::read(&bai_path)?;

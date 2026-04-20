@@ -55,10 +55,19 @@ pub struct TrainSvmArgs {
     /// Per-class confidence thresholds (comma-separated)
     #[arg(long, value_name = "VALUES", help_heading = "Advanced Options")]
     pub thresholds: Option<String>,
+
+    /// Print per-phase timing breakdown after completion
+    #[arg(long)]
+    pub profile: bool,
 }
 
 /// Run the train-svm subcommand.
 pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
+    use crate::commands::profile::PhaseTimer;
+    let mut timer = PhaseTimer::new();
+    timer.phase("Train SVM");
+    let profile = args.profile;
+
     println!("{} SVM model from fingerprints", style::action("Training"));
 
     // Load fingerprints from CSV
@@ -113,6 +122,8 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
         style::count(model.n_classes),
         style::count(model.support_indices.len())
     );
+
+    timer.report(profile);
 
     Ok(())
 }

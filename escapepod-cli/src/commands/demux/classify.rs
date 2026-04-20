@@ -49,6 +49,10 @@ pub struct ClassifyArgs {
     /// Output per-class probabilities (SVM model only)
     #[arg(long, help_heading = "Advanced Options")]
     pub probabilities: bool,
+
+    /// Print per-phase timing breakdown after completion
+    #[arg(long)]
+    pub profile: bool,
 }
 
 /// Classification result for output.
@@ -72,6 +76,11 @@ struct SvmClassifyResult {
 
 /// Run the classify subcommand.
 pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
+    use crate::commands::profile::PhaseTimer;
+    let mut timer = PhaseTimer::new();
+    timer.phase("Classify");
+    let profile = args.profile;
+
     // Count how many input sources are provided
     let source_count = [
         args.reference.is_some(),
@@ -91,7 +100,7 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     }
 
     // Dispatch to appropriate classification method
-    if let Some(svm_model_path) = args.svm_model.take() {
+    let result = if let Some(svm_model_path) = args.svm_model.take() {
         run_with_svm_model(args, svm_model_path)
     } else if let Some(model_path) = args.model.take() {
         run_with_model(args, model_path)
@@ -99,7 +108,10 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         run_with_csv(args, reference_path)
     } else {
         unreachable!()
-    }
+    };
+
+    timer.report(profile);
+    result
 }
 
 /// Run classification using a trained SVM model.

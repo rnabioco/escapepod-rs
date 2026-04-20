@@ -40,7 +40,7 @@ pub fn run(
     let num_groups = groups.len();
     let total_reads = mapping.len();
 
-    println!(
+    eprintln!(
         "{} {} reads into {} output file(s)",
         style::action("Subsetting"),
         style::count(total_reads),
@@ -86,7 +86,7 @@ pub fn run(
     for result in results {
         let (name, matched) = result?;
         let output_path = output_dir.join(&name);
-        println!(
+        eprintln!(
             "  {} ({} reads)",
             style::path(output_path.display()),
             style::count(matched)
@@ -97,9 +97,9 @@ pub fn run(
     let unmatched = (total_reads as u64).saturating_sub(total_matched);
 
     // Print summary
-    println!("\n{}", style::header("Subset summary:"));
-    println!("  Matched reads: {}", style::count(total_matched));
-    println!(
+    eprintln!("\n{}", style::header("Subset summary:"));
+    eprintln!("  Matched reads: {}", style::count(total_matched));
+    eprintln!(
         "  Unmatched reads: {}",
         if unmatched > 0 {
             style::warning(unmatched)

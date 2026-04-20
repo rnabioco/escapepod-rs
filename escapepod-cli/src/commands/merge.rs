@@ -4,7 +4,7 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::collect_pod5_inputs;
+use crate::util::{check_output_writable, collect_pod5_inputs};
 use escapepod_signal::{MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -15,6 +15,7 @@ pub fn run(
     output: PathBuf,
     duplicate_ok: bool,
     threads: Option<usize>,
+    force: bool,
     profile: bool,
 ) -> anyhow::Result<()> {
     // Configure rayon thread pool if threads specified
@@ -24,6 +25,8 @@ pub fn run(
             .build_global()
             .ok(); // Ignore error if pool already initialized
     }
+
+    check_output_writable(&output, force)?;
 
     let all_files = collect_pod5_inputs(&inputs)?;
 
@@ -100,7 +103,7 @@ pub fn run(
 
     progress_bar.finish_and_clear();
 
-    println!(
+    eprintln!(
         "{} {} reads into {}",
         style::action("Merged"),
         style::count(result.reads_written),
@@ -108,7 +111,7 @@ pub fn run(
     );
 
     if result.duplicates_skipped > 0 {
-        println!(
+        eprintln!(
             "{} {} duplicate reads",
             style::note_label("Skipped"),
             style::warning(result.duplicates_skipped)

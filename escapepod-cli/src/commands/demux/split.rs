@@ -32,9 +32,13 @@ pub struct SplitArgs {
     #[arg(long, default_value = "true", value_name = "BOOL")]
     pub unclassified: bool,
 
-    /// Number of threads for parallel processing
-    #[arg(short = 'j', long, default_value = "4", value_name = "N")]
-    pub threads: usize,
+    /// Number of threads for parallel processing (default: all CPUs)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Print per-phase timing breakdown after completion
+    #[arg(long)]
+    pub profile: bool,
 }
 
 /// Statistics for a single barcode output.
@@ -46,6 +50,10 @@ struct BarcodeOutput {
 
 /// Run the split subcommand.
 pub fn run(args: SplitArgs) -> anyhow::Result<()> {
+    use crate::commands::profile::PhaseTimer;
+    let mut timer = PhaseTimer::new();
+    timer.phase("Split");
+    let profile = args.profile;
     println!(
         "{} reads into separate POD5 files by barcode",
         style::action("Splitting"),
@@ -116,6 +124,8 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
 
     // Print summary table
     print_summary(&barcode_stats);
+
+    timer.report(profile);
 
     Ok(())
 }

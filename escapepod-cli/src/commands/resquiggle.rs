@@ -85,8 +85,8 @@ pub struct ResquiggleArgs {
     #[arg(long)]
     pub rna: bool,
 
-    /// Number of threads for parallel processing
-    #[arg(short = 'j', long)]
+    /// Number of threads for parallel processing (default: all CPUs)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 }
 
@@ -362,7 +362,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         chunk.push((read_id, record_buf));
 
         progress_bar.set_position(total_bam as u64);
-        if log_interval > 0 && total_bam % log_interval == 0 {
+        if log_interval > 0 && total_bam.is_multiple_of(log_interval) {
             eprintln!(
                 "[resquiggle] processed {} / {} records ({} matched)",
                 total_bam, bam_total, matched
@@ -627,19 +627,19 @@ fn refine_single_read(
     };
 
     // Verify map is valid for the trimmed signal
-    if let Some(&last) = seq_to_signal.last() {
-        if last > signal_f32.len() {
-            bail!(
-                "map end {} > trimmed signal len {} (seq_len={}, moves={}, stride={}, trim_start={}, trim_end={})",
-                last,
-                signal_f32.len(),
-                sequence.len(),
-                moves.len(),
-                stride,
-                signal_start,
-                signal_end,
-            );
-        }
+    if let Some(&last) = seq_to_signal.last()
+        && last > signal_f32.len()
+    {
+        bail!(
+            "map end {} > trimmed signal len {} (seq_len={}, moves={}, stride={}, trim_start={}, trim_end={})",
+            last,
+            signal_f32.len(),
+            sequence.len(),
+            moves.len(),
+            stride,
+            signal_start,
+            signal_end,
+        );
     }
 
     // Run refinement on trimmed signal
