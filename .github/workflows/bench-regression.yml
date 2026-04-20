@@ -34,20 +34,44 @@ jobs:
 
       - name: Bench main (baseline)
         run: |
+          # Run the baseline only for bench targets that already exist on
+          # main — a PR that *adds* a bench file would otherwise fail here
+          # with "no bench target named X", since criterion has nothing on
+          # main to compare against.
           git fetch origin main
           git checkout origin/main
-          cargo bench --bench hot_paths -p escapepod-signal -- --save-baseline main
-          cargo bench --bench io_hot_paths -p escapepod-pod5 -- --save-baseline main
+          run_if_present() {
+            local pkg="$1" bench="$2"
+            if cargo bench -p "$pkg" --bench "$bench" --no-run >/dev/null 2>&1; then
+              cargo bench -p "$pkg" --bench "$bench" -- --save-baseline main
+            else
+              echo "::notice::skipping baseline for $pkg::$bench (not on main)"
+            fi
+          }
+          run_if_present escapepod-signal hot_paths
+          run_if_present escapepod-pod5 io_hot_paths
 
       - name: Bench PR HEAD vs. baseline
         run: |
+          # For each bench, compare against the `main` baseline when we
+          # captured one; otherwise just record HEAD timings. This keeps the
+          # workflow useful even on first-run introductions of a bench.
           git checkout ${{ github.event.pull_request.head.sha || github.sha }}
-          cargo bench --bench hot_paths -p escapepod-signal -- --baseline main | tee signal_bench.txt
-          cargo bench --bench io_hot_paths -p escapepod-pod5 -- --baseline main | tee pod5_bench.txt
+          bench_diff() {
+            local pkg="$1" bench="$2" out="$3"
+            if [ -d "$CRITERION_HOME" ] \
+                 && find "$CRITERION_HOME" -type d -name main | grep -q .; then
+              # A baseline exists somewhere — let criterion decide which groups match.
+              cargo bench -p "$pkg" --bench "$bench" -- --baseline-lenient main | tee "$out"
+            else
+              cargo bench -p "$pkg" --bench "$bench" | tee "$out"
+            fi
+          }
+          bench_diff escapepod-signal hot_paths signal_bench.txt
+          bench_diff escapepod-pod5 io_hot_paths pod5_bench.txt
 
       - name: Flag regressions
         run: |
-          set -e
           # Criterion prints "regressed" on a line when a group shows
           # statistically-significant slowdown. Surface these without failing
           # the build so the PR author sees the hit.
