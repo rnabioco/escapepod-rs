@@ -40,3 +40,8 @@ train = ["linfa", "linfa-svm"]
 parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
 noodles-bam = "0.87"
 noodles-sam = "0.83"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "hot_paths"
+harness = false
