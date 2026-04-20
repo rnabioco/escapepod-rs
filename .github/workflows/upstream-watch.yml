@@ -1,0 +1,154 @@
+name: Upstream watch (pod5-file-format)
+
+# Nightly check for a new release of nanoporetech/pod5-file-format.
+# If the latest upstream release tag doesn't already have a tracking
+# issue (open or closed) in this repo, open one with links to the
+# release, a diff against the previous upstream release, and a short
+# review checklist. Dedupes purely on exact issue-title match — no
+# state file needed, and the GitHub-hosted `ext/pod5-file-format/`
+# checkout is not required.
+
+on:
+  schedule:
+    # 03:17 UTC every day — odd minute to avoid the thundering-herd cron
+    # slot that everyone else picks.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch latest two upstream releases
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Pull the two most-recent non-prerelease, non-draft releases so
+          # we can link to a diff between them.
+          releases=$(gh api 'repos/nanoporetech/pod5-file-format/releases?per_page=10' \
+            --jq '[.[] | select(.draft == false and .prerelease == false)] | .[:2]')
+
+          tag=$(echo "$releases" | jq -r '.[0].tag_name')
+          url=$(echo "$releases" | jq -r '.[0].html_url')
+          published=$(echo "$releases" | jq -r '.[0].published_at')
+          prev=$(echo "$releases" | jq -r '.[1].tag_name // ""')
+
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::error::Could not determine latest upstream release tag"
+            exit 1
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "url=$url"
+            echo "published=$published"
+            echo "prev=$prev"
+          } >> "$GITHUB_OUTPUT"
+
+          # Release notes body — multiline; use a random delimiter.
+          delim=$(openssl rand -hex 8)
+          {
+            echo "body<<$delim"
+            echo "$releases" | jq -r '.[0].body // ""'
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Upstream latest: $tag (prev: ${prev:-none})"
+
+      - name: Check for an existing tracking issue
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          target_title="pod5-file-format $TAG released — check for upstream changes"
+          # Search open and closed issues for an exact title match — cheap
+          # dedupe without needing a state file.
+          number=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state all \
+            --search "\"$target_title\" in:title" \
+            --json number,title \
+            --jq "[.[] | select(.title == \"$target_title\")] | first | .number // empty")
+          if [ -n "$number" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tracking issue already exists: #$number"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure `upstream-check` label exists
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --force so we don't fail when the label already exists.
+          gh label create upstream-check \
+            --repo "${{ github.repository }}" \
+            --color "0e8a16" \
+            --description "Automated tracking issue for an upstream dependency bump" \
+            --force
+
+      - name: Open tracking issue
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          URL: ${{ steps.upstream.outputs.url }}
+          PUBLISHED: ${{ steps.upstream.outputs.published }}
+          PREV: ${{ steps.upstream.outputs.prev }}
+          BODY: ${{ steps.upstream.outputs.body }}
+        run: |
+          set -euo pipefail
+          changelog_url="https://github.com/nanoporetech/pod5-file-format/blob/${TAG}/CHANGELOG.md"
+          if [ -n "$PREV" ]; then
+            compare_url="https://github.com/nanoporetech/pod5-file-format/compare/${PREV}...${TAG}"
+            compare_line="- [ ] Skim the [diff since \`${PREV}\`]($compare_url) for:"
+          else
+            compare_line="- [ ] Skim the upstream source for:"
+          fi
+
+          # Use a body-specific delimiter so a release note containing the
+          # literal "EOF" on a line can't prematurely end the heredoc.
+          cat > /tmp/issue_body.md <<ESCPOD_ISSUE_END
+          Upstream [nanoporetech/pod5-file-format]($URL) tagged **\`$TAG\`** on $PUBLISHED.
+
+          ## Review checklist
+
+          - [ ] Read the [release notes]($URL)
+          $compare_line
+            - [ ] Changes to the POD5 on-disk format / FlatBuffer footer schema
+            - [ ] Changes to VBZ / SVB16 compression — see \`c++/pod5_format/svb16/\` upstream
+            - [ ] New / removed Arrow columns in the reads, signal, or run_info tables
+            - [ ] Test data fixtures added under \`test_data/\`
+          - [ ] Compare against the latest [CHANGELOG]($changelog_url) and decide whether \`escapepod\` needs:
+            - [ ] Reader / writer changes
+            - [ ] Schema updates in \`escapepod/src/schema/\`
+            - [ ] New decoded/encoded test vectors
+          - [ ] If no action is needed: close with a note saying so.
+
+          ## Release notes (excerpt)
+
+          <details>
+          <summary>From the upstream release</summary>
+
+          $BODY
+
+          </details>
+
+          _Opened automatically by \`.github/workflows/upstream-watch.yml\`._
+          ESCPOD_ISSUE_END
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "pod5-file-format $TAG released — check for upstream changes" \
+            --body-file /tmp/issue_body.md \
+            --label upstream-check
