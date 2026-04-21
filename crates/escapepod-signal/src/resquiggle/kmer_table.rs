@@ -259,7 +259,7 @@ fn kruskal_h(samples: &[&[usize]]) -> f64 {
         .filter(|g| !g.is_empty())
         .map(|group| {
             let rank_sum: f64 = group.iter().map(|&el| el as f64).sum();
-            rank_sum.powi(2) / (group.len() as f64)
+            (rank_sum * rank_sum) / (group.len() as f64)
         })
         .sum();
 

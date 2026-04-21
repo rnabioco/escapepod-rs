@@ -435,7 +435,10 @@ pub fn compute_std_dev_fingerprint(fingerprints: &[Vec<f32>], consensus: &[f32])
         let mean = consensus[i];
         let variance = filtered
             .iter()
-            .map(|fp| (fp[i] - mean).powi(2))
+            .map(|fp| {
+                let d = fp[i] - mean;
+                d * d
+            })
             .sum::<f32>()
             / filtered.len() as f32;
         std_dev.push(variance.sqrt());

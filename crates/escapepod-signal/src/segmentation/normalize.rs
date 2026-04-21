@@ -3,36 +3,44 @@
 //! Provides MAD (Median Absolute Deviation) normalization, dwell time normalization,
 //! and downscaling operations.
 
-/// Compute the median of a sorted slice of values.
+/// Median of an unsorted slice via `select_nth_unstable` (O(n) expected).
+///
+/// The slice is partially reordered in place. Uses `f32::total_cmp`.
 ///
 /// # Panics
 /// Panics if the slice is empty.
-#[inline]
-fn median_sorted(sorted: &[f32]) -> f32 {
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+fn median_via_select(data: &mut [f32]) -> f32 {
+    let n = data.len();
+    let mid = n / 2;
+    let (_, pivot, _) = data.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let hi = *pivot;
+    if n.is_multiple_of(2) {
+        let lo = data[..mid]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        (lo + hi) / 2.0
     } else {
-        sorted[mid]
+        hi
     }
 }
 
-/// Compute median and MAD together with only 2 sorts (the minimum required).
+/// Compute median and MAD in O(n) expected (two `select_nth_unstable` calls).
 ///
 /// Returns (median, MAD) tuple.
 ///
 /// # Panics
 /// Panics if the slice is empty.
 fn median_and_mad(data: &[f32]) -> (f32, f32) {
-    // Sort once to get median
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = median_sorted(&sorted);
+    // select_nth partitions in place; clone once and reuse buf for MAD.
+    let mut buf = data.to_vec();
+    let med = median_via_select(&mut buf);
 
-    // Compute absolute deviations and sort for MAD
-    let mut abs_devs: Vec<f32> = data.iter().map(|&x| (x - med).abs()).collect();
-    abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mad_val = median_sorted(&abs_devs);
+    // Reuse buf: overwrite with absolute deviations keyed off the original data.
+    for (v, slot) in data.iter().zip(buf.iter_mut()) {
+        *slot = (*v - med).abs();
+    }
+    let mad_val = median_via_select(&mut buf);
 
     (med, mad_val)
 }
@@ -190,13 +198,17 @@ pub fn normalize_dwell_times(dwell_times: &[f32]) -> Vec<f32> {
         return Vec::new();
     }
 
-    // Log transform (add small epsilon to avoid log(0))
+    // Log transform (clamp to avoid log(0)).
     let log_dwells: Vec<f32> = dwell_times.iter().map(|&d| (d.max(1.0)).ln()).collect();
 
-    // Compute mean and std of log-transformed values
+    // One-pass mean + sum-of-squares. variance = E[x²] - (E[x])²; acceptable
+    // numerical accuracy here — dwell log-values are small and close to zero.
     let n = log_dwells.len() as f32;
-    let mean = log_dwells.iter().sum::<f32>() / n;
-    let variance = log_dwells.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+    let (sum, sum_sq) = log_dwells
+        .iter()
+        .fold((0.0f32, 0.0f32), |(s, ss), &x| (s + x, ss + x * x));
+    let mean = sum / n;
+    let variance = (sum_sq / n - mean * mean).max(0.0);
     let std = variance.sqrt();
 
     if std < 1e-6 {

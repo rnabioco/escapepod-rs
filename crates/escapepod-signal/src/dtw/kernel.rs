@@ -39,10 +39,16 @@ use ndarray::Array2;
 /// }
 /// ```
 pub fn distance_to_kernel(distances: &Array2<f32>, gamma: f32, power: f32) -> Array2<f32> {
-    distances.mapv(|d| {
-        let powered = d.powf(power);
-        (-gamma * powered).exp()
-    })
+    // powf is ~10× slower than a multiply; specialize the two ubiquitous
+    // integer exponents. `power` is a kernel hyperparameter, not per-element,
+    // so branch prediction pins one arm across the whole mapv.
+    if power == 1.0 {
+        distances.mapv(|d| (-gamma * d).exp())
+    } else if power == 2.0 {
+        distances.mapv(|d| (-gamma * d * d).exp())
+    } else {
+        distances.mapv(|d| (-gamma * d.powf(power)).exp())
+    }
 }
 
 /// Convert a distance matrix to an RBF kernel matrix with automatic gamma estimation.
@@ -81,7 +87,7 @@ pub fn distance_to_kernel_auto(distances: &Array2<f32>, power: f32) -> (Array2<f
     };
 
     // Median heuristic for gamma
-    let gamma = 1.0 / (2.0 * median.powi(2));
+    let gamma = 1.0 / (2.0 * median * median);
 
     (distance_to_kernel(distances, gamma, power), gamma)
 }

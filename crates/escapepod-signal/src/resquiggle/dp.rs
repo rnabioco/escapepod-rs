@@ -438,7 +438,8 @@ pub(super) fn dp_step_with_dwell_penalty(
 pub fn dwell_penalty(dwell: usize, target: f32, weight: f32) -> f32 {
     let d = dwell as f32;
     if d < target {
-        weight * (target - d).powi(2)
+        let diff = target - d;
+        weight * diff * diff
     } else {
         weight * (1.0 + d / target).ln()
     }
