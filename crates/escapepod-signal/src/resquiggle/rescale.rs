@@ -91,7 +91,7 @@ fn calculate_quantiles(data: &[f32], quantiles: &[f32]) -> Result<Vec<f32>> {
     }
 
     let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
     quantiles
         .iter()
@@ -193,7 +193,7 @@ fn theil_sen(
         bail!("theil_sen: all slopes are zero");
     }
 
-    slopes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    slopes.sort_unstable_by(|a, b| a.total_cmp(b));
     let median_slope = median_sorted(&slopes)?;
 
     if median_slope == 0.0 {
@@ -205,7 +205,7 @@ fn theil_sen(
         .zip(y.iter())
         .map(|(&xi, &yi)| yi - median_slope * xi)
         .collect();
-    intercepts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    intercepts.sort_unstable_by(|a, b| a.total_cmp(b));
     let median_intercept = median_sorted(&intercepts)?;
 
     let shift_est = -median_intercept / median_slope;
@@ -299,7 +299,7 @@ pub fn rescale(
     // Dwell quantiles for filtering
     let (dwell_lower_val, dwell_upper_val) = {
         let mut sorted_dwells = dwells.clone();
-        sorted_dwells.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_dwells.sort_unstable_by(|a, b| a.total_cmp(b));
         let low = calculate_quantiles(&sorted_dwells, &[dwell_lower])?[0];
         let high = calculate_quantiles(&sorted_dwells, &[dwell_upper])?[0];
         (low, high)

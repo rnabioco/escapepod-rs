@@ -73,11 +73,18 @@ pub fn confidence_margin(probs: &[f64]) -> f64 {
         return if probs.is_empty() { 0.0 } else { 1.0 };
     }
 
-    // Find top two probabilities
-    let mut sorted: Vec<f64> = probs.to_vec();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-
-    sorted[0] - sorted[1]
+    // Find top two probabilities. We only need the top two, so a full sort
+    // is overkill — two max-passes are O(n) vs O(n log n).
+    let (mut best, mut second) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &p in probs {
+        if p > best {
+            second = best;
+            best = p;
+        } else if p > second {
+            second = p;
+        }
+    }
+    best - second
 }
 
 /// Process probabilities to predictions and confidence scores.
