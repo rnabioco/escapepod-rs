@@ -2,7 +2,9 @@
 
 use escapepod_signal::Reader;
 use noodles_bam as bam;
+#[cfg(feature = "experimental")]
 use noodles_csi::BinningIndex;
+#[cfg(feature = "experimental")]
 use noodles_csi::binning_index::ReferenceSequence as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -221,6 +223,7 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// Creates the BAI index if it does not already exist.
 /// Returns the total number of records (mapped + unmapped).
+#[cfg(feature = "experimental")]
 pub fn count_bam_records(bam_path: &Path) -> anyhow::Result<u64> {
     let bai_path = ensure_bai_index(bam_path)?;
     let index = bam::bai::fs::read(&bai_path)?;

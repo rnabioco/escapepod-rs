@@ -20,10 +20,13 @@ nav = [
     {"merge" = "cli/merge.md"},
     {"filter" = "cli/filter.md"},
     {"bam-filter" = "cli/bam-filter.md"},
-    {"repack" = "cli/repack.md"},
     {"subset" = "cli/subset.md"},
-    {"demux" = "cli/demux.md"},
-    {"resquiggle" = "cli/resquiggle.md"},
+  ]},
+  {"Experimental" = [
+    {"Overview" = "experimental/index.md"},
+    {"repack" = "experimental/repack.md"},
+    {"resquiggle" = "experimental/resquiggle.md"},
+    {"demux" = "experimental/demux.md"},
   ]},
   {"Library" = [
     {"Overview" = "library/index.md"},

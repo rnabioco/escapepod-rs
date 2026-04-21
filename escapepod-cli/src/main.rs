@@ -357,10 +357,24 @@ Examples:
         args: Vec<String>,
     },
 
-    /// Refine signal-to-base mapping using banded DP
+    /// Refine signal-to-base mapping using banded DP (experimental; requires `--features experimental`)
+    #[cfg(feature = "experimental")]
     Resquiggle(commands::resquiggle::ResquiggleArgs),
 
-    /// Build .p5i read index for fast UUID lookup
+    /// Refine signal-to-base mapping using banded DP (rebuild with `--features experimental` to enable)
+    #[cfg(not(feature = "experimental"))]
+    Resquiggle {
+        /// Resquiggle arguments (ignored; feature not enabled)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+
+    /// Build .p5i read index for fast UUID lookup (experimental; requires `--features experimental`)
+    #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
   escpod index input.pod5                   Index one file
@@ -380,6 +394,18 @@ Examples:
         /// Number of threads for parallel processing (default: all CPUs)
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
+    },
+
+    /// Build .p5i read index for fast UUID lookup (rebuild with `--features experimental` to enable)
+    #[cfg(not(feature = "experimental"))]
+    Index {
+        /// Index arguments (ignored; feature not enabled)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
     },
 }
 
@@ -544,12 +570,20 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "demux"))]
         Commands::Demux { .. } => feature_disabled("demux", "demux"),
 
+        #[cfg(feature = "experimental")]
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
 
+        #[cfg(not(feature = "experimental"))]
+        Commands::Resquiggle { .. } => feature_disabled("resquiggle", "experimental"),
+
+        #[cfg(feature = "experimental")]
         Commands::Index {
             inputs,
             force,
             threads,
         } => commands::index::run(inputs, force, threads),
+
+        #[cfg(not(feature = "experimental"))]
+        Commands::Index { .. } => feature_disabled("index", "experimental"),
     }
 }

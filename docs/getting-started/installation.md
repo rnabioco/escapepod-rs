@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.85 or later
+- Rust 1.88 or later
 - Cargo (comes with Rust)
 
 ## Installing the CLI
@@ -25,6 +25,30 @@ cp target/release/escpod ~/.local/bin/
 sudo cp target/release/escpod /usr/local/bin/
 ```
 
+### Optional features
+
+The default build ships the stable CLI surface (summary, view, inspect,
+merge, filter, bam-filter, subset). Extra commands live behind Cargo
+features:
+
+| Feature | Commands unlocked |
+|---------|-------------------|
+| `experimental` | `repack`, `resquiggle`, `index` |
+| `demux` | `demux detect`, `fingerprint`, `classify`, `split`, `train` |
+| `train` | implies `demux`; adds `demux train-svm` |
+| `gpu` | implies `demux`; batched GPU DTW for `classify` / `train-svm` (CUDA driver + libnvrtc required at runtime) |
+| `cnn-detect` | implies `demux`; ADAPTed-style CNN adapter detection (bring-your-own ONNX model) |
+
+Combine as needed:
+
+```bash
+cargo build --release --features experimental,demux
+cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
+```
+
+See the [Experimental](../experimental/index.md) section for per-command
+details.
+
 ### Verify Installation
 
 ```bash
@@ -34,26 +58,32 @@ escpod --help
 
 ## Using the Library
 
-Add escapepod to your `Cargo.toml`:
+The workspace splits the library layer in two: `escapepod-pod5` for format
+I/O and `escapepod-signal` for signal-processing algorithms. `escapepod-signal`
+re-exports the full `escapepod-pod5` surface, so most users only need to
+depend on the signal crate:
 
 ```toml
 [dependencies]
-escapepod = { git = "https://github.com/rnabioco/escapepod-rs.git" }
+escapepod-signal = { git = "https://github.com/rnabioco/escapepod-rs.git" }
 ```
 
-Or if published to crates.io:
+If you only need POD5 file I/O without the signal algorithms:
 
 ```toml
 [dependencies]
-escapepod = "0.1"
+escapepod-pod5 = { git = "https://github.com/rnabioco/escapepod-rs.git" }
 ```
+
+Barcode demultiplexing lives in its own crate, `escapepod-demux`, which
+mirrors the CLI's `demux` feature gate.
 
 ## Building Documentation
 
 To build the API documentation locally:
 
 ```bash
-cargo doc --open
+cargo doc --open --no-deps
 ```
 
 ## Development Setup

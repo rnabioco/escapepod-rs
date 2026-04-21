@@ -1,5 +1,15 @@
 # escpod resquiggle
 
+!!! warning "Experimental — opt-in feature"
+    `resquiggle` is gated behind the `experimental` Cargo feature. Output
+    tag schema and DP parameters are still being tuned and may change
+    between releases.
+
+    ```bash
+    cargo build --release --features experimental
+    cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
+    ```
+
 Refine signal-to-base mapping using banded dynamic programming. Takes an input POD5 file (raw signal) and a BAM file with basecaller move tables, then produces a new BAM file with refined signal boundaries stored in auxiliary tags.
 
 ## Overview

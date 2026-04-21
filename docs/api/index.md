@@ -13,45 +13,39 @@ This opens the documentation in your browser.
 
 ## Crate Structure
 
-### escapepod
+The workspace is split into five crates:
 
-The core library providing POD5 read/write functionality.
+| Crate | Role |
+|-------|------|
+| `escapepod-pod5` | POD5 format I/O (reader, writer, VBZ, footer, block-level merge/filter/subset) |
+| `escapepod-signal` | Signal algorithms (DTW, resquiggle, segmentation); **re-exports the full `escapepod-pod5` surface** |
+| `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing (DTW + SVM classifier, optional CNN adapter detection and GPU acceleration) |
+| `escapepod-cli` | The `escpod` binary |
+| `escapepod-python` | pyo3 bindings |
 
-#### Main Types
+### escapepod-pod5
 
-| Type | Description |
-|------|-------------|
-| `Reader` | Read POD5 files |
-| `Writer` | Create POD5 files |
-| `WriterOptions` | Writer configuration |
-| `ReadData` | Single read record |
-| `RunInfoData` | Run metadata |
-| `EndReason` | Read end reason enum |
-| `Error` | Error type |
+Format I/O.
 
-#### Modules
+**Main types:** `Reader`, `Writer`, `WriterOptions`, `ReadData`, `RunInfoData`, `EndReason`, `Error`.
 
-| Module | Description |
-|--------|-------------|
-| `compression` | VBZ compression codec |
-| `footer` | FlatBuffer footer parsing |
-| `reader` | File reading implementation |
-| `writer` | File writing implementation |
-| `schema` | Arrow schema definitions |
-| `types` | Core data types |
+**Modules:** `reader`, `writer`, `compression` (VBZ / SVB16 / ZSTD), `footer` (FlatBuffer), `schema` (Arrow schemas), `types`, `merge`, `operations::{filter, repack, subset}`.
+
+### escapepod-signal
+
+Signal-processing algorithms, layered on top of `escapepod-pod5` (which it re-exports).
+
+**Modules:** `dtw` (distance, fingerprint, kernel, optional `cuda`), `segmentation` (LLR, t-test, normalize), `resquiggle` (banded DP).
+
+### escapepod-demux
+
+Barcode demultiplexing. Separate crate; the CLI pulls it in only when built with `--features demux`.
+
+**Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `train` (feature `train`), `adapter_cnn` (feature `cnn-detect`).
 
 ### escapepod-cli
 
-The command-line interface binary.
-
-#### Commands
-
-| Command | Description |
-|---------|-------------|
-| `view` | Display reads as table |
-| `inspect` | Inspect file contents |
-| `merge` | Combine multiple files |
-| `filter` | Extract reads by ID |
+The `escpod` binary. Stable commands (always built): `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`. Experimental commands live behind Cargo features — see below.
 
 ## Quick Reference
 
@@ -115,24 +109,57 @@ match result {
 
 ## Feature Flags
 
-| Feature | Description |
-|---------|-------------|
-| `train` | Enables SVM model training with `linfa` and `linfa-svm` |
+### `escapepod-cli`
 
-Core functionality is included by default. Use `--features train` to enable model training capabilities.
+| Feature | Effect |
+|---------|--------|
+| `experimental` | Unlocks `repack`, `resquiggle`, `index` |
+| `demux` | Unlocks the `demux` subcommand tree (detect / fingerprint / classify / split / train) |
+| `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
+| `gpu` | Implies `demux`; batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc at runtime) |
+| `cnn-detect` | Implies `demux`; ADAPTed-style CNN adapter detection (bring-your-own ONNX model; weights are CC BY-NC 4.0 and not bundled) |
+
+### `escapepod-demux`
+
+| Feature | Effect |
+|---------|--------|
+| `train` | `DtwSvmModel` training via `linfa-svm` |
+| `gpu` | Routes to `escapepod-signal`'s CUDA DTW kernel |
+| `cnn-detect` | ADAPTed-style CNN adapter detection via `tract-onnx` |
+
+The CLI features forward to the matching demux features, so building the
+CLI with `--features gpu` transitively enables demux's `gpu` feature.
 
 ## Dependencies
 
-### escapepod
+### escapepod-pod5
 
 | Crate | Purpose |
 |-------|---------|
 | `arrow` | Arrow IPC format |
 | `flatbuffers` | Footer serialization |
 | `zstd` | ZSTD compression |
-| `uuid` | UUID handling |
 | `memmap2` | Memory-mapped files |
+| `uuid` | UUID handling |
 | `thiserror` | Error derive |
+
+### escapepod-signal
+
+| Crate | Purpose |
+|-------|---------|
+| `escapepod-pod5` | Re-exported as `pod5` |
+| `ndarray` | Array operations |
+| `rand`, `flate2` | Resquiggle internals |
+
+### escapepod-demux
+
+| Crate | Purpose |
+|-------|---------|
+| `escapepod-pod5`, `escapepod-signal` | Format I/O + DTW |
+| `ndarray` | Feature vectors |
+| `serde`, `serde_json` | Model JSON |
+| `linfa`, `linfa-svm` | SVM training (feature `train`) |
+| `tract-onnx` | CNN adapter detection (feature `cnn-detect`) |
 
 ### escapepod-cli
 
@@ -140,7 +167,9 @@ Core functionality is included by default. Use `--features train` to enable mode
 |-------|---------|
 | `clap` | Argument parsing |
 | `rayon` | Parallel processing |
+| `noodles-bam`, `noodles-sam` | BAM integration |
+| `tabled` | Table formatting |
 
 ## Minimum Supported Rust Version
 
-Rust 1.85 or later is required.
+Rust 1.88 or later is required (tracked in `[workspace.package].rust-version`).

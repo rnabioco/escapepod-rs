@@ -10,6 +10,8 @@ escpod <COMMAND> [OPTIONS]
 
 ## Commands
 
+These commands are in the default build — no extra Cargo features required.
+
 | Command | Description |
 |---------|-------------|
 | [summary](summary.md) | Comprehensive file summary with QC metrics |
@@ -18,10 +20,11 @@ escpod <COMMAND> [OPTIONS]
 | [merge](merge.md) | Combine multiple POD5 files |
 | [filter](filter.md) | Extract reads by ID list |
 | [bam-filter](bam-filter.md) | Filter reads based on paired BAM file |
-| [repack](repack.md) | Repack POD5 files to optimize storage |
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
-| [demux](demux.md) | Barcode demultiplexing (detect, fingerprint, classify, split, train) — **experimental**, requires `--features demux` |
-| [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP — **experimental**, requires `--features experimental` |
+
+Additional commands (`repack`, `resquiggle`, `demux`, `index`) live behind
+Cargo feature gates — see the [Experimental](../experimental/index.md)
+section.
 
 ## Global Options
 
