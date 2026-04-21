@@ -14,21 +14,13 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "# First, get some read IDs"
-Enter
-Sleep 500ms
-
 Type "escpod view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"
 Enter
 Sleep 1s
 
 Type "cat /tmp/ids.txt"
 Enter
-Sleep 1s
-
-Type "# Now filter to just those reads"
-Enter
-Sleep 500ms
+Sleep 2s
 
 Type "escpod filter data/drna/yeast_trna_reads.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
 Enter

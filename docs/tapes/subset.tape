@@ -14,10 +14,6 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "# Create a CSV mapping file"
-Enter
-Sleep 500ms
-
 Type "echo 'read_id,output' > /tmp/mapping.csv"
 Enter
 Sleep 300ms
@@ -28,11 +24,7 @@ Sleep 500ms
 
 Type "cat /tmp/mapping.csv"
 Enter
-Sleep 1s
-
-Type "# Subset reads based on mapping"
-Enter
-Sleep 500ms
+Sleep 2s
 
 Type "escpod subset data/drna/yeast_trna_reads.pod5 --csv /tmp/mapping.csv -o /tmp/subsets/"
 Enter

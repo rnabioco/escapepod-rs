@@ -1,5 +1,5 @@
 # VHS tape file for escpod-rs demo
-# Run with: vhs demo.tape
+# Run with: vhs readme.tape
 
 Output docs/images/readme.gif
 
@@ -16,45 +16,41 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "# escpod-rs - A fast Rust CLI for POD5 files"
-Enter
-Sleep 1s
-
-Type "# Let's explore a POD5 file"
-Enter
-Sleep 500ms
-
 Type "escpod summary data/drna/yeast_trna_reads.pod5"
 Enter
-Sleep 3s
-
-Type "# View reads as a table"
-Enter
-Sleep 500ms
+Sleep 4s
+Ctrl+L
 
 Type "escpod view data/drna/yeast_trna_reads.pod5"
 Enter
-Sleep 2s
-
-Type "# Extract just read IDs"
-Enter
-Sleep 500ms
+Sleep 3s
+Ctrl+L
 
 Type "escpod view data/drna/yeast_trna_reads.pod5 --ids"
 Enter
-Sleep 2s
-
-Type "# Inspect file metadata"
-Enter
-Sleep 500ms
+Sleep 3s
+Ctrl+L
 
 Type "escpod inspect summary data/drna/yeast_trna_reads.pod5"
 Enter
-Sleep 2s
+Sleep 3s
+Ctrl+L
 
-Type "# List available commands"
+Hide
+Type "escpod view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"
 Enter
 Sleep 500ms
+Show
+
+Type "escpod filter data/drna/yeast_trna_reads.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
+Enter
+Sleep 4s
+Ctrl+L
+
+Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
+Enter
+Sleep 4s
+Ctrl+L
 
 Type "escpod --help"
 Enter

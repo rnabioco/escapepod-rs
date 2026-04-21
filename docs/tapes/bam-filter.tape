@@ -14,21 +14,9 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "# Filter POD5 reads using a paired BAM file"
-Enter
-Sleep 500ms
-
-Type "# Keep only mapped reads with quality >= 10"
-Enter
-Sleep 500ms
-
 Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
 Enter
 Sleep 5s
-
-Type "# Check the result"
-Enter
-Sleep 500ms
 
 Type "escpod inspect summary /tmp/filtered.pod5"
 Enter
