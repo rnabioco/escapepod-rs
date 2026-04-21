@@ -30,6 +30,10 @@ Type "# Now filter to just those reads"
 Enter
 Sleep 500ms
 
-Type "escpod filter data/drna/yeast_trna_reads.pod5 -i /tmp/ids.txt -o /tmp/filtered.pod5"
+Type "escpod filter data/drna/yeast_trna_reads.pod5 \"
+Enter
+Type "  -i /tmp/ids.txt \"
+Enter
+Type "  -o /tmp/filtered.pod5"
 Enter
 Sleep 5s

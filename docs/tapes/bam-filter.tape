@@ -22,7 +22,13 @@ Type "# Keep only mapped reads with quality >= 10"
 Enter
 Sleep 500ms
 
-Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
+Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 \"
+Enter
+Type "  -b data/drna/yeast_trna_mappings.bam \"
+Enter
+Type "  --mapped --quality 10 \"
+Enter
+Type "  -o /tmp/filtered.pod5"
 Enter
 Sleep 5s
 
