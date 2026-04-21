@@ -69,13 +69,55 @@ pub fn compute_distances(query: &[f64], training: &[Vec<f64>], window: Option<us
 /// SVM predictor for One-vs-One multiclass classification.
 ///
 /// Implements the decision function for sklearn's SVC with precomputed kernel.
+///
+/// Precomputes two index tables at construction so the per-read hot loop
+/// doesn't rebuild a `HashMap<i32, usize>` on every call:
+/// - `training_class[i]` — class index for each training sample `i`
+/// - `sv_class[sv_local]` — class index for each support vector
 pub struct SvmPredictor<'a> {
     model: &'a DtwSvmModel,
+    /// Class index (0..n_classes) for each training sample, or None if the
+    /// sample's label isn't in `model.classes` (malformed model — treated as
+    /// "not in any class" to match the old HashMap::get behavior).
+    training_class: Vec<Option<usize>>,
+    /// Class index for each support vector, indexed by the support vector's
+    /// local index (i.e. `sv_class[k]` is the class of `support_indices[k]`).
+    sv_class: Vec<Option<usize>>,
 }
 
 impl<'a> SvmPredictor<'a> {
     pub fn new(model: &'a SvmModel) -> Self {
-        Self { model }
+        // One-time label → class-index lookup. Hot loops below index directly
+        // into training_class / sv_class, so the HashMap never escapes `new`.
+        let label_to_class: std::collections::HashMap<i32, usize> = model
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(idx, &label)| (label, idx))
+            .collect();
+
+        let training_class: Vec<Option<usize>> = model
+            .training_labels
+            .iter()
+            .map(|label| label_to_class.get(label).copied())
+            .collect();
+
+        let sv_class: Vec<Option<usize>> = model
+            .support_indices
+            .iter()
+            .map(|&gidx| {
+                model
+                    .training_labels
+                    .get(gidx)
+                    .and_then(|label| label_to_class.get(label).copied())
+            })
+            .collect();
+
+        Self {
+            model,
+            training_class,
+            sv_class,
+        }
     }
 
     /// Compute class scores using kernel-weighted voting.
@@ -95,18 +137,10 @@ impl<'a> SvmPredictor<'a> {
         let mut class_scores = vec![0.0; n_classes];
         let mut class_counts = vec![0usize; n_classes];
 
-        // Map labels to class indices
-        let label_to_class: std::collections::HashMap<i32, usize> = self
-            .model
-            .classes
-            .iter()
-            .enumerate()
-            .map(|(idx, &label)| (label, idx))
-            .collect();
-
-        // Accumulate kernel-weighted votes for each class
-        for (i, &label) in self.model.training_labels.iter().enumerate() {
-            if let Some(&class_idx) = label_to_class.get(&label) {
+        // Accumulate kernel-weighted votes for each class. The class index
+        // for each training sample was pre-resolved in `new()`.
+        for (i, class_opt) in self.training_class.iter().enumerate() {
+            if let Some(class_idx) = *class_opt {
                 class_scores[class_idx] += kernel_values[i];
                 class_counts[class_idx] += 1;
             }
@@ -162,29 +196,21 @@ impl<'a> SvmPredictor<'a> {
         //   - SVs of class i: use dual_coef[j-1][sv_idx]
         //   - SVs of class j: use dual_coef[i][sv_idx]
         //   - Other SVs: don't contribute
+        //
+        // `sv_class[sv_local_idx]` is precomputed in `new()`, so the inner
+        // loop touches only Vec indexing — no HashMap probe per SV per pair.
         let mut decisions = vec![0.0; n_pairs];
-
-        // Build class index lookup: label -> class index
-        let label_to_class: std::collections::HashMap<i32, usize> = self
-            .model
-            .classes
-            .iter()
-            .enumerate()
-            .map(|(idx, &label)| (label, idx))
-            .collect();
+        let sv_class = self.sv_class.as_slice();
+        let support_indices = self.model.support_indices.as_slice();
+        let intercept = self.model.intercept.as_slice();
 
         let mut pair_idx = 0;
         for i in 0..n_classes {
             for j in (i + 1)..n_classes {
-                let mut sum = self.model.intercept[pair_idx];
+                let mut sum = intercept[pair_idx];
 
-                for (sv_local_idx, &sv_global_idx) in self.model.support_indices.iter().enumerate()
-                {
-                    // Determine which class this SV belongs to
-                    let sv_label = self.model.training_labels[sv_global_idx];
-                    let sv_class = label_to_class.get(&sv_label).copied();
-
-                    let coef = match sv_class {
+                for (sv_local_idx, &sv_global_idx) in support_indices.iter().enumerate() {
+                    let coef = match sv_class[sv_local_idx] {
                         Some(c) if c == i => {
                             // SV of class i: use dual_coef[j-1]
                             self.model.dual_coef[j - 1]
