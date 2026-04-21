@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.3.1 (2026-04-21)
+
+### Added
+
+- `resquiggle::banded_dp_with_penalty_table` — banded Viterbi DP variant
+  that accepts a caller-supplied short-dwell penalty table and uses its
+  length as the check horizon. Tie-break is strict (`<`), matching the
+  Remora-compatible refinement pipeline. Complements the existing
+  `banded_dp` which builds the asymmetric penalty internally.
+- `segmentation::mad_normalize_robust` — median-MAD normalization with
+  the 1.4826 Gaussian scale factor and graceful fallback (returns
+  `signal - median` without dividing) when MAD is essentially zero.
+  Complements `mad_normalize`, which panics on constant signals.
+
+### Performance
+
+- Hot-path audit across fingerprint MAD, SVM prediction, `view`, and
+  `merge`. Fingerprint MAD uses a single-pass median/MAD with an
+  in-place partition; SVM prediction reuses per-thread scratch buffers
+  and avoids redundant kernel evaluations on the OvO dual path; CLI
+  `view` streams reads with reused formatting buffers; `merge` switches
+  to mmap-backed readers where possible to cut per-file overhead.
+
+### Fixed
+
+- `escapepod-python` cdylib now links cleanly under a plain
+  `cargo build` on macOS. A `build.rs` emits the pyo3
+  extension-module link args (equivalent to
+  `pyo3_build_config::add_extension_module_link_args()`), scoped to the
+  cdylib, so the build no longer fails with undefined `_Py*` symbols
+  when maturin is not driving the build. macOS is now in the CI matrix
+  for `check`, `test`, and `clippy` to catch regressions.
+
+### Changed
+
+- Workspace crates moved under `crates/` (no public-API change).
+- Docs reorganised with an "experimental tools" section; `resquiggle`
+  and `index` CLI subcommands are gated behind their respective Cargo
+  features.
+
 ## 0.3.0 (2026-04-20)
 
 ### Breaking
