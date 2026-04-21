@@ -32,7 +32,7 @@ pytest = "*"
 pod5 = ">=0.3.36,<0.4"
 
 [feature.python-test.tasks]
-build-python = "maturin develop --manifest-path escapepod-python/Cargo.toml"
+build-python = "maturin develop --manifest-path crates/escapepod-python/Cargo.toml"
 test-python = { cmd = "pytest tests/python/ -v", depends-on = ["build-python"] }
 test-compat = "python tests/compat/test_pod5_compat.py"
 

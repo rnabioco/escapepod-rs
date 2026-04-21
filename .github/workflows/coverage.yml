@@ -2,9 +2,9 @@ name: Coverage
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

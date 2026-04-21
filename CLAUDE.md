@@ -63,7 +63,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ### Microbenchmarks (criterion)
 
-`escapepod-signal/benches/hot_paths.rs` covers the audit hot paths: DTW, resquiggle DP, fingerprint MAD, VBZ encode/decode, DTW matrix.
+`crates/escapepod-signal/benches/hot_paths.rs` covers the audit hot paths: DTW, resquiggle DP, fingerprint MAD, VBZ encode/decode, DTW matrix.
 
 ```bash
 # Full run
