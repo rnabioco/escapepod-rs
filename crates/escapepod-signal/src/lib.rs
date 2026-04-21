@@ -41,5 +41,5 @@ pub use escapepod_pod5::{
     ReadData, ReadIndex, Reader, RecordBatch, RepackOptions, RepackResult, Result, RunInfoData,
     SignalExtractor, SignalType, Statistics, Uuid, Writer, WriterOptions, compute_n50,
     compute_statistics, determine_fields, get_field_value, merge_files, parse_uuid_flexible,
-    repack_files,
+    repack_files, write_field_value,
 };

@@ -172,6 +172,39 @@ pub fn get_field_value(read: &ReadData, field: &str) -> String {
     }
 }
 
+/// Write the formatted value of a field on a read directly to a writer.
+///
+/// This is the zero-allocation counterpart to [`get_field_value`] — preferable
+/// in tight output loops (`view`, `inspect`) where each read would otherwise
+/// allocate a `String` per field plus another for `join(&sep)`.
+///
+/// For unknown fields, writes nothing (matching `get_field_value`'s empty
+/// string fallback).
+pub fn write_field_value<W: std::io::Write>(
+    writer: &mut W,
+    read: &ReadData,
+    field: &str,
+) -> std::io::Result<()> {
+    match field {
+        "read_id" => write!(writer, "{}", read.read_id),
+        "channel" => write!(writer, "{}", read.channel),
+        "well" => write!(writer, "{}", read.well),
+        "pore_type" => writer.write_all(read.pore_type.as_bytes()),
+        "read_number" => write!(writer, "{}", read.read_number),
+        "start_sample" => write!(writer, "{}", read.start_sample),
+        "median_before" => write!(writer, "{:.2}", read.median_before),
+        "end_reason" => write!(writer, "{}", read.end_reason),
+        "end_reason_forced" => write!(writer, "{}", read.end_reason_forced),
+        "num_samples" => write!(writer, "{}", read.num_samples),
+        "num_minknow_events" => write!(writer, "{}", read.num_minknow_events),
+        "calibration_offset" => write!(writer, "{:.4}", read.calibration_offset),
+        "calibration_scale" => write!(writer, "{:.6}", read.calibration_scale),
+        "run_info" => write!(writer, "{}", read.run_info_index),
+        "open_pore_level" => write!(writer, "{:.2}", read.open_pore_level),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

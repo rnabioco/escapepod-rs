@@ -159,17 +159,20 @@ pub fn dtw_distance_matrix(
     let n_queries = queries.len();
     let n_refs = references.len();
 
-    // Compute distances in parallel
-    let distances: Vec<f32> = (0..n_queries)
-        .into_par_iter()
-        .flat_map(|i| {
-            (0..n_refs)
-                .map(|j| dtw_distance(&queries[i], &references[j], window))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Flat row-major buffer; rayon writes each row in parallel. The previous
+    // `flat_map(... .collect::<Vec<_>>())` allocated n_queries temporary Vecs
+    // just to be flattened and dropped.
+    let mut distances = vec![0.0f32; n_queries * n_refs];
+    distances
+        .par_chunks_mut(n_refs)
+        .enumerate()
+        .for_each(|(i, row)| {
+            let q = &queries[i];
+            for (j, slot) in row.iter_mut().enumerate() {
+                *slot = dtw_distance(q, &references[j], window);
+            }
+        });
 
-    // Reshape into matrix
     Array2::from_shape_vec((n_queries, n_refs), distances)
         .expect("Failed to create distance matrix")
 }
