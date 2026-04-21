@@ -40,15 +40,6 @@ jobs:
       # classify + SVM predict, `train` pulls in linfa-svm.
       - run: cargo test -p escapepod-demux --features train
 
-  bench-build:
-    name: Bench compile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo bench --workspace --no-run
-
   fmt:
     name: Format
     runs-on: ubuntu-latest

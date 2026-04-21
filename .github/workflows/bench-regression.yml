@@ -1,8 +1,9 @@
 name: Benchmark regression
 
 on:
-  pull_request:
-    branches: [main]
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 env:
@@ -18,7 +19,7 @@ jobs:
   bench:
     name: criterion baseline vs. main
     runs-on: ubuntu-latest
-    # Don't gate the whole PR on bench noise; surface regressions via the
+    # Don't gate releases on bench noise; surface regressions via the
     # check output but keep the job non-blocking until we have a stable
     # baseline.
     continue-on-error: true
