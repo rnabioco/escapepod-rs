@@ -5,7 +5,7 @@
 use crate::util::{
     OpenResult, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
 };
-use escapepod_signal::{determine_fields, get_field_value};
+use escapepod_signal::{determine_fields, write_field_value};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -61,9 +61,19 @@ pub fn run(
             if ids_only {
                 writeln!(writer, "{}", read.read_id)?;
             } else {
-                let values: Vec<String> =
-                    fields.iter().map(|f| get_field_value(&read, f)).collect();
-                writeln!(writer, "{}", values.join(&separator))?;
+                // Write fields directly into the BufWriter — avoids the
+                // per-row `Vec<String>` + `join` allocations that dominated
+                // the previous implementation on large files.
+                let sep_bytes = separator.as_bytes();
+                let mut first = true;
+                for f in &fields {
+                    if !first {
+                        writer.write_all(sep_bytes)?;
+                    }
+                    write_field_value(&mut writer, &read, f)?;
+                    first = false;
+                }
+                writer.write_all(b"\n")?;
             }
         }
     }

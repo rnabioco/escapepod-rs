@@ -395,7 +395,7 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
 
     for i in 0..target_length {
         let mut values: Vec<f32> = filtered.iter().map(|fp| fp[i]).collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        values.sort_unstable_by(|a, b| a.total_cmp(b));
 
         let median = if values.len().is_multiple_of(2) {
             let mid = values.len() / 2;
@@ -435,7 +435,10 @@ pub fn compute_std_dev_fingerprint(fingerprints: &[Vec<f32>], consensus: &[f32])
         let mean = consensus[i];
         let variance = filtered
             .iter()
-            .map(|fp| (fp[i] - mean).powi(2))
+            .map(|fp| {
+                let d = fp[i] - mean;
+                d * d
+            })
             .sum::<f32>()
             / filtered.len() as f32;
         std_dev.push(variance.sqrt());

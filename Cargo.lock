@@ -842,6 +842,7 @@ name = "escapepod-demux"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "escapepod-pod5",
  "escapepod-signal",
  "linfa",

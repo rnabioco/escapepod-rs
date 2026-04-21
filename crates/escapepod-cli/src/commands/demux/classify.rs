@@ -445,13 +445,23 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         .map(|(i, (read_id, _))| {
             let row = distances.row(i);
 
-            // Find best and second-best matches
-            let mut indexed: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Bounds check for empty reference set
-            let (best_idx, best_dist) = match indexed.first() {
-                Some(&pair) => pair,
+            // Find best and second-best matches in a single linear pass.
+            // We only care about the top two, so a full sort is wasted work
+            // once the reference set gets past a handful of barcodes.
+            let mut best_idx: Option<usize> = None;
+            let mut best_dist = f32::INFINITY;
+            let mut second_best_dist = f32::INFINITY;
+            for (j, d) in row.iter().copied().enumerate() {
+                if d < best_dist {
+                    second_best_dist = best_dist;
+                    best_dist = d;
+                    best_idx = Some(j);
+                } else if d < second_best_dist {
+                    second_best_dist = d;
+                }
+            }
+            let best_idx = match best_idx {
+                Some(idx) => idx,
                 None => {
                     return ClassifyResult {
                         read_id: *read_id,
@@ -463,7 +473,6 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
                     };
                 }
             };
-            let second_best_dist = indexed.get(1).map(|&(_, d)| d).unwrap_or(f32::INFINITY);
 
             let ratio = if second_best_dist > 0.0 {
                 best_dist / second_best_dist

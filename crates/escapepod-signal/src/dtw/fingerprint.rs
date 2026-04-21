@@ -177,17 +177,15 @@ pub fn normalize_fingerprint(fp: &mut Fingerprint, method: NormMethod) {
             }
         }
         NormMethod::Median => {
-            // Sort once for median, reuse the buffer for MAD to avoid a
-            // second to_vec allocation that compute_mad→compute_median would do.
+            // Median + MAD via select_nth_unstable (O(n) expected), reusing the
+            // abs-deviation buffer. Two full sorts would be O(n log n) each.
             let mut buf = fp.values.clone();
-            buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = median_of_sorted(&buf);
+            let median = median_via_select(&mut buf);
 
             for (v, slot) in fp.values.iter().zip(buf.iter_mut()) {
                 *slot = (*v - median).abs();
             }
-            buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let mad = median_of_sorted(&buf);
+            let mad = median_via_select(&mut buf);
 
             if mad > 0.0 {
                 for val in &mut fp.values {
@@ -220,34 +218,52 @@ fn compute_std(values: &[f32], mean: f32) -> f32 {
     if values.is_empty() {
         return 0.0;
     }
-    let variance = values.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|&x| {
+            let d = x - mean;
+            d * d
+        })
+        .sum::<f32>()
+        / values.len() as f32;
     variance.sqrt()
 }
 
-fn median_of_sorted(sorted: &[f32]) -> f32 {
-    if sorted.is_empty() {
+/// Median of an unsorted `&mut [f32]` slice via `select_nth_unstable` (O(n) expected).
+///
+/// The slice is partially reordered in place. Uses `f32::total_cmp` for a total
+/// ordering so NaN doesn't cause a panic. Returns 0.0 for an empty slice.
+fn median_via_select(data: &mut [f32]) -> f32 {
+    let n = data.len();
+    if n == 0 {
         return 0.0;
     }
-    if sorted.len().is_multiple_of(2) {
-        let mid = sorted.len() / 2;
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+    let mid = n / 2;
+    let (_, pivot, _) = data.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let hi = *pivot;
+    if n.is_multiple_of(2) {
+        // After select_nth, data[..mid] is an unsorted partition of values <= hi.
+        // Max of that partition is the lower median element.
+        let lo = data[..mid]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        (lo + hi) / 2.0
     } else {
-        sorted[sorted.len() / 2]
+        hi
     }
 }
 
 #[cfg(test)]
 fn compute_median(values: &[f32]) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    median_of_sorted(&sorted)
+    let mut buf = values.to_vec();
+    median_via_select(&mut buf)
 }
 
 #[cfg(test)]
 fn compute_mad(values: &[f32], median: f32) -> f32 {
     let mut deviations: Vec<f32> = values.iter().map(|&x| (x - median).abs()).collect();
-    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    median_of_sorted(&deviations)
+    median_via_select(&mut deviations)
 }
 
 #[cfg(test)]

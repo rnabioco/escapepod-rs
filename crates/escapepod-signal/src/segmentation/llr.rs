@@ -346,7 +346,7 @@ fn median_slice(data: &[f32]) -> f32 {
 
     // select_nth_unstable partitions so that element at mid is the nth smallest
     // This is O(N) average case vs O(N log N) for full sort
-    buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    buf.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
 
     if buf.len().is_multiple_of(2) && mid > 0 {
         // For even length, need to also find max of left partition for true median

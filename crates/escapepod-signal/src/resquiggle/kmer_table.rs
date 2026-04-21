@@ -259,7 +259,7 @@ fn kruskal_h(samples: &[&[usize]]) -> f64 {
         .filter(|g| !g.is_empty())
         .map(|group| {
             let rank_sum: f64 = group.iter().map(|&el| el as f64).sum();
-            rank_sum.powi(2) / (group.len() as f64)
+            (rank_sum * rank_sum) / (group.len() as f64)
         })
         .sum();
 
@@ -272,7 +272,7 @@ fn median_f32(data: &[f32]) -> Option<f32> {
         return None;
     }
     let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
     let len = sorted.len();
     Some(if len % 2 == 1 {

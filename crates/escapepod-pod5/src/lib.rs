@@ -40,7 +40,9 @@ pub mod types;
 pub mod writer;
 
 // Re-export CLI-facing utilities
-pub use fields::{ALL_FIELDS, DEFAULT_FIELDS, FieldError, determine_fields, get_field_value};
+pub use fields::{
+    ALL_FIELDS, DEFAULT_FIELDS, FieldError, determine_fields, get_field_value, write_field_value,
+};
 pub use utils::parse_uuid_flexible;
 pub use utils::{Statistics, compute_n50, compute_statistics};
 

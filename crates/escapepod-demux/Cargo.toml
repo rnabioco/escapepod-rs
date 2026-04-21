@@ -44,5 +44,10 @@ gpu = ["escapepod-signal/gpu"]
 cnn-detect = ["dep:tract-onnx"]
 
 [dev-dependencies]
+criterion = "0.8"
 rand = "0.10"
 tempfile = "3"
+
+[[bench]]
+name = "classify"
+harness = false

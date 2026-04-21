@@ -142,11 +142,7 @@ pub fn find_changepoints(
     // latter picks greedily from highest priority down and kills in-range
     // neighbors each round.
     let mut peak_order: Vec<usize> = (0..peaks.len()).collect();
-    peak_order.sort_by(|&a, &b| {
-        t_scores[peaks[b]]
-            .partial_cmp(&t_scores[peaks[a]])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    peak_order.sort_unstable_by(|&a, &b| t_scores[peaks[b]].total_cmp(&t_scores[peaks[a]]));
 
     let mut kept = vec![false; peaks.len()];
     let mut changepoints = Vec::with_capacity(num_changepoints);
