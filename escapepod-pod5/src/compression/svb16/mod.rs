@@ -13,6 +13,7 @@
 //! that advertise the feature; otherwise the scalar implementation below
 //! is used.
 
+#[cfg(target_arch = "x86_64")]
 mod tables;
 
 #[cfg(target_arch = "x86_64")]
