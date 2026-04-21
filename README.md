@@ -4,7 +4,7 @@
 
 A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ![escapepod demo](docs/images/readme.gif)
@@ -13,11 +13,13 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 - **Fast** - Up to 47x faster than Python pod5 tools
 - **Memory efficient** - Memory-mapped I/O for large files
-- **Full featured** - View, inspect, merge, filter, subset, and repack
+- **Full featured** - View, inspect, merge, filter, subset
 - **BAM integration** - Filter reads by alignment status
 
-Experimental features (barcode demultiplexing, resquiggling) live behind
-Cargo feature flags and ship separately — see the [docs](https://rnabioco.github.io/escapepod-rs/) for status and build instructions.
+Experimental features — `repack`, `resquiggle`, `index`, and barcode
+demultiplexing (`demux`) — live behind Cargo feature flags. See the
+[docs](https://rnabioco.github.io/escapepod-rs/experimental/) for status
+and build instructions.
 
 GPU-accelerated DTW for demux classify is available via `--features gpu`
 (opt-in, experimental). Uses NVRTC to compile a CUDA kernel at runtime —
@@ -35,8 +37,20 @@ no `nvcc` needed at build time, only the CUDA driver + libnvrtc at run.
 
 ## Install
 
+Default build (stable commands only):
+
 ```bash
 cargo install --git https://github.com/rnabioco/escapepod-rs
+```
+
+Opt into experimental commands:
+
+```bash
+# repack, resquiggle, index
+cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
+
+# barcode demultiplexing
+cargo install --git https://github.com/rnabioco/escapepod-rs --features demux
 ```
 
 ## License

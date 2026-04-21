@@ -1,8 +1,15 @@
 # escpod repack
 
-Repack POD5 files to optimize storage and apply current compression settings.
+!!! warning "Experimental — opt-in feature"
+    `repack` is gated behind the `experimental` Cargo feature. Its flag set
+    and output layout may change without a deprecation window.
 
-![escpod repack](../images/repack.gif)
+    ```bash
+    cargo build --release --features experimental
+    cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
+    ```
+
+Repack POD5 files to optimize storage and apply current compression settings.
 
 ## Usage
 
