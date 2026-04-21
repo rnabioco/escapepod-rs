@@ -101,14 +101,17 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
 }
 
 /// Collected metadata from a single file for merging.
+///
+/// Holds the live `Reader` so that the signal header/batch slices into its
+/// mmap stay valid for the duration of Phase 2. Dropping the reader would
+/// invalidate the mmap and force us to copy the (potentially 20+ GB) signal
+/// bytes into owned `Vec<u8>` on the heap, which doesn't fit when merging
+/// production-scale runs.
 struct FileMetadata {
+    reader: Reader,
     footer: ArrowIpcFooter,
     run_infos: Vec<RunInfoData>,
     reads: Vec<ReadData>,
-    /// Pre-read signal header bytes (Arrow schema/magic).
-    signal_header: Vec<u8>,
-    /// Pre-read signal batch bytes (all record batches).
-    signal_batches: Vec<u8>,
 }
 
 /// Main merge implementation using zero-copy async I/O.
@@ -127,8 +130,9 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     // Progress counter for parallel metadata loading
     let files_loaded = AtomicUsize::new(0);
 
-    // Phase 1: Open files and collect metadata in parallel
-    // Pre-reads signal bytes into memory so Phase 2 only writes from RAM
+    // Phase 1: Open files and collect metadata in parallel. We keep each
+    // `Reader` alive (and therefore its mmap) so Phase 2 can borrow signal
+    // bytes directly from the mmap rather than copying them into heap Vecs.
     let metadata_results: Vec<Result<FileMetadata>> = input_paths
         .par_iter()
         .map(|path| {
@@ -139,10 +143,6 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             let reads: Vec<ReadData> = reader
                 .reads()?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            // Pre-read signal bytes into memory (moves I/O to parallel phase)
-            let signal_header = footer.header_bytes(signal_bytes).to_vec();
-            let signal_batches = footer.batches_bytes(signal_bytes).to_vec();
 
             // Update progress after successfully loading a file
             let loaded = files_loaded.fetch_add(1, Ordering::Relaxed) + 1;
@@ -155,11 +155,10 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             }
 
             Ok(FileMetadata {
+                reader,
                 footer,
                 run_infos,
                 reads,
-                signal_header,
-                signal_batches,
             })
         })
         .collect();
@@ -208,23 +207,29 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                 Ok((file.into_inner()?, pos))
             });
 
-            // Main thread: send pre-read signal bytes to writer
+            // Main thread: send signal bytes to writer. Slices borrow from
+            // each file's live mmap (via `metadata.reader`); `file_metadata`
+            // is owned by the main thread and outlives this scope.
             let mut header_written = false;
 
             for (file_idx, metadata) in file_metadata.iter().enumerate() {
                 // Record signal row offset for this file
                 signal_offsets.push(current_signal_row);
 
+                let signal_bytes = metadata.reader.signal_table_bytes()?;
+                let signal_header = metadata.footer.header_bytes(signal_bytes);
+                let signal_batches = metadata.footer.batches_bytes(signal_bytes);
+
                 // Write header from first file only
                 if !header_written {
-                    tx.send(&metadata.signal_header)
+                    tx.send(signal_header)
                         .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
-                    current_offset = metadata.signal_header.len();
+                    current_offset = signal_header.len();
                     header_written = true;
                 }
 
-                // Send pre-read batch bytes (no mmap access here)
-                tx.send(&metadata.signal_batches)
+                // Send batch bytes — a slice straight into the mmap, no heap copy.
+                tx.send(signal_batches)
                     .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
 
                 // Adjust batch offsets for the combined output
@@ -241,7 +246,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                     });
                 }
 
-                current_offset += metadata.signal_batches.len();
+                current_offset += signal_batches.len();
                 current_signal_row += metadata.footer.total_rows;
 
                 if let Some(cb) = progress_callback {
