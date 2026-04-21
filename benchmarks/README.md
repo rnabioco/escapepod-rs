@@ -107,8 +107,12 @@ Comparison of `escapepod-rs` vs the official Python `pod5` tool (v0.3.36).
 ## 2026-04-19 run (post-SIMD, post-audit)
 
 Run on the 2026-04 perf branch with SSSE3 SIMD SVB16 + release LTO profile.
-Note: none of the benchmarked commands decompress signal (inspect/view are
-metadata-only; filter/subset use compressed-passthrough), so the SVB16
+The commands that move bulk data — `filter`, `subset`, `bam-filter`, `merge`
+— are the ones that matter on real workflows; `inspect`/`view` are
+metadata-only and included below only for completeness.
+
+None of the benchmarked commands decompress signal (inspect/view hit
+metadata; filter/subset/merge use compressed-passthrough), so the SVB16
 SIMD wins are invisible to this suite — see `escapepod/benches/hot_paths.rs`
 for microbenchmarks that exercise decode/encode directly.
 
@@ -118,15 +122,29 @@ for microbenchmarks that exercise decode/encode directly.
 |------|------|-------|
 | no_aaRS_caps_deacyl_b5.pod5 | 4.4 GB | 520,851 |
 
-### Results Summary
+### Bulk data operations
 
 | Command | escapepod-rs | pod5 (Python) | Speedup |
 |---------|-------------:|--------------:|--------:|
-| inspect summary | 47.9 ms ± 2.6 | 1.854 s ± 0.009 | **38.7×** |
-| view (→/dev/null) | 594 ms ± 7 | 5.873 s ± 0.009 | **9.9×** |
-| filter (10 % of reads) | 1.43 s ± 0.05 | 9.82 s ± 0.11 | **6.9×** |
-| subset (2 groups) | 19.1 s ± 0.9 | 26.8 s ± 0.4 | **1.4×** |
-| merge | skipped (single-file input) | | |
+| filter (10 % of reads, 4.4 GB → ~440 MB) | **1.43 s** ± 0.05 | 9.82 s ± 0.11 | **6.9×** |
+| subset (split into 2 groups, 4.4 GB) | **19.1 s** ± 0.9 | 26.8 s ± 0.4 | **1.4×** |
+| bam-filter (mapped-only, region, MAPQ) | escpod-only | — | — |
+| merge | skipped (single-file input, see 2026-03-20 run) | | |
+
+`bam-filter` has no Python counterpart in `pod5`; it reuses the same
+block-level compressed-signal passthrough as `filter`, so the 4.4 GB
+filter numbers are a reasonable proxy for its I/O path.
+
+### Metadata operations (small absolute times)
+
+| Command | escapepod-rs | pod5 (Python) | Speedup |
+|---------|-------------:|--------------:|--------:|
+| inspect summary | 47.9 ms ± 2.6 | 1.854 s ± 0.009 | 38.7× |
+| view (→/dev/null) | 594 ms ± 7 | 5.873 s ± 0.009 | 9.9× |
+
+These commands finish in well under a second either way — the speedup
+ratio looks dramatic but the wall-clock difference is negligible in a
+pipeline.
 
 ### Microbenchmarks (criterion) — SVB16 SIMD vs scalar
 
@@ -152,33 +170,48 @@ SSSE3 `_mm_shuffle_epi8` + prefix-sum delta decode. Measured with
 | PAY38817_82d9df02_82c8ff31_1.pod5 | 1.5 GB | 153,075 |
 | **Total** | **3.0 GB** | **312,748** |
 
-### Results Summary
+### Bulk data operations
 
-| Command | escapepod | pod5 (Python/C++) | Speedup |
-|---------|-----------|---------------|---------|
-| inspect summary | 36 ms | 1.7 s | **47x faster** |
-| view | 238 ms | 4.5 s | **19x faster** |
-| merge (1 thread, 2 files, 3 GB) | 4.1 s | 4.1 s | ~1x |
-| merge (4 threads) | 3.0 s | 4.1 s | **1.4x faster** |
-| filter (10% of reads) | 513 ms | 4.7 s | **9x faster** |
-| subset (2 groups) | 2.8 s | 8.3 s | **3x faster** |
+| Command | escapepod-rs | pod5 (Python/C++) | Speedup |
+|---------|-------------:|------------------:|--------:|
+| filter (10 % of reads, 3 GB) | **513 ms** | 4.7 s | **9×** |
+| subset (2 groups, 3 GB) | **2.8 s** | 8.3 s | **3×** |
+| merge (4 threads, 2 files, 3 GB) | **3.0 s** | 4.1 s | **1.4×** |
+| merge (1 thread) | 4.1 s | 4.1 s | ~1× (I/O-bound on NFS) |
+
+### Metadata operations
+
+| Command | escapepod-rs | pod5 (Python/C++) | Speedup |
+|---------|-------------:|------------------:|--------:|
+| inspect summary | 36 ms | 1.7 s | 47× |
+| view | 238 ms | 4.5 s | 19× |
 
 ## Analysis
 
-### Where escapepod excels
+### Where escapepod moves the needle
 
-- **Read-only operations**: `inspect` and `view` commands are dramatically faster (19-47x) due to:
-  - No Python interpreter startup overhead
-  - Memory-mapped file I/O
-  - Efficient Arrow table iteration
+- **Filter / subset / bam-filter** share one code path: block-level
+  compressed-signal passthrough with parallel group writes via rayon,
+  plus the `reads_by_ids()` fast path for indexed batch lookup. That
+  gives **~9×** on filter and **~3×** on subset in absolute seconds
+  saved on multi-GB files — the wins scale with input size, unlike
+  the metadata commands.
 
-- **Filter and subset operations**: `filter` is **9x faster** and `subset` is **3x faster** than pod5 due to:
-  - Parallel group processing with rayon
-  - Block-level signal copying (preserves compression)
-  - Indexed batch lookup via `.p5i` or `reads_by_ids()` fast path
-  - Single-pass signal extraction per output group
+- **Merge** is I/O-bound at 1 thread (both tools sit at ~4 s on NFS).
+  With 4 threads, parallel metadata loading + zero-copy signal
+  forwarding give a **1.4×** win, and the `Arc<[u8]>` compressed
+  chunks avoid any decompress/recompress round-trip.
 
-- **Merge operations**: At 1 thread, both tools are ~equal (I/O-bound on NFS). With 4 threads, escapepod is **1.4x faster** thanks to parallel metadata loading and zero-copy signal forwarding.
+- **bam-filter** has no Python counterpart. It reuses the `filter`
+  passthrough path, so its steady-state throughput is bounded by the
+  same block-level copy cost as `filter`.
+
+### Metadata commands (inspect, view)
+
+Dramatically faster on paper (19–47×) thanks to no Python interpreter
+startup, memory-mapped I/O, and tight Arrow iteration — but the
+absolute times are tens to hundreds of milliseconds either way. This
+matters for interactive use; it doesn't change pipeline wall-clock.
 
 ## Running Benchmarks
 
