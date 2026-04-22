@@ -61,11 +61,14 @@ inherits = "release"
 strip = false
 
 # Release-speed build with symbols preserved — for samply/perf recordings
-# where you want final codegen but readable stack traces.
+# where you want final codegen but readable stack traces. Debuginfo is
+# split into a sibling `.dwp` so the binary stays small and link time
+# doesn't balloon; samply/perf/gdb pick up the sidecar automatically.
 [profile.release-with-debug]
 inherits = "release"
 strip = false
 debug = 2
+split-debuginfo = "packed"
 
 # Profiling build: drops LTO and splits codegen so frames aren't inlined
 # away from profilers (valgrind, perf, samply). Slower than release, but
@@ -76,6 +79,7 @@ lto = false
 codegen-units = 16
 strip = false
 debug = 2
+split-debuginfo = "packed"
 
 # Fast dev builds, but with optimized third-party crates so tests run
 # at a reasonable speed.

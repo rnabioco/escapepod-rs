@@ -1,0 +1,23 @@
+# Pinned rustflags for local Linux/x86_64 builds.
+#
+# Baseline: `x86-64-v3` = SSE4.2 + AVX + AVX2 + FMA + BMI1/BMI2 + POPCNT + F16C.
+# Every x86_64 CPU in this cluster (Broadwell login node, Cascade Lake rna,
+# Ice Lake gpu) supports this. Features above v3 (AVX-512, VBMI, …) are not
+# pinned here — the rna partition lacks the Ice Lake-only flags (VBMI, etc.),
+# so a `target-cpu=native` binary produced on a gpu node fails to load on
+# rna. Hot kernels that want AVX-512 should use `#[target_feature]` +
+# runtime `is_x86_feature_detected!` dispatch, not a global baseline bump.
+#
+# Only applies to the x86_64 GNU target. CI release binaries target musl
+# with their own RUSTFLAGS (see .github/workflows/release.yml); aarch64
+# and macOS are unaffected. Python wheels built by developers via
+# maturin/pip pick this up, which is fine since v3 is portable across
+# any x86_64 CPU since ~2013.
+#
+# Faster linker (mold/lld) is a known follow-up. Conda-forge's `clangdev`
+# ships a sysroot-pinned .cfg that conflicts with Rust's host proc-macro
+# linking; working around it also requires glibc-static, which isn't
+# installed on the compute nodes. Needs a system-level install (sudo) or
+# a different toolchain sourcing strategy to land cleanly.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

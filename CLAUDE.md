@@ -43,11 +43,25 @@ cargo test test_round_trip_single_read
 # Run clippy lints
 cargo clippy
 
-# Build optimized for the current CPU (enables AVX2, etc.)
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-
 # Run the CLI (after building)
 ./target/release/escpod <command>
+```
+
+### Build baseline and SLURM builds
+
+Local Linux/x86_64 builds pin `-C target-cpu=x86-64-v3` via `.cargo/config.toml`
+(AVX2 + FMA + BMI2 + POPCNT + F16C). This is portable across every node in
+the cluster (Broadwell login, Cascade Lake rna, Ice Lake gpu). Do **not**
+use `target-cpu=native`: a binary built on a gpu node uses Ice Lake-only
+instructions (VBMI, VPCLMULQDQ, …) that SIGILL on rna. Hot kernels that
+want AVX-512 do so via `#[target_feature]` + runtime `is_x86_feature_detected!`
+dispatch, not a global baseline bump.
+
+The login node has only 2 cores — wrap any heavy build in `srun -p rna -c 32`:
+
+```bash
+srun -p rna -c 32 --mem=32G pixi run cargo build --release
+srun -p rna -c 32 --mem=32G pixi run cargo test --workspace
 ```
 
 ## Benchmarking & Profiling

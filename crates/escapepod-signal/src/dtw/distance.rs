@@ -67,9 +67,15 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         return f32::INFINITY;
     }
 
-    // Use two rows for memory efficiency (current and previous)
+    // Two rows for memory efficiency (current and previous) plus two scratch
+    // buffers that hold per-row precomputed values. The inner loop is split
+    // into a vectorizable "precompute" pass (no loop-carried deps, LLVM
+    // auto-vectorizes to AVX2) and a short serial "chain" pass that applies
+    // the `curr[j-1]` left-neighbor dependency.
     let mut prev = vec![f32::INFINITY; m + 1];
     let mut curr = vec![f32::INFINITY; m + 1];
+    let mut cost_buf = vec![0.0f32; m + 1];
+    let mut prev_min_buf = vec![0.0f32; m + 1];
     prev[0] = 0.0;
 
     for i in 1..=n {
@@ -99,19 +105,43 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
             curr[j_start - 1] = f32::INFINITY;
         }
 
-        // Track minimum value in this row for early abandonment
-        let mut row_min = f32::INFINITY;
+        if j_start > j_end {
+            std::mem::swap(&mut prev, &mut curr);
+            continue;
+        }
 
         let ai = a[i - 1];
-        for j in j_start..=j_end {
-            let diff = ai - b[j - 1];
-            let cost = diff * diff;
-            // Split the chained min so LLVM can schedule the two
-            // independent pair-mins in parallel (shorter critical path).
-            let m1 = prev[j - 1].min(prev[j]);
-            let min_prev = m1.min(curr[j - 1]);
-            let v = cost + min_prev;
-            curr[j] = v;
+        let len = j_end - j_start + 1;
+
+        // Pass 1 (vectorizable): cost[k] = (ai - b[j-1])^2,
+        //                      prev_min[k] = min(prev[j-1], prev[j])
+        // where k = j - j_start. No loop-carried deps on writes; LLVM
+        // auto-vectorizes to AVX2 8-wide with -C target-cpu=x86-64-v3.
+        {
+            let b_slice = &b[j_start - 1..j_end];
+            let prev_left = &prev[j_start - 1..j_end];
+            let prev_right = &prev[j_start..=j_end];
+            let cost = &mut cost_buf[..len];
+            let pm = &mut prev_min_buf[..len];
+            for k in 0..len {
+                let diff = ai - b_slice[k];
+                cost[k] = diff * diff;
+                pm[k] = prev_left[k].min(prev_right[k]);
+            }
+        }
+
+        // Pass 2 (serial): apply the `curr[j-1]` left-chain and update curr.
+        //   curr[j] = cost[k] + min(prev_min[k], curr[j-1])
+        // Only three fp ops per iteration: min, add, row_min update.
+        let mut row_min = f32::INFINITY;
+        let mut left = curr[j_start - 1];
+        let cost = &cost_buf[..len];
+        let pm = &prev_min_buf[..len];
+        let out = &mut curr[j_start..=j_end];
+        for k in 0..len {
+            let v = cost[k] + pm[k].min(left);
+            out[k] = v;
+            left = v;
             row_min = row_min.min(v);
         }
 
