@@ -64,7 +64,7 @@ mod train;
 pub mod adapter_cnn;
 
 pub use fingerprint::{
-    BarcodeFingerprint, ReadFingerprint, compute_consensus_fingerprint,
+    BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
     compute_std_dev_fingerprint, extract_fingerprint_from_signal,
 };
 

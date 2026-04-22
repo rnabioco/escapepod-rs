@@ -1,7 +1,6 @@
 //! Shared utilities for demux subcommands.
 
-use super::types::ReadBoundaries;
-use escapepod_demux::BarcodeFingerprint;
+use escapepod_demux::{BarcodeFingerprint, ReadBoundaries};
 use escapepod_signal::Reader;
 use escapepod_signal::dtw::NormMethod;
 use flate2::read::GzDecoder;

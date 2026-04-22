@@ -1,29 +1,8 @@
-//! Common types for demux subcommands.
+//! CLI-only types used by the demux subcommands. Domain types
+//! (fingerprints, boundaries, etc.) live in [`escapepod_demux`].
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-use uuid::Uuid;
-
-/// Read boundary information from adapter detection.
-#[derive(Debug, Clone)]
-pub struct ReadBoundaries {
-    /// The read identifier
-    pub read_id: Uuid,
-    /// Total number of samples in the read
-    pub num_samples: u64,
-    /// Start position of the adapter region
-    pub adapter_start: usize,
-    /// End position of the adapter region
-    pub adapter_end: usize,
-}
-
-impl ReadBoundaries {
-    /// Check if the adapter region is valid (end > start).
-    pub fn has_valid_adapter(&self) -> bool {
-        self.adapter_end > self.adapter_start
-    }
-}
 
 /// Barcode statistics for training output.
 #[derive(Debug, Serialize, Deserialize)]

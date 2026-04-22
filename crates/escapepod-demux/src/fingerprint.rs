@@ -13,6 +13,27 @@ use escapepod_signal::dtw::{Fingerprint, NormMethod, normalize_fingerprint};
 use escapepod_signal::segmentation::{clip_outliers, mad_normalize, segment_signal};
 use uuid::Uuid;
 
+/// Per-read adapter boundaries — the output of `detect_adapter` augmented
+/// with read identity. Flows from the `detect` stage into `fingerprint`.
+#[derive(Debug, Clone)]
+pub struct ReadBoundaries {
+    /// The read identifier
+    pub read_id: Uuid,
+    /// Total number of samples in the read
+    pub num_samples: u64,
+    /// Start position of the adapter region
+    pub adapter_start: usize,
+    /// End position of the adapter region
+    pub adapter_end: usize,
+}
+
+impl ReadBoundaries {
+    /// Check if the adapter region is valid (end > start).
+    pub fn has_valid_adapter(&self) -> bool {
+        self.adapter_end > self.adapter_start
+    }
+}
+
 /// A fingerprint extracted from a single read's adapter region.
 #[derive(Debug, Clone)]
 pub struct ReadFingerprint {
