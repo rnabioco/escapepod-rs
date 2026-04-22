@@ -20,16 +20,29 @@
 //! ```
 
 mod kernel;
+mod svm_kernels;
+
+pub use svm_kernels::{
+    KERNEL_SRC as SVM_KERNEL_SRC, MODULE_NAME as SVM_MODULE_NAME,
+    OVO_DECISION_KERNEL_NAME, RBF_KERNEL_NAME,
+};
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, DriverError, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaFunction, DriverError, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{CompileError, compile_ptx};
 use ndarray::Array2;
 use thiserror::Error;
 
-const MODULE_NAME: &str = "escapepod_gpu_dtw";
-const KERNEL_NAME: &str = "dtw_matrix_kernel";
+/// Module name registered with the GPU device for the DTW kernel.
+/// Re-exported so downstream crates (escapepod-demux's GPU pipeline)
+/// can grab the `CudaFunction` handle via `GpuDtwContext::function`.
+pub const DTW_MODULE_NAME: &str = "escapepod_gpu_dtw";
+/// Kernel name registered with the GPU device. See `DTW_MODULE_NAME`.
+pub const DTW_KERNEL_NAME: &str = "dtw_matrix_kernel";
+
+const MODULE_NAME: &str = DTW_MODULE_NAME;
+const KERNEL_NAME: &str = DTW_KERNEL_NAME;
 
 /// Errors from the GPU DTW path.
 #[derive(Debug, Error)]
@@ -62,12 +75,45 @@ impl GpuDtwContext {
         Self::new_on_device(0)
     }
 
-    /// Initialize on a specific CUDA device ordinal.
+    /// Initialize on a specific CUDA device ordinal. Compiles **both** the
+    /// DTW kernel and the post-DTW SVM helper kernels (RBF + OvO decision)
+    /// at startup — escapepod-demux's GPU classify path needs them, and
+    /// keeping the load here means downstream callers don't have to learn
+    /// a second NVRTC compile cycle.
     pub fn new_on_device(ordinal: usize) -> Result<Self, GpuDtwError> {
         let device = CudaDevice::new(ordinal)?;
-        let ptx = compile_ptx(kernel::KERNEL_SRC)?;
-        device.load_ptx(ptx, MODULE_NAME, &[KERNEL_NAME])?;
+
+        let dtw_ptx = compile_ptx(kernel::KERNEL_SRC)?;
+        device.load_ptx(dtw_ptx, MODULE_NAME, &[KERNEL_NAME])?;
+
+        let svm_ptx = compile_ptx(SVM_KERNEL_SRC)?;
+        device.load_ptx(
+            svm_ptx,
+            SVM_MODULE_NAME,
+            &[RBF_KERNEL_NAME, OVO_DECISION_KERNEL_NAME],
+        )?;
+
         Ok(Self { device })
+    }
+
+    /// Borrow the underlying `Arc<CudaDevice>`. Lets downstream crates
+    /// (escapepod-demux's GPU classify path) launch their own kernels —
+    /// notably the RBF + OvO decision kernels we pre-load above — without
+    /// having to spin up a second context.
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
+    }
+
+    /// Look up a pre-loaded kernel by `(module_name, kernel_name)`.
+    /// Used by `escapepod-demux` to grab the SVM helper kernels.
+    pub fn function(
+        &self,
+        module: &'static str,
+        kernel_name: &'static str,
+    ) -> Result<CudaFunction, GpuDtwError> {
+        self.device
+            .get_func(module, kernel_name)
+            .ok_or(GpuDtwError::KernelMissing(kernel_name))
     }
 
     /// Compute an (n_queries × n_refs) banded DTW distance matrix on the GPU.

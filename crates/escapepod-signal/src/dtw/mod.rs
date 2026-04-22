@@ -19,4 +19,7 @@ pub use fingerprint::{Fingerprint, NormMethod, normalize_fingerprint};
 pub use kernel::{distance_to_kernel, distance_to_kernel_auto};
 
 #[cfg(feature = "gpu")]
-pub use cuda::{GpuDtwContext, GpuDtwError, dtw_distance_matrix_gpu};
+pub use cuda::{
+    DTW_KERNEL_NAME, DTW_MODULE_NAME, GpuDtwContext, GpuDtwError, OVO_DECISION_KERNEL_NAME,
+    RBF_KERNEL_NAME, SVM_MODULE_NAME, dtw_distance_matrix_gpu,
+};
