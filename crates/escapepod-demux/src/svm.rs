@@ -10,6 +10,7 @@
 //! 4. Convert decision values to probabilities via Platt scaling
 
 use escapepod_signal::dtw::dtw_distance;
+use rayon::prelude::*;
 
 use crate::model::{DtwSvmModel, KernelParams};
 use crate::probability::{ProbabilityResult, process_probabilities};
@@ -701,13 +702,14 @@ pub fn classify_with_svm(model: &SvmModel, fingerprint: &[f64]) -> (Vec<f64>, Pr
 /// whole batch.
 ///
 /// Default chunk budget (in matrix cells) for the GPU batch classifier.
-/// 512M cells × f32 ≈ 2 GB of device distance matrix per call. Fits
-/// comfortably on a 24 GB A30 with ~22 GB of headroom for DTW kernel
-/// scratch. Smaller cards (T4 at 16 GB, older K80) may need to drop
-/// this; bigger cards (H100/A100 80G) can go 2–4× larger. Surfaced as
-/// a tunable parameter on the per-ctx entry point so callers can size
-/// it from a CLI flag or runtime device-memory query.
-pub const DEFAULT_GPU_CHUNK_CELLS: usize = 512 * 1024 * 1024;
+/// 2G cells × f32 ≈ 8 GB of device distance matrix per call. Sized for
+/// a 24 GB A30 with the parallel-consumer pipeline — at 8 GB matrix +
+/// DTW kernel scratch + driver overhead, we sit around 12-14 GB peak,
+/// leaving a comfortable margin. Smaller cards (T4 at 16 GB) want to
+/// drop this to ~512M; bigger cards (H100/A100 80G) can push to 4-8G.
+/// Surfaced as a tunable parameter on the per-ctx entry point so
+/// callers can override from a CLI flag or runtime device query.
+pub const DEFAULT_GPU_CHUNK_CELLS: usize = 2 * 1024 * 1024 * 1024;
 
 /// Only available with the `gpu` feature.
 #[cfg(feature = "gpu")]
@@ -773,8 +775,9 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
     let window = model.window;
 
     let predictor = SvmPredictor::new(model);
-    let mut ws = SvmWorkspace::for_model(model);
     let mut out = Vec::with_capacity(fingerprints.len());
+    let predictor_ref = &predictor;
+    let model_ref = model;
 
     std::thread::scope(|scope| -> Result<(), escapepod_signal::dtw::GpuDtwError> {
         // Producer thread: walks chunks in order, runs GPU DTW, ships
@@ -798,14 +801,20 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
         });
 
         // Consumer (this thread): pulls finished distance matrices in
-        // order and runs the per-row CPU pipeline against them. While
-        // we're crunching chunk N, the producer is uploading chunk N+1.
+        // order and fans the per-row CPU pipeline across rayon. The
+        // per-row work (RBF transform, OvO decision_function, Platt
+        // probabilities, label-mapper lookup) is embarrassingly
+        // parallel and was the wall-clock bottleneck — at AveCPU=1.25
+        // out of 16 cores observed during a 30M-row eval, the GPU
+        // producer was waiting on the consumer the whole way.
+        // Each rayon worker keeps its own `SvmWorkspace` via
+        // `map_init` so the k×k coupling buffers don't reallocate
+        // per-row. `collect()` preserves order so out-of-`out` ordering
+        // matches the input fingerprints.
         for _chunk_idx in 0..n_chunks {
             let dist = match rx.recv() {
                 Ok(Ok(d)) => d,
                 Ok(Err(e)) => {
-                    // Drain remaining sends so the producer can exit
-                    // cleanly, then propagate.
                     drop(rx);
                     let _ = producer.join();
                     return Err(e);
@@ -813,30 +822,39 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
                 Err(_) => break, // producer exited / channel closed
             };
 
-            for i in 0..dist.nrows() {
-                let row = dist.row(i);
-                ws.kernel.clear();
-                ws.kernel.extend(row.iter().map(|&d| {
-                    let d = d as f64;
-                    (-model.kernel_params.gamma * d.powf(model.kernel_params.power)).exp()
-                }));
+            let chunk_results: Vec<(Vec<f64>, ProbabilityResult)> = (0..dist.nrows())
+                .into_par_iter()
+                .map_init(
+                    || SvmWorkspace::for_model(model_ref),
+                    |ws, i| {
+                        let row = dist.row(i);
+                        ws.kernel.clear();
+                        ws.kernel.extend(row.iter().map(|&d| {
+                            let d = d as f64;
+                            (-model_ref.kernel_params.gamma
+                                * d.powf(model_ref.kernel_params.power))
+                            .exp()
+                        }));
 
-                let kernel = std::mem::take(&mut ws.kernel);
-                let mut decisions = std::mem::take(&mut ws.decisions);
-                predictor.decision_function_into(&kernel, &mut ws, &mut decisions);
-                ws.kernel = kernel;
+                        let kernel = std::mem::take(&mut ws.kernel);
+                        let mut decisions = std::mem::take(&mut ws.decisions);
+                        predictor_ref.decision_function_into(&kernel, ws, &mut decisions);
+                        ws.kernel = kernel;
 
-                let probabilities =
-                    predictor.decision_to_probabilities_with(&decisions, &mut ws);
-                ws.decisions = decisions;
+                        let probabilities =
+                            predictor_ref.decision_to_probabilities_with(&decisions, ws);
+                        ws.decisions = decisions;
 
-                let result = process_probabilities(
-                    &probabilities,
-                    &model.label_mapper,
-                    model.thresholds.as_deref(),
-                );
-                out.push((probabilities, result));
-            }
+                        let result = process_probabilities(
+                            &probabilities,
+                            &model_ref.label_mapper,
+                            model_ref.thresholds.as_deref(),
+                        );
+                        (probabilities, result)
+                    },
+                )
+                .collect();
+            out.extend(chunk_results);
         }
 
         let _ = producer.join();
