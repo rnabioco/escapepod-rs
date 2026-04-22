@@ -15,6 +15,7 @@
 mod classify;
 mod detect;
 mod fingerprint;
+mod fp_io;
 mod split;
 mod train;
 mod types;

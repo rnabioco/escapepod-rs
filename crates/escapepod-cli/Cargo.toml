@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+arrow = { workspace = true }
 bstr = "1"
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -33,6 +34,7 @@ noodles-core = "0.19"
 noodles-csi = "0.55"
 noodles-sam = "0.84"
 owo-colors = "4"
+parquet = { workspace = true }
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

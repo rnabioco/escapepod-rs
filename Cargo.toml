@@ -31,6 +31,10 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Compression
 zstd = "0.13"
+# Parquet I/O for fingerprint tables (workspace dep so both test fixtures
+# and the CLI share the same version; features are kept default-off at
+# the workspace level so non-parquet crates don't pay).
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Python bindings
 pyo3 = { version = "0.28", features = ["extension-module"] }
 numpy = "0.28"

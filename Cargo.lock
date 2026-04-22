@@ -812,6 +812,7 @@ name = "escapepod-cli"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "bstr",
  "chrono",
  "clap",
@@ -826,6 +827,7 @@ dependencies = [
  "noodles-csi",
  "noodles-sam",
  "owo-colors",
+ "parquet",
  "rayon",
  "serde",
  "serde_json",
