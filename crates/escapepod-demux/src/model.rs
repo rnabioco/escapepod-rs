@@ -250,6 +250,72 @@ pub fn load_svm_model(path: &Path) -> Result<DtwSvmModel, anyhow::Error> {
     Ok(model)
 }
 
+/// Either kind of barcode model the CLI knows how to classify with.
+///
+/// We maintain two on-disk schemas — `DtwSvmModel` (from `escpod demux
+/// train-svm`, has `label_mapper`) and `WarpDemuxModel` (legacy/exported
+/// from upstream WarpDemuX, has `label_map`) — and callers historically
+/// had to choose the right loader. [`load_any_model`] picks for you based
+/// on the JSON shape and returns a tagged enum; the CLI dispatches on the
+/// variant so users don't have to care which flavor lives on disk.
+#[derive(Debug)]
+pub enum AnyModel {
+    Svm(DtwSvmModel),
+    WarpDemux(WarpDemuxModel),
+}
+
+/// Load a model from JSON, auto-detecting whether it's a `DtwSvmModel` or
+/// a legacy `WarpDemuxModel`.
+///
+/// We discriminate on the presence of `label_mapper` (DtwSvmModel) vs
+/// `label_map` (WarpDemuxModel) at the top level — both structs are
+/// flat JSON objects and those two fields are disjoint by schema, so the
+/// check is unambiguous and cheap (single pass, no full parse before the
+/// branch). Once the kind is known we parse into the appropriate struct
+/// and validate.
+///
+/// Errors if the file isn't valid JSON, matches neither schema, or fails
+/// its model-specific validation.
+pub fn load_any_model(path: &Path) -> Result<AnyModel, anyhow::Error> {
+    use anyhow::Context;
+
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open model file '{}'", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let json: serde_json::Value = serde_json::from_reader(reader)
+        .with_context(|| format!("Failed to parse model JSON at '{}'", path.display()))?;
+
+    let obj = json.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Model file '{}' is not a JSON object",
+            path.display()
+        )
+    })?;
+
+    if obj.contains_key("label_mapper") {
+        let model: DtwSvmModel = serde_json::from_value(json)
+            .with_context(|| "Failed to parse DtwSvmModel JSON")?;
+        model
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid DtwSvmModel: {}", e))?;
+        Ok(AnyModel::Svm(model))
+    } else if obj.contains_key("label_map") {
+        let model: WarpDemuxModel = serde_json::from_value(json)
+            .with_context(|| "Failed to parse WarpDemuxModel JSON")?;
+        model
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid WarpDemuxModel: {}", e))?;
+        Ok(AnyModel::WarpDemux(model))
+    } else {
+        anyhow::bail!(
+            "Model file '{}' has neither `label_mapper` (DtwSvmModel) nor \
+             `label_map` (WarpDemuxModel); can't determine format.",
+            path.display()
+        )
+    }
+}
+
 /// A trained WarpDemuX model for barcode classification.
 ///
 /// This model uses DTW distance to find the nearest training fingerprint,
