@@ -845,6 +845,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "cudarc",
  "escapepod-pod5",
  "escapepod-signal",
  "linfa",

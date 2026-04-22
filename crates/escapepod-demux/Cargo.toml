@@ -29,14 +29,20 @@ linfa-svm = { version = "0.8", optional = true }
 # user supplies the model file at runtime (weights are CC BY-NC).
 tract-onnx = { workspace = true, optional = true }
 
+# CUDA driver bindings for the on-device SVM pipeline (RBF + OvO
+# decision). Opt-in via the `gpu` feature, same as the DTW kernel itself.
+cudarc = { workspace = true, optional = true }
+
 [features]
 default = []
 # Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
 train = ["dep:linfa", "dep:linfa-svm"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
-# time, not build time.
-gpu = ["escapepod-signal/gpu"]
+# time, not build time. Also pulls cudarc directly so the post-DTW SVM
+# pipeline (RBF + OvO decision) can launch its own kernels via the shared
+# device handle.
+gpu = ["escapepod-signal/gpu", "dep:cudarc"]
 # CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
 # tract-onnx). Users supply an ONNX file produced by
 # `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC
