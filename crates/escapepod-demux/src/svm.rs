@@ -702,14 +702,16 @@ pub fn classify_with_svm(model: &SvmModel, fingerprint: &[f64]) -> (Vec<f64>, Pr
 /// whole batch.
 ///
 /// Default chunk budget (in matrix cells) for the GPU batch classifier.
-/// 2G cells × f32 ≈ 8 GB of device distance matrix per call. Sized for
-/// a 24 GB A30 with the parallel-consumer pipeline — at 8 GB matrix +
-/// DTW kernel scratch + driver overhead, we sit around 12-14 GB peak,
-/// leaving a comfortable margin. Smaller cards (T4 at 16 GB) want to
-/// drop this to ~512M; bigger cards (H100/A100 80G) can push to 4-8G.
-/// Surfaced as a tunable parameter on the per-ctx entry point so
-/// callers can override from a CLI flag or runtime device query.
-pub const DEFAULT_GPU_CHUNK_CELLS: usize = 2 * 1024 * 1024 * 1024;
+/// 4G cells × f32 ≈ 16 GB of device distance matrix per call. Sized for
+/// a 24 GB A30 — at 16 GB matrix + 2-4 GB DTW kernel scratch + driver
+/// overhead, peak sits around 20-22 GB with a slim margin. Halves the
+/// chunk count at the 10k-SV / 30M-query eval workload (142 -> 71
+/// chunks), which matters because the per-chunk kernel launch + host-
+/// device transfer overhead stops being the dominant cost.
+///
+/// Smaller cards (T4 at 16 GB) should drop this to 512M-1G via
+/// `--gpu-chunk-cells`; bigger cards (H100/A100-80G) can push to 8G+.
+pub const DEFAULT_GPU_CHUNK_CELLS: usize = 4 * 1024 * 1024 * 1024;
 
 /// Only available with the `gpu` feature.
 #[cfg(feature = "gpu")]
@@ -760,14 +762,16 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
     //   main thread:     CPU kernel + decision_function + probabilities
     //
     // Without this overlap the GPU sat idle during per-row post-processing
-    // and the CPU sat idle during GPU compute. A bounded channel of
-    // depth 1 (sync_channel capacity = 1) means the producer can be one
-    // chunk ahead — enough to fully amortize the pipeline bubble without
-    // letting GPU results pile up in host memory (each result is up to
-    // chunk_size × n_refs × f32 = chunk_matrix_cells × 4 bytes).
+    // and the CPU sat idle during GPU compute. Channel depth 2 lets the
+    // producer queue the next result *while* the previous one is still on
+    // the channel — covers the brief burst of CPU work at the start of
+    // each chunk (parallel rayon spin-up) without letting GPU stall. Each
+    // buffered distance matrix is `chunk_matrix_cells × f32` host bytes,
+    // so depth 2 at the default 4G cells reserves ~32 GB host RAM. The
+    // `classify_val` SLURM rule allocates 64 GB, plenty of margin.
     use std::sync::mpsc::sync_channel;
     let (tx, rx) = sync_channel::<Result<ndarray::Array2<f32>, escapepod_signal::dtw::GpuDtwError>>(
-        1,
+        2,
     );
     let chunks: Vec<&[Vec<f64>]> = fingerprints.chunks(chunk_size).collect();
     let n_chunks = chunks.len();
