@@ -2,11 +2,11 @@
 
 use super::types::ReadBoundaries;
 use super::utils::{
-    configure_thread_pool, downscale_signal, normalize_signal, process_reads_par, total_read_count,
+    configure_thread_pool, normalize_signal, process_reads_par, total_read_count,
 };
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod_signal::segmentation::detect_adapter;
+use escapepod_signal::segmentation::{detect_adapter, downscale};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -141,7 +141,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
     let progress_bar = create_progress_bar(total as u64, "Detecting")?;
 
-    let downscale = args.downscale.max(1);
+    let downscale_factor = args.downscale.max(1);
     let min_adapter = args.min_adapter;
     let border_trim = args.border_trim;
 
@@ -151,8 +151,15 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
         |read_id, num_samples, signal| {
             let normalized = normalize_signal(signal);
 
-            let (processed_signal, scale_factor) = if downscale > 1 {
-                (downscale_signal(&normalized, downscale), downscale)
+            let (processed_signal, scale_factor) = if downscale_factor > 1 {
+                // Truncate to a whole multiple of downscale_factor so the
+                // last (partial) chunk is dropped — matches the historical
+                // cli behavior and WarpDemuX's numpy-style downsampling.
+                let truncated = (normalized.len() / downscale_factor) * downscale_factor;
+                (
+                    downscale(&normalized[..truncated], downscale_factor),
+                    downscale_factor,
+                )
             } else {
                 (normalized, 1)
             };
