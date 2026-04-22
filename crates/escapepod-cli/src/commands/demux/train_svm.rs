@@ -3,11 +3,9 @@
 //! This command trains a DTW-SVM model that can classify reads by barcode
 //! with probability output. Only available with the `train` feature.
 
+use super::fp_io::read_labeled_fingerprints;
 use crate::style;
 use escapepod_demux::{TrainConfig, train_svm};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 /// Arguments for the train-svm subcommand.
@@ -56,6 +54,22 @@ pub struct TrainSvmArgs {
     #[arg(long, value_name = "VALUES", help_heading = "Advanced Options")]
     pub thresholds: Option<String>,
 
+    /// Randomly subsample each barcode class down to at most N fingerprints
+    /// before training. Required for large datasets since the all-pairs DTW
+    /// distance matrix is O(N^2) memory (easily overflows GPU VRAM). Sampling
+    /// is balanced (same cap per class) and deterministic under `--seed`.
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
+    pub max_per_class: Option<usize>,
+
+    /// RNG seed for `--max-per-class` subsampling
+    #[arg(
+        long,
+        default_value = "42",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
+    pub seed: u64,
+
     /// Run the DTW distance matrix on the GPU (requires `--features gpu`).
     #[cfg(feature = "gpu")]
     #[arg(long, help_heading = "Advanced Options")]
@@ -90,15 +104,30 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
 
     println!("{} SVM model from fingerprints", style::action("Training"));
 
-    // Load fingerprints from CSV
-    let (fingerprints, labels, barcode_names) = load_fingerprints(&args.fingerprints)?;
+    // Load fingerprints from CSV. When `--max-per-class` is set, sampling
+    // happens during the scan (per-class reservoir) so we never materialize
+    // the full CSV in memory — critical for multi-GB training sets.
+    let subsample = args.max_per_class.map(|cap| (cap, args.seed));
+    let (fingerprints, labels, barcode_names, total_seen) =
+        read_labeled_fingerprints(&args.fingerprints, subsample)?;
 
-    println!(
-        "{} {} fingerprints across {} barcodes",
-        style::label("Loaded:"),
-        style::count(fingerprints.len()),
-        style::count(barcode_names.len())
-    );
+    if let Some(cap) = args.max_per_class {
+        println!(
+            "{} {} -> {} kept (cap {} per class, seed {})",
+            style::action("Streamed+subsampled:"),
+            style::count(total_seen),
+            style::count(fingerprints.len()),
+            style::count(cap),
+            style::value(args.seed),
+        );
+    } else {
+        println!(
+            "{} {} fingerprints across {} barcodes",
+            style::label("Loaded:"),
+            style::count(fingerprints.len()),
+            style::count(barcode_names.len())
+        );
+    }
 
     // Parse thresholds if provided
     let thresholds = args.thresholds.as_ref().map(|t| {
@@ -163,65 +192,4 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
     timer.report(profile);
 
     Ok(())
-}
-
-/// Load fingerprints from CSV file.
-///
-/// Expected format: read_id,barcode,feat1,feat2,...,featN
-/// Returns: (fingerprints, labels, barcode_names)
-type FingerprintData = (Vec<Vec<f64>>, Vec<i32>, Vec<String>);
-
-fn load_fingerprints(path: &PathBuf) -> anyhow::Result<FingerprintData> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut fingerprints = Vec::new();
-    let mut labels = Vec::new();
-    let mut barcode_to_id: HashMap<String, i32> = HashMap::new();
-    let mut barcode_names = Vec::new();
-    let mut next_id = 0i32;
-
-    let mut line_count = 0;
-    for line in reader.lines() {
-        let line = line?;
-        line_count += 1;
-
-        // Skip header
-        if line_count == 1 {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 3 {
-            continue; // Need at least read_id, barcode, and one feature
-        }
-
-        // parts[0] is read_id (ignored for training)
-        let barcode = parts[1].to_string();
-
-        // Get or assign barcode ID
-        let label = *barcode_to_id.entry(barcode.clone()).or_insert_with(|| {
-            let id = next_id;
-            next_id += 1;
-            barcode_names.push(barcode);
-            id
-        });
-
-        // Parse features
-        let features: Vec<f64> = parts[2..]
-            .iter()
-            .filter_map(|s| s.trim().parse::<f64>().ok())
-            .collect();
-
-        if !features.is_empty() {
-            fingerprints.push(features);
-            labels.push(label);
-        }
-    }
-
-    if fingerprints.is_empty() {
-        anyhow::bail!("No valid fingerprints found in {}", path.display());
-    }
-
-    Ok((fingerprints, labels, barcode_names))
 }

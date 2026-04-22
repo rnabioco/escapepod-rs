@@ -1,14 +1,36 @@
 //! Classify subcommand - barcode classification using DTW distance.
 
-use super::utils::parse_reference_csv;
+use super::fp_io::{read_query_fingerprints_f32, read_query_fingerprints_f64};
+use super::utils::{configure_thread_pool, parse_reference_csv};
 use crate::style;
-use escapepod_demux::{DtwSvmModel, SvmPredictor, SvmWorkspace, load_svm_model};
+use anyhow::Context;
+use escapepod_demux::{AnyModel, DtwSvmModel, SvmPredictor, SvmWorkspace, load_any_model};
 use escapepod_signal::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Open a streaming output writer. Detects `.gz` extension and transparently
+/// gzip-compresses the output; otherwise writes plain bytes. Both paths
+/// front-buffer with a 256 KiB BufWriter so per-row `writeln!` calls don't
+/// hit the filesystem. `GzEncoder::Drop` finalizes the gzip trailer on
+/// thread teardown; callers should still call `flush()` explicitly to
+/// surface I/O errors during streaming.
+fn open_output_writer(path: &Path) -> anyhow::Result<Box<dyn Write + Send>> {
+    let file = File::create(path)
+        .with_context(|| format!("Failed to create output file '{}'", path.display()))?;
+    let buf = BufWriter::with_capacity(256 * 1024, file);
+    if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        Ok(Box::new(flate2::write::GzEncoder::new(
+            buf,
+            flate2::Compression::default(),
+        )))
+    } else {
+        Ok(Box::new(buf))
+    }
+}
 
 /// Arguments for the classify subcommand.
 #[derive(Debug, clap::Args)]
@@ -17,21 +39,37 @@ pub struct ClassifyArgs {
     #[arg(value_name = "FILE")]
     pub fingerprints: PathBuf,
 
-    /// Reference barcode fingerprints (training data)
+    /// Reference barcode fingerprints (training data, CSV format).
     #[arg(long, value_name = "FILE")]
     pub reference: Option<PathBuf>,
 
-    /// Trained WarpDemuX model (JSON format, legacy distance-based)
+    /// Trained model JSON. Auto-detects between `DtwSvmModel` (from
+    /// `escpod demux train-svm`) and the legacy `WarpDemuxModel` based on
+    /// the JSON shape — users no longer need to pick the matching flag.
     #[arg(long, value_name = "FILE")]
     pub model: Option<PathBuf>,
 
-    /// Trained SVM model (JSON format, with probabilities)
-    #[arg(long, value_name = "FILE")]
+    /// Deprecated alias for `--model`. Kept for compatibility with existing
+    /// scripts; emits a warning when used.
+    #[arg(long, value_name = "FILE", hide = true)]
     pub svm_model: Option<PathBuf>,
 
     /// Output classifications file
     #[arg(short, long, required = true, value_name = "FILE")]
     pub output: PathBuf,
+
+    /// Number of threads for parallel processing (default: all CPUs, or
+    /// whatever the rayon global pool picks up from `RAYON_NUM_THREADS`).
+    #[arg(long, short = 'j', value_name = "N", help_heading = "Advanced Options")]
+    pub threads: Option<usize>,
+
+    /// GPU DTW batch size in matrix cells (queries × refs). Default
+    /// 536_870_912 (~2 GB of f32 distance matrix per call), which fits
+    /// on a 24 GB A30. Lower if you see VRAM OOMs on a smaller card
+    /// (T4 at 16 GB), higher on H100/A100-80G with more headroom.
+    #[cfg(feature = "gpu")]
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
+    pub gpu_chunk_cells: Option<usize>,
 
     /// DTW window constraint (Sakoe-Chiba band width)
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
@@ -105,29 +143,34 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     timer.phase("Classify");
     let profile = args.profile;
 
-    // Count how many input sources are provided
-    let source_count = [
-        args.reference.is_some(),
-        args.model.is_some(),
-        args.svm_model.is_some(),
-    ]
-    .iter()
-    .filter(|&&x| x)
-    .count();
-
-    if source_count == 0 {
-        anyhow::bail!("One of --reference, --model, or --svm-model must be provided");
+    // Fold the deprecated --svm-model alias into --model, since the model
+    // loader now auto-detects the JSON shape. Emit a warning so scripts
+    // start migrating.
+    if let Some(p) = args.svm_model.take() {
+        eprintln!(
+            "{} --svm-model is deprecated; use --model (auto-detects SVM vs WarpDemux JSON).",
+            style::label("warning:"),
+        );
+        if args.model.is_some() {
+            anyhow::bail!("Specify only one of --model / --svm-model (they are aliases now).");
+        }
+        args.model = Some(p);
     }
 
-    if source_count > 1 {
-        anyhow::bail!("Only one of --reference, --model, or --svm-model can be specified");
+    configure_thread_pool(args.threads);
+
+    // Validate that exactly one input source was provided.
+    match (args.model.is_some(), args.reference.is_some()) {
+        (false, false) => anyhow::bail!("One of --reference or --model must be provided"),
+        (true, true) => anyhow::bail!("Only one of --reference or --model can be specified"),
+        _ => {}
     }
 
-    // Dispatch to appropriate classification method
-    let result = if let Some(svm_model_path) = args.svm_model.take() {
-        run_with_svm_model(args, svm_model_path)
-    } else if let Some(model_path) = args.model.take() {
-        run_with_model(args, model_path)
+    let result = if let Some(model_path) = args.model.take() {
+        match load_any_model(&model_path)? {
+            AnyModel::Svm(model) => run_with_svm_model(args, model_path, model),
+            AnyModel::WarpDemux(_) => run_with_model(args, model_path),
+        }
     } else if let Some(reference_path) = args.reference.take() {
         run_with_csv(args, reference_path)
     } else {
@@ -138,8 +181,15 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     result
 }
 
-/// Run classification using a trained SVM model.
-fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Result<()> {
+/// Run classification using a trained SVM model. `model` is the already-parsed
+/// JSON (the dispatcher in `run()` detects the file's schema via
+/// `load_any_model` to pick this path vs the WarpDemux path, so re-reading it
+/// here would be wasted I/O).
+fn run_with_svm_model(
+    args: ClassifyArgs,
+    svm_model_path: PathBuf,
+    model: DtwSvmModel,
+) -> anyhow::Result<()> {
     println!("{} reads using SVM model", style::action("Classifying"));
     println!(
         "{} {}",
@@ -160,10 +210,6 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
         println!("{} per-class probabilities", style::label("Including:"));
     }
 
-    // Load the SVM model
-    println!("{} SVM model...", style::action("Loading"));
-    let model = load_svm_model(&svm_model_path)?;
-
     println!(
         "{} {} classes, {} training samples, {} support vectors",
         style::label("Model:"),
@@ -173,7 +219,7 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
     );
 
     // Read query fingerprints
-    let query_fps = parse_query_fingerprints_f64(&args.fingerprints)?;
+    let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
     println!(
         "{} {} query fingerprints",
@@ -195,12 +241,22 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
     let (confident_count, total_count) = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
-            use escapepod_demux::classify_with_svm_batch_gpu;
+            use escapepod_demux::{
+                DEFAULT_GPU_CHUNK_CELLS, classify_with_svm_batch_gpu_with_ctx,
+            };
             println!("{} reads with SVM on GPU...", style::action("Classifying"));
+            let chunk_cells = args.gpu_chunk_cells.unwrap_or(DEFAULT_GPU_CHUNK_CELLS);
             let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
-            let gpu_results = classify_with_svm_batch_gpu(&model, &fps)
-                .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
+            let ctx = escapepod_signal::dtw::GpuDtwContext::new()
+                .map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+            let gpu_results = classify_with_svm_batch_gpu_with_ctx(
+                &ctx,
+                &model,
+                &fps,
+                chunk_cells,
+            )
+            .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
 
             // GPU batch already produces the full Vec; stream it to the
             // writer so we still avoid buffering n_pairs × probabilities
@@ -314,7 +370,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
     );
 
     // Read query fingerprints
-    let query_fps = parse_query_fingerprints_f64(&args.fingerprints)?;
+    let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
     println!(
         "{} {} query fingerprints",
@@ -438,7 +494,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     }
 
     // Read query fingerprints
-    let query_fps = parse_query_fingerprints_f32(&args.fingerprints)?;
+    let query_fps = read_query_fingerprints_f32(&args.fingerprints)?;
 
     println!(
         "{} {} query fingerprints",
@@ -554,55 +610,9 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     Ok(())
 }
 
-/// Parse query fingerprints from CSV file.
-///
-/// The CSV should have a header row, with the first column being the read_id (UUID)
-/// and subsequent columns being feature values.
-fn parse_query_fingerprints<T>(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<T>)>>
-where
-    T: std::str::FromStr,
-{
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut fingerprints = Vec::new();
-    let mut header_seen = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        if !header_seen {
-            header_seen = true;
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 2
-            && let Ok(read_id) = Uuid::parse_str(parts[0])
-        {
-            let values: Vec<T> = parts[1..]
-                .iter()
-                .filter_map(|s| s.parse::<T>().ok())
-                .collect();
-            if !values.is_empty() {
-                fingerprints.push((read_id, values));
-            }
-        }
-    }
-
-    Ok(fingerprints)
-}
-
-/// Parse query fingerprints as f64 (for model classification).
-#[inline]
-fn parse_query_fingerprints_f64(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<f64>)>> {
-    parse_query_fingerprints(path)
-}
-
-/// Parse query fingerprints as f32 (for CSV classification).
-#[inline]
-fn parse_query_fingerprints_f32(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec<f32>)>> {
-    parse_query_fingerprints(path)
-}
+// Query fingerprint parsing moved to `super::fp_io` so the CSV path and
+// the new Parquet path share the same dispatch + barcode-column-skip
+// logic. See `read_query_fingerprints_f64` / `_f32` there.
 
 /// Streaming variant of the legacy `write_model_classifications` writer.
 /// Same producer/consumer pattern as [`stream_svm_classifications`].
@@ -619,8 +629,7 @@ where
     let path_buf = path.to_path_buf();
 
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<(usize, usize)> {
-        let output_file = File::create(&path_buf)?;
-        let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
+        let mut writer = open_output_writer(&path_buf)?;
         writeln!(
             writer,
             "read_id,barcode,confidence,best_distance,second_best_distance,is_confident"
@@ -658,8 +667,7 @@ where
 
 /// Write CSV classification results to CSV.
 fn write_csv_classifications(path: &PathBuf, results: &[ClassifyResult]) -> anyhow::Result<()> {
-    let output_file = File::create(path)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = open_output_writer(path)?;
 
     writeln!(
         writer,
@@ -723,8 +731,7 @@ where
     let path_buf = path.to_path_buf();
 
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<(usize, usize)> {
-        let output_file = File::create(&path_buf)?;
-        let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
+        let mut writer = open_output_writer(&path_buf)?;
 
         if include_probabilities {
             write!(writer, "read_id,predicted_barcode,confidence,is_confident")?;
