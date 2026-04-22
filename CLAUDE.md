@@ -57,11 +57,19 @@ instructions (VBMI, VPCLMULQDQ, …) that SIGILL on rna. Hot kernels that
 want AVX-512 do so via `#[target_feature]` + runtime `is_x86_feature_detected!`
 dispatch, not a global baseline bump.
 
-The login node has only 2 cores — wrap any heavy build in `srun -p rna -c 32`:
+The login node has only 2 cores — wrap any heavy build or bench in `srun -p rna`:
 
 ```bash
+# build / test — 32 logical CPUs (16 physical cores + HT) is enough
 srun -p rna -c 32 --mem=32G pixi run cargo build --release
 srun -p rna -c 32 --mem=32G pixi run cargo test --workspace
+
+# throughput-sensitive demux runs — ask for a full socket (48 logical = 24 physical + HT).
+# SLURM's `-c 32` only allocates 16 physical cores on rna's Gold 6240R, not 32;
+# `-c 48` fills the socket and gives ~20% more wall-clock speedup on fingerprint
+# without crossing NUMA boundaries. Crossing sockets (`-c 64`+) is a crapshoot on
+# a shared node — other jobs on the second socket regress wall time.
+srun -p rna -c 48 --mem=64G pixi run escpod demux fingerprint …
 ```
 
 ## Benchmarking & Profiling
