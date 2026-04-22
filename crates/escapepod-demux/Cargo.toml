@@ -33,6 +33,11 @@ tract-onnx = { workspace = true, optional = true }
 # decision). Opt-in via the `gpu` feature, same as the DTW kernel itself.
 cudarc = { workspace = true, optional = true }
 
+# Per-chunk progress bar for `classify_with_svm_batch_gpu_*`. Opt-in via
+# the `gpu` feature since the only progress reporting we have today is
+# in the batched GPU classify loop.
+indicatif = { workspace = true, optional = true }
+
 [features]
 default = []
 # Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
@@ -42,7 +47,7 @@ train = ["dep:linfa", "dep:linfa-svm"]
 # time, not build time. Also pulls cudarc directly so the post-DTW SVM
 # pipeline (RBF + OvO decision) can launch its own kernels via the shared
 # device handle.
-gpu = ["escapepod-signal/gpu", "dep:cudarc"]
+gpu = ["escapepod-signal/gpu", "dep:cudarc", "dep:indicatif"]
 # CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
 # tract-onnx). Users supply an ONNX file produced by
 # `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC

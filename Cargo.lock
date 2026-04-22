@@ -848,6 +848,7 @@ dependencies = [
  "cudarc",
  "escapepod-pod5",
  "escapepod-signal",
+ "indicatif",
  "linfa",
  "linfa-svm",
  "ndarray 0.16.1",

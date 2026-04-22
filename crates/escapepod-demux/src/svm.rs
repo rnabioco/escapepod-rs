@@ -781,14 +781,33 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
     let model_ref = model;
     let n_pairs = model.n_classes * (model.n_classes - 1) / 2;
 
+    // indicatif progress bar over chunks. Drawn to stderr so it
+    // composes with snakemake's per-rule log capture (`2> {log}`),
+    // and auto-suppresses to a no-op if stderr isn't a TTY (e.g.
+    // piped to a file) — a per-chunk println goes out instead so
+    // batch logs still record progression.
+    let pb = indicatif::ProgressBar::new(n_chunks as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "[gpu classify] {bar:40.cyan/blue} {pos}/{len} chunks ({percent}%) elapsed {elapsed_precise} eta {eta_precise}",
+        )
+        .expect("static template")
+        .progress_chars("##-"),
+    );
+    let pb_for_producer = pb.clone();
+
     std::thread::scope(|scope| -> Result<(), escapepod_signal::dtw::GpuDtwError> {
         let producer = scope.spawn(move || {
-            for chunk in chunks {
+            for chunk in chunks.into_iter() {
                 let result = svm_ctx.classify_chunk(chunk);
+                if result.is_ok() {
+                    pb_for_producer.inc(1);
+                }
                 if tx.send(result).is_err() {
                     break;
                 }
             }
+            pb_for_producer.finish_and_clear();
         });
 
         for _chunk_idx in 0..n_chunks {
