@@ -9,15 +9,18 @@
 //! - Keys section: 1 bit per sample (0 = 1-byte value, 1 = 2-byte value)
 //! - Data section: variable-length encoded values
 //!
-//! Decoding runtime-dispatches to an SSSE3 implementation on x86_64 CPUs
-//! that advertise the feature; otherwise the scalar implementation below
-//! is used.
+//! Decoding runtime-dispatches (in preference order) to AVX2 (16 samples
+//! per iteration), SSSE3 (8 samples per iteration), or the scalar
+//! implementation.
 
 #[cfg(target_arch = "x86_64")]
 mod tables;
 
 #[cfg(target_arch = "x86_64")]
 mod simd_ssse3;
+
+#[cfg(target_arch = "x86_64")]
+mod simd_avx2;
 
 use crate::error::{Error, Result};
 
@@ -130,9 +133,9 @@ pub fn encode_scalar(samples: &[i16]) -> Result<Vec<u8>> {
 
 /// Decode SVB16-encoded data back to samples.
 ///
-/// Runtime-dispatches to an SSSE3 implementation on capable x86_64 CPUs;
-/// otherwise uses the scalar fallback. The two paths are verified equivalent
-/// by the tests in `simd_ssse3`.
+/// Runtime-dispatches (in preference order) to AVX2, SSSE3, or the scalar
+/// fallback. Each SIMD path is verified against `decode_scalar` in its
+/// own test module.
 ///
 /// # Arguments
 /// * `data` - The encoded data (keys + variable-length values)
@@ -153,10 +156,18 @@ pub fn decode(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
 
     #[cfg(target_arch = "x86_64")]
     {
+        let (keys, values) = data.split_at(keys_len);
+        let mut out: Vec<i16> = Vec::with_capacity(sample_count);
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 verified at runtime.
+            unsafe {
+                simd_avx2::decode(keys, values, sample_count, &mut out)
+                    .map_err(|e| Error::Decompression(e.to_string()))?;
+            }
+            return Ok(out);
+        }
         if is_x86_feature_detected!("ssse3") {
-            let (keys, values) = data.split_at(keys_len);
-            let mut out: Vec<i16> = Vec::with_capacity(sample_count);
-            // SAFETY: is_x86_feature_detected verified at runtime.
+            // SAFETY: SSSE3 verified at runtime.
             unsafe {
                 simd_ssse3::decode(keys, values, sample_count, &mut out)
                     .map_err(|e| Error::Decompression(e.to_string()))?;
