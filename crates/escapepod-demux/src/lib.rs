@@ -79,7 +79,9 @@ pub use probability::{
     ProbabilityResult, confidence_margin, format_probability_columns, process_probabilities,
     softmax,
 };
-pub use svm::{SvmModel, SvmPredictor, classify_with_svm, compute_distances, distances_to_kernel};
+pub use svm::{
+    SvmModel, SvmPredictor, SvmWorkspace, classify_with_svm, compute_distances, distances_to_kernel,
+};
 
 #[cfg(feature = "gpu")]
 pub use svm::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx};

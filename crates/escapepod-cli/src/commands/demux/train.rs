@@ -291,11 +291,15 @@ fn extract_fingerprints(
     let total_reads: usize = reads_by_file.values().map(|v| v.len()).sum();
     let progress_bar = create_progress_bar(total_reads as u64, "Processing")?;
 
+    // Inner `for read in reads.flatten()` is sequential per file, so we batch
+    // progress increments to cut cross-file atomic contention.
+    const PROGRESS_BATCH: u64 = 64;
     let all_fingerprints: HashMap<Uuid, Vec<f32>> = reads_by_file
         .par_iter()
         .flat_map(|(pod5_path, read_list)| {
             let mut fingerprints = Vec::new();
             let read_ids: HashSet<Uuid> = read_list.iter().map(|(id, _)| *id).collect();
+            let mut pending_inc: u64 = 0;
 
             if let Ok(reader) = Reader::open(pod5_path)
                 && let Ok(reads) = reader.reads()
@@ -309,8 +313,15 @@ fn extract_fingerprints(
                     {
                         fingerprints.push((read.read_id, fp));
                     }
-                    progress_bar.inc(1);
+                    pending_inc += 1;
+                    if pending_inc >= PROGRESS_BATCH {
+                        progress_bar.inc(pending_inc);
+                        pending_inc = 0;
+                    }
                 }
+            }
+            if pending_inc > 0 {
+                progress_bar.inc(pending_inc);
             }
 
             fingerprints

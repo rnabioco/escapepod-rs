@@ -181,40 +181,45 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
 
     let progress_bar = create_progress_bar(reads_to_process.len() as u64, "Fingerprinting")?;
 
-    // Process reads in parallel
+    // Process reads in parallel. Chunked so progress updates hit the shared
+    // atomic counter once per 64 reads instead of once per read — keeps all
+    // CPUs busy on fingerprint extraction rather than fighting over the
+    // progress bar's atomic add.
+    const PROGRESS_BATCH: usize = 64;
     let fingerprints: Vec<ReadFingerprint> = reads_to_process
-        .par_iter()
-        .filter_map(|(read_id, adapter_start, adapter_end, signal)| {
-            // Compute the region for fingerprinting
-            let (region_start, region_end) = if use_full_adapter {
-                // WarpDemuX-compat: use full adapter region (start=0 means adapter_start itself)
-                (*adapter_start, *adapter_end)
-            } else {
-                // Default: use a fixed window within the adapter
-                let start = adapter_start + args.segment_start;
-                let end = (adapter_start + args.segment_end).min(*adapter_end);
-                (start, end)
-            };
+        .par_chunks(PROGRESS_BATCH)
+        .flat_map(|chunk| {
+            let results: Vec<ReadFingerprint> = chunk
+                .iter()
+                .filter_map(|(read_id, adapter_start, adapter_end, signal)| {
+                    // Compute the region for fingerprinting
+                    let (region_start, region_end) = if use_full_adapter {
+                        (*adapter_start, *adapter_end)
+                    } else {
+                        let start = adapter_start + args.segment_start;
+                        let end = (adapter_start + args.segment_end).min(*adapter_end);
+                        (start, end)
+                    };
 
-            if region_end <= region_start {
-                progress_bar.inc(1);
-                return None;
-            }
+                    if region_end <= region_start {
+                        return None;
+                    }
 
-            let result = extract_fingerprint_from_signal(
-                signal,
-                region_start,
-                region_end,
-                num_segments,
-                window_width,
-                norm_method,
-                *read_id,
-                min_separation,
-                keep_last,
-            );
-
-            progress_bar.inc(1);
-            result
+                    extract_fingerprint_from_signal(
+                        signal,
+                        region_start,
+                        region_end,
+                        num_segments,
+                        window_width,
+                        norm_method,
+                        *read_id,
+                        min_separation,
+                        keep_last,
+                    )
+                })
+                .collect();
+            progress_bar.inc(chunk.len() as u64);
+            results
         })
         .collect();
 

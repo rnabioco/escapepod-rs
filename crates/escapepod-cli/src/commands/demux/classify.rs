@@ -2,12 +2,12 @@
 
 use super::utils::parse_reference_csv;
 use crate::style;
-use escapepod_demux::{DtwSvmModel, classify_with_svm, load_svm_model};
+use escapepod_demux::{DtwSvmModel, SvmPredictor, SvmWorkspace, load_svm_model};
 use escapepod_signal::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Arguments for the classify subcommand.
@@ -186,7 +186,13 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
     }
 
     // Classify each query (GPU batched if requested, else parallel CPU).
-    let results: Vec<SvmClassifyResult> = if gpu_requested(&args) {
+    // Both paths feed a producer/consumer stream: classifications go into a
+    // bounded mpsc channel, a dedicated writer thread formats+writes as
+    // results arrive. This overlaps DTW/SVM work with I/O and lets us drop
+    // per-read probability vectors once they're serialized (saving ~8 · k ·
+    // N_reads bytes of peak heap, which for a 1M-read classify with k=20
+    // barcodes is ~160 MB that never gets buffered).
+    let (confident_count, total_count) = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::classify_with_svm_batch_gpu;
@@ -195,17 +201,29 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
             let gpu_results = classify_with_svm_batch_gpu(&model, &fps)
                 .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
-            gpu_results
-                .into_iter()
-                .zip(read_ids)
-                .map(|((probs, result), read_id)| SvmClassifyResult {
-                    read_id,
-                    predicted_barcode: result.predicted_barcode,
-                    confidence: result.confidence,
-                    is_confident: result.is_confident,
-                    probabilities: probs,
-                })
-                .collect()
+
+            // GPU batch already produces the full Vec; stream it to the
+            // writer so we still avoid buffering n_pairs × probabilities
+            // for the write step.
+            stream_svm_classifications(
+                &args.output,
+                &model,
+                args.probabilities,
+                gpu_results.len(),
+                |tx| {
+                    for ((probs, result), read_id) in gpu_results.into_iter().zip(read_ids) {
+                        tx.send(SvmClassifyResult {
+                            read_id,
+                            predicted_barcode: result.predicted_barcode,
+                            confidence: result.confidence,
+                            is_confident: result.is_confident,
+                            probabilities: probs,
+                        })
+                        .ok();
+                    }
+                    Ok(())
+                },
+            )?
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -213,26 +231,35 @@ fn run_with_svm_model(args: ClassifyArgs, svm_model_path: PathBuf) -> anyhow::Re
         }
     } else {
         println!("{} reads with SVM...", style::action("Classifying"));
-        query_fps
-            .par_iter()
-            .map(|(read_id, fingerprint)| {
-                let (probs, result) = classify_with_svm(&model, fingerprint);
-                SvmClassifyResult {
-                    read_id: *read_id,
-                    predicted_barcode: result.predicted_barcode,
-                    confidence: result.confidence,
-                    is_confident: result.is_confident,
-                    probabilities: probs,
-                }
-            })
-            .collect()
+        // Build the predictor once (label→class-index tables reused across
+        // every read) and give each rayon worker its own workspace so the
+        // k×k coupling matrices never re-allocate per read.
+        let predictor = SvmPredictor::new(&model);
+        let n = query_fps.len();
+        stream_svm_classifications(&args.output, &model, args.probabilities, n, |tx| {
+            query_fps
+                .par_iter()
+                .map_init(
+                    || SvmWorkspace::for_model(&model),
+                    |ws, (read_id, fingerprint)| {
+                        let (probs, result) = predictor.predict_with_workspace(fingerprint, ws);
+                        SvmClassifyResult {
+                            read_id: *read_id,
+                            predicted_barcode: result.predicted_barcode,
+                            confidence: result.confidence,
+                            is_confident: result.is_confident,
+                            probabilities: probs,
+                        }
+                    },
+                )
+                .for_each_with(tx.clone(), |tx, r| {
+                    tx.send(r).ok();
+                });
+            Ok(())
+        })?
     };
 
-    // Write output
-    write_svm_classifications(&args.output, &results, &model, args.probabilities)?;
-
-    let confident_count = results.iter().filter(|r| r.is_confident).count();
-    let unclassified_count = results.len() - confident_count;
+    let unclassified_count = total_count - confident_count;
 
     println!(
         "{} classifications written to {}",
@@ -299,8 +326,10 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
         anyhow::bail!("No valid query fingerprints found");
     }
 
-    // Classify each query (GPU if requested, else parallel CPU).
-    let results: Vec<ClassifyResult> = if gpu_requested(&args) {
+    // Classify each query (GPU if requested, else parallel CPU). Streams
+    // results through a bounded mpsc channel to a dedicated writer thread;
+    // classification workers don't buffer a full `Vec<ClassifyResult>`.
+    let (confident_count, total_count) = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::classify_reads_gpu;
@@ -309,18 +338,21 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
             let gpu_results = classify_reads_gpu(&model, &fps)
                 .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
-            gpu_results
-                .into_iter()
-                .zip(read_ids)
-                .map(|(result, read_id)| ClassifyResult {
-                    read_id,
-                    barcode: result.barcode,
-                    confidence: result.confidence,
-                    best_distance: result.best_distance,
-                    second_best_distance: result.second_best_distance,
-                    is_confident: result.is_confident,
-                })
-                .collect()
+
+            stream_model_classifications(&args.output, gpu_results.len(), |tx| {
+                for (result, read_id) in gpu_results.into_iter().zip(read_ids) {
+                    tx.send(ClassifyResult {
+                        read_id,
+                        barcode: result.barcode,
+                        confidence: result.confidence,
+                        best_distance: result.best_distance,
+                        second_best_distance: result.second_best_distance,
+                        is_confident: result.is_confident,
+                    })
+                    .ok();
+                }
+                Ok(())
+            })?
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -328,27 +360,29 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
         }
     } else {
         println!("{} reads...", style::action("Classifying"));
-        query_fps
-            .par_iter()
-            .map(|(read_id, fingerprint)| {
-                let result = classify_read(&model, fingerprint);
-                ClassifyResult {
-                    read_id: *read_id,
-                    barcode: result.barcode,
-                    confidence: result.confidence,
-                    best_distance: result.best_distance,
-                    second_best_distance: result.second_best_distance,
-                    is_confident: result.is_confident,
-                }
-            })
-            .collect()
+        let n = query_fps.len();
+        stream_model_classifications(&args.output, n, |tx| {
+            query_fps
+                .par_iter()
+                .map(|(read_id, fingerprint)| {
+                    let result = classify_read(&model, fingerprint);
+                    ClassifyResult {
+                        read_id: *read_id,
+                        barcode: result.barcode,
+                        confidence: result.confidence,
+                        best_distance: result.best_distance,
+                        second_best_distance: result.second_best_distance,
+                        is_confident: result.is_confident,
+                    }
+                })
+                .for_each_with(tx.clone(), |tx, r| {
+                    tx.send(r).ok();
+                });
+            Ok(())
+        })?
     };
 
-    // Write output
-    write_model_classifications(&args.output, &results)?;
-
-    let confident_count = results.iter().filter(|r| r.is_confident).count();
-    let unclassified_count = results.len() - confident_count;
+    let unclassified_count = total_count - confident_count;
 
     println!(
         "{} classifications written to {}",
@@ -416,17 +450,22 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         anyhow::bail!("No valid query fingerprints found");
     }
 
-    // Extract values for DTW computation
-    // Note: dtw_distance_matrix takes &[Vec<f32>], so we need owned vectors
-    let query_values: Vec<Vec<f32>> = query_fps.iter().map(|(_, v)| v.clone()).collect();
-    let ref_values: Vec<Vec<f32>> = reference_fps.iter().map(|fp| fp.values.clone()).collect();
+    // Pass the existing fingerprint buffers to dtw_distance_matrix by slice
+    // instead of cloning every query + reference Vec. For 100k queries at
+    // 150 f32 each, this saves ~60 MB of peak heap (only ~1.6 MB of
+    // `&[f32]` fat-pointers remain).
+    let query_slices: Vec<&[f32]> = query_fps.iter().map(|(_, v)| v.as_slice()).collect();
+    let ref_slices: Vec<&[f32]> = reference_fps
+        .iter()
+        .map(|fp| fp.values.as_slice())
+        .collect();
 
     let distances = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
             use escapepod_signal::dtw::dtw_distance_matrix_gpu;
             println!("{} DTW distances on GPU...", style::action("Computing"));
-            dtw_distance_matrix_gpu(&query_values, &ref_values, args.window)
+            dtw_distance_matrix_gpu(&query_slices, &ref_slices, args.window)
                 .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?
         }
         #[cfg(not(feature = "gpu"))]
@@ -435,7 +474,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         }
     } else {
         println!("{} DTW distances...", style::action("Computing"));
-        dtw_distance_matrix(&query_values, &ref_values, args.window)
+        dtw_distance_matrix(&query_slices, &ref_slices, args.window)
     };
 
     // Classify each query
@@ -565,31 +604,56 @@ fn parse_query_fingerprints_f32(path: &PathBuf) -> anyhow::Result<Vec<(Uuid, Vec
     parse_query_fingerprints(path)
 }
 
-/// Write model classification results to CSV.
-fn write_model_classifications(path: &PathBuf, results: &[ClassifyResult]) -> anyhow::Result<()> {
-    let output_file = File::create(path)?;
-    let mut writer = BufWriter::new(output_file);
+/// Streaming variant of the legacy `write_model_classifications` writer.
+/// Same producer/consumer pattern as [`stream_svm_classifications`].
+fn stream_model_classifications<F>(
+    path: &Path,
+    _expected: usize,
+    produce: F,
+) -> anyhow::Result<(usize, usize)>
+where
+    F: FnOnce(&std::sync::mpsc::SyncSender<ClassifyResult>) -> anyhow::Result<()>,
+{
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::sync_channel::<ClassifyResult>(4096);
+    let path_buf = path.to_path_buf();
 
-    writeln!(
-        writer,
-        "read_id,barcode,confidence,best_distance,second_best_distance,is_confident"
-    )?;
-
-    for result in results {
+    let writer_thread = std::thread::spawn(move || -> anyhow::Result<(usize, usize)> {
+        let output_file = File::create(&path_buf)?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
         writeln!(
             writer,
-            "{},{},{:.6},{:.4},{:.4},{}",
-            result.read_id,
-            result.barcode,
-            result.confidence,
-            result.best_distance,
-            result.second_best_distance,
-            result.is_confident
+            "read_id,barcode,confidence,best_distance,second_best_distance,is_confident"
         )?;
-    }
+        let mut confident = 0usize;
+        let mut total = 0usize;
+        for result in rx.iter() {
+            total += 1;
+            if result.is_confident {
+                confident += 1;
+            }
+            writeln!(
+                writer,
+                "{},{},{:.6},{:.4},{:.4},{}",
+                result.read_id,
+                result.barcode,
+                result.confidence,
+                result.best_distance,
+                result.second_best_distance,
+                result.is_confident,
+            )?;
+        }
+        writer.flush()?;
+        Ok((confident, total))
+    });
 
-    writer.flush()?;
-    Ok(())
+    produce(&tx)?;
+    drop(tx);
+
+    let counts = writer_thread
+        .join()
+        .map_err(|e| anyhow::anyhow!("writer thread panicked: {:?}", e))??;
+    Ok(counts)
 }
 
 /// Write CSV classification results to CSV.
@@ -625,65 +689,99 @@ fn write_csv_classifications(path: &PathBuf, results: &[ClassifyResult]) -> anyh
     Ok(())
 }
 
-/// Write SVM classification results to CSV.
-fn write_svm_classifications(
-    path: &PathBuf,
-    results: &[SvmClassifyResult],
+/// Stream SVM classification results through a producer/consumer channel.
+///
+/// Spawns a writer thread that opens the output file, writes the header, and
+/// drains a bounded mpsc channel of [`SvmClassifyResult`]s — formatting each
+/// row with direct `write!` calls (no per-row `format!` + `Vec<String>` +
+/// `join` allocations). `produce` runs on the calling thread (typically a
+/// rayon `par_iter().for_each_with(tx, ...)`).
+///
+/// Returns `(confident_count, total_count)`.
+fn stream_svm_classifications<F>(
+    path: &Path,
     model: &DtwSvmModel,
     include_probabilities: bool,
-) -> anyhow::Result<()> {
-    let output_file = File::create(path)?;
-    let mut writer = BufWriter::new(output_file);
+    _expected: usize,
+    produce: F,
+) -> anyhow::Result<(usize, usize)>
+where
+    F: FnOnce(&std::sync::mpsc::SyncSender<SvmClassifyResult>) -> anyhow::Result<()>,
+{
+    use std::sync::mpsc;
 
-    // Write header
-    if include_probabilities {
-        // Generate probability column headers from the model's label mapper
-        let prob_header: String = (0..model.n_classes)
-            .map(|i| {
-                let barcode_id = model.label_mapper.get(&i).copied().unwrap_or(i as i32);
-                format!("p{:02}", barcode_id)
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        writeln!(
-            writer,
-            "read_id,predicted_barcode,confidence,is_confident,{}",
-            prob_header
-        )?;
-    } else {
-        writeln!(writer, "read_id,predicted_barcode,confidence,is_confident")?;
-    }
+    // Bounded channel provides backpressure: if I/O stalls, classification
+    // workers block instead of piling up results in unbounded queue memory.
+    // 4096 is deep enough to hide short syscall hiccups without letting the
+    // buffer grow faster than the writer can drain it.
+    let (tx, rx) = mpsc::sync_channel::<SvmClassifyResult>(4096);
 
-    // Write results
-    for result in results {
-        let barcode_name = if result.predicted_barcode >= 0 {
-            format!("BC{:02}", result.predicted_barcode)
-        } else {
-            "unclassified".to_string()
-        };
+    // Pre-build the barcode label strings once (instead of `format!("BC{:02}", id)`
+    // per read) and the probability header once.
+    let label_mapper = model.label_mapper.clone();
+    let n_classes = model.n_classes;
+    let path_buf = path.to_path_buf();
+
+    let writer_thread = std::thread::spawn(move || -> anyhow::Result<(usize, usize)> {
+        let output_file = File::create(&path_buf)?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
 
         if include_probabilities {
-            let prob_str: String = result
-                .probabilities
-                .iter()
-                .map(|p| format!("{:.6}", p))
-                .collect::<Vec<_>>()
-                .join(",");
-
-            writeln!(
-                writer,
-                "{},{},{:.6},{},{}",
-                result.read_id, barcode_name, result.confidence, result.is_confident, prob_str
-            )?;
+            write!(writer, "read_id,predicted_barcode,confidence,is_confident")?;
+            for i in 0..n_classes {
+                let barcode_id = label_mapper.get(&i).copied().unwrap_or(i as i32);
+                write!(writer, ",p{:02}", barcode_id)?;
+            }
+            writeln!(writer)?;
         } else {
-            writeln!(
-                writer,
-                "{},{},{:.6},{}",
-                result.read_id, barcode_name, result.confidence, result.is_confident
-            )?;
+            writeln!(writer, "read_id,predicted_barcode,confidence,is_confident")?;
         }
-    }
 
-    writer.flush()?;
-    Ok(())
+        let mut confident = 0usize;
+        let mut total = 0usize;
+
+        for result in rx.iter() {
+            total += 1;
+            if result.is_confident {
+                confident += 1;
+            }
+
+            // Direct `write!` → BufWriter: no intermediate `String` per row,
+            // no `Vec<String>` + `join(",")` for the probability columns.
+            if result.predicted_barcode >= 0 {
+                write!(
+                    writer,
+                    "{},BC{:02},{:.6},{}",
+                    result.read_id,
+                    result.predicted_barcode,
+                    result.confidence,
+                    result.is_confident,
+                )?;
+            } else {
+                write!(
+                    writer,
+                    "{},unclassified,{:.6},{}",
+                    result.read_id, result.confidence, result.is_confident,
+                )?;
+            }
+
+            if include_probabilities {
+                for &p in &result.probabilities {
+                    write!(writer, ",{:.6}", p)?;
+                }
+            }
+            writeln!(writer)?;
+        }
+
+        writer.flush()?;
+        Ok((confident, total))
+    });
+
+    produce(&tx)?;
+    drop(tx); // close sender so the writer thread's `rx.iter()` terminates.
+
+    let counts = writer_thread
+        .join()
+        .map_err(|e| anyhow::anyhow!("writer thread panicked: {:?}", e))??;
+    Ok(counts)
 }

@@ -151,11 +151,15 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
 /// let matrix = dtw_distance_matrix(&queries, &references, None);
 /// assert_eq!(matrix.shape(), &[2, 2]);
 /// ```
-pub fn dtw_distance_matrix(
-    queries: &[Vec<f32>],
-    references: &[Vec<f32>],
+pub fn dtw_distance_matrix<Q, R>(
+    queries: &[Q],
+    references: &[R],
     window: Option<usize>,
-) -> Array2<f32> {
+) -> Array2<f32>
+where
+    Q: AsRef<[f32]> + Sync,
+    R: AsRef<[f32]> + Sync,
+{
     let n_queries = queries.len();
     let n_refs = references.len();
 
@@ -167,9 +171,9 @@ pub fn dtw_distance_matrix(
         .par_chunks_mut(n_refs)
         .enumerate()
         .for_each(|(i, row)| {
-            let q = &queries[i];
+            let q = queries[i].as_ref();
             for (j, slot) in row.iter_mut().enumerate() {
-                *slot = dtw_distance(q, &references[j], window);
+                *slot = dtw_distance(q, references[j].as_ref(), window);
             }
         });
 

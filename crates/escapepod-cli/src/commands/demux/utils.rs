@@ -225,6 +225,12 @@ where
 {
     use rayon::prelude::*;
 
+    // Batch progress-bar updates: under N rayon workers, `pb.inc(1)` per
+    // read is an atomic add contended across all cores. Chunking at 64
+    // cuts the contended writes 64× while keeping the bar visibly
+    // responsive (64 reads is well under 1s of wall time in practice).
+    const PROGRESS_BATCH: usize = 64;
+
     let per_file: anyhow::Result<Vec<Vec<T>>> = input_files
         .par_iter()
         .map(|path| -> anyhow::Result<Vec<T>> {
@@ -237,14 +243,22 @@ where
             let extractor = reader.signal_extractor()?;
 
             let out: Vec<T> = reads
-                .par_iter()
-                .filter_map(|r| {
-                    let signal = extractor.get_signal(&r.signal_rows).ok()?;
-                    let result = process(r.read_id, r.num_samples, &signal);
+                .par_chunks(PROGRESS_BATCH)
+                .flat_map(|chunk| {
+                    let results: Vec<T> = chunk
+                        .iter()
+                        .filter_map(|r| {
+                            let signal = extractor.get_signal(&r.signal_rows).ok()?;
+                            Some(process(r.read_id, r.num_samples, &signal))
+                        })
+                        .collect();
                     if let Some(pb) = progress {
-                        pb.inc(1);
+                        // Count the reads we *attempted* (chunk.len()), not
+                        // just the successful ones, so the bar reflects
+                        // work done even when signals fail to decompress.
+                        pb.inc(chunk.len() as u64);
                     }
-                    Some(result)
+                    results
                 })
                 .collect();
             Ok(out)

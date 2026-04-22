@@ -75,12 +75,16 @@ impl GpuDtwContext {
     /// Inputs and outputs mirror the CPU [`crate::dtw::dtw_distance_matrix`]
     /// exactly, up to f32 summation order; tolerance in parity tests is
     /// `1e-4 * max(1, |cpu|)`.
-    pub fn distance_matrix(
+    pub fn distance_matrix<Q, R>(
         &self,
-        queries: &[Vec<f32>],
-        references: &[Vec<f32>],
+        queries: &[Q],
+        references: &[R],
         window: Option<usize>,
-    ) -> Result<Array2<f32>, GpuDtwError> {
+    ) -> Result<Array2<f32>, GpuDtwError>
+    where
+        Q: AsRef<[f32]>,
+        R: AsRef<[f32]>,
+    {
         let n_q = queries.len();
         let n_r = references.len();
 
@@ -97,8 +101,12 @@ impl GpuDtwContext {
         // Shared memory sizing needs both dimensions: `a_s` + three rolling
         // diagonal buffers are indexed by the query position `i`, while
         // `b_s` caches the reference in shared memory.
-        let max_n: usize = queries.iter().map(|q| q.len()).max().unwrap_or(0);
-        let max_m: usize = references.iter().map(|r| r.len()).max().unwrap_or(0);
+        let max_n: usize = queries.iter().map(|q| q.as_ref().len()).max().unwrap_or(0);
+        let max_m: usize = references
+            .iter()
+            .map(|r| r.as_ref().len())
+            .max()
+            .unwrap_or(0);
         if max_n > i32::MAX as usize {
             return Err(GpuDtwError::InputTooLarge {
                 what: "query length exceeds i32::MAX",
@@ -190,17 +198,21 @@ impl GpuDtwContext {
 ///
 /// Prefer `GpuDtwContext::new()` + `distance_matrix()` when doing multiple
 /// passes — NVRTC compilation is ~100 ms.
-pub fn dtw_distance_matrix_gpu(
-    queries: &[Vec<f32>],
-    references: &[Vec<f32>],
+pub fn dtw_distance_matrix_gpu<Q, R>(
+    queries: &[Q],
+    references: &[R],
     window: Option<usize>,
-) -> Result<Array2<f32>, GpuDtwError> {
+) -> Result<Array2<f32>, GpuDtwError>
+where
+    Q: AsRef<[f32]>,
+    R: AsRef<[f32]>,
+{
     let ctx = GpuDtwContext::new()?;
     ctx.distance_matrix(queries, references, window)
 }
 
-fn flatten_with_offsets(v: &[Vec<f32>]) -> Result<(Vec<f32>, Vec<i32>), GpuDtwError> {
-    let total: usize = v.iter().map(|x| x.len()).sum();
+fn flatten_with_offsets<T: AsRef<[f32]>>(v: &[T]) -> Result<(Vec<f32>, Vec<i32>), GpuDtwError> {
+    let total: usize = v.iter().map(|x| x.as_ref().len()).sum();
     if total > i32::MAX as usize {
         return Err(GpuDtwError::InputTooLarge {
             what: "flattened buffer exceeds i32::MAX",
@@ -211,8 +223,9 @@ fn flatten_with_offsets(v: &[Vec<f32>]) -> Result<(Vec<f32>, Vec<i32>), GpuDtwEr
     offsets.push(0i32);
     let mut acc: i32 = 0;
     for item in v {
-        flat.extend_from_slice(item);
-        acc += item.len() as i32;
+        let s = item.as_ref();
+        flat.extend_from_slice(s);
+        acc += s.len() as i32;
         offsets.push(acc);
     }
     Ok((flat, offsets))

@@ -36,6 +36,17 @@ pub fn distances_to_kernel(distances: &[f64], params: &KernelParams) -> Vec<f64>
         .collect()
 }
 
+/// In-place variant of [`distances_to_kernel`] that writes into a caller-owned
+/// buffer. Avoids a `Vec<f64>` allocation per read in the SVM pipeline.
+fn distances_to_kernel_into(distances: &[f64], params: &KernelParams, out: &mut Vec<f64>) {
+    out.clear();
+    out.extend(
+        distances
+            .iter()
+            .map(|&d| (-params.gamma * d.powf(params.power)).exp()),
+    );
+}
+
 /// Compute DTW distances from a query fingerprint to all training fingerprints.
 ///
 /// # Arguments
@@ -48,22 +59,106 @@ pub fn distances_to_kernel(distances: &[f64], params: &KernelParams) -> Vec<f64>
 ///
 /// Vector of DTW distances
 pub fn compute_distances(query: &[f64], training: &[Vec<f64>], window: Option<usize>) -> Vec<f64> {
-    let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+    let mut ws = SvmWorkspace::new();
+    compute_distances_into(query, training, window, &mut ws);
+    std::mem::take(&mut ws.distances)
+}
 
-    // Reused across training fingerprints to avoid a Vec allocation per
-    // support vector. The caller is typically already parallelized per
-    // read, so the inner loop stays serial to avoid rayon oversubscription.
-    let mut train_scratch: Vec<f32> =
-        Vec::with_capacity(training.first().map(Vec::len).unwrap_or(0));
+/// Workspace-backed variant of [`compute_distances`]. Reuses f32 conversion
+/// buffers and writes results into `ws.distances` (cleared first).
+fn compute_distances_into(
+    query: &[f64],
+    training: &[Vec<f64>],
+    window: Option<usize>,
+    ws: &mut SvmWorkspace,
+) {
+    ws.query_f32.clear();
+    ws.query_f32.extend(query.iter().map(|&x| x as f32));
 
-    training
-        .iter()
-        .map(|train_fp| {
-            train_scratch.clear();
-            train_scratch.extend(train_fp.iter().map(|&x| x as f32));
-            dtw_distance(&query_f32, &train_scratch, window) as f64
-        })
-        .collect()
+    ws.distances.clear();
+    ws.distances.reserve(training.len());
+    // Split the borrow so the inner loop can write to `ws.distances` while
+    // rewriting `ws.train_scratch` on each iteration.
+    let query_f32 = ws.query_f32.as_slice();
+    let train_scratch = &mut ws.train_scratch;
+    let distances = &mut ws.distances;
+    for train_fp in training {
+        train_scratch.clear();
+        train_scratch.extend(train_fp.iter().map(|&x| x as f32));
+        distances.push(dtw_distance(query_f32, train_scratch, window) as f64);
+    }
+}
+
+/// Reusable scratch buffers for the SVM prediction pipeline.
+///
+/// `SvmPredictor::predict` in a tight loop (e.g. `par_iter` over 100k reads)
+/// otherwise allocates 6–8 `Vec<f64>`s per read — and `couple_probabilities`
+/// alone allocates two `k × k` matrices and two `k`-vectors. For k = 32 classes
+/// across 100k reads that's ~10M heap allocations just for coupling scratch.
+///
+/// Hand one workspace per rayon worker (via `par_iter().map_init`) and pass
+/// `&mut` to [`SvmPredictor::predict_with_workspace`]; buffers resize up to
+/// the max ever needed and stay there.
+#[derive(Default, Debug, Clone)]
+pub struct SvmWorkspace {
+    /// f32 cast of the query, reused across training fingerprints.
+    query_f32: Vec<f32>,
+    /// f32 cast of the current training fingerprint (rewritten per-SV).
+    train_scratch: Vec<f32>,
+    /// DTW distances from query to every training fingerprint.
+    distances: Vec<f64>,
+    /// RBF kernel values (same length as `distances`).
+    kernel: Vec<f64>,
+    /// Per-pair decision values from the OvO SVM.
+    decisions: Vec<f64>,
+    /// Per-pair Platt-scaled probabilities (coupling input).
+    pair_probs: Vec<f64>,
+    /// Kernel-weighted score per class (fallback + kernel-weighted path).
+    class_scores: Vec<f64>,
+    /// Per-class training sample counts (kernel-weighted path).
+    class_counts: Vec<usize>,
+    /// Flattened `k × k` row-major pairwise probability matrix.
+    r: Vec<f64>,
+    /// Flattened `k × k` row-major `Q` matrix for multiclass coupling.
+    q: Vec<f64>,
+    /// Current probability estimate in the coupling iteration.
+    p: Vec<f64>,
+    /// `Q p` product, recycled across the 100+ coupling iterations.
+    qp: Vec<f64>,
+}
+
+impl SvmWorkspace {
+    /// Empty workspace. Buffers grow lazily as predictions are run.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate a workspace sized for the shape of `model`. Avoids the first
+    /// few grow-and-copy rounds when you already know the model.
+    pub fn for_model(model: &DtwSvmModel) -> Self {
+        let mut ws = Self::new();
+        ws.reserve_for_model(model);
+        ws
+    }
+
+    fn reserve_for_model(&mut self, model: &DtwSvmModel) {
+        let k = model.n_classes;
+        let n_train = model.training_fingerprints.len();
+        let n_pairs = k * (k - 1) / 2;
+        let flen = model.training_fingerprints.first().map_or(0, Vec::len);
+        self.query_f32.reserve(flen);
+        self.train_scratch.reserve(flen);
+        self.distances.reserve(n_train);
+        self.kernel.reserve(n_train);
+        self.decisions.reserve(n_pairs);
+        self.pair_probs.reserve(n_pairs);
+        self.class_scores.reserve(k);
+        self.class_counts.reserve(k);
+        self.r.reserve(k * k);
+        self.q.reserve(k * k);
+        self.p.reserve(k);
+        self.qp.reserve(k);
+    }
 }
 
 /// SVM predictor for One-vs-One multiclass classification.
@@ -156,6 +251,35 @@ impl<'a> SvmPredictor<'a> {
         class_scores
     }
 
+    /// Workspace-backed variant. Reuses `scores` / `counts` buffers across
+    /// calls so hot-loop callers don't allocate two `Vec`s per prediction.
+    #[inline]
+    fn kernel_weighted_scores_into(
+        &self,
+        kernel_values: &[f64],
+        scores: &mut Vec<f64>,
+        counts: &mut Vec<usize>,
+    ) {
+        let n_classes = self.model.n_classes;
+        scores.clear();
+        scores.resize(n_classes, 0.0);
+        counts.clear();
+        counts.resize(n_classes, 0);
+
+        for (i, class_opt) in self.training_class.iter().enumerate() {
+            if let Some(class_idx) = *class_opt {
+                scores[class_idx] += kernel_values[i];
+                counts[class_idx] += 1;
+            }
+        }
+
+        for (score, count) in scores.iter_mut().zip(counts.iter()) {
+            if *count > 0 {
+                *score /= *count as f64;
+            }
+        }
+    }
+
     /// Compute decision function for a query fingerprint.
     ///
     /// For OvO classification, this computes decision values for each pair of classes.
@@ -174,19 +298,15 @@ impl<'a> SvmPredictor<'a> {
 
         // Use kernel-weighted voting if specified in model
         if self.model.use_kernel_weighted {
-            // Use kernel-weighted scores to generate OvO decisions
             let class_scores = self.kernel_weighted_scores(kernel_values);
             let mut decisions = vec![0.0; n_pairs];
             let mut pair_idx = 0;
-
             for i in 0..n_classes {
                 for j in (i + 1)..n_classes {
-                    // Decision: positive if class i wins, negative if class j wins
                     decisions[pair_idx] = class_scores[i] - class_scores[j];
                     pair_idx += 1;
                 }
             }
-
             return decisions;
         }
 
@@ -203,31 +323,23 @@ impl<'a> SvmPredictor<'a> {
         let sv_class = self.sv_class.as_slice();
         let support_indices = self.model.support_indices.as_slice();
         let intercept = self.model.intercept.as_slice();
+        let dual_coef = self.model.dual_coef.as_slice();
 
         let mut pair_idx = 0;
         for i in 0..n_classes {
             for j in (i + 1)..n_classes {
+                // Indexed once per pair; inner loop reads contiguous slices
+                // and drops the prior `.get().copied().unwrap_or(0.0)` guard.
+                let coef_i = dual_coef[j - 1].as_slice();
+                let coef_j = dual_coef[i].as_slice();
                 let mut sum = intercept[pair_idx];
 
                 for (sv_local_idx, &sv_global_idx) in support_indices.iter().enumerate() {
                     let coef = match sv_class[sv_local_idx] {
-                        Some(c) if c == i => {
-                            // SV of class i: use dual_coef[j-1]
-                            self.model.dual_coef[j - 1]
-                                .get(sv_local_idx)
-                                .copied()
-                                .unwrap_or(0.0)
-                        }
-                        Some(c) if c == j => {
-                            // SV of class j: use dual_coef[i]
-                            self.model.dual_coef[i]
-                                .get(sv_local_idx)
-                                .copied()
-                                .unwrap_or(0.0)
-                        }
-                        _ => 0.0, // SV of other class: doesn't contribute
+                        Some(c) if c == i => coef_i[sv_local_idx],
+                        Some(c) if c == j => coef_j[sv_local_idx],
+                        _ => 0.0,
                     };
-
                     sum += coef * kernel_values[sv_global_idx];
                 }
 
@@ -237,6 +349,64 @@ impl<'a> SvmPredictor<'a> {
         }
 
         decisions
+    }
+
+    /// Workspace-backed variant of [`Self::decision_function`]. Reuses
+    /// `ws.class_scores` / `ws.class_counts` for the kernel-weighted path so
+    /// the inner hot loop avoids two `Vec<f64>` allocations per call.
+    fn decision_function_into(
+        &self,
+        kernel_values: &[f64],
+        ws: &mut SvmWorkspace,
+        decisions: &mut Vec<f64>,
+    ) {
+        let n_classes = self.model.n_classes;
+        let n_pairs = n_classes * (n_classes - 1) / 2;
+        decisions.clear();
+        decisions.resize(n_pairs, 0.0);
+
+        if self.model.use_kernel_weighted {
+            self.kernel_weighted_scores_into(
+                kernel_values,
+                &mut ws.class_scores,
+                &mut ws.class_counts,
+            );
+            let class_scores = ws.class_scores.as_slice();
+            let mut pair_idx = 0;
+            for i in 0..n_classes {
+                for j in (i + 1)..n_classes {
+                    decisions[pair_idx] = class_scores[i] - class_scores[j];
+                    pair_idx += 1;
+                }
+            }
+            return;
+        }
+
+        let sv_class = self.sv_class.as_slice();
+        let support_indices = self.model.support_indices.as_slice();
+        let intercept = self.model.intercept.as_slice();
+        let dual_coef = self.model.dual_coef.as_slice();
+
+        let mut pair_idx = 0;
+        for i in 0..n_classes {
+            for j in (i + 1)..n_classes {
+                let coef_i = dual_coef[j - 1].as_slice();
+                let coef_j = dual_coef[i].as_slice();
+                let mut sum = intercept[pair_idx];
+
+                for (sv_local_idx, &sv_global_idx) in support_indices.iter().enumerate() {
+                    let coef = match sv_class[sv_local_idx] {
+                        Some(c) if c == i => coef_i[sv_local_idx],
+                        Some(c) if c == j => coef_j[sv_local_idx],
+                        _ => 0.0,
+                    };
+                    sum += coef * kernel_values[sv_global_idx];
+                }
+
+                decisions[pair_idx] = sum;
+                pair_idx += 1;
+            }
+        }
     }
 
     /// Convert OvO decision values to class votes.
@@ -283,112 +453,151 @@ impl<'a> SvmPredictor<'a> {
     ///
     /// Probability distribution over classes
     pub fn decision_to_probabilities(&self, decisions: &[f64]) -> Vec<f64> {
+        let mut ws = SvmWorkspace::new();
+        self.decision_to_probabilities_with(decisions, &mut ws)
+    }
+
+    fn decision_to_probabilities_with(&self, decisions: &[f64], ws: &mut SvmWorkspace) -> Vec<f64> {
         let n_classes = self.model.n_classes;
 
         // Use Platt scaling if available
         if let (Some(prob_a), Some(prob_b)) = (&self.model.prob_a, &self.model.prob_b) {
             // Platt scaling: P = 1 / (1 + exp(A * f + B))
-            let pair_probs: Vec<f64> = decisions
-                .iter()
-                .zip(prob_a.iter().zip(prob_b.iter()))
-                .map(|(&f, (&a, &b))| 1.0 / (1.0 + (a * f + b).exp()))
-                .collect();
+            ws.pair_probs.clear();
+            ws.pair_probs.extend(
+                decisions
+                    .iter()
+                    .zip(prob_a.iter().zip(prob_b.iter()))
+                    .map(|(&f, (&a, &b))| 1.0 / (1.0 + (a * f + b).exp())),
+            );
 
             // Aggregate pairwise probabilities to class probabilities
             // Using the coupling method from sklearn
-            return self.couple_probabilities(&pair_probs);
+            return self.couple_probabilities_with(ws);
         }
 
-        // Fallback: simple sigmoid + voting
-        let mut class_scores = vec![0.0; n_classes];
+        // Fallback: simple sigmoid + voting (reuses ws.class_scores).
+        ws.class_scores.clear();
+        ws.class_scores.resize(n_classes, 0.0);
+        let scores = ws.class_scores.as_mut_slice();
 
         let mut pair_idx = 0;
         for i in 0..n_classes {
             for j in (i + 1)..n_classes {
-                // Sigmoid of decision value
                 let prob_i = 1.0 / (1.0 + (-decisions[pair_idx]).exp());
-                class_scores[i] += prob_i;
-                class_scores[j] += 1.0 - prob_i;
+                scores[i] += prob_i;
+                scores[j] += 1.0 - prob_i;
                 pair_idx += 1;
             }
         }
 
-        // Normalize to probabilities
-        let sum: f64 = class_scores.iter().sum();
+        let sum: f64 = scores.iter().sum();
         if sum > 0.0 {
-            class_scores.iter_mut().for_each(|v| *v /= sum);
+            scores.iter_mut().for_each(|v| *v /= sum);
         }
 
-        class_scores
+        ws.class_scores.clone()
     }
 
     /// Couple pairwise probabilities to class probabilities.
     ///
-    /// Implements libsvm's `multiclass_probability` (Wu et al. 2004).
-    /// This matches sklearn's internal probability coupling exactly.
+    /// Reads `ws.pair_probs` as input and reuses flat row-major `ws.r` / `ws.q`
+    /// matrices (length `k * k`) plus `ws.p` / `ws.qp` vectors. Returns an
+    /// owned copy of `ws.p` so the caller can keep the result independently of
+    /// the workspace.
+    ///
+    /// Implements libsvm's `multiclass_probability` (Wu et al. 2004); matches
+    /// sklearn's internal probability coupling exactly.
     #[allow(clippy::needless_range_loop)]
-    fn couple_probabilities(&self, pair_probs: &[f64]) -> Vec<f64> {
+    fn couple_probabilities_with(&self, ws: &mut SvmWorkspace) -> Vec<f64> {
         let k = self.model.n_classes;
+        let kk = k * k;
 
-        // Build pairwise probability matrix r[i][j]
-        let mut r = vec![vec![0.0; k]; k];
+        // Flat k×k row-major layout for r and q. We hand them to slice views
+        // below so the inner loops see `&[f64]` / `&mut [f64]` and can get
+        // vectorized by the autovectorizer.
+        ws.r.clear();
+        ws.r.resize(kk, 0.0);
+        let r = ws.r.as_mut_slice();
+
         let mut pair_idx = 0;
         for i in 0..k {
             for j in (i + 1)..k {
-                r[i][j] = pair_probs[pair_idx].clamp(1e-7, 1.0 - 1e-7);
-                r[j][i] = 1.0 - r[i][j];
+                let v = ws.pair_probs[pair_idx].clamp(1e-7, 1.0 - 1e-7);
+                r[i * k + j] = v;
+                r[j * k + i] = 1.0 - v;
                 pair_idx += 1;
             }
         }
 
         // Build Q matrix: Q[t][t] = sum_{j!=t} r[j][t]^2
         //                  Q[t][j] = -r[j][t] * r[t][j]  (j != t)
-        let mut q = vec![vec![0.0; k]; k];
+        ws.q.clear();
+        ws.q.resize(kk, 0.0);
+        let q = ws.q.as_mut_slice();
         for t in 0..k {
-            q[t][t] = 0.0;
+            let mut diag = 0.0;
             for j in 0..k {
                 if j != t {
-                    q[t][t] += r[j][t] * r[j][t];
-                    q[t][j] = -r[j][t] * r[t][j];
+                    let rjt = r[j * k + t];
+                    diag += rjt * rjt;
+                    q[t * k + j] = -rjt * r[t * k + j];
                 }
             }
+            q[t * k + t] = diag;
         }
 
         // Initialize uniform probabilities
-        let mut p = vec![1.0 / k as f64; k];
+        ws.p.clear();
+        ws.p.resize(k, 1.0 / k as f64);
+        ws.qp.clear();
+        ws.qp.resize(k, 0.0);
+        let p = ws.p.as_mut_slice();
+        let qp = ws.qp.as_mut_slice();
         let eps = 0.005 / k as f64;
         let max_iter = 100.max(k);
 
         for _ in 0..max_iter {
             // Compute Qp and pQp
-            let mut qp = vec![0.0; k];
             let mut p_qp = 0.0;
             for t in 0..k {
+                let mut acc = 0.0;
+                let q_row = &q[t * k..t * k + k];
                 for j in 0..k {
-                    qp[t] += q[t][j] * p[j];
+                    acc += q_row[j] * p[j];
                 }
-                p_qp += p[t] * qp[t];
+                qp[t] = acc;
+                p_qp += p[t] * acc;
             }
 
             // Check convergence
-            let max_error = (0..k).map(|t| (qp[t] - p_qp).abs()).fold(0.0_f64, f64::max);
+            let mut max_error = 0.0_f64;
+            for t in 0..k {
+                let e = (qp[t] - p_qp).abs();
+                if e > max_error {
+                    max_error = e;
+                }
+            }
             if max_error < eps {
                 break;
             }
 
             // Update each p[t]
             for t in 0..k {
-                let diff = (-qp[t] + p_qp) / q[t][t];
+                let q_tt = q[t * k + t];
+                let diff = (-qp[t] + p_qp) / q_tt;
                 p[t] += diff;
-                p_qp = (p_qp + diff * (diff * q[t][t] + 2.0 * qp[t])) / (1.0 + diff) / (1.0 + diff);
+                p_qp = (p_qp + diff * (diff * q_tt + 2.0 * qp[t])) / (1.0 + diff) / (1.0 + diff);
+                let scale = 1.0 / (1.0 + diff);
+                let q_row = &q[t * k..t * k + k];
                 for j in 0..k {
-                    qp[j] = (qp[j] + diff * q[t][j]) / (1.0 + diff);
-                    p[j] /= 1.0 + diff;
+                    qp[j] = (qp[j] + diff * q_row[j]) * scale;
+                    p[j] *= scale;
                 }
             }
         }
 
-        p
+        ws.p.clone()
     }
 
     /// Classify a query fingerprint.
@@ -408,20 +617,47 @@ impl<'a> SvmPredictor<'a> {
     ///
     /// Tuple of (probabilities, prediction result)
     pub fn predict(&self, query: &[f64]) -> (Vec<f64>, ProbabilityResult) {
-        // Compute DTW distances
-        let distances =
-            compute_distances(query, &self.model.training_fingerprints, self.model.window);
+        // For a single predict, lazy growth costs less than pre-reserving
+        // k×k coupling matrices. Hot-loop callers should share a workspace
+        // via `predict_with_workspace`.
+        let mut ws = SvmWorkspace::new();
+        self.predict_with_workspace(query, &mut ws)
+    }
 
-        // Convert to kernel
-        let kernel_values = distances_to_kernel(&distances, &self.model.kernel_params);
+    /// Workspace-backed variant of [`Self::predict`]. Reuses all scratch
+    /// buffers across calls; prefer this in a tight `par_iter` by creating
+    /// one workspace per rayon worker via
+    /// `map_init(|| SvmWorkspace::for_model(predictor.model()), …)`.
+    pub fn predict_with_workspace(
+        &self,
+        query: &[f64],
+        ws: &mut SvmWorkspace,
+    ) -> (Vec<f64>, ProbabilityResult) {
+        // 1) DTW distances → ws.distances
+        compute_distances_into(
+            query,
+            &self.model.training_fingerprints,
+            self.model.window,
+            ws,
+        );
 
-        // Compute decision function
-        let decisions = self.decision_function(&kernel_values);
+        // 2) Kernel transform. Borrow-split: we need `&ws.distances` while
+        // writing `ws.kernel`.
+        let distances = std::mem::take(&mut ws.distances);
+        distances_to_kernel_into(&distances, &self.model.kernel_params, &mut ws.kernel);
+        ws.distances = distances;
 
-        // Convert to probabilities
-        let probabilities = self.decision_to_probabilities(&decisions);
+        // 3) Decision function. Needs &ws.kernel plus &mut ws (for
+        // kernel_weighted_scores scratch); swap kernel + decisions out.
+        let kernel = std::mem::take(&mut ws.kernel);
+        let mut decisions = std::mem::take(&mut ws.decisions);
+        self.decision_function_into(&kernel, ws, &mut decisions);
+        ws.kernel = kernel;
 
-        // Process probabilities
+        // 4) Probabilities. Same borrow-split trick for decisions.
+        let probabilities = self.decision_to_probabilities_with(&decisions, ws);
+        ws.decisions = decisions;
+
         let result = process_probabilities(
             &probabilities,
             &self.model.label_mapper,
@@ -429,6 +665,13 @@ impl<'a> SvmPredictor<'a> {
         );
 
         (probabilities, result)
+    }
+
+    /// Return a reference to the underlying model. Useful for sizing
+    /// [`SvmWorkspace`] via [`SvmWorkspace::for_model`] when the caller holds
+    /// a predictor but not the model directly.
+    pub fn model(&self) -> &DtwSvmModel {
+        self.model
     }
 }
 
@@ -492,13 +735,27 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
     let dist = ctx.distance_matrix(&queries_f32, &refs_f32, model.window)?;
 
     let predictor = SvmPredictor::new(model);
+    let mut ws = SvmWorkspace::for_model(model);
     let mut out = Vec::with_capacity(fingerprints.len());
     for i in 0..fingerprints.len() {
         let row = dist.row(i);
-        let distances_f64: Vec<f64> = row.iter().map(|&d| d as f64).collect();
-        let kernel_values = distances_to_kernel(&distances_f64, &model.kernel_params);
-        let decisions = predictor.decision_function(&kernel_values);
-        let probabilities = predictor.decision_to_probabilities(&decisions);
+        // Write the f32 row directly into the kernel buffer via the in-place
+        // transform — skips a per-query `Vec<f64>` allocation for distances.
+        ws.kernel.clear();
+        ws.kernel.extend(row.iter().map(|&d| {
+            let d = d as f64;
+            (-model.kernel_params.gamma * d.powf(model.kernel_params.power)).exp()
+        }));
+
+        // Run the rest of the pipeline against the pre-filled kernel buffer.
+        let kernel = std::mem::take(&mut ws.kernel);
+        let mut decisions = std::mem::take(&mut ws.decisions);
+        predictor.decision_function_into(&kernel, &mut ws, &mut decisions);
+        ws.kernel = kernel;
+
+        let probabilities = predictor.decision_to_probabilities_with(&decisions, &mut ws);
+        ws.decisions = decisions;
+
         let result = process_probabilities(
             &probabilities,
             &model.label_mapper,
