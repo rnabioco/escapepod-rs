@@ -700,6 +700,15 @@ pub fn classify_with_svm(model: &SvmModel, fingerprint: &[f64]) -> (Vec<f64>, Pr
 /// many queries — kernel launch and NVRTC compile costs amortize across the
 /// whole batch.
 ///
+/// Default chunk budget (in matrix cells) for the GPU batch classifier.
+/// 512M cells × f32 ≈ 2 GB of device distance matrix per call. Fits
+/// comfortably on a 24 GB A30 with ~22 GB of headroom for DTW kernel
+/// scratch. Smaller cards (T4 at 16 GB, older K80) may need to drop
+/// this; bigger cards (H100/A100 80G) can go 2–4× larger. Surfaced as
+/// a tunable parameter on the per-ctx entry point so callers can size
+/// it from a CLI flag or runtime device-memory query.
+pub const DEFAULT_GPU_CHUNK_CELLS: usize = 512 * 1024 * 1024;
+
 /// Only available with the `gpu` feature.
 #[cfg(feature = "gpu")]
 pub fn classify_with_svm_batch_gpu(
@@ -707,62 +716,132 @@ pub fn classify_with_svm_batch_gpu(
     fingerprints: &[Vec<f64>],
 ) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, escapepod_signal::dtw::GpuDtwError> {
     let ctx = escapepod_signal::dtw::GpuDtwContext::new()?;
-    classify_with_svm_batch_gpu_with_ctx(&ctx, model, fingerprints)
+    classify_with_svm_batch_gpu_with_ctx(&ctx, model, fingerprints, DEFAULT_GPU_CHUNK_CELLS)
 }
 
 /// Same as [`classify_with_svm_batch_gpu`] but reuses an existing
-/// [`escapepod_signal::dtw::GpuDtwContext`].
+/// [`escapepod_signal::dtw::GpuDtwContext`] and lets callers tune the
+/// per-call GPU distance-matrix budget.
+///
+/// `chunk_matrix_cells` caps `queries.len() × refs.len()` for each GPU
+/// call — the kernel allocates that many f32 cells for the result plus
+/// scratch for the DTW kernel. On an A30 (24 GB VRAM) `512 * 1024 * 1024`
+/// is a good starting point (`DEFAULT_GPU_CHUNK_CELLS`). Going too high
+/// triggers `CUDA_ERROR_OUT_OF_MEMORY`; too low leaves throughput on the
+/// table (kernel launch + host↔device copy overhead amortizes poorly).
 #[cfg(feature = "gpu")]
 pub fn classify_with_svm_batch_gpu_with_ctx(
     ctx: &escapepod_signal::dtw::GpuDtwContext,
     model: &SvmModel,
     fingerprints: &[Vec<f64>],
+    chunk_matrix_cells: usize,
 ) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, escapepod_signal::dtw::GpuDtwError> {
     if fingerprints.is_empty() {
         return Ok(Vec::new());
     }
 
-    let queries_f32: Vec<Vec<f32>> = fingerprints
-        .iter()
-        .map(|fp| fp.iter().map(|&x| x as f32).collect())
-        .collect();
+    // Convert refs once (shared across all chunks).
     let refs_f32: Vec<Vec<f32>> = model
         .training_fingerprints
         .iter()
         .map(|fp| fp.iter().map(|&x| x as f32).collect())
         .collect();
 
-    let dist = ctx.distance_matrix(&queries_f32, &refs_f32, model.window)?;
+    // Chunk queries to fit the per-call `Array2<f32>` distance matrix in
+    // GPU VRAM. Previously this was one shot (`distance_matrix(all_queries,
+    // all_refs)`) which OOM'd on realistic eval sets — 17M queries × 10k
+    // refs × 4 bytes is ~680 GB, and the A30 has 24 GB VRAM.
+    let chunk_size = (chunk_matrix_cells / refs_f32.len().max(1)).max(1);
+
+    // Producer/consumer split:
+    //   producer thread: GPU distance_matrix(chunk_queries, refs)
+    //   main thread:     CPU kernel + decision_function + probabilities
+    //
+    // Without this overlap the GPU sat idle during per-row post-processing
+    // and the CPU sat idle during GPU compute. A bounded channel of
+    // depth 1 (sync_channel capacity = 1) means the producer can be one
+    // chunk ahead — enough to fully amortize the pipeline bubble without
+    // letting GPU results pile up in host memory (each result is up to
+    // chunk_size × n_refs × f32 = chunk_matrix_cells × 4 bytes).
+    use std::sync::mpsc::sync_channel;
+    let (tx, rx) = sync_channel::<Result<ndarray::Array2<f32>, escapepod_signal::dtw::GpuDtwError>>(
+        1,
+    );
+    let chunks: Vec<&[Vec<f64>]> = fingerprints.chunks(chunk_size).collect();
+    let n_chunks = chunks.len();
+    let refs_for_producer = &refs_f32;
+    let window = model.window;
 
     let predictor = SvmPredictor::new(model);
     let mut ws = SvmWorkspace::for_model(model);
     let mut out = Vec::with_capacity(fingerprints.len());
-    for i in 0..fingerprints.len() {
-        let row = dist.row(i);
-        // Write the f32 row directly into the kernel buffer via the in-place
-        // transform — skips a per-query `Vec<f64>` allocation for distances.
-        ws.kernel.clear();
-        ws.kernel.extend(row.iter().map(|&d| {
-            let d = d as f64;
-            (-model.kernel_params.gamma * d.powf(model.kernel_params.power)).exp()
-        }));
 
-        // Run the rest of the pipeline against the pre-filled kernel buffer.
-        let kernel = std::mem::take(&mut ws.kernel);
-        let mut decisions = std::mem::take(&mut ws.decisions);
-        predictor.decision_function_into(&kernel, &mut ws, &mut decisions);
-        ws.kernel = kernel;
+    std::thread::scope(|scope| -> Result<(), escapepod_signal::dtw::GpuDtwError> {
+        // Producer thread: walks chunks in order, runs GPU DTW, ships
+        // each Array2<f32> over the channel. If a chunk fails, the error
+        // is forwarded so the consumer can short-circuit.
+        let producer = scope.spawn(move || {
+            for chunk in chunks {
+                let queries_f32: Vec<Vec<f32>> = chunk
+                    .iter()
+                    .map(|fp| fp.iter().map(|&x| x as f32).collect())
+                    .collect();
+                let result = ctx.distance_matrix(&queries_f32, refs_for_producer, window);
+                // Receiver hung up means consumer is bailing on an
+                // earlier error; quietly stop.
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+            // Implicit drop(tx) closes the channel on producer exit so
+            // the consumer's recv() loop terminates.
+        });
 
-        let probabilities = predictor.decision_to_probabilities_with(&decisions, &mut ws);
-        ws.decisions = decisions;
+        // Consumer (this thread): pulls finished distance matrices in
+        // order and runs the per-row CPU pipeline against them. While
+        // we're crunching chunk N, the producer is uploading chunk N+1.
+        for _chunk_idx in 0..n_chunks {
+            let dist = match rx.recv() {
+                Ok(Ok(d)) => d,
+                Ok(Err(e)) => {
+                    // Drain remaining sends so the producer can exit
+                    // cleanly, then propagate.
+                    drop(rx);
+                    let _ = producer.join();
+                    return Err(e);
+                }
+                Err(_) => break, // producer exited / channel closed
+            };
 
-        let result = process_probabilities(
-            &probabilities,
-            &model.label_mapper,
-            model.thresholds.as_deref(),
-        );
-        out.push((probabilities, result));
-    }
+            for i in 0..dist.nrows() {
+                let row = dist.row(i);
+                ws.kernel.clear();
+                ws.kernel.extend(row.iter().map(|&d| {
+                    let d = d as f64;
+                    (-model.kernel_params.gamma * d.powf(model.kernel_params.power)).exp()
+                }));
+
+                let kernel = std::mem::take(&mut ws.kernel);
+                let mut decisions = std::mem::take(&mut ws.decisions);
+                predictor.decision_function_into(&kernel, &mut ws, &mut decisions);
+                ws.kernel = kernel;
+
+                let probabilities =
+                    predictor.decision_to_probabilities_with(&decisions, &mut ws);
+                ws.decisions = decisions;
+
+                let result = process_probabilities(
+                    &probabilities,
+                    &model.label_mapper,
+                    model.thresholds.as_deref(),
+                );
+                out.push((probabilities, result));
+            }
+        }
+
+        let _ = producer.join();
+        Ok(())
+    })?;
 
     Ok(out)
 }

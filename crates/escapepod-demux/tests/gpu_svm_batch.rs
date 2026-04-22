@@ -98,8 +98,13 @@ fn parity_svm_classify_batch() {
         .map(|q| classify_with_svm(&model, q))
         .collect();
 
-    let gpu_results = escapepod_demux::classify_with_svm_batch_gpu_with_ctx(&ctx, &model, &queries)
-        .expect("gpu svm batch ok");
+    let gpu_results = escapepod_demux::classify_with_svm_batch_gpu_with_ctx(
+        &ctx,
+        &model,
+        &queries,
+        escapepod_demux::DEFAULT_GPU_CHUNK_CELLS,
+    )
+    .expect("gpu svm batch ok");
 
     assert_eq!(gpu_results.len(), cpu_results.len());
     for (i, ((cpu_probs, cpu_res), (gpu_probs, gpu_res))) in

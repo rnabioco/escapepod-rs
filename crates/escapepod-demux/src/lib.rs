@@ -86,6 +86,8 @@ pub use svm::{
     SvmModel, SvmPredictor, SvmWorkspace, classify_with_svm, compute_distances, distances_to_kernel,
 };
 
+pub use svm::DEFAULT_GPU_CHUNK_CELLS;
+
 #[cfg(feature = "gpu")]
 pub use svm::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx};
 
