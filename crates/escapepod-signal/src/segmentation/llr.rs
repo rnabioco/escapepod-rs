@@ -206,6 +206,10 @@ impl LlrTrace {
 
     /// Find the single best split point based on maximum LLR gain.
     ///
+    /// Argmax is tracked inline during the scan — no gains vector is
+    /// materialized. Ties prefer the earlier position, matching the previous
+    /// `compute_gains`-based implementation.
+    ///
     /// # Arguments
     /// * `start` - Start index of the range to search
     /// * `end` - End index of the range to search
@@ -222,27 +226,43 @@ impl LlrTrace {
         min_obs: usize,
         border_trim: usize,
     ) -> Option<(usize, f64)> {
-        let gains = self.compute_gains(start, end, min_obs, border_trim);
-
-        let search_start = start + min_obs;
-        let search_end = end.saturating_sub(border_trim);
-
-        // Check for invalid range (segment too short)
-        if search_start >= search_end || search_end > gains.len() {
+        if end > self.cumsum.len() {
             return None;
         }
 
-        gains[search_start..search_end]
-            .iter()
-            .enumerate()
-            .fold(None, |best, (offset, &gain)| {
-                let i = search_start + offset;
-                match best {
-                    Some((_, best_gain)) if gain <= best_gain => best,
-                    _ if gain > 0.0 => Some((i, gain)),
-                    _ => best,
+        let var_full = self.variance(start, end);
+        if var_full <= 0.0 {
+            return None;
+        }
+        let var_summed = ((end - start) as f64) * var_full.ln();
+
+        let search_start = start + min_obs;
+        let search_end = end.saturating_sub(border_trim);
+        if search_start >= search_end {
+            return None;
+        }
+
+        let stride = self.stride.max(1);
+        let mut best: Option<(usize, f64)> = None;
+        for i in (search_start..search_end).step_by(stride) {
+            let var_head = self.variance(start, i);
+            let var_tail = self.variance(i, end);
+            if var_head <= 0.0 || var_tail <= 0.0 {
+                continue;
+            }
+            let gain = var_summed
+                - ((i - start) as f64) * var_head.ln()
+                - ((end - i) as f64) * var_tail.ln();
+            if gain > 0.0
+                && match best {
+                    Some((_, best_gain)) => gain > best_gain,
+                    None => true,
                 }
-            })
+            {
+                best = Some((i, gain));
+            }
+        }
+        best
     }
 
     /// Get the length of the signal.
@@ -286,7 +306,6 @@ pub fn detect_adapter(
     let trace = LlrTrace::new(signal, 1);
     let length = trace.len();
 
-    // Find primary split
     let Some((x_first, _)) =
         trace.best_split(0, length, min_obs_adapter + border_trim, border_trim)
     else {
