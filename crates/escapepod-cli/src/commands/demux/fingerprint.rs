@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use uuid::Uuid;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Arguments for the fingerprint subcommand.
 #[derive(Debug, clap::Args)]
@@ -150,79 +150,101 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
         style::count(boundaries_map.len())
     );
 
-    // Collect reads that have boundaries
-    let mut reads_to_process: Vec<(Uuid, usize, usize, Vec<i16>)> = Vec::new();
-
-    for path in &args.input {
-        let reader = Reader::open(path)?;
-        if let Ok(reads) = reader.reads() {
-            for read_result in reads {
-                let read = read_result?;
-                if let Some(boundaries) = boundaries_map.get(&read.read_id)
-                    && !read.signal_rows.is_empty()
-                    && let Ok(signal) = reader.get_signal(&read.signal_rows)
-                {
-                    reads_to_process.push((
-                        read.read_id,
-                        boundaries.adapter_start,
-                        boundaries.adapter_end,
-                        signal,
-                    ));
-                }
-            }
-        }
-    }
-
+    // Upper bound for the progress bar: every boundary record is a candidate
+    // read. Some may not appear in the POD5 corpus, in which case the bar
+    // stops short of 100% — acceptable for a progress indicator.
     println!(
-        "{} {} reads to fingerprint",
+        "{} up to {} reads to fingerprint",
         style::label("Processing:"),
-        style::count(reads_to_process.len())
+        style::count(boundaries_map.len())
     );
 
-    let progress_bar = create_progress_bar(reads_to_process.len() as u64, "Fingerprinting")?;
+    let progress_bar = create_progress_bar(boundaries_map.len() as u64, "Fingerprinting")?;
 
-    // Process reads in parallel. Chunked so progress updates hit the shared
-    // atomic counter once per 64 reads instead of once per read — keeps all
-    // CPUs busy on fingerprint extraction rather than fighting over the
-    // progress bar's atomic add.
+    // Fan out across POD5 files with the outer par_iter; within each file,
+    // do the expensive signal decompress + fingerprint with an inner
+    // par_iter. Nested rayon work-stealing keeps all CPUs busy even when the
+    // read count is skewed across files. Unlike the previous serial-load +
+    // par_chunks pattern, there is no single-threaded phase — I/O,
+    // SVB16+ZSTD decompression, and fingerprint compute all overlap.
+    //
+    // Batched progress updates: one pb.inc(64) per 64 reads instead of one
+    // atomic RMW per read keeps contention off the hot path.
     const PROGRESS_BATCH: usize = 64;
-    let fingerprints: Vec<ReadFingerprint> = reads_to_process
-        .par_chunks(PROGRESS_BATCH)
-        .flat_map(|chunk| {
-            let results: Vec<ReadFingerprint> = chunk
-                .iter()
-                .filter_map(|(read_id, adapter_start, adapter_end, signal)| {
-                    // Compute the region for fingerprinting
+    let pb_counter = AtomicUsize::new(0);
+    let pb_ref = &progress_bar;
+    let pb_counter_ref = &pb_counter;
+
+    let fingerprints: Vec<ReadFingerprint> = args
+        .input
+        .par_iter()
+        .map(|path| -> Vec<ReadFingerprint> {
+            let Ok(reader) = Reader::open(path) else {
+                return Vec::new();
+            };
+            let Ok(read_iter) = reader.reads() else {
+                return Vec::new();
+            };
+            // Metadata-only pre-filter: boundaries + non-empty signal_rows.
+            // No signal I/O yet — the signal decode is the expensive part
+            // and happens in the inner par_iter below.
+            let reads: Vec<_> = read_iter
+                .filter_map(Result::ok)
+                .filter(|r| !r.signal_rows.is_empty() && boundaries_map.contains_key(&r.read_id))
+                .collect();
+            let Ok(extractor) = reader.signal_extractor() else {
+                return Vec::new();
+            };
+
+            reads
+                .par_iter()
+                .filter_map(|r| {
+                    let signal = extractor.get_signal(&r.signal_rows).ok()?;
+                    let boundaries = boundaries_map.get(&r.read_id)?;
                     let (region_start, region_end) = if use_full_adapter {
-                        (*adapter_start, *adapter_end)
+                        (boundaries.adapter_start, boundaries.adapter_end)
                     } else {
-                        let start = adapter_start + args.segment_start;
-                        let end = (adapter_start + args.segment_end).min(*adapter_end);
+                        let start = boundaries.adapter_start + args.segment_start;
+                        let end = (boundaries.adapter_start + args.segment_end)
+                            .min(boundaries.adapter_end);
                         (start, end)
                     };
-
                     if region_end <= region_start {
                         return None;
                     }
-
-                    extract_fingerprint_from_signal(
-                        signal,
+                    let fp = extract_fingerprint_from_signal(
+                        &signal,
                         region_start,
                         region_end,
                         num_segments,
                         window_width,
                         norm_method,
-                        *read_id,
+                        r.read_id,
                         min_separation,
                         keep_last,
-                    )
+                    );
+                    // Count attempts (not only successes) so the bar advances
+                    // even when a read fails to fingerprint.
+                    let count = pb_counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(PROGRESS_BATCH) {
+                        pb_ref.inc(PROGRESS_BATCH as u64);
+                    }
+                    fp
                 })
-                .collect();
-            progress_bar.inc(chunk.len() as u64);
-            results
+                .collect()
         })
-        .collect();
+        .reduce(Vec::new, |mut a, b| {
+            a.extend(b);
+            a
+        });
 
+    // Advance the bar by any reads counted but not yet reflected (tail of
+    // the last PROGRESS_BATCH-sized group).
+    let total_counted = pb_counter.load(Ordering::Relaxed);
+    let remainder = total_counted % PROGRESS_BATCH;
+    if remainder > 0 {
+        progress_bar.inc(remainder as u64);
+    }
     progress_bar.finish_with_message("complete");
 
     // Write fingerprints
