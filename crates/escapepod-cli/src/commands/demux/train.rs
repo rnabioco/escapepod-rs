@@ -1,12 +1,12 @@
 //! Train subcommand - generate reference barcode fingerprints from known samples.
 
 use super::types::{BarcodeStats, TrainParams, TrainingOutput};
-use super::utils::{
-    compute_consensus_fingerprint, compute_std_dev_fingerprint, configure_thread_pool,
-    extract_fingerprint_from_signal, parse_norm_method,
-};
+use super::utils::{configure_thread_pool, parse_norm_method};
 use crate::progress::create_progress_bar;
 use crate::style;
+use escapepod_demux::{
+    compute_consensus_fingerprint, compute_std_dev_fingerprint, extract_fingerprint_from_signal,
+};
 use escapepod_signal::Reader;
 use escapepod_signal::segmentation::{detect_adapter, normalize_signal};
 use rayon::prelude::*;

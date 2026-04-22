@@ -1,11 +1,9 @@
 //! Fingerprint subcommand - extract signal features from adapter regions.
 
-use super::types::ReadFingerprint;
-use super::utils::{
-    configure_thread_pool, extract_fingerprint_from_signal, parse_boundaries_csv, parse_norm_method,
-};
+use super::utils::{configure_thread_pool, parse_boundaries_csv, parse_norm_method};
 use crate::progress::create_progress_bar;
 use crate::style;
+use escapepod_demux::{ReadFingerprint, extract_fingerprint_from_signal};
 use escapepod_signal::Reader;
 use escapepod_signal::dtw::NormMethod;
 use rayon::prelude::*;

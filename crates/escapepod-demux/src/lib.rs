@@ -52,6 +52,7 @@
 //! ```
 
 mod classify;
+mod fingerprint;
 mod model;
 mod probability;
 mod svm;
@@ -61,6 +62,11 @@ mod train;
 
 #[cfg(feature = "cnn-detect")]
 pub mod adapter_cnn;
+
+pub use fingerprint::{
+    BarcodeFingerprint, ReadFingerprint, compute_consensus_fingerprint,
+    compute_std_dev_fingerprint, extract_fingerprint_from_signal,
+};
 
 // Legacy distance-based classifier.
 pub use classify::{ClassificationResult, classify_from_distances, classify_read};

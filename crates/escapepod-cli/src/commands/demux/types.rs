@@ -25,38 +25,6 @@ impl ReadBoundaries {
     }
 }
 
-/// A fingerprint extracted from a read's adapter region.
-#[derive(Debug, Clone)]
-pub struct ReadFingerprint {
-    /// The read identifier
-    pub read_id: Uuid,
-    /// The fingerprint feature values
-    pub values: Vec<f64>,
-}
-
-impl ReadFingerprint {
-    /// Create a new read fingerprint.
-    pub fn new(read_id: Uuid, values: Vec<f64>) -> Self {
-        Self { read_id, values }
-    }
-}
-
-/// A reference barcode fingerprint for classification.
-#[derive(Debug, Clone)]
-pub struct BarcodeFingerprint {
-    /// The barcode name (e.g., "BC01")
-    pub barcode: String,
-    /// The fingerprint feature values
-    pub values: Vec<f32>,
-}
-
-impl BarcodeFingerprint {
-    /// Create a new barcode fingerprint.
-    pub fn new(barcode: String, values: Vec<f32>) -> Self {
-        Self { barcode, values }
-    }
-}
-
 /// Barcode statistics for training output.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BarcodeStats {
