@@ -205,14 +205,16 @@ pub fn total_read_count(input_files: &[PathBuf]) -> usize {
         .sum()
 }
 
-/// Fan out across POD5 files with rayon, process each read in-place, drop the
-/// signal buffer before moving to the next read.
+/// Fan out across POD5 files and across reads within each file, processing
+/// each read in-place so signal buffers never outlive the closure.
 ///
-/// Files are handled in parallel (one file per rayon worker); reads within a
-/// file are iterated sequentially, which keeps mmap access patterns linear and
-/// avoids contending on the reader's signal cache. Peak signal RAM is bounded
-/// by `rayon::current_num_threads()` reads, not the total read count — fixes
-/// the OOM that hit on multi-hundred-file directories.
+/// Nested rayon: the outer `par_iter` pairs one worker per file; within each
+/// file, read metadata is collected cheaply, then a second `par_iter` fans
+/// signal decompression + the user closure across workers using the
+/// thread-safe `SignalExtractor`. Rayon's work-stealing flows across both
+/// levels, so on fixtures with few files and many reads we stop bottlenecking
+/// on file count — all CPUs stay busy. Peak signal RAM is still bounded by
+/// `rayon::current_num_threads()` reads (not total reads).
 pub fn process_reads_par<F, T>(
     input_files: &[PathBuf],
     progress: Option<&indicatif::ProgressBar>,
@@ -228,18 +230,24 @@ where
         .par_iter()
         .map(|path| -> anyhow::Result<Vec<T>> {
             let reader = Reader::open(path)?;
-            let mut out = Vec::new();
-            for read_result in reader.reads()? {
-                let read = read_result?;
-                if read.signal_rows.is_empty() {
-                    continue;
-                }
-                let signal = reader.get_signal(&read.signal_rows)?;
-                out.push(process(read.read_id, read.num_samples, &signal));
-                if let Some(pb) = progress {
-                    pb.inc(1);
-                }
-            }
+            let reads: Vec<_> = reader
+                .reads()?
+                .filter_map(Result::ok)
+                .filter(|r| !r.signal_rows.is_empty())
+                .collect();
+            let extractor = reader.signal_extractor()?;
+
+            let out: Vec<T> = reads
+                .par_iter()
+                .filter_map(|r| {
+                    let signal = extractor.get_signal(&r.signal_rows).ok()?;
+                    let result = process(r.read_id, r.num_samples, &signal);
+                    if let Some(pb) = progress {
+                        pb.inc(1);
+                    }
+                    Some(result)
+                })
+                .collect();
             Ok(out)
         })
         .collect();
