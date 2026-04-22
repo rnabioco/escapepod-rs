@@ -3,12 +3,12 @@
 use super::types::{BarcodeStats, TrainParams, TrainingOutput};
 use super::utils::{
     compute_consensus_fingerprint, compute_std_dev_fingerprint, configure_thread_pool,
-    extract_fingerprint_from_signal, normalize_signal, parse_norm_method,
+    extract_fingerprint_from_signal, parse_norm_method,
 };
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_signal::Reader;
-use escapepod_signal::segmentation::detect_adapter;
+use escapepod_signal::segmentation::{detect_adapter, normalize_signal};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

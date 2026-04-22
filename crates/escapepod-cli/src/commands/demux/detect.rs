@@ -1,12 +1,10 @@
 //! Detect subcommand - LLR-based adapter boundary detection.
 
 use super::types::ReadBoundaries;
-use super::utils::{
-    configure_thread_pool, normalize_signal, process_reads_par, total_read_count,
-};
+use super::utils::{configure_thread_pool, process_reads_par, total_read_count};
 use crate::progress::create_progress_bar;
 use crate::style;
-use escapepod_signal::segmentation::{detect_adapter, downscale};
+use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;

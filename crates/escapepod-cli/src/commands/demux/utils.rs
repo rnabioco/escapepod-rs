@@ -255,19 +255,6 @@ where
     Ok(per_file?.into_iter().flatten().collect())
 }
 
-/// Process raw signal for adapter detection.
-///
-/// Converts i16 to f32 and applies MAD normalization.
-pub fn normalize_signal(signal: &[i16]) -> Vec<f32> {
-    let signal_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
-
-    if signal_f32.len() > 10 {
-        mad_normalize(&signal_f32)
-    } else {
-        signal_f32
-    }
-}
-
 /// Extract a fingerprint from an adapter region of a signal.
 ///
 /// Returns None if the region is too small or segmentation fails.
@@ -561,25 +548,6 @@ mod tests {
         assert_eq!(result[0].values, vec![0.1, 0.2, 0.3]);
         assert_eq!(result[1].barcode, "BC02");
         assert_eq!(result[1].values, vec![0.4, 0.5, 0.6]);
-    }
-
-    #[test]
-    fn test_normalize_signal_short() {
-        let signal: Vec<i16> = vec![100, 200, 300];
-        let result = normalize_signal(&signal);
-        // Short signals are just converted, not normalized
-        assert_eq!(result, vec![100.0, 200.0, 300.0]);
-    }
-
-    #[test]
-    fn test_normalize_signal_long() {
-        // Create a signal with enough samples for normalization
-        let signal: Vec<i16> = (0..100).map(|i| (i as i16) * 10 + 200).collect();
-        let result = normalize_signal(&signal);
-        // MAD normalization should be applied
-        assert_eq!(result.len(), 100);
-        // The result should be different from simple conversion
-        assert!(result[0] != 200.0);
     }
 
     #[test]

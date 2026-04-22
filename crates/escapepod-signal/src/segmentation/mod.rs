@@ -55,7 +55,7 @@ pub mod ttest;
 pub use llr::{LlrTrace, detect_adapter};
 pub use normalize::{
     clip_outliers, downscale, mad_normalize, mad_normalize_robust, mad_normalize_with_clipping,
-    normalize_dwell_times, normalize_dwell_times_mad,
+    normalize_dwell_times, normalize_dwell_times_mad, normalize_signal,
 };
 pub use ttest::{
     SegmentationResult, compute_segment_means, find_changepoints, segment_signal,

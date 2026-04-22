@@ -78,6 +78,20 @@ pub fn mad_normalize(signal: &[f32]) -> Vec<f32> {
     signal.iter().map(|&x| (x - med) / mad_val).collect()
 }
 
+/// Cast a raw i16 signal (the native POD5 sample type) to f32 and apply
+/// MAD normalization.
+///
+/// Signals of ≤ 10 samples are returned unnormalized to avoid degenerate
+/// median/MAD on trivial inputs.
+pub fn normalize_signal(signal: &[i16]) -> Vec<f32> {
+    let signal_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
+    if signal_f32.len() > 10 {
+        mad_normalize(&signal_f32)
+    } else {
+        signal_f32
+    }
+}
+
 /// Normalize signal using median-MAD with the Gaussian scale factor (1.4826).
 ///
 /// Transforms the signal to: `(signal - median) / (1.4826 * MAD)`.
@@ -353,6 +367,23 @@ mod tests {
         for &val in &normalized {
             assert!((-2.0..=2.0).contains(&val));
         }
+    }
+
+    #[test]
+    fn test_normalize_signal_short() {
+        let signal: Vec<i16> = vec![100, 200, 300];
+        let result = normalize_signal(&signal);
+        // Short signals are just converted, not normalized.
+        assert_eq!(result, vec![100.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn test_normalize_signal_long() {
+        let signal: Vec<i16> = (0..100).map(|i| (i as i16) * 10 + 200).collect();
+        let result = normalize_signal(&signal);
+        assert_eq!(result.len(), 100);
+        // MAD normalization has been applied — result differs from raw cast.
+        assert!(result[0] != 200.0);
     }
 
     #[test]
