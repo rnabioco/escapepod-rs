@@ -111,15 +111,18 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     // Progress bar for file processing
     let progress_bar = create_progress_bar(files.len() as u64, "Analyzing")?;
     progress_bar.set_message("files");
+    let show_message = !progress_bar.is_hidden();
 
     // Process each file
     for path in &files {
-        progress_bar.set_message(
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-        );
+        if show_message {
+            progress_bar.set_message(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
         // Try to open the file, skip if corrupted
         let reader = match Reader::open(path) {
             Ok(r) => r,

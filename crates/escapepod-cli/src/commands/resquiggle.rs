@@ -329,6 +329,10 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     // Stream BAM records, filter against POD5 index, and process in chunks
     // Each chunk entry carries the pre-parsed UUID to avoid double parsing.
     const CHUNK_SIZE: usize = 10_000;
+    // Batch progress updates: tens of millions of BAM records × per-record
+    // set_position is pure overhead (atomic store + draw-throttle check);
+    // 1k granularity is well under a frame of wall time.
+    const PROGRESS_STRIDE: usize = 1_000;
     let progress_bar = create_progress_bar(bam_total, "Processing")?;
     let log_interval: usize = if progress_bar.is_hidden() { 10_000 } else { 0 };
     let mut chunk: Vec<(uuid::Uuid, RecordBuf)> = Vec::with_capacity(CHUNK_SIZE);
@@ -354,20 +358,22 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             }
         });
 
-        let read_id = match read_id {
-            Some(id) => id,
-            None => continue,
-        };
-        matched += 1;
-        chunk.push((read_id, record_buf));
-
-        progress_bar.set_position(total_bam as u64);
+        if total_bam.is_multiple_of(PROGRESS_STRIDE) {
+            progress_bar.set_position(total_bam as u64);
+        }
         if log_interval > 0 && total_bam.is_multiple_of(log_interval) {
             eprintln!(
                 "[resquiggle] processed {} / {} records ({} matched)",
                 total_bam, bam_total, matched
             );
         }
+
+        let read_id = match read_id {
+            Some(id) => id,
+            None => continue,
+        };
+        matched += 1;
+        chunk.push((read_id, record_buf));
 
         if chunk.len() >= CHUNK_SIZE {
             refine_and_send_chunk(&mut chunk, &ctx, &tx)?;

@@ -47,45 +47,49 @@ pub fn run(
     let progress_bar = create_progress_bar(num_files as u64, "Loading")?;
     progress_bar.set_message("metadata");
 
-    // Track current phase and timing
-    let current_phase = Mutex::new(None::<MergePhase>);
-    let phase_start = Mutex::new(Instant::now());
-    let phase_times: Mutex<Vec<(MergePhase, Duration)>> = Mutex::new(Vec::new());
+    // Track current phase and timing. One mutex holds the entire tracker so
+    // each callback takes a single lock instead of five. LoadingMetadata
+    // fires the callback from a parallel par_iter, so the old multi-mutex
+    // dance caused real lock traffic on large input sets.
+    struct PhaseTracker {
+        current: Option<MergePhase>,
+        start: Instant,
+        times: Vec<(MergePhase, Duration)>,
+    }
+    let tracker = Mutex::new(PhaseTracker {
+        current: None,
+        start: Instant::now(),
+        times: Vec::new(),
+    });
     let total_start = Instant::now();
 
     let callback = |progress: MergeProgress| {
-        let mut phase_guard = current_phase.lock().unwrap();
+        let mut t = tracker.lock().unwrap();
 
-        // Detect phase transitions
-        if *phase_guard != Some(progress.phase) {
-            // Record previous phase duration
-            if let Some(prev_phase) = *phase_guard {
-                let elapsed = phase_start.lock().unwrap().elapsed();
-                phase_times.lock().unwrap().push((prev_phase, elapsed));
+        if t.current != Some(progress.phase) {
+            if let Some(prev) = t.current {
+                let elapsed = t.start.elapsed();
+                t.times.push((prev, elapsed));
             }
-            *phase_start.lock().unwrap() = Instant::now();
-            *phase_guard = Some(progress.phase);
+            t.start = Instant::now();
+            t.current = Some(progress.phase);
 
             match progress.phase {
                 MergePhase::LoadingMetadata => {
                     progress_bar.set_prefix("Loading");
                     progress_bar.set_message("metadata");
-                    progress_bar.set_length(progress.total as u64);
-                    progress_bar.set_position(0);
                 }
                 MergePhase::WritingSignal => {
                     progress_bar.set_prefix("Writing");
                     progress_bar.set_message("signal");
-                    progress_bar.set_length(progress.total as u64);
-                    progress_bar.set_position(0);
                 }
                 MergePhase::WritingReads => {
                     progress_bar.set_prefix("Writing");
                     progress_bar.set_message("reads");
-                    progress_bar.set_length(progress.total as u64);
-                    progress_bar.set_position(0);
                 }
             }
+            progress_bar.set_length(progress.total as u64);
+            progress_bar.set_position(0);
         }
 
         progress_bar.set_position(progress.current as u64);
@@ -95,10 +99,14 @@ pub fn run(
     let result = merge_files(&all_files, &output, &options, Some(&callback))?;
 
     // Record final phase duration
-    if let Some(last_phase) = *current_phase.lock().unwrap() {
-        let elapsed = phase_start.lock().unwrap().elapsed();
-        phase_times.lock().unwrap().push((last_phase, elapsed));
-    }
+    let phase_times = {
+        let mut t = tracker.lock().unwrap();
+        if let Some(last) = t.current {
+            let elapsed = t.start.elapsed();
+            t.times.push((last, elapsed));
+        }
+        std::mem::take(&mut t.times)
+    };
     let total_elapsed = total_start.elapsed();
 
     progress_bar.finish_and_clear();
@@ -122,8 +130,7 @@ pub fn run(
     if profile {
         eprintln!();
         eprintln!("{}", style::action("Profile"));
-        let times = phase_times.lock().unwrap();
-        for (phase, duration) in times.iter() {
+        for (phase, duration) in phase_times.iter() {
             let phase_name = match phase {
                 MergePhase::LoadingMetadata => "Loading metadata (parallel)",
                 MergePhase::WritingSignal => "Writing signal data",
