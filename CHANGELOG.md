@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 0.4.0 (2026-04-22)
+
+### Performance
+
+- `demux fingerprint`: nested `par_iter` streams signals across files and
+  reads so fingerprinting a 48-file run drops from ~32 min to ~9.8 s on
+  the rna partition.
+- `demux classify` / `train-svm`: reusable per-thread `SvmWorkspace` and
+  a streaming (rayon fan-out + single writer) output path cut RSS by
+  ~37% and remove a serialize-then-write stall.
+- `svb16`: AVX2 decode path (16 samples/iter), preferred at runtime over
+  SSSE3 when available.
+- `dtw`: split the inner band loop so the trailing segment auto-
+  vectorizes under AVX2; the x86-64-v3 baseline (AVX2 + FMA + BMI2 +
+  POPCNT + F16C) is now pinned in `.cargo/config.toml` for portability
+  across Broadwell/Cascade Lake/Ice Lake cluster nodes.
+- `segmentation::llr`: allocation-free `best_split` and an opt-in
+  early-stop variant.
+- CLI: progress-bar updates throttled out of hot paths.
+
+### Changed
+
+- Moved from CLI into libraries (additive for library consumers):
+  - `ReadBoundaries` and fingerprint types/helpers now live in
+    `escapepod-demux`.
+  - `normalize_signal(&[i16])` and the CLI's `downscale_signal` now
+    live in `escapepod-signal` (the CLI's duplicate was removed).
+- Docs: recommend `srun -c 48` for throughput-sensitive demux runs on
+  the rna partition (fills one socket without crossing NUMA).
+
 ## 0.3.1 (2026-04-21)
 
 ### Added
