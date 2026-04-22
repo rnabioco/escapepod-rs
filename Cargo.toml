@@ -53,12 +53,12 @@ opt-level = 3
 
 # `cargo bench` uses [profile.bench], which by default does NOT inherit from
 # [profile.release]. Pin it here so microbenchmarks measure the same codegen
-# (LTO, single codegen unit) that ships in the release binary. `strip` and
-# `panic = "abort"` are omitted: criterion needs symbols and unwinding.
+# (LTO, single codegen unit) that ships in the release binary. `strip` is
+# disabled so criterion has symbols; `panic` is not set because Cargo ignores
+# it for bench profiles (bench binaries always unwind).
 [profile.bench]
 inherits = "release"
 strip = false
-panic = "unwind"
 
 # Release-speed build with symbols preserved — for samply/perf recordings
 # where you want final codegen but readable stack traces.
