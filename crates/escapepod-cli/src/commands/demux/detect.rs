@@ -2,12 +2,11 @@
 
 use super::types::ReadBoundaries;
 use super::utils::{
-    collect_reads_with_signals, configure_thread_pool, downscale_signal, normalize_signal,
+    configure_thread_pool, downscale_signal, normalize_signal, process_reads_par, total_read_count,
 };
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_signal::segmentation::detect_adapter;
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -133,57 +132,48 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     // Set thread pool size
     configure_thread_pool(args.threads);
 
-    // Collect all reads with their signals
-    let all_reads = collect_reads_with_signals(&args.input)?;
-
+    let total = total_read_count(&args.input);
     println!(
         "{} {} reads to process",
         style::label("Found:"),
-        style::count(all_reads.len())
+        style::count(total)
     );
 
-    let progress_bar = create_progress_bar(all_reads.len() as u64, "Detecting")?;
+    let progress_bar = create_progress_bar(total as u64, "Detecting")?;
 
-    // Process reads in parallel
-    let downscale = args.downscale.max(1); // Ensure at least 1
-    let results: Vec<ReadBoundaries> = all_reads
-        .par_iter()
-        .map(|(read_id, num_samples, signal)| {
-            // Normalize signal
+    let downscale = args.downscale.max(1);
+    let min_adapter = args.min_adapter;
+    let border_trim = args.border_trim;
+
+    let results: Vec<ReadBoundaries> = process_reads_par(
+        &args.input,
+        Some(&progress_bar),
+        |read_id, num_samples, signal| {
             let normalized = normalize_signal(signal);
 
-            // Optionally downscale signal
             let (processed_signal, scale_factor) = if downscale > 1 {
                 (downscale_signal(&normalized, downscale), downscale)
             } else {
                 (normalized, 1)
             };
 
-            // Scale parameters for downscaled signal
-            let scaled_min_adapter = args.min_adapter / scale_factor;
-            let scaled_border_trim = args.border_trim / scale_factor;
+            let scaled_min_adapter = min_adapter / scale_factor;
+            let scaled_border_trim = border_trim / scale_factor;
 
-            // Detect adapter using LLR
             let (adapter_start, adapter_end) = detect_adapter(
                 &processed_signal,
                 scaled_min_adapter.max(1),
                 scaled_border_trim.max(1),
             );
 
-            // Scale results back to original resolution
-            let adapter_start = adapter_start * scale_factor;
-            let adapter_end = adapter_end * scale_factor;
-
-            progress_bar.inc(1);
-
             ReadBoundaries {
-                read_id: *read_id,
-                num_samples: *num_samples,
-                adapter_start,
-                adapter_end,
+                read_id,
+                num_samples,
+                adapter_start: adapter_start * scale_factor,
+                adapter_end: adapter_end * scale_factor,
             }
-        })
-        .collect();
+        },
+    )?;
 
     progress_bar.finish_with_message("complete");
 
@@ -275,34 +265,34 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     let cnn =
         AdapterCnn::load(cnn_model_path).map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
 
-    let all_reads = collect_reads_with_signals(&args.input)?;
+    let total = total_read_count(&args.input);
     println!(
         "{} {} reads to process",
         style::label("Found:"),
-        style::count(all_reads.len())
+        style::count(total)
     );
 
-    let progress_bar = create_progress_bar(all_reads.len() as u64, "Detecting (CNN)")?;
+    let progress_bar = create_progress_bar(total as u64, "Detecting (CNN)")?;
 
-    let results: Vec<ReadBoundaries> = all_reads
-        .par_iter()
-        .map(|(read_id, num_samples, signal)| {
+    let results: Vec<ReadBoundaries> = process_reads_par(
+        &args.input,
+        Some(&progress_bar),
+        |read_id, num_samples, signal| {
             // MAD normalization inside the CNN's `prepare_data` is
             // scale-invariant, so raw i16 → f32 matches the pA-calibrated
             // path WarpDemuX uses bit-for-bit post-normalization.
             let signal_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
             let adapter_end = cnn.detect_adapter_end(&signal_f32).unwrap_or(0);
-            progress_bar.inc(1);
             ReadBoundaries {
-                read_id: *read_id,
-                num_samples: *num_samples,
+                read_id,
+                num_samples,
                 // ADAPTed's CNN sets adapter_start=0 always — boundary
                 // detection on this path is single-ended.
                 adapter_start: 0,
                 adapter_end,
             }
-        })
-        .collect();
+        },
+    )?;
 
     progress_bar.finish_with_message("complete");
 

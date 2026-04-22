@@ -193,29 +193,58 @@ pub fn parse_reference_csv(path: &PathBuf) -> anyhow::Result<Vec<BarcodeFingerpr
     Ok(fingerprints)
 }
 
-/// Collect reads with signal data from POD5 files.
+/// Sum of reads across a list of POD5 files (metadata-only scan, no signal I/O).
 ///
-/// Returns a vector of (read_id, num_samples, signal) tuples.
-pub fn collect_reads_with_signals(
-    input_files: &[PathBuf],
-) -> anyhow::Result<Vec<(Uuid, u64, Vec<i16>)>> {
-    let mut all_reads = Vec::new();
+/// `Reader::read_count` only touches the reads Arrow table, so this is cheap
+/// enough to run up-front to size a progress bar.
+pub fn total_read_count(input_files: &[PathBuf]) -> usize {
+    use rayon::prelude::*;
+    input_files
+        .par_iter()
+        .map(|p| Reader::open(p).and_then(|r| r.read_count()).unwrap_or(0))
+        .sum()
+}
 
-    for path in input_files {
-        let reader = Reader::open(path)?;
-        if let Ok(reads) = reader.reads() {
-            for read_result in reads {
+/// Fan out across POD5 files with rayon, process each read in-place, drop the
+/// signal buffer before moving to the next read.
+///
+/// Files are handled in parallel (one file per rayon worker); reads within a
+/// file are iterated sequentially, which keeps mmap access patterns linear and
+/// avoids contending on the reader's signal cache. Peak signal RAM is bounded
+/// by `rayon::current_num_threads()` reads, not the total read count — fixes
+/// the OOM that hit on multi-hundred-file directories.
+pub fn process_reads_par<F, T>(
+    input_files: &[PathBuf],
+    progress: Option<&indicatif::ProgressBar>,
+    process: F,
+) -> anyhow::Result<Vec<T>>
+where
+    F: Fn(Uuid, u64, &[i16]) -> T + Send + Sync,
+    T: Send,
+{
+    use rayon::prelude::*;
+
+    let per_file: anyhow::Result<Vec<Vec<T>>> = input_files
+        .par_iter()
+        .map(|path| -> anyhow::Result<Vec<T>> {
+            let reader = Reader::open(path)?;
+            let mut out = Vec::new();
+            for read_result in reader.reads()? {
                 let read = read_result?;
-                if !read.signal_rows.is_empty()
-                    && let Ok(signal) = reader.get_signal(&read.signal_rows)
-                {
-                    all_reads.push((read.read_id, read.num_samples, signal));
+                if read.signal_rows.is_empty() {
+                    continue;
+                }
+                let signal = reader.get_signal(&read.signal_rows)?;
+                out.push(process(read.read_id, read.num_samples, &signal));
+                if let Some(pb) = progress {
+                    pb.inc(1);
                 }
             }
-        }
-    }
+            Ok(out)
+        })
+        .collect();
 
-    Ok(all_reads)
+    Ok(per_file?.into_iter().flatten().collect())
 }
 
 /// Process raw signal for adapter detection.
