@@ -11,9 +11,7 @@
 
 use std::collections::HashMap;
 
-use linfa::prelude::*;
-use linfa_svm::Svm;
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use rayon::prelude::*;
 
 use crate::model::{DtwSvmModel, KernelParams};
@@ -269,38 +267,22 @@ pub fn train_svm_from_distances(
 }
 
 /// Train binary SVM classifier.
+///
+/// Same stub status as `train_multiclass_svm`: returns uniform-weighted
+/// kernel voting, not a real SVM. The previous SMO-fit-then-discard dance
+/// is removed here too; see that function for the full explanation and
+/// the `TODO(svm-real-fit)` tracking note.
 fn train_binary_svm(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
-    kernel_matrix: &Array2<f64>,
-    target_indices: &[usize],
+    _kernel_matrix: &Array2<f64>,
+    _target_indices: &[usize],
     label_mapper: &HashMap<usize, i32>,
     classes: Vec<i32>,
     config: &TrainConfig,
 ) -> Result<DtwSvmModel, anyhow::Error> {
     let n_samples = fingerprints.len();
-
-    // Convert targets to bool for linfa-svm
-    let targets: Array1<bool> =
-        Array1::from_vec(target_indices.iter().map(|&idx| idx == 1).collect());
-
-    // Create dataset with kernel matrix as features
-    let dataset = Dataset::new(kernel_matrix.clone(), targets);
-
-    // Train SVM
-    let _model = Svm::<_, bool>::params()
-        .pos_neg_weights(1.0, 1.0)
-        .gaussian_kernel(1.0) // We're using precomputed kernel, so this is effectively linear
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("SVM training failed: {:?}", e))?;
-
-    // Extract model parameters
-    // For now, we'll store all training points as support vectors
-    // since linfa doesn't expose the internal SV indices directly
     let support_indices: Vec<usize> = (0..n_samples).collect();
-
-    // The dual coefficients would come from the trained model
-    // For simplicity, we'll use a placeholder approach
     let n_classes = 2;
     let dual_coef = vec![vec![1.0 / n_samples as f64; n_samples]];
     let intercept = vec![0.0];
@@ -329,10 +311,21 @@ fn train_binary_svm(
 }
 
 /// Train multiclass SVM using One-vs-One decomposition.
+///
+/// *Known limitation.* This path does not currently produce a real SVM — it
+/// emits uniform per-sample weights and relies on the predictor's
+/// kernel-weighted voting fallback (`use_kernel_weighted: true`). Proper
+/// dual-coefficient extraction from linfa-svm requires either vendoring the
+/// SMO solver or a Cholesky factorization of each kernel submatrix; see
+/// `TODO(svm-real-fit)` in `train_svm_gpu` for the tracking note. The old
+/// implementation here called `Svm::params().gaussian_kernel(1.0).fit(...)`
+/// which re-applied RBF on top of the already-RBF-transformed kernel matrix
+/// (meaningless) and then threw the solver's output away; removed because
+/// it cost hours of single-threaded SMO for a result that was discarded.
 fn train_multiclass_svm(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
-    kernel_matrix: &Array2<f64>,
+    _kernel_matrix: &Array2<f64>,
     target_indices: &[usize],
     label_mapper: &HashMap<usize, i32>,
     classes: Vec<i32>,
@@ -342,61 +335,35 @@ fn train_multiclass_svm(
     let n_classes = classes.len();
     let n_pairs = n_classes * (n_classes - 1) / 2;
 
-    // For OvO, we train n_classes*(n_classes-1)/2 binary classifiers
+    // Kernel-weighted voting weights: every sample in the OvO pair gets a
+    // uniform contribution. Because `svm::decision_function` adds a
+    // class-scores subtraction `scores[i] - scores[j]` in kernel-weighted
+    // mode, these weights translate into a nearest-neighbour-like
+    // classifier on the DTW-RBF kernel. Works passably when classes are
+    // well-separated in kernel space, which is the regime DNA barcodes
+    // typically live in; not a substitute for a real SVM.
     let mut all_dual_coef: Vec<Vec<f64>> = vec![vec![0.0; n_samples]; n_classes - 1];
     let intercepts = vec![0.0; n_pairs];
     for i in 0..n_classes {
         for j in (i + 1)..n_classes {
-            // Get samples for this pair
-            let pair_mask: Vec<bool> = target_indices
-                .iter()
-                .map(|&idx| idx == i || idx == j)
-                .collect();
-
-            let pair_indices: Vec<usize> = pair_mask
+            let pair_indices: Vec<usize> = target_indices
                 .iter()
                 .enumerate()
-                .filter(|&(_, &m)| m)
-                .map(|(idx, _)| idx)
+                .filter_map(|(idx, &c)| (c == i || c == j).then_some(idx))
                 .collect();
-
             if pair_indices.len() < 2 {
                 continue;
             }
-
-            // Extract kernel submatrix and targets for this pair
             let n_pair = pair_indices.len();
-            let mut pair_kernel = Array2::<f64>::zeros((n_pair, n_pair));
-            let mut pair_targets = Vec::with_capacity(n_pair);
-
-            for (new_i, &old_i) in pair_indices.iter().enumerate() {
-                for (new_j, &old_j) in pair_indices.iter().enumerate() {
-                    pair_kernel[[new_i, new_j]] = kernel_matrix[[old_i, old_j]];
-                }
-                pair_targets.push(target_indices[old_i] == j); // true = class j, false = class i
-            }
-
-            let targets: Array1<bool> = Array1::from_vec(pair_targets);
-            let dataset = Dataset::new(pair_kernel, targets);
-
-            // Train binary SVM for this pair
-            let _model = Svm::<_, bool>::params()
-                .pos_neg_weights(1.0, 1.0)
-                .gaussian_kernel(1.0)
-                .fit(&dataset);
-
-            // Store coefficients (simplified - actual extraction would need linfa internals)
-            // For now, use uniform weights
             for &idx in &pair_indices {
                 let class_idx = target_indices[idx];
                 if class_idx < n_classes - 1 {
-                    all_dual_coef[class_idx][idx] += 1.0 / pair_indices.len() as f64;
+                    all_dual_coef[class_idx][idx] += 1.0 / n_pair as f64;
                 }
             }
         }
     }
 
-    // All training points are support vectors in this simplified approach
     let support_indices: Vec<usize> = (0..n_samples).collect();
 
     Ok(DtwSvmModel {
@@ -418,7 +385,7 @@ fn train_multiclass_svm(
         prob_b: None,
         n_classes,
         noise_class: false,
-        use_kernel_weighted: true, // Use kernel-weighted voting since we can't extract real dual coefficients
+        use_kernel_weighted: true,
     })
 }
 
