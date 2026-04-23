@@ -10,6 +10,7 @@
 //! 4. Convert decision values to probabilities via Platt scaling
 
 use escapepod_signal::dtw::dtw_distance;
+#[cfg(feature = "gpu")]
 use rayon::prelude::*;
 
 use crate::model::{DtwSvmModel, KernelParams};
@@ -896,15 +897,15 @@ pub mod gpu_pipeline {
         // Persistent device buffers — uploaded / sized at construction.
         refs_dev: CudaSlice<f32>,
         r_off_dev: CudaSlice<i32>,
-        coef_dev: CudaSlice<f32>,        // (n_pairs × n_sv) row-major
-        intercept_dev: CudaSlice<f32>,   // (n_pairs)
-        dist_dev: CudaSlice<f32>,        // (max_chunk_q × n_sv) reused per call
-        decisions_dev: CudaSlice<f32>,   // (max_chunk_q × n_pairs) reused per call
+        coef_dev: CudaSlice<f32>,      // (n_pairs × n_sv) row-major
+        intercept_dev: CudaSlice<f32>, // (n_pairs)
+        dist_dev: CudaSlice<f32>,      // (max_chunk_q × n_sv) reused per call
+        decisions_dev: CudaSlice<f32>, // (max_chunk_q × n_pairs) reused per call
         // Sizing.
         n_sv: usize,
         n_pairs: usize,
-        max_m: usize,         // max ref length (in samples)
-        max_chunk_q: usize,   // capacity of dist/decisions buffers
+        max_m: usize,       // max ref length (in samples)
+        max_chunk_q: usize, // capacity of dist/decisions buffers
         window: Option<usize>,
         gamma: f32,
         power: f32,
@@ -1071,10 +1072,7 @@ pub mod gpu_pipeline {
         /// `queries` must have `<= self.max_chunk_q` rows; otherwise the
         /// pre-allocated `dist_dev` / `decisions_dev` buffers wouldn't
         /// hold the result.
-        pub fn classify_chunk(
-            &mut self,
-            queries: &[Vec<f64>],
-        ) -> Result<Array2<f32>, GpuDtwError> {
+        pub fn classify_chunk(&mut self, queries: &[Vec<f64>]) -> Result<Array2<f32>, GpuDtwError> {
             let n_q = queries.len();
             if n_q == 0 {
                 return Ok(Array2::zeros((0, self.n_pairs)));
@@ -1208,7 +1206,8 @@ pub mod gpu_pipeline {
             // cudarc's CudaSlice supports slicing via `.try_clone()` +
             // index, but the simplest path is a sized helper:
             let decisions_view = self.decisions_dev.slice(0..total_out);
-            self.device.dtoh_sync_copy_into(&decisions_view, &mut host_out)?;
+            self.device
+                .dtoh_sync_copy_into(&decisions_view, &mut host_out)?;
 
             Ok(Array2::from_shape_vec((n_q, self.n_pairs), host_out)
                 .expect("shape matches by construction"))

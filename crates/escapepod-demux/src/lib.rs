@@ -75,8 +75,7 @@ pub use classify::{ClassificationResult, classify_from_distances, classify_read}
 pub use classify::{classify_reads_gpu, classify_reads_gpu_with_ctx};
 
 pub use model::{
-    AnyModel, DtwSvmModel, KernelParams, WarpDemuxModel, load_any_model, load_model,
-    load_svm_model,
+    AnyModel, DtwSvmModel, KernelParams, WarpDemuxModel, load_any_model, load_model, load_svm_model,
 };
 pub use probability::{
     ProbabilityResult, confidence_margin, format_probability_columns, process_probabilities,

@@ -286,23 +286,20 @@ pub fn load_any_model(path: &Path) -> Result<AnyModel, anyhow::Error> {
     let json: serde_json::Value = serde_json::from_reader(reader)
         .with_context(|| format!("Failed to parse model JSON at '{}'", path.display()))?;
 
-    let obj = json.as_object().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Model file '{}' is not a JSON object",
-            path.display()
-        )
-    })?;
+    let obj = json
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Model file '{}' is not a JSON object", path.display()))?;
 
     if obj.contains_key("label_mapper") {
-        let model: DtwSvmModel = serde_json::from_value(json)
-            .with_context(|| "Failed to parse DtwSvmModel JSON")?;
+        let model: DtwSvmModel =
+            serde_json::from_value(json).with_context(|| "Failed to parse DtwSvmModel JSON")?;
         model
             .validate()
             .map_err(|e| anyhow::anyhow!("Invalid DtwSvmModel: {}", e))?;
         Ok(AnyModel::Svm(model))
     } else if obj.contains_key("label_map") {
-        let model: WarpDemuxModel = serde_json::from_value(json)
-            .with_context(|| "Failed to parse WarpDemuxModel JSON")?;
+        let model: WarpDemuxModel =
+            serde_json::from_value(json).with_context(|| "Failed to parse WarpDemuxModel JSON")?;
         model
             .validate()
             .map_err(|e| anyhow::anyhow!("Invalid WarpDemuxModel: {}", e))?;

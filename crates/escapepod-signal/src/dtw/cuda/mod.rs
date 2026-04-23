@@ -23,8 +23,8 @@ mod kernel;
 mod svm_kernels;
 
 pub use svm_kernels::{
-    KERNEL_SRC as SVM_KERNEL_SRC, MODULE_NAME as SVM_MODULE_NAME,
-    OVO_DECISION_KERNEL_NAME, RBF_KERNEL_NAME,
+    KERNEL_SRC as SVM_KERNEL_SRC, MODULE_NAME as SVM_MODULE_NAME, OVO_DECISION_KERNEL_NAME,
+    RBF_KERNEL_NAME,
 };
 
 use std::sync::Arc;

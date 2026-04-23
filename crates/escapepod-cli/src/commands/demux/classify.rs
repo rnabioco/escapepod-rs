@@ -241,22 +241,15 @@ fn run_with_svm_model(
     let (confident_count, total_count) = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
-            use escapepod_demux::{
-                DEFAULT_GPU_CHUNK_CELLS, classify_with_svm_batch_gpu_with_ctx,
-            };
+            use escapepod_demux::{DEFAULT_GPU_CHUNK_CELLS, classify_with_svm_batch_gpu_with_ctx};
             println!("{} reads with SVM on GPU...", style::action("Classifying"));
             let chunk_cells = args.gpu_chunk_cells.unwrap_or(DEFAULT_GPU_CHUNK_CELLS);
             let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
             let ctx = escapepod_signal::dtw::GpuDtwContext::new()
                 .map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
-            let gpu_results = classify_with_svm_batch_gpu_with_ctx(
-                &ctx,
-                &model,
-                &fps,
-                chunk_cells,
-            )
-            .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
+            let gpu_results = classify_with_svm_batch_gpu_with_ctx(&ctx, &model, &fps, chunk_cells)
+                .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
 
             // GPU batch already produces the full Vec; stream it to the
             // writer so we still avoid buffering n_pairs × probabilities

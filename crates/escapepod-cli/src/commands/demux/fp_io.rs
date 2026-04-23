@@ -195,14 +195,12 @@ fn read_labeled_csv(
             None => continue,
         };
 
-        let label = *barcode_to_id
-            .entry(barcode.to_string())
-            .or_insert_with(|| {
-                let id = next_id;
-                next_id += 1;
-                barcode_names.push(barcode.to_string());
-                id
-            });
+        let label = *barcode_to_id.entry(barcode.to_string()).or_insert_with(|| {
+            let id = next_id;
+            next_id += 1;
+            barcode_names.push(barcode.to_string());
+            id
+        });
 
         total_seen += 1;
 
@@ -356,8 +354,8 @@ fn read_labeled_parquet(
     path: &Path,
     subsample: Option<(usize, u64)>,
 ) -> Result<LabeledFingerprintData> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open parquet '{}'", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open parquet '{}'", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| "Failed to initialize parquet reader")?;
     let schema = builder.schema().clone();
@@ -434,14 +432,12 @@ fn read_labeled_parquet(
 
         for row in 0..batch.num_rows() {
             let barcode = barcode_col.value(row);
-            let label = *barcode_to_id
-                .entry(barcode.to_string())
-                .or_insert_with(|| {
-                    let id = next_id;
-                    next_id += 1;
-                    barcode_names.push(barcode.to_string());
-                    id
-                });
+            let label = *barcode_to_id.entry(barcode.to_string()).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                barcode_names.push(barcode.to_string());
+                id
+            });
             total_seen += 1;
 
             // Assemble the row's feature vector by gathering across the
@@ -509,8 +505,8 @@ fn read_query_parquet<T, F>(path: &Path, convert: F) -> Result<Vec<(Uuid, Vec<T>
 where
     F: Fn(f64) -> T,
 {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open parquet '{}'", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open parquet '{}'", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| "Failed to initialize parquet reader")?;
     let schema = builder.schema().clone();
@@ -525,10 +521,7 @@ where
         }
     }
     let Some(read_id_idx) = read_id_idx else {
-        anyhow::bail!(
-            "Parquet '{}' has no `read_id` column",
-            path.display()
-        );
+        anyhow::bail!("Parquet '{}' has no `read_id` column", path.display());
     };
     if feature_idxs.is_empty() {
         anyhow::bail!("Parquet '{}' has no feature columns", path.display());
@@ -613,12 +606,17 @@ mod tests {
         let f2 = Float64Array::from_iter_values(rows.iter().map(|(_, _, v)| v[2]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(ids), Arc::new(bcs), Arc::new(f0), Arc::new(f1), Arc::new(f2)],
+            vec![
+                Arc::new(ids),
+                Arc::new(bcs),
+                Arc::new(f0),
+                Arc::new(f1),
+                Arc::new(f2),
+            ],
         )
         .unwrap();
         let f = NamedTempFile::new().unwrap();
-        let mut writer =
-            ArrowWriter::try_new(f.reopen().unwrap(), schema.clone(), None).unwrap();
+        let mut writer = ArrowWriter::try_new(f.reopen().unwrap(), schema.clone(), None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         f
