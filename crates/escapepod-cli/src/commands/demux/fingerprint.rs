@@ -3,13 +3,20 @@
 use super::utils::{configure_thread_pool, parse_boundaries_csv, parse_norm_method};
 use crate::progress::create_progress_bar;
 use crate::style;
+use arrow::array::{ArrayRef, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use escapepod_demux::{ReadFingerprint, extract_fingerprint_from_signal};
 use escapepod_signal::Reader;
 use escapepod_signal::dtw::NormMethod;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Arguments for the fingerprint subcommand.
@@ -258,8 +265,11 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     }
     progress_bar.finish_with_message("complete");
 
-    // Write fingerprints
-    write_fingerprints_csv(&args.output, &fingerprints)?;
+    // Write fingerprints — dispatch by extension so downstream consumers
+    // (join_labels.py, concat_labeled.py, escpod's own fp_io reader)
+    // work with either CSV or parquet. Parquet is 3-4x smaller, faster to
+    // read, and avoids the text parse roundtrip through polars.
+    write_fingerprints(&args.output, &fingerprints)?;
 
     eprintln!(
         "{} {} fingerprints written to {}",
@@ -273,6 +283,97 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write fingerprints, choosing parquet or CSV by output extension.
+///
+/// `.parquet` → columnar zstd-compressed arrow/parquet (3-4x smaller on disk
+/// than CSV, ~10x faster downstream read). Anything else falls back to the
+/// flat CSV writer. No format sniffing — the caller picks the shape by
+/// naming their output `*.parquet` vs `*.csv`.
+fn write_fingerprints(path: &Path, fingerprints: &[ReadFingerprint]) -> anyhow::Result<()> {
+    match path.extension().and_then(|s| s.to_str()) {
+        Some("parquet") => write_fingerprints_parquet(path, fingerprints),
+        _ => write_fingerprints_csv(path, fingerprints),
+    }
+}
+
+/// Write fingerprints as an Arrow/parquet table, zstd-compressed.
+///
+/// Schema matches the CSV writer (`read_id, fp_0..N-1` plus optional
+/// `dwell_0..N-1`) so `escpod`'s own `fp_io::read_query_fingerprints` and
+/// the Python `polars.scan_parquet` path in `scripts/join_labels.py` read
+/// the same column set regardless of which format produced it.
+///
+/// Single-batch write: the full fingerprint set is materialized as one
+/// `RecordBatch` and handed to `ArrowWriter`. For 11M rows × 50 columns
+/// peak memory is ~4.4 GB of column buffers plus Arrow overhead — well
+/// inside the `fingerprint_run` SLURM allocation. If this ever outgrows
+/// that, swap in a row-group loop that batches N rows at a time.
+fn write_fingerprints_parquet(
+    path: &Path,
+    fingerprints: &[ReadFingerprint],
+) -> anyhow::Result<()> {
+    let (fp_width, dwell_width) = match fingerprints.first() {
+        Some(first) => (
+            first.values.len(),
+            first.dwell_times.as_ref().map_or(0, |d| d.len()),
+        ),
+        None => (0, 0),
+    };
+
+    // Schema: read_id + fp_* + dwell_* (dwell_* only if present).
+    let mut fields: Vec<Field> = Vec::with_capacity(1 + fp_width + dwell_width);
+    fields.push(Field::new("read_id", DataType::Utf8, false));
+    for i in 0..fp_width {
+        fields.push(Field::new(format!("fp_{i}"), DataType::Float64, false));
+    }
+    for i in 0..dwell_width {
+        fields.push(Field::new(format!("dwell_{i}"), DataType::Float64, false));
+    }
+    let schema = Arc::new(Schema::new(fields));
+
+    // Single-pass columnar accumulation — one iteration over
+    // `fingerprints` fills every column, much cache-friendlier than 1 +
+    // fp_width + dwell_width separate iterations.
+    let n = fingerprints.len();
+    let mut read_ids: Vec<String> = Vec::with_capacity(n);
+    let mut fp_cols: Vec<Vec<f64>> =
+        (0..fp_width).map(|_| Vec::with_capacity(n)).collect();
+    let mut dwell_cols: Vec<Vec<f64>> =
+        (0..dwell_width).map(|_| Vec::with_capacity(n)).collect();
+
+    for fp in fingerprints {
+        read_ids.push(fp.read_id.to_string());
+        for (i, v) in fp.values.iter().enumerate() {
+            fp_cols[i].push(*v);
+        }
+        if let Some(d) = &fp.dwell_times {
+            for (i, v) in d.iter().enumerate() {
+                dwell_cols[i].push(*v);
+            }
+        }
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(1 + fp_width + dwell_width);
+    columns.push(Arc::new(StringArray::from(read_ids)));
+    for col in fp_cols {
+        columns.push(Arc::new(Float64Array::from(col)));
+    }
+    for col in dwell_cols {
+        columns.push(Arc::new(Float64Array::from(col)));
+    }
+
+    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+
+    let file = File::create(path)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
 /// Write fingerprints to a CSV file.
 ///
 /// Schema:
@@ -282,7 +383,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
 /// Dwell presence is sampled from the first row; mixing dwell-carrying and
 /// plain `ReadFingerprint`s in the same call would produce jagged rows and
 /// is caller error — the extractor always emits one shape per run.
-fn write_fingerprints_csv(path: &PathBuf, fingerprints: &[ReadFingerprint]) -> anyhow::Result<()> {
+fn write_fingerprints_csv(path: &Path, fingerprints: &[ReadFingerprint]) -> anyhow::Result<()> {
     let output_file = File::create(path)?;
     let mut writer = BufWriter::new(output_file);
 
