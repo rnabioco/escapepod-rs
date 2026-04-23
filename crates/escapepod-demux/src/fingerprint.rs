@@ -10,7 +10,9 @@
 //!    fingerprint at training time.
 
 use escapepod_signal::dtw::{Fingerprint, NormMethod, normalize_fingerprint};
-use escapepod_signal::segmentation::{clip_outliers, mad_normalize, segment_signal};
+use escapepod_signal::segmentation::{
+    clip_outliers, mad_normalize, normalize_dwell_times, segment_signal,
+};
 use uuid::Uuid;
 
 /// Per-read adapter boundaries — the output of `detect_adapter` augmented
@@ -41,12 +43,32 @@ pub struct ReadFingerprint {
     pub read_id: Uuid,
     /// The fingerprint feature values (segment means, normalized)
     pub values: Vec<f64>,
+    /// Per-segment dwell times (in samples), `log1p + z-score` normalized,
+    /// aligned 1:1 with `values`. `None` when the caller didn't request
+    /// `emit_dwell`; `Some` with `values.len()` entries otherwise.
+    pub dwell_times: Option<Vec<f64>>,
 }
 
 impl ReadFingerprint {
-    /// Create a new read fingerprint.
+    /// Create a new read fingerprint (segment means only, no dwell).
     pub fn new(read_id: Uuid, values: Vec<f64>) -> Self {
-        Self { read_id, values }
+        Self { read_id, values, dwell_times: None }
+    }
+
+    /// Create a read fingerprint with segment means and per-segment dwell
+    /// times appended as a parallel feature channel. `dwell_times.len()`
+    /// must match `values.len()` — aligned per-segment.
+    pub fn with_dwell_times(
+        read_id: Uuid,
+        values: Vec<f64>,
+        dwell_times: Vec<f64>,
+    ) -> Self {
+        debug_assert_eq!(
+            values.len(),
+            dwell_times.len(),
+            "dwell_times must align 1:1 with values",
+        );
+        Self { read_id, values, dwell_times: Some(dwell_times) }
     }
 }
 
@@ -85,6 +107,7 @@ pub fn extract_fingerprint_from_signal(
     read_id: Uuid,
     min_separation: Option<usize>,
     keep_last: Option<usize>,
+    emit_dwell: bool,
 ) -> Option<ReadFingerprint> {
     // In WarpDemuX-compat mode, extend the adapter region by
     // `sig_extract.padding = 100` samples on each side before clipping and
@@ -143,9 +166,20 @@ pub fn extract_fingerprint_from_signal(
         return None;
     }
 
-    // Extract segment means as fingerprint
+    // Extract segment means as fingerprint. Dwell (end - start in samples)
+    // comes for free from the same segment tuples — skip the Vec build
+    // entirely when emit_dwell is false so the non-dwell path stays at its
+    // current cost.
     let mut fingerprint_values: Vec<f32> =
         segments.iter().map(|(_, _, mean)| *mean as f32).collect();
+    let mut dwell_values: Vec<f32> = if emit_dwell {
+        segments
+            .iter()
+            .map(|(s, e, _)| e.saturating_sub(*s) as f32)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     if let Some(n) = keep_last {
         // WarpDemuX-compat: normalize ALL event means first, then truncate.
@@ -158,6 +192,23 @@ pub fn extract_fingerprint_from_signal(
             fingerprint_values = fingerprint_values[fingerprint_values.len() - n..].to_vec();
         }
 
+        if emit_dwell {
+            // Truncate dwell the same way (segment-aligned with means), then
+            // normalize over the kept 25 — matches the mean-column
+            // convention. Doing this after truncation avoids letting the
+            // large-tailed early-adapter segments distort log1p stats for
+            // the barcode region.
+            if dwell_values.len() > n {
+                dwell_values = dwell_values[dwell_values.len() - n..].to_vec();
+            }
+            dwell_values = normalize_dwell_times(&dwell_values);
+            return Some(ReadFingerprint::with_dwell_times(
+                read_id,
+                fingerprint_values.iter().map(|&v| v as f64).collect(),
+                dwell_values.iter().map(|&v| v as f64).collect(),
+            ));
+        }
+
         return Some(ReadFingerprint::new(
             read_id,
             fingerprint_values.iter().map(|&v| v as f64).collect(),
@@ -167,10 +218,16 @@ pub fn extract_fingerprint_from_signal(
     let mut fp = Fingerprint::new(fingerprint_values, read_id);
     normalize_fingerprint(&mut fp, norm_method);
 
-    Some(ReadFingerprint::new(
-        read_id,
-        fp.values.iter().map(|&v| v as f64).collect(),
-    ))
+    let values_f64: Vec<f64> = fp.values.iter().map(|&v| v as f64).collect();
+    if emit_dwell {
+        let dwell_f64: Vec<f64> = normalize_dwell_times(&dwell_values)
+            .iter()
+            .map(|&v| v as f64)
+            .collect();
+        Some(ReadFingerprint::with_dwell_times(read_id, values_f64, dwell_f64))
+    } else {
+        Some(ReadFingerprint::new(read_id, values_f64))
+    }
 }
 
 /// Compute consensus fingerprint as element-wise median.
@@ -332,6 +389,7 @@ mod tests {
             read_id,
             None,
             None,
+            false,
         );
         assert!(result.is_none());
     }
@@ -350,10 +408,41 @@ mod tests {
             read_id,
             None,
             None,
+            false,
         );
         assert!(result.is_some());
         let fp = result.unwrap();
         assert_eq!(fp.read_id, read_id);
         assert!(!fp.values.is_empty());
+        assert!(fp.dwell_times.is_none());
+    }
+
+    #[test]
+    fn test_extract_fingerprint_emits_dwell_aligned() {
+        let signal: Vec<i16> = (0..1000).map(|i| (i as i16) % 1000).collect();
+        let read_id = Uuid::new_v4();
+        let result = extract_fingerprint_from_signal(
+            &signal,
+            0,
+            500,
+            10,
+            5,
+            NormMethod::None,
+            read_id,
+            None,
+            None,
+            true,
+        );
+        let fp = result.expect("valid signal should produce a fingerprint");
+        let dwells = fp.dwell_times.as_ref().expect("emit_dwell=true => Some");
+        assert_eq!(
+            dwells.len(),
+            fp.values.len(),
+            "dwell column count must equal means column count",
+        );
+        // normalize_dwell_times is log1p + z-score: finite values, not all zero
+        // unless there's exactly one segment (in which case the normalization
+        // collapses to zero — a degenerate but legal case).
+        assert!(dwells.iter().all(|v| v.is_finite()));
     }
 }

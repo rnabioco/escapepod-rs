@@ -78,6 +78,16 @@ pub struct FingerprintArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub warpdemux_compat: bool,
 
+    /// Append per-segment dwell time (in samples) as a second feature
+    /// channel, normalized with `log1p + z-score`. Doubles the output
+    /// feature width from N to 2N columns (`fp_0..N-1, dwell_0..N-1`).
+    /// DTW distance in downstream train-svm / classify operates on the
+    /// concatenated vector — means first, dwells after. Opt-in because
+    /// existing WarpDemux-compat models are 25-wide; turning this on
+    /// breaks binary compatibility with them by design.
+    #[arg(long, help_heading = "Advanced Options")]
+    pub emit_dwell: bool,
+
     /// Number of threads for parallel processing (default: all CPUs)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
@@ -222,6 +232,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                         r.read_id,
                         min_separation,
                         keep_last,
+                        args.emit_dwell,
                     );
                     // Count attempts (not only successes) so the bar advances
                     // even when a read fails to fingerprint.
@@ -263,24 +274,44 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
 }
 
 /// Write fingerprints to a CSV file.
+///
+/// Schema:
+///   without dwell: `read_id, fp_0, ..., fp_{N-1}`
+///   with dwell:    `read_id, fp_0, ..., fp_{N-1}, dwell_0, ..., dwell_{N-1}`
+///
+/// Dwell presence is sampled from the first row; mixing dwell-carrying and
+/// plain `ReadFingerprint`s in the same call would produce jagged rows and
+/// is caller error — the extractor always emits one shape per run.
 fn write_fingerprints_csv(path: &PathBuf, fingerprints: &[ReadFingerprint]) -> anyhow::Result<()> {
     let output_file = File::create(path)?;
     let mut writer = BufWriter::new(output_file);
 
-    // Header: read_id,fp_0,fp_1,...,fp_n
+    let (fp_width, dwell_width) = match fingerprints.first() {
+        Some(first) => (
+            first.values.len(),
+            first.dwell_times.as_ref().map_or(0, |d| d.len()),
+        ),
+        None => (0, 0),
+    };
+
     write!(writer, "read_id")?;
-    if let Some(first_fp) = fingerprints.first() {
-        for i in 0..first_fp.values.len() {
-            write!(writer, ",fp_{}", i)?;
-        }
+    for i in 0..fp_width {
+        write!(writer, ",fp_{}", i)?;
+    }
+    for i in 0..dwell_width {
+        write!(writer, ",dwell_{}", i)?;
     }
     writeln!(writer)?;
 
-    // Data rows
     for fp in fingerprints {
         write!(writer, "{}", fp.read_id)?;
         for val in &fp.values {
             write!(writer, ",{:.6}", val)?;
+        }
+        if let Some(dwells) = &fp.dwell_times {
+            for val in dwells {
+                write!(writer, ",{:.6}", val)?;
+            }
         }
         writeln!(writer)?;
     }

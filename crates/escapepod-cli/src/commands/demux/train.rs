@@ -359,7 +359,9 @@ fn extract_training_fingerprint(
         return None;
     }
 
-    // Use the utility function to extract fingerprint
+    // Use the utility function to extract fingerprint.
+    // `demux train` (the WarpDemux-style reference-fingerprint path) never
+    // needs dwell features — those are an SVM-training-only augmentation.
     let fp = extract_fingerprint_from_signal(
         signal,
         region_start,
@@ -370,6 +372,7 @@ fn extract_training_fingerprint(
         read_id,
         None,
         None,
+        false,
     )?;
 
     Some(fp.values.iter().map(|&v| v as f32).collect())
