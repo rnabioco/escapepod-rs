@@ -43,10 +43,10 @@ impl<'a> StrCol<'a> {
     fn from_array(arr: &'a dyn Array) -> Option<Self> {
         if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
             Some(StrCol::Small(s))
-        } else if let Some(s) = arr.as_any().downcast_ref::<LargeStringArray>() {
-            Some(StrCol::Large(s))
         } else {
-            None
+            arr.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .map(StrCol::Large)
         }
     }
 

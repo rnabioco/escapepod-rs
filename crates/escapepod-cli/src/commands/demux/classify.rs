@@ -659,7 +659,7 @@ where
 }
 
 /// Write CSV classification results to CSV.
-fn write_csv_classifications(path: &PathBuf, results: &[ClassifyResult]) -> anyhow::Result<()> {
+fn write_csv_classifications(path: &Path, results: &[ClassifyResult]) -> anyhow::Result<()> {
     let mut writer = open_output_writer(path)?;
 
     writeln!(

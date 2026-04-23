@@ -52,23 +52,27 @@ pub struct ReadFingerprint {
 impl ReadFingerprint {
     /// Create a new read fingerprint (segment means only, no dwell).
     pub fn new(read_id: Uuid, values: Vec<f64>) -> Self {
-        Self { read_id, values, dwell_times: None }
+        Self {
+            read_id,
+            values,
+            dwell_times: None,
+        }
     }
 
     /// Create a read fingerprint with segment means and per-segment dwell
     /// times appended as a parallel feature channel. `dwell_times.len()`
     /// must match `values.len()` — aligned per-segment.
-    pub fn with_dwell_times(
-        read_id: Uuid,
-        values: Vec<f64>,
-        dwell_times: Vec<f64>,
-    ) -> Self {
+    pub fn with_dwell_times(read_id: Uuid, values: Vec<f64>, dwell_times: Vec<f64>) -> Self {
         debug_assert_eq!(
             values.len(),
             dwell_times.len(),
             "dwell_times must align 1:1 with values",
         );
-        Self { read_id, values, dwell_times: Some(dwell_times) }
+        Self {
+            read_id,
+            values,
+            dwell_times: Some(dwell_times),
+        }
     }
 }
 
@@ -224,7 +228,9 @@ pub fn extract_fingerprint_from_signal(
             .iter()
             .map(|&v| v as f64)
             .collect();
-        Some(ReadFingerprint::with_dwell_times(read_id, values_f64, dwell_f64))
+        Some(ReadFingerprint::with_dwell_times(
+            read_id, values_f64, dwell_f64,
+        ))
     } else {
         Some(ReadFingerprint::new(read_id, values_f64))
     }

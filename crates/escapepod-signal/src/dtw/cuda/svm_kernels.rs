@@ -36,6 +36,7 @@
 //!   * for pair `(i, j)` with `i < j`, an SV of class `i` contributes
 //!     `dual_coef[j-1][sv]` and an SV of class `j` contributes
 //!     `dual_coef[i][sv]`; SVs of any other class contribute 0.
+//!
 //! That lets the kernel be a flat dot product without per-SV class
 //! branching — ~2× the host memory of the sparse representation but
 //! O(n_pairs · n_sv) is small (240 KB at 6 pairs × 10k SVs × f32).

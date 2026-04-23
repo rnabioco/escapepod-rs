@@ -308,10 +308,7 @@ fn write_fingerprints(path: &Path, fingerprints: &[ReadFingerprint]) -> anyhow::
 /// peak memory is ~4.4 GB of column buffers plus Arrow overhead — well
 /// inside the `fingerprint_run` SLURM allocation. If this ever outgrows
 /// that, swap in a row-group loop that batches N rows at a time.
-fn write_fingerprints_parquet(
-    path: &Path,
-    fingerprints: &[ReadFingerprint],
-) -> anyhow::Result<()> {
+fn write_fingerprints_parquet(path: &Path, fingerprints: &[ReadFingerprint]) -> anyhow::Result<()> {
     let (fp_width, dwell_width) = match fingerprints.first() {
         Some(first) => (
             first.values.len(),
@@ -336,10 +333,8 @@ fn write_fingerprints_parquet(
     // fp_width + dwell_width separate iterations.
     let n = fingerprints.len();
     let mut read_ids: Vec<String> = Vec::with_capacity(n);
-    let mut fp_cols: Vec<Vec<f64>> =
-        (0..fp_width).map(|_| Vec::with_capacity(n)).collect();
-    let mut dwell_cols: Vec<Vec<f64>> =
-        (0..dwell_width).map(|_| Vec::with_capacity(n)).collect();
+    let mut fp_cols: Vec<Vec<f64>> = (0..fp_width).map(|_| Vec::with_capacity(n)).collect();
+    let mut dwell_cols: Vec<Vec<f64>> = (0..dwell_width).map(|_| Vec::with_capacity(n)).collect();
 
     for fp in fingerprints {
         read_ids.push(fp.read_id.to_string());

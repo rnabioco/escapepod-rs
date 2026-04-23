@@ -985,10 +985,8 @@ pub mod gpu_pipeline {
             if model.use_kernel_weighted {
                 // Per-class counts for the normalization.
                 let mut counts = vec![0usize; n_classes];
-                for c in &sv_class {
-                    if let Some(idx) = c {
-                        counts[*idx] += 1;
-                    }
+                for idx in sv_class.iter().flatten() {
+                    counts[*idx] += 1;
                 }
                 let mut pair_idx = 0;
                 for i in 0..n_classes {
