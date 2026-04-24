@@ -113,8 +113,27 @@ zensical = "*"
 docs-build = "zensical build"
 docs-serve = "zensical serve"
 
+# Fast local dev builds via mold. The task wrappers use `mold -run`, which
+# intercepts the linker exec via LD_PRELOAD and works with the system gcc
+# 11.5 on the compute nodes — no `-fuse-ld=mold` support required, and no
+# glibc-static (the previous conda-clang attempt hit that wall, see
+# .cargo/config.toml). GH Release binaries are built in CI against musl
+# and are unaffected by this feature.
+[feature.dev.dependencies]
+mold = ">=2.4"
+
+[feature.dev.tasks]
+build     = "mold -run cargo build"
+build-rel = "mold -run cargo build --release"
+test      = "mold -run cargo test"
+check     = "mold -run cargo check"
+clippy    = "mold -run cargo clippy --workspace --all-targets"
+
 [environments]
 python-test = { features = ["python-test"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
 gpu = { features = ["gpu"], solve-group = "default" }
 warpdemux-bench = { features = ["warpdemux-bench"], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+# dev + gpu combo for GPU work that still wants mold linking.
+dev-gpu = { features = ["dev", "gpu"], solve-group = "default" }

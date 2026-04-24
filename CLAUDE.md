@@ -45,6 +45,19 @@ cargo clippy
 
 # Run the CLI (after building)
 ./target/release/escpod <command>
+
+# Fast local dev builds via mold (pixi env: dev). `mold -run` intercepts
+# the linker exec and works with system gcc 11.5 — no glibc-static needed.
+# Release artifacts shipped via GitHub Releases are built in CI against
+# musl (static); these local builds remain dynamic gnu by design.
+pixi run -e dev build        # cargo build
+pixi run -e dev build-rel    # cargo build --release (dynamic gnu)
+pixi run -e dev test         # cargo test
+pixi run -e dev check        # cargo check
+pixi run -e dev clippy       # cargo clippy --workspace --all-targets
+
+# mold + GPU:
+pixi run -e dev-gpu cargo build --features gpu -p escapepod-cli
 ```
 
 ### Build baseline and SLURM builds
@@ -63,6 +76,12 @@ The login node has only 2 cores — wrap any heavy build or bench in `srun -p rn
 # build / test — 32 logical CPUs (16 physical cores + HT) is enough
 srun -p rna -c 32 --mem=32G pixi run cargo build --release
 srun -p rna -c 32 --mem=32G pixi run cargo test --workspace
+
+# With mold: swap `pixi run` for `pixi run -e dev <task>`. mold itself is
+# multithreaded on the link step, so the 32-core allocation helps both the
+# compile and the link phases.
+srun -p rna -c 32 --mem=32G pixi run -e dev build-rel
+srun -p rna -c 32 --mem=32G pixi run -e dev test
 
 # throughput-sensitive demux runs — ask for a full socket (48 logical = 24 physical + HT).
 # SLURM's `-c 32` only allocates 16 physical cores on rna's Gold 6240R, not 32;
