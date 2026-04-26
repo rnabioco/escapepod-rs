@@ -4,7 +4,7 @@
 //! Arrow RecordBatches, reducing code duplication across the reader module.
 
 use crate::error::{Error, Result};
-use crate::types::{ReadData, Uuid};
+use crate::types::{PoreType, ReadData, Uuid};
 use arrow::array::{
     Array, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, Int16Array,
     ListArray, StringArray, TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
@@ -322,7 +322,11 @@ pub struct ReadsBatchView<'a> {
     channel: &'a UInt16Array,
     well: &'a UInt8Array,
     pore_type_keys: &'a Int16Array,
-    pore_type_values: &'a StringArray,
+    /// Pre-built `PoreType` per unique pore-type dictionary value, indexed
+    /// by the dictionary key. Per-row `read()` calls clone a `PoreType`
+    /// out of here — refcount-only on the underlying `Arc<str>`, no
+    /// allocation per read.
+    pore_type_values: Vec<PoreType>,
     calibration_offset: &'a Float32Array,
     calibration_scale: &'a Float32Array,
     end_reason_keys: &'a Int16Array,
@@ -359,11 +363,14 @@ impl<'a> ReadsBatchView<'a> {
             "pore_type",
             "DictionaryArray<Int16>",
         )?;
-        let pore_type_values = downcast::<StringArray>(
+        let pore_type_dict_values = downcast::<StringArray>(
             pore_type_dict.values().as_ref(),
             "pore_type",
             "String dictionary values",
         )?;
+        let pore_type_values: Vec<PoreType> = (0..pore_type_dict_values.len())
+            .map(|i| PoreType::from(pore_type_dict_values.value(i)))
+            .collect();
 
         let end_reason_dict = require_typed::<DictionaryArray<Int16Type>>(
             batch,
@@ -453,7 +460,10 @@ impl<'a> ReadsBatchView<'a> {
     pub fn read(&self, row: usize) -> Result<ReadData> {
         let pore_type = {
             let key = self.pore_type_keys.value(row);
-            self.pore_type_values.value(key as usize).to_string()
+            self.pore_type_values
+                .get(key as usize)
+                .cloned()
+                .unwrap_or_default()
         };
 
         let end_reason = {

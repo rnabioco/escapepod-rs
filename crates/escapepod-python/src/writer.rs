@@ -169,7 +169,7 @@ impl PyWriter {
             start_sample,
             channel,
             well,
-            pore_type: pore_type.to_string(),
+            pore_type: pore_type.into(),
             calibration_offset,
             calibration_scale,
             median_before,

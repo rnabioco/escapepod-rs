@@ -37,7 +37,7 @@ pub fn make_read(run_info_idx: u32, read_number: u32, num_samples: u64) -> ReadD
         start_sample: (read_number as u64 - 1) * num_samples,
         channel: 1,
         well: 1,
-        pore_type: "not_set".to_string(),
+        pore_type: "not_set".into(),
         calibration_offset: 0.5,
         calibration_scale: 0.95,
         median_before: 200.0,

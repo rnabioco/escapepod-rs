@@ -226,14 +226,8 @@ impl Reader {
     /// per row. This is the hot path for merge (which materializes every
     /// read of every input file) and for filter's non-UUID criteria path.
     pub fn collect_all_reads(&self) -> Result<Vec<ReadData>> {
-        let embedded = self
-            .footer
-            .reads_table()
-            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let reader = self.create_arrow_reader(embedded)?;
-
         let mut out: Vec<ReadData> = Vec::new();
-        for batch_result in reader {
+        for batch_result in self.read_batches()? {
             let batch = batch_result?;
             let view = ReadsBatchView::new(&batch, false)?;
             out.reserve(view.num_rows());
@@ -242,6 +236,36 @@ impl Reader {
             }
         }
         Ok(out)
+    }
+
+    /// Iterate the reads-table batches as raw Arrow `RecordBatch`es.
+    ///
+    /// This is the streaming counterpart to `collect_all_reads`. Hot
+    /// consumers that don't want to materialize every read up front
+    /// (e.g. `repack`, `resquiggle`'s read indexer, `demux fingerprint`'s
+    /// pre-filter) should iterate batches and build a `ReadsBatchView`
+    /// per batch:
+    ///
+    /// ```ignore
+    /// for batch_result in reader.read_batches()? {
+    ///     let batch = batch_result?;
+    ///     let view = ReadsBatchView::new(&batch, false)?;
+    ///     for row in 0..view.num_rows() {
+    ///         let read = view.read(row)?;
+    ///         // ...
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// This avoids the per-row `column_by_name` lookups that
+    /// `Reader::reads()`'s row-yielding iterator pays.
+    pub fn read_batches(&self) -> Result<impl Iterator<Item = Result<RecordBatch>> + '_> {
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+        let reader = self.create_arrow_reader(embedded)?;
+        Ok(reader.map(|r| r.map_err(Error::from)))
     }
 
     /// Get the total number of reads (requires scanning all batches).

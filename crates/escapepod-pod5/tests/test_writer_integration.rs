@@ -130,7 +130,7 @@ fn writer_predefined_dictionaries_enforce_pore_types() {
 
     // Second read introduces a disallowed pore_type — must error.
     let mut bad = make_read(run_idx, 2, 300);
-    bad.pore_type = "rna_pore".to_string();
+    bad.pore_type = "rna_pore".into();
     let err = writer.add_read(bad, &synth_signal(300, 0xBAD)).unwrap_err();
     let msg = format!("{err}");
     assert!(

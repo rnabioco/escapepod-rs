@@ -70,7 +70,7 @@ fn main() -> escapepod_signal::Result<()> {
             start_sample: (i as u64) * 100_000,
             channel: (i as u16 % 512) + 1,
             well: 1,
-            pore_type: "not_set".to_string(),
+            pore_type: "not_set".into(),
             calibration_offset: -220.0,
             calibration_scale: 0.15,
             median_before: 200.0,

@@ -4,7 +4,9 @@ use crate::CompressedSignalChunk;
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::schema::{reads_schema, run_info_schema, signal_schema};
-use crate::types::{FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION, ReadData, RunInfoData, Uuid};
+use crate::types::{
+    FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid,
+};
 use arrow::array::{
     ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder,
     LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
@@ -315,7 +317,7 @@ impl Writer {
         }
 
         // Track dictionary entries (may fail in predefined mode)
-        self.get_pore_type_index(&read.pore_type)?;
+        self.get_pore_type_index(read.pore_type.as_str())?;
         self.get_end_reason_index(read.end_reason.as_str())?;
 
         self.pending_reads.push(PendingRead {
@@ -360,7 +362,7 @@ impl Writer {
         }
 
         // Track dictionary entries (may fail in predefined mode)
-        self.get_pore_type_index(&read.pore_type)?;
+        self.get_pore_type_index(read.pore_type.as_str())?;
         self.get_end_reason_index(read.end_reason.as_str())?;
 
         self.pending_reads.push(PendingRead {
@@ -517,7 +519,7 @@ impl Writer {
         }
 
         // Track dictionary entries (may fail in predefined mode)
-        self.get_pore_type_index(&read.pore_type)?;
+        self.get_pore_type_index(read.pore_type.as_str())?;
         self.get_end_reason_index(read.end_reason.as_str())?;
 
         self.pending_reads.push(PendingRead {
@@ -655,7 +657,7 @@ impl Writer {
             // V3
             channel_builder.append_value(read.channel);
             well_builder.append_value(read.well);
-            pore_type_builder.append_value(&read.pore_type);
+            pore_type_builder.append_value(read.pore_type.as_str());
             calibration_offset_builder.append_value(read.calibration_offset);
             calibration_scale_builder.append_value(read.calibration_scale);
             end_reason_builder.append_value(read.end_reason.as_str());
@@ -907,8 +909,17 @@ impl Writer {
             self.file.take().ok_or(Error::WriterFinalized)?
         };
 
+        // Track byte position manually from here on. `stream_position()` on
+        // a `BufWriter` flushes the buffer; previously this was called 6
+        // times here, including once per byte inside per-byte padding
+        // loops. Querying it once after the signal writer is unavoidable
+        // because the Arrow IPC writer doesn't expose its bytes-written
+        // count, but every subsequent position is derived from that
+        // anchor + the lengths of buffers we control.
+        let mut pos = file.stream_position()? as usize;
+
         // Record signal table info
-        let signal_length = file.stream_position()? as i64 - self.signal_offset;
+        let signal_length = pos as i64 - self.signal_offset;
         if signal_length > 0 {
             embedded_files.push(EmbeddedFileInfo {
                 offset: self.signal_offset,
@@ -917,16 +928,16 @@ impl Writer {
             });
         }
 
-        // Pad to 8-byte alignment
-        while file.stream_position()? % 8 != 0 {
-            file.write_all(&[0u8])?;
-        }
+        // Pad to 8-byte alignment + section marker
+        pos += write_padding_to_align8(&mut file, pos)?;
         file.write_all(self.section_marker.as_bytes())?;
+        pos += SECTION_MARKER_LENGTH;
 
         // Write run info table
         let run_info_data = self.build_run_info_table()?;
-        let run_info_offset = file.stream_position()? as i64;
+        let run_info_offset = pos as i64;
         file.write_all(&run_info_data)?;
+        pos += run_info_data.len();
         let run_info_length = run_info_data.len() as i64;
         embedded_files.push(EmbeddedFileInfo {
             offset: run_info_offset,
@@ -935,19 +946,23 @@ impl Writer {
         });
 
         // Pad and section marker
-        while file.stream_position()? % 8 != 0 {
-            file.write_all(&[0u8])?;
-        }
+        pos += write_padding_to_align8(&mut file, pos)?;
         file.write_all(self.section_marker.as_bytes())?;
+        pos += SECTION_MARKER_LENGTH;
 
         // Write reads table from memory buffer
-        let reads_offset = file.stream_position()? as i64;
-        if let Some(mut writer) = self.reads_writer.take() {
+        let reads_offset = pos as i64;
+        let reads_bytes_written = if let Some(mut writer) = self.reads_writer.take() {
             writer.finish()?;
             let cursor = writer.into_inner()?;
-            file.write_all(cursor.get_ref())?;
-        }
-        let reads_length = file.stream_position()? as i64 - reads_offset;
+            let bytes = cursor.get_ref();
+            file.write_all(bytes)?;
+            bytes.len()
+        } else {
+            0
+        };
+        pos += reads_bytes_written;
+        let reads_length = reads_bytes_written as i64;
         if reads_length > 0 {
             embedded_files.push(EmbeddedFileInfo {
                 offset: reads_offset,
@@ -957,9 +972,7 @@ impl Writer {
         }
 
         // Pad and section marker
-        while file.stream_position()? % 8 != 0 {
-            file.write_all(&[0u8])?;
-        }
+        let _ = write_padding_to_align8(&mut file, pos)?;
         file.write_all(self.section_marker.as_bytes())?;
 
         // Write FOOTER magic
@@ -983,6 +996,17 @@ impl Writer {
         self.finalized = true;
         Ok(())
     }
+}
+
+/// Write zero bytes to reach the next 8-byte alignment boundary.
+/// Returns the number of padding bytes written (0..=7).
+fn write_padding_to_align8<W: Write>(file: &mut W, pos: usize) -> Result<usize> {
+    const ZEROS: [u8; 8] = [0u8; 8];
+    let padding = (8 - (pos % 8)) % 8;
+    if padding > 0 {
+        file.write_all(&ZEROS[..padding])?;
+    }
+    Ok(padding)
 }
 
 #[cfg(test)]
@@ -1028,7 +1052,7 @@ mod tests {
             start_sample: (read_number as u64 - 1) * num_samples,
             channel: 1,
             well: 1,
-            pore_type: "not_set".to_string(),
+            pore_type: "not_set".into(),
             calibration_offset: 0.5,
             calibration_scale: 0.95,
             median_before: 200.0,
@@ -1099,7 +1123,7 @@ mod tests {
             start_sample: 0,
             channel: 1,
             well: 1,
-            pore_type: "not_set".to_string(),
+            pore_type: "not_set".into(),
             calibration_offset: 0.0,
             calibration_scale: 1.0,
             median_before: 200.0,
@@ -1195,7 +1219,7 @@ mod tests {
                 start_sample: i as u64 * 1000,
                 channel: 1,
                 well: 1,
-                pore_type: "not_set".to_string(),
+                pore_type: "not_set".into(),
                 calibration_offset: 0.0,
                 calibration_scale: 1.0,
                 median_before: 200.0,

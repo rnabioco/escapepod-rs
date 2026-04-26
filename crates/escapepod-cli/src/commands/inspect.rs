@@ -2,7 +2,7 @@
 
 use crate::style;
 use crate::util::resolve_pod5_inputs;
-use escapepod_signal::Reader;
+use escapepod_signal::{Reader, ReadsBatchView};
 use std::path::PathBuf;
 
 pub fn summary(input: PathBuf) -> anyhow::Result<()> {
@@ -151,8 +151,8 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
             }
         };
 
-        let reads_iter = match reader.reads() {
-            Ok(iter) => iter,
+        let batches = match reader.read_batches() {
+            Ok(b) => b,
             Err(e) => {
                 if is_directory {
                     eprintln!(
@@ -168,15 +168,18 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
             }
         };
 
-        for read_result in reads_iter {
-            let read = match read_result {
-                Ok(r) => r,
-                Err(_) => continue,
+        for batch_result in batches {
+            let Ok(batch) = batch_result else { continue };
+            let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                continue;
             };
-            println!(
-                "{:<36} {:>8} {:>4} {:>10} {:>12}",
-                read.read_id, read.channel, read.well, read.num_samples, read.end_reason
-            );
+            for row in 0..view.num_rows() {
+                let Ok(read) = view.read(row) else { continue };
+                println!(
+                    "{:<36} {:>8} {:>4} {:>10} {:>12}",
+                    read.read_id, read.channel, read.well, read.num_samples, read.end_reason
+                );
+            }
         }
     }
 
@@ -195,17 +198,17 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         };
 
-        let reads_iter = match reader.reads() {
-            Ok(iter) => iter,
+        // Use the indexed by-id lookup so this is O(1) per file when a
+        // .p5i sidecar exists, instead of scanning every batch.
+        let mut targets = std::collections::HashSet::new();
+        targets.insert(target_id);
+        let matches = match reader.reads_by_ids(&targets) {
+            Ok(m) => m,
             Err(_) if is_directory => continue,
             Err(e) => return Err(e.into()),
         };
 
-        for read_result in reads_iter {
-            let read = match read_result {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        for read in matches {
             if read.read_id == target_id {
                 println!("{}", style::header("Read Details"));
                 println!("============");

@@ -1,6 +1,7 @@
 //! Core data types for POD5 files.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub use uuid::Uuid;
 
@@ -109,6 +110,63 @@ impl From<EndReason> for u8 {
     }
 }
 
+/// Identifier for the chemistry / pore type a read was sequenced with.
+///
+/// POD5's spec leaves the `pore_type` column open-vocabulary — the values
+/// are chemistry strings (e.g. `"dna_r10.4.1"`, `"rna_004"`, `"not_set"`)
+/// that ONT introduces with each chemistry release, so this is a thin
+/// newtype around `Arc<str>` rather than a closed enum.
+///
+/// `Arc<str>` makes cloning between reads a refcount bump rather than a
+/// heap allocation. The pore-type column is dictionary-encoded with very
+/// few unique values per file, so the underlying allocations are shared
+/// across millions of reads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PoreType(Arc<str>);
+
+impl PoreType {
+    /// Borrow the pore-type string. Mirrors the `EndReason::as_str` API.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for PoreType {
+    fn default() -> Self {
+        Self(Arc::from(""))
+    }
+}
+
+impl AsRef<str> for PoreType {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PoreType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<Arc<str>> for PoreType {
+    fn from(s: Arc<str>) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for PoreType {
+    fn from(s: &str) -> Self {
+        Self(Arc::from(s))
+    }
+}
+
+impl From<String> for PoreType {
+    fn from(s: String) -> Self {
+        Self(Arc::from(s.as_str()))
+    }
+}
+
 /// Data for a single read.
 #[derive(Debug, Clone)]
 pub struct ReadData {
@@ -122,8 +180,8 @@ pub struct ReadData {
     pub channel: u16,
     /// Well number (typically 1-4).
     pub well: u8,
-    /// Pore type string.
-    pub pore_type: String,
+    /// Pore type for this read. See [`PoreType`].
+    pub pore_type: PoreType,
     /// Calibration offset for converting ADC to pA.
     pub calibration_offset: f32,
     /// Calibration scale for converting ADC to pA.
@@ -166,7 +224,7 @@ impl Default for ReadData {
             start_sample: 0,
             channel: 0,
             well: 0,
-            pore_type: String::new(),
+            pore_type: PoreType::default(),
             calibration_offset: 0.0,
             calibration_scale: 1.0,
             median_before: 0.0,
