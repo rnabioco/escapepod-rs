@@ -2,12 +2,14 @@
 //!
 //! Uses raw byte extraction from mmap without Arrow deserialization.
 
-use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
+use crate::arrow_ipc::ArrowIpcFooter;
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::parse_uuid_flexible;
-use crate::utils::pod5_assembler::{deduplicate_run_infos, remap_read, write_post_signal_sections};
+use crate::utils::pod5_assembler::{
+    ProcessedRead, deduplicate_run_infos, remap_read, write_post_signal_sections,
+};
 use crate::utils::table_builders::SchemaMetadata;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -242,18 +244,20 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         .map(|m| m.matching_reads.len() as u64)
         .sum();
 
-    // Phase 2: Extract signal data in parallel across files
-    // Each file's mmap is independent, so extraction can be parallelized
-    struct FileSignalExtraction {
-        /// Extracted signal chunks (Arc to avoid copying)
-        chunks: Vec<(Arc<[u8]>, u32)>, // (signal_data, samples)
-    }
+    // Phase 2: Extract signal data in parallel across files.
+    //
+    // Each file's mmap is independent so extraction parallelizes per file.
+    // Each chunk is held as a `&[u8]` into the source mmap (kept alive by
+    // `file_metadata`'s readers) — never copied to the heap. On a 26 GB
+    // POD5 this avoids ~26 GB of `Arc<[u8]>` heap allocation that would
+    // otherwise OOM modest SLURM allocations.
+    type SignalChunks<'a> = Vec<(&'a [u8], u32)>;
 
-    let extractions: Vec<Result<FileSignalExtraction>> = file_metadata
+    let extractions: Vec<Result<SignalChunks<'_>>> = file_metadata
         .par_iter()
         .map(|metadata| {
             if metadata.matching_reads.is_empty() {
-                return Ok(FileSignalExtraction { chunks: Vec::new() });
+                return Ok(Vec::new());
             }
 
             let signal_bytes = metadata.reader.signal_table_bytes()?;
@@ -265,39 +269,30 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 .flat_map(|read| read.signal_rows.iter().copied())
                 .collect();
 
-            // Extract all signal rows in batch
             let raw_chunks = metadata
                 .signal_footer
                 .extract_signal_rows(&signal_row_indices, signal_bytes)?;
 
-            // Store as Arc to avoid copying signal bytes
-            let chunks: Vec<(Arc<[u8]>, u32)> = raw_chunks
+            let chunks: SignalChunks<'_> = raw_chunks
                 .into_iter()
-                .map(|chunk| (Arc::from(chunk.signal), chunk.samples))
+                .map(|chunk| (chunk.signal, chunk.samples))
                 .collect();
 
-            Ok(FileSignalExtraction { chunks })
+            Ok(chunks)
         })
         .collect();
 
-    // Unwrap results and combine sequentially (preserves file order)
-    let file_extractions: Vec<FileSignalExtraction> =
+    let file_extractions: Vec<SignalChunks<'_>> =
         extractions.into_iter().collect::<Result<Vec<_>>>()?;
 
-    // Combine all signal chunks with sequential index assignment.
-    // Pre-size: total chunk count is known from the parallel extractions.
-    let total_chunks: usize = file_extractions.iter().map(|e| e.chunks.len()).sum();
-    let mut all_signal_chunks: Vec<(usize, u64, u32)> = Vec::with_capacity(total_chunks);
-    let mut signal_data_arcs: Vec<Arc<[u8]>> = Vec::with_capacity(total_chunks);
-    let mut current_signal_row: u64 = 0;
-
-    for (file_idx, extraction) in file_extractions.iter().enumerate() {
-        for (signal_data, samples) in &extraction.chunks {
-            signal_data_arcs.push(signal_data.clone());
-            all_signal_chunks.push((signal_data_arcs.len() - 1, current_signal_row, *samples));
-            current_signal_row += 1;
-        }
-
+    // Flatten file extractions into a single chunk list in source-file order.
+    // Order matters: the reads table's `signal_rows` field is assigned by
+    // `remap_read` in the same order, so chunk N in this Vec must correspond
+    // to signal-row N in the output.
+    let total_chunks: usize = file_extractions.iter().map(|e| e.len()).sum();
+    let mut signal_chunks: Vec<(&[u8], u32)> = Vec::with_capacity(total_chunks);
+    for (file_idx, chunks) in file_extractions.iter().enumerate() {
+        signal_chunks.extend_from_slice(chunks);
         if let Some(ref cb) = progress {
             cb(Progress {
                 current: file_idx as u64 + 1,
@@ -320,18 +315,20 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let section_marker = Uuid::new_v4();
     file.write_all(section_marker.as_bytes())?;
 
-    // Build and write signal table
-    let (signal_table_bytes, _signal_batches) = build_raw_signal_table(
-        &signal_data_arcs,
-        &all_signal_chunks,
+    // Stream the signal table directly to the file. Previously this built
+    // the full IPC bytes into a `Vec<u8>` and then wrote it — for a 26 GB
+    // input that meant a ~26 GB heap allocation. Streaming keeps peak
+    // memory bounded by `signal_batch_size` chunks in flight.
+    let signal_table_bytes_written = write_raw_signal_table(
+        &mut file,
+        &signal_chunks,
         options.signal_batch_size,
         &schema_meta,
     )?;
-    file.write_all(&signal_table_bytes)?;
 
     // Track signal_end manually to avoid `stream_position()`, which would
     // force a flush of the 128 MiB BufWriter.
-    let signal_end = POD5_SIGNATURE.len() + 16 + signal_table_bytes.len();
+    let signal_end = POD5_SIGNATURE.len() + 16 + signal_table_bytes_written;
 
     // Borrow each file's run_infos for dedup — avoids deep-cloning every
     // RunInfoData (each carries 13 Strings + 2 HashMaps).
@@ -342,8 +339,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
 
     // Remap reads with deduplicated run info indices and sequential signal rows
     let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
-    let mut processed_reads: Vec<(ReadData, Vec<u64>)> =
-        Vec::with_capacity(matching_count as usize);
+    let mut processed_reads: Vec<ProcessedRead> = Vec::with_capacity(matching_count as usize);
     let mut signal_row_cursor: u64 = 0;
 
     for metadata in &file_metadata {
@@ -373,14 +369,47 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     })
 }
 
-/// Build a signal table from raw signal chunks.
-/// Returns the complete IPC bytes and batch metadata.
-fn build_raw_signal_table(
-    signal_data: &[Arc<[u8]>],
-    chunks: &[(usize, u64, u32)], // (data_idx, _signal_row, samples)
+/// `Write` adapter that counts the bytes flowing through. The Arrow IPC
+/// writer needs a `Write` sink, but we also want to know how many bytes
+/// it emitted so we can compute `signal_end` without `stream_position()`.
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    count: usize,
+}
+
+impl<'a, W: Write> CountingWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self { inner, count: 0 }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.count += buf.len();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Stream the signal IPC table directly to `file`, returning the number of
+/// bytes written. Peak memory is bounded by one in-flight `RecordBatch`
+/// (≤ `batch_size` chunks), independent of the total signal volume.
+fn write_raw_signal_table<W: Write>(
+    file: &mut W,
+    chunks: &[(&[u8], u32)],
     batch_size: u32,
     meta: &SchemaMetadata,
-) -> Result<(Vec<u8>, Vec<BatchBlock>)> {
+) -> Result<usize> {
     use crate::schema::signal_schema;
     use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
     use arrow::ipc::writer::FileWriter;
@@ -388,49 +417,45 @@ fn build_raw_signal_table(
 
     let schema = Arc::new(meta.apply(signal_schema()));
 
-    let mut output = Vec::new();
-    let mut writer = FileWriter::try_new(&mut output, &schema)?;
+    let mut counter = CountingWriter::new(file);
+    {
+        let mut writer = FileWriter::try_new(&mut counter, &schema)?;
 
-    // Build batches
-    let total_rows = chunks.len();
-    let mut offset = 0;
+        let total_rows = chunks.len();
+        let mut offset = 0;
+        while offset < total_rows {
+            let end = std::cmp::min(offset + batch_size as usize, total_rows);
+            let batch_chunks = &chunks[offset..end];
 
-    while offset < total_rows {
-        let end = std::cmp::min(offset + batch_size as usize, total_rows);
-        let batch_chunks = &chunks[offset..end];
+            let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
+            let mut signal_builder = LargeBinaryBuilder::new();
+            let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
 
-        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
-        let mut signal_builder = LargeBinaryBuilder::new();
-        let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
+            for (signal_data, samples) in batch_chunks {
+                // The actual read_id lives in the reads table; the signal
+                // table's read_id column is unused by the POD5 reader.
+                read_id_builder.append_value([0u8; 16])?;
+                signal_builder.append_value(*signal_data);
+                samples_builder.append_value(*samples);
+            }
 
-        for (data_idx, _, samples) in batch_chunks {
-            // Use a placeholder read_id (the actual read_id is in the reads table)
-            read_id_builder.append_value([0u8; 16])?;
-            signal_builder.append_value(&signal_data[*data_idx]);
-            samples_builder.append_value(*samples);
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(read_id_builder.finish()) as ArrayRef,
+                    Arc::new(signal_builder.finish()) as ArrayRef,
+                    Arc::new(samples_builder.finish()) as ArrayRef,
+                ],
+            )?;
+
+            writer.write(&batch)?;
+            offset = end;
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(read_id_builder.finish()) as ArrayRef,
-                Arc::new(signal_builder.finish()) as ArrayRef,
-                Arc::new(samples_builder.finish()) as ArrayRef,
-            ],
-        )?;
-
-        writer.write(&batch)?;
-        offset = end;
+        writer.finish()?;
     }
 
-    writer.finish()?;
-    drop(writer);
-
-    // Parse the output to get batch metadata
-    let footer = ArrowIpcFooter::parse(&output)?;
-    let batches = footer.record_batches.clone();
-
-    Ok((output, batches))
+    Ok(counter.count)
 }
 
 /// Read read IDs from a text file or stdin (one per line).

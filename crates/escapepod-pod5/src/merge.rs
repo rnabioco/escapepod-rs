@@ -7,7 +7,9 @@ use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
-use crate::utils::pod5_assembler::{deduplicate_run_infos, write_post_signal_sections};
+use crate::utils::pod5_assembler::{
+    ProcessedRead, deduplicate_run_infos, write_post_signal_sections,
+};
 use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer};
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -305,8 +307,12 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         });
     }
 
-    // Transform reads in parallel (signal row adjustment, run_info remapping)
-    let per_file_reads: Vec<Vec<(Uuid, ReadData, Vec<u64>)>> = file_metadata
+    // Transform reads in parallel (signal row adjustment, run_info remapping).
+    // Each entry pairs the read's original UUID (for dedup) with the
+    // remapped `ProcessedRead` payload that the writer expects.
+    type RemappedRead = (Uuid, ReadData, Vec<u64>);
+
+    let per_file_reads: Vec<Vec<RemappedRead>> = file_metadata
         .par_iter()
         .zip(signal_offsets.par_iter())
         .map(|(metadata, &signal_offset)| {
@@ -341,8 +347,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         HashSet::with_capacity(total_read_count as usize)
     };
 
-    let mut processed_reads: Vec<(ReadData, Vec<u64>)> =
-        Vec::with_capacity(total_read_count as usize);
+    let mut processed_reads: Vec<ProcessedRead> = Vec::with_capacity(total_read_count as usize);
     let mut duplicate_count = 0u64;
 
     for file_reads in per_file_reads {

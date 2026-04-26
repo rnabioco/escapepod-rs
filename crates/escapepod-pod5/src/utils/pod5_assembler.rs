@@ -13,6 +13,10 @@ use crate::utils::table_builders::{
 use std::collections::HashMap;
 use std::io::Write;
 
+/// A read paired with the signal-row indices it should reference in the
+/// output reads table. Used by the writers in merge and filter.
+pub(crate) type ProcessedRead = (ReadData, Vec<u64>);
+
 /// Up to 7 zero bytes for 8-byte alignment padding.
 const PADDING_ZEROS: [u8; 8] = [0u8; 8];
 
@@ -34,7 +38,7 @@ pub(crate) fn write_post_signal_sections<W: Write>(
     schema_meta: &SchemaMetadata,
     signal_end: usize,
     all_run_infos: &[RunInfoData],
-    processed_reads: &[(ReadData, Vec<u64>)],
+    processed_reads: &[ProcessedRead],
 ) -> Result<()> {
     let mut pos = signal_end;
 
