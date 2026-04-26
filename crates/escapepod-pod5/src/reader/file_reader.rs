@@ -1,7 +1,7 @@
 //! Main POD5 file reader.
 
 use crate::CompressedSignalChunk;
-use crate::arrow_helpers::BatchFieldExtractor;
+use crate::arrow_helpers::{BatchFieldExtractor, ReadsBatchView};
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
@@ -217,6 +217,31 @@ impl Reader {
             current_batch: None,
             batch_row: 0,
         })
+    }
+
+    /// Collect every read in the file into a single `Vec<ReadData>`.
+    ///
+    /// Functionally equivalent to `reads()?.collect()`, but resolves
+    /// column lookups once per batch via `ReadsBatchView` instead of once
+    /// per row. This is the hot path for merge (which materializes every
+    /// read of every input file) and for filter's non-UUID criteria path.
+    pub fn collect_all_reads(&self) -> Result<Vec<ReadData>> {
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+        let reader = self.create_arrow_reader(embedded)?;
+
+        let mut out: Vec<ReadData> = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result?;
+            let view = ReadsBatchView::new(&batch, false)?;
+            out.reserve(view.num_rows());
+            for row in 0..view.num_rows() {
+                out.push(view.read(row)?);
+            }
+        }
+        Ok(out)
     }
 
     /// Get the total number of reads (requires scanning all batches).
@@ -1123,16 +1148,16 @@ impl Reader {
                 index: batch_idx,
                 max: reader.num_batches(),
             })??;
+            // Resolve columns once per batch, then loop targets.
+            let view = ReadsBatchView::new(&batch, true)?;
             for (_uuid, row) in targets {
-                results.push(extract_read_from_batch(&batch, row, true)?);
+                results.push(view.read(row)?);
             }
         }
         Ok(results)
     }
 
     fn reads_by_ids_scan(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
-        use arrow::array::{Array, FixedSizeBinaryArray};
-
         let embedded = self
             .footer
             .reads_table()
@@ -1143,19 +1168,12 @@ impl Reader {
         let mut results = Vec::with_capacity(n);
         for batch_result in reader {
             let batch = batch_result?;
-            let id_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "read_id".to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
-            for row in 0..batch.num_rows() {
-                if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
+            let view = ReadsBatchView::new(&batch, true)?;
+            for row in 0..view.num_rows() {
+                if let Ok(uuid) = view.read_id(row)
                     && target_ids.contains(&uuid)
                 {
-                    results.push(extract_read_from_batch(&batch, row, true)?);
+                    results.push(view.read(row)?);
                     if results.len() == n {
                         return Ok(results);
                     }
