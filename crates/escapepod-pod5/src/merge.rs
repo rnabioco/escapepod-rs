@@ -7,9 +7,7 @@ use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
-use crate::utils::pod5_assembler::{
-    SourceFileMetadata, deduplicate_run_infos, write_post_signal_sections,
-};
+use crate::utils::pod5_assembler::{deduplicate_run_infos, write_post_signal_sections};
 use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer};
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -140,9 +138,10 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             let signal_bytes = reader.signal_table_bytes()?;
             let footer = ArrowIpcFooter::parse(signal_bytes)?;
             let run_infos = reader.run_infos().to_vec();
-            let reads: Vec<ReadData> = reader
-                .reads()?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // collect_all_reads resolves columns once per batch (see
+            // ReadsBatchView), versus reads()'s per-row resolution. This
+            // is the merge metadata-load hot path.
+            let reads: Vec<ReadData> = reader.collect_all_reads()?;
 
             // Update progress after successfully loading a file
             let loaded = files_loaded.fetch_add(1, Ordering::Relaxed) + 1;
@@ -288,15 +287,14 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
 
     // Phase 3: Write remaining sections (run info, reads, footer)
 
-    // Build source metadata for run info dedup
-    let source_metadata: Vec<SourceFileMetadata> = file_metadata
+    // Borrow each file's run_infos for dedup — no clone of the (heavy)
+    // RunInfoData entries. The deduped Vec is reused for the writer below.
+    let per_file_run_infos: Vec<&[RunInfoData]> = file_metadata
         .iter()
-        .map(|m| SourceFileMetadata {
-            run_infos: m.run_infos.clone(),
-        })
+        .map(|m| m.run_infos.as_slice())
         .collect();
 
-    let (_all_run_infos, run_info_map) = deduplicate_run_infos(&source_metadata);
+    let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
 
     // Notify start of reads phase
     if let Some(cb) = progress_callback {
@@ -368,7 +366,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         &section_marker,
         &schema_meta,
         signal_end,
-        &source_metadata,
+        &all_run_infos,
         &processed_reads,
     )?;
 

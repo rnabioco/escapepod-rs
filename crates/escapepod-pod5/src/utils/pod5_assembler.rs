@@ -11,63 +11,61 @@ use crate::utils::table_builders::{
     SchemaMetadata, build_pod5_footer, build_reads_table, build_run_info_table,
 };
 use std::collections::HashMap;
-use std::io::{Seek, Write};
+use std::io::Write;
 
-/// Metadata collected per source file, used to deduplicate run infos
-/// and remap `run_info_index` fields across files.
-pub(crate) struct SourceFileMetadata {
-    pub run_infos: Vec<RunInfoData>,
-}
+/// Up to 7 zero bytes for 8-byte alignment padding.
+const PADDING_ZEROS: [u8; 8] = [0u8; 8];
 
 /// Writes the shared post-signal sections of a POD5 file.
 ///
 /// Call this after all signal data has been written. It handles:
 /// - Padding to 8-byte alignment + section marker after signal
-/// - Deduplicated run info table
+/// - Run info table (caller already deduplicated)
 /// - Reads table with remapped signal rows and run_info indices
 /// - POD5 footer (flatbuffer + length + closing signature)
-pub(crate) fn write_post_signal_sections<W: Write + Seek>(
+///
+/// `signal_end` is the absolute byte offset of the end of the signal section
+/// (i.e. how many bytes have been written so far). The function tracks the
+/// position internally rather than calling `stream_position()`, which would
+/// force the underlying `BufWriter` to flush.
+pub(crate) fn write_post_signal_sections<W: Write>(
     file: &mut W,
     section_marker: &Uuid,
     schema_meta: &SchemaMetadata,
     signal_end: usize,
-    file_metadata: &[SourceFileMetadata],
+    all_run_infos: &[RunInfoData],
     processed_reads: &[(ReadData, Vec<u64>)],
 ) -> Result<()> {
-    // Pad signal section to 8-byte alignment
-    let padding_needed = (8 - (signal_end % 8)) % 8;
-    for _ in 0..padding_needed {
-        file.write_all(&[0u8])?;
-    }
+    let mut pos = signal_end;
+
+    // Pad signal section to 8-byte alignment, then section marker.
+    pos += write_padding_to_align8(file, pos)?;
     file.write_all(section_marker.as_bytes())?;
+    pos += 16;
 
-    // Build deduplicated run info table
-    let (all_run_infos, _run_info_map) = deduplicate_run_infos(file_metadata);
-
-    let run_info_offset = file.stream_position()? as i64;
-    let run_info_bytes = build_run_info_table(&all_run_infos, schema_meta)?;
+    // Run info table.
+    let run_info_offset = pos as i64;
+    let run_info_bytes = build_run_info_table(all_run_infos, schema_meta)?;
     file.write_all(&run_info_bytes)?;
+    pos += run_info_bytes.len();
     let run_info_length = run_info_bytes.len() as i64;
 
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
+    pos += write_padding_to_align8(file, pos)?;
     file.write_all(section_marker.as_bytes())?;
+    pos += 16;
 
-    // Write reads table
-    let reads_offset = file.stream_position()? as i64;
-    let reads_bytes = build_reads_table(processed_reads, &all_run_infos, schema_meta)?;
+    // Reads table.
+    let reads_offset = pos as i64;
+    let reads_bytes = build_reads_table(processed_reads, all_run_infos, schema_meta)?;
     file.write_all(&reads_bytes)?;
+    pos += reads_bytes.len();
     let reads_length = reads_bytes.len() as i64;
 
-    // Pad and section marker
-    while file.stream_position()? % 8 != 0 {
-        file.write_all(&[0u8])?;
-    }
+    let _ = write_padding_to_align8(file, pos)?;
     file.write_all(section_marker.as_bytes())?;
+    // pos no longer needed after this point.
 
-    // Write POD5 footer
+    // POD5 footer.
     file.write_all(&FOOTER_MAGIC)?;
 
     let signal_offset_val = 24i64; // POD5 header size (signature + section marker)
@@ -95,17 +93,30 @@ pub(crate) fn write_post_signal_sections<W: Write + Seek>(
     Ok(())
 }
 
+/// Write zero bytes to reach the next 8-byte alignment boundary.
+/// Returns the number of padding bytes written (0..=7).
+fn write_padding_to_align8<W: Write>(file: &mut W, pos: usize) -> Result<usize> {
+    let padding = (8 - (pos % 8)) % 8;
+    if padding > 0 {
+        file.write_all(&PADDING_ZEROS[..padding])?;
+    }
+    Ok(padding)
+}
+
 /// Deduplicate run infos from multiple source files by `acquisition_id`.
 ///
 /// Returns the deduplicated list and a map from `acquisition_id` to index.
+/// Each input slice is the run-info table of a single source file. We borrow
+/// rather than own to avoid deep-cloning every `RunInfoData` (which carries
+/// two `HashMap<String,String>` plus 13 Strings).
 pub(crate) fn deduplicate_run_infos(
-    file_metadata: &[SourceFileMetadata],
+    per_file_run_infos: &[&[RunInfoData]],
 ) -> (Vec<RunInfoData>, HashMap<String, u32>) {
     let mut run_info_map: HashMap<String, u32> = HashMap::new();
     let mut all_run_infos: Vec<RunInfoData> = Vec::new();
 
-    for metadata in file_metadata {
-        for run_info in &metadata.run_infos {
+    for run_infos in per_file_run_infos {
+        for run_info in run_infos.iter() {
             if !run_info_map.contains_key(&run_info.acquisition_id) {
                 let idx = all_run_infos.len() as u32;
                 run_info_map.insert(run_info.acquisition_id.clone(), idx);

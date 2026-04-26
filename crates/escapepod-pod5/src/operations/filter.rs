@@ -7,14 +7,12 @@ use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::parse_uuid_flexible;
-use crate::utils::pod5_assembler::{
-    SourceFileMetadata, deduplicate_run_infos, remap_read, write_post_signal_sections,
-};
+use crate::utils::pod5_assembler::{deduplicate_run_infos, remap_read, write_post_signal_sections};
 use crate::utils::table_builders::SchemaMetadata;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -211,9 +209,8 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 let matching = reader.reads_by_ids(target_ids)?;
                 (matching, total)
             } else {
-                let all_reads: Vec<ReadData> = reader
-                    .reads()?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // collect_all_reads resolves columns once per batch.
+                let all_reads: Vec<ReadData> = reader.collect_all_reads()?;
                 let total = all_reads.len();
                 let matching = all_reads
                     .into_iter()
@@ -287,9 +284,11 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let file_extractions: Vec<FileSignalExtraction> =
         extractions.into_iter().collect::<Result<Vec<_>>>()?;
 
-    // Combine all signal chunks with sequential index assignment
-    let mut all_signal_chunks: Vec<(usize, u64, u32)> = Vec::new();
-    let mut signal_data_arcs: Vec<Arc<[u8]>> = Vec::new();
+    // Combine all signal chunks with sequential index assignment.
+    // Pre-size: total chunk count is known from the parallel extractions.
+    let total_chunks: usize = file_extractions.iter().map(|e| e.chunks.len()).sum();
+    let mut all_signal_chunks: Vec<(usize, u64, u32)> = Vec::with_capacity(total_chunks);
+    let mut signal_data_arcs: Vec<Arc<[u8]>> = Vec::with_capacity(total_chunks);
     let mut current_signal_row: u64 = 0;
 
     for (file_idx, extraction) in file_extractions.iter().enumerate() {
@@ -312,7 +311,9 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let schema_meta = SchemaMetadata::new();
 
     let file = File::create(output_path.as_ref())?;
-    let mut file = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    // 128 MiB buffer matches merge.rs and avoids many small syscalls when
+    // the reads/run_info tables are flushed at the end.
+    let mut file = BufWriter::with_capacity(128 * 1024 * 1024, file);
 
     // Write POD5 header
     file.write_all(&POD5_SIGNATURE)?;
@@ -328,19 +329,21 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     )?;
     file.write_all(&signal_table_bytes)?;
 
-    let signal_end = file.stream_position()? as usize;
+    // Track signal_end manually to avoid `stream_position()`, which would
+    // force a flush of the 128 MiB BufWriter.
+    let signal_end = POD5_SIGNATURE.len() + 16 + signal_table_bytes.len();
 
-    // Build source metadata for run info dedup
-    let source_metadata: Vec<SourceFileMetadata> = file_metadata
+    // Borrow each file's run_infos for dedup — avoids deep-cloning every
+    // RunInfoData (each carries 13 Strings + 2 HashMaps).
+    let per_file_run_infos: Vec<&[RunInfoData]> = file_metadata
         .iter()
-        .map(|m| SourceFileMetadata {
-            run_infos: m.run_infos.clone(),
-        })
+        .map(|m| m.run_infos.as_slice())
         .collect();
 
     // Remap reads with deduplicated run info indices and sequential signal rows
-    let (_all_run_infos, run_info_map) = deduplicate_run_infos(&source_metadata);
-    let mut processed_reads: Vec<(ReadData, Vec<u64>)> = Vec::new();
+    let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
+    let mut processed_reads: Vec<(ReadData, Vec<u64>)> =
+        Vec::with_capacity(matching_count as usize);
     let mut signal_row_cursor: u64 = 0;
 
     for metadata in &file_metadata {
@@ -358,7 +361,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         &section_marker,
         &schema_meta,
         signal_end,
-        &source_metadata,
+        &all_run_infos,
         &processed_reads,
     )?;
 
