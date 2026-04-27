@@ -361,6 +361,133 @@ fn build_partition(
     }
 }
 
+/// Build arrays for a single partition of `FlatReadRef`s, applying the
+/// remap (`signal_rows`, `run_info_index`) inline so the caller never
+/// has to materialize a `Vec<ProcessedRead>`. This is the lazy-remap
+/// counterpart to `build_partition`.
+fn build_partition_remapped(
+    flat: &[crate::utils::pod5_assembler::FlatReadRef<'_>],
+    pore_type_map: &HashMap<&str, i16>,
+    end_reason_map: &HashMap<&str, i16>,
+    run_info_remap: &HashMap<String, u32>,
+) -> PartitionArrays {
+    let num_reads = flat.len();
+
+    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
+    let signal_field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::UInt64,
+        true,
+    ));
+    let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
+    let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
+    let mut start_builder = UInt64Builder::with_capacity(num_reads);
+    let mut median_before_builder = Float32Builder::with_capacity(num_reads);
+    let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
+    let mut tracked_scaling_scale_builder = Float32Builder::with_capacity(num_reads);
+    let mut tracked_scaling_shift_builder = Float32Builder::with_capacity(num_reads);
+    let mut predicted_scaling_scale_builder = Float32Builder::with_capacity(num_reads);
+    let mut predicted_scaling_shift_builder = Float32Builder::with_capacity(num_reads);
+    let mut num_reads_since_mux_change_builder = UInt32Builder::with_capacity(num_reads);
+    let mut time_since_mux_change_builder = Float32Builder::with_capacity(num_reads);
+    let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
+    let mut channel_builder = UInt16Builder::with_capacity(num_reads);
+    let mut well_builder = UInt8Builder::with_capacity(num_reads);
+    let mut pore_type_keys_builder = Int16Builder::with_capacity(num_reads);
+    let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
+    let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
+    let mut end_reason_keys_builder = Int16Builder::with_capacity(num_reads);
+    let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
+    let mut run_info_keys_builder = Int16Builder::with_capacity(num_reads);
+    let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
+
+    for entry in flat {
+        let read = entry.read;
+        let _ = read_id_builder.append_value(read.read_id.as_bytes());
+
+        // Inline-remap signal rows from the source's signal_rows length
+        // and the per-read prefix-sum offset.
+        let values = signal_builder.values();
+        let n = read.signal_rows.len() as u64;
+        for i in 0..n {
+            values.append_value(entry.new_signal_rows_start + i);
+        }
+        signal_builder.append(true);
+
+        // V0 fields (unchanged from source)
+        read_number_builder.append_value(read.read_number);
+        start_builder.append_value(read.start_sample);
+        median_before_builder.append_value(read.median_before);
+
+        // V1 fields
+        num_minknow_events_builder.append_value(read.num_minknow_events);
+        tracked_scaling_scale_builder.append_value(read.tracked_scaling_scale);
+        tracked_scaling_shift_builder.append_value(read.tracked_scaling_shift);
+        predicted_scaling_scale_builder.append_value(read.predicted_scaling_scale);
+        predicted_scaling_shift_builder.append_value(read.predicted_scaling_shift);
+        num_reads_since_mux_change_builder.append_value(read.num_reads_since_mux_change);
+        time_since_mux_change_builder.append_value(read.time_since_mux_change);
+
+        // V2 fields
+        num_samples_builder.append_value(read.num_samples);
+
+        // V3 fields
+        channel_builder.append_value(read.channel);
+        well_builder.append_value(read.well);
+        let pore_key = pore_type_map
+            .get(read.pore_type.as_str())
+            .copied()
+            .unwrap_or(0);
+        pore_type_keys_builder.append_value(pore_key);
+        calibration_offset_builder.append_value(read.calibration_offset);
+        calibration_scale_builder.append_value(read.calibration_scale);
+        let end_key = end_reason_map
+            .get(read.end_reason.as_str())
+            .copied()
+            .unwrap_or(0);
+        end_reason_keys_builder.append_value(end_key);
+        end_reason_forced_builder.append_value(read.end_reason_forced);
+
+        // Look up the source acquisition_id and remap to its index in
+        // the deduplicated `all_run_infos` (which doubles as the dict
+        // key index for the `run_info` column).
+        let new_run_info_idx = entry
+            .source_run_infos
+            .get(read.run_info_index as usize)
+            .and_then(|ri| run_info_remap.get(&ri.acquisition_id).copied())
+            .unwrap_or(0);
+        run_info_keys_builder.append_value(new_run_info_idx as i16);
+
+        // V4 fields
+        open_pore_level_builder.append_value(read.open_pore_level);
+    }
+
+    PartitionArrays {
+        read_id: read_id_builder.finish(),
+        signal: signal_builder.finish(),
+        read_number: read_number_builder.finish(),
+        start: start_builder.finish(),
+        median_before: median_before_builder.finish(),
+        num_minknow_events: num_minknow_events_builder.finish(),
+        tracked_scaling_scale: tracked_scaling_scale_builder.finish(),
+        tracked_scaling_shift: tracked_scaling_shift_builder.finish(),
+        predicted_scaling_scale: predicted_scaling_scale_builder.finish(),
+        predicted_scaling_shift: predicted_scaling_shift_builder.finish(),
+        num_reads_since_mux_change: num_reads_since_mux_change_builder.finish(),
+        time_since_mux_change: time_since_mux_change_builder.finish(),
+        num_samples: num_samples_builder.finish(),
+        channel: channel_builder.finish(),
+        well: well_builder.finish(),
+        pore_type_keys: pore_type_keys_builder.finish(),
+        calibration_offset: calibration_offset_builder.finish(),
+        calibration_scale: calibration_scale_builder.finish(),
+        end_reason_keys: end_reason_keys_builder.finish(),
+        end_reason_forced: end_reason_forced_builder.finish(),
+        run_info_keys: run_info_keys_builder.finish(),
+        open_pore_level: open_pore_level_builder.finish(),
+    }
+}
+
 /// Build reads Arrow IPC table.
 ///
 /// Uses parallel partition-based building for performance:
@@ -556,6 +683,205 @@ pub(crate) fn build_reads_table(
         end_reason_forced_array,
         run_info_array,
         // V4
+        open_pore_level_array,
+    ];
+
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+
+    Ok(buffer)
+}
+
+/// Lazy-remap reads-table builder for `filter`.
+///
+/// Mirrors `build_reads_table` (single record batch, parallel partition
+/// build, dictionary collection across the whole input) but consumes
+/// `FlatReadRef`s — borrowed source `ReadData`s plus the per-read
+/// signal-row prefix-sum offset and a borrow of the source's run-info
+/// table — so the caller never has to materialize a `Vec<ProcessedRead>`.
+///
+/// On a 30M-match filter this saves ~6 GB peak RSS (200 B/read × 30M)
+/// without the per-batch overhead that broke the multi-batch streaming
+/// design. Within a single record batch, build cost is the same as
+/// `build_reads_table` — same parallel partitioning, same concat.
+///
+/// `run_info_remap` maps source `acquisition_id` → index in the deduped
+/// `all_run_infos` (which doubles as the dictionary key for the
+/// `run_info` column).
+pub(crate) fn build_reads_table_remapped(
+    flat: &[crate::utils::pod5_assembler::FlatReadRef<'_>],
+    all_run_infos: &[RunInfoData],
+    run_info_remap: &HashMap<String, u32>,
+    meta: &SchemaMetadata,
+) -> Result<Vec<u8>> {
+    let schema = Arc::new(meta.apply(reads_schema()));
+
+    if flat.is_empty() {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
+            writer.finish()?;
+        }
+        return Ok(buffer);
+    }
+
+    // Dictionary collection: parallel scan over the borrowed reads.
+    let (pore_type_set, end_reason_set): (HashSet<&str>, HashSet<&str>) = flat
+        .par_iter()
+        .fold(
+            || (HashSet::new(), HashSet::new()),
+            |(mut pores, mut ends), entry| {
+                pores.insert(entry.read.pore_type.as_str());
+                ends.insert(entry.read.end_reason.as_str());
+                (pores, ends)
+            },
+        )
+        .reduce(
+            || (HashSet::new(), HashSet::new()),
+            |(mut a_pores, mut a_ends), (b_pores, b_ends)| {
+                a_pores.extend(b_pores);
+                a_ends.extend(b_ends);
+                (a_pores, a_ends)
+            },
+        );
+
+    let pore_types: Vec<&str> = pore_type_set.into_iter().collect();
+    let end_reasons: Vec<&str> = end_reason_set.into_iter().collect();
+    let run_info_ids: Vec<&str> = all_run_infos
+        .iter()
+        .map(|ri| ri.acquisition_id.as_str())
+        .collect();
+
+    let pore_type_map: HashMap<&str, i16> = pore_types
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as i16))
+        .collect();
+    let end_reason_map: HashMap<&str, i16> = end_reasons
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as i16))
+        .collect();
+
+    // Parallel partition build: each partition does the inline remap.
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = flat.len().div_ceil(num_threads);
+
+    let partition_arrays: Vec<PartitionArrays> = flat
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            build_partition_remapped(chunk, &pore_type_map, &end_reason_map, run_info_remap)
+        })
+        .collect();
+
+    // Concat partition arrays — identical to build_reads_table from here on.
+    macro_rules! concat_arrays {
+        ($field:ident, $array_type:ty) => {{
+            let refs: Vec<&dyn Array> = partition_arrays
+                .iter()
+                .map(|p| &p.$field as &dyn Array)
+                .collect();
+            Arc::new(
+                concat(&refs)?
+                    .as_any()
+                    .downcast_ref::<$array_type>()
+                    .unwrap()
+                    .clone(),
+            ) as ArrayRef
+        }};
+    }
+
+    let read_id_array = concat_arrays!(read_id, FixedSizeBinaryArray);
+    let signal_array = concat_arrays!(signal, ListArray);
+    let read_number_array = concat_arrays!(read_number, UInt32Array);
+    let start_array = concat_arrays!(start, UInt64Array);
+    let median_before_array = concat_arrays!(median_before, Float32Array);
+    let num_minknow_events_array = concat_arrays!(num_minknow_events, UInt64Array);
+    let tracked_scaling_scale_array = concat_arrays!(tracked_scaling_scale, Float32Array);
+    let tracked_scaling_shift_array = concat_arrays!(tracked_scaling_shift, Float32Array);
+    let predicted_scaling_scale_array = concat_arrays!(predicted_scaling_scale, Float32Array);
+    let predicted_scaling_shift_array = concat_arrays!(predicted_scaling_shift, Float32Array);
+    let num_reads_since_mux_change_array = concat_arrays!(num_reads_since_mux_change, UInt32Array);
+    let time_since_mux_change_array = concat_arrays!(time_since_mux_change, Float32Array);
+    let num_samples_array = concat_arrays!(num_samples, UInt64Array);
+    let channel_array = concat_arrays!(channel, UInt16Array);
+    let well_array = concat_arrays!(well, UInt8Array);
+    let calibration_offset_array = concat_arrays!(calibration_offset, Float32Array);
+    let calibration_scale_array = concat_arrays!(calibration_scale, Float32Array);
+    let end_reason_forced_array = concat_arrays!(end_reason_forced, BooleanArray);
+    let open_pore_level_array = concat_arrays!(open_pore_level, Float32Array);
+
+    let pore_type_keys_refs: Vec<&dyn Array> = partition_arrays
+        .iter()
+        .map(|p| &p.pore_type_keys as &dyn Array)
+        .collect();
+    let pore_type_keys = concat(&pore_type_keys_refs)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap()
+        .clone();
+    let pore_type_dict = StringArray::from_iter_values(pore_types.iter().copied());
+    let pore_type_array: ArrayRef = Arc::new(DictionaryArray::new(
+        pore_type_keys,
+        Arc::new(pore_type_dict),
+    ));
+
+    let end_reason_keys_refs: Vec<&dyn Array> = partition_arrays
+        .iter()
+        .map(|p| &p.end_reason_keys as &dyn Array)
+        .collect();
+    let end_reason_keys = concat(&end_reason_keys_refs)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap()
+        .clone();
+    let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().copied());
+    let end_reason_array: ArrayRef = Arc::new(DictionaryArray::new(
+        end_reason_keys,
+        Arc::new(end_reason_dict),
+    ));
+
+    let run_info_keys_refs: Vec<&dyn Array> = partition_arrays
+        .iter()
+        .map(|p| &p.run_info_keys as &dyn Array)
+        .collect();
+    let run_info_keys = concat(&run_info_keys_refs)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap()
+        .clone();
+    let run_info_dict = StringArray::from_iter_values(run_info_ids.iter().copied());
+    let run_info_array: ArrayRef =
+        Arc::new(DictionaryArray::new(run_info_keys, Arc::new(run_info_dict)));
+
+    let arrays: Vec<ArrayRef> = vec![
+        read_id_array,
+        signal_array,
+        read_number_array,
+        start_array,
+        median_before_array,
+        num_minknow_events_array,
+        tracked_scaling_scale_array,
+        tracked_scaling_shift_array,
+        predicted_scaling_scale_array,
+        predicted_scaling_shift_array,
+        num_reads_since_mux_change_array,
+        time_since_mux_change_array,
+        num_samples_array,
+        channel_array,
+        well_array,
+        pore_type_array,
+        calibration_offset_array,
+        calibration_scale_array,
+        end_reason_array,
+        end_reason_forced_array,
+        run_info_array,
         open_pore_level_array,
     ];
 

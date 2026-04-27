@@ -7,15 +7,33 @@
 
 use crate::error::Result;
 use crate::types::{FOOTER_MAGIC, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
-use crate::utils::table_builders::{
-    SchemaMetadata, build_pod5_footer, build_reads_table, build_run_info_table,
-};
+use crate::utils::table_builders::{SchemaMetadata, build_pod5_footer, build_run_info_table};
 use std::collections::HashMap;
 use std::io::Write;
 
 /// A read paired with the signal-row indices it should reference in the
 /// output reads table. Used by the writers in merge and filter.
 pub(crate) type ProcessedRead = (ReadData, Vec<u64>);
+
+/// A borrowed source read plus the context needed to write it to the
+/// output reads table without first materializing a `ProcessedRead`.
+///
+/// Filter accumulates a `Vec<FlatReadRef>` over its `file_metadata` (one
+/// entry per matching read, in source-file order) and feeds it to
+/// `build_reads_table_remapped`, which applies the remap inline during
+/// the parallel partition build. This avoids the ~200 B/read clone of
+/// `for_writing` + `Vec<u64>` that an intermediate `Vec<ProcessedRead>`
+/// would carry.
+pub(crate) struct FlatReadRef<'a> {
+    pub read: &'a ReadData,
+    /// Source file's run-info table (read.run_info_index indexes into
+    /// this).
+    pub source_run_infos: &'a [RunInfoData],
+    /// Cumulative count of `signal_rows.len()` for every earlier
+    /// matching read in source-file order. The new signal_rows for this
+    /// read are `start..start + read.signal_rows.len()`.
+    pub new_signal_rows_start: u64,
+}
 
 /// Up to 7 zero bytes for 8-byte alignment padding.
 const PADDING_ZEROS: [u8; 8] = [0u8; 8];
@@ -25,7 +43,11 @@ const PADDING_ZEROS: [u8; 8] = [0u8; 8];
 /// Call this after all signal data has been written. It handles:
 /// - Padding to 8-byte alignment + section marker after signal
 /// - Run info table (caller already deduplicated)
-/// - Reads table with remapped signal rows and run_info indices
+/// - Reads table — caller pre-builds the Arrow IPC bytes via
+///   `build_reads_table` (merge: materialized `Vec<ProcessedRead>`) or
+///   `build_reads_table_remapped` (filter: lazy-remap from
+///   `&[FlatReadRef]`). Splitting this lets filter avoid materializing
+///   ~200 B/read of intermediate `ProcessedRead`s on big match sets.
 /// - POD5 footer (flatbuffer + length + closing signature)
 ///
 /// `signal_end` is the absolute byte offset of the end of the signal section
@@ -38,7 +60,7 @@ pub(crate) fn write_post_signal_sections<W: Write>(
     schema_meta: &SchemaMetadata,
     signal_end: usize,
     all_run_infos: &[RunInfoData],
-    processed_reads: &[ProcessedRead],
+    reads_table_bytes: &[u8],
 ) -> Result<()> {
     let mut pos = signal_end;
 
@@ -60,10 +82,9 @@ pub(crate) fn write_post_signal_sections<W: Write>(
 
     // Reads table.
     let reads_offset = pos as i64;
-    let reads_bytes = build_reads_table(processed_reads, all_run_infos, schema_meta)?;
-    file.write_all(&reads_bytes)?;
-    pos += reads_bytes.len();
-    let reads_length = reads_bytes.len() as i64;
+    file.write_all(reads_table_bytes)?;
+    pos += reads_table_bytes.len();
+    let reads_length = reads_table_bytes.len() as i64;
 
     let _ = write_padding_to_align8(file, pos)?;
     file.write_all(section_marker.as_bytes())?;
@@ -130,33 +151,4 @@ pub(crate) fn deduplicate_run_infos(
     }
 
     (all_run_infos, run_info_map)
-}
-
-/// Remap a read's `run_info_index` using the dedup map, and compute new sequential
-/// signal rows starting from `signal_row_cursor`.
-///
-/// Returns `(new_read, new_signal_rows, updated_cursor)`.
-pub(crate) fn remap_read(
-    read: &ReadData,
-    source_run_infos: &[RunInfoData],
-    run_info_map: &HashMap<String, u32>,
-    signal_row_cursor: u64,
-) -> (ReadData, Vec<u64>, u64) {
-    let original_run_info = source_run_infos.get(read.run_info_index as usize);
-    let new_run_info_idx = if let Some(ri) = original_run_info {
-        *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
-    } else {
-        0
-    };
-
-    let num_signal_rows = read.signal_rows.len() as u64;
-    let new_signal_rows: Vec<u64> =
-        (signal_row_cursor..signal_row_cursor + num_signal_rows).collect();
-
-    let new_read = read.for_writing(new_run_info_idx);
-    (
-        new_read,
-        new_signal_rows,
-        signal_row_cursor + num_signal_rows,
-    )
 }
