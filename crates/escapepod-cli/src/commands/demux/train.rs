@@ -7,8 +7,8 @@ use crate::style;
 use escapepod_demux::{
     compute_consensus_fingerprint, compute_std_dev_fingerprint, extract_fingerprint_from_signal,
 };
-use escapepod_signal::Reader;
 use escapepod_signal::segmentation::{detect_adapter, normalize_signal};
+use escapepod_signal::{Reader, ReadsBatchView};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -221,10 +221,16 @@ fn collect_assignments_from_directory(
                 let pod5_path = pod5_entry.path().to_path_buf();
                 let reader = Reader::open(&pod5_path)?;
 
-                if let Ok(reads) = reader.reads() {
-                    for read_result in reads {
-                        let read = read_result?;
-                        assignments.insert(read.read_id, (barcode.clone(), pod5_path.clone()));
+                // Only the read_id is needed here, so use the lighter
+                // view.read_id() rather than decoding all 22 fields.
+                if let Ok(batches) = reader.read_batches() {
+                    for batch_result in batches {
+                        let batch = batch_result?;
+                        let view = ReadsBatchView::new(&batch, false)?;
+                        for row in 0..view.num_rows() {
+                            let read_id = view.read_id(row)?;
+                            assignments.insert(read_id, (barcode.clone(), pod5_path.clone()));
+                        }
                     }
                 }
             }
@@ -302,21 +308,32 @@ fn extract_fingerprints(
             let mut pending_inc: u64 = 0;
 
             if let Ok(reader) = Reader::open(pod5_path)
-                && let Ok(reads) = reader.reads()
+                && let Ok(batches) = reader.read_batches()
             {
-                for read in reads.flatten() {
-                    if read_ids.contains(&read.read_id)
-                        && !read.signal_rows.is_empty()
-                        && let Ok(signal) = reader.get_signal(&read.signal_rows)
-                        && let Some(fp) =
-                            extract_training_fingerprint(&signal, args, norm_method, read.read_id)
-                    {
-                        fingerprints.push((read.read_id, fp));
-                    }
-                    pending_inc += 1;
-                    if pending_inc >= PROGRESS_BATCH {
-                        progress_bar.inc(pending_inc);
-                        pending_inc = 0;
+                for batch_result in batches {
+                    let Ok(batch) = batch_result else { continue };
+                    let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                        continue;
+                    };
+                    for row in 0..view.num_rows() {
+                        let Ok(read) = view.read(row) else { continue };
+                        if read_ids.contains(&read.read_id)
+                            && !read.signal_rows.is_empty()
+                            && let Ok(signal) = reader.get_signal(&read.signal_rows)
+                            && let Some(fp) = extract_training_fingerprint(
+                                &signal,
+                                args,
+                                norm_method,
+                                read.read_id,
+                            )
+                        {
+                            fingerprints.push((read.read_id, fp));
+                        }
+                        pending_inc += 1;
+                        if pending_inc >= PROGRESS_BATCH {
+                            progress_bar.inc(pending_inc);
+                            pending_inc = 0;
+                        }
                     }
                 }
             }

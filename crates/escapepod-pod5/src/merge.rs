@@ -10,7 +10,7 @@ use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::pod5_assembler::{
     ProcessedRead, deduplicate_run_infos, write_post_signal_sections,
 };
-use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer};
+use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer, build_reads_table};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -365,14 +365,17 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let total_reads = processed_reads.len() as u64;
 
-    // Write post-signal sections (run info, reads, footer)
+    // Build the reads-table Arrow IPC bytes (single batch from the
+    // already-materialized `processed_reads`), then write the post-signal
+    // sections.
+    let reads_table_bytes = build_reads_table(&processed_reads, &all_run_infos, &schema_meta)?;
     write_post_signal_sections(
         &mut file,
         &section_marker,
         &schema_meta,
         signal_end,
         &all_run_infos,
-        &processed_reads,
+        &reads_table_bytes,
     )?;
 
     Ok(MergeResult {

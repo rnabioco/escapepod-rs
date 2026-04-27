@@ -2,7 +2,7 @@
 //!
 //! Repacks POD5 files using block-level signal copying (no decompression/recompression).
 
-use crate::{Reader, Result, Writer, WriterOptions};
+use crate::{Reader, ReadsBatchView, Result, Writer, WriterOptions};
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
@@ -85,18 +85,25 @@ fn repack_single_file(
 
     let mut count = 0u64;
 
-    // Copy reads with COMPRESSED signals (no decompression/recompression)
-    for read_result in reader.reads()? {
-        let read = read_result?;
+    // Copy reads with COMPRESSED signals (no decompression/recompression).
+    // Iterate by Arrow batch and resolve columns once per batch via
+    // ReadsBatchView — much faster than reader.reads()'s per-row column
+    // lookup loop.
+    for batch_result in reader.read_batches()? {
+        let batch = batch_result?;
+        let view = ReadsBatchView::new(&batch, false)?;
+        for row in 0..view.num_rows() {
+            let read = view.read(row)?;
 
-        // Get compressed signal blocks directly (no decompression)
-        let compressed_signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
+            // Get compressed signal blocks directly (no decompression)
+            let compressed_signal = reader.get_compressed_signal_for_rows(&read.signal_rows)?;
 
-        // Write with compressed signal (no recompression)
-        let new_read = read.for_writing_same_run();
-        writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
+            // Write with compressed signal (no recompression)
+            let new_read = read.for_writing_same_run();
+            writer.add_read_with_compressed_signal(new_read, &compressed_signal)?;
 
-        count += 1;
+            count += 1;
+        }
     }
 
     writer.finish()?;

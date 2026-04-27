@@ -37,7 +37,7 @@ impl PyReadData {
 
     #[getter]
     fn pore_type(&self) -> &str {
-        &self.inner.pore_type
+        self.inner.pore_type.as_str()
     }
 
     #[getter]

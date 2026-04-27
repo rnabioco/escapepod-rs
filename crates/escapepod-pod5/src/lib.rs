@@ -47,6 +47,7 @@ pub use utils::parse_uuid_flexible;
 pub use utils::{Statistics, compute_n50, compute_statistics};
 
 // Re-export commonly used types
+pub use arrow_helpers::ReadsBatchView;
 pub use error::{Error, Result};
 pub use merge::{MergeOptions, MergePhase, MergeProgress, MergeResult, merge_files};
 pub use operations::{RepackOptions, RepackResult, repack_files};
@@ -54,7 +55,7 @@ pub use progress::{Progress, ProgressCallback};
 pub use reader::ReadIndex;
 pub use reader::Reader;
 pub use reader::SignalExtractor;
-pub use types::{EndReason, ReadData, RunInfoData, SignalType, Uuid};
+pub use types::{EndReason, PoreType, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{PredefinedDictionaries, Writer, WriterOptions};
 
 // Re-export Arrow types needed for batch-level operations

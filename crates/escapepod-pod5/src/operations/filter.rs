@@ -8,9 +8,9 @@ use crate::reader::Reader;
 use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::parse_uuid_flexible;
 use crate::utils::pod5_assembler::{
-    ProcessedRead, deduplicate_run_infos, remap_read, write_post_signal_sections,
+    FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
-use crate::utils::table_builders::SchemaMetadata;
+use crate::utils::table_builders::{SchemaMetadata, build_reads_table_remapped};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -286,9 +286,9 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         extractions.into_iter().collect::<Result<Vec<_>>>()?;
 
     // Flatten file extractions into a single chunk list in source-file order.
-    // Order matters: the reads table's `signal_rows` field is assigned by
-    // `remap_read` in the same order, so chunk N in this Vec must correspond
-    // to signal-row N in the output.
+    // Order matters: the reads-table's per-read signal-row prefix sums (built
+    // below into `flat_reads`) walk source files in this same order, so chunk
+    // N of the signal table must correspond to signal-row N of the output.
     let total_chunks: usize = file_extractions.iter().map(|e| e.len()).sum();
     let mut signal_chunks: Vec<(&[u8], u32)> = Vec::with_capacity(total_chunks);
     for (file_idx, chunks) in file_extractions.iter().enumerate() {
@@ -336,29 +336,48 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         .iter()
         .map(|m| m.run_infos.as_slice())
         .collect();
-
-    // Remap reads with deduplicated run info indices and sequential signal rows
     let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
-    let mut processed_reads: Vec<ProcessedRead> = Vec::with_capacity(matching_count as usize);
-    let mut signal_row_cursor: u64 = 0;
 
+    // Build a flat view of every matching read with the prefix-sum
+    // signal-row offset and remapped run_info dict key baked in. Each
+    // `FlatReadRef` is borrowed pointers + two scalars (~32 B/entry) —
+    // for a 30M-match workload this is ~960 MB of refs, vs ~6 GB if we
+    // materialized cloned `ProcessedRead`s here. The remap is applied
+    // here once per read; `build_reads_table_remapped` then walks the
+    // flat list during its parallel partition build with no further
+    // remap work per row.
+    let mut flat_reads: Vec<FlatReadRef<'_>> = Vec::with_capacity(matching_count as usize);
+    let mut signal_row_cursor: u64 = 0;
     for metadata in &file_metadata {
         for read in &metadata.matching_reads {
-            let (new_read, new_signal_rows, new_cursor) =
-                remap_read(read, &metadata.run_infos, &run_info_map, signal_row_cursor);
-            signal_row_cursor = new_cursor;
-            processed_reads.push((new_read, new_signal_rows));
+            let run_info_key = metadata
+                .run_infos
+                .get(read.run_info_index as usize)
+                .and_then(|ri| run_info_map.get(&ri.acquisition_id).copied())
+                .unwrap_or(0);
+            flat_reads.push(FlatReadRef {
+                read,
+                new_signal_rows_start: signal_row_cursor,
+                run_info_key: i16::try_from(run_info_key).unwrap_or(0),
+            });
+            signal_row_cursor += read.signal_rows.len() as u64;
         }
     }
 
-    // Write post-signal sections (run info, reads, footer)
+    let reads_table_bytes = build_reads_table_remapped(&flat_reads, &all_run_infos, &schema_meta)?;
+
+    // Free the borrow refs before the (large) reads_table_bytes buffer
+    // hits the writer, so peak RSS is dominated by the IPC-encoded form
+    // (~50–100 B/read) rather than carrying both shapes in memory.
+    drop(flat_reads);
+
     write_post_signal_sections(
         &mut file,
         &section_marker,
         &schema_meta,
         signal_end,
         &all_run_infos,
-        &processed_reads,
+        &reads_table_bytes,
     )?;
 
     Ok(FilterResult {

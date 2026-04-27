@@ -215,17 +215,23 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
 
     for (reader_idx, path) in pod5_files.iter().enumerate() {
         let reader = escapepod_signal::Reader::open(path)?;
-        for read_result in reader.reads()? {
-            let read = read_result?;
-            pod5_reads.insert(
-                read.read_id,
-                Pod5ReadInfo {
-                    reader_idx,
-                    calibration_scale: read.calibration_scale,
-                    calibration_offset: read.calibration_offset,
-                    signal_rows: read.signal_rows.clone(),
-                },
-            );
+        // Iterate by Arrow batch and resolve columns once per batch.
+        for batch_result in reader.read_batches()? {
+            let batch = batch_result?;
+            let view = escapepod_signal::ReadsBatchView::new(&batch, false)?;
+            pod5_reads.reserve(view.num_rows());
+            for row in 0..view.num_rows() {
+                let read = view.read(row)?;
+                pod5_reads.insert(
+                    read.read_id,
+                    Pod5ReadInfo {
+                        reader_idx,
+                        calibration_scale: read.calibration_scale,
+                        calibration_offset: read.calibration_offset,
+                        signal_rows: read.signal_rows,
+                    },
+                );
+            }
         }
         pod5_readers.push(reader);
     }

@@ -105,7 +105,7 @@ pub(super) fn extract_read_from_batch(
         start_sample,
         channel: ext.get_u16("channel")?,
         well: ext.get_u8("well")?,
-        pore_type: ext.get_dict_string("pore_type").unwrap_or_default(),
+        pore_type: ext.get_dict_string("pore_type").unwrap_or_default().into(),
         calibration_offset: ext.get_f32("calibration_offset")?,
         calibration_scale: ext.get_f32("calibration_scale")?,
         median_before: ext.get_f32("median_before")?,

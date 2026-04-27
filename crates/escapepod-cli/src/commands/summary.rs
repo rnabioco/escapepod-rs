@@ -5,7 +5,7 @@
 use crate::progress::create_progress_bar;
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
 use chrono::{TimeZone, Utc};
-use escapepod_signal::{Reader, RunInfoData};
+use escapepod_signal::{Reader, ReadsBatchView, RunInfoData};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -161,30 +161,40 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
         let mut file_read_count = 0u64;
         let mut read_errors = 0u64;
 
-        match reader.reads() {
-            Ok(reads_iter) => {
-                for read_result in reads_iter {
-                    match read_result {
-                        Ok(read) => {
-                            file_read_count += 1;
-                            stats.count += 1;
-                            stats.total_samples += read.num_samples;
-                            stats.lengths.push(read.num_samples);
+        match reader.read_batches() {
+            Ok(batches) => {
+                for batch_result in batches {
+                    let Ok(batch) = batch_result else {
+                        read_errors += 1;
+                        continue;
+                    };
+                    let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                        read_errors += 1;
+                        continue;
+                    };
+                    for row in 0..view.num_rows() {
+                        match view.read(row) {
+                            Ok(read) => {
+                                file_read_count += 1;
+                                stats.count += 1;
+                                stats.total_samples += read.num_samples;
+                                stats.lengths.push(read.num_samples);
 
-                            *stats.channels.entry(read.channel).or_insert(0) += 1;
-                            stats.max_channel = stats.max_channel.max(read.channel);
+                                *stats.channels.entry(read.channel).or_insert(0) += 1;
+                                stats.max_channel = stats.max_channel.max(read.channel);
 
-                            if read.well >= 1 && read.well <= 4 {
-                                stats.wells[read.well as usize] += 1;
+                                if read.well >= 1 && read.well <= 4 {
+                                    stats.wells[read.well as usize] += 1;
+                                }
+
+                                *stats
+                                    .end_reasons
+                                    .entry(read.end_reason.as_str().to_string())
+                                    .or_insert(0) += 1;
                             }
-
-                            *stats
-                                .end_reasons
-                                .entry(read.end_reason.as_str().to_string())
-                                .or_insert(0) += 1;
-                        }
-                        Err(_) => {
-                            read_errors += 1;
+                            Err(_) => {
+                                read_errors += 1;
+                            }
                         }
                     }
                 }

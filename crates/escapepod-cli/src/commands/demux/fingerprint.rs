@@ -7,8 +7,8 @@ use arrow::array::{ArrayRef, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use escapepod_demux::{ReadFingerprint, extract_fingerprint_from_signal};
-use escapepod_signal::Reader;
 use escapepod_signal::dtw::NormMethod;
+use escapepod_signal::{Reader, ReadsBatchView};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -199,16 +199,26 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
             let Ok(reader) = Reader::open(path) else {
                 return Vec::new();
             };
-            let Ok(read_iter) = reader.reads() else {
-                return Vec::new();
-            };
             // Metadata-only pre-filter: boundaries + non-empty signal_rows.
+            // Iterate by Arrow batch and resolve columns once per batch.
             // No signal I/O yet — the signal decode is the expensive part
             // and happens in the inner par_iter below.
-            let reads: Vec<_> = read_iter
-                .filter_map(Result::ok)
-                .filter(|r| !r.signal_rows.is_empty() && boundaries_map.contains_key(&r.read_id))
-                .collect();
+            let mut reads: Vec<_> = Vec::new();
+            let Ok(batches) = reader.read_batches() else {
+                return Vec::new();
+            };
+            for batch_result in batches {
+                let Ok(batch) = batch_result else { continue };
+                let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                    continue;
+                };
+                for row in 0..view.num_rows() {
+                    let Ok(r) = view.read(row) else { continue };
+                    if !r.signal_rows.is_empty() && boundaries_map.contains_key(&r.read_id) {
+                        reads.push(r);
+                    }
+                }
+            }
             let Ok(extractor) = reader.signal_extractor() else {
                 return Vec::new();
             };
