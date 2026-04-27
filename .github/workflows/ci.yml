@@ -73,6 +73,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.9.4
         with:
           environments: python-test
+          cache: true
       - name: Build and test Python bindings
         run: pixi run -e python-test test-python
 
@@ -89,6 +90,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.9.4
         with:
           environments: python-test
+          cache: true
       - name: Round-trip compat vs Python pod5
         run: pixi run -e python-test test-compat
 

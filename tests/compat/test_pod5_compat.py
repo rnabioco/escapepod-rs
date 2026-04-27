@@ -5,9 +5,13 @@ POD5 forward/backward compatibility tests between escapepod-rs and Python pod5.
 Tests:
   1. Python → escapepod (backward compat): Write with pod5, read with escpod CLI
   2. escapepod → Python (forward compat): Filter through escpod, read with pod5
-  3. Full round-trip: Python → escpod filter → Python, verify no data loss
-  4. Edge cases: minimal signal, multi-chunk signal, empty metadata dicts
-  5. Existing test files: read real ONT POD5 files with both tools
+  3. Filter round-trip: Python → escpod filter → Python, verify no data loss
+  4. Merge round-trip: Python A + B → escpod merge → Python, verify run_info dedup
+  5. Subset round-trip: Python → escpod subset (CSV mapping) → Python per group
+  6. Edge cases: minimal signal, multi-chunk signal, empty metadata dicts
+  7. Existing test files: read real ONT POD5 files with both tools
+
+Index and repack are intentionally not round-trip tested here (experimental).
 
 Usage:
     cargo build --release
@@ -20,6 +24,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 from datetime import datetime, timezone
 
@@ -190,6 +195,92 @@ def write_python_pod5(path: Path):
             writer.add_read(r)
 
 
+def write_python_pod5_subset(path: Path, indices: list[int]):
+    """Write a subset of the canonical reads to a POD5 file."""
+    all_reads = make_pod5_reads()
+    with pod5.Writer(path) as writer:
+        for i in indices:
+            writer.add_read(all_reads[i])
+
+
+# ---------------------------------------------------------------------------
+# Reader helpers
+# ---------------------------------------------------------------------------
+# `pod5.Read.signal` is lazy and reads through the underlying ArrowTableHandle,
+# so the reader must still be open at access time. To avoid encoding that
+# footgun into every assertion block, drain everything we care about
+# (metadata + signal) into plain in-memory snapshots while the reader is
+# open, then close it before any assertions run. Each test only touches each
+# read once, so there's no reader-cache "warm path" to worry about hiding
+# bugs.
+def materialize_reads(path: Path) -> dict:
+    """Open path, drain all reads + signals into SimpleNamespace snapshots
+    that mirror pod5.Read accessors, then close the reader. Returns a dict
+    keyed by read_id (UUID)."""
+    out: dict = {}
+    with pod5.Reader(path) as reader:
+        for r in reader.reads():
+            out[r.read_id] = SimpleNamespace(
+                read_id=r.read_id,
+                read_number=r.read_number,
+                start_sample=r.start_sample,
+                median_before=r.median_before,
+                num_samples=r.num_samples,
+                num_minknow_events=r.num_minknow_events,
+                pore=SimpleNamespace(
+                    channel=r.pore.channel,
+                    well=r.pore.well,
+                    pore_type=r.pore.pore_type,
+                ),
+                calibration=SimpleNamespace(
+                    offset=r.calibration.offset,
+                    scale=r.calibration.scale,
+                ),
+                end_reason=SimpleNamespace(
+                    name=r.end_reason.name,
+                    forced=r.end_reason.forced,
+                ),
+                signal=np.asarray(r.signal),
+            )
+    return out
+
+
+def read_run_info_count(path: Path) -> int:
+    """Open path, count run_info rows, close. Separate fresh open so this
+    exercises the footer parse independently of the reads-table path."""
+    with pod5.Reader(path) as reader:
+        return len(list(reader.run_info_table.read_pandas().itertuples()))
+
+
+def random_access_signal_check(
+    label: str, path: Path, read_id: uuid.UUID, expected_signal: np.ndarray
+) -> bool:
+    """Fresh-open `path` and request a single read by ID. Exercises the
+    cold footer-parse + signal-block-index lookup that downstream tools
+    (basecallers, demuxers) rely on. Returns True on signal byte-equality.
+
+    This is intentionally a *separate* open from any prior materialize call,
+    so a footer/signal-row-count regression that only manifests on first
+    access cannot be masked by a still-warm reader."""
+    try:
+        with pod5.Reader(path) as reader:
+            picked = list(reader.reads(selection=[read_id]))
+            if not picked:
+                print(f"  FAIL: {label} cold lookup found no read for {read_id}")
+                return False
+            sig = np.asarray(picked[0].signal)
+    except Exception as e:
+        print(f"  FAIL: {label} cold-open random-access raised: {e}")
+        return False
+    try:
+        np.testing.assert_array_equal(sig, expected_signal)
+    except AssertionError:
+        print(f"  FAIL: {label} cold-open signal mismatch for {read_id}")
+        return False
+    print(f"  OK: {label} cold-open + by-ID lookup signal exact match")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Helper: parse escpod view TSV output
 # ---------------------------------------------------------------------------
@@ -335,28 +426,22 @@ def test_escapepod_to_python(tmpdir: Path) -> bool:
         print("  FAIL: escpod filter did not produce output file")
         return False
 
-    # Read with Python pod5 — keep reader open until after signal access
+    # Drain the escapepod-written file into in-memory snapshots (signals as
+    # numpy arrays). Reader closes inside materialize_reads — assertions run
+    # against pure Python data with no live ArrowTableHandle.
     try:
-        reader = pod5.Reader(escpod_pod5)
+        snapshots = materialize_reads(escpod_pod5)
     except Exception as e:
-        print(f"  FAIL: Python pod5 cannot open escapepod-written file: {e}")
+        print(f"  FAIL: Python pod5 cannot drain escapepod-written file: {e}")
         return False
 
-    try:
-        reads = list(reader.reads())
-    except Exception as e:
-        print(f"  FAIL: Python pod5 cannot read reads from escapepod-written file: {e}")
-        reader.close()
+    if len(snapshots) != 5:
+        print(f"  FAIL: Expected 5 reads, got {len(snapshots)}")
         return False
+    print(f"  OK: Python pod5 drained escapepod-written file ({len(snapshots)} reads)")
 
-    if len(reads) != 5:
-        print(f"  FAIL: Expected 5 reads, got {len(reads)}")
-        return False
-    print(f"  OK: Python pod5 successfully opened escapepod-written file with {len(reads)} reads")
-
-    # Sort reads by ID
-    id_to_idx = {rid: i for i, rid in enumerate(READ_IDS)}
-    reads.sort(key=lambda r: id_to_idx.get(r.read_id, 999))
+    # Walk reads in canonical (writer) order for stable per-read messages.
+    reads = [snapshots[rid] for rid in READ_IDS if rid in snapshots]
 
     for i, read in enumerate(reads):
         prefix = f"  Read {i}"
@@ -415,7 +500,7 @@ def test_escapepod_to_python(tmpdir: Path) -> bool:
             print(f"  FAIL: {prefix} end_reason_forced: expected {expected_forced}, got {read.end_reason.forced}")
             ok = False
 
-        # Signal - exact i16 match
+        # Signal - exact i16 match (snapshot already holds a numpy array)
         signal = read.signal
         try:
             np.testing.assert_array_equal(signal, SIGNALS[i])
@@ -425,13 +510,11 @@ def test_escapepod_to_python(tmpdir: Path) -> bool:
         else:
             print(f"  OK: {prefix} signal ({len(signal)} samples) exact match")
 
-    reader.close()
-
-    # Verify run info
+    # Verify run info via a separate fresh open — exercises footer parse
+    # independently of the reads-table drain above.
     try:
-        with pod5.Reader(escpod_pod5) as reader:
-            run_infos = list(reader.run_info_table.read_pandas().itertuples())
-            print(f"  OK: {len(run_infos)} run info record(s) read successfully")
+        n_run_info = read_run_info_count(escpod_pod5)
+        print(f"  OK: {n_run_info} run info record(s) read successfully")
     except Exception as e:
         print(f"  FAIL: Could not read run info: {e}")
         ok = False
@@ -465,17 +548,13 @@ def test_round_trip(tmpdir: Path) -> bool:
         "--output", str(roundtrip_pod5),
     )
 
-    # Read original with Python — keep readers open for signal access
-    orig_reader = pod5.Reader(python_pod5)
-    orig_reads = {r.read_id: r for r in orig_reader.reads()}
-
-    # Read round-tripped with Python
+    # Drain both files into snapshots and close their readers before any
+    # assertions run.
+    orig_reads = materialize_reads(python_pod5)
     try:
-        rt_reader = pod5.Reader(roundtrip_pod5)
-        rt_reads = {r.read_id: r for r in rt_reader.reads()}
+        rt_reads = materialize_reads(roundtrip_pod5)
     except Exception as e:
         print(f"  FAIL: Python pod5 cannot open escapepod-written file: {e}")
-        orig_reader.close()
         return False
 
     if set(orig_reads.keys()) != set(rt_reads.keys()):
@@ -524,8 +603,13 @@ def test_round_trip(tmpdir: Path) -> bool:
             print(f"  FAIL: {prefix} end_reason_forced changed")
             ok = False
 
-    orig_reader.close()
-    rt_reader.close()
+    # Cold-open random-access spot-check on the multi-chunk read (read 2,
+    # 150k samples) — that's the most interesting signal layout to exercise
+    # via fresh footer parse + by-ID lookup.
+    if not random_access_signal_check(
+        "filter output", roundtrip_pod5, READ_IDS[2], SIGNALS[2]
+    ):
+        ok = False
 
     if ok:
         print("  PASS: Round-trip preserves all data")
@@ -533,11 +617,165 @@ def test_round_trip(tmpdir: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Edge cases
+# Test 4: Merge round-trip
+# ---------------------------------------------------------------------------
+def test_merge_round_trip(tmpdir: Path) -> bool:
+    """Write 2 Python files (overlapping run_info groups), merge with escpod,
+    read back with Python and verify all reads + run_info dedup."""
+    print("\n=== Test 4: Merge round-trip (Python A + B → escpod merge → Python) ===")
+    ok = True
+
+    # Reads 0-2 (RUN_INFO_1) and read 4 (RUN_INFO_2) — read 4 is in B alone, but
+    # run_info_1 and run_info_2 both appear in B (read 3 uses RUN_INFO_2,
+    # read 0 in A also uses RUN_INFO_1) so we exercise both the dedup path
+    # (RUN_INFO_1 appears in both files) and the distinct path (RUN_INFO_2
+    # only in B).
+    file_a = tmpdir / "merge_a.pod5"
+    file_b = tmpdir / "merge_b.pod5"
+    write_python_pod5_subset(file_a, [0, 1, 2])  # all RUN_INFO_1
+    write_python_pod5_subset(file_b, [3, 4])     # both RUN_INFO_2
+
+    merged = tmpdir / "merged.pod5"
+    run_escpod("merge", str(file_a), str(file_b), "--output", str(merged))
+
+    if not merged.exists():
+        print("  FAIL: escpod merge did not produce output")
+        return False
+
+    try:
+        by_id = materialize_reads(merged)
+    except Exception as e:
+        print(f"  FAIL: Python pod5 cannot open merged file: {e}")
+        return False
+
+    if len(by_id) != 5:
+        print(f"  FAIL: Expected 5 reads after merge, got {len(by_id)}")
+        ok = False
+    else:
+        print(f"  OK: Merged file has {len(by_id)} reads")
+
+    # Run info dedup via a separate fresh open: RUN_INFO_1 and RUN_INFO_2
+    # should collapse to exactly 2 rows even though RUN_INFO_1 was
+    # referenced from multiple reads across both inputs.
+    n_run_info = read_run_info_count(merged)
+    if n_run_info != 2:
+        print(f"  FAIL: Expected 2 run_info rows after dedup, got {n_run_info}")
+        ok = False
+    else:
+        print(f"  OK: Run info deduplicated to {n_run_info} rows")
+
+    # Verify each canonical read survived with byte-identical signal.
+    for i, rid in enumerate(READ_IDS):
+        if rid not in by_id:
+            print(f"  FAIL: Read {rid} missing from merged file")
+            ok = False
+            continue
+        try:
+            np.testing.assert_array_equal(by_id[rid].signal, SIGNALS[i])
+        except AssertionError:
+            print(f"  FAIL: Signal mismatch after merge for {rid}")
+            ok = False
+
+    # Cold-open random-access spot-check — pick the multi-chunk read (read 2)
+    # to stress the signal-block-index lookup on the merged signal table.
+    if not random_access_signal_check(
+        "merge output", merged, READ_IDS[2], SIGNALS[2]
+    ):
+        ok = False
+
+    if ok:
+        print("  PASS: Merge preserves all reads and dedups run_info")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Subset round-trip
+# ---------------------------------------------------------------------------
+def test_subset_round_trip(tmpdir: Path) -> bool:
+    """Write a Python file, split into 2 groups via escpod subset CSV mapping,
+    read each output back with Python and verify ID + signal preservation."""
+    print("\n=== Test 5: Subset round-trip (Python → escpod subset → Python) ===")
+    ok = True
+
+    src = tmpdir / "subset_src.pod5"
+    if not src.exists():
+        write_python_pod5(src)
+
+    # CSV maps reads to two output groups: 3 reads → group_a, 2 reads → group_b.
+    # Use subdir to keep the output area clean from other test artifacts.
+    out_dir = tmpdir / "subset_out"
+    out_dir.mkdir(exist_ok=True)
+    csv_path = tmpdir / "subset_map.csv"
+    group_a_ids = [READ_IDS[0], READ_IDS[2], READ_IDS[4]]
+    group_b_ids = [READ_IDS[1], READ_IDS[3]]
+    with csv_path.open("w") as f:
+        f.write("read_id,output\n")
+        for rid in group_a_ids:
+            f.write(f"{rid},group_a.pod5\n")
+        for rid in group_b_ids:
+            f.write(f"{rid},group_b.pod5\n")
+
+    run_escpod(
+        "subset", str(src),
+        "--csv", str(csv_path),
+        "--output-dir", str(out_dir),
+    )
+
+    expectations = [
+        ("group_a.pod5", group_a_ids),
+        ("group_b.pod5", group_b_ids),
+    ]
+    for fname, expected_ids in expectations:
+        path = out_dir / fname
+        if not path.exists():
+            print(f"  FAIL: subset output {fname} missing")
+            ok = False
+            continue
+        try:
+            got_reads = materialize_reads(path)
+        except Exception as e:
+            print(f"  FAIL: Python pod5 cannot open {fname}: {e}")
+            ok = False
+            continue
+        if set(got_reads.keys()) != set(expected_ids):
+            print(
+                f"  FAIL: {fname} read IDs differ — "
+                f"expected {sorted(map(str, expected_ids))}, "
+                f"got {sorted(map(str, got_reads.keys()))}"
+            )
+            ok = False
+            continue
+        # Signal byte-equality for every read in this group.
+        for rid in expected_ids:
+            canonical_idx = READ_IDS.index(rid)
+            try:
+                np.testing.assert_array_equal(
+                    got_reads[rid].signal, SIGNALS[canonical_idx]
+                )
+            except AssertionError:
+                print(f"  FAIL: {fname} signal mismatch for {rid}")
+                ok = False
+        print(f"  OK: {fname} has {len(got_reads)} reads with matching signals")
+
+    # Cold-open random-access spot-check — fresh open of one group + by-ID
+    # lookup of one read. group_a contains the multi-chunk read (READ_IDS[2]
+    # → 150k samples) so that's the highest-value target.
+    if not random_access_signal_check(
+        "subset group_a", out_dir / "group_a.pod5", READ_IDS[2], SIGNALS[2]
+    ):
+        ok = False
+
+    if ok:
+        print("  PASS: Subset partitions reads correctly with no data loss")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Edge cases
 # ---------------------------------------------------------------------------
 def test_edge_cases(tmpdir: Path) -> bool:
     """Test edge cases: minimal signal, large multi-chunk, empty metadata."""
-    print("\n=== Test 4: Edge cases ===")
+    print("\n=== Test 6: Edge cases ===")
     ok = True
 
     edge_pod5 = tmpdir / "edge_cases.pod5"
@@ -653,8 +891,8 @@ def test_edge_cases(tmpdir: Path) -> bool:
     )
 
     try:
-        reader = pod5.Reader(escpod_edge)
-        reads = {str(r.read_id): r for r in reader.reads()}
+        snapshots = materialize_reads(escpod_edge)
+        reads = {str(rid): snap for rid, snap in snapshots.items()}
     except Exception as e:
         print(f"  FAIL: Python pod5 cannot open escapepod-written edge case file: {e}")
         return False
@@ -681,19 +919,17 @@ def test_edge_cases(tmpdir: Path) -> bool:
         print(f"  FAIL: 200k-sample read not in escpod output")
         ok = False
 
-    reader.close()
-
     if ok:
         print("  PASS: Edge cases handled correctly")
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Existing ONT test files
+# Test 7: Existing ONT test files
 # ---------------------------------------------------------------------------
 def test_existing_files() -> bool:
     """Read existing POD5 files with both Python and escapepod."""
-    print("\n=== Test 5: Existing test files ===")
+    print("\n=== Test 7: Existing test files ===")
     ok = True
 
     test_file = REPO_ROOT / "ext" / "remora" / "tests" / "data" / "can_reads.pod5"
@@ -701,9 +937,9 @@ def test_existing_files() -> bool:
         print(f"  SKIP: {test_file} not found")
         return True
 
-    # Read with Python - keep reader open for signal access
-    reader = pod5.Reader(test_file)
-    py_reads = list(reader.reads())
+    # Drain into snapshots — closes the reader before assertions run.
+    py_snapshots = materialize_reads(test_file)
+    py_reads = list(py_snapshots.values())
     py_count = len(py_reads)
     print(f"  Python pod5: {py_count} reads")
 
@@ -735,7 +971,7 @@ def test_existing_files() -> bool:
     else:
         print(f"  OK: All read IDs match")
 
-    # Spot-check num_samples for first read (signal access requires open reader)
+    # Spot-check num_samples for first read.
     if py_reads:
         first_py = py_reads[0]
         first_id = str(first_py.read_id)
@@ -749,8 +985,6 @@ def test_existing_files() -> bool:
                 ok = False
             else:
                 print(f"  OK: Sample count matches for first read ({py_nsamples})")
-
-    reader.close()
 
     # Also check inspect summary
     result = run_escpod("inspect", "summary", str(test_file))
@@ -786,6 +1020,8 @@ def main():
         results["backward_compat"] = test_python_to_escapepod(tmpdir)
         results["forward_compat"] = test_escapepod_to_python(tmpdir)
         results["round_trip"] = test_round_trip(tmpdir)
+        results["merge_round_trip"] = test_merge_round_trip(tmpdir)
+        results["subset_round_trip"] = test_subset_round_trip(tmpdir)
         results["edge_cases"] = test_edge_cases(tmpdir)
 
     results["existing_files"] = test_existing_files()
