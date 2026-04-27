@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+## 0.5.0 (2026-04-27)
+
+### Added
+
+- `demux fingerprint`: Parquet output when `-o` ends in `.parquet`, plus
+  an `--emit-dwell` flag that adds per-segment dwell-time features.
+- `demux classify` (CLI): `fp_io` module reads fingerprint inputs from
+  both Parquet and CSV (gzipped CSV included); new flags
+  `--gpu-chunk-cells` and `--threads`, with model auto-detection so
+  `--model` accepts any supported format.
+- `escapepod-demux`: `AnyModel` enum and `load_any_model()` for
+  format-agnostic SVM/DTW model loading.
+- `escapepod-signal`: SVM helper CUDA kernels exposed via function
+  handles for downstream GPU pipelines.
+
+### Performance
+
+- `demux classify` (GPU): on-GPU RBF + OvO decision pipeline
+  (`GpuSvmContext`) keeps SVM evaluation on the device; producer/
+  consumer pipeline parallelizes the consumer side and bumps the
+  default chunk to 4G cells with channel depth 2 for better GPU
+  utilization on long runs. Per-chunk indicatif progress bar surfaces
+  throughput.
+- `escapepod-demux`: RBF kernel fast paths for `power == 1.0` and
+  `power == 2.0` skip the generic `powf` call.
+- `escapepod-pod5`: filter and merge hot paths reworked; remaining
+  `reader.reads()` callers now batch-amortize the schema/footer parse,
+  and a `PoreType` newtype removes per-read string churn.
+
+### Fixed
+
+- `train` (multiclass OvO): dropped an unused SMO solve path that ran
+  during training without contributing to the final model.
+
+### Build / Tooling
+
+- Pixi `dev` env wires `mold -run` for fast local links (system gcc
+  11.5, no glibc-static needed); release artifacts in CI continue to
+  build against musl.
+- Docs: benchmark page leads with bulk operations (`merge`, `filter`,
+  `subset`, `repack`); `inspect` and `view` demoted to a secondary
+  section.
+
 ## 0.4.0 (2026-04-22)
 
 ### Performance
