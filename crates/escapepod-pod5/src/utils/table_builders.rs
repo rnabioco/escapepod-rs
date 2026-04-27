@@ -244,15 +244,70 @@ struct PartitionArrays {
     open_pore_level: Float32Array,
 }
 
-/// Build arrays for a single partition of reads.
-fn build_partition(
-    reads: &[(ReadData, Vec<u64>)],
+/// View of one row that's about to be emitted to the output reads
+/// table. Implementations encapsulate the two differences between the
+/// merge path (`(ReadData, Vec<u64>)` — already-remapped) and the
+/// filter path (`FlatReadRef` — borrowed source `ReadData` plus a
+/// prefix-sum signal-row offset and a precomputed run_info dict key).
+/// Everything else (read_id, scalar fields, pore_type / end_reason
+/// dict lookups) is identical and lives in `build_partition_inner`.
+trait PartitionRow {
+    fn read(&self) -> &ReadData;
+    /// Append every signal-row index for this read into the inner
+    /// `UInt64Builder` of the signal `ListBuilder`.
+    fn append_signal_rows(&self, builder: &mut UInt64Builder);
+    /// Dictionary key for the `run_info` column — i.e. this read's
+    /// index in the deduplicated `all_run_infos`.
+    fn run_info_key(&self) -> i16;
+}
+
+impl PartitionRow for (ReadData, Vec<u64>) {
+    fn read(&self) -> &ReadData {
+        &self.0
+    }
+
+    fn append_signal_rows(&self, builder: &mut UInt64Builder) {
+        for &idx in &self.1 {
+            builder.append_value(idx);
+        }
+    }
+
+    fn run_info_key(&self) -> i16 {
+        // Merge's `for_writing` already remapped `run_info_index` to
+        // point at `all_run_infos`, which is exactly the dictionary
+        // index. Saturate on overflow rather than allocating an error
+        // path — i16::MAX (32767) is far past any realistic run-info
+        // count.
+        i16::try_from(self.0.run_info_index).unwrap_or(0)
+    }
+}
+
+impl PartitionRow for crate::utils::pod5_assembler::FlatReadRef<'_> {
+    fn read(&self) -> &ReadData {
+        self.read
+    }
+
+    fn append_signal_rows(&self, builder: &mut UInt64Builder) {
+        let n = self.read.signal_rows.len() as u64;
+        for i in 0..n {
+            builder.append_value(self.new_signal_rows_start + i);
+        }
+    }
+
+    fn run_info_key(&self) -> i16 {
+        self.run_info_key
+    }
+}
+
+/// Build arrays for a single partition of reads. Generic over
+/// `PartitionRow` so the same builder boilerplate covers both the
+/// already-remapped merge input and the borrow-only filter input.
+fn build_partition_inner<R: PartitionRow>(
+    rows: &[R],
     pore_type_map: &HashMap<&str, i16>,
     end_reason_map: &HashMap<&str, i16>,
-    run_info_map: &HashMap<&str, i16>,
-    run_infos: &[RunInfoData],
 ) -> PartitionArrays {
-    let num_reads = reads.len();
+    let num_reads = rows.len();
 
     let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
     let signal_field = Arc::new(arrow::datatypes::Field::new(
@@ -282,14 +337,13 @@ fn build_partition(
     let mut run_info_keys_builder = Int16Builder::with_capacity(num_reads);
     let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
 
-    for (read, signal_rows) in reads {
-        // read_id is infallible for 16-byte slices
+    for row in rows {
+        let read = row.read();
+
+        // read_id append is infallible for 16-byte slices
         let _ = read_id_builder.append_value(read.read_id.as_bytes());
 
-        let values = signal_builder.values();
-        for &idx in signal_rows {
-            values.append_value(idx);
-        }
+        row.append_signal_rows(signal_builder.values());
         signal_builder.append(true);
 
         // V0 fields
@@ -325,138 +379,7 @@ fn build_partition(
             .unwrap_or(0);
         end_reason_keys_builder.append_value(end_key);
         end_reason_forced_builder.append_value(read.end_reason_forced);
-        let run_info_key = run_infos
-            .get(read.run_info_index as usize)
-            .and_then(|ri| run_info_map.get(ri.acquisition_id.as_str()).copied())
-            .unwrap_or(0);
-        run_info_keys_builder.append_value(run_info_key);
-
-        // V4 fields
-        open_pore_level_builder.append_value(read.open_pore_level);
-    }
-
-    PartitionArrays {
-        read_id: read_id_builder.finish(),
-        signal: signal_builder.finish(),
-        read_number: read_number_builder.finish(),
-        start: start_builder.finish(),
-        median_before: median_before_builder.finish(),
-        num_minknow_events: num_minknow_events_builder.finish(),
-        tracked_scaling_scale: tracked_scaling_scale_builder.finish(),
-        tracked_scaling_shift: tracked_scaling_shift_builder.finish(),
-        predicted_scaling_scale: predicted_scaling_scale_builder.finish(),
-        predicted_scaling_shift: predicted_scaling_shift_builder.finish(),
-        num_reads_since_mux_change: num_reads_since_mux_change_builder.finish(),
-        time_since_mux_change: time_since_mux_change_builder.finish(),
-        num_samples: num_samples_builder.finish(),
-        channel: channel_builder.finish(),
-        well: well_builder.finish(),
-        pore_type_keys: pore_type_keys_builder.finish(),
-        calibration_offset: calibration_offset_builder.finish(),
-        calibration_scale: calibration_scale_builder.finish(),
-        end_reason_keys: end_reason_keys_builder.finish(),
-        end_reason_forced: end_reason_forced_builder.finish(),
-        run_info_keys: run_info_keys_builder.finish(),
-        open_pore_level: open_pore_level_builder.finish(),
-    }
-}
-
-/// Build arrays for a single partition of `FlatReadRef`s, applying the
-/// remap (`signal_rows`, `run_info_index`) inline so the caller never
-/// has to materialize a `Vec<ProcessedRead>`. This is the lazy-remap
-/// counterpart to `build_partition`.
-fn build_partition_remapped(
-    flat: &[crate::utils::pod5_assembler::FlatReadRef<'_>],
-    pore_type_map: &HashMap<&str, i16>,
-    end_reason_map: &HashMap<&str, i16>,
-    run_info_remap: &HashMap<String, u32>,
-) -> PartitionArrays {
-    let num_reads = flat.len();
-
-    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
-    let signal_field = Arc::new(arrow::datatypes::Field::new(
-        "item",
-        arrow::datatypes::DataType::UInt64,
-        true,
-    ));
-    let mut signal_builder = ListBuilder::new(UInt64Builder::new()).with_field(signal_field);
-    let mut read_number_builder = UInt32Builder::with_capacity(num_reads);
-    let mut start_builder = UInt64Builder::with_capacity(num_reads);
-    let mut median_before_builder = Float32Builder::with_capacity(num_reads);
-    let mut num_minknow_events_builder = UInt64Builder::with_capacity(num_reads);
-    let mut tracked_scaling_scale_builder = Float32Builder::with_capacity(num_reads);
-    let mut tracked_scaling_shift_builder = Float32Builder::with_capacity(num_reads);
-    let mut predicted_scaling_scale_builder = Float32Builder::with_capacity(num_reads);
-    let mut predicted_scaling_shift_builder = Float32Builder::with_capacity(num_reads);
-    let mut num_reads_since_mux_change_builder = UInt32Builder::with_capacity(num_reads);
-    let mut time_since_mux_change_builder = Float32Builder::with_capacity(num_reads);
-    let mut num_samples_builder = UInt64Builder::with_capacity(num_reads);
-    let mut channel_builder = UInt16Builder::with_capacity(num_reads);
-    let mut well_builder = UInt8Builder::with_capacity(num_reads);
-    let mut pore_type_keys_builder = Int16Builder::with_capacity(num_reads);
-    let mut calibration_offset_builder = Float32Builder::with_capacity(num_reads);
-    let mut calibration_scale_builder = Float32Builder::with_capacity(num_reads);
-    let mut end_reason_keys_builder = Int16Builder::with_capacity(num_reads);
-    let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
-    let mut run_info_keys_builder = Int16Builder::with_capacity(num_reads);
-    let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
-
-    for entry in flat {
-        let read = entry.read;
-        let _ = read_id_builder.append_value(read.read_id.as_bytes());
-
-        // Inline-remap signal rows from the source's signal_rows length
-        // and the per-read prefix-sum offset.
-        let values = signal_builder.values();
-        let n = read.signal_rows.len() as u64;
-        for i in 0..n {
-            values.append_value(entry.new_signal_rows_start + i);
-        }
-        signal_builder.append(true);
-
-        // V0 fields (unchanged from source)
-        read_number_builder.append_value(read.read_number);
-        start_builder.append_value(read.start_sample);
-        median_before_builder.append_value(read.median_before);
-
-        // V1 fields
-        num_minknow_events_builder.append_value(read.num_minknow_events);
-        tracked_scaling_scale_builder.append_value(read.tracked_scaling_scale);
-        tracked_scaling_shift_builder.append_value(read.tracked_scaling_shift);
-        predicted_scaling_scale_builder.append_value(read.predicted_scaling_scale);
-        predicted_scaling_shift_builder.append_value(read.predicted_scaling_shift);
-        num_reads_since_mux_change_builder.append_value(read.num_reads_since_mux_change);
-        time_since_mux_change_builder.append_value(read.time_since_mux_change);
-
-        // V2 fields
-        num_samples_builder.append_value(read.num_samples);
-
-        // V3 fields
-        channel_builder.append_value(read.channel);
-        well_builder.append_value(read.well);
-        let pore_key = pore_type_map
-            .get(read.pore_type.as_str())
-            .copied()
-            .unwrap_or(0);
-        pore_type_keys_builder.append_value(pore_key);
-        calibration_offset_builder.append_value(read.calibration_offset);
-        calibration_scale_builder.append_value(read.calibration_scale);
-        let end_key = end_reason_map
-            .get(read.end_reason.as_str())
-            .copied()
-            .unwrap_or(0);
-        end_reason_keys_builder.append_value(end_key);
-        end_reason_forced_builder.append_value(read.end_reason_forced);
-
-        // Look up the source acquisition_id and remap to its index in
-        // the deduplicated `all_run_infos` (which doubles as the dict
-        // key index for the `run_info` column).
-        let new_run_info_idx = entry
-            .source_run_infos
-            .get(read.run_info_index as usize)
-            .and_then(|ri| run_info_remap.get(&ri.acquisition_id).copied())
-            .unwrap_or(0);
-        run_info_keys_builder.append_value(new_run_info_idx as i16);
+        run_info_keys_builder.append_value(row.run_info_key());
 
         // V4 fields
         open_pore_level_builder.append_value(read.open_pore_level);
@@ -538,18 +461,15 @@ pub(crate) fn build_reads_table(
         .map(|ri| ri.acquisition_id.as_str())
         .collect();
 
-    // Phase 2: Create O(1) lookup maps for dictionary keys
+    // Phase 2: Create O(1) lookup maps for dictionary keys.
+    // (run_info doesn't need a map: each read's `run_info_index` is
+    // already the dict key index — see `PartitionRow::run_info_key`.)
     let pore_type_map: HashMap<&str, i16> = pore_types
         .iter()
         .enumerate()
         .map(|(i, &s)| (s, i as i16))
         .collect();
     let end_reason_map: HashMap<&str, i16> = end_reasons
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (s, i as i16))
-        .collect();
-    let run_info_map: HashMap<&str, i16> = run_info_ids
         .iter()
         .enumerate()
         .map(|(i, &s)| (s, i as i16))
@@ -561,15 +481,7 @@ pub(crate) fn build_reads_table(
 
     let partition_arrays: Vec<PartitionArrays> = reads
         .par_chunks(chunk_size)
-        .map(|chunk| {
-            build_partition(
-                chunk,
-                &pore_type_map,
-                &end_reason_map,
-                &run_info_map,
-                run_infos,
-            )
-        })
+        .map(|chunk| build_partition_inner(chunk, &pore_type_map, &end_reason_map))
         .collect();
 
     // Phase 4: Concatenate partition arrays and create DictionaryArrays
@@ -711,13 +623,12 @@ pub(crate) fn build_reads_table(
 /// design. Within a single record batch, build cost is the same as
 /// `build_reads_table` — same parallel partitioning, same concat.
 ///
-/// `run_info_remap` maps source `acquisition_id` → index in the deduped
-/// `all_run_infos` (which doubles as the dictionary key for the
-/// `run_info` column).
+/// The caller (filter) precomputes each `FlatReadRef::run_info_key` —
+/// the index in the deduplicated `all_run_infos`, which doubles as the
+/// dictionary key for the `run_info` column — when it builds `flat`.
 pub(crate) fn build_reads_table_remapped(
     flat: &[crate::utils::pod5_assembler::FlatReadRef<'_>],
     all_run_infos: &[RunInfoData],
-    run_info_remap: &HashMap<String, u32>,
     meta: &SchemaMetadata,
 ) -> Result<Vec<u8>> {
     let schema = Arc::new(meta.apply(reads_schema()));
@@ -775,9 +686,7 @@ pub(crate) fn build_reads_table_remapped(
 
     let partition_arrays: Vec<PartitionArrays> = flat
         .par_chunks(chunk_size)
-        .map(|chunk| {
-            build_partition_remapped(chunk, &pore_type_map, &end_reason_map, run_info_remap)
-        })
+        .map(|chunk| build_partition_inner(chunk, &pore_type_map, &end_reason_map))
         .collect();
 
     // Concat partition arrays — identical to build_reads_table from here on.

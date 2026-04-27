@@ -339,27 +339,32 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
 
     // Build a flat view of every matching read with the prefix-sum
-    // signal-row offset baked in. Each `FlatReadRef` is just borrowed
-    // pointers (~24 B/entry) — for a 30M-match workload this is ~700 MB
-    // of refs, vs ~6 GB if we materialized cloned `ProcessedRead`s here.
-    // The remap (`run_info_index`, `new_signal_rows`) is applied inline
-    // inside `build_reads_table_remapped` during the parallel partition
-    // build.
+    // signal-row offset and remapped run_info dict key baked in. Each
+    // `FlatReadRef` is borrowed pointers + two scalars (~32 B/entry) —
+    // for a 30M-match workload this is ~960 MB of refs, vs ~6 GB if we
+    // materialized cloned `ProcessedRead`s here. The remap is applied
+    // here once per read; `build_reads_table_remapped` then walks the
+    // flat list during its parallel partition build with no further
+    // remap work per row.
     let mut flat_reads: Vec<FlatReadRef<'_>> = Vec::with_capacity(matching_count as usize);
     let mut signal_row_cursor: u64 = 0;
     for metadata in &file_metadata {
         for read in &metadata.matching_reads {
+            let run_info_key = metadata
+                .run_infos
+                .get(read.run_info_index as usize)
+                .and_then(|ri| run_info_map.get(&ri.acquisition_id).copied())
+                .unwrap_or(0);
             flat_reads.push(FlatReadRef {
                 read,
-                source_run_infos: &metadata.run_infos,
                 new_signal_rows_start: signal_row_cursor,
+                run_info_key: i16::try_from(run_info_key).unwrap_or(0),
             });
             signal_row_cursor += read.signal_rows.len() as u64;
         }
     }
 
-    let reads_table_bytes =
-        build_reads_table_remapped(&flat_reads, &all_run_infos, &run_info_map, &schema_meta)?;
+    let reads_table_bytes = build_reads_table_remapped(&flat_reads, &all_run_infos, &schema_meta)?;
 
     // Free the borrow refs before the (large) reads_table_bytes buffer
     // hits the writer, so peak RSS is dominated by the IPC-encoded form

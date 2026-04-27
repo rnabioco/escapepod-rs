@@ -15,8 +15,9 @@ use std::io::Write;
 /// output reads table. Used by the writers in merge and filter.
 pub(crate) type ProcessedRead = (ReadData, Vec<u64>);
 
-/// A borrowed source read plus the context needed to write it to the
-/// output reads table without first materializing a `ProcessedRead`.
+/// A borrowed source read plus the precomputed bookkeeping needed to
+/// write it to the output reads table without first materializing a
+/// `ProcessedRead`.
 ///
 /// Filter accumulates a `Vec<FlatReadRef>` over its `file_metadata` (one
 /// entry per matching read, in source-file order) and feeds it to
@@ -24,15 +25,18 @@ pub(crate) type ProcessedRead = (ReadData, Vec<u64>);
 /// the parallel partition build. This avoids the ~200 B/read clone of
 /// `for_writing` + `Vec<u64>` that an intermediate `Vec<ProcessedRead>`
 /// would carry.
+///
+/// `run_info_key` is the read's index in the deduplicated `all_run_infos`
+/// (which doubles as the dictionary key for the output `run_info`
+/// column). Computing it once at flat-list build time keeps the
+/// per-row partition builder branch-free.
 pub(crate) struct FlatReadRef<'a> {
     pub read: &'a ReadData,
-    /// Source file's run-info table (read.run_info_index indexes into
-    /// this).
-    pub source_run_infos: &'a [RunInfoData],
     /// Cumulative count of `signal_rows.len()` for every earlier
     /// matching read in source-file order. The new signal_rows for this
     /// read are `start..start + read.signal_rows.len()`.
     pub new_signal_rows_start: u64,
+    pub run_info_key: i16,
 }
 
 /// Up to 7 zero bytes for 8-byte alignment padding.
