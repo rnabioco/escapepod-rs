@@ -68,6 +68,9 @@ Examples:
   escpod merge *.pod5 -o merged.pod5        Merge multiple files
   escpod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
   escpod summary input.pod5                 Comprehensive statistics
+
+Experimental commands (repack, resquiggle, index, demux) are not built by default.
+Rebuild with `--features experimental` and/or `--features demux` to enable them.
 ")]
 struct Cli {
     /// Silence all output except errors. Overrides `--verbose`.
@@ -287,6 +290,7 @@ Examples:
 
     /// Repack POD5 files to optimize storage (rebuild with `--features experimental` to enable)
     #[cfg(not(feature = "experimental"))]
+    #[command(hide = true)]
     Repack {
         /// Repack arguments (ignored; feature not enabled)
         #[arg(
@@ -347,6 +351,7 @@ Examples:
 
     /// Barcode demultiplexing workflow (rebuild with `--features demux` to enable)
     #[cfg(not(feature = "demux"))]
+    #[command(hide = true)]
     Demux {
         /// Demux subcommand and arguments (ignored; feature not enabled)
         #[arg(
@@ -363,6 +368,7 @@ Examples:
 
     /// Refine signal-to-base mapping using banded DP (rebuild with `--features experimental` to enable)
     #[cfg(not(feature = "experimental"))]
+    #[command(hide = true)]
     Resquiggle {
         /// Resquiggle arguments (ignored; feature not enabled)
         #[arg(
@@ -398,6 +404,7 @@ Examples:
 
     /// Build .p5i read index for fast UUID lookup (rebuild with `--features experimental` to enable)
     #[cfg(not(feature = "experimental"))]
+    #[command(hide = true)]
     Index {
         /// Index arguments (ignored; feature not enabled)
         #[arg(
