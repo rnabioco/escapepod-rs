@@ -16,6 +16,31 @@ class Pod5Error(Exception):
 class ReadData:
     """A single read's metadata from a POD5 file."""
 
+    def __init__(
+        self,
+        read_id: str,
+        read_number: int = 0,
+        start_sample: int = 0,
+        channel: int = 0,
+        well: int = 0,
+        pore_type: str = "not_set",
+        calibration_offset: float = 0.0,
+        calibration_scale: float = 1.0,
+        median_before: float = 0.0,
+        end_reason: str = "unknown",
+        end_reason_forced: bool = False,
+        run_info_index: int = 0,
+        num_minknow_events: int = 0,
+        tracked_scaling_scale: float = 1.0,
+        tracked_scaling_shift: float = 0.0,
+        predicted_scaling_scale: float = 1.0,
+        predicted_scaling_shift: float = 0.0,
+        num_reads_since_mux_change: int = 0,
+        time_since_mux_change: float = 0.0,
+        num_samples: int = 0,
+        open_pore_level: float = 0.0,
+        signal_rows: Optional[list[int]] = None,
+    ) -> None: ...
     @property
     def read_id(self) -> str: ...
     @property
@@ -67,6 +92,29 @@ class ReadData:
 class RunInfo:
     """Run information metadata from a POD5 file."""
 
+    def __init__(
+        self,
+        acquisition_id: str,
+        acquisition_start_time: int = 0,
+        adc_max: int = 2047,
+        adc_min: int = -2048,
+        experiment_name: str = "",
+        flow_cell_id: str = "",
+        flow_cell_product_code: str = "",
+        protocol_name: str = "",
+        protocol_run_id: str = "",
+        protocol_start_time: int = 0,
+        sample_id: str = "",
+        sample_rate: int = 4000,
+        sequencing_kit: str = "",
+        sequencer_position: str = "",
+        sequencer_position_type: str = "",
+        software: str = "",
+        system_name: str = "",
+        system_type: str = "",
+        context_tags: Optional[dict[str, str]] = None,
+        tracking_id: Optional[dict[str, str]] = None,
+    ) -> None: ...
     @property
     def acquisition_id(self) -> str: ...
     @property
@@ -195,6 +243,13 @@ class Writer:
         num_minknow_events: int,
         signal: npt.NDArray[np.int16],
         num_samples: Optional[int] = None,
+        tracked_scaling_scale: float = 1.0,
+        tracked_scaling_shift: float = 0.0,
+        predicted_scaling_scale: float = 1.0,
+        predicted_scaling_shift: float = 0.0,
+        num_reads_since_mux_change: int = 0,
+        time_since_mux_change: float = 0.0,
+        open_pore_level: float = 0.0,
     ) -> None: ...
     def add_read_data(
         self, read: ReadData, signal: npt.NDArray[np.int16]

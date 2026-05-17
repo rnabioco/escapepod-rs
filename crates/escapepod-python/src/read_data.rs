@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
+use crate::error::to_py_err;
+use crate::writer::parse_end_reason;
+
 /// A single read's metadata from a POD5 file.
 #[pyclass(name = "ReadData", frozen)]
 pub struct PyReadData {
@@ -10,6 +13,95 @@ pub struct PyReadData {
 
 #[pymethods]
 impl PyReadData {
+    /// Construct a ReadData from scratch.
+    ///
+    /// All fields except `read_id` have defaults matching the underlying
+    /// `ReadData::default()`. Use this to build reads for `Writer.add_read_data`
+    /// without going through the 15+ kwargs of `Writer.add_read`.
+    ///
+    /// `signal_rows` is informational — when passing the result to
+    /// `Writer.add_read_data`, the writer assigns its own signal rows.
+    #[new]
+    #[pyo3(signature = (
+        read_id,
+        read_number = 0,
+        start_sample = 0,
+        channel = 0,
+        well = 0,
+        pore_type = "not_set",
+        calibration_offset = 0.0,
+        calibration_scale = 1.0,
+        median_before = 0.0,
+        end_reason = "unknown",
+        end_reason_forced = false,
+        run_info_index = 0,
+        num_minknow_events = 0,
+        tracked_scaling_scale = 1.0,
+        tracked_scaling_shift = 0.0,
+        predicted_scaling_scale = 1.0,
+        predicted_scaling_shift = 0.0,
+        num_reads_since_mux_change = 0,
+        time_since_mux_change = 0.0,
+        num_samples = 0,
+        open_pore_level = 0.0,
+        signal_rows = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        read_id: &str,
+        read_number: u32,
+        start_sample: u64,
+        channel: u16,
+        well: u8,
+        pore_type: &str,
+        calibration_offset: f32,
+        calibration_scale: f32,
+        median_before: f32,
+        end_reason: &str,
+        end_reason_forced: bool,
+        run_info_index: u32,
+        num_minknow_events: u64,
+        tracked_scaling_scale: f32,
+        tracked_scaling_shift: f32,
+        predicted_scaling_scale: f32,
+        predicted_scaling_shift: f32,
+        num_reads_since_mux_change: u32,
+        time_since_mux_change: f32,
+        num_samples: u64,
+        open_pore_level: f32,
+        signal_rows: Option<Vec<u64>>,
+    ) -> PyResult<Self> {
+        let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
+            .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
+        let end_reason = parse_end_reason(end_reason)?;
+        Ok(Self {
+            inner: escapepod_signal::ReadData {
+                read_id: uuid,
+                read_number,
+                start_sample,
+                channel,
+                well,
+                pore_type: pore_type.into(),
+                calibration_offset,
+                calibration_scale,
+                median_before,
+                end_reason,
+                end_reason_forced,
+                run_info_index,
+                num_minknow_events,
+                tracked_scaling_scale,
+                tracked_scaling_shift,
+                predicted_scaling_scale,
+                predicted_scaling_shift,
+                num_reads_since_mux_change,
+                time_since_mux_change,
+                num_samples,
+                open_pore_level,
+                signal_rows: signal_rows.unwrap_or_default(),
+            },
+        })
+    }
+
     #[getter]
     fn read_id(&self) -> String {
         self.inner.read_id.to_string()
@@ -144,6 +236,82 @@ pub struct PyRunInfo {
 
 #[pymethods]
 impl PyRunInfo {
+    /// Construct a RunInfo from scratch.
+    ///
+    /// Equivalent to `escapepod.create_run_info(...)` — both are kept so
+    /// existing call sites continue to work.
+    #[new]
+    #[pyo3(signature = (
+        acquisition_id,
+        acquisition_start_time = 0,
+        adc_max = 2047,
+        adc_min = -2048,
+        experiment_name = "",
+        flow_cell_id = "",
+        flow_cell_product_code = "",
+        protocol_name = "",
+        protocol_run_id = "",
+        protocol_start_time = 0,
+        sample_id = "",
+        sample_rate = 4000,
+        sequencing_kit = "",
+        sequencer_position = "",
+        sequencer_position_type = "",
+        software = "",
+        system_name = "",
+        system_type = "",
+        context_tags = None,
+        tracking_id = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        acquisition_id: &str,
+        acquisition_start_time: i64,
+        adc_max: i16,
+        adc_min: i16,
+        experiment_name: &str,
+        flow_cell_id: &str,
+        flow_cell_product_code: &str,
+        protocol_name: &str,
+        protocol_run_id: &str,
+        protocol_start_time: i64,
+        sample_id: &str,
+        sample_rate: u16,
+        sequencing_kit: &str,
+        sequencer_position: &str,
+        sequencer_position_type: &str,
+        software: &str,
+        system_name: &str,
+        system_type: &str,
+        context_tags: Option<HashMap<String, String>>,
+        tracking_id: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            inner: escapepod_signal::RunInfoData {
+                acquisition_id: acquisition_id.to_string(),
+                acquisition_start_time,
+                adc_max,
+                adc_min,
+                experiment_name: experiment_name.to_string(),
+                flow_cell_id: flow_cell_id.to_string(),
+                flow_cell_product_code: flow_cell_product_code.to_string(),
+                protocol_name: protocol_name.to_string(),
+                protocol_run_id: protocol_run_id.to_string(),
+                protocol_start_time,
+                sample_id: sample_id.to_string(),
+                sample_rate,
+                sequencing_kit: sequencing_kit.to_string(),
+                sequencer_position: sequencer_position.to_string(),
+                sequencer_position_type: sequencer_position_type.to_string(),
+                software: software.to_string(),
+                system_name: system_name.to_string(),
+                system_type: system_type.to_string(),
+                context_tags: context_tags.unwrap_or_default(),
+                tracking_id: tracking_id.unwrap_or_default(),
+            },
+        }
+    }
+
     #[getter]
     fn acquisition_id(&self) -> &str {
         &self.inner.acquisition_id

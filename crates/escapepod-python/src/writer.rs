@@ -119,6 +119,16 @@ impl PyWriter {
     ///     Raw ADC signal data.
     /// num_samples : int, optional
     ///     Number of samples (default: len(signal)).
+    /// tracked_scaling_scale, tracked_scaling_shift : float, optional
+    ///     Tracked scaling parameters (defaults: 1.0, 0.0).
+    /// predicted_scaling_scale, predicted_scaling_shift : float, optional
+    ///     Predicted scaling parameters (defaults: 1.0, 0.0).
+    /// num_reads_since_mux_change : int, optional
+    ///     Reads since last mux change (default: 0).
+    /// time_since_mux_change : float, optional
+    ///     Seconds since last mux change (default: 0.0).
+    /// open_pore_level : float, optional
+    ///     Estimated open pore current (default: 0.0).
     #[pyo3(signature = (
         read_id,
         read_number,
@@ -135,6 +145,13 @@ impl PyWriter {
         num_minknow_events,
         signal,
         num_samples=None,
+        tracked_scaling_scale=1.0,
+        tracked_scaling_shift=0.0,
+        predicted_scaling_scale=1.0,
+        predicted_scaling_shift=0.0,
+        num_reads_since_mux_change=0,
+        time_since_mux_change=0.0,
+        open_pore_level=0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_read(
@@ -154,6 +171,13 @@ impl PyWriter {
         num_minknow_events: u64,
         signal: &Bound<'_, PyArray1<i16>>,
         num_samples: Option<u64>,
+        tracked_scaling_scale: f32,
+        tracked_scaling_shift: f32,
+        predicted_scaling_scale: f32,
+        predicted_scaling_shift: f32,
+        num_reads_since_mux_change: u32,
+        time_since_mux_change: f32,
+        open_pore_level: f32,
     ) -> PyResult<()> {
         let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
             .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
@@ -177,14 +201,14 @@ impl PyWriter {
             end_reason_forced,
             run_info_index,
             num_minknow_events,
-            tracked_scaling_scale: 1.0,
-            tracked_scaling_shift: 0.0,
-            predicted_scaling_scale: 1.0,
-            predicted_scaling_shift: 0.0,
-            num_reads_since_mux_change: 0,
-            time_since_mux_change: 0.0,
+            tracked_scaling_scale,
+            tracked_scaling_shift,
+            predicted_scaling_scale,
+            predicted_scaling_shift,
+            num_reads_since_mux_change,
+            time_since_mux_change,
             num_samples: sample_count,
-            open_pore_level: 0.0,
+            open_pore_level,
             signal_rows: Vec::new(), // Writer populates this
         };
 
@@ -239,13 +263,54 @@ impl PyWriter {
     }
 }
 
+/// Best-effort finalize on garbage collection.
+///
+/// Writer holds an open file handle but its footer is only written by
+/// `finish()` (called from `close()` / `__exit__`). If the user forgets
+/// the context manager and the wrapper is GC'd, drop the inner Writer
+/// through `finish()` so the file ends up readable, and emit a
+/// `ResourceWarning` so the omission is at least visible.
+///
+/// `finish()` runs before we touch Python so the file is finalized even
+/// if interpreter shutdown is racing us; the warning is best-effort.
+impl Drop for PyWriter {
+    fn drop(&mut self) {
+        let Some(writer) = self.inner.take() else {
+            return;
+        };
+        let finish_result = writer.finish();
+
+        // Don't attach during interpreter shutdown — Py_IsInitialized() is
+        // false then and Python::attach would deadlock or panic.
+        if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+            return;
+        }
+
+        Python::attach(|py| {
+            let msg = if finish_result.is_ok() {
+                c"escapepod.Writer was not explicitly closed; finalized on garbage collection. Use a `with` block or call .close()."
+            } else {
+                c"escapepod.Writer was not explicitly closed and finalization failed; output file may be corrupt."
+            };
+            if let Err(e) = PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyResourceWarning>(),
+                msg,
+                1,
+            ) {
+                e.write_unraisable(py, None);
+            }
+        });
+    }
+}
+
 /// Parse an end-reason string and reject unknown values.
 ///
 /// `EndReason::from_str` is infallible and silently maps unknowns to
 /// `Unknown`, which would let callers write misspelled metadata without
 /// noticing. Here we validate against the known set and raise a
 /// `ValueError` for anything else.
-fn parse_end_reason(s: &str) -> PyResult<escapepod_signal::EndReason> {
+pub(crate) fn parse_end_reason(s: &str) -> PyResult<escapepod_signal::EndReason> {
     const VALID: &[&str] = &[
         "unknown",
         "mux_change",
