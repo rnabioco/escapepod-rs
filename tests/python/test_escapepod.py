@@ -376,6 +376,144 @@ class TestWriter:
             path.unlink(missing_ok=True)
 
 
+class TestRunInfoConstructor:
+    def test_minimal(self):
+        ri = escapepod.RunInfo("test-acq")
+        assert ri.acquisition_id == "test-acq"
+        assert ri.sample_rate == 4000
+
+    def test_kwargs(self):
+        ri = escapepod.RunInfo("acq-1", sample_rate=5000, flow_cell_id="FC")
+        assert ri.sample_rate == 5000
+        assert ri.flow_cell_id == "FC"
+
+    def test_usable_as_writer_input(self):
+        ri = escapepod.RunInfo("acq-1", sample_rate=4000)
+        with tempfile.NamedTemporaryFile(suffix=".pod5", delete=False) as f:
+            path = f.name
+        try:
+            with escapepod.Writer(path) as w:
+                idx = w.add_run_info(ri)
+                assert idx == 0
+            with escapepod.Reader(path) as r:
+                assert r.run_infos[0].acquisition_id == "acq-1"
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+
+class TestReadDataConstructor:
+    def test_minimal(self):
+        rd = escapepod.ReadData("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        assert rd.read_id == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        assert rd.read_number == 0
+        assert rd.calibration_scale == 1.0
+        assert rd.end_reason == "unknown"
+
+    def test_full_kwargs_round_trip(self):
+        """All ReadData fields should survive a write/read cycle via the constructor."""
+        with tempfile.NamedTemporaryFile(suffix=".pod5", delete=False) as f:
+            path = f.name
+        try:
+            ri = escapepod.RunInfo("acq-1")
+            rd = escapepod.ReadData(
+                "11111111-2222-3333-4444-555555555555",
+                read_number=7,
+                channel=42,
+                well=2,
+                pore_type="not_set",
+                calibration_offset=10.0,
+                calibration_scale=0.5,
+                median_before=199.5,
+                end_reason="signal_positive",
+                end_reason_forced=True,
+                num_minknow_events=88,
+                tracked_scaling_scale=1.25,
+                tracked_scaling_shift=-3.5,
+                predicted_scaling_scale=1.1,
+                predicted_scaling_shift=0.25,
+                num_reads_since_mux_change=12,
+                time_since_mux_change=4.2,
+                open_pore_level=180.0,
+            )
+            sig = np.arange(500, dtype=np.int16)
+            with escapepod.Writer(path) as w:
+                w.add_run_info(ri)
+                w.add_read_data(rd, sig)
+            with escapepod.Reader(path) as r:
+                out = r.reads()[0]
+                assert out.read_number == 7
+                assert out.channel == 42
+                assert out.well == 2
+                assert out.end_reason == "signal_positive"
+                assert out.end_reason_forced is True
+                assert out.num_minknow_events == 88
+                assert out.tracked_scaling_scale == pytest.approx(1.25)
+                assert out.tracked_scaling_shift == pytest.approx(-3.5)
+                assert out.predicted_scaling_scale == pytest.approx(1.1)
+                assert out.predicted_scaling_shift == pytest.approx(0.25)
+                assert out.num_reads_since_mux_change == 12
+                assert out.time_since_mux_change == pytest.approx(4.2)
+                assert out.open_pore_level == pytest.approx(180.0)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_invalid_uuid(self):
+        with pytest.raises(ValueError, match="Invalid UUID"):
+            escapepod.ReadData("not-a-uuid")
+
+    def test_invalid_end_reason(self):
+        with pytest.raises(ValueError, match="Invalid end_reason"):
+            escapepod.ReadData(
+                "11111111-2222-3333-4444-555555555555",
+                end_reason="bogus",
+            )
+
+
+class TestWriterDropWarning:
+    def test_unclosed_writer_emits_resource_warning(self):
+        """Forgetting to close should not corrupt the file; it should warn.
+
+        Writes one read before dropping so the readback path is meaningful
+        (a truly empty POD5 has no reads table and can't be reopened).
+        """
+        import gc
+
+        with tempfile.NamedTemporaryFile(suffix=".pod5", delete=False) as f:
+            path = f.name
+        try:
+            read_id = "11111111-2222-3333-4444-555555555555"
+            sig = np.arange(100, dtype=np.int16)
+
+            with pytest.warns(ResourceWarning, match="not explicitly closed"):
+                w = escapepod.Writer(path)
+                ri_idx = w.add_run_info(escapepod.RunInfo("drop-acq"))
+                w.add_read(
+                    read_id=read_id,
+                    read_number=1,
+                    start_sample=0,
+                    channel=1,
+                    well=1,
+                    pore_type="not_set",
+                    calibration_offset=0.0,
+                    calibration_scale=1.0,
+                    median_before=200.0,
+                    end_reason="signal_positive",
+                    end_reason_forced=False,
+                    run_info_index=ri_idx,
+                    num_minknow_events=0,
+                    signal=sig,
+                )
+                del w
+                gc.collect()
+
+            # Best-effort finalize in Drop should have written a valid file.
+            with escapepod.Reader(path) as r:
+                assert r.read_count == 1
+                assert r.reads()[0].read_id == read_id
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+
 class TestCreateRunInfo:
     def test_minimal(self):
         ri = escapepod.create_run_info("test-acq")
