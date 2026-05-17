@@ -471,19 +471,45 @@ class TestReadDataConstructor:
 
 class TestWriterDropWarning:
     def test_unclosed_writer_emits_resource_warning(self):
-        """Forgetting to close should not corrupt the file; it should warn."""
+        """Forgetting to close should not corrupt the file; it should warn.
+
+        Writes one read before dropping so the readback path is meaningful
+        (a truly empty POD5 has no reads table and can't be reopened).
+        """
         import gc
 
         with tempfile.NamedTemporaryFile(suffix=".pod5", delete=False) as f:
             path = f.name
         try:
+            read_id = "11111111-2222-3333-4444-555555555555"
+            sig = np.arange(100, dtype=np.int16)
+
             with pytest.warns(ResourceWarning, match="not explicitly closed"):
                 w = escapepod.Writer(path)
+                ri_idx = w.add_run_info(escapepod.RunInfo("drop-acq"))
+                w.add_read(
+                    read_id=read_id,
+                    read_number=1,
+                    start_sample=0,
+                    channel=1,
+                    well=1,
+                    pore_type="not_set",
+                    calibration_offset=0.0,
+                    calibration_scale=1.0,
+                    median_before=200.0,
+                    end_reason="signal_positive",
+                    end_reason_forced=False,
+                    run_info_index=ri_idx,
+                    num_minknow_events=0,
+                    signal=sig,
+                )
                 del w
                 gc.collect()
-            # File should still be readable — best-effort finalize ran on drop.
+
+            # Best-effort finalize in Drop should have written a valid file.
             with escapepod.Reader(path) as r:
-                assert r.read_count == 0
+                assert r.read_count == 1
+                assert r.reads()[0].read_id == read_id
         finally:
             Path(path).unlink(missing_ok=True)
 
