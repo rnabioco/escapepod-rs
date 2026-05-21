@@ -1,7 +1,15 @@
-//! Windowed t-test segmentation for nanopore signal processing.
+//! Windowed t-statistic changepoint detection for one-dimensional signals.
 //!
-//! This module implements a sliding window t-test approach to find changepoints
-//! in nanopore signals. It's based on the Tombo algorithm used in WarpDemuX.
+//! Slides two adjacent equal-width windows along the input and computes a
+//! Welch-like statistic `|m1 - m2| / sqrt(var1 + var2)` at each position. Peaks
+//! in the score series mark candidate changepoints. The approach is the
+//! classical mean-shift CUSUM/changepoint formulation (Page 1954; Hinkley
+//! 1971) and is a workhorse for nanopore event-level segmentation.
+//!
+//! The statistic here drops the degrees-of-freedom normalization, so it is
+//! monotone-equivalent to a true t-score but is not on the t-distribution.
+//! That's fine for ranking candidate boundaries against one another, which
+//! is all the downstream code needs.
 
 /// Compute t-scores for all candidate changepoint positions using a sliding window.
 ///
@@ -129,18 +137,17 @@ pub fn find_changepoints(
         return Vec::new();
     }
 
-    // Step 1: Find local maxima with scipy.signal.find_peaks semantics —
-    // strict `>` on both sides, with plateaus collapsed to a single peak at
-    // the midpoint. (The older `>=` + `t_scores[i] > 0` filter produced
-    // different peak sets than WarpDemuX on real data — see
-    // benchmarks/README.md.)
-    let peaks = local_maxima_scipy(&t_scores);
+    // Step 1: Find local maxima with strict-greater semantics on both sides,
+    // collapsing plateaus to a single peak at the midpoint. A non-strict
+    // (`>=`) variant accepts adjacent equal values as separate peaks, which
+    // produces spurious clusters on plateaus in real signal.
+    let peaks = local_maxima_strict(&t_scores);
 
     // Step 2: Greedy top-N selection by score with a `< min_separation`
-    // distance constraint — functionally identical to scipy's
-    // `_select_by_peak_distance` followed by a top-N by score, since the
-    // latter picks greedily from highest priority down and kills in-range
-    // neighbors each round.
+    // pairwise-distance constraint. Picking from highest score down and
+    // killing in-range neighbours at each step is the standard way to combine
+    // "top-N peaks" with "no two peaks closer than k samples"; it is
+    // equivalent to a non-maximum-suppression pass over the peak list.
     let mut peak_order: Vec<usize> = (0..peaks.len()).collect();
     peak_order.sort_unstable_by(|&a, &b| t_scores[peaks[b]].total_cmp(&t_scores[peaks[a]]));
 
@@ -173,8 +180,11 @@ pub fn find_changepoints(
         }
 
         kept[idx] = true;
-        // Shift to the window boundary — WarpDemuX's
-        // `valid_cpts = peaks[...] + running_stat_width` convention.
+        // Map back from candidate-space to signal-space. By construction,
+        // candidate index `pos` corresponds to the score computed from the
+        // two adjacent windows `[pos, pos+w)` and `[pos+w, pos+2w)`, so the
+        // changepoint they delimit sits at the boundary between them at
+        // signal-space position `pos + w`.
         changepoints.push(pos + window_width);
     }
 
@@ -182,12 +192,15 @@ pub fn find_changepoints(
     changepoints
 }
 
-/// 1-D local maxima with `scipy.signal._local_maxima_1d` semantics:
-/// returns indices of peaks where `x[i-1] < x[i]` and `x[i] > x[j]` for the
-/// first index `j > i` with a different value. Plateaus (runs of equal
-/// values bounded by strictly-lower neighbours) collapse to a single peak
-/// at the midpoint. Returns positions in ascending order.
-fn local_maxima_scipy(x: &[f64]) -> Vec<usize> {
+/// 1-D local maxima with strict-greater semantics on both sides.
+///
+/// Returns indices `i` where `x[i-1] < x[i]` and `x[i] > x[j]` for the
+/// first `j > i` whose value differs from `x[i]`. Plateaus (runs of equal
+/// values bounded by strictly lower neighbours) collapse to a single peak
+/// at the (left-biased) midpoint of the plateau. Indices are returned in
+/// ascending order. The boundary samples `x[0]` and `x[n-1]` are never
+/// reported as peaks.
+fn local_maxima_strict(x: &[f64]) -> Vec<usize> {
     let n = x.len();
     if n < 3 {
         return Vec::new();

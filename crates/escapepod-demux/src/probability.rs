@@ -1,80 +1,87 @@
-//! Probability processing utilities for barcode classification.
+//! Probability post-processing for multiclass SVM classifiers: numerically
+//! stable softmax, margin-based confidence, and per-class threshold gating.
 //!
-//! This module provides functions for processing raw model outputs into
-//! probability distributions and confidence scores, compatible with WarpDemuX.
+//! These are standard building blocks for probabilistic classifiers — none of
+//! this module is specific to any particular upstream tool. The margin score
+//! is the classical top-1-minus-top-2 quantity used in margin-based active
+//! learning (Scheffer, Decomain & Wrobel, 2001; see also Schapire & Singer
+//! 1999 on margins for confidence-rated predictions). The threshold-gated
+//! argmax head is the textbook decision rule for a Platt-scaled SVM.
 
 use std::collections::HashMap;
 
-/// Result of processing probabilities for a single sample.
+/// Outcome of running [`process_probabilities`] on one sample.
 #[derive(Debug, Clone)]
 pub struct ProbabilityResult {
-    /// Predicted barcode ID (-1 for unclassified)
+    /// Predicted barcode ID after threshold gating. `-1` means the
+    /// prediction was rejected (low confidence) or no mapping exists.
     pub predicted_barcode: i32,
 
-    /// Confidence score (margin between top 2 probabilities)
+    /// Margin between the top-1 and top-2 probabilities, in `[0.0, 1.0]`.
     pub confidence: f64,
 
-    /// Index of the predicted class in the probability vector
+    /// Index of the argmax class in the input probability vector. Always
+    /// populated, even when the prediction is rejected.
     pub predicted_index: usize,
 
-    /// Whether the prediction passed the confidence threshold
+    /// `true` iff `confidence` was at or above the gating threshold for
+    /// the predicted class.
     pub is_confident: bool,
 }
 
-/// Apply softmax to convert raw scores to probabilities.
-///
-/// Uses the stable softmax algorithm: subtract max before exp to prevent overflow.
+/// Numerically stable softmax: subtracts the maximum input before
+/// exponentiating to avoid overflow. Returns a uniform distribution as a
+/// graceful fallback if every input is `-inf` (sum underflows to 0).
 ///
 /// # Arguments
 ///
-/// * `scores` - Raw decision function scores
+/// * `scores` - Raw decision-function outputs (any real range).
 ///
 /// # Returns
 ///
-/// Probability distribution that sums to 1.0
+/// A vector that sums to `1.0`, or an empty vector if the input was empty.
 pub fn softmax(scores: &[f64]) -> Vec<f64> {
     if scores.is_empty() {
         return vec![];
     }
 
-    // Find max for numerical stability
     let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
-    // Compute exp(score - max) for each score
     let exp_scores: Vec<f64> = scores.iter().map(|&s| (s - max_score).exp()).collect();
 
-    // Normalize
     let sum: f64 = exp_scores.iter().sum();
     if sum > 0.0 {
         exp_scores.iter().map(|&e| e / sum).collect()
     } else {
-        // Fallback: uniform distribution
         let n = scores.len() as f64;
         vec![1.0 / n; scores.len()]
     }
 }
 
-/// Compute confidence margin between top 2 probabilities.
+/// Margin between the top-1 and top-2 probabilities — `p[best] - p[second]`.
 ///
-/// This matches WarpDemuX's `confidence_margin` function:
-/// confidence = P(top_class) - P(second_class)
+/// Standard uncertainty score in margin-based active learning. Larger values
+/// mean the classifier is committing more strongly to a single class; values
+/// near `0.0` indicate the top two classes are tied. Single-class input
+/// returns `1.0`; empty input returns `0.0`.
 ///
-/// Higher confidence means the model is more certain about its prediction.
+/// Two linear passes (one to find best, one tracking second) — `O(n)`, no
+/// allocation, faster than sorting for the common case where there are only
+/// a handful of classes.
 ///
 /// # Arguments
 ///
-/// * `probs` - Probability distribution over classes
+/// * `probs` - Class probabilities (need not sum to 1 — only the relative
+///   ordering of the two largest entries matters).
 ///
 /// # Returns
 ///
-/// Confidence margin in [0, 1]
+/// `p[best] - p[second]`, clamped to `[0.0, 1.0]` for well-formed inputs.
 pub fn confidence_margin(probs: &[f64]) -> f64 {
     if probs.len() < 2 {
         return if probs.is_empty() { 0.0 } else { 1.0 };
     }
 
-    // Find top two probabilities. We only need the top two, so a full sort
-    // is overkill — two max-passes are O(n) vs O(n log n).
     let (mut best, mut second) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
     for &p in probs {
         if p > best {
@@ -87,22 +94,28 @@ pub fn confidence_margin(probs: &[f64]) -> f64 {
     best - second
 }
 
-/// Process probabilities to predictions and confidence scores.
+/// Classify one sample given a class-probability vector: argmax to pick a
+/// class, map to the caller's external label space, score with the top-1
+/// vs. top-2 margin, and gate on a per-class threshold.
 ///
-/// This matches WarpDemuX's `process_probs` function:
-/// 1. Find argmax for prediction
-/// 2. Compute confidence as margin between top 2 probabilities
-/// 3. Apply per-class thresholds to filter low-confidence predictions
+/// This is the textbook decision rule for a probabilistic multiclass
+/// classifier with a reject option: classes whose margin falls below their
+/// individual threshold are returned as `-1` (rejected) instead of the
+/// argmax label.
 ///
 /// # Arguments
 ///
-/// * `probs` - Probability distribution over classes
-/// * `label_mapper` - Maps class index to barcode ID
-/// * `thresholds` - Optional per-class confidence thresholds
+/// * `probs` - Class probability vector (one entry per training class).
+/// * `label_mapper` - Maps internal class index → external barcode ID. An
+///   index missing from the map maps to `-1`.
+/// * `thresholds` - Optional per-class margin thresholds, indexed the same
+///   way as `probs`. If `None`, no rejection is applied.
 ///
 /// # Returns
 ///
-/// `ProbabilityResult` with prediction and confidence
+/// A [`ProbabilityResult`] describing the decision. `predicted_index` is
+/// always the argmax position even when rejected, so callers can recover
+/// the most likely class if they want to override the gate.
 pub fn process_probabilities(
     probs: &[f64],
     label_mapper: &HashMap<usize, i32>,
@@ -117,20 +130,16 @@ pub fn process_probabilities(
         };
     }
 
-    // Find argmax
     let (pred_idx, _max_prob) = probs
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap();
 
-    // Map to barcode ID
     let barcode_id = label_mapper.get(&pred_idx).copied().unwrap_or(-1);
 
-    // Compute confidence margin
     let confidence = confidence_margin(probs);
 
-    // Apply threshold if provided
     let is_confident = if let Some(thresh) = thresholds {
         let threshold = thresh.get(pred_idx).copied().unwrap_or(0.0);
         confidence >= threshold
@@ -148,18 +157,23 @@ pub fn process_probabilities(
     }
 }
 
-/// Convert probability vector to formatted output columns.
+/// Lay out per-class probabilities as `(column_name, value)` pairs for CSV
+/// output, with column names of the form `p<NN>` where `NN` is the
+/// zero-padded external barcode ID. Two-digit padding is for stable column
+/// ordering when sorted lexically (`p00 … p99`).
 ///
-/// Creates column names like "p00", "p01", ..., "p12" matching WarpDemuX output.
+/// This is a serialization helper — it produces no decisions and consumes
+/// no decisions; it just names columns.
 ///
 /// # Arguments
 ///
-/// * `probs` - Probability distribution
-/// * `label_mapper` - Maps class index to barcode ID
+/// * `probs` - Class probability vector.
+/// * `label_mapper` - Maps internal class index → external barcode ID.
+///   Indices missing from the map fall back to the index itself.
 ///
 /// # Returns
 ///
-/// Vector of (column_name, probability) pairs
+/// One `(name, probability)` pair per input entry, in the input's order.
 pub fn format_probability_columns(
     probs: &[f64],
     label_mapper: &HashMap<usize, i32>,
@@ -183,18 +197,15 @@ mod tests {
         let scores = vec![1.0, 2.0, 3.0];
         let probs = softmax(&scores);
 
-        // Should sum to 1
         let sum: f64 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-10);
 
-        // Higher score = higher probability
         assert!(probs[2] > probs[1]);
         assert!(probs[1] > probs[0]);
     }
 
     #[test]
     fn test_softmax_stability() {
-        // Large values that could overflow without stability fix
         let scores = vec![1000.0, 1001.0, 1002.0];
         let probs = softmax(&scores);
 
@@ -253,13 +264,12 @@ mod tests {
         label_mapper.insert(1, 5);
         label_mapper.insert(2, 6);
 
-        // Threshold is higher than confidence (0.05)
         let thresholds = vec![0.1, 0.1, 0.1];
         let result = process_probabilities(&probs, &label_mapper, Some(&thresholds));
 
-        assert_eq!(result.predicted_barcode, -1); // Unclassified
+        assert_eq!(result.predicted_barcode, -1);
         assert!(!result.is_confident);
-        assert_eq!(result.predicted_index, 0); // Still tracks the argmax
+        assert_eq!(result.predicted_index, 0);
     }
 
     #[test]
