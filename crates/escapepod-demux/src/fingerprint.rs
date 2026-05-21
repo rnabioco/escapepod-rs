@@ -96,10 +96,14 @@ impl BarcodeFingerprint {
 ///
 /// Returns `None` if the region is too small or segmentation fails.
 ///
-/// When `keep_last` is set (WarpDemuX-compat mode), normalization is applied
-/// to ALL segment means before truncation, matching WarpDemuX's behavior where
-/// z-score is computed over all 110 events then the last 25 are retained.
-/// In this mode, the signal is NOT pre-normalized (WarpDemuX segments raw pA values).
+/// Two pipeline variants are selected by `keep_last`:
+/// * `None` — segment the (MAD-normalized) adapter signal directly and
+///   normalize the resulting feature vector once.
+/// * `Some(n)` — segment the clipped (but not pre-normalized) signal,
+///   normalize the full segment-mean population, then keep the last `n`
+///   features. Normalizing over the full population before truncation makes
+///   the z-score stable against the choice of `n`; truncating first would
+///   leave the statistics at the mercy of the small retained tail.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_fingerprint_from_signal(
     signal: &[i16],
@@ -113,16 +117,18 @@ pub fn extract_fingerprint_from_signal(
     keep_last: Option<usize>,
     emit_dwell: bool,
 ) -> Option<ReadFingerprint> {
-    // In WarpDemuX-compat mode, extend the adapter region by
-    // `sig_extract.padding = 100` samples on each side before clipping and
-    // segmenting (matches `extract_adapter` in WarpDemuX's `sig_proc.py`).
-    // This is load-bearing — changes to this offset shift every changepoint
-    // and the final 25 segment means retained for the fingerprint.
+    // When the caller selects the "keep last N" pipeline, widen the slice
+    // by a small fixed buffer on each side. Adapter-boundary detectors are
+    // approximate (LLR / CNN both report positions accurate to within a few
+    // tens of samples), and segmentation benefits from a little context on
+    // either side of the nominal boundary so changepoints near the edges
+    // aren't clamped. The buffer is a fixed sample count rather than a
+    // fraction so it remains meaningful regardless of adapter length.
     let (slice_start, slice_end) = if keep_last.is_some() {
-        const WARPDEMUX_PADDING: usize = 100;
-        let ss = adapter_start.saturating_sub(WARPDEMUX_PADDING);
+        const BOUNDARY_PADDING_SAMPLES: usize = 100;
+        let ss = adapter_start.saturating_sub(BOUNDARY_PADDING_SAMPLES);
         let se = adapter_end
-            .saturating_add(WARPDEMUX_PADDING)
+            .saturating_add(BOUNDARY_PADDING_SAMPLES)
             .min(signal.len());
         (ss, se)
     } else {
@@ -133,16 +139,20 @@ pub fn extract_fingerprint_from_signal(
         return None;
     }
 
-    // Convert to f32. When keep_last is set (WarpDemuX-compat), don't pre-normalize
-    // — WarpDemuX segments raw pA values and normalizes event means afterwards.
-    // For the default mode, MAD-normalize for consistency with existing behavior.
+    // Pipeline-variant data prep:
+    // * `keep_last == Some(_)`: clip extreme excursions but leave the scale
+    //   alone — segmentation operates on (clipped) raw samples and the
+    //   normalization step happens later at the feature level.
+    // * `keep_last == None`: MAD-normalize up front so the t-test scores
+    //   downstream are scale-invariant and directly comparable across reads.
+    // The 5×MAD clip cutoff is a conventional "extreme outlier" threshold
+    // from robust statistics — wider than 3σ-equivalent (≈3×MAD) so genuine
+    // signal extremes survive, narrow enough to suppress spike artefacts.
     let adapter_signal: Vec<f32> = if keep_last.is_some() {
         let raw: Vec<f32> = signal[slice_start..slice_end]
             .iter()
             .map(|&s| s as f32)
             .collect();
-        // WarpDemuX clips outliers (median ± 5*MAD) before t-test segmentation
-        // to prevent extreme values from distorting changepoint detection.
         clip_outliers(&raw, 5.0)
     } else {
         let raw: Vec<f32> = signal[slice_start..slice_end]
@@ -186,8 +196,12 @@ pub fn extract_fingerprint_from_signal(
     };
 
     if let Some(n) = keep_last {
-        // WarpDemuX-compat: normalize ALL event means first, then truncate.
-        // WarpDemuX's "mean" normalization is actually z-score (mean/std).
+        // Normalize the full segment-mean population first, then truncate to
+        // the tail of length `n`. Doing it in this order makes the z-score
+        // statistics depend on the full adapter feature distribution rather
+        // than on the small retained slice; truncate-then-normalize would
+        // make the output sensitive to the choice of `n` and to whatever
+        // happens to live in the kept tail.
         let mut all_fp = Fingerprint::new(fingerprint_values, read_id);
         normalize_fingerprint(&mut all_fp, norm_method);
         fingerprint_values = all_fp.values;
@@ -197,11 +211,13 @@ pub fn extract_fingerprint_from_signal(
         }
 
         if emit_dwell {
-            // Truncate dwell the same way (segment-aligned with means), then
-            // normalize over the kept 25 — matches the mean-column
-            // convention. Doing this after truncation avoids letting the
-            // large-tailed early-adapter segments distort log1p stats for
-            // the barcode region.
+            // Dwell features take the opposite order: truncate first, then
+            // normalize. Adapter-onset segments are typically far longer
+            // than barcode-region segments, and a log1p+z-score computed
+            // over the full population would have its location/scale
+            // dominated by those early outliers — leaving the kept-tail
+            // values bunched near zero. Normalizing only over the kept tail
+            // keeps the dwell channel discriminative for the barcode.
             if dwell_values.len() > n {
                 dwell_values = dwell_values[dwell_values.len() - n..].to_vec();
             }
