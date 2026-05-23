@@ -27,14 +27,17 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Run tests with coverage
-        # Library crates covered by `cargo test`: escapepod-pod5,
+        # Library crates covered by nextest: escapepod-pod5,
         # escapepod-signal, escapepod-demux. escapepod-python (pyo3
         # bindings exercised by the Python test harness) and escapepod-cli
         # (binary; command handlers covered end-to-end via compat tests)
         # are intentionally excluded from the lines gate.
         run: >
-          cargo llvm-cov
+          cargo llvm-cov nextest
           --package escapepod-pod5
           --package escapepod-signal
           --package escapepod-demux
@@ -55,7 +58,7 @@ jobs:
       - name: Upload HTML report
         if: always()
         run: >
-          cargo llvm-cov
+          cargo llvm-cov nextest
           --package escapepod-pod5
           --package escapepod-signal
           --package escapepod-demux

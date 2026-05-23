@@ -95,8 +95,11 @@ For contributing to escapepod-rs:
 git clone https://github.com/rnabioco/escapepod-rs.git
 cd escapepod-rs
 
-# Run tests
-cargo test
+# Run tests (cargo-nextest)
+cargo nextest run
+
+# Run doctests separately — nextest does not execute them
+cargo test --doc --workspace
 
 # Run clippy lints
 cargo clippy

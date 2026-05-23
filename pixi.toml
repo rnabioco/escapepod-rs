@@ -121,11 +121,14 @@ docs-serve = "zensical serve"
 # and are unaffected by this feature.
 [feature.dev.dependencies]
 mold = ">=2.4"
+cargo-nextest = ">=0.9"
 
 [feature.dev.tasks]
 build     = "mold -run cargo build"
 build-rel = "mold -run cargo build --release"
-test      = "mold -run cargo test"
+# nextest does not run doctests; use the test-doc task for those.
+test      = "mold -run cargo nextest run"
+test-doc  = "mold -run cargo test --doc"
 check     = "mold -run cargo check"
 clippy    = "mold -run cargo clippy --workspace --all-targets"
 
