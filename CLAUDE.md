@@ -27,18 +27,21 @@ pixi run -e gpu cargo build --release --features gpu -p escapepod-cli
 
 # Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`):
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
-    pixi run -e gpu cargo test --features gpu -p escapepod-signal --test gpu_dtw
+    pixi run -e gpu cargo nextest run --features gpu -p escapepod-signal --test gpu_dtw
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     pixi run -e gpu cargo bench --features gpu --bench hot_paths_gpu
 
 # Use on a node with a visible GPU:
 escpod demux classify --model model.json reads.fp.csv --gpu -o out.tsv
 
-# Run tests
-cargo test
+# Run tests (cargo-nextest)
+cargo nextest run
+
+# Doctests — nextest does not run doctests, keep them on a separate invocation
+cargo test --doc --workspace
 
 # Run a specific test
-cargo test test_round_trip_single_read
+cargo nextest run test_round_trip_single_read
 
 # Run clippy lints
 cargo clippy
@@ -52,7 +55,8 @@ cargo clippy
 # musl (static); these local builds remain dynamic gnu by design.
 pixi run -e dev build        # cargo build
 pixi run -e dev build-rel    # cargo build --release (dynamic gnu)
-pixi run -e dev test         # cargo test
+pixi run -e dev test         # cargo nextest run
+pixi run -e dev test-doc     # cargo test --doc (nextest skips doctests)
 pixi run -e dev check        # cargo check
 pixi run -e dev clippy       # cargo clippy --workspace --all-targets
 
@@ -75,7 +79,7 @@ The login node has only 2 cores — wrap any heavy build or bench in `srun -p rn
 ```bash
 # build / test — 32 logical CPUs (16 physical cores + HT) is enough
 srun -p rna -c 32 --mem=32G pixi run cargo build --release
-srun -p rna -c 32 --mem=32G pixi run cargo test --workspace
+srun -p rna -c 32 --mem=32G pixi run cargo nextest run --workspace
 
 # With mold: swap `pixi run` for `pixi run -e dev <task>`. mold itself is
 # multithreaded on the link step, so the 32-core allocation helps both the

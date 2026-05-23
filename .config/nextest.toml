@@ -1,0 +1,17 @@
+# cargo-nextest configuration.
+#
+# `default` is used for local runs. `ci` is opted into via `--profile ci` by
+# the GitHub Actions workflows: it keeps going past first failure, retries
+# flaky tests, and emits JUnit XML for the test summary artifact.
+
+[profile.default]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false
+retries = 2
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[profile.ci.junit]
+path = "junit.xml"
