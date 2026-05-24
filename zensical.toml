@@ -7,39 +7,39 @@ repo_name = "rnabioco/escapepod-rs"
 copyright = "Copyright &copy; 2025 RNA Bioscience Initiative"
 
 nav = [
-  {"Home" = "index.md"},
-  {"Getting Started" = [
-    {"Installation" = "getting-started/installation.md"},
-    {"Quick Start" = "getting-started/quickstart.md"},
-  ]},
-  {"CLI Reference" = [
-    {"Overview" = "cli/index.md"},
-    {"summary" = "cli/summary.md"},
-    {"view" = "cli/view.md"},
-    {"inspect" = "cli/inspect.md"},
-    {"merge" = "cli/merge.md"},
-    {"filter" = "cli/filter.md"},
-    {"bam-filter" = "cli/bam-filter.md"},
-    {"subset" = "cli/subset.md"},
-  ]},
-  {"Experimental" = [
-    {"Overview" = "experimental/index.md"},
-    {"repack" = "experimental/repack.md"},
-    {"resquiggle" = "experimental/resquiggle.md"},
-    {"demux" = "experimental/demux.md"},
-  ]},
-  {"Library" = [
-    {"Overview" = "library/index.md"},
-    {"Reading Files" = "library/reading.md"},
-    {"Writing Files" = "library/writing.md"},
-    {"Data Types" = "library/types.md"},
-  ]},
-  {"File Format" = [
-    {"Overview" = "format/index.md"},
-    {"Container Structure" = "format/container.md"},
-    {"Signal Compression" = "format/compression.md"},
-  ]},
-  {"API Reference" = "api/index.md"},
+  { "Home" = "index.md" },
+  { "Getting Started" = [
+    { "Installation" = "getting-started/installation.md" },
+    { "Quick Start" = "getting-started/quickstart.md" },
+  ] },
+  { "CLI Reference" = [
+    { "Overview" = "cli/index.md" },
+    { "summary" = "cli/summary.md" },
+    { "view" = "cli/view.md" },
+    { "inspect" = "cli/inspect.md" },
+    { "merge" = "cli/merge.md" },
+    { "filter" = "cli/filter.md" },
+    { "bam-filter" = "cli/bam-filter.md" },
+    { "subset" = "cli/subset.md" },
+  ] },
+  { "Experimental" = [
+    { "Overview" = "experimental/index.md" },
+    { "repack" = "experimental/repack.md" },
+    { "resquiggle" = "experimental/resquiggle.md" },
+    { "demux" = "experimental/demux.md" },
+  ] },
+  { "Library" = [
+    { "Overview" = "library/index.md" },
+    { "Reading Files" = "library/reading.md" },
+    { "Writing Files" = "library/writing.md" },
+    { "Data Types" = "library/types.md" },
+  ] },
+  { "File Format" = [
+    { "Overview" = "format/index.md" },
+    { "Container Structure" = "format/container.md" },
+    { "Signal Compression" = "format/compression.md" },
+  ] },
+  { "API Reference" = "api/index.md" },
 ]
 
 [project.theme]
@@ -75,17 +75,21 @@ linenums = true
 pygments_lang_class = true
 
 [project.markdown_extensions.pymdownx.inlinehilite]
+
 [project.markdown_extensions.pymdownx.snippets]
+
 [[project.markdown_extensions.pymdownx.superfences.custom_fences]]
 name = "mermaid"
 class = "mermaid"
 format = "pymdownx.superfences.fence_code_format"
+
 [project.markdown_extensions.pymdownx.details]
 
 [project.markdown_extensions.pymdownx.tabbed]
 alternate_style = true
 
 [project.markdown_extensions.admonition]
+
 [project.markdown_extensions.tables]
 
 [project.markdown_extensions.toc]

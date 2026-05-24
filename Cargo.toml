@@ -15,8 +15,15 @@ anyhow = "1"
 # Arrow ecosystem
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 byteorder = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
+# GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
+cudarc = {
+  version = "0.12",
+  default-features = false,
+  features = ["cuda-12020", "driver", "nvrtc", "std"]
+}
 # Workspace crates
 escapepod-demux = { path = "crates/escapepod-demux", version = "0.5.0" }
 escapepod-pod5 = { path = "crates/escapepod-pod5", version = "0.5.0" }
@@ -26,34 +33,27 @@ flatbuffers = "25"
 indicatif = "0.18"
 # I/O
 memmap2 = "0.9"
-rayon = "1"
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
-# Compression
-zstd = "0.13"
+numpy = "0.28"
 # Parquet I/O for fingerprint tables (workspace dep so both test fixtures
 # and the CLI share the same version; features are kept default-off at
 # the workspace level so non-parquet crates don't pay).
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
+parquet = {
+  version = "58",
+  default-features = false,
+  features = ["arrow", "snap", "zstd"]
+}
 # Python bindings
 pyo3 = { version = "0.28", features = ["extension-module"] }
-numpy = "0.28"
+rayon = "1"
+thiserror = "2"
 # Structured logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
-cudarc = { version = "0.12", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12020"] }
 # Pure-Rust ONNX runtime for the CNN adapter detector (opt-in via `cnn-detect`).
 tract-onnx = "0.21"
-
-# Optimized release build: LTO + single codegen unit for maximum performance.
-[profile.release]
-lto = "fat"
-codegen-units = 1
-strip = true
-panic = "abort"
-opt-level = 3
+uuid = { version = "1", features = ["v4"] }
+# Compression
+zstd = "0.13"
 
 # `cargo bench` uses [profile.bench], which by default does NOT inherit from
 # [profile.release]. Pin it here so microbenchmarks measure the same codegen
@@ -64,31 +64,39 @@ opt-level = 3
 inherits = "release"
 strip = false
 
-# Release-speed build with symbols preserved — for samply/perf recordings
-# where you want final codegen but readable stack traces. Debuginfo is
-# split into a sibling `.dwp` so the binary stays small and link time
-# doesn't balloon; samply/perf/gdb pick up the sidecar automatically.
-[profile.release-with-debug]
+# Fast dev builds, but with optimized third-party crates so tests run
+# at a reasonable speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Optimized release build: LTO + single codegen unit for maximum performance.
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+
+[profile.dist]
 inherits = "release"
-strip = false
-debug = 2
-split-debuginfo = "packed"
 
 # Profiling build: drops LTO and splits codegen so frames aren't inlined
 # away from profilers (valgrind, perf, samply). Slower than release, but
 # faithfully reports call graphs.
 [profile.profiling]
 inherits = "release"
-lto = false
-codegen-units = 16
-strip = false
 debug = 2
 split-debuginfo = "packed"
+strip = false
+lto = false
+codegen-units = 16
 
-# Fast dev builds, but with optimized third-party crates so tests run
-# at a reasonable speed.
-[profile.dev.package."*"]
-opt-level = 2
-
-[profile.dist]
+# Release-speed build with symbols preserved — for samply/perf recordings
+# where you want final codegen but readable stack traces. Debuginfo is
+# split into a sibling `.dwp` so the binary stays small and link time
+# doesn't balloon; samply/perf/gdb pick up the sidecar automatically.
+[profile.release-with-debug]
 inherits = "release"
+debug = 2
+split-debuginfo = "packed"
+strip = false

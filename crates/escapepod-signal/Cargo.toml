@@ -4,11 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Signal-processing algorithms (DTW, resquiggle, segmentation) for Oxford Nanopore POD5 data. Barcode demultiplexing lives in the companion `escapepod-demux` crate."
+readme = "../README.md"
 repository.workspace = true
 license.workspace = true
-readme = "../README.md"
-keywords = ["nanopore", "pod5", "sequencing", "bioinformatics"]
-categories = ["science", "parser-implementations"]
+keywords = ["bioinformatics", "nanopore", "pod5", "sequencing"]
+categories = ["parser-implementations", "science"]
+
+[[bench]]
+harness = false
+name = "hot_paths"
+
+[[bench]]
+harness = false
+name = "hot_paths_gpu"
+required-features = ["gpu"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -23,26 +32,21 @@ uuid = { workspace = true }
 cudarc = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 
+[dev-dependencies]
+arrow = { workspace = true }
+criterion = { version = "0.8.2", features = ["html_reports"] }
+noodles-bam = "0.88"
+noodles-sam = "0.84"
+parquet = {
+  version = "58",
+  default-features = false,
+  features = ["arrow", "snap", "zstd"]
+}
+tempfile = "3"
+
 [features]
 default = []
 # GPU-accelerated DTW distance matrix (requires CUDA driver at runtime).
 # Exposes `dtw::cuda::GpuDtwContext` and `dtw_distance_matrix_gpu`. Demux
 # consumers wire these in through the `escapepod-demux` crate.
 gpu = ["dep:cudarc", "dep:thiserror"]
-
-[dev-dependencies]
-arrow = { workspace = true }
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
-noodles-bam = "0.88"
-noodles-sam = "0.84"
-criterion = { version = "0.8.2", features = ["html_reports"] }
-tempfile = "3"
-
-[[bench]]
-name = "hot_paths"
-harness = false
-
-[[bench]]
-name = "hot_paths_gpu"
-harness = false
-required-features = ["gpu"]

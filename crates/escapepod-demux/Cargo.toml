@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "WarpDemuX-compatible barcode demultiplexing for Oxford Nanopore POD5 data (DTW + SVM, optional CNN adapter detection and GPU acceleration)."
+readme = "../README.md"
 repository.workspace = true
 license.workspace = true
-readme = "../README.md"
-keywords = ["nanopore", "pod5", "demultiplex", "barcode", "svm"]
-categories = ["science", "algorithms"]
+keywords = ["barcode", "demultiplex", "nanopore", "pod5", "svm"]
+categories = ["algorithms", "science"]
+
+[[bench]]
+harness = false
+name = "classify"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -38,27 +42,23 @@ cudarc = { workspace = true, optional = true }
 # in the batched GPU classify loop.
 indicatif = { workspace = true, optional = true }
 
-[features]
-default = []
-# Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
-train = ["dep:linfa", "dep:linfa-svm"]
-# Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
-# from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
-# time, not build time. Also pulls cudarc directly so the post-DTW SVM
-# pipeline (RBF + OvO decision) can launch its own kernels via the shared
-# device handle.
-gpu = ["escapepod-signal/gpu", "dep:cudarc", "dep:indicatif"]
-# CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
-# tract-onnx). Users supply an ONNX file produced by
-# `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC
-# 4.0 and must not be bundled with this crate.
-cnn-detect = ["dep:tract-onnx"]
-
 [dev-dependencies]
 criterion = "0.8"
 rand = "0.10"
 tempfile = "3"
 
-[[bench]]
-name = "classify"
-harness = false
+[features]
+default = []
+# CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
+# tract-onnx). Users supply an ONNX file produced by
+# `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC
+# 4.0 and must not be bundled with this crate.
+cnn-detect = ["dep:tract-onnx"]
+# Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
+# from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
+# time, not build time. Also pulls cudarc directly so the post-DTW SVM
+# pipeline (RBF + OvO decision) can launch its own kernels via the shared
+# device handle.
+gpu = ["dep:cudarc", "dep:indicatif", "escapepod-signal/gpu"]
+# Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
+train = ["dep:linfa", "dep:linfa-svm"]

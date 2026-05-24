@@ -1,17 +1,16 @@
+[project]
+name = "escapepod"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+]
+dynamic = ["version"]
+
 [build-system]
 requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
-[project]
-name = "escapepod"
-dynamic = ["version"]
-requires-python = ">=3.9"
-classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-]
-
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "escapepod"
-

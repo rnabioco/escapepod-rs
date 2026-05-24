@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "CLI tools for working with POD5 files (Oxford Nanopore)"
+readme = "../README.md"
 repository.workspace = true
 license.workspace = true
-readme = "../README.md"
-keywords = ["nanopore", "pod5", "sequencing", "bioinformatics", "cli"]
-categories = ["science", "command-line-utilities"]
+keywords = ["bioinformatics", "cli", "nanopore", "pod5", "sequencing"]
+categories = ["command-line-utilities", "science"]
 
 [[bin]]
 name = "escpod"
@@ -47,14 +47,14 @@ walkdir = "2"
 
 [features]
 default = []
-experimental = []
-# Barcode demultiplexing commands. Experimental — opt in with `--features demux`.
-demux = ["dep:escapepod-demux"]
-# Training support for demux SVM models (implies `demux`).
-train = ["demux", "escapepod-demux/train"]
-# GPU-accelerated DTW for demux classify and train-svm (requires CUDA
-# driver + libnvrtc at runtime).
-gpu = ["demux", "escapepod-demux/gpu"]
 # CNN-based adapter detection (requires a local ADAPTed-exported .onnx model
 # at runtime; weights are CC BY-NC 4.0 and not bundled).
 cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
+# Barcode demultiplexing commands. Experimental — opt in with `--features demux`.
+demux = ["dep:escapepod-demux"]
+experimental = []
+# GPU-accelerated DTW for demux classify and train-svm (requires CUDA
+# driver + libnvrtc at runtime).
+gpu = ["demux", "escapepod-demux/gpu"]
+# Training support for demux SVM models (implies `demux`).
+train = ["demux", "escapepod-demux/train"]

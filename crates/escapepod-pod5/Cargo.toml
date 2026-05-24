@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "POD5 file format I/O (Oxford Nanopore) — reader, writer, VBZ compression"
+readme = "../README.md"
 repository.workspace = true
 license.workspace = true
-readme = "../README.md"
-keywords = ["nanopore", "pod5", "sequencing", "bioinformatics"]
-categories = ["science", "parser-implementations"]
+keywords = ["bioinformatics", "nanopore", "pod5", "sequencing"]
+categories = ["parser-implementations", "science"]
+
+[[bench]]
+harness = false
+name = "io_hot_paths"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -25,7 +29,3 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
-
-[[bench]]
-name = "io_hot_paths"
-harness = false

@@ -7,10 +7,10 @@ repository.workspace = true
 license.workspace = true
 
 [lib]
-name = "escapepod_python"
 crate-type = ["cdylib"]
+name = "escapepod_python"
 
 [dependencies]
 escapepod-signal = { workspace = true }
-pyo3 = { workspace = true }
 numpy = { workspace = true }
+pyo3 = { workspace = true }
