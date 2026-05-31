@@ -37,11 +37,7 @@ arrow = { workspace = true }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 noodles-bam = "0.88"
 noodles-sam = "0.84"
-parquet = {
-  version = "58",
-  default-features = false,
-  features = ["arrow", "snap", "zstd"]
-}
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
 tempfile = "3"
 
 [features]

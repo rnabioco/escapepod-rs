@@ -1,0 +1,94 @@
+//! RBF kernel computation and DTW distance helpers for the SVM pipeline.
+
+use escapepod_signal::dtw::dtw_distance;
+
+use crate::model::KernelParams;
+
+use super::workspace::SvmWorkspace;
+
+/// Compute RBF kernel from distances.
+///
+/// K = exp(-gamma * distance^power)
+///
+/// # Arguments
+///
+/// * `distances` - DTW distances to training samples
+/// * `params` - Kernel parameters
+///
+/// # Returns
+///
+/// Kernel values (similarity scores)
+pub fn distances_to_kernel(distances: &[f64], params: &KernelParams) -> Vec<f64> {
+    distances.iter().map(|&d| kernel_value(d, params)).collect()
+}
+
+/// In-place variant of [`distances_to_kernel`] that writes into a caller-owned
+/// buffer. Avoids a `Vec<f64>` allocation per read in the SVM pipeline.
+pub(super) fn distances_to_kernel_into(
+    distances: &[f64],
+    params: &KernelParams,
+    out: &mut Vec<f64>,
+) {
+    out.clear();
+    out.extend(distances.iter().map(|&d| kernel_value(d, params)));
+}
+
+/// Compute one RBF kernel value: `exp(-gamma * distance^power)`.
+///
+/// Specializes the two common cases (`power == 1.0`, the default; and
+/// `power == 2.0`, classic RBF) to skip the transcendental `f64::powf`.
+/// `powf(1.0)` is the WarpDemuX default and shows up in every per-(read
+/// × support-vector) kernel evaluation.
+#[inline]
+fn kernel_value(distance: f64, params: &KernelParams) -> f64 {
+    let scaled = if params.power == 1.0 {
+        distance
+    } else if params.power == 2.0 {
+        distance * distance
+    } else {
+        distance.powf(params.power)
+    };
+    (-params.gamma * scaled).exp()
+}
+
+/// Compute DTW distances from a query fingerprint to all training fingerprints.
+///
+/// # Arguments
+///
+/// * `query` - Query fingerprint
+/// * `training` - Training fingerprints
+/// * `window` - Optional Sakoe-Chiba band constraint
+///
+/// # Returns
+///
+/// Vector of DTW distances
+pub fn compute_distances(query: &[f64], training: &[Vec<f64>], window: Option<usize>) -> Vec<f64> {
+    let mut ws = SvmWorkspace::new();
+    compute_distances_into(query, training, window, &mut ws);
+    std::mem::take(&mut ws.distances)
+}
+
+/// Workspace-backed variant of [`compute_distances`]. Reuses f32 conversion
+/// buffers and writes results into `ws.distances` (cleared first).
+pub(super) fn compute_distances_into(
+    query: &[f64],
+    training: &[Vec<f64>],
+    window: Option<usize>,
+    ws: &mut SvmWorkspace,
+) {
+    ws.query_f32.clear();
+    ws.query_f32.extend(query.iter().map(|&x| x as f32));
+
+    ws.distances.clear();
+    ws.distances.reserve(training.len());
+    // Split the borrow so the inner loop can write to `ws.distances` while
+    // rewriting `ws.train_scratch` on each iteration.
+    let query_f32 = ws.query_f32.as_slice();
+    let train_scratch = &mut ws.train_scratch;
+    let distances = &mut ws.distances;
+    for train_fp in training {
+        train_scratch.clear();
+        train_scratch.extend(train_fp.iter().map(|&x| x as f32));
+        distances.push(dtw_distance(query_f32, train_scratch, window) as f64);
+    }
+}

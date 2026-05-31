@@ -1,7 +1,7 @@
 //! Dictionary value scanning utilities.
 
 use crate::Reader;
-use arrow::array::{Array, DictionaryArray, StringArray};
+use arrow::array::{Array, AsArray};
 use arrow::datatypes::Int16Type;
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -25,8 +25,8 @@ fn extract_dict_values(
     values: &mut BTreeSet<String>,
 ) {
     if let Some(col) = batch.column_by_name(col_name)
-        && let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int16Type>>()
-        && let Some(dict_values) = dict.values().as_any().downcast_ref::<StringArray>()
+        && let Some(dict) = col.as_dictionary_opt::<Int16Type>()
+        && let Some(dict_values) = dict.values().as_string_opt::<i32>()
     {
         for i in 0..dict_values.len() {
             if !dict_values.is_null(i) {

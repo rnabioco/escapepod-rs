@@ -673,7 +673,8 @@ impl Reader {
         batch: &RecordBatch,
         row: usize,
     ) -> Result<CompressedSignalChunk> {
-        use arrow::array::{Array, FixedSizeBinaryArray, LargeBinaryArray, UInt32Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt32Type;
 
         let read_id_col = batch
             .column_by_name("read_id")
@@ -685,25 +686,24 @@ impl Reader {
             .column_by_name("samples")
             .ok_or_else(|| Error::MissingField("samples column".to_string()))?;
 
-        let read_id_array = read_id_col
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "read_id".to_string(),
-                message: "Expected FixedSizeBinaryArray".to_string(),
-            })?;
+        let read_id_array =
+            read_id_col
+                .as_fixed_size_binary_opt()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "read_id".to_string(),
+                    message: "Expected FixedSizeBinaryArray".to_string(),
+                })?;
 
-        let signal_array = signal_col
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "signal".to_string(),
-                message: "Expected LargeBinaryArray".to_string(),
-            })?;
+        let signal_array =
+            signal_col
+                .as_binary_opt::<i64>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected LargeBinaryArray".to_string(),
+                })?;
 
         let samples_array = samples_col
-            .as_any()
-            .downcast_ref::<UInt32Array>()
+            .as_primitive_opt::<UInt32Type>()
             .ok_or_else(|| Error::InvalidField {
                 field: "samples".to_string(),
                 message: "Expected UInt32Array".to_string(),
@@ -728,7 +728,8 @@ impl Reader {
         batch: &RecordBatch,
         chunks: &mut Vec<CompressedSignalChunk>,
     ) -> Result<()> {
-        use arrow::array::{Array, FixedSizeBinaryArray, LargeBinaryArray, UInt32Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt32Type;
 
         let read_id_col = batch
             .column_by_name("read_id")
@@ -740,25 +741,24 @@ impl Reader {
             .column_by_name("samples")
             .ok_or_else(|| Error::MissingField("samples column".to_string()))?;
 
-        let read_id_array = read_id_col
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "read_id".to_string(),
-                message: "Expected FixedSizeBinaryArray".to_string(),
-            })?;
+        let read_id_array =
+            read_id_col
+                .as_fixed_size_binary_opt()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "read_id".to_string(),
+                    message: "Expected FixedSizeBinaryArray".to_string(),
+                })?;
 
-        let signal_array = signal_col
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "signal".to_string(),
-                message: "Expected LargeBinaryArray".to_string(),
-            })?;
+        let signal_array =
+            signal_col
+                .as_binary_opt::<i64>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected LargeBinaryArray".to_string(),
+                })?;
 
         let samples_array = samples_col
-            .as_any()
-            .downcast_ref::<UInt32Array>()
+            .as_primitive_opt::<UInt32Type>()
             .ok_or_else(|| Error::InvalidField {
                 field: "samples".to_string(),
                 message: "Expected UInt32Array".to_string(),
@@ -783,7 +783,8 @@ impl Reader {
 
     /// Extract signal samples from a signal table batch row.
     fn extract_signal_from_batch(&self, batch: &RecordBatch, row: usize) -> Result<Vec<i16>> {
-        use arrow::array::{Array, LargeBinaryArray, UInt32Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt32Type;
 
         // Get signal column (LargeBinary with VBZ data)
         let signal_col = batch
@@ -796,8 +797,7 @@ impl Reader {
             .ok_or_else(|| Error::MissingField("samples column".to_string()))?;
 
         let samples_array = samples_col
-            .as_any()
-            .downcast_ref::<UInt32Array>()
+            .as_primitive_opt::<UInt32Type>()
             .ok_or_else(|| Error::InvalidField {
                 field: "samples".to_string(),
                 message: "Expected UInt32Array".to_string(),
@@ -806,13 +806,13 @@ impl Reader {
         let sample_count = samples_array.value(row) as usize;
 
         // Handle signal data (could be LargeBinary for VBZ)
-        let signal_array = signal_col
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "signal".to_string(),
-                message: "Expected LargeBinaryArray".to_string(),
-            })?;
+        let signal_array =
+            signal_col
+                .as_binary_opt::<i64>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected LargeBinaryArray".to_string(),
+                })?;
 
         let compressed_data = signal_array.value(row);
 
@@ -833,7 +833,7 @@ impl Reader {
     /// This is much faster than iterating over all reads when you only need the IDs,
     /// as it uses Arrow column projection to avoid loading other columns.
     pub fn read_ids(&self) -> Result<Vec<Uuid>> {
-        use arrow::array::{Array, FixedSizeBinaryArray};
+        use arrow::array::{Array, AsArray};
 
         let embedded = self
             .footer
@@ -847,11 +847,7 @@ impl Reader {
         for batch_result in reader {
             let batch = batch_result?;
             // The projected batch will have read_id as column 0
-            if let Some(col) = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-            {
+            if let Some(col) = batch.column(0).as_fixed_size_binary_opt() {
                 for row in 0..col.len() {
                     if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
                         read_ids.push(uuid);
@@ -865,7 +861,7 @@ impl Reader {
 
     /// Get read IDs from a specific batch efficiently (reads only the read_id column).
     pub fn read_ids_from_batch(&self, batch_idx: usize) -> Result<Vec<Uuid>> {
-        use arrow::array::{Array, FixedSizeBinaryArray};
+        use arrow::array::{Array, AsArray};
 
         let embedded = self
             .footer
@@ -893,11 +889,7 @@ impl Reader {
         })??;
 
         let mut read_ids = Vec::new();
-        if let Some(col) = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-        {
+        if let Some(col) = batch.column(0).as_fixed_size_binary_opt() {
             for row in 0..col.len() {
                 if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
                     read_ids.push(uuid);
@@ -928,7 +920,7 @@ impl Reader {
     ///
     /// Projects only column 0 (read_id) to avoid parsing all 22 columns.
     fn build_read_index_from_scan(&self) -> Result<ReadIndex> {
-        use arrow::array::{Array, FixedSizeBinaryArray};
+        use arrow::array::{Array, AsArray};
 
         let embedded = self
             .footer
@@ -940,14 +932,14 @@ impl Reader {
         let mut entries = Vec::new();
         for (batch_idx, batch_result) in reader.enumerate() {
             let batch = batch_result?;
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "read_id".to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
+            let col =
+                batch
+                    .column(0)
+                    .as_fixed_size_binary_opt()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "read_id".to_string(),
+                        message: "Expected FixedSizeBinaryArray".to_string(),
+                    })?;
             for row in 0..col.len() {
                 let bytes = col.value(row);
                 if bytes.len() == 16 {
@@ -1226,7 +1218,8 @@ impl Reader {
         &self,
         target_ids: &HashSet<Uuid>,
     ) -> Result<Vec<(Uuid, Vec<u64>)>> {
-        use arrow::array::{Array, ListArray, UInt64Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt64Type;
 
         let index = self.read_index()?;
 
@@ -1253,23 +1246,23 @@ impl Reader {
                 index: batch_idx,
                 max: reader.num_batches(),
             })??;
-            let signal_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected ListArray".to_string(),
-                })?;
-            for (uuid, row) in targets {
-                let values = signal_col.value(row);
-                let u64_arr = values
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
+            let signal_col =
+                batch
+                    .column(1)
+                    .as_list_opt::<i32>()
                     .ok_or_else(|| Error::InvalidField {
                         field: "signal".to_string(),
-                        message: "Expected UInt64Array values".to_string(),
+                        message: "Expected ListArray".to_string(),
                     })?;
+            for (uuid, row) in targets {
+                let values = signal_col.value(row);
+                let u64_arr =
+                    values
+                        .as_primitive_opt::<UInt64Type>()
+                        .ok_or_else(|| Error::InvalidField {
+                            field: "signal".to_string(),
+                            message: "Expected UInt64Array values".to_string(),
+                        })?;
                 results.push((uuid, u64_arr.values().to_vec()));
             }
         }
@@ -1280,7 +1273,8 @@ impl Reader {
         &self,
         target_ids: &HashSet<Uuid>,
     ) -> Result<Vec<SignalCalibration>> {
-        use arrow::array::{Array, Float32Array, ListArray, UInt64Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::{Float32Type, UInt64Type};
 
         let index = self.read_index()?;
 
@@ -1308,39 +1302,37 @@ impl Reader {
                 index: batch_idx,
                 max: reader.num_batches(),
             })??;
-            let signal_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected ListArray".to_string(),
-                })?;
+            let signal_col =
+                batch
+                    .column(1)
+                    .as_list_opt::<i32>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "signal".to_string(),
+                        message: "Expected ListArray".to_string(),
+                    })?;
             let cal_offset_col = batch
                 .column(2)
-                .as_any()
-                .downcast_ref::<Float32Array>()
+                .as_primitive_opt::<Float32Type>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "calibration_offset".to_string(),
                     message: "Expected Float32Array".to_string(),
                 })?;
             let cal_scale_col = batch
                 .column(3)
-                .as_any()
-                .downcast_ref::<Float32Array>()
+                .as_primitive_opt::<Float32Type>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "calibration_scale".to_string(),
                     message: "Expected Float32Array".to_string(),
                 })?;
             for (uuid, row) in targets {
                 let values = signal_col.value(row);
-                let u64_arr = values
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected UInt64Array values".to_string(),
-                    })?;
+                let u64_arr =
+                    values
+                        .as_primitive_opt::<UInt64Type>()
+                        .ok_or_else(|| Error::InvalidField {
+                            field: "signal".to_string(),
+                            message: "Expected UInt64Array values".to_string(),
+                        })?;
                 results.push(SignalCalibration {
                     read_id: uuid,
                     signal_rows: u64_arr.values().to_vec(),
@@ -1355,7 +1347,8 @@ impl Reader {
     // ---- Single-pass path (no index — column-projected scan with inline filter) ----
 
     fn find_signal_rows_scan(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<(Uuid, Vec<u64>)>> {
-        use arrow::array::{Array, FixedSizeBinaryArray, ListArray, UInt64Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt64Type;
 
         let embedded = self
             .footer
@@ -1368,35 +1361,33 @@ impl Reader {
         let mut results = Vec::with_capacity(n);
         for batch_result in reader {
             let batch = batch_result?;
-            let id_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "read_id".to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
-            let signal_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected ListArray".to_string(),
-                })?;
+            let id_col =
+                batch
+                    .column(0)
+                    .as_fixed_size_binary_opt()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "read_id".to_string(),
+                        message: "Expected FixedSizeBinaryArray".to_string(),
+                    })?;
+            let signal_col =
+                batch
+                    .column(1)
+                    .as_list_opt::<i32>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "signal".to_string(),
+                        message: "Expected ListArray".to_string(),
+                    })?;
             for row in 0..batch.num_rows() {
                 if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
                     && target_ids.contains(&uuid)
                 {
                     let values = signal_col.value(row);
-                    let u64_arr =
-                        values
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or_else(|| Error::InvalidField {
-                                field: "signal".to_string(),
-                                message: "Expected UInt64Array values".to_string(),
-                            })?;
+                    let u64_arr = values.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+                        Error::InvalidField {
+                            field: "signal".to_string(),
+                            message: "Expected UInt64Array values".to_string(),
+                        }
+                    })?;
                     results.push((uuid, u64_arr.values().to_vec()));
                     if results.len() == n {
                         return Ok(results);
@@ -1411,7 +1402,8 @@ impl Reader {
         &self,
         target_ids: &HashSet<Uuid>,
     ) -> Result<Vec<SignalCalibration>> {
-        use arrow::array::{Array, FixedSizeBinaryArray, Float32Array, ListArray, UInt64Array};
+        use arrow::array::AsArray;
+        use arrow::datatypes::{Float32Type, UInt64Type};
 
         let embedded = self
             .footer
@@ -1425,34 +1417,32 @@ impl Reader {
         let mut results = Vec::with_capacity(n);
         for batch_result in reader {
             let batch = batch_result?;
-            let id_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "read_id".to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
-            let signal_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected ListArray".to_string(),
-                })?;
+            let id_col =
+                batch
+                    .column(0)
+                    .as_fixed_size_binary_opt()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "read_id".to_string(),
+                        message: "Expected FixedSizeBinaryArray".to_string(),
+                    })?;
+            let signal_col =
+                batch
+                    .column(1)
+                    .as_list_opt::<i32>()
+                    .ok_or_else(|| Error::InvalidField {
+                        field: "signal".to_string(),
+                        message: "Expected ListArray".to_string(),
+                    })?;
             let cal_offset_col = batch
                 .column(2)
-                .as_any()
-                .downcast_ref::<Float32Array>()
+                .as_primitive_opt::<Float32Type>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "calibration_offset".to_string(),
                     message: "Expected Float32Array".to_string(),
                 })?;
             let cal_scale_col = batch
                 .column(3)
-                .as_any()
-                .downcast_ref::<Float32Array>()
+                .as_primitive_opt::<Float32Type>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "calibration_scale".to_string(),
                     message: "Expected Float32Array".to_string(),
@@ -1462,14 +1452,12 @@ impl Reader {
                     && target_ids.contains(&uuid)
                 {
                     let values = signal_col.value(row);
-                    let u64_arr =
-                        values
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or_else(|| Error::InvalidField {
-                                field: "signal".to_string(),
-                                message: "Expected UInt64Array values".to_string(),
-                            })?;
+                    let u64_arr = values.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+                        Error::InvalidField {
+                            field: "signal".to_string(),
+                            message: "Expected UInt64Array values".to_string(),
+                        }
+                    })?;
                     results.push(SignalCalibration {
                         read_id: uuid,
                         signal_rows: u64_arr.values().to_vec(),
@@ -1585,34 +1573,26 @@ impl Reader {
 
     /// Parse a Map column into a HashMap.
     fn parse_map_column(batch: &RecordBatch, name: &str, row: usize) -> HashMap<String, String> {
-        use arrow::array::{Array, MapArray, StringArray, StructArray};
+        use arrow::array::{Array, AsArray};
 
         let Some(col) = batch.column_by_name(name) else {
             return HashMap::new();
         };
 
-        let Some(map_array) = col.as_any().downcast_ref::<MapArray>() else {
+        let Some(map_array) = col.as_map_opt() else {
             return HashMap::new();
         };
 
         let mut result = HashMap::new();
 
-        // Get the entries for this row as a StructArray
-        let entries = map_array.value(row);
-        let Some(struct_array) = entries.as_any().downcast_ref::<StructArray>() else {
-            return HashMap::new();
-        };
+        // Get the entries for this row as a StructArray. `MapArray::value`
+        // already yields a concrete `StructArray`, so no downcast is needed.
+        let struct_array = map_array.value(row);
 
         if struct_array.num_columns() >= 2
             && let (Some(keys), Some(values)) = (
-                struct_array
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>(),
-                struct_array
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<StringArray>(),
+                struct_array.column(0).as_string_opt::<i32>(),
+                struct_array.column(1).as_string_opt::<i32>(),
             )
         {
             for i in 0..struct_array.len() {
