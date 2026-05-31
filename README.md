@@ -4,7 +4,7 @@
 
 A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ![escapepod demo](docs/images/readme.gif)

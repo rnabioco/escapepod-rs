@@ -172,4 +172,4 @@ CLI with `--features gpu` transitively enables demux's `gpu` feature.
 
 ## Minimum Supported Rust Version
 
-Rust 1.88 or later is required (tracked in `[workspace.package].rust-version`).
+Rust 1.92 or later is required (tracked in `[workspace.package].rust-version`).
