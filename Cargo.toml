@@ -19,11 +19,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 # GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
-cudarc = {
-  version = "0.12",
-  default-features = false,
-  features = ["cuda-12020", "driver", "nvrtc", "std"]
-}
+cudarc = { version = "0.12", default-features = false, features = ["cuda-12020", "driver", "nvrtc", "std"] }
 # Workspace crates
 escapepod-demux = { path = "crates/escapepod-demux", version = "0.5.0" }
 escapepod-pod5 = { path = "crates/escapepod-pod5", version = "0.5.0" }
@@ -37,11 +33,7 @@ numpy = "0.28"
 # Parquet I/O for fingerprint tables (workspace dep so both test fixtures
 # and the CLI share the same version; features are kept default-off at
 # the workspace level so non-parquet crates don't pay).
-parquet = {
-  version = "58",
-  default-features = false,
-  features = ["arrow", "snap", "zstd"]
-}
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Python bindings
 pyo3 = { version = "0.28", features = ["extension-module"] }
 rayon = "1"

@@ -1,0 +1,12 @@
+# Tombi (TOML formatter) configuration.
+#
+# Cargo's manifest parser does not accept multi-line inline tables until a very
+# recent toolchain (the MSRV, Rust 1.92, rejects them with "newlines are
+# unsupported in inline tables"). Tombi's default line-width of 80 wraps long
+# dependency inline tables such as `cudarc = { version = ..., features = [...] }`
+# across lines, which breaks `cargo` for everyone on the MSRV. Widen the limit so
+# those dependency tables stay on a single line.
+toml-version = "v1.0.0"
+
+[format.rules]
+line-width = 120
