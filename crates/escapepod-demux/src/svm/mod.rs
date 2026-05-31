@@ -27,7 +27,7 @@ pub use workspace::SvmWorkspace;
 pub use gpu::DEFAULT_GPU_CHUNK_CELLS;
 
 #[cfg(feature = "gpu")]
-pub use gpu::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx, gpu_pipeline};
+pub use gpu::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx};
 
 #[cfg(test)]
 mod tests {
