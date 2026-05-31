@@ -8,9 +8,9 @@
 use rayon::prelude::*;
 
 #[cfg(feature = "gpu")]
-use crate::probability::{ProbabilityResult, process_probabilities};
-#[cfg(feature = "gpu")]
 use super::{SvmModel, SvmPredictor, SvmWorkspace};
+#[cfg(feature = "gpu")]
+use crate::probability::{ProbabilityResult, process_probabilities};
 
 /// Default chunk budget (in matrix cells) for the GPU batch classifier.
 ///

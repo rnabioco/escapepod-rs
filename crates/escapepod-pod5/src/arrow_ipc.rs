@@ -77,7 +77,9 @@ fn slice_at(bytes: &[u8], off: usize, len: usize) -> Result<&[u8]> {
 fn fb_sub_offset(base: usize, soffset: i32) -> Result<usize> {
     let pos = (base as i64) - (soffset as i64);
     if pos < 0 {
-        return Err(Error::InvalidArrowIpc("Invalid negative FlatBuffer offset".into()));
+        return Err(Error::InvalidArrowIpc(
+            "Invalid negative FlatBuffer offset".into(),
+        ));
     }
     Ok(pos as usize)
 }
@@ -889,7 +891,12 @@ mod tests {
             if let Ok(footer) = ArrowIpcFooter::parse(bytes) {
                 // If the footer parsed, hammer the downstream extraction paths
                 // with both in-range and out-of-range rows.
-                for row in [0u64, 1, footer.total_rows, footer.total_rows.wrapping_add(1)] {
+                for row in [
+                    0u64,
+                    1,
+                    footer.total_rows,
+                    footer.total_rows.wrapping_add(1),
+                ] {
                     let _ = footer.extract_signal_row(row, bytes);
                 }
                 let probe_rows: Vec<u64> = (0..footer.total_rows.min(8)).collect();
