@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 repository = "https://github.com/rnabioco/escapepod-rs"
 license = "MIT"
 
