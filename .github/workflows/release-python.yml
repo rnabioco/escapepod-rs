@@ -1,0 +1,150 @@
+name: Release Python (escapepod wheels)
+
+# Builds and publishes the `escapepod` PyPI distribution — the pyo3 Reader
+# bindings from crates/escapepod-python (module `escapepod`, used by e.g.
+# `from escapepod import Reader`). The `escpod` CLI is published separately
+# as binaries (see release.yml); this workflow only handles the Python wheel.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MANIFEST: crates/escapepod-python/Cargo.toml
+
+jobs:
+  linux:
+    name: Wheels — linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # manylinux containers ship many CPython interpreters; --find-interpreter
+          # builds a wheel for each (the crate is a plain extension module, not
+          # abi3, so wheels are version-specific).
+          args: --release --out dist --find-interpreter --manifest-path ${{ env.MANIFEST }}
+          manylinux: auto
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist/*.whl
+
+  macos:
+    name: Wheels — macos ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64
+            runner: macos-14
+          - target: x86_64
+            runner: macos-13
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter --manifest-path ${{ env.MANIFEST }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist/*.whl
+
+  windows:
+    name: Wheels — windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --find-interpreter --manifest-path ${{ env.MANIFEST }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-windows-x64
+          path: dist/*.whl
+
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          # maturin vendors the in-repo path dependencies (escapepod-signal,
+          # escapepod-pod5) into the sdist, so it is self-contained and builds
+          # without the (private) repo — only a Rust toolchain is needed.
+          args: --out dist --manifest-path ${{ env.MANIFEST }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish escapepod to PyPI
+    runs-on: ubuntu-latest
+    needs: [linux, macos, windows, sdist]
+    # Skip on manual runs unless you explicitly want to publish; tag pushes
+    # publish. (workflow_dispatch builds wheels as artifacts for inspection.)
+    if: github.event_name == 'push'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '{wheels-*,sdist}'
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
