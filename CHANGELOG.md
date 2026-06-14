@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- Resolved a PyPI name collision: both the `escapepod` CLI crate and the
+  `escapepod-python` bindings crate declared `name = "escapepod"`. The PyPI
+  `escapepod` distribution is the **Python `Reader` bindings**
+  (`escapepod-python`); the `escpod` CLI now ships via `cargo install
+  escapepod` and GitHub release binaries only, so its maturin `pyproject.toml`
+  (a `bindings = "bin"` wheel) has been removed. This reverses the 0.5.1 note
+  about `pip install escapepod` installing the CLI.
+
 ## 0.5.1 (2026-06-14)
 
 ### Changed
