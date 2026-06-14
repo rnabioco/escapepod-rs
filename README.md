@@ -11,7 +11,7 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 ## Highlights
 
-- **Fast** - Up to 47x faster than Python pod5 tools
+- **Fast** - Up to 9x faster than Python pod5 tools on large-file operations
 - **Memory efficient** - Memory-mapped I/O for large files
 - **Full featured** - View, inspect, merge, filter, subset
 - **BAM integration** - Filter reads by alignment status
@@ -27,10 +27,11 @@ no `nvcc` needed at build time, only the CUDA driver + libnvrtc at run.
 
 ## Performance
 
+Numbers are for the I/O-bound operations where runtime is large enough to
+matter; sub-second commands (`inspect`, `view`) are omitted.
+
 | Command | escapepod | pod5 | Speedup |
 |---------|-----------|------|---------|
-| inspect | 36 ms | 1.7 s | **47x** |
-| view | 238 ms | 4.5 s | **19x** |
 | filter | 513 ms | 4.7 s | **9x** |
 | subset | 2.8 s | 8.3 s | **3x** |
 | merge | 3.0 s | 4.1 s | **1.4x** |
