@@ -15,7 +15,7 @@
 # Prerequisites:
 #   - Cloned ext/WarpDemuX and ext/ADAPTed (see docs/cli/demux.md)
 #   - `pixi install -e warpdemux-bench && pixi run -e warpdemux-bench install-warpdemux`
-#   - `cargo build --release -p escapepod-cli --features "demux train"` (CPU)
+#   - `cargo build --release -p escapepod --features "demux train"` (CPU)
 #   - For --gpu: build with `--features "demux train gpu"` on a node with
 #     CUDA driver + libnvrtc (use `pixi run -e gpu cargo build ...`).
 #
@@ -96,7 +96,7 @@ echo ""
 # Sanity checks
 if [ ! -f "$ESCAPEPOD_BIN" ]; then
     echo "error: $ESCAPEPOD_BIN not found." >&2
-    echo "       cargo build --release -p escapepod-cli --features 'demux train'$([[ $USE_GPU -eq 1 ]] && echo ' gpu')" >&2
+    echo "       cargo build --release -p escapepod --features 'demux train'$([[ $USE_GPU -eq 1 ]] && echo ' gpu')" >&2
     exit 1
 fi
 if [ ! -f "$POD5_FILE" ]; then

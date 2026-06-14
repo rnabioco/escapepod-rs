@@ -72,13 +72,13 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --profile dist --target ${{ matrix.target }} -p escapepod-cli
+        run: cross build --profile dist --target ${{ matrix.target }} -p escapepod
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
+        run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 

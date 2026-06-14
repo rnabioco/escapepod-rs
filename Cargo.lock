@@ -811,15 +811,6 @@ dependencies = [
 name = "escapepod"
 version = "0.5.0"
 dependencies = [
- "escapepod-demux",
- "escapepod-pod5",
- "escapepod-signal",
-]
-
-[[package]]
-name = "escapepod-cli"
-version = "0.5.0"
-dependencies = [
  "anyhow",
  "arrow",
  "bstr",
@@ -827,6 +818,7 @@ dependencies = [
  "clap",
  "csv",
  "escapepod-demux",
+ "escapepod-pod5",
  "escapepod-signal",
  "flate2",
  "indicatif",

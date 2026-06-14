@@ -20,7 +20,7 @@ The workspace is split into five crates:
 | `escapepod-pod5` | POD5 format I/O (reader, writer, VBZ, footer, block-level merge/filter/subset) |
 | `escapepod-signal` | Signal algorithms (DTW, resquiggle, segmentation); **re-exports the full `escapepod-pod5` surface** |
 | `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing (DTW + SVM classifier, optional CNN adapter detection and GPU acceleration) |
-| `escapepod-cli` | The `escpod` binary |
+| `escapepod` | The `escpod` CLI binary (default `cli` feature) plus an optional umbrella library re-exporting the layers below |
 | `escapepod-python` | pyo3 bindings |
 
 ### escapepod-pod5
@@ -43,9 +43,9 @@ Barcode demultiplexing. Separate crate; the CLI pulls it in only when built with
 
 **Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `train` (feature `train`), `adapter_cnn` (feature `cnn-detect`).
 
-### escapepod-cli
+### escapepod
 
-The `escpod` binary. Stable commands (always built): `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`. Experimental commands live behind Cargo features — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install escapepod` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod::signal`) without the CLI's dependency tree. Stable commands (built with `cli`): `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`. Experimental commands live behind Cargo features — see below.
 
 ## Quick Reference
 
@@ -109,10 +109,12 @@ match result {
 
 ## Feature Flags
 
-### `escapepod-cli`
+### `escapepod`
 
 | Feature | Effect |
 |---------|--------|
+| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal` |
+| `pod5` / `signal` / `demux` | Library re-exports of each layer (for `default-features = false` consumers) |
 | `experimental` | Unlocks `repack`, `resquiggle`, `index` |
 | `demux` | Unlocks the `demux` subcommand tree (detect / fingerprint / classify / split / train) |
 | `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
@@ -161,7 +163,7 @@ CLI with `--features gpu` transitively enables demux's `gpu` feature.
 | `linfa`, `linfa-svm` | SVM training (feature `train`) |
 | `tract-onnx` | CNN adapter detection (feature `cnn-detect`) |
 
-### escapepod-cli
+### escapepod (`cli` feature)
 
 | Crate | Purpose |
 |-------|---------|

@@ -1,30 +1,34 @@
 //! Pure-Rust toolkit for Oxford Nanopore POD5 data.
 //!
-//! `escapepod` is an umbrella crate: it bundles the escapepod workspace layers
-//! behind feature flags and re-exports each as a module, so you can depend on a
-//! single crate and pull in exactly the layers you need.
+//! The headline artifact of this crate is the **`escpod` command-line tool**:
 //!
-//! | Module                       | Crate                                                         | Feature       |
-//! |------------------------------|---------------------------------------------------------------|---------------|
-//! | [`pod5`]                     | [`escapepod-pod5`](https://crates.io/crates/escapepod-pod5)   | `pod5`        |
-//! | [`signal`]                   | [`escapepod-signal`](https://crates.io/crates/escapepod-signal) | `signal`    |
-//! | [`demux`]                    | [`escapepod-demux`](https://crates.io/crates/escapepod-demux) | `demux`       |
+//! ```sh
+//! cargo install escapepod   # installs the `escpod` binary
+//! ```
 //!
-//! The `pod5` and `signal` features are enabled by default. `demux` is opt-in
-//! (it pulls in serde/linfa/tract-onnx); the `train`, `gpu`, and `cnn-detect`
-//! features forward to the demux crate and each imply `demux`.
+//! This library surface is secondary. It is an umbrella that re-exports the
+//! escapepod workspace layers behind feature flags, so library consumers can
+//! depend on a single crate and pull in exactly the layers they need without
+//! the CLI's dependency tree:
 //!
 //! ```toml
-//! # Just the format + signal layers (default):
-//! escapepod = "0.5"
-//!
-//! # Add barcode demultiplexing:
-//! escapepod = { version = "0.5", features = ["demux"] }
+//! # Library only — no clap/noodles/etc.:
+//! escapepod = { version = "0.5", default-features = false, features = ["signal"] }
 //! ```
+//!
+//! | Module       | Crate                                                            | Feature   |
+//! |--------------|------------------------------------------------------------------|-----------|
+//! | [`pod5`]     | [`escapepod-pod5`](https://crates.io/crates/escapepod-pod5)       | `pod5`    |
+//! | [`signal`]   | [`escapepod-signal`](https://crates.io/crates/escapepod-signal)  | `signal`  |
+//! | [`demux`]    | [`escapepod-demux`](https://crates.io/crates/escapepod-demux)    | `demux`   |
+//!
+//! The default `cli` feature enables `signal` (and `pod5` transitively).
 //!
 //! # Example
 //!
 //! ```no_run
+//! # #[cfg(feature = "signal")]
+//! # fn main() -> Result<(), escapepod::signal::Error> {
 //! use escapepod::signal::Reader;
 //!
 //! let reader = Reader::open("example.pod5")?;
@@ -32,7 +36,10 @@
 //!     let read = read_result?;
 //!     println!("Read: {}", read.read_id);
 //! }
-//! # Ok::<(), escapepod::signal::Error>(())
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "signal"))]
+//! # fn main() {}
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -44,7 +51,7 @@ pub use escapepod_pod5 as pod5;
 /// Signal-processing algorithms — DTW, resquiggle, segmentation.
 ///
 /// Re-exports the [`pod5`] format surface as well, so this is the single
-/// entry point most consumers want.
+/// entry point most library consumers want.
 #[cfg(feature = "signal")]
 pub use escapepod_signal as signal;
 
