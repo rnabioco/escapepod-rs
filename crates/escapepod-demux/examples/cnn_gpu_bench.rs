@@ -7,40 +7,47 @@
 //!
 //! Needs benchmarks/adapter_cnn_rna004.{onnx,weights} (gitignored; generated
 //! by scripts/export_adapter_cnn_to_onnx.py + dump_adapter_cnn_weights.py).
-#![cfg(all(feature = "gpu", feature = "cnn-detect"))]
 
-use std::path::PathBuf;
-use std::time::Instant;
-
-use escapepod_demux::{AdapterCnn, CnnCompute, GpuCnn};
-
-fn artifact(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks")
-        .join(name)
-}
-
-// Deterministic LCG — avoids a dev-dep on rand for an example.
-fn synth(n: usize) -> Vec<Vec<f32>> {
-    let mut s: u64 = 0x1234_5678;
-    let mut next = || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((s >> 33) as u32) as f32 / u32::MAX as f32
-    };
-    (0..n)
-        .map(|_| {
-            let len = 3000 + (next() * 4000.0) as usize;
-            let step = 1200 + (next() * 3000.0) as usize;
-            (0..len)
-                .map(|i| (if i < step { 95.0 } else { 75.0 }) + 8.0 * (next() - 0.5))
-                .collect()
-        })
-        .collect()
-}
-
+// Without the GPU + CNN features there is nothing to bench; keep a `main` so
+// `cargo build --all-targets` (default features) still compiles this example.
+#[cfg(not(all(feature = "gpu", feature = "cnn-detect")))]
 fn main() {
+    eprintln!("cnn_gpu_bench requires: --features \"gpu cnn-detect\"");
+}
+
+#[cfg(all(feature = "gpu", feature = "cnn-detect"))]
+fn main() {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use escapepod_demux::{AdapterCnn, CnnCompute, GpuCnn};
+
+    fn artifact(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks")
+            .join(name)
+    }
+
+    // Deterministic LCG — avoids a dev-dep on rand for an example.
+    fn synth(n: usize) -> Vec<Vec<f32>> {
+        let mut s: u64 = 0x1234_5678;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as u32) as f32 / u32::MAX as f32
+        };
+        (0..n)
+            .map(|_| {
+                let len = 3000 + (next() * 4000.0) as usize;
+                let step = 1200 + (next() * 3000.0) as usize;
+                (0..len)
+                    .map(|i| (if i < step { 95.0 } else { 75.0 }) + 8.0 * (next() - 0.5))
+                    .collect()
+            })
+            .collect()
+    }
+
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
