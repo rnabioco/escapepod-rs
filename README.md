@@ -108,6 +108,11 @@ from the [KleistLab](https://github.com/KleistLab):
   `escapepod-signal::resquiggle` is inspired by fishnet. Per the original
   authors' GPL-3.0 license, those source files are tagged
   `SPDX-License-Identifier: GPL-3.0-or-later`.
+- **[Remora](https://github.com/nanoporetech/remora)** — Oxford Nanopore
+  Technologies. Referenced for signal-to-sequence anchoring conventions.
+- **[nanopolish](https://github.com/jts/nanopolish)** by Jared Simpson
+  et al. Referenced for its event-alignment approach to signal-to-base
+  assignment.
 
 ### Signal compression
 
