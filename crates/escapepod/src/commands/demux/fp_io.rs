@@ -628,7 +628,10 @@ mod tests {
         .unwrap();
         // Needs a `.parquet` suffix so `detect_format` reads it as parquet
         // rather than falling back to CSV (production files are `*.parquet`).
-        let f = tempfile::Builder::new().suffix(".parquet").tempfile().unwrap();
+        let f = tempfile::Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .unwrap();
         let mut writer = ArrowWriter::try_new(f.reopen().unwrap(), schema.clone(), None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
