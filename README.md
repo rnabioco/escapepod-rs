@@ -56,10 +56,9 @@ cargo install --git https://github.com/rnabioco/escapepod-rs --features demux
 
 ## License
 
-MIT, with one exception: the `resquiggle` module under
-`crates/escapepod-signal/src/resquiggle/` is licensed under GPL-3.0-or-later
-because it is inspired by [fishnet](https://github.com/dnbrckr/fishnet)
-(Brickner et al.). Per-file SPDX identifiers are authoritative.
+MIT, except the `resquiggle` module
+(`crates/escapepod-signal/src/resquiggle/`), which is GPL-3.0-or-later.
+Per-file SPDX identifiers are authoritative.
 
 ## Acknowledgments
 
