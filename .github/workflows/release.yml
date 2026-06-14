@@ -15,7 +15,7 @@ jobs:
     env:
       RUSTFLAGS: -Dwarnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -53,7 +53,7 @@ jobs:
             use_cross: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -72,13 +72,13 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --profile dist --target ${{ matrix.target }} -p escapepod-cli
+        run: cross build --profile dist --target ${{ matrix.target }} -p escapepod
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod-cli
+        run: cargo build --profile dist --target ${{ matrix.target }} -p escapepod
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -89,7 +89,7 @@ jobs:
           cd ../../..
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: escpod-${{ matrix.target }}
           path: escpod-${{ github.ref_name }}-${{ matrix.target }}.*
@@ -99,10 +99,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -125,7 +125,7 @@ jobs:
           echo "$body" > release_notes.md
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: release_notes.md
           files: |

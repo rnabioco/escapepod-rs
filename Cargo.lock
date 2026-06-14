@@ -808,7 +808,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "escapepod-cli"
+name = "escapepod"
 version = "0.5.0"
 dependencies = [
  "anyhow",
@@ -818,6 +818,7 @@ dependencies = [
  "clap",
  "csv",
  "escapepod-demux",
+ "escapepod-pod5",
  "escapepod-signal",
  "flate2",
  "indicatif",

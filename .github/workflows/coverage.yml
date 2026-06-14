@@ -14,7 +14,7 @@ jobs:
     name: llvm-cov
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -49,7 +49,7 @@ jobs:
         run: cargo llvm-cov report --summary-only --fail-under-lines 60
 
       - name: Upload LCOV report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
           path: lcov.info
@@ -65,7 +65,7 @@ jobs:
           --features escapepod-demux/train
           --html --output-dir coverage-html
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-html

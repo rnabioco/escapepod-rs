@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-escapepod-rs is a pure Rust implementation for reading and writing POD5 files, the native file format for Oxford Nanopore sequencing data. The workspace splits the library into two layers — `escapepod-pod5` for format I/O and `escapepod-signal` for signal-processing algorithms — plus a CLI tool (`escapepod-cli`) and Python bindings (`escapepod-python`).
+escapepod-rs is a pure Rust implementation for reading and writing POD5 files, the native file format for Oxford Nanopore sequencing data. The workspace splits the library into two layers — `escapepod-pod5` for format I/O and `escapepod-signal` for signal-processing algorithms — plus the `escapepod` crate (the `escpod` CLI binary, with an optional umbrella library re-exporting the layers) and Python bindings (`escapepod-python`).
 
 ## Requirements
 
@@ -23,7 +23,7 @@ cargo build --release --features train
 # driver + libnvrtc at runtime — no nvcc required at build time).
 # The pixi `gpu` env provides libnvrtc via conda-forge's cuda-nvrtc package
 # and sets LD_LIBRARY_PATH automatically:
-pixi run -e gpu cargo build --release --features gpu -p escapepod-cli
+pixi run -e gpu cargo build --release --features gpu -p escapepod
 
 # Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`):
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
@@ -61,7 +61,7 @@ pixi run -e dev check        # cargo check
 pixi run -e dev clippy       # cargo clippy --workspace --all-targets
 
 # mold + GPU:
-pixi run -e dev-gpu cargo build --features gpu -p escapepod-cli
+pixi run -e dev-gpu cargo build --features gpu -p escapepod
 ```
 
 ### Build baseline and SLURM builds
@@ -137,7 +137,7 @@ Runs `inspect summary`, `view`, `merge`, `filter`, `subset` via hyperfine agains
 
 ```bash
 # 1. build with symbols kept
-cargo build --profile release-with-debug -p escapepod-cli
+cargo build --profile release-with-debug -p escapepod
 # 2. record with samply (pixi-provided binary recommended)
 samply record target/release-with-debug/escpod <args>
 # 3. flamegraph-style view in browser
@@ -163,7 +163,7 @@ escpod -q merge …                         # errors only
 - **escapepod-pod5**: POD5 format I/O layer — reader, writer, VBZ compression, footer parsing, block-level merge/filter/repack/subset operations.
 - **escapepod-signal**: Signal-processing algorithms (DTW, resquiggle, segmentation) layered on top of `escapepod-pod5`. Re-exports the pod5 surface so downstream consumers can depend on a single crate.
 - **escapepod-demux**: WarpDemuX-compatible barcode demultiplexing — SVM model loaders, DTW+SVM classifier, Platt scaling, optional SVM training (`train`), GPU DTW batch classify (`gpu`), ADAPTed CNN adapter detection (`cnn-detect`). Depends on `escapepod-signal` for DTW and fingerprint primitives.
-- **escapepod-cli**: CLI binary (`escpod`). Demux commands require building with `--features demux` (pulls in `escapepod-demux`); forward features `train`, `gpu`, `cnn-detect` propagate to the demux crate.
+- **escapepod**: the `escpod` CLI binary (built by the default `cli` feature, so `cargo install escapepod` ships the tool) plus an optional umbrella library that re-exports `pod5`/`signal`/`demux` behind feature flags for `default-features = false` consumers. Demux commands require building with `--features demux` (pulls in `escapepod-demux`); forward features `train`, `gpu`, `cnn-detect` propagate to the demux crate.
 - **escapepod-python**: pyo3 bindings.
 
 ### POD5 File Format
@@ -268,7 +268,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 - **serde/serde_json**: JSON model serialization (demux)
 - **linfa/linfa-svm**: SVM training (optional, requires `train` feature)
 
-### CLI (escapepod-cli)
+### CLI (escapepod, `cli` feature)
 - **clap**: CLI argument parsing
 - **rayon**: Parallel iteration for merge operations
 - **tabled**: Table formatting for CLI output

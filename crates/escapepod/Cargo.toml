@@ -1,0 +1,108 @@
+[package]
+name = "escapepod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust toolkit for Oxford Nanopore POD5 — the `escpod` CLI plus an optional library re-exporting format I/O, signal processing, and barcode demultiplexing"
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords = ["bioinformatics", "cli", "nanopore", "pod5", "sequencing"]
+categories = ["command-line-utilities", "science"]
+
+# The `escpod` binary is the primary artifact: `cargo install escapepod`
+# builds it via the default `cli` feature. Library-only consumers can opt out
+# with `default-features = false` and pick the layers they want (pod5/signal/
+# demux), which keeps clap/noodles/etc. out of their dependency graph.
+[[bin]]
+name = "escpod"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+# Library re-export layers (see src/lib.rs). Optional so a `default-features =
+# false` build pulls in only the layers the consumer asks for.
+escapepod-pod5 = { workspace = true, optional = true }
+escapepod-signal = { workspace = true, optional = true }
+escapepod-demux = { workspace = true, optional = true }
+
+# CLI-only dependencies. All optional and rolled into the `cli` feature so the
+# library surface stays lean.
+anyhow = { version = "1", optional = true }
+arrow = { workspace = true, optional = true }
+bstr = { version = "1", optional = true }
+chrono = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+csv = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }
+indicatif = { workspace = true, optional = true }
+# BAM file support
+noodles-bam = { version = "0.88", optional = true }
+noodles-bgzf = { version = "0.46", optional = true }
+noodles-core = { version = "0.19", optional = true }
+noodles-csi = { version = "0.55", optional = true }
+noodles-sam = { version = "0.84", optional = true }
+owo-colors = { version = "4", optional = true }
+parquet = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tabled = { version = "0.20", features = ["ansi"], optional = true }
+tempfile = { version = "3", optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+walkdir = { version = "2", optional = true }
+
+[features]
+# `cargo install escapepod` ships the `escpod` CLI out of the box.
+default = ["cli"]
+
+# Library re-export layers. `signal` pulls the pod5 layer transitively.
+pod5 = ["dep:escapepod-pod5"]
+signal = ["dep:escapepod-signal"]
+demux = ["dep:escapepod-demux"]
+
+# The `escpod` binary and everything it links. Implies the `signal` layer.
+cli = [
+    "signal",
+    "dep:anyhow",
+    "dep:arrow",
+    "dep:bstr",
+    "dep:chrono",
+    "dep:clap",
+    "dep:csv",
+    "dep:flate2",
+    "dep:indicatif",
+    "dep:noodles-bam",
+    "dep:noodles-bgzf",
+    "dep:noodles-core",
+    "dep:noodles-csi",
+    "dep:noodles-sam",
+    "dep:owo-colors",
+    "dep:parquet",
+    "dep:rayon",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tabled",
+    "dep:tempfile",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:uuid",
+    "dep:walkdir",
+]
+
+# CNN-based adapter detection (requires a local ADAPTed-exported .onnx model
+# at runtime; weights are CC BY-NC 4.0 and not bundled).
+cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
+experimental = []
+# GPU-accelerated DTW for demux classify and train-svm (requires CUDA
+# driver + libnvrtc at runtime).
+gpu = ["demux", "escapepod-demux/gpu"]
+# Training support for demux SVM models (implies `demux`).
+train = ["demux", "escapepod-demux/train"]
+
+[package.metadata.docs.rs]
+# Document the library layers, not the CLI deps.
+no-default-features = true
+features = ["pod5", "signal", "demux"]
