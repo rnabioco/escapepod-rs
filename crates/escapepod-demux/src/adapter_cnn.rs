@@ -166,7 +166,7 @@ impl AdapterCnn {
 /// Non-overlapping mean pool. Last block is zero-padded to `factor` if the
 /// input length isn't a multiple — matches ADAPTed's `efficient_average_pooling`
 /// behaviour (extends with zeros, then averages).
-fn mean_pool(signal: &[f32], factor: usize) -> Vec<f32> {
+pub(crate) fn mean_pool(signal: &[f32], factor: usize) -> Vec<f32> {
     debug_assert!(factor >= 1);
     let full = signal.len() / factor;
     let rem = signal.len() % factor;
@@ -189,7 +189,7 @@ fn mean_pool(signal: &[f32], factor: usize) -> Vec<f32> {
 /// In-place `(x - median) / MAD` where `MAD = median(|x - median|)`. Returns
 /// a fresh vector. NaN-safe — any non-finite input is replaced with `-5.0`
 /// (ADAPTed's `SCORE_EXCL`) after the transform.
-fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
+pub(crate) fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
     if signal.is_empty() {
         return Vec::new();
     }
