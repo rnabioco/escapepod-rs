@@ -114,6 +114,26 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
 ./benchmarks/benchmark_demux.sh --model WDX10_rna004_v1_0   # larger DTW workload
 ```
 
+#### Example sweep (2026-06-14, parallel fan-out; AlaRS_all20_b4 real run)
+
+`benchmark_demux_matrix.sh` across WDX4/6/10 × {4k bundled, 25k, 100k real}
+× {cpu, gpu}, 18 cells fanned out concurrently (cpu `-c 24`, gpu A30). The
+GPU classify (DTW) only earns its keep at scale; at 4k reads NVRTC compile +
+H2D transfer dominate.
+
+| model | n_reads | escpod CPU s | escpod GPU s | speedup CPU | speedup GPU |
+|---|---:|---:|---:|---:|---:|
+| WDX4  | 3,786  | 1.81  | 1.57  | 17.6× | 20.3× |
+| WDX4  | 55,864 | 30.23 | **10.00** | 3.8× | **11.5×** |
+| WDX6  | 55,864 | 43.14 | **10.71** | 2.8× | **11.1×** |
+| WDX10 | 3,786  | 2.85  | 3.53  | 12.3× | 9.9× |
+| WDX10 | 55,864 | 60.44 | **12.06** | 1.6× | **7.9×** |
+
+At 100k reads the GPU is **~5× faster than escpod-CPU** for the heaviest model
+(WDX10: 60.4 → 12.1 s) — DTW dominates and the A30 pays off. At 4k it's within
+noise or slower. Agreement (default LLR path) is 93–96% across the sweep and is
+model/boundary-bound, not affected by the device.
+
 #### Harness scripts (2026-06-14)
 
 | Script | Purpose |
