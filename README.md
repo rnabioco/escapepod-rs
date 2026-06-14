@@ -105,9 +105,7 @@ from the [KleistLab](https://github.com/KleistLab):
 
 - **[fishnet](https://www.researchsquare.com/article/rs-8345719/v1)** by
   Brickner et al. The banded DP refinement and signal rescaling in
-  `escapepod-signal::resquiggle` is inspired by fishnet. Per the original
-  authors' GPL-3.0 license, those source files are tagged
-  `SPDX-License-Identifier: GPL-3.0-or-later`.
+  `escapepod-signal::resquiggle` is inspired by fishnet.
 - **[Remora](https://github.com/nanoporetech/remora)** — Oxford Nanopore
   Technologies. Referenced for signal-to-sequence anchoring conventions.
 - **[nanopolish](https://github.com/jts/nanopolish)** by Jared Simpson
