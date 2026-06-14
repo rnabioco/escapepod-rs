@@ -23,10 +23,13 @@ use arrow::array::{Array, AsArray, Float32Array, Float64Array, LargeStringArray,
 use arrow::datatypes::{Float32Type, Float64Type};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
+// Used only by the `train`-gated labeled-fingerprint loaders below.
+#[cfg(feature = "train")]
+use std::collections::HashMap;
+#[cfg(feature = "train")]
+use std::io::{BufRead, BufReader};
 use uuid::Uuid;
 
 /// String-column accessor that handles both Arrow `Utf8` (StringArray) and
@@ -87,6 +90,9 @@ impl<'a> FloatCol<'a> {
 
 /// Result type for labeled fingerprint loads (matches `train_svm::FingerprintData`):
 /// `(rows, labels, barcode_names, total_rows_seen)`.
+///
+/// Labeled loading is only consumed by the `train`-gated `train-svm` command.
+#[cfg(feature = "train")]
 pub type LabeledFingerprintData = (Vec<Vec<f64>>, Vec<i32>, Vec<String>, usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +119,7 @@ fn detect_format(path: &Path) -> FpFormat {
 /// dropped N` line on stderr). This catches the silent-truncation bug
 /// where a malformed CSV cell used to produce a short fingerprint row
 /// that broke model validation downstream.
+#[cfg(feature = "train")]
 pub fn read_labeled_fingerprints(
     path: &Path,
     subsample: Option<(usize, u64)>,
@@ -145,6 +152,7 @@ pub fn read_query_fingerprints_f32(path: &Path) -> Result<Vec<(Uuid, Vec<f32>)>>
 // CSV readers
 // ---------------------------------------------------------------------
 
+#[cfg(feature = "train")]
 fn read_labeled_csv(
     path: &Path,
     subsample: Option<(usize, u64)>,
@@ -338,6 +346,7 @@ where
     Ok(fingerprints)
 }
 
+#[cfg(feature = "train")]
 fn parse_csv_row(rest: &str) -> Option<Vec<f64>> {
     let mut out = Vec::with_capacity(8);
     for s in rest.split(',') {
@@ -350,6 +359,7 @@ fn parse_csv_row(rest: &str) -> Option<Vec<f64>> {
 // Parquet readers
 // ---------------------------------------------------------------------
 
+#[cfg(feature = "train")]
 fn read_labeled_parquet(
     path: &Path,
     subsample: Option<(usize, u64)>,
@@ -577,6 +587,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
+    #[cfg(feature = "train")]
     fn write_labeled_csv(rows: &[(&str, &str, &[f64])]) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "read_id,barcode,f0,f1,f2").unwrap();
@@ -615,7 +626,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let f = NamedTempFile::new().unwrap();
+        // Needs a `.parquet` suffix so `detect_format` reads it as parquet
+        // rather than falling back to CSV (production files are `*.parquet`).
+        let f = tempfile::Builder::new().suffix(".parquet").tempfile().unwrap();
         let mut writer = ArrowWriter::try_new(f.reopen().unwrap(), schema.clone(), None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
@@ -632,6 +645,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "train")]
     #[test]
     fn csv_and_parquet_agree() {
         let owned = make_labeled_rows(100, 4);
@@ -657,6 +671,7 @@ mod tests {
         assert_eq!(csv_total, 100);
     }
 
+    #[cfg(feature = "train")]
     #[test]
     fn parquet_subsample_caps_classes() {
         let owned = make_labeled_rows(300, 3);
