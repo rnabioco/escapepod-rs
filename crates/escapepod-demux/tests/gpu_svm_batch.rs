@@ -65,6 +65,7 @@ fn make_svm_model(training: Vec<Vec<f64>>, labels: Vec<i32>) -> DtwSvmModel {
             power: 1.0,
         },
         window: None,
+        penalty: 0.0,
         label_mapper,
         thresholds: None,
         prob_a: None,
@@ -132,6 +133,62 @@ fn parity_svm_classify_batch() {
 /// `coef_dev = dual_coef` branch in `GpuSvmContext::new` and the
 /// `intercept != 0` path. Synthetic 3-class model with hand-crafted
 /// dual coefficients per pair.
+/// Parity check with a nonzero DTW warping `penalty` (as carried by real
+/// WarpDemuX models, e.g. 0.1). Validates that the GPU DTW kernel applies the
+/// `penalty^2` warp cost identically to the CPU `dtw_distance_penalty`, so
+/// `--gpu` classify matches CPU classify (and therefore WarpDemuX).
+#[test]
+fn parity_svm_classify_batch_penalty() {
+    let Some(ctx) = try_context() else { return };
+
+    let training: Vec<Vec<f64>> = vec![
+        (0..110).map(|k| 0.1 * ((k % 7) as f64)).collect(),
+        (0..110).map(|k| 0.5 + 0.05 * (k as f64).sin()).collect(),
+        (0..110).map(|k| 0.9 - 0.02 * ((k % 5) as f64)).collect(),
+        (0..110).map(|k| 0.05 * ((k % 11) as f64)).collect(),
+    ];
+    let labels = vec![0i32, 1, 2, 0];
+    let mut model = make_svm_model(training, labels);
+    model.penalty = 0.1; // dtaidistance-style warp penalty
+
+    let mut rng = StdRng::seed_from_u64(99);
+    let queries: Vec<Vec<f64>> = (0..32)
+        .map(|_| (0..110).map(|_| rng.random::<f64>()).collect())
+        .collect();
+
+    let cpu_results: Vec<_> = queries
+        .iter()
+        .map(|q| classify_with_svm(&model, q))
+        .collect();
+
+    let gpu_results = escapepod_demux::classify_with_svm_batch_gpu_with_ctx(
+        &ctx,
+        &model,
+        &queries,
+        escapepod_demux::DEFAULT_GPU_CHUNK_CELLS,
+    )
+    .expect("gpu svm batch (penalty) ok");
+
+    assert_eq!(gpu_results.len(), cpu_results.len());
+    for (i, ((cpu_probs, cpu_res), (gpu_probs, gpu_res))) in
+        cpu_results.iter().zip(gpu_results.iter()).enumerate()
+    {
+        assert_eq!(
+            cpu_res.predicted_barcode, gpu_res.predicted_barcode,
+            "penalty prediction mismatch on query {i}: cpu={} gpu={}",
+            cpu_res.predicted_barcode, gpu_res.predicted_barcode
+        );
+        for (k, (&cp, &gp)) in cpu_probs.iter().zip(gpu_probs.iter()).enumerate() {
+            let diff = (cp - gp).abs();
+            let tol = (1e-3_f64).max(1e-3 * cp.abs());
+            assert!(
+                diff <= tol,
+                "penalty probability mismatch on query {i} class {k}: cpu={cp} gpu={gp} diff={diff} tol={tol}"
+            );
+        }
+    }
+}
+
 #[test]
 fn parity_svm_classify_batch_real_ovo() {
     let Some(ctx) = try_context() else { return };

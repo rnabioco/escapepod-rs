@@ -13,7 +13,8 @@ mod kernel;
 pub mod cuda;
 
 pub use distance::{
-    dtw_distance, dtw_distance_bounded, dtw_distance_matrix, dtw_distance_matrix_blocked,
+    dtw_distance, dtw_distance_bounded, dtw_distance_bounded_penalty, dtw_distance_matrix,
+    dtw_distance_matrix_blocked, dtw_distance_penalty,
 };
 pub use fingerprint::{Fingerprint, NormMethod, normalize_fingerprint};
 pub use kernel::{distance_to_kernel, distance_to_kernel_auto};

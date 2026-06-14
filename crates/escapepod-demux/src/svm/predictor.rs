@@ -491,6 +491,7 @@ impl<'a> SvmPredictor<'a> {
             query,
             &self.model.training_fingerprints,
             self.model.window,
+            self.model.penalty,
             ws,
         );
 

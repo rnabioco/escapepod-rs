@@ -228,6 +228,7 @@ pub mod gpu_pipeline {
         max_m: usize,       // max ref length (in samples)
         max_chunk_q: usize, // capacity of dist/decisions buffers
         window: Option<usize>,
+        penalty: f32, // DTW warping penalty (dtaidistance-compatible)
         gamma: f32,
         power: f32,
     }
@@ -380,6 +381,7 @@ pub mod gpu_pipeline {
                 max_m,
                 max_chunk_q,
                 window: model.window,
+                penalty: model.penalty,
                 gamma: model.kernel_params.gamma as f32,
                 power: model.kernel_params.power as f32,
             })
@@ -471,6 +473,7 @@ pub mod gpu_pipeline {
                         max_n as i32,
                         self.max_m as i32,
                         window_i32,
+                        self.penalty,
                     ),
                 )?;
             }

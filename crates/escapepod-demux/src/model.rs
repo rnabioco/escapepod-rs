@@ -74,6 +74,12 @@ pub struct DtwSvmModel {
     #[serde(default)]
     pub window: Option<usize>,
 
+    /// DTW warping penalty (dtaidistance `penalty`): a fixed cost added to the
+    /// non-diagonal DP transitions. WarpDemuX models carry a nonzero value
+    /// (e.g. 0.1) and must apply it for distance parity. Defaults to 0.0.
+    #[serde(default)]
+    pub penalty: f32,
+
     /// Maps class index (0, 1, 2, ...) to barcode ID (4, 5, 6, ...).
     pub label_mapper: HashMap<usize, i32>,
 
@@ -586,6 +592,7 @@ mod tests {
             classes: vec![4, 5, 6],
             kernel_params: KernelParams::default(),
             window: None,
+            penalty: 0.0,
             label_mapper,
             thresholds: None,
             prob_a: None,

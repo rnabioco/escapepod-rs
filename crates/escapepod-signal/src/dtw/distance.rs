@@ -31,7 +31,24 @@ use rayon::prelude::*;
 /// assert_eq!(distance, 0.0);
 /// ```
 pub fn dtw_distance(a: &[f32], b: &[f32], window: Option<usize>) -> f32 {
-    dtw_distance_bounded(a, b, window, f32::INFINITY)
+    dtw_distance_bounded_penalty(a, b, window, f32::INFINITY, 0.0)
+}
+
+/// Compute DTW distance with a warping penalty.
+///
+/// Matches `dtaidistance`'s `penalty` parameter (used by WarpDemuX): a fixed
+/// cost added to the two non-diagonal (expansion / compression) transitions of
+/// the DP recurrence, so the alignment is biased toward the diagonal:
+///
+/// `D[i,j] = (a_i - b_j)^2 + min(D[i-1,j-1], D[i-1,j] + penalty^2, D[i,j-1] + penalty^2)`
+///
+/// `penalty` matches dtaidistance's parameter: it is given in the *non-squared*
+/// distance space, so each warping step contributes `penalty^2` to this DP's
+/// squared cumulative cost (the final distance is `sqrt(D[n,m])`). Verified
+/// against `dtaidistance.dtw.distance(..., penalty=p, use_c=True)`. `penalty ==
+/// 0.0` is bit-identical to [`dtw_distance`].
+pub fn dtw_distance_penalty(a: &[f32], b: &[f32], window: Option<usize>, penalty: f32) -> f32 {
+    dtw_distance_bounded_penalty(a, b, window, f32::INFINITY, penalty)
 }
 
 /// Compute DTW distance with early abandonment.
@@ -51,12 +68,34 @@ pub fn dtw_distance(a: &[f32], b: &[f32], window: Option<usize>) -> f32 {
 ///
 /// The DTW distance, or `f32::INFINITY` if early abandonment occurred.
 pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_bound: f32) -> f32 {
+    dtw_distance_bounded_penalty(a, b, window, upper_bound, 0.0)
+}
+
+/// Core DTW with both early abandonment and a warping `penalty`. See
+/// [`dtw_distance_bounded`] and [`dtw_distance_penalty`]. The penalty is added
+/// to the expansion (`prev[j]`) and compression (`curr[j-1]`) neighbors before
+/// the `min`; with `penalty == 0.0` (`x + 0.0 == x` for finite and ±INF) the
+/// arithmetic is identical to the no-penalty path.
+pub fn dtw_distance_bounded_penalty(
+    a: &[f32],
+    b: &[f32],
+    window: Option<usize>,
+    upper_bound: f32,
+    penalty: f32,
+) -> f32 {
     let n = a.len();
     let m = b.len();
 
     if n == 0 || m == 0 {
         return f32::INFINITY;
     }
+
+    // dtaidistance's `penalty` is expressed in the *non-squared* distance space,
+    // but this DP accumulates squared local costs (`(a-b)^2`) and takes a single
+    // `sqrt` at the end. To match, each warping step adds `penalty^2` to the
+    // squared cumulative (verified: dtaidistance `distance([0,0,0],[0], penalty=p)`
+    // == sqrt(2 * p^2)). `penalty == 0.0` keeps `pen_sq == 0.0`, a no-op.
+    let pen_sq = penalty * penalty;
 
     // Classical Sakoe-Chiba: the endpoint `(n, m)` itself has to lie in the
     // band. If `|n - m| > w` no alignment is possible and the DP would
@@ -126,7 +165,9 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
             for k in 0..len {
                 let diff = ai - b_slice[k];
                 cost[k] = diff * diff;
-                pm[k] = prev_left[k].min(prev_right[k]);
+                // Diagonal (prev_left) takes no penalty; expansion (prev_right)
+                // does. `+ 0.0` is a no-op for the default penalty.
+                pm[k] = prev_left[k].min(prev_right[k] + pen_sq);
             }
         }
 
@@ -139,7 +180,8 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
         let pm = &prev_min_buf[..len];
         let out = &mut curr[j_start..=j_end];
         for k in 0..len {
-            let v = cost[k] + pm[k].min(left);
+            // Compression (left neighbor, `curr[j-1]`) takes the penalty too.
+            let v = cost[k] + pm[k].min(left + pen_sq);
             out[k] = v;
             left = v;
             row_min = row_min.min(v);
@@ -407,6 +449,35 @@ mod tests {
         // The actual distance would be 40, so bound of 5 should cause abandonment
         let bounded = dtw_distance_bounded(&a, &b, None, 5.0);
         assert!(bounded.is_infinite());
+    }
+
+    #[test]
+    fn test_dtw_penalty_zero_matches_unpenalized() {
+        // penalty == 0.0 must be bit-identical to the no-penalty path.
+        let a = vec![1.0, 2.0, 3.0, 2.5, 4.0];
+        let b = vec![1.0, 1.5, 3.0, 4.0];
+        assert_eq!(
+            dtw_distance(&a, &b, None),
+            dtw_distance_penalty(&a, &b, None, 0.0)
+        );
+        assert_eq!(
+            dtw_distance(&a, &b, Some(2)),
+            dtw_distance_penalty(&a, &b, Some(2), 0.0)
+        );
+    }
+
+    #[test]
+    fn test_dtw_penalty_forced_warp() {
+        // Aligning [0,0,0] to [0] forces two compression steps, each charged
+        // `penalty^2` in the squared cumulative: D = 2*penalty^2, distance =
+        // sqrt(2)*penalty. Matches dtaidistance: distance([0,0,0],[0],penalty=p).
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![0.0];
+        assert!(dtw_distance_penalty(&a, &b, None, 0.0).abs() < 1e-6);
+        // dtaidistance penalty=0.1 -> sqrt(2 * 0.1^2) = 0.14142...
+        let d = dtw_distance_penalty(&a, &b, None, 0.1);
+        let expected = (2.0f32 * 0.1 * 0.1).sqrt();
+        assert!((d - expected).abs() < 1e-6, "expected {expected}, got {d}");
     }
 
     #[test]

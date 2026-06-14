@@ -231,6 +231,10 @@ impl GpuDtwContext {
                     max_n as i32,
                     max_m as i32,
                     window_i32,
+                    // No warping penalty for the plain distance matrix (used by
+                    // training / reference-mode). The SVM batch path launches
+                    // this kernel directly with the model's penalty.
+                    0.0f32,
                 ),
             )?;
         }
