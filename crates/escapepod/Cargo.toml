@@ -1,0 +1,33 @@
+[package]
+name = "escapepod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust toolkit for Oxford Nanopore POD5 — umbrella crate re-exporting format I/O, signal processing, and barcode demultiplexing behind feature flags"
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords = ["bioinformatics", "nanopore", "pod5", "sequencing"]
+categories = ["parser-implementations", "science"]
+
+[dependencies]
+escapepod-pod5 = { workspace = true, optional = true }
+escapepod-signal = { workspace = true, optional = true }
+escapepod-demux = { workspace = true, optional = true }
+
+[features]
+# Format I/O + signal processing are on by default; demux is opt-in because it
+# pulls in serde/linfa/tract-onnx. Enabling `signal` transitively enables the
+# pod5 layer, which `escapepod-signal` re-exports.
+default = ["pod5", "signal"]
+pod5 = ["dep:escapepod-pod5"]
+signal = ["dep:escapepod-signal"]
+demux = ["dep:escapepod-demux"]
+# Forwarded demux sub-features (each implies `demux`).
+train = ["demux", "escapepod-demux/train"]
+gpu = ["demux", "escapepod-demux/gpu"]
+cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
+
+[package.metadata.docs.rs]
+# Document every layer on docs.rs, including the optional demux surface.
+all-features = true

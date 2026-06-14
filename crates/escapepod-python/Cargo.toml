@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Distributed as a PyPI wheel (maturin), not on crates.io.
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.92"
 repository = "https://github.com/rnabioco/escapepod-rs"
 license = "MIT"
+readme = "README.md"
 
 [workspace.dependencies]
 # Error handling

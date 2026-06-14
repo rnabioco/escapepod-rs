@@ -808,6 +808,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "escapepod"
+version = "0.5.0"
+dependencies = [
+ "escapepod-demux",
+ "escapepod-pod5",
+ "escapepod-signal",
+]
+
+[[package]]
 name = "escapepod-cli"
 version = "0.5.0"
 dependencies = [
