@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.5.1 (2026-06-14)
+
+### Changed
+
+- The CLI now ships from the `escapepod` crate (renamed from
+  `escapepod-cli`), so `cargo install escapepod` installs the `escpod`
+  binary. The same crate doubles as an umbrella library: with
+  `default-features = false` plus `pod5` / `signal` / `demux`, it
+  re-exports each layer (e.g. `escapepod::signal`) without pulling in the
+  CLI's dependency tree. `demux` stays opt-in until it stabilizes.
+- The maturin binary wheel is published as `escapepod` (was
+  `escapepod-cli`) so `pip install escapepod` matches `cargo install`.
+
+### Fixed
+
+- Packaging `readme` pointed at a nonexistent path, which made
+  `cargo package` fail; the workspace now points every publishable crate
+  at the root `README.md`. `escapepod-python` is marked `publish = false`.
+- `demux fingerprint` (test fixture): labeled-Parquet temp files lacked a
+  `.parquet` suffix, so format detection read them as CSV and the parquet
+  loaders failed with an "invalid UTF-8" error.
+
+### Build / Tooling
+
+- Gated the `train`-only labeled-fingerprint loaders behind
+  `#[cfg(feature = "train")]`, removing dead-code warnings from
+  `--features demux` builds.
+- Bumped GitHub Actions to current majors (checkout v6, upload-artifact
+  v7, download-artifact v8, setup-python v6, setup-pixi v0.9.6,
+  action-gh-release v3, actions-netlify v4), clearing the Node 20
+  deprecation warnings.
+
 ## 0.5.0 (2026-04-27)
 
 ### Added
