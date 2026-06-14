@@ -63,6 +63,12 @@ mod train;
 #[cfg(feature = "cnn-detect")]
 pub mod adapter_cnn;
 
+#[cfg(feature = "cnn-detect")]
+mod adapter_cnn_compute;
+
+#[cfg(all(feature = "gpu", feature = "cnn-detect"))]
+mod gpu_cnn;
+
 pub use fingerprint::{
     BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
     compute_std_dev_fingerprint, extract_fingerprint_from_signal,
@@ -95,3 +101,9 @@ pub use train::*;
 
 #[cfg(feature = "cnn-detect")]
 pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError};
+
+#[cfg(feature = "cnn-detect")]
+pub use adapter_cnn_compute::{CnnCompute, CnnComputeError, CnnWeights};
+
+#[cfg(all(feature = "gpu", feature = "cnn-detect"))]
+pub use gpu_cnn::{GpuCnn, GpuCnnError};

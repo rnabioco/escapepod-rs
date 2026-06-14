@@ -37,6 +37,8 @@ __pycache__/
 # scripts/export_adapter_cnn_to_onnx.py, never commit.
 /benchmarks/*.onnx
 /benchmarks/*.pth
+# Flat weight blob derived from the CC BY-NC ONNX (dump_adapter_cnn_weights.py).
+/benchmarks/*.weights
 /.bench_data/
 /.bench_output/
 
