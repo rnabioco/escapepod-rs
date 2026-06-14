@@ -100,7 +100,7 @@ from the [KleistLab](https://github.com/KleistLab):
   `scripts/export_adapter_cnn_to_onnx.py`) and accept ADAPTed's license
   terms separately.
 
-### Signal-to-base resquiggle — fishnet
+### Signal-to-base resquiggle
 
 - **[fishnet](https://www.researchsquare.com/article/rs-8345719/v1)** by
   Brickner et al. The banded DP refinement and signal rescaling in
