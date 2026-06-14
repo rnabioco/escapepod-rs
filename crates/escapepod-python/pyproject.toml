@@ -1,9 +1,13 @@
 [project]
 name = "escapepod"
+description = "Fast Rust-based reading of Oxford Nanopore POD5 signal data (the escapepod Reader bindings)"
+readme = "../../README.md"
+license = "MIT"
 requires-python = ">=3.9"
 classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dynamic = ["version"]
 

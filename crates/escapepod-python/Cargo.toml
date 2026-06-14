@@ -3,7 +3,9 @@ name = "escapepod-python"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Python bindings for escapepod-rs: fast Rust-based reading of Oxford Nanopore POD5 signal data (the `escapepod` module, e.g. `from escapepod import Reader`)"
 repository.workspace = true
+readme.workspace = true
 license.workspace = true
 # Distributed as a PyPI wheel (maturin), not on crates.io.
 publish = false
