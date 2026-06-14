@@ -91,14 +91,19 @@ if [ "$NEED_SRC" -eq 1 ]; then
     fi
     echo ">>> source for large tiers: $SRC_POD5"
 
-    # Build the full ordered read-ID list once, then head -N per tier.
+    # Build an ordered read-ID list once, then head -N per tier. Only the
+    # largest requested tier's worth of IDs are needed, so cap the listing:
+    # `head -n MAXN` closes the pipe and `escpod view` streams per-read and
+    # stops early on SIGPIPE — no full scan of a 50 GB source file.
+    MAXN=0
+    for N in $TIERS; do [ "$N" -gt "$MAXN" ] && MAXN="$N"; done
     ALL_IDS="$OUT_DIR/.src_read_ids.txt"
-    if [ ! -s "$ALL_IDS" ]; then
-        echo ">>> listing source read IDs (one-time)..."
-        "$ESCPOD_BIN" view "$SRC_POD5" | tail -n +2 | cut -f1 > "$ALL_IDS"
+    if [ "$(wc -l < "$ALL_IDS" 2>/dev/null || echo 0)" -lt "$MAXN" ]; then
+        echo ">>> listing first $MAXN source read IDs (one-time)..."
+        "$ESCPOD_BIN" view "$SRC_POD5" | tail -n +2 | head -n "$MAXN" | cut -f1 > "$ALL_IDS" || true
     fi
     TOTAL=$(wc -l < "$ALL_IDS" | tr -d ' ')
-    echo "    source has $TOTAL reads"
+    echo "    listed $TOTAL source reads (cap $MAXN)"
 
     for N in $TIERS; do
         [ "$N" -le 5000 ] && continue
