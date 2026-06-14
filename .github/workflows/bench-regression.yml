@@ -24,7 +24,7 @@ jobs:
     # baseline.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Need full history so we can check out `main` as a baseline.
           fetch-depth: 0
@@ -80,7 +80,7 @@ jobs:
             echo "::warning::Criterion detected a regression — inspect the artifact."
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: criterion-output
