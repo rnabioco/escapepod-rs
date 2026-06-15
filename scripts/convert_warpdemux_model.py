@@ -163,6 +163,10 @@ def convert_model(model, output_path: Path) -> None:
     # DTW window
     window = int(model.window) if model.window else None
 
+    # DTW warping penalty (dtaidistance `penalty`). WarpDemuX models carry a
+    # nonzero value (e.g. 0.1) that must be applied for DTW-distance parity.
+    penalty = float(model.penalty) if getattr(model, "penalty", None) else 0.0
+
     # Label mapper: class_index -> barcode_id
     # WarpDemuX's label_mapper maps class_idx -> barcode_id
     label_mapper = {str(k): int(v) for k, v in model.label_mapper.items()}
@@ -199,6 +203,8 @@ def convert_model(model, output_path: Path) -> None:
 
     if window is not None:
         output["window"] = window
+    if penalty:
+        output["penalty"] = penalty
     if thresholds is not None:
         output["thresholds"] = thresholds
     if prob_a is not None:

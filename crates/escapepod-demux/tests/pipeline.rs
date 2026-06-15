@@ -79,7 +79,7 @@ fn classify_read_rejects_ambiguous_query() {
 fn compute_distances_shape_and_ordering() {
     let model = synth_model();
     let query = model.training_fingerprints[0].clone();
-    let distances = compute_distances(&query, &model.training_fingerprints, None);
+    let distances = compute_distances(&query, &model.training_fingerprints, None, 0.0);
     assert_eq!(distances.len(), model.training_fingerprints.len());
     // Query == training[0], so distances[0] must be the minimum.
     let (min_idx, _) = distances

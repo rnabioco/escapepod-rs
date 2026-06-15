@@ -39,7 +39,8 @@ void dtw_matrix_kernel(
     int n_r,
     int max_n,
     int max_m,
-    int window)
+    int window,
+    float penalty)
 {
     int qi = blockIdx.x;
     int rj = blockIdx.y;
@@ -85,6 +86,11 @@ void dtw_matrix_kernel(
 
     int w = (window < 0) ? (n + m) : window;
 
+    // dtaidistance's `penalty` lives in non-squared space; this DP accumulates
+    // squared local costs, so each warping (non-diagonal) step adds penalty^2.
+    // Mirrors the CPU `dtw_distance_penalty`. penalty == 0 -> pen == 0 (no-op).
+    float pen = penalty * penalty;
+
     // Anti-diagonal DP. Each thread runtime-checks the band on its strided
     // `i` — the band-bound arithmetic is fiddly enough that a straight
     // runtime predicate is cheaper than precomputing bounds per diagonal.
@@ -102,7 +108,9 @@ void dtw_matrix_kernel(
 
             float diff = a_s[i - 1] - b_s[j - 1];
             float cost = diff * diff;
-            float m1 = fminf(d1[i - 1], d1[i]);
+            // d1[i-1] (expansion) and d1[i] (compression) are the off-diagonal
+            // predecessors and take the penalty; d2[i-1] (match) is diagonal.
+            float m1 = fminf(d1[i - 1] + pen, d1[i] + pen);
             float mp = fminf(m1, d2[i - 1]);
             d0[i] = cost + mp;
         }

@@ -41,6 +41,9 @@ __pycache__/
 /benchmarks/*.weights
 /.bench_data/
 /.bench_output/
+# Demux benchmark/parity scratch (size-tier pod5s, matrix.tsv, mismatch dumps).
+/.demux_matrix_out/
+/.parity_out*/
 
 # Built documentation
 site/

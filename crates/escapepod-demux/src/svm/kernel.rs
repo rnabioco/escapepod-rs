@@ -1,6 +1,6 @@
 //! RBF kernel computation and DTW distance helpers for the SVM pipeline.
 
-use escapepod_signal::dtw::dtw_distance;
+use escapepod_signal::dtw::dtw_distance_penalty;
 
 use crate::model::KernelParams;
 
@@ -62,9 +62,14 @@ fn kernel_value(distance: f64, params: &KernelParams) -> f64 {
 /// # Returns
 ///
 /// Vector of DTW distances
-pub fn compute_distances(query: &[f64], training: &[Vec<f64>], window: Option<usize>) -> Vec<f64> {
+pub fn compute_distances(
+    query: &[f64],
+    training: &[Vec<f64>],
+    window: Option<usize>,
+    penalty: f32,
+) -> Vec<f64> {
     let mut ws = SvmWorkspace::new();
-    compute_distances_into(query, training, window, &mut ws);
+    compute_distances_into(query, training, window, penalty, &mut ws);
     std::mem::take(&mut ws.distances)
 }
 
@@ -74,6 +79,7 @@ pub(super) fn compute_distances_into(
     query: &[f64],
     training: &[Vec<f64>],
     window: Option<usize>,
+    penalty: f32,
     ws: &mut SvmWorkspace,
 ) {
     ws.query_f32.clear();
@@ -89,6 +95,6 @@ pub(super) fn compute_distances_into(
     for train_fp in training {
         train_scratch.clear();
         train_scratch.extend(train_fp.iter().map(|&x| x as f32));
-        distances.push(dtw_distance(query_f32, train_scratch, window) as f64);
+        distances.push(dtw_distance_penalty(query_f32, train_scratch, window, penalty) as f64);
     }
 }

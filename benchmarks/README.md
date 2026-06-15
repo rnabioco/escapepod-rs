@@ -41,40 +41,53 @@ on much larger inputs where DTW dominates; the
 `hot_paths_gpu` microbench at 8192 × 40 fingerprints measures a 7.7×
 speedup on the kernel in isolation.
 
-### Classification agreement (`compare_demux_results.py`)
+### Classification agreement — parity ladder (2026-06-14 update)
 
-Using the **same** SVM model (`WDX4_rna004_v1_0`). Layered tests while
-closing the gap:
+The stage-isolation harness `benchmarks/benchmark_demux_parity.sh` runs
+four layers that swap escpod stages in one at a time, so the agreement
+drop between adjacent layers attributes any gap to a specific stage. All
+layers classify with the **same** converted `WDX4_rna004_v1_0` model and
+are compared against WarpDemuX's own predictions.
 
-| Experiment | Input | Agreement |
-|---|---|---:|
-| Layer A: WDX boundaries + WDX fingerprints → `escpod classify` | `barcode_fpts_0.npz` → CSV | **97.14 %** (100 % on conf ≥ 0.5, r = 0.9958) |
-| Layer B, LLR detect (escpod default) | — | **93.37 %** |
-| Layer B, CNN detect (`--method cnn`) | — | **96.95 %** |
+| Layer | boundaries / fingerprints | overall | conf ≥ 0.5 |
+|---|---|---:|---:|
+| A — WDX bounds + WDX fpts → `escpod classify` | WDX / WDX | **99.63 %** | **100.00 %** |
+| B-bounds — WDX bounds + escpod fpt | WDX / escpod | 99.61 % | 100.00 % |
+| B-cnn — escpod CNN detect (`--method cnn`) | escpod / escpod | **99.26 %** | 100.00 % |
+| B-llr — escpod LLR detect (default) | escpod / escpod | 94.14 % | 96.34 % |
 
-Layer A showed early that the SVM / DTW / kernel / Platt pipeline is
-faithful. Closing the original Layer-B gap (23 % → ~97 %) required
-three fixes, all in fingerprint extraction:
+**Confident reads (conf ≥ 0.5) are at 100 % parity through Layer B-cnn.**
 
-1. **Extract padding.** WDX's `sig_extract.padding = 100` — the
-   adapter region fed to clipping + segmentation is
-   `signal[adapter_start-100 : adapter_end+100]`, not
-   `signal[adapter_start : adapter_end]`. Missing this shifted every
-   changepoint and the retained last-25 segment means. **Biggest
-   single contributor.**
-2. **scipy-matching `find_changepoints`.** Local-max detection switched
-   to strict `>` with scipy-style plateau-midpoint collapse; removed
-   the `t_score > 0.0` filter. Verified by direct Rust-vs-scipy
-   comparison: the two produce bit-identical peak sets on real
-   adapter signals.
-3. **CNN adapter detection (`--method cnn`).** Ports ADAPTed's
-   `BoundariesCNN` through tract-onnx. Closes most of the LLR vs CNN
-   boundary gap (CNN reaches Layer-A ceiling; LLR stops a few points
-   short because the LLR detector occasionally disagrees with the CNN
-   on adapter_end by ≥ 20 samples).
+#### The DTW warping-penalty fix (97.1 % → 99.6 % ceiling)
 
-The remaining ~3 % on the LLR path and ~0.1 % on the CNN path trace to
-boundary-detection differences on hard reads — not a compat bug.
+Earlier the Layer-A ceiling sat at **97.14 %** — even with identical WDX
+boundaries *and* fingerprints, `escpod classify` disagreed ~2.9 %. The
+root cause was the DTW distance: WarpDemuX models carry a
+`dtaidistance` warping **`penalty`** (`WDX4` = 0.1) added to the two
+non-diagonal (expansion / compression) DP transitions, and escpod
+applied none. Plumbing it through (`DtwSvmModel.penalty`, extracted by
+`convert_warpdemux_model.py`; applied in `dtw_distance_penalty`) lifts
+Layer A to **99.63 %** and confident reads to **100 %**.
+
+Subtlety that bit once: `dtaidistance`'s penalty is expressed in
+*non-squared* distance space while escpod's DP accumulates squared local
+costs, so each warp step adds **`penalty²`** (verified directly:
+`dtaidistance.dtw.distance([0,0,0],[0], penalty=0.1) == sqrt(2·0.1²)`).
+Adding the raw `penalty` over-penalizes 10× and *regresses* parity to
+~80 %. The GPU kernel applies the identical `penalty²` so `--gpu`
+classify matches CPU (test: `gpu_svm_batch::parity_svm_classify_batch_penalty`).
+
+The remaining Layer-A 0.37 % are all low-confidence near-ties
+(`wdx_conf < 0.5`) that flip on f32-vs-f64 DTW rounding — escpod keeps
+f32 DTW for throughput; the residual is below the confident-call gate.
+
+Earlier work (still in place) closed the original 23 % → 97 % Layer-B
+gap with three fingerprint-extraction fixes: WDX's `sig_extract.padding
+= 100`; scipy-matching `find_changepoints` (strict `>` + plateau
+midpoint); and the ADAPTed `BoundariesCNN` port (`--method cnn`). The
+residual ~5 % on the **default LLR** path (94.14 % vs B-cnn 99.26 %) is
+boundary detection — **use `--method cnn` for parity**; LLR occasionally
+disagrees with the CNN on `adapter_end` by ≥ 20 samples on hard reads.
 
 ### Reproducing
 
@@ -96,8 +109,50 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     -p escapepod --features "demux train gpu"
 
 # Run — auto-dispatches to the right SLURM partition
-./benchmarks/benchmark_demux.sh          # CPU only
-./benchmarks/benchmark_demux.sh --gpu    # adds the GPU variant
+./benchmarks/benchmark_demux.sh                       # CPU only, WDX4
+./benchmarks/benchmark_demux.sh --gpu                 # adds the GPU variant
+./benchmarks/benchmark_demux.sh --model WDX10_rna004_v1_0   # larger DTW workload
+```
+
+#### Example sweep (2026-06-14, parallel fan-out; AlaRS_all20_b4 real run)
+
+`benchmark_demux_matrix.sh` across WDX4/6/10 × {4k bundled, 25k, 100k real}
+× {cpu, gpu}, 18 cells fanned out concurrently (cpu `-c 24`, gpu A30). The
+GPU classify (DTW) only earns its keep at scale; at 4k reads NVRTC compile +
+H2D transfer dominate.
+
+| model | n_reads | escpod CPU s | escpod GPU s | speedup CPU | speedup GPU |
+|---|---:|---:|---:|---:|---:|
+| WDX4  | 3,786  | 1.81  | 1.57  | 17.6× | 20.3× |
+| WDX4  | 55,864 | 30.23 | **10.00** | 3.8× | **11.5×** |
+| WDX6  | 55,864 | 43.14 | **10.71** | 2.8× | **11.1×** |
+| WDX10 | 3,786  | 2.85  | 3.53  | 12.3× | 9.9× |
+| WDX10 | 55,864 | 60.44 | **12.06** | 1.6× | **7.9×** |
+
+At 100k reads the GPU is **~5× faster than escpod-CPU** for the heaviest model
+(WDX10: 60.4 → 12.1 s) — DTW dominates and the A30 pays off. At 4k it's within
+noise or slower. Agreement (default LLR path) is 93–96% across the sweep and is
+model/boundary-bound, not affected by the device.
+
+#### Harness scripts (2026-06-14)
+
+| Script | Purpose |
+|---|---|
+| `benchmark_demux.sh` | Single cell: detect+fingerprint+classify vs WarpDemuX. Flags: `--model NAME`, `--gpu`, `--out-dir DIR`, `--emit-tsv FILE`. |
+| `make_demux_inputs.sh` | Builds reproducible size tiers (4k/25k/100k reads) from a real run via `escpod filter`; the bundled 4000-read file is always the smallest tier. |
+| `benchmark_demux_matrix.sh` | Sweeps {models} × {tiers} × {cpu,gpu}, one srun per device, → `matrix.tsv` + `matrix.md` (speed + agreement per cell). |
+| `benchmark_demux_parity.sh` | The stage-isolation ladder above. `--dump-mismatches` writes a per-read CSV for root-causing. Needs the CNN ONNX for the B-cnn layer. |
+
+```bash
+# Full speed+agreement matrix across models and dataset sizes:
+./benchmarks/benchmark_demux_matrix.sh \
+    --models "WDX4_rna004_v1_0 WDX6_rna004_v1_0 WDX10_rna004_v1_0" \
+    --tiers "4000 25000 100000" --devices "cpu gpu" --src /path/to/real_run
+
+# Parity ladder + per-read mismatch dump:
+#   (B-cnn needs scripts/export_adapter_cnn_to_onnx.py -> benchmarks/adapter_cnn_rna004.onnx,
+#    built from a local ADAPTed install; CC BY-NC weights are not redistributed.)
+./benchmarks/benchmark_demux_parity.sh --dump-mismatches
 ```
 
 ---
