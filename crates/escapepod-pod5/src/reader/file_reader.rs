@@ -410,10 +410,12 @@ impl Reader {
     ) -> Result<RecordBatch> {
         let mut reader = self.create_arrow_reader(embedded)?;
 
-        // Skip to the desired batch
-        for _ in 0..batch_idx {
-            reader.next();
-        }
+        // Seek directly to the desired batch via the IPC footer's block
+        // offsets. The previous `for _ in 0..batch_idx { reader.next() }`
+        // skip-loop *decoded* every preceding batch (O(N) materialize +
+        // memcpy/memset per call, O(N^2) over a scan), which dominated cold
+        // demux reads on a network FS. `set_index` is an O(1) seek.
+        reader.set_index(batch_idx)?;
 
         reader
             .next()
