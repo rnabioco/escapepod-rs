@@ -66,6 +66,21 @@ impl Reader {
         let file = File::open(&file_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Hint the OS to stream the mapping. POD5 access is overwhelmingly a
+        // single front-to-back scan of the (large) signal + reads tables —
+        // `view`, `filter`, `merge`, `repack`, and `demux` all read the whole
+        // file once. Without a readahead hint the kernel faults mmap pages 4 KiB
+        // at a time on demand; on a network filesystem (BeeGFS/Lustre/NFS) each
+        // fault is a server round-trip, collapsing effective throughput to a few
+        // MB/s even though the FS streams sequentially at ~1 GB/s — the dominant
+        // cost (and the multi-minute "slow to get going" stall) on large remote
+        // POD5 files. `MADV_SEQUENTIAL` widens the readahead window so the
+        // mapping streams near raw bandwidth. It is a hint (ignored where
+        // unsupported); single-read random access pays only a negligible
+        // over-readahead cost.
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+
         // Verify signature at start
         if mmap.len() < 8 || mmap[..8] != POD5_SIGNATURE {
             return Err(Error::InvalidSignature);
@@ -268,24 +283,27 @@ impl Reader {
         Ok(reader.map(|r| r.map_err(Error::from)))
     }
 
-    /// Distinct `pore_type` and end_reason dictionary labels across the reads
-    /// table, read from the file's Arrow dictionaries (O(num_batches × dict),
-    /// not O(num_reads)). Useful for pre-declaring a writer's dictionaries when
-    /// block-copying reads into one or more output files.
+    /// Distinct `pore_type` and end_reason dictionary labels for the reads
+    /// table. Truly O(dict): a POD5 reads table is a single Arrow IPC stream
+    /// with one shared dictionary per dictionary-encoded column (no IPC
+    /// dictionary replacement/deltas), so every record batch carries the same
+    /// `pore_type` / end_reason dictionary values. We therefore read only the
+    /// **first** batch's dictionaries rather than scanning the whole table.
+    ///
+    /// Scanning every batch (the previous implementation) decoded the entire
+    /// reads table — including the large `signal` row-index list column — up
+    /// front, which stalled `demux` for minutes before the first read was
+    /// processed on multi-GB / multi-million-read files. Useful for
+    /// pre-declaring a writer's dictionaries when block-copying reads into one
+    /// or more output files.
     pub fn reads_dictionaries(&self) -> Result<(Vec<String>, Vec<String>)> {
-        use std::collections::BTreeSet;
-        let mut pore_types: BTreeSet<String> = BTreeSet::new();
-        let mut end_reasons: BTreeSet<String> = BTreeSet::new();
-        for batch in self.read_batches()? {
-            let batch = batch?;
-            let view = crate::arrow_helpers::ReadsBatchView::new(&batch, false)?;
-            pore_types.extend(view.pore_type_dict());
-            end_reasons.extend(view.end_reason_dict());
-        }
-        Ok((
-            pore_types.into_iter().collect(),
-            end_reasons.into_iter().collect(),
-        ))
+        let Some(batch) = self.read_batches()?.next() else {
+            // Empty reads table (no batches) → no dictionary labels.
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let batch = batch?;
+        let view = crate::arrow_helpers::ReadsBatchView::new(&batch, false)?;
+        Ok((view.pore_type_dict(), view.end_reason_dict()))
     }
 
     /// Get the total number of reads.
