@@ -186,22 +186,6 @@ impl Detector {
             }
         }
     }
-
-    /// Decode the signal and detect the adapter region. Returns the decoded
-    /// signal and `(adapter_start, adapter_end)`.
-    ///
-    /// Used only by the GPU producer; the CPU path decodes in-memory bulk
-    /// chunks and calls [`Detector::detect`] directly (see `produce_cpu`).
-    #[cfg(feature = "gpu")]
-    fn prep(
-        &self,
-        extractor: &escapepod_signal::SignalExtractor,
-        rows: &[u64],
-    ) -> Option<(Vec<i16>, usize, usize)> {
-        let signal = extractor.get_signal(rows).ok()?;
-        let (s, e) = self.detect(&signal);
-        Some((signal, s, e))
-    }
 }
 
 fn barcode_label(predicted: i32) -> String {
@@ -588,7 +572,6 @@ fn produce_gpu(
         let mut metas: Vec<Meta> = Vec::with_capacity(GPU_BATCH);
         for path in &args.input {
             let reader = Reader::open(path)?;
-            let extractor = reader.signal_extractor()?;
             let run_infos = Arc::new(reader.run_infos().to_vec());
             for batch in reader.read_batches()? {
                 let batch = batch?;
@@ -598,14 +581,24 @@ fn produce_gpu(
                     .filter(|r| !r.signal_rows.is_empty())
                     .collect();
 
+                // One sequential sweep pulls this read-batch's compressed signal
+                // (see produce_cpu for why single-stream I/O beats per-worker
+                // faulting on a network FS, #72), then the CPU prep parallelizes
+                // over the in-memory chunks.
+                let keyed: Vec<(usize, Vec<u64>)> = reads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (i, r.signal_rows.clone()))
+                    .collect();
+                let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+
                 type Prepped = (ReadData, Option<Vec<f64>>, Vec<CompressedSignalChunk>);
-                let prepped: Vec<Option<Prepped>> = reads
+                let prepped: Vec<Option<Prepped>> = bulk
                     .par_iter()
-                    .map(|read| -> Option<Prepped> {
-                        let (signal, s, e) = detector.prep(&extractor, &read.signal_rows)?;
-                        let chunks = reader
-                            .get_compressed_signal_for_rows(&read.signal_rows)
-                            .ok()?;
+                    .map(|(i, chunks)| -> Option<Prepped> {
+                        let read = &reads[*i];
+                        let signal = decode_chunks(chunks)?;
+                        let (s, e) = detector.detect(&signal);
                         let features = if e > s {
                             extract_fingerprint_from_signal(
                                 &signal,
@@ -623,7 +616,11 @@ fn produce_gpu(
                         } else {
                             None
                         };
-                        Some((read.for_writing(read.run_info_index), features, chunks))
+                        Some((
+                            read.for_writing(read.run_info_index),
+                            features,
+                            chunks.clone(),
+                        ))
                     })
                     .collect();
                 pb.inc(reads.len() as u64);
