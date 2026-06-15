@@ -13,8 +13,12 @@ mod style;
 mod util;
 
 /// Terse event formatter for `escpod` logs: `YYYY-MM-DD HH:MM:SS  LEVEL [target] message`.
-/// Targets inside the `escapepod` library are shown without the crate prefix
-/// to keep lines short; external targets are printed verbatim.
+///
+/// The CLI's own events (target `escpod` / `escpod::*`) are the primary status
+/// channel, so their target is omitted entirely to keep status lines clean
+/// (`… INFO Merging 2 files …`). `escapepod_signal::` targets are shown without
+/// the crate prefix; all other (library/external) targets are printed verbatim
+/// so `-v` can attribute them.
 struct EscpodFormatter;
 
 impl<S, N> FormatEvent<S, N> for EscpodFormatter
@@ -33,7 +37,9 @@ where
         write!(writer, " {:>5}", event.metadata().level())?;
 
         let target = event.metadata().target();
-        if let Some(module) = target.strip_prefix("escapepod_signal::") {
+        if target == "escpod" || target.starts_with("escpod::") {
+            // CLI's own status output — no target label.
+        } else if let Some(module) = target.strip_prefix("escapepod_signal::") {
             write!(writer, " [{module}]")?;
         } else if target != "escapepod_cli" && target != "escapepod" {
             write!(writer, " [{target}]")?;
@@ -77,8 +83,8 @@ struct Cli {
     #[arg(short = 'q', long, global = true)]
     quiet: bool,
 
-    /// Increase log verbosity. `-v` = info, `-vv` = debug, `-vvv` = trace.
-    /// `RUST_LOG` takes precedence when set.
+    /// Increase log verbosity. Status messages show by default (info);
+    /// `-v` = debug, `-vv` = trace. `RUST_LOG` takes precedence when set.
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -481,11 +487,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Verbosity → log level. `RUST_LOG` always wins if set.
+    // Status/progress output is emitted at INFO, so INFO is the default level
+    // (status visible out of the box); `-q` drops to errors only.
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
-        (_, 0) => "warn",
-        (_, 1) => "info",
-        (_, 2) => "debug",
+        (_, 0) => "info",
+        (_, 1) => "debug",
         _ => "trace",
     };
     tracing_subscriber::fmt()

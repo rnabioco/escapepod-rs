@@ -7,6 +7,7 @@ use super::fp_io::read_labeled_fingerprints;
 use crate::style;
 use escapepod_demux::{TrainConfig, train_svm};
 use std::path::PathBuf;
+use tracing::info;
 
 /// Arguments for the train-svm subcommand.
 #[derive(Debug, clap::Args)]
@@ -102,7 +103,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
     timer.phase("Train SVM");
     let profile = args.profile;
 
-    println!("{} SVM model from fingerprints", style::action("Training"));
+    info!("{} SVM model from fingerprints", style::action("Training"));
 
     // Load fingerprints from CSV. When `--max-per-class` is set, sampling
     // happens during the scan (per-class reservoir) so we never materialize
@@ -112,7 +113,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
         read_labeled_fingerprints(&args.fingerprints, subsample)?;
 
     if let Some(cap) = args.max_per_class {
-        println!(
+        info!(
             "{} {} -> {} kept (cap {} per class, seed {})",
             style::action("Streamed+subsampled:"),
             style::count(total_seen),
@@ -121,7 +122,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
             style::value(args.seed),
         );
     } else {
-        println!(
+        info!(
             "{} {} fingerprints across {} barcodes",
             style::label("Loaded:"),
             style::count(fingerprints.len()),
@@ -145,7 +146,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
         thresholds,
     };
 
-    println!(
+    info!(
         "{} gamma={}, power={}, C={}",
         style::label("Config:"),
         config.gamma,
@@ -159,7 +160,7 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::train_svm_gpu;
-            println!(
+            info!(
                 "{} DTW distance matrix on GPU...",
                 style::action("Computing")
             );
@@ -170,19 +171,19 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
             unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
         }
     } else {
-        println!("{} DTW distance matrix...", style::action("Computing"));
+        info!("{} DTW distance matrix...", style::action("Computing"));
         train_svm(fingerprints, labels, &config)?
     };
 
     // Save the model
     model.save(&args.output)?;
 
-    println!(
+    info!(
         "{} SVM model written to {}",
         style::action("Trained"),
         style::path(args.output.display())
     );
-    println!(
+    info!(
         "{} {} classes, {} support vectors",
         style::label("Model:"),
         style::count(model.n_classes),

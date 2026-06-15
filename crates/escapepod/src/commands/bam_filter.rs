@@ -16,6 +16,7 @@ use noodles_core::Region;
 use std::collections::HashSet;
 use std::io::BufReader;
 use std::path::PathBuf;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Run the bam-filter command.
@@ -39,7 +40,7 @@ pub fn run(
     let files = resolve_pod5_inputs(&input)?;
     let is_directory = files.len() > 1;
 
-    eprintln!(
+    info!(
         "{} {} using BAM {}",
         style::action("Filtering"),
         if is_directory {
@@ -53,7 +54,7 @@ pub fn run(
         },
         style::path(bam_path.display())
     );
-    eprintln!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(output.display())
@@ -61,13 +62,13 @@ pub fn run(
 
     // Print filter criteria
     if mapped_only {
-        eprintln!("  Filter: {}", style::value("mapped reads only"));
+        info!("Filter: {}", style::value("mapped reads only"));
     }
     if let Some(ref r) = region {
-        eprintln!("  Filter: region {}", style::value(r));
+        info!("Filter: region {}", style::value(r));
     }
     if let Some(q) = min_quality {
-        eprintln!("  Filter: MAPQ >= {}", style::value(q));
+        info!("Filter: MAPQ >= {}", style::value(q));
     }
 
     // Read IDs from BAM file
@@ -125,7 +126,7 @@ pub fn run(
     }
 
     let percentage = result.match_percentage();
-    eprintln!(
+    info!(
         "{} {} reads from {} total ({})",
         style::action("Filtered"),
         style::count(result.matched_reads),
@@ -135,9 +136,8 @@ pub fn run(
 
     let not_found = (ids.len() as u64).saturating_sub(result.matched_reads);
     if not_found > 0 {
-        eprintln!(
-            "{} {} BAM read IDs were not found in POD5 file(s)",
-            style::note_label("Note:"),
+        warn!(
+            "{} BAM read IDs were not found in POD5 file(s)",
             style::warning(not_found)
         );
     }
@@ -146,9 +146,8 @@ pub fn run(
 
     // Report any errors encountered
     if result.read_errors > 0 || result.signal_errors > 0 {
-        eprintln!(
-            "{} encountered {} read error(s) and {} signal error(s)",
-            style::error_label("Warning:"),
+        warn!(
+            "encountered {} read error(s) and {} signal error(s)",
             style::error(result.read_errors),
             style::error(result.signal_errors)
         );

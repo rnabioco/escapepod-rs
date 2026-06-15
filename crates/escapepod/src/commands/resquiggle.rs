@@ -7,6 +7,7 @@ use anyhow::bail;
 use bstr::ByteSlice;
 use clap::Args;
 use rayon::prelude::*;
+use tracing::{info, warn};
 
 use escapepod_signal::parse_uuid_flexible;
 use escapepod_signal::resquiggle::{
@@ -186,7 +187,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     };
 
     // --- Phase 1: Load kmer table ---
-    println!(
+    info!(
         "{} kmer table from {}",
         style::action("Loading"),
         style::path(args.kmer_table.display())
@@ -194,7 +195,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     let mut kmer_table = KmerTable::from_file(&args.kmer_table)?;
     if settings.normalize_levels {
         kmer_table.fix_gauge()?;
-        println!("  Applied MAD normalization to kmer levels");
+        info!("applied MAD normalization to kmer levels");
     }
 
     // --- Phase 2: Index all POD5 reads ---
@@ -239,8 +240,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         "{} reads indexed from POD5",
         style::count(pod5_reads.len())
     ));
-    eprintln!(
-        "[resquiggle] {} reads indexed from {} POD5 file(s)",
+    info!(
+        "{} reads indexed from {} POD5 file(s)",
         pod5_reads.len(),
         pod5_files.len()
     );
@@ -253,7 +254,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
 
     // --- Phase 3: Stream BAM, refine in parallel, write asynchronously ---
     let bam_total = count_bam_records(&args.bam)?;
-    eprintln!("[resquiggle] BAM contains {} records", bam_total);
+    info!("BAM contains {} records", bam_total);
 
     let file = std::fs::File::open(&args.bam)?;
     let worker_count = args
@@ -368,8 +369,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
             progress_bar.set_position(total_bam as u64);
         }
         if log_interval > 0 && total_bam.is_multiple_of(log_interval) {
-            eprintln!(
-                "[resquiggle] processed {} / {} records ({} matched)",
+            info!(
+                "processed {} / {} records ({} matched)",
                 total_bam, bam_total, matched
             );
         }
@@ -407,9 +408,8 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     let refined = ctx.refined_count.load(std::sync::atomic::Ordering::Relaxed);
     let errors = ctx.error_count.load(std::sync::atomic::Ordering::Relaxed);
 
-    println!(
-        "{} {} refined, {} errors, {} written to {}",
-        style::action("Done:"),
+    info!(
+        "{} refined, {} errors, {} written to {}",
         style::count(refined),
         errors,
         style::count(written),
@@ -418,7 +418,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     if errors > 0 {
         let reasons = ctx.skip_reasons.lock().unwrap();
         for (reason, count) in reasons.iter() {
-            eprintln!("  error ({}x): {}", count, reason);
+            warn!("error ({}x): {}", count, reason);
         }
     }
 

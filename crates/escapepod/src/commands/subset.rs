@@ -9,6 +9,7 @@ use escapepod_signal::operations::{FilterOptions, filter_files, parse_csv_mappin
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use tracing::info;
 use uuid::Uuid;
 
 pub fn run(
@@ -40,7 +41,7 @@ pub fn run(
     let num_groups = groups.len();
     let total_reads = mapping.len();
 
-    eprintln!(
+    info!(
         "{} {} reads into {} output file(s)",
         style::action("Subsetting"),
         style::count(total_reads),
@@ -83,30 +84,36 @@ pub fn run(
         .collect();
 
     let mut total_matched = 0u64;
+    let mut group_rows: Vec<(PathBuf, u64)> = Vec::new();
     for result in results {
         let (name, matched) = result?;
         let output_path = output_dir.join(&name);
-        eprintln!(
-            "  {} ({} reads)",
-            style::path(output_path.display()),
-            style::count(matched)
-        );
+        group_rows.push((output_path, matched));
         total_matched += matched;
     }
 
     let unmatched = (total_reads as u64).saturating_sub(total_matched);
 
-    // Print summary
-    eprintln!("\n{}", style::header("Subset summary:"));
-    eprintln!("  Matched reads: {}", style::count(total_matched));
-    eprintln!(
-        "  Unmatched reads: {}",
-        if unmatched > 0 {
-            style::warning(unmatched)
-        } else {
-            unmatched.to_string()
+    // Styled multi-line report; gate on verbosity instead of per-line tracing events.
+    if tracing::enabled!(tracing::Level::INFO) {
+        for (output_path, matched) in &group_rows {
+            eprintln!(
+                "  {} ({} reads)",
+                style::path(output_path.display()),
+                style::count(*matched)
+            );
         }
-    );
+        eprintln!("\n{}", style::header("Subset summary:"));
+        eprintln!("  Matched reads: {}", style::count(total_matched));
+        eprintln!(
+            "  Unmatched reads: {}",
+            if unmatched > 0 {
+                style::warning(unmatched)
+            } else {
+                unmatched.to_string()
+            }
+        );
+    }
 
     timer.report(profile);
 

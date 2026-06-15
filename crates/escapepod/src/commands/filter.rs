@@ -14,6 +14,7 @@ use escapepod_signal::operations::{
 use escapepod_signal::types::EndReason;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use tracing::{info, warn};
 
 #[allow(clippy::too_many_arguments)] // args mirror the CLI subcommand surface
 pub fn run(
@@ -79,7 +80,7 @@ pub fn run(
     }
 
     // Print filtering info
-    eprintln!(
+    info!(
         "{} {}",
         style::action("Filtering"),
         if is_directory {
@@ -95,37 +96,37 @@ pub fn run(
 
     // Print active criteria
     if let Some(ref ids) = criteria.read_ids {
-        eprintln!(
-            "  {} {} read IDs from {}",
+        info!(
+            "{} {} read IDs from {}",
             style::label("IDs:"),
             style::count(ids.len()),
             style::path(ids_file.as_ref().unwrap().display())
         );
     }
     if let Some(min) = criteria.min_samples {
-        eprintln!("  {} >= {}", style::label("Samples:"), style::value(min));
+        info!("{} >= {}", style::label("Samples:"), style::value(min));
     }
     if let Some(max) = criteria.max_samples {
-        eprintln!("  {} <= {}", style::label("Samples:"), style::value(max));
+        info!("{} <= {}", style::label("Samples:"), style::value(max));
     }
     if let Some(ref reasons) = criteria.include_end_reasons {
         let reason_strs: Vec<_> = reasons.iter().map(|r| r.as_str()).collect();
-        eprintln!(
-            "  {} {}",
+        info!(
+            "{} {}",
             style::label("End reasons:"),
             reason_strs.join(", ")
         );
     }
     if let Some(ref reasons) = criteria.exclude_end_reasons {
         let reason_strs: Vec<_> = reasons.iter().map(|r| r.as_str()).collect();
-        eprintln!(
-            "  {} {}",
+        info!(
+            "{} {}",
             style::label("Exclude end reasons:"),
             reason_strs.join(", ")
         );
     }
 
-    eprintln!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(output.display())
@@ -156,7 +157,7 @@ pub fn run(
     filter_bar.finish_with_message(format!("{} matched", result.matched_reads));
 
     let percentage = result.match_percentage();
-    eprintln!(
+    info!(
         "{} {} reads from {} total ({})",
         style::action("Filtered"),
         style::count(result.matched_reads),
@@ -168,16 +169,14 @@ pub fn run(
     if let Some(ref ids) = criteria.read_ids {
         let not_found = (ids.len() as u64).saturating_sub(result.matched_reads);
         if not_found > 0 {
-            eprintln!(
-                "{} {} requested IDs were not found in the input",
-                style::warning_label("Warning:"),
+            warn!(
+                "{} requested IDs were not found in the input",
                 style::warning(not_found)
             );
         }
         if result.matched_reads > ids.len() as u64 {
-            eprintln!(
-                "{} {} duplicate reads matched across multiple files",
-                style::note_label("Note:"),
+            warn!(
+                "{} duplicate reads matched across multiple files",
                 style::warning(result.matched_reads - ids.len() as u64)
             );
         }
@@ -185,9 +184,8 @@ pub fn run(
 
     // Report any errors encountered
     if result.read_errors > 0 || result.signal_errors > 0 {
-        eprintln!(
-            "{} encountered {} read error(s) and {} signal error(s)",
-            style::error_label("Warning:"),
+        warn!(
+            "encountered {} read error(s) and {} signal error(s)",
             style::error(result.read_errors),
             style::error(result.signal_errors)
         );

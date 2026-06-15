@@ -30,6 +30,8 @@ use std::path::Path;
 use std::collections::HashMap;
 #[cfg(feature = "train")]
 use std::io::{BufRead, BufReader};
+#[cfg(feature = "train")]
+use tracing::warn;
 use uuid::Uuid;
 
 /// String-column accessor that handles both Arrow `Utf8` (StringArray) and
@@ -258,8 +260,8 @@ fn read_labeled_csv(
     }
 
     if malformed_rows > 0 {
-        eprintln!(
-            "warning: dropped {malformed_rows} fingerprint row(s) whose feature width did \
+        warn!(
+            "dropped {malformed_rows} fingerprint row(s) whose feature width did \
              not match the expected {} (truncated CSV or NaN/empty cells)",
             expected_width.unwrap_or(0),
         );

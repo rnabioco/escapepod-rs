@@ -110,7 +110,9 @@ pub fn value<T: Display>(s: T) -> String {
     }
 }
 
-/// Style for warning prefix "Warning:"
+/// Style for a warning label (only the demux `split` summary still labels
+/// inline; other warnings now flow through `tracing::warn!`).
+#[cfg_attr(not(feature = "demux"), allow(dead_code))]
 pub fn warning_label<T: Display>(s: T) -> String {
     if use_color() {
         format!("{}", s.yellow().bold())
@@ -123,15 +125,6 @@ pub fn warning_label<T: Display>(s: T) -> String {
 pub fn warning<T: Display>(s: T) -> String {
     if use_color() {
         format!("{}", s.yellow())
-    } else {
-        s.to_string()
-    }
-}
-
-/// Style for error prefix "Error:"
-pub fn error_label<T: Display>(s: T) -> String {
-    if use_color() {
-        format!("{}", s.red().bold())
     } else {
         s.to_string()
     }
@@ -150,15 +143,6 @@ pub fn error<T: Display>(s: T) -> String {
 pub fn note_label<T: Display>(s: T) -> String {
     if use_color() {
         format!("{}", s.yellow())
-    } else {
-        s.to_string()
-    }
-}
-
-/// Style for informational messages
-pub fn info<T: Display>(s: T) -> String {
-    if use_color() {
-        format!("{}", s.blue())
     } else {
         s.to_string()
     }

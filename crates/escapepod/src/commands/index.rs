@@ -6,6 +6,8 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
+use tracing::{info, warn};
+
 use crate::style;
 use crate::util::collect_pod5_inputs;
 
@@ -27,11 +29,7 @@ pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow:
     let files = collect_pod5_inputs(&inputs)?;
 
     let total = files.len();
-    eprintln!(
-        "{} Building read indexes for {} file(s)...",
-        style::action("Index:"),
-        style::count(total),
-    );
+    info!("building read indexes for {} file(s)", style::count(total),);
 
     let indexed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
@@ -46,9 +44,8 @@ pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow:
             };
 
             if p5i_path.exists() && !force {
-                eprintln!(
-                    "  {} {} (already exists, use --force to overwrite)",
-                    style::info("skip"),
+                warn!(
+                    "skipping {} (already exists, use --force to overwrite)",
                     style::path(p5i_path.display()),
                 );
                 skipped.fetch_add(1, Ordering::Relaxed);
@@ -66,8 +63,8 @@ pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow:
             };
             let elapsed = t0.elapsed();
 
-            eprintln!(
-                "  {} {} — {} reads in {:.1}s",
+            info!(
+                "{} {} — {} reads in {:.1}s",
                 style::action("wrote"),
                 style::path(p5i_path.display()),
                 style::count(count),
@@ -82,9 +79,8 @@ pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow:
         return Err(first_err);
     }
 
-    eprintln!(
-        "{} {} indexed, {} skipped",
-        style::action("Done:"),
+    info!(
+        "{} indexed, {} skipped",
         style::count(indexed.load(Ordering::Relaxed)),
         style::count(skipped.load(Ordering::Relaxed)),
     );
