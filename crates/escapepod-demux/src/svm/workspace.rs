@@ -1,5 +1,7 @@
 //! Reusable scratch buffers for the SVM prediction pipeline.
 
+use escapepod_signal::dtw::{DtwBatchScratch, DtwScratch};
+
 use crate::model::DtwSvmModel;
 
 /// Reusable scratch buffers for the SVM prediction pipeline.
@@ -40,6 +42,12 @@ pub struct SvmWorkspace {
     pub(super) p: Vec<f64>,
     /// `Q p` product, recycled across the 100+ coupling iterations.
     pub(super) qp: Vec<f64>,
+    /// Reusable DTW row buffers, shared across every training-fingerprint
+    /// distance in a single `predict` (and across reads). Without this each of
+    /// the (n_train) DTW calls per read would heap-allocate its own row buffers.
+    pub(super) dtw: DtwScratch,
+    /// Reusable lane-parallel DTW buffers for the uniform-length fast path.
+    pub(super) dtw_batch: DtwBatchScratch,
 }
 
 impl SvmWorkspace {

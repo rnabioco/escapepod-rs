@@ -161,21 +161,33 @@ pub fn find_changepoints(
         let pos = peaks[idx];
 
         // Reject if a previously-kept peak is within `min_separation` samples.
-        // Scan outward from `idx`; with peaks sorted ascending by position,
-        // we can stop as soon as distance exceeds the threshold.
-        let too_close_left = (0..idx).rev().any(|k| {
+        // Peaks are sorted ascending by position, so scanning outward from
+        // `idx` we can `break` the moment a neighbour is at least
+        // `min_separation` away — everything past it is strictly farther.
+        // (A previous `.any()` form returned `false` at that point, which does
+        // not stop `.any()` iteration, so the scan ran to the ends every time.)
+        let mut too_close = false;
+        for k in (0..idx).rev() {
             if pos.saturating_sub(peaks[k]) >= min_separation {
-                return false;
+                break;
             }
-            kept[k]
-        });
-        let too_close_right = ((idx + 1)..peaks.len()).any(|k| {
-            if peaks[k].saturating_sub(pos) >= min_separation {
-                return false;
+            if kept[k] {
+                too_close = true;
+                break;
             }
-            kept[k]
-        });
-        if too_close_left || too_close_right {
+        }
+        if !too_close {
+            for k in (idx + 1)..peaks.len() {
+                if peaks[k].saturating_sub(pos) >= min_separation {
+                    break;
+                }
+                if kept[k] {
+                    too_close = true;
+                    break;
+                }
+            }
+        }
+        if too_close {
             continue;
         }
 

@@ -23,7 +23,8 @@ use super::utils::configure_thread_pool;
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::{
-    AnyModel, DtwSvmModel, SvmPredictor, extract_fingerprint_from_signal, load_any_model,
+    AnyModel, DtwSvmModel, SvmPredictor, SvmWorkspace, extract_fingerprint_from_signal,
+    load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
 use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
@@ -444,23 +445,31 @@ fn produce_cpu(
                 .collect();
             let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
-            bulk.par_iter().for_each(|(i, chunks)| {
-                let read = &reads[*i];
-                if let Some((barcode, conf)) =
-                    classify_one_cpu(read, chunks, detector, &predictor, fp)
-                {
-                    route(
-                        routers,
-                        class_tx,
-                        read.for_writing(read.run_info_index),
-                        barcode,
-                        chunks.clone(),
-                        run_infos.clone(),
-                        conf,
-                    );
-                }
-                pb.inc(1);
-            });
+            // One SVM workspace per rayon worker (not per read): classify scores
+            // each read against tens of thousands of training fingerprints, and
+            // `SvmWorkspace` holds the reusable scratch (DTW row buffers,
+            // distances, kernel, coupling matrices). Sharing it across reads on a
+            // worker avoids re-allocating that scratch for every read.
+            bulk.par_iter().for_each_init(
+                || SvmWorkspace::for_model(predictor.model()),
+                |ws, (i, chunks)| {
+                    let read = &reads[*i];
+                    if let Some((barcode, conf)) =
+                        classify_one_cpu(read, chunks, detector, &predictor, fp, ws)
+                    {
+                        route(
+                            routers,
+                            class_tx,
+                            read.for_writing(read.run_info_index),
+                            barcode,
+                            chunks.clone(),
+                            run_infos.clone(),
+                            conf,
+                        );
+                    }
+                    pb.inc(1);
+                },
+            );
         }
     }
     Ok(())
@@ -489,6 +498,7 @@ fn classify_one_cpu(
     detector: &Detector,
     predictor: &SvmPredictor,
     fp: FpParams,
+    ws: &mut SvmWorkspace,
 ) -> Option<(String, f64)> {
     let signal = decode_chunks(chunks)?;
     let (s, e) = detector.detect(&signal);
@@ -509,7 +519,7 @@ fn classify_one_cpu(
     ) else {
         return Some((UNCLASSIFIED.to_string(), 0.0));
     };
-    let (_probs, result) = predictor.predict(&features.values);
+    let (_probs, result) = predictor.predict_with_workspace(&features.values, ws);
     Some((barcode_label(result.predicted_barcode), result.confidence))
 }
 
