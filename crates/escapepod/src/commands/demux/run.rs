@@ -186,18 +186,6 @@ impl Detector {
             }
         }
     }
-
-    /// Decode the signal and detect the adapter region. Returns the decoded
-    /// signal and `(adapter_start, adapter_end)`.
-    fn prep(
-        &self,
-        extractor: &escapepod_signal::SignalExtractor,
-        rows: &[u64],
-    ) -> Option<(Vec<i16>, usize, usize)> {
-        let signal = extractor.get_signal(rows).ok()?;
-        let (s, e) = self.detect(&signal);
-        Some((signal, s, e))
-    }
 }
 
 fn barcode_label(predicted: i32) -> String {
@@ -430,7 +418,6 @@ fn produce_cpu(
     let predictor = SvmPredictor::new(model);
     for path in &args.input {
         let reader = Reader::open(path)?;
-        let extractor = reader.signal_extractor()?;
         let run_infos = Arc::new(reader.run_infos().to_vec());
         for batch in reader.read_batches()? {
             let batch = batch?;
@@ -440,16 +427,34 @@ fn produce_cpu(
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
 
-            reads.par_iter().for_each(|read| {
-                if let Some((barcode, chunks, conf)) =
-                    classify_one_cpu(read, &extractor, detector, &predictor, fp, &reader)
+            // I/O and CPU are split deliberately. Pulling each read's signal on
+            // its own rayon worker (the old `reads.par_iter()`) puts 48 threads
+            // on the mmap at once, each faulting a different batch region — on a
+            // network FS that scatters page faults and defeats kernel readahead,
+            // collapsing cold throughput to ~single-digit MB/s (#72). Instead do
+            // ONE sequential, ascending-order sweep to pull this read-batch's
+            // compressed signal into memory (readahead engages → ~hundreds of
+            // MB/s cold), then parallelize only the CPU work over those in-memory
+            // chunks. The bulk chunks are reused for both classify-decode and the
+            // block-level write, so each read's signal is read exactly once.
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+
+            bulk.par_iter().for_each(|(i, chunks)| {
+                let read = &reads[*i];
+                if let Some((barcode, conf)) =
+                    classify_one_cpu(read, chunks, detector, &predictor, fp)
                 {
                     route(
                         routers,
                         class_tx,
                         read.for_writing(read.run_info_index),
                         barcode,
-                        chunks,
+                        chunks.clone(),
                         run_infos.clone(),
                         conf,
                     );
@@ -461,21 +466,34 @@ fn produce_cpu(
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
+/// Decode (decompress) a read's in-memory compressed signal chunks into a
+/// single sample buffer, concatenated in chunk order.
+fn decode_chunks(chunks: &[CompressedSignalChunk]) -> Option<Vec<i16>> {
+    let total: usize = chunks.iter().map(|c| c.samples as usize).sum();
+    let mut signal = Vec::with_capacity(total);
+    for c in chunks {
+        let decoded =
+            escapepod_signal::pod5::compression::decompress_signal(&c.data, c.samples as usize)
+                .ok()?;
+        signal.extend_from_slice(&decoded);
+    }
+    Some(signal)
+}
+
+/// Classify a single read from its already-in-memory compressed signal chunks
+/// (decode → detect → fingerprint → SVM). Returns `(barcode, confidence)`; the
+/// caller already holds the chunks for routing.
 fn classify_one_cpu(
     read: &ReadData,
-    extractor: &escapepod_signal::SignalExtractor,
+    chunks: &[CompressedSignalChunk],
     detector: &Detector,
     predictor: &SvmPredictor,
     fp: FpParams,
-    reader: &Reader,
-) -> Option<(String, Vec<CompressedSignalChunk>, f64)> {
-    let (signal, s, e) = detector.prep(extractor, &read.signal_rows)?;
-    let chunks = reader
-        .get_compressed_signal_for_rows(&read.signal_rows)
-        .ok()?;
+) -> Option<(String, f64)> {
+    let signal = decode_chunks(chunks)?;
+    let (s, e) = detector.detect(&signal);
     if e <= s {
-        return Some((UNCLASSIFIED.to_string(), chunks, 0.0));
+        return Some((UNCLASSIFIED.to_string(), 0.0));
     }
     let Some(features) = extract_fingerprint_from_signal(
         &signal,
@@ -489,14 +507,10 @@ fn classify_one_cpu(
         fp.keep_last,
         false,
     ) else {
-        return Some((UNCLASSIFIED.to_string(), chunks, 0.0));
+        return Some((UNCLASSIFIED.to_string(), 0.0));
     };
     let (_probs, result) = predictor.predict(&features.values);
-    Some((
-        barcode_label(result.predicted_barcode),
-        chunks,
-        result.confidence,
-    ))
+    Some((barcode_label(result.predicted_barcode), result.confidence))
 }
 
 /// GPU producer: parallel CPU prep (decode + detect + fingerprint) feeds a
@@ -558,7 +572,6 @@ fn produce_gpu(
         let mut metas: Vec<Meta> = Vec::with_capacity(GPU_BATCH);
         for path in &args.input {
             let reader = Reader::open(path)?;
-            let extractor = reader.signal_extractor()?;
             let run_infos = Arc::new(reader.run_infos().to_vec());
             for batch in reader.read_batches()? {
                 let batch = batch?;
@@ -568,14 +581,24 @@ fn produce_gpu(
                     .filter(|r| !r.signal_rows.is_empty())
                     .collect();
 
+                // One sequential sweep pulls this read-batch's compressed signal
+                // (see produce_cpu for why single-stream I/O beats per-worker
+                // faulting on a network FS, #72), then the CPU prep parallelizes
+                // over the in-memory chunks.
+                let keyed: Vec<(usize, Vec<u64>)> = reads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (i, r.signal_rows.clone()))
+                    .collect();
+                let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+
                 type Prepped = (ReadData, Option<Vec<f64>>, Vec<CompressedSignalChunk>);
-                let prepped: Vec<Option<Prepped>> = reads
+                let prepped: Vec<Option<Prepped>> = bulk
                     .par_iter()
-                    .map(|read| -> Option<Prepped> {
-                        let (signal, s, e) = detector.prep(&extractor, &read.signal_rows)?;
-                        let chunks = reader
-                            .get_compressed_signal_for_rows(&read.signal_rows)
-                            .ok()?;
+                    .map(|(i, chunks)| -> Option<Prepped> {
+                        let read = &reads[*i];
+                        let signal = decode_chunks(chunks)?;
+                        let (s, e) = detector.detect(&signal);
                         let features = if e > s {
                             extract_fingerprint_from_signal(
                                 &signal,
@@ -593,7 +616,11 @@ fn produce_gpu(
                         } else {
                             None
                         };
-                        Some((read.for_writing(read.run_info_index), features, chunks))
+                        Some((
+                            read.for_writing(read.run_info_index),
+                            features,
+                            chunks.clone(),
+                        ))
                     })
                     .collect();
                 pb.inc(reads.len() as u64);

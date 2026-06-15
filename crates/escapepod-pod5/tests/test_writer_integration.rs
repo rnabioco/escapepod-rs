@@ -97,6 +97,61 @@ fn writer_compressed_signal_passthrough() {
 }
 
 #[test]
+fn get_compressed_signal_bulk_matches_per_read() {
+    // Multi-batch fixture so the requested rows span several signal batches,
+    // exercising the batch-grouping in get_compressed_signal_bulk.
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("bulk.pod5");
+    let opts = WriterOptions {
+        read_batch_size: 4,
+        signal_batch_size: 3,
+        ..WriterOptions::default()
+    };
+    let mut writer = Writer::create(&path, opts).expect("create");
+    let run_idx = writer.add_run_info(make_run_info("bulk_acq")).unwrap();
+    for i in 0..20u64 {
+        let read = make_read(run_idx, i as u32 + 1, 700);
+        writer
+            .add_read(read, &synth_signal(700, 0xC0DE + i))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = Reader::open(&path).unwrap();
+    let reads: Vec<_> = reader.reads().unwrap().collect::<Result<_, _>>().unwrap();
+    assert!(reader.signal_row_count().unwrap() > 1);
+
+    // Reference: per-read path.
+    let per_read: Vec<Vec<_>> = reads
+        .iter()
+        .map(|r| {
+            reader
+                .get_compressed_signal_for_rows(&r.signal_rows)
+                .unwrap()
+        })
+        .collect();
+
+    // Bulk path over all reads at once.
+    let keyed: Vec<(Uuid, Vec<u64>)> = reads
+        .iter()
+        .map(|r| (r.read_id, r.signal_rows.clone()))
+        .collect();
+    let bulk = reader.get_compressed_signal_bulk(&keyed).unwrap();
+
+    assert_eq!(bulk.len(), reads.len());
+    for (i, (key, chunks)) in bulk.iter().enumerate() {
+        assert_eq!(*key, reads[i].read_id);
+        let reference = &per_read[i];
+        assert_eq!(chunks.len(), reference.len(), "chunk count for read {i}");
+        for (b, r) in chunks.iter().zip(reference.iter()) {
+            assert_eq!(b.read_id, r.read_id, "read_id read {i}");
+            assert_eq!(b.samples, r.samples, "samples read {i}");
+            assert_eq!(b.data.as_ref(), r.data.as_ref(), "vbz bytes read {i}");
+        }
+    }
+}
+
+#[test]
 fn writer_predefined_dictionaries_enforce_pore_types() {
     // Only `not_set` pore_type is allowed; any other must error.
     let tmp = TempDir::new().expect("tempdir");
