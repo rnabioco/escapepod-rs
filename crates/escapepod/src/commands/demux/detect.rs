@@ -69,6 +69,11 @@ pub struct DetectArgs {
 
     /// Run the CNN batched on the GPU instead of per-read on the CPU
     /// (`--method cnn` only; requires a build with `--features "cnn-detect gpu"`).
+    ///
+    /// Produces identical boundaries to the CPU path. This is NOT a default
+    /// speedup: at typical scales `detect` is dominated by POD5 reading and
+    /// signal prep, not CNN compute, so the CPU (tract) path is usually as fast
+    /// or faster. Worth it only for very large / compute-bound batches.
     #[cfg(feature = "gpu")]
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
