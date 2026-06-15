@@ -33,6 +33,7 @@ use escapepod_signal::{
     Uuid, Writer, WriterOptions,
 };
 use rayon::prelude::*;
+use tracing::info;
 
 const UNCLASSIFIED: &str = "unclassified";
 
@@ -287,18 +288,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     configure_thread_pool(args.threads);
     std::fs::create_dir_all(&output_dir)?;
 
-    println!("{} fused streaming demux", style::action("Running"));
-    println!(
+    info!("{} fused streaming demux", style::action("Running"));
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Model:"),
         style::path(model_path.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(output_dir.display())
@@ -775,15 +776,18 @@ struct DemuxSummary {
 }
 
 fn print_summary(summary: &DemuxSummary) {
-    let total: usize = summary.per_barcode.iter().map(|(_, n)| n).sum();
-    println!("\n{}", style::action("Demux summary:"));
-    for (barcode, n) in &summary.per_barcode {
-        println!("  {} {}", style::label(barcode), style::count(*n));
+    // Styled multi-line report; gate on verbosity instead of per-line tracing events.
+    if tracing::enabled!(tracing::Level::INFO) {
+        let total: usize = summary.per_barcode.iter().map(|(_, n)| n).sum();
+        println!("\n{}", style::action("Demux summary:"));
+        for (barcode, n) in &summary.per_barcode {
+            println!("  {} {}", style::label(barcode), style::count(*n));
+        }
+        println!(
+            "{} {} reads across {} barcode file(s)",
+            style::action("Total:"),
+            style::count(total),
+            summary.per_barcode.len()
+        );
     }
-    println!(
-        "{} {} reads across {} barcode file(s)",
-        style::action("Total:"),
-        style::count(total),
-        summary.per_barcode.len()
-    );
 }

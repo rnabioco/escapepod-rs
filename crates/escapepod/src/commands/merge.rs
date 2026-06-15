@@ -9,6 +9,7 @@ use escapepod_signal::{MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 pub fn run(
     inputs: Vec<PathBuf>,
@@ -31,7 +32,7 @@ pub fn run(
     let all_files = collect_pod5_inputs(&inputs)?;
 
     let num_files = all_files.len();
-    eprintln!(
+    info!(
         "{} {} files into {}",
         style::action("Merging"),
         style::count(num_files),
@@ -111,7 +112,7 @@ pub fn run(
 
     progress_bar.finish_and_clear();
 
-    eprintln!(
+    info!(
         "{} {} reads into {}",
         style::action("Merged"),
         style::count(result.reads_written),
@@ -119,7 +120,7 @@ pub fn run(
     );
 
     if result.duplicates_skipped > 0 {
-        eprintln!(
+        info!(
             "{} {} duplicate reads",
             style::note_label("Skipped"),
             style::warning(result.duplicates_skipped)

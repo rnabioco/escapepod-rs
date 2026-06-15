@@ -9,6 +9,8 @@ use noodles_csi::binning_index::ReferenceSequence as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use tracing::{info, warn};
+
 use crate::style;
 
 /// Resolve input path to a list of POD5 files.
@@ -163,8 +165,8 @@ pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> Open
         Ok(r) => OpenResult::Ok(r),
         Err(e) => {
             if is_directory {
-                eprintln!(
-                    "Warning: skipping {} ({})",
+                warn!(
+                    "skipping {} ({})",
                     file_path.file_name().unwrap_or_default().to_string_lossy(),
                     e
                 );
@@ -190,17 +192,15 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
     // Also check for path.bai (alternative naming convention)
     let alt_bai_path = bam_path.with_extension("bai");
     if alt_bai_path.exists() {
-        eprintln!(
-            "{} Found index at {} but noodles expects {}",
-            style::note_label("Note:"),
+        info!(
+            "found index at {} but noodles expects {}",
             style::path(alt_bai_path.display()),
             style::path(bai_path.display())
         );
     }
 
-    eprintln!(
-        "{} BAI index not found, creating {}...",
-        style::info("Info:"),
+    info!(
+        "BAI index not found, creating {}...",
         style::path(bai_path.display())
     );
 
@@ -210,11 +210,7 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
     // Write the index to file
     bam::bai::fs::write(&bai_path, &index)?;
 
-    eprintln!(
-        "{} Created BAI index: {}",
-        style::action("Done:"),
-        style::path(bai_path.display())
-    );
+    info!("created BAI index: {}", style::path(bai_path.display()));
 
     Ok(bai_path)
 }
@@ -252,8 +248,8 @@ pub fn get_reads_iter_with_warning<'a>(
         Ok(iter) => OpenResult::Ok(iter),
         Err(e) => {
             if is_directory {
-                eprintln!(
-                    "Warning: cannot read {} ({})",
+                warn!(
+                    "cannot read {} ({})",
                     file_path.file_name().unwrap_or_default().to_string_lossy(),
                     e
                 );

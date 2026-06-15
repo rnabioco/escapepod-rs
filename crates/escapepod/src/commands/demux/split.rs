@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use tabled::{builder::Builder, settings::Style};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Arguments for the split subcommand.
@@ -54,21 +55,21 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
     timer.phase("Split");
     let profile = args.profile;
-    println!(
+    info!(
         "{} reads into separate POD5 files by barcode",
         style::action("Splitting"),
     );
-    println!(
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Classifications:"),
         style::path(args.classifications.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output dir:"),
         style::path(args.output_dir.display())
@@ -81,9 +82,9 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&args.output_dir)?;
 
     // Parse the classifications CSV
-    println!("{} classifications...", style::action("Loading"));
+    info!("{} classifications...", style::action("Loading"));
     let barcode_mapping = parse_barcode_mapping(&args.classifications)?;
-    println!(
+    info!(
         "{} {} classified reads",
         style::label("Loaded:"),
         style::count(barcode_mapping.len())
@@ -96,7 +97,7 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     let mut barcodes: Vec<String> = barcode_groups.keys().cloned().collect();
     barcodes.sort();
 
-    println!(
+    info!(
         "{} {} unique barcodes",
         style::label("Found:"),
         style::count(barcodes.len())
@@ -109,7 +110,7 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
         // Skip unclassified if requested
         if barcode == "unclassified" && !args.unclassified {
             let count = barcode_groups.get(barcode).map(|s| s.len()).unwrap_or(0);
-            println!(
+            warn!(
                 "{} {} unclassified reads (--unclassified=false)",
                 style::warning_label("Skipping"),
                 style::count(count)
@@ -155,7 +156,7 @@ fn process_barcode(
     let output_filename = format!("{}_{}.pod5", args.prefix, barcode);
     let output_path = args.output_dir.join(&output_filename);
 
-    println!(
+    info!(
         "{} {} ({} reads)...",
         style::action("Processing"),
         style::value(barcode),
@@ -173,8 +174,8 @@ fn process_barcode(
     // Get file size
     let file_size = fs::metadata(&output_path)?.len();
 
-    println!(
-        "  {} {} reads to {}",
+    info!(
+        "{} {} reads to {}",
         style::action("Wrote"),
         style::count(result.matched_reads),
         style::path(&output_filename)
@@ -189,35 +190,38 @@ fn process_barcode(
 
 /// Print a summary table of all processed barcodes.
 fn print_summary(stats: &[BarcodeOutput]) {
-    println!("\n{}", style::action("Summary:"));
-    println!("{}", style::label("─".repeat(60)));
+    // Styled multi-line report; gate on verbosity instead of per-line tracing events.
+    if tracing::enabled!(tracing::Level::INFO) {
+        println!("\n{}", style::action("Summary:"));
+        println!("{}", style::label("─".repeat(60)));
 
-    let mut builder = Builder::default();
-    builder.push_record(vec!["Barcode", "Reads", "File Size"]);
+        let mut builder = Builder::default();
+        builder.push_record(vec!["Barcode", "Reads", "File Size"]);
 
-    for output in stats {
-        let size_mb = (output.file_size as f64) / (1024.0 * 1024.0);
-        builder.push_record(vec![
-            output.barcode.clone(),
-            format!("{}", output.read_count),
-            format!("{:.2} MB", size_mb),
-        ]);
+        for output in stats {
+            let size_mb = (output.file_size as f64) / (1024.0 * 1024.0);
+            builder.push_record(vec![
+                output.barcode.clone(),
+                format!("{}", output.read_count),
+                format!("{:.2} MB", size_mb),
+            ]);
+        }
+
+        let mut table = builder.build();
+        table.with(Style::rounded());
+        println!("{}", table);
+
+        let total_reads: u64 = stats.iter().map(|s| s.read_count).sum();
+        let total_size: u64 = stats.iter().map(|s| s.file_size).sum();
+        let total_size_mb = (total_size as f64) / (1024.0 * 1024.0);
+
+        println!("\n{}", style::label("─".repeat(60)));
+        println!(
+            "{} {} reads across {} files ({:.2} MB total)",
+            style::action("Split"),
+            style::count(total_reads),
+            style::count(stats.len()),
+            total_size_mb
+        );
     }
-
-    let mut table = builder.build();
-    table.with(Style::rounded());
-    println!("{}", table);
-
-    let total_reads: u64 = stats.iter().map(|s| s.read_count).sum();
-    let total_size: u64 = stats.iter().map(|s| s.file_size).sum();
-    let total_size_mb = (total_size as f64) / (1024.0 * 1024.0);
-
-    println!("\n{}", style::label("─".repeat(60)));
-    println!(
-        "{} {} reads across {} files ({:.2} MB total)",
-        style::action("Split"),
-        style::count(total_reads),
-        style::count(stats.len()),
-        total_size_mb
-    );
 }

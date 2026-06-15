@@ -8,6 +8,9 @@ use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use tracing::info;
+#[cfg(feature = "cnn-detect")]
+use tracing::warn;
 
 /// Arguments for the detect subcommand.
 #[derive(Debug, clap::Args)]
@@ -124,21 +127,21 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
     timer.phase("Detect adapters");
     let profile = args.profile;
-    println!(
+    info!(
         "{} adapter boundaries using LLR algorithm",
         style::action("Detecting"),
     );
-    println!(
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
     );
-    println!(
+    info!(
         "{} min_adapter={}, border_trim={}, downscale={}",
         style::label("Parameters:"),
         style::value(args.min_adapter),
@@ -150,7 +153,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     configure_thread_pool(args.threads);
 
     let total = total_read_count(&args.input);
-    println!(
+    info!(
         "{} {} reads to process",
         style::label("Found:"),
         style::count(total)
@@ -224,12 +227,12 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
     writer.flush()?;
 
-    eprintln!(
+    info!(
         "{} boundaries written to {}",
         style::action("Detected"),
         style::path(args.output.display())
     );
-    eprintln!(
+    info!(
         "{} {} reads with detected adapters",
         style::label("Result:"),
         style::count(detected_count)
@@ -264,27 +267,26 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
 
-    eprintln!(
-        "{} the ADAPTed CNN path uses CC BY-NC 4.0 weights you supply via --cnn-model; \
+    warn!(
+        "the ADAPTed CNN path uses CC BY-NC 4.0 weights you supply via --cnn-model; \
          downstream non-commercial-use obligations apply.",
-        style::label("Note:")
     );
 
-    println!(
+    info!(
         "{} adapter boundaries using ADAPTed CNN",
         style::action("Detecting"),
     );
-    println!(
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Model:"),
         style::path(cnn_model_path.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
@@ -296,7 +298,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         AdapterCnn::load(cnn_model_path).map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
 
     let total = total_read_count(&args.input);
-    println!(
+    info!(
         "{} {} reads to process",
         style::label("Found:"),
         style::count(total)
@@ -343,12 +345,12 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     }
     writer.flush()?;
 
-    eprintln!(
+    info!(
         "{} boundaries written to {}",
         style::action("Detected"),
         style::path(args.output.display())
     );
-    eprintln!(
+    info!(
         "{} {} reads with detected adapters",
         style::label("Result:"),
         style::count(detected)
@@ -388,26 +390,25 @@ fn run_cnn_gpu(args: DetectArgs) -> anyhow::Result<()> {
         );
     }
 
-    eprintln!(
-        "{} the ADAPTed CNN path uses CC BY-NC 4.0 weights you supply; \
+    warn!(
+        "the ADAPTed CNN path uses CC BY-NC 4.0 weights you supply; \
          downstream non-commercial-use obligations apply.",
-        style::label("Note:")
     );
-    println!(
+    info!(
         "{} adapter boundaries using ADAPTed CNN (GPU, batched)",
         style::action("Detecting"),
     );
-    println!(
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Weights:"),
         style::path(weights_path.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
@@ -418,7 +419,7 @@ fn run_cnn_gpu(args: DetectArgs) -> anyhow::Result<()> {
     let gpu = GpuCnn::load(&weights_path).map_err(|e| anyhow::anyhow!("loading GPU CNN: {e}"))?;
 
     let total = total_read_count(&args.input);
-    println!(
+    info!(
         "{} {} reads to process",
         style::label("Found:"),
         style::count(total)
@@ -473,12 +474,12 @@ fn run_cnn_gpu(args: DetectArgs) -> anyhow::Result<()> {
     }
     writer.flush()?;
 
-    eprintln!(
+    info!(
         "{} boundaries written to {}",
         style::action("Detected"),
         style::path(args.output.display())
     );
-    eprintln!(
+    info!(
         "{} {} reads with detected adapters",
         style::label("Result:"),
         style::count(detected)

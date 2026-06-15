@@ -147,14 +147,30 @@ For perf/valgrind where inlining hides frames, swap `release-with-debug` for `pr
 
 ### Runtime verbosity
 
-The CLI is wired to `tracing` with stderr output. Control the level via CLI flags or `RUST_LOG`:
+All CLI status/progress/warning output flows through `tracing` to stderr (the
+custom `EscpodFormatter` in `main.rs` renders `timestamp LEVEL [target] message`).
+Command *data* — TSV/CSV rows, `inspect`/`summary` reports, ID lists — stays on
+**stdout** via `println!`, so it can be piped/redirected independently of logs.
+
+Default level is **info** (status visible out of the box). Control via CLI flags
+or `RUST_LOG` (which always wins when set):
 
 ```bash
-escpod -v inspect summary file.pod5      # info
-escpod -vv merge *.pod5 -o out.pod5      # debug
+escpod inspect summary file.pod5         # info (default): status + warnings
+escpod -v merge *.pod5 -o out.pod5       # debug
+escpod -vv merge *.pod5 -o out.pod5      # trace
+escpod -q merge …                         # errors only (status + progress bars suppressed)
 RUST_LOG=escapepod_signal::reader=trace escpod view file.pod5   # module-scoped
-escpod -q merge …                         # errors only
 ```
+
+Progress bars/spinners (`progress.rs`) are status output too: they auto-hide
+when the level drops below info (i.e. under `-q`). Multi-line styled report
+blocks (e.g. `merge --profile` timings, demux summaries) are gated on
+`tracing::enabled!(Level::INFO)` rather than emitted as per-line events.
+
+When adding output: use `tracing::info!`/`warn!`/`error!` for diagnostics
+(don't hand-prefix messages with `Warning:`/`Note:` — the formatter prints the
+level); use `println!`→stdout only for the command's actual data product.
 
 ## Architecture
 
