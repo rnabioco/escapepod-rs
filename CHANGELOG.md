@@ -23,6 +23,10 @@
   dominant prep stage — ~5× faster, with ~98% barcode agreement versus
   full-resolution (ds=1). Pass `--downscale 1` to restore full-resolution
   detect.
+- Dependency bumps (no behavior change): Arrow ecosystem `arrow` + `parquet`
+  58 → 59, `tabled` 0.20 → 0.21, and the `noodles-*` BAM stack (`bam` 0.90,
+  `sam` 0.85, `bgzf` 0.47, `core` 0.20, `csi` 0.56). `ndarray` is held at 0.16
+  — the `linfa` SVM stack still pins it, so 0.17 is blocked upstream.
 
 ### Fixed
 
