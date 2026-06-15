@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
 
     let model = match load_any_model(model_path.as_ref())? {
         AnyModel::Svm(m) => m,
-        AnyModel::WarpDemux(_) => anyhow::bail!("need an SVM model"),
+        AnyModel::WarpDemux(_) | AnyModel::Gbm(_) => anyhow::bail!("need an SVM model"),
     };
     let flen = if qlen > 0 {
         qlen

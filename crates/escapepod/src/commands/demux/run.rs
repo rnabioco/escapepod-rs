@@ -280,6 +280,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             "`demux` needs an SVM model (DtwSvmModel / converted WarpDemuX). \
              The reference-CSV path is only on `demux classify --reference`."
         ),
+        AnyModel::Gbm(_) => anyhow::bail!(
+            "`demux` (fused pipeline) does not support GBM models yet; run the \
+             stages separately and classify with `demux classify --model <gbm.json>`."
+        ),
     };
     let detector = build_detector(&args)?;
     let fp = FpParams::default();

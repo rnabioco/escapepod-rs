@@ -4,9 +4,12 @@ use super::fp_io::{read_query_fingerprints_f32, read_query_fingerprints_f64};
 use super::utils::{configure_thread_pool, parse_reference_csv};
 use crate::style;
 use anyhow::Context;
-use escapepod_demux::{AnyModel, DtwSvmModel, SvmPredictor, SvmWorkspace, load_any_model};
+use escapepod_demux::{
+    AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace, load_any_model,
+};
 use escapepod_signal::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -170,6 +173,7 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         match load_any_model(&model_path)? {
             AnyModel::Svm(model) => run_with_svm_model(args, model_path, model),
             AnyModel::WarpDemux(_) => run_with_model(args, model_path),
+            AnyModel::Gbm(model) => run_with_gbm_model(args, model_path, model),
         }
     } else if let Some(reference_path) = args.reference.take() {
         run_with_csv(args, reference_path)
@@ -256,7 +260,8 @@ fn run_with_svm_model(
             // for the write step.
             stream_svm_classifications(
                 &args.output,
-                &model,
+                &model.label_mapper,
+                model.n_classes,
                 args.probabilities,
                 gpu_results.len(),
                 |tx| {
@@ -285,28 +290,164 @@ fn run_with_svm_model(
         // k×k coupling matrices never re-allocate per read.
         let predictor = SvmPredictor::new(&model);
         let n = query_fps.len();
-        stream_svm_classifications(&args.output, &model, args.probabilities, n, |tx| {
+        stream_svm_classifications(
+            &args.output,
+            &model.label_mapper,
+            model.n_classes,
+            args.probabilities,
+            n,
+            |tx| {
+                query_fps
+                    .par_iter()
+                    .map_init(
+                        || SvmWorkspace::for_model(&model),
+                        |ws, (read_id, fingerprint)| {
+                            let (probs, result) = predictor.predict_with_workspace(fingerprint, ws);
+                            SvmClassifyResult {
+                                read_id: *read_id,
+                                predicted_barcode: result.predicted_barcode,
+                                confidence: result.confidence,
+                                is_confident: result.is_confident,
+                                probabilities: probs,
+                            }
+                        },
+                    )
+                    .for_each_with(tx.clone(), |tx, r| {
+                        tx.send(r).ok();
+                    });
+                Ok(())
+            },
+        )?
+    };
+
+    let unclassified_count = total_count - confident_count;
+
+    println!(
+        "{} classifications written to {}",
+        style::action("Wrote"),
+        style::path(args.output.display())
+    );
+    println!(
+        "{} {} confident, {} unclassified",
+        style::label("Result:"),
+        style::count(confident_count),
+        style::warning(unclassified_count)
+    );
+
+    Ok(())
+}
+
+/// Run classification using a trained gradient-boosted (GBM) tree model.
+///
+/// Unlike the SVM path there is no DTW, no reference bank, and no GPU branch:
+/// each fingerprint is run through the tree ensemble independently. The
+/// predictor is read-only and `Sync`, so the rayon loop shares a single
+/// `&GbmPredictor` with no per-worker workspace. Output format matches the SVM
+/// path (`read_id,predicted_barcode,confidence,is_confident[,p<NN>…]`) so
+/// downstream scoring scripts treat the two interchangeably.
+fn run_with_gbm_model(
+    args: ClassifyArgs,
+    gbm_model_path: PathBuf,
+    model: GbmModel,
+) -> anyhow::Result<()> {
+    println!("{} reads using GBM model", style::action("Classifying"));
+    println!(
+        "{} {}",
+        style::label("Fingerprints:"),
+        style::path(args.fingerprints.display())
+    );
+    println!(
+        "{} {}",
+        style::label("GBM Model:"),
+        style::path(gbm_model_path.display())
+    );
+    println!(
+        "{} {}",
+        style::label("Output:"),
+        style::path(args.output.display())
+    );
+    if args.probabilities {
+        println!("{} per-class probabilities", style::label("Including:"));
+    }
+    println!(
+        "{} {} classes, {} features, {} boosting iterations",
+        style::label("Model:"),
+        style::count(model.n_classes),
+        style::count(model.n_features),
+        style::count(model.n_iterations())
+    );
+
+    if gpu_requested(&args) {
+        eprintln!(
+            "{} GBM inference is CPU-only; ignoring --gpu.",
+            style::label("warning:"),
+        );
+    }
+
+    let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
+
+    println!(
+        "{} {} query fingerprints",
+        style::label("Loaded:"),
+        style::count(query_fps.len())
+    );
+
+    if query_fps.is_empty() {
+        anyhow::bail!("No valid query fingerprints found");
+    }
+
+    // Fail fast on a model/fingerprint dimension mismatch (e.g. wrong model for
+    // these fingerprints) rather than silently classifying every read as
+    // unclassified.
+    if let Some((_, first)) = query_fps.first()
+        && first.len() != model.n_features
+    {
+        anyhow::bail!(
+            "Query fingerprints have {} features but the GBM model expects {}",
+            first.len(),
+            model.n_features
+        );
+    }
+
+    println!("{} reads with GBM...", style::action("Classifying"));
+    let predictor = GbmPredictor::new(&model);
+    let n = query_fps.len();
+    let (confident_count, total_count) = stream_svm_classifications(
+        &args.output,
+        &model.label_mapper,
+        model.n_classes,
+        args.probabilities,
+        n,
+        |tx| {
             query_fps
                 .par_iter()
-                .map_init(
-                    || SvmWorkspace::for_model(&model),
-                    |ws, (read_id, fingerprint)| {
-                        let (probs, result) = predictor.predict_with_workspace(fingerprint, ws);
-                        SvmClassifyResult {
+                .map(
+                    |(read_id, fingerprint)| match predictor.predict(fingerprint) {
+                        Ok((probs, result)) => SvmClassifyResult {
                             read_id: *read_id,
                             predicted_barcode: result.predicted_barcode,
                             confidence: result.confidence,
                             is_confident: result.is_confident,
                             probabilities: probs,
-                        }
+                        },
+                        // A length mismatch on a single read shouldn't abort the
+                        // whole batch — emit it as an unclassified row (barcode -1)
+                        // with empty probabilities, mirroring a rejected call.
+                        Err(_) => SvmClassifyResult {
+                            read_id: *read_id,
+                            predicted_barcode: -1,
+                            confidence: 0.0,
+                            is_confident: false,
+                            probabilities: Vec::new(),
+                        },
                     },
                 )
                 .for_each_with(tx.clone(), |tx, r| {
                     tx.send(r).ok();
                 });
             Ok(())
-        })?
-    };
+        },
+    )?;
 
     let unclassified_count = total_count - confident_count;
 
@@ -701,7 +842,8 @@ fn write_csv_classifications(path: &Path, results: &[ClassifyResult]) -> anyhow:
 /// Returns `(confident_count, total_count)`.
 fn stream_svm_classifications<F>(
     path: &Path,
-    model: &DtwSvmModel,
+    label_mapper: &HashMap<usize, i32>,
+    n_classes: usize,
     include_probabilities: bool,
     _expected: usize,
     produce: F,
@@ -719,8 +861,7 @@ where
 
     // Pre-build the barcode label strings once (instead of `format!("BC{:02}", id)`
     // per read) and the probability header once.
-    let label_mapper = model.label_mapper.clone();
-    let n_classes = model.n_classes;
+    let label_mapper = label_mapper.clone();
     let path_buf = path.to_path_buf();
 
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<(usize, usize)> {
