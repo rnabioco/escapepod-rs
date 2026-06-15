@@ -37,17 +37,17 @@ csv = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
 indicatif = { workspace = true, optional = true }
 # BAM file support
-noodles-bam = { version = "0.88", optional = true }
-noodles-bgzf = { version = "0.46", optional = true }
-noodles-core = { version = "0.19", optional = true }
-noodles-csi = { version = "0.55", optional = true }
-noodles-sam = { version = "0.84", optional = true }
+noodles-bam = { version = "0.90", optional = true }
+noodles-bgzf = { version = "0.47", optional = true }
+noodles-core = { version = "0.20", optional = true }
+noodles-csi = { version = "0.56", optional = true }
+noodles-sam = { version = "0.85", optional = true }
 owo-colors = { version = "4", optional = true }
 parquet = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-tabled = { version = "0.20", features = ["ansi"], optional = true }
+tabled = { version = "0.21", features = ["ansi"], optional = true }
 tempfile = { version = "3", optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }

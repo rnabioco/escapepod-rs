@@ -14,7 +14,7 @@ readme = "README.md"
 # Error handling
 anyhow = "1"
 # Arrow ecosystem
-arrow = { version = "58", default-features = false, features = ["ipc"] }
+arrow = { version = "59", default-features = false, features = ["ipc"] }
 byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CLI
@@ -34,7 +34,7 @@ numpy = "0.28"
 # Parquet I/O for fingerprint tables (workspace dep so both test fixtures
 # and the CLI share the same version; features are kept default-off at
 # the workspace level so non-parquet crates don't pay).
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Python bindings
 pyo3 = { version = "0.28", features = ["extension-module"] }
 rayon = "1"
