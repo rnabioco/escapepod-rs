@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
 
     let model = match load_any_model(model_path.as_ref())? {
         AnyModel::Svm(m) => m,
-        AnyModel::WarpDemux(_) => anyhow::bail!("need an SVM model"),
+        AnyModel::WarpDemux(_) | AnyModel::Gbm(_) => anyhow::bail!("need an SVM model"),
     };
     let gamma = model.kernel_params.gamma;
     let power = model.kernel_params.power;

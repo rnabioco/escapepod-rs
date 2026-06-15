@@ -258,30 +258,34 @@ pub fn load_svm_model(path: &Path) -> Result<DtwSvmModel, anyhow::Error> {
 
 /// Either kind of barcode model the CLI knows how to classify with.
 ///
-/// We maintain two on-disk schemas — `DtwSvmModel` (from `escpod demux
-/// train-svm`, has `label_mapper`) and `WarpDemuxModel` (legacy/exported
-/// from upstream WarpDemuX, has `label_map`) — and callers historically
-/// had to choose the right loader. [`load_any_model`] picks for you based
-/// on the JSON shape and returns a tagged enum; the CLI dispatches on the
-/// variant so users don't have to care which flavor lives on disk.
+/// We maintain three on-disk schemas — `DtwSvmModel` (from `escpod demux
+/// train-svm`, has `label_mapper`), `WarpDemuxModel` (legacy/exported from
+/// upstream WarpDemuX, has `label_map`), and `GbmModel` (gradient-boosted
+/// trees from `scripts/export_gbm_model.py`, tagged `model_type: "gbm"`) —
+/// and callers historically had to choose the right loader. [`load_any_model`]
+/// picks for you based on the JSON shape and returns a tagged enum; the CLI
+/// dispatches on the variant so users don't have to care which flavor lives
+/// on disk.
 #[derive(Debug)]
 pub enum AnyModel {
     Svm(DtwSvmModel),
     WarpDemux(WarpDemuxModel),
+    Gbm(crate::GbmModel),
 }
 
-/// Load a model from JSON, auto-detecting whether it's a `DtwSvmModel` or
-/// a legacy `WarpDemuxModel`.
+/// Load a model from JSON, auto-detecting whether it's a `GbmModel`,
+/// `DtwSvmModel`, or a legacy `WarpDemuxModel`.
 ///
-/// We discriminate on the presence of `label_mapper` (DtwSvmModel) vs
-/// `label_map` (WarpDemuxModel) at the top level — both structs are
-/// flat JSON objects and those two fields are disjoint by schema, so the
-/// check is unambiguous and cheap (single pass, no full parse before the
-/// branch). Once the kind is known we parse into the appropriate struct
-/// and validate.
+/// Discrimination is a cheap single-pass key check on the top-level object:
+/// the GBM tag (`model_type == "gbm"`, or a `trees` array as a fallback) is
+/// tested *first* because a GBM JSON also carries `label_mapper` and would
+/// otherwise be misparsed as a `DtwSvmModel`. After that we fall back to
+/// `label_mapper` (DtwSvmModel) vs `label_map` (WarpDemuxModel), which are
+/// disjoint by schema. Once the kind is known we parse into the appropriate
+/// struct and validate.
 ///
-/// Errors if the file isn't valid JSON, matches neither schema, or fails
-/// its model-specific validation.
+/// Errors if the file isn't valid JSON, matches no schema, or fails its
+/// model-specific validation.
 pub fn load_any_model(path: &Path) -> Result<AnyModel, anyhow::Error> {
     use anyhow::Context;
 
@@ -296,7 +300,17 @@ pub fn load_any_model(path: &Path) -> Result<AnyModel, anyhow::Error> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Model file '{}' is not a JSON object", path.display()))?;
 
-    if obj.contains_key("label_mapper") {
+    let is_gbm =
+        obj.get("model_type").and_then(|v| v.as_str()) == Some("gbm") || obj.contains_key("trees");
+
+    if is_gbm {
+        let model: crate::GbmModel =
+            serde_json::from_value(json).with_context(|| "Failed to parse GbmModel JSON")?;
+        model
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid GbmModel: {}", e))?;
+        Ok(AnyModel::Gbm(model))
+    } else if obj.contains_key("label_mapper") {
         let model: DtwSvmModel =
             serde_json::from_value(json).with_context(|| "Failed to parse DtwSvmModel JSON")?;
         model
