@@ -92,10 +92,13 @@ pub struct RunArgs {
     )]
     pub border_trim: usize,
 
-    /// Downscale factor for LLR signal processing (10 = WarpDemuX-compatible).
+    /// Downscale factor for LLR signal processing. Default 10 is the
+    /// WarpDemuX-native mode (~5× faster detect, the dominant prep stage,
+    /// with ~98% barcode agreement vs full resolution). Set 1 for
+    /// full-resolution detect.
     #[arg(
         long,
-        default_value = "1",
+        default_value = "10",
         value_name = "N",
         help_heading = "Advanced Options"
     )]

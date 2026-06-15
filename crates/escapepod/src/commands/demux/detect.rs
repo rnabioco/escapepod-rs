@@ -38,10 +38,11 @@ pub struct DetectArgs {
     )]
     pub border_trim: usize,
 
-    /// Downscale factor for signal processing (1 = no downscaling, 10 = WarpDemuX-compatible)
+    /// Downscale factor for signal processing. Default 10 is the
+    /// WarpDemuX-native mode; set 1 for full-resolution (no downscaling).
     #[arg(
         long,
-        default_value = "1",
+        default_value = "10",
         value_name = "N",
         help_heading = "Advanced Options"
     )]
