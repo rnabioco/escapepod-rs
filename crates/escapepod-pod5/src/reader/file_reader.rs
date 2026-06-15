@@ -576,6 +576,79 @@ impl Reader {
         Ok(results)
     }
 
+    /// Bulk-extract **compressed** signal chunks for many reads in one pass.
+    ///
+    /// Like [`Self::get_signal_bulk`] but returns the raw VBZ bytes without
+    /// decompressing — the primitive a demux/scan front-end wants when it will
+    /// decompress on its own worker threads.
+    ///
+    /// Crucially, this uses the batch-grouped raw-byte path
+    /// ([`ArrowIpcFooter::extract_signal_rows`]): every requested row is grouped
+    /// by batch and each batch's bytes are read exactly once, in **ascending
+    /// file order**. On a cold network filesystem that turns the scattered,
+    /// per-read page faults of [`Self::get_compressed_signal_for_rows`] (which
+    /// defeat kernel readahead) into a single sequential sweep. Doing one bulk
+    /// call per worker chunk — instead of N parallel single-read calls — is the
+    /// difference between single-digit MB/s and near-disk bandwidth on BeeGFS.
+    pub fn get_compressed_signal_bulk<K: Clone>(
+        &self,
+        reads: &[(K, Vec<u64>)],
+    ) -> Result<Vec<(K, Vec<CompressedSignalChunk>)>> {
+        use crate::arrow_ipc::ArrowIpcFooter;
+
+        let signal_bytes = self.signal_table_bytes()?;
+        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+
+        // Flatten to a single row list, keeping a back-reference to which read
+        // and which position-within-read each row came from.
+        let mut back_refs: Vec<(usize, usize)> = Vec::new();
+        let mut row_indices: Vec<u64> = Vec::new();
+        for (read_idx, (_key, rows)) in reads.iter().enumerate() {
+            for (chunk_idx, &row) in rows.iter().enumerate() {
+                back_refs.push((read_idx, chunk_idx));
+                row_indices.push(row);
+            }
+        }
+
+        // One batch-grouped, ascending-order sweep over the signal table.
+        let raw_chunks = footer.extract_signal_rows(&row_indices, signal_bytes)?;
+        if raw_chunks.len() != row_indices.len() {
+            // A requested row was out of bounds; positional alignment with
+            // `back_refs` would be wrong. Fall back to the per-read path.
+            return reads
+                .iter()
+                .map(|(k, rows)| {
+                    self.get_compressed_signal_for_rows(rows)
+                        .map(|c| (k.clone(), c))
+                })
+                .collect();
+        }
+
+        // Reassemble per read, preserving chunk order within each read.
+        let mut per_read: Vec<Vec<(usize, CompressedSignalChunk)>> = vec![Vec::new(); reads.len()];
+        for (i, raw) in raw_chunks.iter().enumerate() {
+            let (read_idx, chunk_idx) = back_refs[i];
+            per_read[read_idx].push((
+                chunk_idx,
+                CompressedSignalChunk {
+                    read_id: Uuid::from_bytes(raw.read_id),
+                    samples: raw.samples,
+                    data: Arc::from(raw.signal),
+                },
+            ));
+        }
+
+        let mut results = Vec::with_capacity(reads.len());
+        for (read_idx, (key, _)) in reads.iter().enumerate() {
+            let chunks = &mut per_read[read_idx];
+            chunks.sort_by_key(|(idx, _)| *idx);
+            let v: Vec<CompressedSignalChunk> = chunks.drain(..).map(|(_, c)| c).collect();
+            results.push((key.clone(), v));
+        }
+
+        Ok(results)
+    }
+
     /// Create a thread-safe `SignalExtractor` for parallel per-read signal extraction.
     ///
     /// The returned extractor borrows the memory-mapped signal table and can be
