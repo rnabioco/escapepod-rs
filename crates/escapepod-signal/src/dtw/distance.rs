@@ -326,9 +326,10 @@ fn reset_row(buf: &mut Vec<f32>, len: usize) {
 }
 
 /// Number of training fingerprints scored per SIMD batch by
-/// [`dtw_distances_batch_unconstrained`]. Eight `f32` lanes map to one AVX2
-/// vector register under the workspace `-C target-cpu=x86-64-v3` baseline.
-pub const DTW_LANES: usize = 8;
+/// [`dtw_distances_batch_unconstrained`]. Sixteen `f32` lanes fill one AVX-512
+/// `zmm` register; on the `-C target-cpu=x86-64-v3` (AVX2) baseline the same
+/// block layout is consumed as two `ymm` registers per step.
+pub const DTW_LANES: usize = 16;
 
 /// Reusable row buffers for [`dtw_distances_batch_unconstrained`]. Each row
 /// cell holds `DTW_LANES` independent DP states (one per training fingerprint
@@ -363,7 +364,79 @@ impl DtwBatchScratch {
 /// **bit-identical** to the scalar [`dtw_distance`] for the same pair: the
 /// per-lane body is the same fused recurrence, and on the (square-distance +
 /// `+INF`) value domain here the `<`-fold and `f32::min` select equal bits.
+///
+/// Dispatch: the default path is the AVX2 baseline — the 16-lane block feeds
+/// two independent `ymm` chains per step, which (measured) beats a single
+/// 512-bit `zmm` chain. The DP carries a serial `left` dependency along each
+/// row, so throughput is bound by how many *independent* lane-chains stay in
+/// flight; 2×`ymm` exposes more instruction-level parallelism than 1×`zmm`.
+/// AVX-512 was ~22% slower on Cascade Lake (rna, where 512-bit ops also
+/// downclock) and still ~11% slower on Emerald Rapids (gpu node, ~no
+/// frequency penalty) — i.e. the loss is mostly ILP/port throughput, not just
+/// downclocking. The AVX-512 kernel is therefore **opt-in** via
+/// `ESCAPEPOD_DTW_AVX512=1` and off by default. The choice is a single cached
+/// CPUID + env probe, so the same binary serves every node.
 pub fn dtw_distances_batch_unconstrained(
+    query: &[f32],
+    train_blocks: &[f32],
+    train_len: usize,
+    n_train: usize,
+    out: &mut Vec<f64>,
+    scratch: &mut DtwBatchScratch,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx512() {
+            // SAFETY: `use_avx512()` returned true, so `avx512f` is supported
+            // on this CPU; that is the only requirement of the target-feature
+            // function.
+            unsafe {
+                dtw_batch_avx512(query, train_blocks, train_len, n_train, out, scratch);
+            }
+            return;
+        }
+    }
+    dtw_batch_kernel(query, train_blocks, train_len, n_train, out, scratch);
+}
+
+/// Cached dispatch decision: AVX-512 is used only when the CPU supports
+/// `avx512f` *and* the caller opted in via `ESCAPEPOD_DTW_AVX512=1`. Off by
+/// default because the 512-bit path measured slower than the AVX2 baseline on
+/// every cluster CPU tested (Cascade Lake −22%, Emerald Rapids −11%).
+/// `is_x86_feature_detected!` caches its own CPUID probe; the `OnceLock` also
+/// folds in the env check so neither runs per call.
+#[cfg(target_arch = "x86_64")]
+fn use_avx512() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        std::env::var_os("ESCAPEPOD_DTW_AVX512").is_some_and(|v| v == "1")
+            && std::arch::is_x86_feature_detected!("avx512f")
+    })
+}
+
+/// AVX-512 entry point: identical body to the baseline, but compiled with
+/// `avx512f` enabled so the inlined kernel autovectorizes to 512-bit `zmm`
+/// (16 lanes per register). Only ever reached via [`use_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dtw_batch_avx512(
+    query: &[f32],
+    train_blocks: &[f32],
+    train_len: usize,
+    n_train: usize,
+    out: &mut Vec<f64>,
+    scratch: &mut DtwBatchScratch,
+) {
+    dtw_batch_kernel(query, train_blocks, train_len, n_train, out, scratch);
+}
+
+/// The lane-parallel DTW body, shared by the baseline and AVX-512 entry points.
+/// `#[inline(always)]` so that when it is inlined into the `avx512f` wrapper it
+/// is recompiled with that feature and the `for lane in 0..DTW_LANES` loop
+/// lowers to `zmm`; inlined into the baseline it stays at AVX2 (`ymm`).
+#[inline(always)]
+fn dtw_batch_kernel(
     query: &[f32],
     train_blocks: &[f32],
     train_len: usize,
@@ -413,9 +486,10 @@ pub fn dtw_distances_batch_unconstrained(
                 let pr = prev[j];
                 let bj = &block[(j - 1) * DTW_LANES..j * DTW_LANES];
                 let mut row = [0.0f32; DTW_LANES];
-                // Independent across lanes → autovectorizes to one AVX2 op per
-                // arithmetic step. No NaN can arise (squared diffs + ±INF), so
-                // the `<`-fold matches `f32::min` bit-for-bit.
+                // Independent across lanes → autovectorizes to one vector op per
+                // arithmetic step (zmm under avx512f, ymm×2 at baseline). No NaN
+                // can arise (squared diffs + ±INF), so the `<`-fold matches
+                // `f32::min` bit-for-bit.
                 for lane in 0..DTW_LANES {
                     let d = ai - bj[lane];
                     let mut best = pl[lane];
@@ -834,24 +908,70 @@ mod tests {
                         .collect();
 
                     let blocks = pack_training_blocks(&training, train_len);
-                    let mut got = Vec::new();
+
+                    // Check both the public dispatcher (which uses the AVX-512
+                    // kernel on a capable node) and the baseline kernel directly
+                    // (so the non-AVX-512 path is covered on the same machine).
+                    let mut got_dispatch = Vec::new();
                     dtw_distances_batch_unconstrained(
                         &query,
                         &blocks,
                         train_len,
                         n_train,
-                        &mut got,
+                        &mut got_dispatch,
+                        &mut scratch,
+                    );
+                    let mut got_baseline = Vec::new();
+                    dtw_batch_kernel(
+                        &query,
+                        &blocks,
+                        train_len,
+                        n_train,
+                        &mut got_baseline,
                         &mut scratch,
                     );
 
-                    assert_eq!(got.len(), n_train);
-                    for (k, (&w, &g)) in want.iter().zip(got.iter()).enumerate() {
-                        assert_eq!(
-                            (w as f64).to_bits(),
-                            g.to_bits(),
-                            "mismatch train_len={train_len} n_train={n_train} \
-                             query_len={query_len} k={k}: want {w} got {g}",
-                        );
+                    // Also exercise the AVX-512 kernel directly when the host
+                    // supports it (the public dispatcher keeps it opt-in, so it
+                    // wouldn't otherwise run in the default test config).
+                    let mut got_avx512 = Vec::new();
+                    #[cfg(target_arch = "x86_64")]
+                    if std::arch::is_x86_feature_detected!("avx512f") {
+                        // SAFETY: gated by the runtime feature check above.
+                        unsafe {
+                            dtw_batch_avx512(
+                                &query,
+                                &blocks,
+                                train_len,
+                                n_train,
+                                &mut got_avx512,
+                                &mut scratch,
+                            );
+                        }
+                    } else {
+                        got_avx512 = got_baseline.clone();
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        got_avx512 = got_baseline.clone();
+                    }
+
+                    assert_eq!(got_dispatch.len(), n_train);
+                    assert_eq!(got_baseline.len(), n_train);
+                    assert_eq!(got_avx512.len(), n_train);
+                    for (k, &w) in want.iter().enumerate() {
+                        for (path, &g) in [
+                            ("dispatch", &got_dispatch[k]),
+                            ("baseline", &got_baseline[k]),
+                            ("avx512", &got_avx512[k]),
+                        ] {
+                            assert_eq!(
+                                (w as f64).to_bits(),
+                                g.to_bits(),
+                                "{path} mismatch train_len={train_len} n_train={n_train} \
+                                 query_len={query_len} k={k}: want {w} got {g}",
+                            );
+                        }
                     }
                 }
             }
