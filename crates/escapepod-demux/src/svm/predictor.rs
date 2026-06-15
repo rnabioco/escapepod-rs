@@ -530,21 +530,25 @@ impl<'a> SvmPredictor<'a> {
         ws.query_f32.clear();
         ws.query_f32.extend(query.iter().map(|&x| x as f32));
         match self.train_uniform_len {
-            // Fast path: uniform-length bank, unconstrained DTW (the WarpDemuX
-            // default) → score DTW_LANES training fingerprints per SIMD batch.
-            Some(len) if self.model.window.is_none() && self.model.penalty == 0.0 => {
-                escapepod_signal::dtw::dtw_distances_batch_unconstrained(
+            // Uniform-length bank → score DTW_LANES training fingerprints per
+            // SIMD batch. Handles both the unconstrained case (window=None,
+            // penalty=0) and the real WarpDemuX config (Sakoe-Chiba band +
+            // warping penalty); `dtw_distances_batch` fast-paths the former.
+            Some(len) => {
+                escapepod_signal::dtw::dtw_distances_batch(
                     &ws.query_f32,
                     &self.training_blocks,
                     len,
                     self.training_f32.len(),
+                    self.model.window,
+                    self.model.penalty,
                     &mut ws.distances,
                     &mut ws.dtw_batch,
                 );
             }
-            // Fallback: ragged bank, or a Sakoe-Chiba band / warping penalty is
-            // in play — score one fingerprint at a time, reusing the row buffers.
-            _ => {
+            // Fallback: ragged bank (training fingerprints of differing length)
+            // → score one fingerprint at a time, reusing the row buffers.
+            None => {
                 super::kernel::compute_distances_f32_into(
                     &ws.query_f32,
                     &self.training_f32,

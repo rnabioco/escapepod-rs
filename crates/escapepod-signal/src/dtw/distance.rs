@@ -522,6 +522,170 @@ fn dtw_batch_kernel(
     scratch.curr = curr;
 }
 
+/// Lane-parallel DTW for an arbitrary Sakoe-Chiba `window` and warping
+/// `penalty` — the general form used by real WarpDemuX-config DTW-SVM models
+/// (which carry e.g. `window=15, penalty=0.1`). Same SoA `train_blocks` layout
+/// and bit-identical-to-scalar contract as
+/// [`dtw_distances_batch_unconstrained`], to which it fast-paths when
+/// `window == None && penalty == 0.0`.
+///
+/// All training sequences in a batch share the query length `n` and the
+/// uniform `train_len = m`, so the band geometry (`[j_start, j_end]` per row)
+/// and the feasibility test `|n - m| > w` are identical across lanes — only the
+/// per-cell `(a_i - b_j)^2` and the three-way `min` differ between lanes.
+#[allow(clippy::too_many_arguments)]
+pub fn dtw_distances_batch(
+    query: &[f32],
+    train_blocks: &[f32],
+    train_len: usize,
+    n_train: usize,
+    window: Option<usize>,
+    penalty: f32,
+    out: &mut Vec<f64>,
+    scratch: &mut DtwBatchScratch,
+) {
+    if window.is_none() && penalty == 0.0 {
+        dtw_distances_batch_unconstrained(query, train_blocks, train_len, n_train, out, scratch);
+        return;
+    }
+    dtw_batch_kernel_windowed(
+        query,
+        train_blocks,
+        train_len,
+        n_train,
+        window,
+        penalty,
+        out,
+        scratch,
+    );
+}
+
+/// Banded + penalized lane-parallel DTW body. Mirrors the scalar general path
+/// in [`dtw_distance_bounded_penalty_into`] cell-for-cell (full `+INF` re-init
+/// of both rows per block, `curr[0]` and the band's left boundary re-seeded to
+/// `+INF` each row, diagonal step un-penalized, expansion/compression steps
+/// charged `penalty^2`), so each lane is bit-identical to the scalar distance.
+#[allow(clippy::too_many_arguments)]
+fn dtw_batch_kernel_windowed(
+    query: &[f32],
+    train_blocks: &[f32],
+    train_len: usize,
+    n_train: usize,
+    window: Option<usize>,
+    penalty: f32,
+    out: &mut Vec<f64>,
+    scratch: &mut DtwBatchScratch,
+) {
+    out.clear();
+    if n_train == 0 {
+        return;
+    }
+    out.reserve(n_train);
+
+    let n = query.len();
+    let m = train_len;
+    if n == 0 || m == 0 {
+        out.resize(n_train, f32::INFINITY as f64);
+        return;
+    }
+
+    let pen_sq = penalty * penalty;
+    let inf = [f32::INFINITY; DTW_LANES];
+
+    // The endpoint must lie in the band; if not, every lane's distance is +INF
+    // (no feasible alignment) — identical across lanes since n, m, w are shared.
+    let infeasible = matches!(window, Some(w) if n.abs_diff(m) > w);
+    if infeasible {
+        out.resize(n_train, f32::INFINITY as f64);
+        return;
+    }
+
+    let n_blocks = n_train.div_ceil(DTW_LANES);
+    if scratch.prev.len() < m + 1 {
+        scratch.prev.resize(m + 1, inf);
+    }
+    if scratch.curr.len() < m + 1 {
+        scratch.curr.resize(m + 1, inf);
+    }
+    let mut prev = std::mem::take(&mut scratch.prev);
+    let mut curr = std::mem::take(&mut scratch.curr);
+
+    for c in 0..n_blocks {
+        let block = &train_blocks[c * m * DTW_LANES..(c + 1) * m * DTW_LANES];
+
+        // Full re-init of both rows (the band leaves cells unwritten; they must
+        // read as +INF, exactly as the scalar path's fresh buffers do).
+        for cell in prev[..=m].iter_mut() {
+            *cell = inf;
+        }
+        for cell in curr[..=m].iter_mut() {
+            *cell = inf;
+        }
+        prev[0] = [0.0; DTW_LANES];
+
+        for i in 1..=n {
+            curr[0] = inf;
+            let j_start = match window {
+                Some(w) => 1.max(i.saturating_sub(w)),
+                None => 1,
+            };
+            let j_end = match window {
+                Some(w) => m.min(i + w),
+                None => m,
+            };
+            if j_start <= j_end && j_start > 1 {
+                // Re-seed the left boundary so j == j_start can't read a stale
+                // in-band value from an earlier row.
+                curr[j_start - 1] = inf;
+            }
+            if j_start > j_end {
+                std::mem::swap(&mut prev, &mut curr);
+                continue;
+            }
+
+            let ai = query[i - 1];
+            // `left` carries curr[j-1]; at j == j_start it is the (re-seeded
+            // or boundary) +INF cell.
+            let mut left = curr[j_start - 1];
+            for j in j_start..=j_end {
+                let pl = prev[j - 1]; // diagonal (no penalty)
+                let pr = prev[j]; // expansion (penalty)
+                let bj = &block[(j - 1) * DTW_LANES..j * DTW_LANES];
+                let mut row = [0.0f32; DTW_LANES];
+                for lane in 0..DTW_LANES {
+                    let d = ai - bj[lane];
+                    let mut best = pl[lane];
+                    let up = pr[lane] + pen_sq;
+                    if up < best {
+                        best = up;
+                    }
+                    let lf = left[lane] + pen_sq; // compression (penalty)
+                    if lf < best {
+                        best = lf;
+                    }
+                    row[lane] = d * d + best;
+                }
+                curr[j] = row;
+                left = row;
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+
+        let valid = if c + 1 < n_blocks {
+            DTW_LANES
+        } else {
+            n_train - c * DTW_LANES
+        };
+        let last = prev[m];
+        for &v in last.iter().take(valid) {
+            out.push(v.sqrt() as f64);
+        }
+    }
+
+    scratch.prev = prev;
+    scratch.curr = curr;
+}
+
 /// Pack a uniform-length training bank into the SoA block layout consumed by
 /// [`dtw_distances_batch_unconstrained`]. Returns the flat buffer; padding
 /// lanes in the final block are zero-filled (their distances go unused).
@@ -969,6 +1133,79 @@ mod tests {
                                 (w as f64).to_bits(),
                                 g.to_bits(),
                                 "{path} mismatch train_len={train_len} n_train={n_train} \
+                                 query_len={query_len} k={k}: want {w} got {g}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dtw_distances_batch_windowed_matches_scalar() {
+        // The general (windowed + penalty) lane-parallel batch must be
+        // bit-identical to the scalar `dtw_distance_bounded_penalty` for every
+        // training fingerprint, across window/penalty settings, query/train
+        // lengths, padded final blocks, and a reused scratch.
+        fn pseudo(seed: u64, i: usize) -> f32 {
+            let x = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(i as u64)
+                .wrapping_mul(1442695040888963407);
+            ((x >> 33) as f32 / u32::MAX as f32) * 4.0 - 2.0
+        }
+
+        let mut scratch = DtwBatchScratch::new();
+        for &(window, penalty) in &[
+            (None, 0.0f32),
+            (None, 0.1),
+            (Some(15usize), 0.1),
+            (Some(3), 0.0),
+            (Some(2), 0.5),
+            (Some(0), 0.1),
+        ] {
+            for &train_len in &[1usize, 4, 10, 25] {
+                for &n_train in &[1usize, 8, 9, 33] {
+                    for &query_len in &[4usize, 10, 25] {
+                        let query: Vec<f32> = (0..query_len).map(|i| pseudo(7, i)).collect();
+                        let training: Vec<Vec<f32>> = (0..n_train)
+                            .map(|k| (0..train_len).map(|j| pseudo(200 + k as u64, j)).collect())
+                            .collect();
+
+                        let want: Vec<f32> = training
+                            .iter()
+                            .map(|t| {
+                                dtw_distance_bounded_penalty(
+                                    &query,
+                                    t,
+                                    window,
+                                    f32::INFINITY,
+                                    penalty,
+                                )
+                            })
+                            .collect();
+
+                        let blocks = pack_training_blocks(&training, train_len);
+                        let mut got = Vec::new();
+                        dtw_distances_batch(
+                            &query,
+                            &blocks,
+                            train_len,
+                            n_train,
+                            window,
+                            penalty,
+                            &mut got,
+                            &mut scratch,
+                        );
+
+                        assert_eq!(got.len(), n_train);
+                        for (k, (&w, &g)) in want.iter().zip(got.iter()).enumerate() {
+                            assert_eq!(
+                                (w as f64).to_bits(),
+                                g.to_bits(),
+                                "mismatch window={window:?} penalty={penalty} \
+                                 train_len={train_len} n_train={n_train} \
                                  query_len={query_len} k={k}: want {w} got {g}",
                             );
                         }
