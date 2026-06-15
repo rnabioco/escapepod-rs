@@ -86,6 +86,11 @@ struct Cli {
     command: Commands,
 }
 
+// The `Demux` variant carries the fused-pipeline arg struct, which is wide by
+// nature (one field per pipeline knob). Boxing a clap `Args` variant is awkward,
+// and a `Commands` value is constructed exactly once at startup — the size
+// asymmetry is irrelevant here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// View read summaries from a POD5 file as TSV

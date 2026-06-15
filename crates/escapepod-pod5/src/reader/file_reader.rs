@@ -268,6 +268,26 @@ impl Reader {
         Ok(reader.map(|r| r.map_err(Error::from)))
     }
 
+    /// Distinct `pore_type` and end_reason dictionary labels across the reads
+    /// table, read from the file's Arrow dictionaries (O(num_batches × dict),
+    /// not O(num_reads)). Useful for pre-declaring a writer's dictionaries when
+    /// block-copying reads into one or more output files.
+    pub fn reads_dictionaries(&self) -> Result<(Vec<String>, Vec<String>)> {
+        use std::collections::BTreeSet;
+        let mut pore_types: BTreeSet<String> = BTreeSet::new();
+        let mut end_reasons: BTreeSet<String> = BTreeSet::new();
+        for batch in self.read_batches()? {
+            let batch = batch?;
+            let view = crate::arrow_helpers::ReadsBatchView::new(&batch, false)?;
+            pore_types.extend(view.pore_type_dict());
+            end_reasons.extend(view.end_reason_dict());
+        }
+        Ok((
+            pore_types.into_iter().collect(),
+            end_reasons.into_iter().collect(),
+        ))
+    }
+
     /// Get the total number of reads.
     ///
     /// Parses the reads-table Arrow IPC footer to sum each

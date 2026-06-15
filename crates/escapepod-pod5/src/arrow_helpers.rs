@@ -438,6 +438,22 @@ impl<'a> ReadsBatchView<'a> {
         self.read_id.len()
     }
 
+    /// The distinct `pore_type` dictionary labels for this batch (O(dict), not
+    /// O(rows)).
+    pub fn pore_type_dict(&self) -> Vec<String> {
+        self.pore_type_values
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect()
+    }
+
+    /// The distinct `end_reason` dictionary labels for this batch.
+    pub fn end_reason_dict(&self) -> Vec<String> {
+        (0..self.end_reason_values.len())
+            .map(|i| self.end_reason_values.value(i).to_string())
+            .collect()
+    }
+
     /// Read ID of a single row (for fast UUID scans without building a full ReadData).
     pub fn read_id(&self, row: usize) -> Result<Uuid> {
         Uuid::from_slice(self.read_id.value(row)).map_err(|e| Error::InvalidUuid(e.to_string()))
