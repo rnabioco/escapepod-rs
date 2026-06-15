@@ -1,6 +1,6 @@
 //! RBF kernel computation and DTW distance helpers for the SVM pipeline.
 
-use escapepod_signal::dtw::dtw_distance_penalty;
+use escapepod_signal::dtw::dtw_distance_bounded_penalty_into;
 
 use crate::model::KernelParams;
 
@@ -88,13 +88,47 @@ pub(super) fn compute_distances_into(
     ws.distances.clear();
     ws.distances.reserve(training.len());
     // Split the borrow so the inner loop can write to `ws.distances` while
-    // rewriting `ws.train_scratch` on each iteration.
+    // rewriting `ws.train_scratch` and reusing the shared DTW row buffers.
     let query_f32 = ws.query_f32.as_slice();
     let train_scratch = &mut ws.train_scratch;
     let distances = &mut ws.distances;
+    let dtw = &mut ws.dtw;
     for train_fp in training {
         train_scratch.clear();
         train_scratch.extend(train_fp.iter().map(|&x| x as f32));
-        distances.push(dtw_distance_penalty(query_f32, train_scratch, window, penalty) as f64);
+        distances.push(dtw_distance_bounded_penalty_into(
+            query_f32,
+            train_scratch,
+            window,
+            f32::INFINITY,
+            penalty,
+            dtw,
+        ) as f64);
+    }
+}
+
+/// Compute DTW distances from an already-`f32` query to a bank of already-`f32`
+/// training fingerprints, reusing the workspace's row buffers. This skips the
+/// per-call `f64 -> f32` reconversion of the training set — the training
+/// fingerprints are constant across reads, so the caller converts them once.
+pub(super) fn compute_distances_f32_into(
+    query_f32: &[f32],
+    training_f32: &[Vec<f32>],
+    window: Option<usize>,
+    penalty: f32,
+    distances: &mut Vec<f64>,
+    dtw: &mut escapepod_signal::dtw::DtwScratch,
+) {
+    distances.clear();
+    distances.reserve(training_f32.len());
+    for train_fp in training_f32 {
+        distances.push(dtw_distance_bounded_penalty_into(
+            query_f32,
+            train_fp,
+            window,
+            f32::INFINITY,
+            penalty,
+            dtw,
+        ) as f64);
     }
 }

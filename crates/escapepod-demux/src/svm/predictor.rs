@@ -4,7 +4,7 @@
 use crate::model::DtwSvmModel;
 use crate::probability::{ProbabilityResult, process_probabilities};
 
-use super::kernel::{compute_distances_into, distances_to_kernel_into};
+use super::kernel::distances_to_kernel_into;
 use super::workspace::SvmWorkspace;
 
 // Re-export SvmModel as an alias for DtwSvmModel for backwards compatibility
@@ -27,6 +27,11 @@ pub struct SvmPredictor<'a> {
     /// Class index for each support vector, indexed by the support vector's
     /// local index (i.e. `sv_class[k]` is the class of `support_indices[k]`).
     sv_class: Vec<Option<usize>>,
+    /// `f32` copy of `model.training_fingerprints`, converted once at
+    /// construction. The DTW distance loop runs in `f32`; without this the
+    /// per-read hot loop would re-cast all (n_train × fp_len) values from `f64`
+    /// on every read. Constant across reads, so it belongs on the predictor.
+    training_f32: Vec<Vec<f32>>,
 }
 
 impl<'a> SvmPredictor<'a> {
@@ -57,10 +62,17 @@ impl<'a> SvmPredictor<'a> {
             })
             .collect();
 
+        let training_f32: Vec<Vec<f32>> = model
+            .training_fingerprints
+            .iter()
+            .map(|fp| fp.iter().map(|&x| x as f32).collect())
+            .collect();
+
         Self {
             model,
             training_class,
             sv_class,
+            training_f32,
         }
     }
 
@@ -486,13 +498,19 @@ impl<'a> SvmPredictor<'a> {
         query: &[f64],
         ws: &mut SvmWorkspace,
     ) -> (Vec<f64>, ProbabilityResult) {
-        // 1) DTW distances → ws.distances
-        compute_distances_into(
-            query,
-            &self.model.training_fingerprints,
+        // 1) DTW distances → ws.distances. Use the predictor's precomputed f32
+        // training set (constant across reads) and the workspace's shared DTW
+        // row buffers, so a read scoring against n_train fingerprints neither
+        // re-casts the training set nor allocates per DTW call.
+        ws.query_f32.clear();
+        ws.query_f32.extend(query.iter().map(|&x| x as f32));
+        super::kernel::compute_distances_f32_into(
+            &ws.query_f32,
+            &self.training_f32,
             self.model.window,
             self.model.penalty,
-            ws,
+            &mut ws.distances,
+            &mut ws.dtw,
         );
 
         // 2) Kernel transform. Borrow-split: we need `&ws.distances` while
