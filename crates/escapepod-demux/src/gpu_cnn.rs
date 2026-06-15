@@ -200,6 +200,13 @@ impl GpuCnn {
     /// Detect adapter-end for a batch of calibrated-pA reads. Same per-read
     /// contract as [`crate::adapter_cnn::AdapterCnn::detect_adapter_end`];
     /// reads too short to process yield `0`.
+    ///
+    /// Reads vary enormously in length (nanopore RNA reads can be >500 k
+    /// samples), and a batch is zero-padded to its longest member — so naively
+    /// batching everything would size the conv buffers to the longest read and
+    /// blow past device memory. Reads are therefore sorted by (pooled) length
+    /// and split into memory-bounded sub-batches; padding waste stays small and
+    /// a single very long read lands in its own tiny batch.
     pub fn detect_adapter_end_batch(&self, signals: &[&[f32]]) -> Result<Vec<usize>, GpuCnnError> {
         let cfg = self.config;
         let n = signals.len();
@@ -209,7 +216,7 @@ impl GpuCnn {
 
         // CPU prep: slice + mean-pool + median/MAD normalize, in parallel across
         // reads (rayon) — otherwise a serial scalar prep starves the GPU. Same
-        // math as the CPU/tract path; order preserved by the parallel map.
+        // math as the CPU/tract path.
         let prepped: Vec<Vec<f32>> = signals
             .par_iter()
             .map(|&sig| {
@@ -221,6 +228,48 @@ impl GpuCnn {
                 }
             })
             .collect();
+
+        // Order by pooled length; greedily pack sub-batches so the dominant conv
+        // buffers (3 × n_batch × C × L0 f32) stay near ~5 GB. `n_batch * L0` is
+        // the proxy we cap; L0 ≈ Lmax/3.
+        const MAX_BATCH_L0_ELEMS: usize = 6_000_000;
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| prepped[i].len());
+
+        let mut out = vec![0usize; n];
+        let mut start = 0usize;
+        while start < n {
+            let mut end = start;
+            // The batch's Lmax is the last (longest) member, since `order` is
+            // ascending — so L0 only grows as we extend the batch.
+            while end < n {
+                let lmax = prepped[order[end]].len().max(1);
+                let l0 = conv_out_len(lmax, K, 3, 3);
+                let count = end - start + 1;
+                if count > 1 && count * l0 > MAX_BATCH_L0_ELEMS {
+                    break;
+                }
+                end += 1;
+            }
+            let idxs = &order[start..end];
+            let batch: Vec<&[f32]> = idxs.iter().map(|&i| prepped[i].as_slice()).collect();
+            let ends = self.run_prepped(&batch)?;
+            for (&i, e) in idxs.iter().zip(ends) {
+                out[i] = e;
+            }
+            start = end;
+        }
+        Ok(out)
+    }
+
+    /// Run the conv stack on one already-prepped, memory-safe sub-batch and
+    /// return per-read adapter-end positions (in the original signal frame).
+    fn run_prepped(&self, prepped: &[&[f32]]) -> Result<Vec<usize>, GpuCnnError> {
+        let cfg = self.config;
+        let n = prepped.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
 
         let lmax = prepped.iter().map(|p| p.len()).max().unwrap_or(0).max(1);
 
