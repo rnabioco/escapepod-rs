@@ -1,8 +1,34 @@
-//! GPU-accelerated banded DTW distance matrix.
+//! GPU-accelerated banded DTW distance matrix, plus **experimental** GPU
+//! primitives for the demux signal chain (SVB16 decode, t-test fingerprint,
+//! LLR adapter detect).
 //!
-//! Enabled via the `gpu` feature. Compiles a CUDA kernel at runtime using
+//! Enabled via the `gpu` feature. Compiles CUDA kernels at runtime using
 //! NVRTC (no `nvcc` / CUDA toolkit required at build time — only the CUDA
 //! driver and libnvrtc at runtime).
+//!
+//! ## Why the prep kernels are experimental (not in the default pipeline)
+//!
+//! The DTW distance matrix below is a genuine GPU win — dense, regular, f32
+//! work. The signal-processing *prep* kernels ([`GpuDtwContext::decode_svb16_batch`],
+//! [`GpuDtwContext::fingerprint_batch`], [`GpuDtwContext::detect_adapter_batch`] /
+//! [`GpuDtwContext::detect_adapter_batch_block`]) are parity-validated against
+//! their CPU references but are **not** wired into `escpod demux`, because
+//! measurement shows prep belongs on the CPU:
+//!
+//! - Prep cost splits ~detect **85%** / fingerprint **12.5%** / decode **2.8%**.
+//! - Detect (the dominant stage) is f64-/`ln`-heavy, branchy, with a serial
+//!   cumsum dependency — the opposite of what a GPU accelerates. On an A30 the
+//!   best block-per-read detect reaches ~2.7–4.5× a *single* CPU thread, but
+//!   still loses to a 48-core CPU by ~11–18× (f64-throughput bound, within ~3×
+//!   of the card's f64 roofline). Fusing prep onto the GPU made the pipeline
+//!   ~15× slower overall.
+//! - The real prep speed-up is CPU-side: `--downscale 10` (the WarpDemuX
+//!   default) cuts detect ~5.3× with ~98–99.9% barcode agreement.
+//!
+//! These kernels are kept as validated, reusable primitives — useful on
+//! few-core GPU hosts or future fast-f64 cards, and as the record of the
+//! measurement. The [`GpuDtwContext`] DTW + SVM classify path remains the
+//! production GPU usage.
 //!
 //! ## Typical use
 //!
@@ -20,7 +46,11 @@
 //! ```
 
 mod kernel;
+mod llr_detect_block_kernel;
+mod llr_detect_kernel;
+mod svb16_kernel;
 mod svm_kernels;
+mod ttest_fp_kernel;
 
 pub use svm_kernels::{
     KERNEL_SRC as SVM_KERNEL_SRC, MODULE_NAME as SVM_MODULE_NAME, OVO_DECISION_KERNEL_NAME,
@@ -91,6 +121,34 @@ impl GpuDtwContext {
             svm_ptx,
             SVM_MODULE_NAME,
             &[RBF_KERNEL_NAME, OVO_DECISION_KERNEL_NAME],
+        )?;
+
+        let svb16_ptx = compile_ptx(svb16_kernel::KERNEL_SRC)?;
+        device.load_ptx(
+            svb16_ptx,
+            svb16_kernel::MODULE_NAME,
+            &[svb16_kernel::KERNEL_NAME],
+        )?;
+
+        let ttest_fp_ptx = compile_ptx(ttest_fp_kernel::KERNEL_SRC)?;
+        device.load_ptx(
+            ttest_fp_ptx,
+            ttest_fp_kernel::MODULE_NAME,
+            &[ttest_fp_kernel::KERNEL_NAME],
+        )?;
+
+        let llr_ptx = compile_ptx(llr_detect_kernel::KERNEL_SRC)?;
+        device.load_ptx(
+            llr_ptx,
+            llr_detect_kernel::MODULE_NAME,
+            &[llr_detect_kernel::KERNEL_NAME],
+        )?;
+
+        let llr_block_ptx = compile_ptx(llr_detect_block_kernel::KERNEL_SRC)?;
+        device.load_ptx(
+            llr_block_ptx,
+            llr_detect_block_kernel::MODULE_NAME,
+            &[llr_detect_block_kernel::KERNEL_NAME],
         )?;
 
         Ok(Self { device })
@@ -241,6 +299,456 @@ impl GpuDtwContext {
 
         let host_out = dev.dtoh_sync_copy(&out_dev)?;
         Ok(Array2::from_shape_vec((n_q, n_r), host_out).expect("shape matches"))
+    }
+
+    /// Decode a batch of SVB16 byte streams on the GPU, one thread per read.
+    ///
+    /// `reads` is `(svb16_bytes, sample_count)` per read — exactly the input
+    /// the CPU [`escapepod_pod5::compression::svb16::decode`] takes, after the
+    /// host has zstd-decompressed each VBZ chunk. Returns the decoded `i16`
+    /// signals in input order. Bit-exact with the scalar CPU decoder.
+    ///
+    /// This host method dtoh's the decoded signal for testing/standalone use;
+    /// the fused pipeline keeps the decoded signal on-device and feeds it
+    /// straight into the detect/fingerprint kernels.
+    pub fn decode_svb16_batch(
+        &self,
+        reads: &[(&[u8], usize)],
+    ) -> Result<Vec<Vec<i16>>, GpuDtwError> {
+        if reads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = reads.len();
+        if n > i32::MAX as usize {
+            return Err(GpuDtwError::InputTooLarge {
+                what: "too many reads for i32 grid dims",
+            });
+        }
+
+        let total_bytes: usize = reads.iter().map(|(b, _)| b.len()).sum();
+        let total_out: usize = reads.iter().map(|(_, c)| *c).sum();
+
+        let mut data_flat: Vec<u8> = Vec::with_capacity(total_bytes);
+        let mut data_off: Vec<i64> = Vec::with_capacity(n + 1);
+        let mut counts: Vec<i32> = Vec::with_capacity(n);
+        let mut out_off: Vec<i64> = Vec::with_capacity(n + 1);
+        data_off.push(0);
+        out_off.push(0);
+        let mut dacc: i64 = 0;
+        let mut oacc: i64 = 0;
+        for (bytes, count) in reads {
+            data_flat.extend_from_slice(bytes);
+            dacc += bytes.len() as i64;
+            data_off.push(dacc);
+            counts.push(
+                i32::try_from(*count).map_err(|_| GpuDtwError::InputTooLarge {
+                    what: "sample count exceeds i32::MAX",
+                })?,
+            );
+            oacc += *count as i64;
+            out_off.push(oacc);
+        }
+
+        let dev = &self.device;
+        let data_dev = dev.htod_sync_copy(&data_flat)?;
+        let data_off_dev = dev.htod_sync_copy(&data_off)?;
+        let counts_dev = dev.htod_sync_copy(&counts)?;
+        let out_off_dev = dev.htod_sync_copy(&out_off)?;
+        let mut out_dev = dev.alloc_zeros::<i16>(total_out.max(1))?;
+
+        const THREADS: u32 = 256;
+        let blocks = (n as u32).div_ceil(THREADS);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev
+            .get_func(svb16_kernel::MODULE_NAME, svb16_kernel::KERNEL_NAME)
+            .ok_or(GpuDtwError::KernelMissing(svb16_kernel::KERNEL_NAME))?;
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    &data_dev,
+                    &data_off_dev,
+                    &counts_dev,
+                    &out_off_dev,
+                    &mut out_dev,
+                    n as i32,
+                ),
+            )?;
+        }
+
+        let host_out = dev.dtoh_sync_copy(&out_dev)?;
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = out_off[i] as usize;
+            let e = out_off[i + 1] as usize;
+            result.push(host_out[s..e].to_vec());
+        }
+        Ok(result)
+    }
+
+    /// Extract barcode fingerprints on the GPU for the demux path
+    /// (`keep_last = Some(n)`, z-score, no dwell).
+    ///
+    /// `reads` is `(full_signal, adapter_start, adapter_end)` per read — the
+    /// kernel slices `[adapter_start - 100 .. adapter_end + 100]` (clamped),
+    /// clips ±5·MAD, t-test segments, z-scores the segment means, and keeps the
+    /// last `keep_last`. Returns `None` for reads whose adapter region is too
+    /// small to segment (matching `extract_fingerprint_from_signal`).
+    ///
+    /// Reads are length-sorted and split into memory-bounded sub-batches so
+    /// rectangular scratch (`max_len` slots/read) tracks each sub-batch rather
+    /// than the global maximum.
+    pub fn fingerprint_batch(
+        &self,
+        reads: &[(&[i16], usize, usize)],
+        window_width: usize,
+        num_segments: usize,
+        min_separation: usize,
+        keep_last: usize,
+    ) -> Result<Vec<Option<Vec<f64>>>, GpuDtwError> {
+        const PAD: usize = 100;
+        // Scratch budget in "cells" (read × max_len). ~36 B/cell of scratch →
+        // ~2.3 GB at 64M cells; comfortable on a 24 GB card.
+        const CELL_BUDGET: usize = 64 * 1024 * 1024;
+
+        let n = reads.len();
+        let mut result: Vec<Option<Vec<f64>>> = vec![None; n];
+        if n == 0 {
+            return Ok(result);
+        }
+
+        // Per-read slice length L (after pad+clamp); 0 ⇒ skipped (stays None).
+        let slice_len = |&(sig, a_s, a_e): &(&[i16], usize, usize)| -> usize {
+            let ss = a_s.saturating_sub(PAD);
+            let se = (a_e + PAD).min(sig.len());
+            se.saturating_sub(ss)
+        };
+
+        // Length-sort indices (ascending) so each sub-batch has a tight max_len.
+        let mut order: Vec<usize> = (0..n)
+            .filter(|&i| slice_len(&reads[i]) >= window_width * 2)
+            .collect();
+        order.sort_unstable_by_key(|&i| slice_len(&reads[i]));
+
+        let mut start = 0usize;
+        while start < order.len() {
+            // Grow the sub-batch while cells stay under budget. Since `order`
+            // is ascending, max_len is the last element's slice length.
+            let mut end = start + 1;
+            while end < order.len() {
+                let max_len = slice_len(&reads[order[end]]);
+                if (end - start + 1) * max_len.max(1) > CELL_BUDGET {
+                    break;
+                }
+                end += 1;
+            }
+            let batch = &order[start..end];
+            self.fingerprint_subbatch(
+                reads,
+                batch,
+                window_width,
+                num_segments,
+                min_separation,
+                keep_last,
+                PAD,
+                &mut result,
+            )?;
+            start = end;
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fingerprint_subbatch(
+        &self,
+        reads: &[(&[i16], usize, usize)],
+        batch: &[usize],
+        window_width: usize,
+        num_segments: usize,
+        min_separation: usize,
+        keep_last: usize,
+        pad: usize,
+        result: &mut [Option<Vec<f64>>],
+    ) -> Result<(), GpuDtwError> {
+        let bn = batch.len();
+        if bn == 0 {
+            return Ok(());
+        }
+        let slice_len = |i: usize| -> usize {
+            let (sig, a_s, a_e) = reads[i];
+            let ss = a_s.saturating_sub(pad);
+            let se = (a_e + pad).min(sig.len());
+            se - ss
+        };
+        let max_len = batch.iter().map(|&i| slice_len(i)).max().unwrap_or(0);
+        if max_len == 0 {
+            return Ok(());
+        }
+        let max_cand = max_len.saturating_sub(2 * window_width).max(1);
+
+        // Flatten full signals + per-read offsets / boundaries.
+        let total_sig: usize = batch.iter().map(|&i| reads[i].0.len()).sum();
+        let mut sig_flat: Vec<i16> = Vec::with_capacity(total_sig);
+        let mut sig_off: Vec<i64> = Vec::with_capacity(bn + 1);
+        let mut adapter_start: Vec<i32> = Vec::with_capacity(bn);
+        let mut adapter_end: Vec<i32> = Vec::with_capacity(bn);
+        sig_off.push(0);
+        let mut acc: i64 = 0;
+        for &i in batch {
+            let (sig, a_s, a_e) = reads[i];
+            sig_flat.extend_from_slice(sig);
+            acc += sig.len() as i64;
+            sig_off.push(acc);
+            adapter_start.push(a_s as i32);
+            adapter_end.push(a_e as i32);
+        }
+
+        // Packed scalar params (cudarc 0.12 caps launches at 12 tuple args).
+        let mut params = vec![0i32; ttest_fp_kernel::N_PARAMS];
+        params[ttest_fp_kernel::P_N_READS] = bn as i32;
+        params[ttest_fp_kernel::P_WW] = window_width as i32;
+        params[ttest_fp_kernel::P_MIN_SEP] = min_separation as i32;
+        params[ttest_fp_kernel::P_NUM_CP] = num_segments.saturating_sub(1) as i32;
+        params[ttest_fp_kernel::P_KEEP_LAST] = keep_last as i32;
+        params[ttest_fp_kernel::P_MAX_LEN] = max_len as i32;
+        params[ttest_fp_kernel::P_MAX_CAND] = max_cand as i32;
+        params[ttest_fp_kernel::P_PAD] = pad as i32;
+
+        let dev = &self.device;
+        let sig_dev = dev.htod_sync_copy(&sig_flat)?;
+        let sig_off_dev = dev.htod_sync_copy(&sig_off)?;
+        let as_dev = dev.htod_sync_copy(&adapter_start)?;
+        let ae_dev = dev.htod_sync_copy(&adapter_end)?;
+        let params_dev = dev.htod_sync_copy(&params)?;
+
+        // Merged scratch: A|B share one f32 region, cumsum|cumsum_sq one f64.
+        let mut scratch_f32 = dev.alloc_zeros::<f32>(bn * 2 * max_len)?;
+        let mut scratch_f64 = dev.alloc_zeros::<f64>(bn * 2 * (max_len + 1))?;
+        let mut tscores = dev.alloc_zeros::<f64>(bn * max_cand)?;
+        let mut peaks = dev.alloc_zeros::<i32>(bn * max_cand)?;
+        let mut out = dev.alloc_zeros::<f32>(bn * keep_last)?;
+        let mut out_len = dev.alloc_zeros::<i32>(bn)?;
+
+        const THREADS: u32 = 128;
+        let blocks = (bn as u32).div_ceil(THREADS);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev
+            .get_func(ttest_fp_kernel::MODULE_NAME, ttest_fp_kernel::KERNEL_NAME)
+            .ok_or(GpuDtwError::KernelMissing(ttest_fp_kernel::KERNEL_NAME))?;
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    &sig_dev,
+                    &sig_off_dev,
+                    &as_dev,
+                    &ae_dev,
+                    &params_dev,
+                    &mut scratch_f32,
+                    &mut scratch_f64,
+                    &mut tscores,
+                    &mut peaks,
+                    &mut out,
+                    &mut out_len,
+                ),
+            )?;
+        }
+
+        let host_out = dev.dtoh_sync_copy(&out)?;
+        let host_len = dev.dtoh_sync_copy(&out_len)?;
+
+        for (b, &i) in batch.iter().enumerate() {
+            let k = host_len[b] as usize; // 0 == no fingerprint produced
+            if k == 0 {
+                continue;
+            }
+            let base = b * keep_last;
+            result[i] = Some(host_out[base..base + k].iter().map(|&v| v as f64).collect());
+        }
+        Ok(())
+    }
+
+    /// Detect adapter boundaries on the GPU (LLR path), mirroring the demux
+    /// `normalize_signal` → optional `downscale` → `detect_adapter` pipeline.
+    ///
+    /// Returns `(adapter_start, adapter_end)` per read (already scaled back from
+    /// the downscaled domain). `(0, 0)` means no adapter detected. Reads are
+    /// split into memory-bounded sub-batches (scratch is jagged at the full
+    /// read length, since LLR scans the whole read).
+    pub fn detect_adapter_batch(
+        &self,
+        signals: &[&[i16]],
+        min_adapter: usize,
+        border_trim: usize,
+        downscale: usize,
+    ) -> Result<Vec<(usize, usize)>, GpuDtwError> {
+        self.detect_adapter_batch_impl(signals, min_adapter, border_trim, downscale, false)
+    }
+
+    /// Block-per-read variant of [`Self::detect_adapter_batch`]: parallelises
+    /// `best_split` across a CUDA block and z-score normalizes via a parallel
+    /// reduction. Same result as the thread-per-read detector (LLR is affine-
+    /// invariant), but built for throughput rather than simplicity.
+    pub fn detect_adapter_batch_block(
+        &self,
+        signals: &[&[i16]],
+        min_adapter: usize,
+        border_trim: usize,
+        downscale: usize,
+    ) -> Result<Vec<(usize, usize)>, GpuDtwError> {
+        self.detect_adapter_batch_impl(signals, min_adapter, border_trim, downscale, true)
+    }
+
+    fn detect_adapter_batch_impl(
+        &self,
+        signals: &[&[i16]],
+        min_adapter: usize,
+        border_trim: usize,
+        downscale: usize,
+        block: bool,
+    ) -> Result<Vec<(usize, usize)>, GpuDtwError> {
+        // ~40 B/sample of scratch (3×f32 + 2×f64); ~2.5 GB at 64M samples.
+        const SAMPLE_BUDGET: usize = 64 * 1024 * 1024;
+
+        let n = signals.len();
+        let mut result = vec![(0usize, 0usize); n];
+        if n == 0 {
+            return Ok(result);
+        }
+
+        let mut start = 0usize;
+        while start < n {
+            let mut end = start;
+            let mut acc = 0usize;
+            while end < n {
+                let len = signals[end].len();
+                if end > start && acc + len > SAMPLE_BUDGET {
+                    break;
+                }
+                acc += len;
+                end += 1;
+            }
+            self.detect_subbatch(
+                &signals[start..end],
+                min_adapter,
+                border_trim,
+                downscale,
+                block,
+                &mut result[start..end],
+            )?;
+            start = end;
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn detect_subbatch(
+        &self,
+        signals: &[&[i16]],
+        min_adapter: usize,
+        border_trim: usize,
+        downscale: usize,
+        block: bool,
+        result: &mut [(usize, usize)],
+    ) -> Result<(), GpuDtwError> {
+        let bn = signals.len();
+        if bn == 0 {
+            return Ok(());
+        }
+        let total: usize = signals.iter().map(|s| s.len()).sum();
+        let mut sig_flat: Vec<i16> = Vec::with_capacity(total);
+        let mut off: Vec<i64> = Vec::with_capacity(bn + 1);
+        off.push(0);
+        let mut acc: i64 = 0;
+        for s in signals {
+            sig_flat.extend_from_slice(s);
+            acc += s.len() as i64;
+            off.push(acc);
+        }
+        let total = total.max(1);
+
+        let mut params = vec![0i32; llr_detect_kernel::N_PARAMS];
+        params[llr_detect_kernel::P_N_READS] = bn as i32;
+        params[llr_detect_kernel::P_MIN_ADAPTER] = min_adapter as i32;
+        params[llr_detect_kernel::P_BORDER_TRIM] = border_trim as i32;
+        params[llr_detect_kernel::P_DOWNSCALE] = downscale.max(1) as i32;
+
+        let dev = &self.device;
+        let sig_dev = dev.htod_sync_copy(&sig_flat)?;
+        let off_dev = dev.htod_sync_copy(&off)?;
+        let params_dev = dev.htod_sync_copy(&params)?;
+        let mut norm = dev.alloc_zeros::<f32>(total)?;
+        let mut processed = dev.alloc_zeros::<f32>(total)?;
+        let mut medbuf = dev.alloc_zeros::<f32>(total)?;
+        let mut cumsum = dev.alloc_zeros::<f64>(total)?;
+        let mut cumsumsq = dev.alloc_zeros::<f64>(total)?;
+        let mut out_start = dev.alloc_zeros::<i32>(bn)?;
+        let mut out_end = dev.alloc_zeros::<i32>(bn)?;
+
+        let (cfg, func) = if block {
+            // One block per read, fixed 128 threads (matches BLK in the kernel).
+            let cfg = LaunchConfig {
+                grid_dim: (bn as u32, 1, 1),
+                block_dim: (llr_detect_block_kernel::BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let func = dev
+                .get_func(
+                    llr_detect_block_kernel::MODULE_NAME,
+                    llr_detect_block_kernel::KERNEL_NAME,
+                )
+                .ok_or(GpuDtwError::KernelMissing(
+                    llr_detect_block_kernel::KERNEL_NAME,
+                ))?;
+            (cfg, func)
+        } else {
+            const THREADS: u32 = 64;
+            let blocks = (bn as u32).div_ceil(THREADS);
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let func = dev
+                .get_func(
+                    llr_detect_kernel::MODULE_NAME,
+                    llr_detect_kernel::KERNEL_NAME,
+                )
+                .ok_or(GpuDtwError::KernelMissing(llr_detect_kernel::KERNEL_NAME))?;
+            (cfg, func)
+        };
+        unsafe {
+            func.launch(
+                cfg,
+                (
+                    &sig_dev,
+                    &off_dev,
+                    &params_dev,
+                    &mut norm,
+                    &mut processed,
+                    &mut medbuf,
+                    &mut cumsum,
+                    &mut cumsumsq,
+                    &mut out_start,
+                    &mut out_end,
+                ),
+            )?;
+        }
+
+        let hs = dev.dtoh_sync_copy(&out_start)?;
+        let he = dev.dtoh_sync_copy(&out_end)?;
+        for b in 0..bn {
+            result[b] = (hs[b].max(0) as usize, he[b].max(0) as usize);
+        }
+        Ok(())
     }
 }
 

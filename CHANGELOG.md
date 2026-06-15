@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- `escpod demux <file> --model M -d OUT` now runs a **fused, streaming
+  pipeline** by default: each read's signal is decoded once, then detect +
+  fingerprint + classify run in a single pass and reads are routed
+  (block-level compressed copy) into per-barcode POD5s — no intermediate
+  boundaries/fingerprints/classifications files. The granular
+  `detect`/`fingerprint`/`classify`/`split`/`train` subcommands remain for
+  advanced use. `--classifications` writes the per-read CSV only when asked.
+- Experimental GPU primitives (behind `--features gpu`) for the demux signal
+  chain — SVB16 decode, t-test fingerprint, LLR detect — kept as validated,
+  reusable kernels. They are **not** used by `escpod demux`: measurement shows
+  the prep stages run faster on a multi-core CPU than on the GPU.
+
+### Changed
+
+- The LLR detect `--downscale` default is now **10** (the WarpDemuX-native
+  mode) for `demux` and `demux detect`, up from 1. This makes detect — the
+  dominant prep stage — ~5× faster, with ~98% barcode agreement versus
+  full-resolution (ds=1). Pass `--downscale 1` to restore full-resolution
+  detect.
+
 ### Fixed
 
 - Resolved a PyPI name collision: both the `escapepod` CLI crate and the
