@@ -325,6 +325,147 @@ fn reset_row(buf: &mut Vec<f32>, len: usize) {
     }
 }
 
+/// Number of training fingerprints scored per SIMD batch by
+/// [`dtw_distances_batch_unconstrained`]. Eight `f32` lanes map to one AVX2
+/// vector register under the workspace `-C target-cpu=x86-64-v3` baseline.
+pub const DTW_LANES: usize = 8;
+
+/// Reusable row buffers for [`dtw_distances_batch_unconstrained`]. Each row
+/// cell holds `DTW_LANES` independent DP states (one per training fingerprint
+/// in the current batch).
+#[derive(Default, Clone, Debug)]
+pub struct DtwBatchScratch {
+    prev: Vec<[f32; DTW_LANES]>,
+    curr: Vec<[f32; DTW_LANES]>,
+}
+
+impl DtwBatchScratch {
+    /// A fresh, empty scratch. Buffers grow lazily on first use.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Lane-parallel unconstrained DTW: compute `dtw_distance(query, training[k],
+/// None)` for every `k` in `0..n_train`, evaluating `DTW_LANES` training
+/// sequences at once down independent SIMD lanes. All training sequences must
+/// have the same length `train_len`.
+///
+/// `train_blocks` is the training bank in a SIMD-friendly *structure of arrays*
+/// layout: block `c` (training indices `c*DTW_LANES .. c*DTW_LANES+DTW_LANES`)
+/// occupies `train_blocks[c*train_len*DTW_LANES ..]`, and within a block
+/// element `[j*DTW_LANES + lane]` is `training[c*DTW_LANES + lane][j]`. The
+/// trailing lanes of the final block (when `n_train` is not a multiple of
+/// `DTW_LANES`) may hold arbitrary values — their distances are simply not
+/// written.
+///
+/// `out` receives exactly `n_train` distances in training-index order, each
+/// **bit-identical** to the scalar [`dtw_distance`] for the same pair: the
+/// per-lane body is the same fused recurrence, and on the (square-distance +
+/// `+INF`) value domain here the `<`-fold and `f32::min` select equal bits.
+pub fn dtw_distances_batch_unconstrained(
+    query: &[f32],
+    train_blocks: &[f32],
+    train_len: usize,
+    n_train: usize,
+    out: &mut Vec<f64>,
+    scratch: &mut DtwBatchScratch,
+) {
+    out.clear();
+    if n_train == 0 {
+        return;
+    }
+    out.reserve(n_train);
+
+    let n = query.len();
+    let m = train_len;
+    // Match `dtw_distance`'s empty-input contract (returns +INF).
+    if n == 0 || m == 0 {
+        out.resize(n_train, f32::INFINITY as f64);
+        return;
+    }
+
+    let n_blocks = n_train.div_ceil(DTW_LANES);
+    if scratch.prev.len() < m + 1 {
+        scratch.prev.resize(m + 1, [f32::INFINITY; DTW_LANES]);
+    }
+    if scratch.curr.len() < m + 1 {
+        scratch.curr.resize(m + 1, [f32::INFINITY; DTW_LANES]);
+    }
+    let mut prev = std::mem::take(&mut scratch.prev);
+    let mut curr = std::mem::take(&mut scratch.curr);
+
+    for c in 0..n_blocks {
+        let block = &train_blocks[c * m * DTW_LANES..(c + 1) * m * DTW_LANES];
+
+        // Seed virtual row 0 for all lanes: prev[0] = 0, prev[1..=m] = +INF.
+        prev[0] = [0.0; DTW_LANES];
+        for p in prev[1..=m].iter_mut() {
+            *p = [f32::INFINITY; DTW_LANES];
+        }
+
+        for i in 1..=n {
+            let ai = query[i - 1];
+            curr[0] = [f32::INFINITY; DTW_LANES];
+            let mut left = [f32::INFINITY; DTW_LANES];
+            for j in 1..=m {
+                let pl = prev[j - 1];
+                let pr = prev[j];
+                let bj = &block[(j - 1) * DTW_LANES..j * DTW_LANES];
+                let mut row = [0.0f32; DTW_LANES];
+                // Independent across lanes → autovectorizes to one AVX2 op per
+                // arithmetic step. No NaN can arise (squared diffs + ±INF), so
+                // the `<`-fold matches `f32::min` bit-for-bit.
+                for lane in 0..DTW_LANES {
+                    let d = ai - bj[lane];
+                    let mut best = pl[lane];
+                    if pr[lane] < best {
+                        best = pr[lane];
+                    }
+                    if left[lane] < best {
+                        best = left[lane];
+                    }
+                    row[lane] = d * d + best;
+                }
+                curr[j] = row;
+                left = row;
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+
+        let valid = if c + 1 < n_blocks {
+            DTW_LANES
+        } else {
+            n_train - c * DTW_LANES
+        };
+        let last = prev[m];
+        for &v in last.iter().take(valid) {
+            out.push(v.sqrt() as f64);
+        }
+    }
+
+    scratch.prev = prev;
+    scratch.curr = curr;
+}
+
+/// Pack a uniform-length training bank into the SoA block layout consumed by
+/// [`dtw_distances_batch_unconstrained`]. Returns the flat buffer; padding
+/// lanes in the final block are zero-filled (their distances go unused).
+pub fn pack_training_blocks(training: &[Vec<f32>], train_len: usize) -> Vec<f32> {
+    let n_train = training.len();
+    let n_blocks = n_train.div_ceil(DTW_LANES);
+    let mut blocks = vec![0.0f32; n_blocks * train_len * DTW_LANES];
+    for (k, fp) in training.iter().enumerate() {
+        let c = k / DTW_LANES;
+        let lane = k % DTW_LANES;
+        let base = c * train_len * DTW_LANES;
+        for (j, &v) in fp.iter().take(train_len).enumerate() {
+            blocks[base + j * DTW_LANES + lane] = v;
+        }
+    }
+    blocks
+}
+
 /// Compute the full DTW distance matrix between query sequences and reference sequences.
 ///
 /// This function computes pairwise DTW distances between all query sequences and all
@@ -661,6 +802,59 @@ mod tests {
             let got =
                 dtw_distance_bounded_penalty_into(a, b, None, f32::INFINITY, 0.0, &mut scratch);
             assert_eq!(want.to_bits(), got.to_bits(), "a={a:?} b={b:?}");
+        }
+    }
+
+    #[test]
+    fn test_dtw_batch_matches_scalar() {
+        // The lane-parallel batch must be bit-identical to the scalar
+        // `dtw_distance` for every training fingerprint, including the padded
+        // final block (n_train not a multiple of DTW_LANES) and reused scratch.
+        fn pseudo(seed: u64, i: usize) -> f32 {
+            // Deterministic, no Date/rand: a cheap LCG-ish hash → small floats.
+            let x = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(i as u64)
+                .wrapping_mul(1442695040888963407);
+            ((x >> 33) as f32 / u32::MAX as f32) * 4.0 - 2.0
+        }
+
+        let mut scratch = DtwBatchScratch::new();
+        for &train_len in &[1usize, 4, 10, 17] {
+            for &n_train in &[1usize, 7, 8, 9, 20, 41] {
+                for &query_len in &[1usize, 6, 10, 25] {
+                    let query: Vec<f32> = (0..query_len).map(|i| pseudo(11, i)).collect();
+                    let training: Vec<Vec<f32>> = (0..n_train)
+                        .map(|k| (0..train_len).map(|j| pseudo(100 + k as u64, j)).collect())
+                        .collect();
+
+                    let want: Vec<f32> = training
+                        .iter()
+                        .map(|t| dtw_distance(&query, t, None))
+                        .collect();
+
+                    let blocks = pack_training_blocks(&training, train_len);
+                    let mut got = Vec::new();
+                    dtw_distances_batch_unconstrained(
+                        &query,
+                        &blocks,
+                        train_len,
+                        n_train,
+                        &mut got,
+                        &mut scratch,
+                    );
+
+                    assert_eq!(got.len(), n_train);
+                    for (k, (&w, &g)) in want.iter().zip(got.iter()).enumerate() {
+                        assert_eq!(
+                            (w as f64).to_bits(),
+                            g.to_bits(),
+                            "mismatch train_len={train_len} n_train={n_train} \
+                             query_len={query_len} k={k}: want {w} got {g}",
+                        );
+                    }
+                }
+            }
         }
     }
 
