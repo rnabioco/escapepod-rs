@@ -43,6 +43,17 @@ impl Default for AdapterCnnConfig {
     }
 }
 
+impl AdapterCnnConfig {
+    /// Preprocess a raw signal into the model input (slice + mean-pool +
+    /// median/MAD-normalize + truncate to the receptive-field-bounded cap), or
+    /// `None` if the read is too short. Exposed so callers can prep many reads
+    /// in parallel and then hand the prepped vectors to a batched detector
+    /// (e.g. [`AdapterCnnGpu::detect_prepped`](crate::adapter_cnn_gpu::AdapterCnnGpu::detect_prepped)).
+    pub fn prep(&self, signal_pa: &[f32]) -> Option<Vec<f32>> {
+        prep_adapter_signal(signal_pa, self)
+    }
+}
+
 /// Errors from the CNN detector.
 #[derive(Debug, Clone, Error)]
 pub enum AdapterCnnError {
@@ -313,11 +324,24 @@ pub(crate) fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
 /// Downscaled positions past the adapter search window that can still reach it
 /// through the CNN's receptive field. The graph is local (`Conv`/`Add`/`Relu`),
 /// so any model input beyond `search_window + this margin` cannot affect a
-/// score *inside* the search window. Feeding only that prefix to the model is
-/// therefore output-preserving, and it bounds inference work + activation
-/// memory for very long reads (e.g. a 260k-sample read otherwise becomes a
-/// 26k-wide conv batch). Generous relative to the `tcn_l4` receptive field.
-const SEARCH_RECEPTIVE_MARGIN: usize = 1024;
+/// score *inside* the search window — feeding only that prefix is
+/// output-preserving. Truncating to it also bounds conv work/memory for very
+/// long reads AND collapses every read longer than the cap onto one common
+/// length, which is what lets the GPU path batch them together. Default 256 is
+/// comfortably above the `tcn_l4` receptive field (kernel 7 × dilations ≤ 8 ⇒
+/// half-width ~90); override via `ESCAPEPOD_CNN_MARGIN` for a model with a
+/// larger field (a too-small value silently shifts boundaries — validate with
+/// the batch-parity test against a larger margin).
+fn search_receptive_margin() -> usize {
+    use std::sync::OnceLock;
+    static MARGIN: OnceLock<usize> = OnceLock::new();
+    *MARGIN.get_or_init(|| {
+        std::env::var("ESCAPEPOD_CNN_MARGIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256)
+    })
+}
 
 /// Slice `[min_obs_adapter:]`, mean-pool by `downscale_factor`, then
 /// median/MAD-normalize — the exact input the boundary CNN expects. Returns
@@ -328,7 +352,7 @@ const SEARCH_RECEPTIVE_MARGIN: usize = 1024;
 /// Normalization statistics are computed over the **full** tail (matching the
 /// per-read reference exactly), then the model input is truncated to a prefix
 /// covering the search window plus receptive-field margin — see
-/// [`SEARCH_RECEPTIVE_MARGIN`]. This keeps results identical to feeding the
+/// [`search_receptive_margin`]. This keeps results identical to feeding the
 /// whole read while keeping batched conv tensors bounded.
 pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> Option<Vec<f32>> {
     if signal_pa.len() <= cfg.min_obs_adapter + cfg.downscale_factor {
@@ -338,7 +362,7 @@ pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> 
     let mut normalized = median_mad_normalize(&mean_pool(tail, cfg.downscale_factor));
     let search_window =
         cfg.max_obs_adapter.saturating_sub(cfg.min_obs_adapter) / cfg.downscale_factor;
-    let cap = search_window + SEARCH_RECEPTIVE_MARGIN;
+    let cap = search_window + search_receptive_margin();
     if normalized.len() > cap {
         normalized.truncate(cap);
     }

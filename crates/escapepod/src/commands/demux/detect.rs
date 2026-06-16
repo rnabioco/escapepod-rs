@@ -1,7 +1,5 @@
 //! Detect subcommand - LLR-based adapter boundary detection.
 
-#[cfg(feature = "cnn-detect")]
-use super::utils::process_read_batches_par;
 use super::utils::{configure_thread_pool, process_reads_par, total_read_count};
 use crate::progress::create_progress_bar;
 use crate::style;
@@ -13,6 +11,8 @@ use std::path::PathBuf;
 use tracing::info;
 #[cfg(feature = "cnn-detect")]
 use tracing::warn;
+#[cfg(feature = "cnn-detect")]
+use uuid::Uuid;
 
 /// Arguments for the detect subcommand.
 #[derive(Debug, clap::Args)]
@@ -306,7 +306,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     let too_short = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     // ADAPTed's CNN sets adapter_start=0 always — this path is single-ended.
-    let boundaries = |read_id, num_samples, end: Result<usize, AdapterCnnError>| {
+    let boundaries = |read_id: Uuid, num_samples: u64, end: Result<usize, AdapterCnnError>| {
         let adapter_end = match end {
             Ok(e) => e,
             Err(AdapterCnnError::SignalTooShort { .. }) => {
@@ -327,28 +327,84 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     };
 
     let results: Vec<ReadBoundaries> = if use_gpu {
-        // GPU: batched onnxruntime CUDA. A large batch saturates the device; a
-        // small worker pool bounds how many on-device batches are live at once
-        // (the single CUDA session serializes the actual GPU work anyway).
+        // GPU: a dedicated consumer thread builds the ort session — overlapping
+        // the (multi-second) CUDA/cuDNN init with the producers' first decodes —
+        // then runs each prepped block batched. CPU producers use the full pool
+        // to decode + prep in parallel and feed blocks through a small bounded
+        // channel (double-buffered, so the GPU isn't starved).
         #[cfg(feature = "cnn-gpu")]
         {
-            configure_thread_pool(Some(args.threads.unwrap_or(4).min(4)));
-            let gpu = escapepod_demux::AdapterCnnGpu::load(cnn_model_path)
-                .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
-            const GPU_BATCH: usize = 1024;
-            process_read_batches_par(&args.input, GPU_BATCH, Some(&progress_bar), |batch| {
-                // MAD normalization is scale-invariant, so raw i16 → f32 matches
-                // the pA-calibrated path bit-for-bit post-normalization.
-                let sigs_f32: Vec<Vec<f32>> = batch
-                    .iter()
-                    .map(|(_, _, s)| s.iter().map(|&x| x as f32).collect())
-                    .collect();
-                let refs: Vec<&[f32]> = sigs_f32.iter().map(Vec::as_slice).collect();
-                gpu.detect_adapter_end_batch(&refs)
-                    .into_iter()
-                    .zip(batch)
-                    .map(|(end, &(read_id, num_samples, _))| boundaries(read_id, num_samples, end))
-                    .collect()
+            use escapepod_demux::AdapterCnnConfig;
+            use escapepod_signal::Reader;
+            use rayon::prelude::*;
+            use std::sync::mpsc::sync_channel;
+
+            configure_thread_pool(args.threads);
+
+            // Reads per block: bigger ⇒ bigger same-length groups ⇒ fewer, larger
+            // onnxruntime calls. Bounded at 2 in flight to cap memory.
+            const GPU_BLOCK: usize = 16_384;
+            let cfg = AdapterCnnConfig::default();
+            type Block = (Vec<(Uuid, u64)>, Vec<Option<Vec<f32>>>);
+            let (tx, rx) = sync_channel::<Block>(2);
+
+            let model_path = cnn_model_path.clone();
+            let pb = &progress_bar;
+            let bnd = &boundaries;
+            std::thread::scope(|scope| -> anyhow::Result<Vec<ReadBoundaries>> {
+                let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<ReadBoundaries>> {
+                    let gpu = escapepod_demux::AdapterCnnGpu::load(&model_path)
+                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
+                    let mut out = Vec::new();
+                    for (meta, prepped) in rx.iter() {
+                        let ends = gpu.detect_prepped(&prepped);
+                        pb.inc(meta.len() as u64);
+                        for (end, (read_id, num_samples)) in ends.into_iter().zip(meta) {
+                            out.push(bnd(read_id, num_samples, end));
+                        }
+                    }
+                    Ok(out)
+                });
+
+                // Producers: per file, sort reads by length (so each block's reads
+                // share lengths ⇒ big exact-length groups), then decode + i16→f32 +
+                // prep in parallel and push blocks. MAD-norm is scale-invariant, so
+                // raw i16 → f32 matches the pA path bit-for-bit post-normalization.
+                for path in &args.input {
+                    let reader = Reader::open(path)?;
+                    let mut reads: Vec<_> = reader
+                        .reads()?
+                        .filter_map(Result::ok)
+                        .filter(|r| !r.signal_rows.is_empty())
+                        .collect();
+                    reads.sort_by_key(|r| r.num_samples);
+                    let extractor = reader.signal_extractor()?;
+                    for window in reads.chunks(GPU_BLOCK) {
+                        let prepped: Vec<(Uuid, u64, Option<Vec<f32>>)> = window
+                            .par_iter()
+                            .map(|r| {
+                                let p = extractor.get_signal(&r.signal_rows).ok().and_then(|s| {
+                                    let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
+                                    cfg.prep(&f)
+                                });
+                                (r.read_id, r.num_samples, p)
+                            })
+                            .collect();
+                        let mut meta = Vec::with_capacity(prepped.len());
+                        let mut preps = Vec::with_capacity(prepped.len());
+                        for (id, ns, p) in prepped {
+                            meta.push((id, ns));
+                            preps.push(p);
+                        }
+                        if tx.send((meta, preps)).is_err() {
+                            break; // GPU thread died; its error surfaces at join
+                        }
+                    }
+                }
+                drop(tx);
+                gpu_handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("GPU detection thread panicked"))?
             })?
         }
         #[cfg(not(feature = "cnn-gpu"))]

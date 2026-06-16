@@ -268,65 +268,6 @@ where
     Ok(per_file?.into_iter().flatten().collect())
 }
 
-/// Like [`process_reads_par`] but hands the closure a whole *batch* of decoded
-/// reads at once, so it can run one batched inference per call rather than one
-/// per read.
-///
-/// Reads within each file are sorted by `num_samples` before chunking, so each
-/// fixed-size batch spans a narrow length range — keeping any zero-padding to
-/// the batch's max length tight. Peak signal RAM is bounded by `batch_size ×
-/// rayon workers` reads. Output is per-file in length-sorted order, so keep
-/// results keyed by `read_id` (the row order is not the input order).
-pub fn process_read_batches_par<F, T>(
-    input_files: &[PathBuf],
-    batch_size: usize,
-    progress: Option<&indicatif::ProgressBar>,
-    process_batch: F,
-) -> anyhow::Result<Vec<T>>
-where
-    F: Fn(&[(Uuid, u64, Vec<i16>)]) -> Vec<T> + Send + Sync,
-    T: Send,
-{
-    use rayon::prelude::*;
-    let batch_size = batch_size.max(1);
-
-    let per_file: anyhow::Result<Vec<Vec<T>>> = input_files
-        .par_iter()
-        .map(|path| -> anyhow::Result<Vec<T>> {
-            let reader = Reader::open(path)?;
-            let mut reads: Vec<_> = reader
-                .reads()?
-                .filter_map(Result::ok)
-                .filter(|r| !r.signal_rows.is_empty())
-                .collect();
-            // Length-bucket so each chunk pads minimally to its own max length.
-            reads.sort_by_key(|r| r.num_samples);
-            let extractor = reader.signal_extractor()?;
-
-            let out: Vec<T> = reads
-                .par_chunks(batch_size)
-                .flat_map(|chunk| {
-                    let batch: Vec<(Uuid, u64, Vec<i16>)> = chunk
-                        .iter()
-                        .filter_map(|r| {
-                            let signal = extractor.get_signal(&r.signal_rows).ok()?;
-                            Some((r.read_id, r.num_samples, signal))
-                        })
-                        .collect();
-                    let results = process_batch(&batch);
-                    if let Some(pb) = progress {
-                        pb.inc(chunk.len() as u64);
-                    }
-                    results
-                })
-                .collect();
-            Ok(out)
-        })
-        .collect();
-
-    Ok(per_file?.into_iter().flatten().collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

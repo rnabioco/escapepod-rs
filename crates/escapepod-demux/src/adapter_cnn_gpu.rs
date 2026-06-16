@@ -62,12 +62,9 @@ impl AdapterCnnGpu {
         self.config
     }
 
-    /// Batched adapter-end detection. Same contract and the *same* bit-exact
-    /// length-grouping as
-    /// [`AdapterCnn::detect_adapter_end_batch`](crate::AdapterCnn::detect_adapter_end_batch):
-    /// one result per input signal in order, too-short reads excluded, and each
-    /// exact-length group run as an unpadded `[group, 1, len]` onnxruntime
-    /// batch (no cross-read padding). Length-bucket upstream so groups are big.
+    /// Batched adapter-end detection from raw signals. Preps each signal then
+    /// delegates to [`Self::detect_prepped`]. Same bit-exact length-grouping as
+    /// [`AdapterCnn::detect_adapter_end_batch`](crate::AdapterCnn::detect_adapter_end_batch).
     pub fn detect_adapter_end_batch(
         &self,
         signals: &[&[f32]],
@@ -77,18 +74,55 @@ impl AdapterCnnGpu {
             .iter()
             .map(|&s| prep_adapter_signal(s, &cfg))
             .collect();
-        let valid_idx: Vec<usize> = (0..signals.len())
+        // Re-stamp too-short errors with the real input length (detect_prepped
+        // only sees `None`, not the original signal).
+        let mut out = self.detect_prepped(&prepped);
+        for (i, r) in out.iter_mut().enumerate() {
+            if matches!(r, Err(AdapterCnnError::SignalTooShort { .. })) {
+                *r = Err(AdapterCnnError::SignalTooShort {
+                    len: signals[i].len(),
+                    required: cfg.min_obs_adapter + cfg.downscale_factor,
+                });
+            }
+        }
+        out
+    }
+
+    /// Batched detection over **already-prepped** signals (`None` = too short).
+    /// Lets callers run [`AdapterCnnConfig::prep`](crate::AdapterCnnConfig::prep)
+    /// in parallel on CPU producer threads and feed prepped blocks to the GPU,
+    /// so the GPU thread only does grouping + inference + decode. Each exact
+    /// length is one unpadded `[group, 1, len]` onnxruntime batch.
+    pub fn detect_prepped(
+        &self,
+        prepped: &[Option<Vec<f32>>],
+    ) -> Vec<Result<usize, AdapterCnnError>> {
+        let valid_idx: Vec<usize> = (0..prepped.len())
             .filter(|&i| prepped[i].is_some())
             .collect();
+        let mut out: Vec<Result<usize, AdapterCnnError>> = (0..prepped.len())
+            .map(|_| {
+                Err(AdapterCnnError::SignalTooShort {
+                    len: 0,
+                    required: 0,
+                })
+            })
+            .collect();
+        self.run_grouped(prepped, &valid_idx, &mut out);
+        out
+    }
 
-        let short_err = |i: usize| AdapterCnnError::SignalTooShort {
-            len: signals[i].len(),
-            required: cfg.min_obs_adapter + cfg.downscale_factor,
-        };
-        let mut out: Vec<Result<usize, AdapterCnnError>> =
-            (0..signals.len()).map(|i| Err(short_err(i))).collect();
-
-        for (len, group) in group_by_len(&prepped, &valid_idx) {
+    /// Run each exact-length group as one unpadded onnxruntime batch, writing
+    /// `Ok`/`Err` into `out` at each read's original index. `out` must already
+    /// be sized to `prepped.len()` (with too-short defaults in place).
+    fn run_grouped(
+        &self,
+        prepped: &[Option<Vec<f32>>],
+        valid_idx: &[usize],
+        out: &mut [Result<usize, AdapterCnnError>],
+    ) {
+        let cfg = self.config;
+        for (len, group) in group_by_len(prepped, valid_idx) {
             let run = (|| -> Result<Vec<usize>, AdapterCnnError> {
                 let g = group.len();
                 let mut data = vec![0f32; g * len];
@@ -132,6 +166,5 @@ impl AdapterCnnGpu {
                 }
             }
         }
-        out
     }
 }
