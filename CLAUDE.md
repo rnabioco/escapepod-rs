@@ -237,7 +237,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 - `svm.rs`: Full SVM predictor — RBF kernel, OvO dual coefficients, Platt scaling, multiclass probability coupling, batched GPU classify.
 - `probability.rs`: softmax / coupling utilities.
 - `train.rs` (feature: `train`): SVM training via linfa-svm, optional GPU all-pairs DTW matrix.
-- `adapter_cnn.rs` (feature: `cnn-detect`): port of ADAPTed's `BoundariesCNN` through tract-onnx. Loads ADAPTed-exported ONNX model at runtime; weights are CC BY-NC 4.0 and are NOT bundled.
+- `adapter_cnn.rs` (feature: `cnn-detect`): runs a user-supplied boundary-CNN ONNX graph (`[B,1,L] -> [B,2,L]`) through tract-onnx at runtime. Architecture-agnostic and CPU-only — works with escapepod-models' `adapter_rna004` TCN (CC-BY) or an ADAPTed `BoundariesCNN` export (CC BY-NC, NOT bundled). No GPU CNN path: at typical scales `detect` is dominated by POD5 read + signal prep, not CNN compute, so the tract path is as fast or faster (the old arch-locked GPU kernel was removed).
 
 ### CLI Commands
 

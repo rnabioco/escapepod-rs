@@ -10,8 +10,10 @@
 //!   via linfa-svm ([`train_svm`] and friends).
 //! - Optional `gpu` feature: batched GPU DTW matrix (routed through
 //!   `escapepod-signal`'s CUDA kernel) for classify and training.
-//! - Optional `cnn-detect` feature: port of ADAPTed's `BoundariesCNN` for
-//!   adapter-end detection via tract-onnx ([`AdapterCnn`]).
+//! - Optional `cnn-detect` feature: adapter-end detection by running an
+//!   exported boundary-CNN ONNX graph through tract-onnx ([`AdapterCnn`]).
+//!   This is CPU-only and architecture-agnostic (any `[B,1,L] -> [B,2,L]`
+//!   graph); there is no GPU CNN path.
 //!
 //! # Model workflow
 //!
@@ -64,12 +66,6 @@ mod train;
 #[cfg(feature = "cnn-detect")]
 pub mod adapter_cnn;
 
-#[cfg(feature = "cnn-detect")]
-mod adapter_cnn_compute;
-
-#[cfg(all(feature = "gpu", feature = "cnn-detect"))]
-mod gpu_cnn;
-
 pub use fingerprint::{
     BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
     compute_std_dev_fingerprint, extract_fingerprint_from_signal,
@@ -103,9 +99,3 @@ pub use train::*;
 
 #[cfg(feature = "cnn-detect")]
 pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError};
-
-#[cfg(feature = "cnn-detect")]
-pub use adapter_cnn_compute::{CnnCompute, CnnComputeError, CnnWeights};
-
-#[cfg(all(feature = "gpu", feature = "cnn-detect"))]
-pub use gpu_cnn::{GpuCnn, GpuCnnError};

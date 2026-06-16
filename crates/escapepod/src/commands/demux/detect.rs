@@ -54,10 +54,12 @@ pub struct DetectArgs {
     /// Adapter detection method.
     ///
     /// `llr` (default) uses the built-in log-likelihood ratio detector.
-    /// `cnn` uses a port of ADAPTed's BoundariesCNN (opt-in via `--features
-    /// cnn-detect`; requires a `.onnx` model produced by
-    /// `scripts/export_adapter_cnn_to_onnx.py` from a local ADAPTed install
-    /// — those weights are CC BY-NC 4.0 and not bundled with this crate).
+    /// `cnn` runs a boundary-CNN ONNX graph through tract-onnx (opt-in via
+    /// `--features cnn-detect`). Supply any model with the `[B,1,L] -> [B,2,L]`
+    /// contract via `--cnn-model` — e.g. escapepod-models' `adapter_rna004`
+    /// (CC-BY), or an ADAPTed `BoundariesCNN` exported with
+    /// `scripts/export_adapter_cnn_to_onnx.py` (those weights are CC BY-NC 4.0
+    /// and not bundled). CPU-only; no GPU CNN path.
     #[arg(
         long,
         default_value = "llr",
@@ -66,28 +68,10 @@ pub struct DetectArgs {
     )]
     pub method: String,
 
-    /// Path to the ADAPTed CNN ONNX model (only used with `--method cnn`).
+    /// Path to the boundary-CNN ONNX model (only used with `--method cnn`).
     #[cfg(feature = "cnn-detect")]
     #[arg(long, value_name = "FILE", help_heading = "Advanced Options")]
     pub cnn_model: Option<PathBuf>,
-
-    /// Run the CNN batched on the GPU instead of per-read on the CPU
-    /// (`--method cnn` only; requires a build with `--features "cnn-detect gpu"`).
-    ///
-    /// Produces identical boundaries to the CPU path. This is NOT a default
-    /// speedup: at typical scales `detect` is dominated by POD5 reading and
-    /// signal prep, not CNN compute, so the CPU (tract) path is usually as fast
-    /// or faster. Worth it only for very large / compute-bound batches.
-    #[cfg(feature = "gpu")]
-    #[arg(long, help_heading = "Advanced Options")]
-    pub gpu: bool,
-
-    /// Weight blob for the GPU CNN path — flat little-endian f32 from
-    /// `scripts/dump_adapter_cnn_weights.py`. Defaults to `--cnn-model` with a
-    /// `.weights` extension.
-    #[cfg(all(feature = "gpu", feature = "cnn-detect"))]
-    #[arg(long, value_name = "FILE", help_heading = "Advanced Options")]
-    pub cnn_weights: Option<PathBuf>,
 
     /// Number of threads for parallel processing (default: all CPUs)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
@@ -243,20 +227,16 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the detect subcommand using the ADAPTed CNN (opt-in).
+/// Run the detect subcommand using a boundary-CNN ONNX model (opt-in).
 ///
-/// Requires a user-supplied ONNX model (ADAPTed weights are CC BY-NC
-/// and must not be bundled). See `scripts/export_adapter_cnn_to_onnx.py`.
+/// Runs a user-supplied `[B,1,L] -> [B,2,L]` ONNX graph through tract-onnx
+/// (CPU). Works with any such model — escapepod-models' `adapter_rna004`
+/// (CC-BY) or an ADAPTed `BoundariesCNN` export (CC BY-NC; not bundled). See
+/// `scripts/export_adapter_cnn_to_onnx.py`.
 #[cfg(feature = "cnn-detect")]
 fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     use crate::commands::profile::PhaseTimer;
     use escapepod_demux::AdapterCnn;
-
-    // Route to the batched GPU path when requested.
-    #[cfg(feature = "gpu")]
-    if args.gpu {
-        return run_cnn_gpu(args);
-    }
 
     let mut timer = PhaseTimer::new();
     timer.phase("Detect adapters (CNN)");
@@ -268,12 +248,12 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
 
     warn!(
-        "the ADAPTed CNN path uses CC BY-NC 4.0 weights you supply via --cnn-model; \
-         downstream non-commercial-use obligations apply.",
+        "boundary CNN runs the model you supply via --cnn-model; respect that \
+         model's license (e.g. ADAPTed-derived weights are CC BY-NC 4.0).",
     );
 
     info!(
-        "{} adapter boundaries using ADAPTed CNN",
+        "{} adapter boundaries using boundary CNN",
         style::action("Detecting"),
     );
     info!(
@@ -332,135 +312,6 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     let mut writer = BufWriter::new(output_file);
     writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
 
-    let mut detected = 0;
-    for b in &results {
-        writeln!(
-            writer,
-            "{},{},{},{}",
-            b.read_id, b.num_samples, b.adapter_start, b.adapter_end
-        )?;
-        if b.has_valid_adapter() {
-            detected += 1;
-        }
-    }
-    writer.flush()?;
-
-    info!(
-        "{} boundaries written to {}",
-        style::action("Detected"),
-        style::path(args.output.display())
-    );
-    info!(
-        "{} {} reads with detected adapters",
-        style::label("Result:"),
-        style::count(detected)
-    );
-
-    timer.report(profile);
-    Ok(())
-}
-
-/// CNN detection on the GPU (batched). Same output contract as [`run_cnn`], but
-/// runs all reads through the network in device-sized chunks instead of
-/// per-read on the CPU. See [`escapepod_demux::GpuCnn`].
-#[cfg(all(feature = "gpu", feature = "cnn-detect"))]
-fn run_cnn_gpu(args: DetectArgs) -> anyhow::Result<()> {
-    use crate::commands::profile::PhaseTimer;
-    use escapepod_demux::GpuCnn;
-
-    let mut timer = PhaseTimer::new();
-    timer.phase("Detect adapters (CNN, GPU)");
-    let profile = args.profile;
-
-    let cnn_model_path = args
-        .cnn_model
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
-    let weights_path = args
-        .cnn_weights
-        .clone()
-        .unwrap_or_else(|| cnn_model_path.with_extension("weights"));
-    if !weights_path.exists() {
-        anyhow::bail!(
-            "GPU CNN needs a weight blob at {}.\n       Generate it once with:\n       \
-             pixi run -e warpdemux-bench python scripts/dump_adapter_cnn_weights.py {} {}",
-            weights_path.display(),
-            cnn_model_path.display(),
-            weights_path.display()
-        );
-    }
-
-    warn!(
-        "the ADAPTed CNN path uses CC BY-NC 4.0 weights you supply; \
-         downstream non-commercial-use obligations apply.",
-    );
-    info!(
-        "{} adapter boundaries using ADAPTed CNN (GPU, batched)",
-        style::action("Detecting"),
-    );
-    info!(
-        "{} {} POD5 file(s)",
-        style::label("Input:"),
-        style::count(args.input.len())
-    );
-    info!(
-        "{} {}",
-        style::label("Weights:"),
-        style::path(weights_path.display())
-    );
-    info!(
-        "{} {}",
-        style::label("Output:"),
-        style::path(args.output.display())
-    );
-
-    configure_thread_pool(args.threads);
-
-    let gpu = GpuCnn::load(&weights_path).map_err(|e| anyhow::anyhow!("loading GPU CNN: {e}"))?;
-
-    let total = total_read_count(&args.input);
-    info!(
-        "{} {} reads to process",
-        style::label("Found:"),
-        style::count(total)
-    );
-
-    // Read + convert signals in parallel, then run the CNN in device-sized
-    // chunks (bounds GPU memory on large inputs).
-    let read_bar = create_progress_bar(total as u64, "Reading")?;
-    let reads: Vec<_> = process_reads_par(
-        &args.input,
-        Some(&read_bar),
-        |read_id, num_samples, signal| {
-            let sig: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
-            (read_id, num_samples, sig)
-        },
-    )?;
-    read_bar.finish_with_message("read");
-
-    const CHUNK: usize = 8192;
-    let infer_bar = create_progress_bar(reads.len() as u64, "Detecting (CNN/GPU)")?;
-    let mut results: Vec<ReadBoundaries> = Vec::with_capacity(reads.len());
-    for chunk in reads.chunks(CHUNK) {
-        let sigs: Vec<&[f32]> = chunk.iter().map(|(_, _, s)| s.as_slice()).collect();
-        let ends = gpu
-            .detect_adapter_end_batch(&sigs)
-            .map_err(|e| anyhow::anyhow!("GPU CNN inference: {e}"))?;
-        for ((read_id, num_samples, _), adapter_end) in chunk.iter().zip(ends) {
-            results.push(ReadBoundaries {
-                read_id: *read_id,
-                num_samples: *num_samples,
-                adapter_start: 0,
-                adapter_end,
-            });
-        }
-        infer_bar.inc(chunk.len() as u64);
-    }
-    infer_bar.finish_with_message("complete");
-
-    let output_file = File::create(&args.output)?;
-    let mut writer = BufWriter::new(output_file);
-    writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
     let mut detected = 0;
     for b in &results {
         writeln!(
