@@ -23,8 +23,8 @@ use super::utils::configure_thread_pool;
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::{
-    AnyModel, DtwSvmModel, SvmPredictor, SvmWorkspace, extract_fingerprint_from_signal,
-    load_any_model,
+    AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace,
+    extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
 use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
@@ -45,7 +45,8 @@ pub struct RunArgs {
     #[arg(value_name = "FILES")]
     pub input: Vec<PathBuf>,
 
-    /// Trained SVM model JSON (from `demux train-svm` or a converted WarpDemuX model)
+    /// Trained classifier JSON — DTW-SVM (`demux train-svm` / converted
+    /// WarpDemuX) or native GBM tree ensemble. Auto-detected by JSON shape.
     #[arg(long, value_name = "FILE")]
     pub model: Option<PathBuf>,
 
@@ -199,10 +200,10 @@ fn barcode_label(predicted: i32) -> String {
     }
 }
 
-/// The set of output barcode labels (model barcodes + unclassified).
-fn barcode_set(model: &DtwSvmModel) -> Vec<String> {
-    let mut set: Vec<String> = model
-        .label_mapper
+/// The set of output barcode labels (model barcodes + unclassified). Takes the
+/// raw `label_mapper` so it serves both the SVM and GBM heads.
+fn barcode_set(label_mapper: &HashMap<usize, i32>) -> Vec<String> {
+    let mut set: Vec<String> = label_mapper
         .values()
         .filter(|&&id| id >= 0)
         .map(|&id| format!("BC{id:02}"))
@@ -255,6 +256,25 @@ fn route(
     });
 }
 
+/// Either classifier head the fused pipeline can drive. Detect + fingerprint are
+/// model-agnostic; only the per-read classify differs — DTW-SVM (with an optional
+/// GPU DTW path) or the CPU-only GBM tree walk.
+enum ClassifyModel {
+    Svm(DtwSvmModel),
+    Gbm(GbmModel),
+}
+
+impl ClassifyModel {
+    /// Class-index → barcode-id map (same shape on both heads), for the output
+    /// barcode set.
+    fn label_mapper(&self) -> &HashMap<usize, i32> {
+        match self {
+            ClassifyModel::Svm(m) => &m.label_mapper,
+            ClassifyModel::Gbm(m) => &m.label_mapper,
+        }
+    }
+}
+
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
     use crate::commands::profile::PhaseTimer;
     let mut timer = PhaseTimer::new();
@@ -275,15 +295,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("-d/--output-dir <DIR> is required"))?;
 
+    // The fused pipeline supports both classifier heads: DTW-SVM (with an
+    // optional GPU DTW path) and the native GBM tree ensemble (CPU-only). Only
+    // the legacy reference-bank WarpDemux JSON is rejected here.
     let model = match load_any_model(&model_path)? {
-        AnyModel::Svm(m) => m,
+        AnyModel::Svm(m) => ClassifyModel::Svm(m),
+        AnyModel::Gbm(m) => ClassifyModel::Gbm(m),
         AnyModel::WarpDemux(_) => anyhow::bail!(
-            "`demux` needs an SVM model (DtwSvmModel / converted WarpDemuX). \
-             The reference-CSV path is only on `demux classify --reference`."
-        ),
-        AnyModel::Gbm(_) => anyhow::bail!(
-            "`demux` (fused pipeline) does not support GBM models yet; run the \
-             stages separately and classify with `demux classify --model <gbm.json>`."
+            "`demux` needs an SVM or GBM model (DtwSvmModel / converted WarpDemuX \
+             / native GBM). The reference-CSV path is only on `demux classify --reference`."
         ),
     };
     let detector = build_detector(&args)?;
@@ -326,7 +346,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut routers: Routers = HashMap::new();
     let mut writer_handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<usize>>)> =
         Vec::new();
-    for bc in barcode_set(&model) {
+    for bc in barcode_set(model.label_mapper()) {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(4096);
         let path = output_dir.join(format!("{}_{}.pod5", args.prefix, bc));
         let dicts = predefined.clone();
@@ -340,42 +360,27 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let (class_tx, class_handle) = spawn_class_writer(args.classifications.as_deref())?;
 
     // ---- Stages A/B: produce classified reads ----
-    let produce_result = {
-        #[cfg(feature = "gpu")]
-        {
-            if args.gpu {
-                produce_gpu(
-                    &args,
-                    &detector,
-                    &model,
-                    fp,
-                    &routers,
-                    class_tx.as_ref(),
-                    &pb,
-                )
-            } else {
-                produce_cpu(
-                    &args,
-                    &detector,
-                    &model,
-                    fp,
-                    &routers,
-                    class_tx.as_ref(),
-                    &pb,
-                )
+    let produce_result = match &model {
+        ClassifyModel::Svm(svm) => {
+            #[cfg(feature = "gpu")]
+            {
+                if args.gpu {
+                    produce_gpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
+                } else {
+                    produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
             }
         }
-        #[cfg(not(feature = "gpu"))]
-        {
-            produce_cpu(
-                &args,
-                &detector,
-                &model,
-                fp,
-                &routers,
-                class_tx.as_ref(),
-                &pb,
-            )
+        ClassifyModel::Gbm(gbm) => {
+            #[cfg(feature = "gpu")]
+            if args.gpu {
+                tracing::warn!("GBM classify is CPU-only; ignoring --gpu in the fused pipeline.");
+            }
+            produce_cpu_gbm(&args, &detector, gbm, fp, &routers, class_tx.as_ref(), &pb)
         }
     };
 
@@ -526,6 +531,101 @@ fn classify_one_cpu(
     };
     let (_probs, result) = predictor.predict_with_workspace(&features.values, ws);
     Some((barcode_label(result.predicted_barcode), result.confidence))
+}
+
+/// GBM producer: same fused, single-stream-I/O structure as [`produce_cpu`],
+/// but the per-read classifier is the native tree ensemble. The GBM predictor
+/// holds no per-read mutable state (it's `Sync`, read-only), so — unlike the SVM
+/// path's `for_each_init` workspace — this is a plain `par_iter`. No GPU branch:
+/// GBM inference is CPU-only.
+fn produce_cpu_gbm(
+    args: &RunArgs,
+    detector: &Detector,
+    model: &GbmModel,
+    fp: FpParams,
+    routers: &Routers,
+    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    pb: &indicatif::ProgressBar,
+) -> anyhow::Result<()> {
+    let predictor = GbmPredictor::new(model);
+    for path in &args.input {
+        let reader = Reader::open(path)?;
+        let run_infos = Arc::new(reader.run_infos().to_vec());
+        for batch in reader.read_batches()? {
+            let batch = batch?;
+            let view = ReadsBatchView::new(&batch, false)?;
+            let reads: Vec<ReadData> = (0..view.num_rows())
+                .filter_map(|row| view.read(row).ok())
+                .filter(|r| !r.signal_rows.is_empty())
+                .collect();
+
+            // One sequential sweep pulls this batch's compressed signal (see
+            // produce_cpu for why single-stream I/O beats per-worker faulting on
+            // a network FS, #72); then parallelize the CPU work over the
+            // in-memory chunks. Each read's signal is decoded once and reused
+            // for both classify and the block-level write.
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+
+            bulk.par_iter().for_each(|(i, chunks)| {
+                let read = &reads[*i];
+                if let Some((barcode, conf)) =
+                    classify_one_cpu_gbm(read, chunks, detector, &predictor, fp)
+                {
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        barcode,
+                        chunks.clone(),
+                        run_infos.clone(),
+                        conf,
+                    );
+                }
+                pb.inc(1);
+            });
+        }
+    }
+    Ok(())
+}
+
+/// GBM counterpart to [`classify_one_cpu`]: decode → detect → fingerprint → GBM
+/// tree walk. Returns `(barcode, confidence)`; unfingerprintable reads route to
+/// `unclassified` (matching the SVM path), undecodable reads are dropped.
+fn classify_one_cpu_gbm(
+    read: &ReadData,
+    chunks: &[CompressedSignalChunk],
+    detector: &Detector,
+    predictor: &GbmPredictor,
+    fp: FpParams,
+) -> Option<(String, f64)> {
+    let signal = decode_chunks(chunks)?;
+    let (s, e) = detector.detect(&signal);
+    if e <= s {
+        return Some((UNCLASSIFIED.to_string(), 0.0));
+    }
+    let Some(features) = extract_fingerprint_from_signal(
+        &signal,
+        s,
+        e,
+        fp.num_segments,
+        fp.window_width,
+        NormMethod::ZScore,
+        read.read_id,
+        fp.min_separation,
+        fp.keep_last,
+        false,
+    ) else {
+        return Some((UNCLASSIFIED.to_string(), 0.0));
+    };
+    match predictor.predict(&features.values) {
+        Ok((_probs, result)) => Some((barcode_label(result.predicted_barcode), result.confidence)),
+        Err(_) => Some((UNCLASSIFIED.to_string(), 0.0)),
+    }
 }
 
 /// GPU producer: parallel CPU prep (decode + detect + fingerprint) feeds a
