@@ -473,14 +473,74 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads decoded + detected together per producer step. Bounds peak decoded-
-/// signal memory and sizes the GPU detect batch (bigger ⇒ bigger length groups,
-/// fewer onnxruntime calls). Detection over a window is one batched GPU call or
-/// one parallel CPU sweep; classification then reuses the decoded signal.
-const DETECT_WINDOW: usize = 8192;
+/// Reads accumulated into one detect+classify block. POD5 Arrow read-batches
+/// are small (~1000 reads), so detecting per batch makes GPU CNN fire many tiny
+/// calls; accumulating across batches into a large block groups far more
+/// same-length reads per onnxruntime call. Host cost is one block of decoded
+/// signal (bounded; trivial relative to typical node RAM). The on-device batch
+/// is separately capped by `gpu_batch_elems`.
+const DETECT_WINDOW: usize = 65_536;
 
-/// CPU producer: per Arrow batch, decode + detect + fingerprint + classify in
-/// parallel, routing each read directly to its barcode writer.
+/// One read's context carried alongside its decoded signal through a block:
+/// the writable read record, its compressed chunks (for the block-level write),
+/// and its run-info table.
+type BlockItem = (ReadData, Vec<CompressedSignalChunk>, Arc<Vec<RunInfoData>>);
+
+/// Stream reads through the fused pipeline in large blocks: per Arrow batch do
+/// the single-stream, ascending-order signal sweep (#72) and decode in
+/// parallel, accumulate across batches up to [`DETECT_WINDOW`] reads, then hand
+/// each full block (decoded signals + per-read context, aligned) to
+/// `process_block`. Accumulating across the file's small Arrow batches is what
+/// lets GPU detection batch many reads per call.
+fn drive_blocks(
+    input: &[std::path::PathBuf],
+    mut process_block: impl FnMut(Vec<Option<Vec<i16>>>, Vec<BlockItem>),
+) -> anyhow::Result<()> {
+    let mut sigs: Vec<Option<Vec<i16>>> = Vec::with_capacity(DETECT_WINDOW);
+    let mut items: Vec<BlockItem> = Vec::with_capacity(DETECT_WINDOW);
+    for path in input {
+        let reader = Reader::open(path)?;
+        let run_infos = Arc::new(reader.run_infos().to_vec());
+        for batch in reader.read_batches()? {
+            let batch = batch?;
+            let view = ReadsBatchView::new(&batch, false)?;
+            let reads: Vec<ReadData> = (0..view.num_rows())
+                .filter_map(|row| view.read(row).ok())
+                .filter(|r| !r.signal_rows.is_empty())
+                .collect();
+            // One sequential, ascending-order sweep pulls this batch's signal
+            // (grouped by Arrow record-batch — see #72), then decode in parallel.
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+            let decoded: Vec<Option<Vec<i16>>> = bulk
+                .par_iter()
+                .map(|(_, chunks)| decode_chunks(chunks))
+                .collect();
+
+            let mut reads_opt: Vec<Option<ReadData>> = reads.into_iter().map(Some).collect();
+            for ((i, chunks), sig) in bulk.into_iter().zip(decoded) {
+                let read = reads_opt[i].take().expect("each read consumed once");
+                sigs.push(sig);
+                items.push((read, chunks, run_infos.clone()));
+            }
+            if sigs.len() >= DETECT_WINDOW {
+                process_block(std::mem::take(&mut sigs), std::mem::take(&mut items));
+            }
+        }
+    }
+    if !sigs.is_empty() {
+        process_block(sigs, items);
+    }
+    Ok(())
+}
+
+/// CPU-classify producer (DTW-SVM): stream reads in large blocks
+/// ([`drive_blocks`]), batch-detect, then fingerprint + classify + route each
+/// read in parallel. `--method cnn --gpu` makes detection a batched GPU stage.
 fn produce_cpu(
     args: &RunArgs,
     detector: &Detector,
@@ -491,75 +551,34 @@ fn produce_cpu(
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     let predictor = SvmPredictor::new(model);
-    for path in &args.input {
-        let reader = Reader::open(path)?;
-        let run_infos = Arc::new(reader.run_infos().to_vec());
-        for batch in reader.read_batches()? {
-            let batch = batch?;
-            let view = ReadsBatchView::new(&batch, false)?;
-            let reads: Vec<ReadData> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
-                .filter(|r| !r.signal_rows.is_empty())
-                .collect();
-
-            // I/O and CPU are split deliberately. Pulling each read's signal on
-            // its own rayon worker (the old `reads.par_iter()`) puts 48 threads
-            // on the mmap at once, each faulting a different batch region — on a
-            // network FS that scatters page faults and defeats kernel readahead,
-            // collapsing cold throughput to ~single-digit MB/s (#72). Instead do
-            // ONE sequential, ascending-order sweep to pull this read-batch's
-            // compressed signal into memory (readahead engages → ~hundreds of
-            // MB/s cold), then parallelize only the CPU work over those in-memory
-            // chunks. The bulk chunks are reused for both classify-decode and the
-            // block-level write, so each read's signal is read exactly once.
-            let keyed: Vec<(usize, Vec<u64>)> = reads
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (i, r.signal_rows.clone()))
-                .collect();
-            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
-
-            // Decode + detect + classify in windows. Decoding a window up front
-            // lets GPU CNN detection run as one batched call (and bounds peak
-            // decoded-signal memory); LLR / CPU-CNN detect per read in parallel.
-            // The single-stream bulk load above (one ascending sweep, #72) is
-            // unchanged — windowing only splits the in-memory CPU work.
-            for window in bulk.chunks(DETECT_WINDOW) {
-                let signals: Vec<Option<Vec<i16>>> = window
-                    .par_iter()
-                    .map(|(_, chunks)| decode_chunks(chunks))
-                    .collect();
-                let bounds = detector.detect_batch(&signals);
-                // One SVM workspace per rayon worker (not per read): classify
-                // scores each read against tens of thousands of training
-                // fingerprints, and `SvmWorkspace` holds the reusable scratch
-                // (DTW row buffers, distances, kernel, coupling). Sharing it
-                // across reads on a worker avoids re-allocating per read.
-                window.par_iter().enumerate().for_each_init(
-                    || SvmWorkspace::for_model(predictor.model()),
-                    |ws, (k, (i, chunks))| {
-                        let read = &reads[*i];
-                        if let Some(signal) = &signals[k] {
-                            let (s, e) = bounds[k];
-                            let (barcode, conf) =
-                                classify_one_cpu(read, signal, s, e, &predictor, fp, ws);
-                            route(
-                                routers,
-                                class_tx,
-                                read.for_writing(read.run_info_index),
-                                barcode,
-                                chunks.clone(),
-                                run_infos.clone(),
-                                conf,
-                            );
-                        }
-                        pb.inc(1);
-                    },
-                );
-            }
-        }
-    }
-    Ok(())
+    drive_blocks(&args.input, |sigs, items| {
+        // Batch-detect the whole block (GPU CNN = grouped onnxruntime calls; LLR
+        // / CPU-CNN = parallel per read), then classify reusing each decoded
+        // signal. One SVM workspace per rayon worker (not per read): classify
+        // scores each read against tens of thousands of training fingerprints,
+        // and `SvmWorkspace` holds the reusable scratch (DTW rows, distances,
+        // kernel, coupling).
+        let bounds = detector.detect_batch(&sigs);
+        sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
+            || SvmWorkspace::for_model(predictor.model()),
+            |ws, ((signal, (s, e)), (read, chunks, run_infos))| {
+                if let Some(signal) = signal {
+                    let (barcode, conf) =
+                        classify_one_cpu(&read, &signal, s, e, &predictor, fp, ws);
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        barcode,
+                        chunks,
+                        run_infos,
+                        conf,
+                    );
+                }
+                pb.inc(1);
+            },
+        );
+    })
 }
 
 /// Decode (decompress) a read's in-memory compressed signal chunks into a
@@ -624,59 +643,30 @@ fn produce_cpu_gbm(
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     let predictor = GbmPredictor::new(model);
-    for path in &args.input {
-        let reader = Reader::open(path)?;
-        let run_infos = Arc::new(reader.run_infos().to_vec());
-        for batch in reader.read_batches()? {
-            let batch = batch?;
-            let view = ReadsBatchView::new(&batch, false)?;
-            let reads: Vec<ReadData> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
-                .filter(|r| !r.signal_rows.is_empty())
-                .collect();
-
-            // One sequential sweep pulls this batch's compressed signal (see
-            // produce_cpu for why single-stream I/O beats per-worker faulting on
-            // a network FS, #72); then parallelize the CPU work over the
-            // in-memory chunks. Each read's signal is decoded once and reused
-            // for both classify and the block-level write.
-            let keyed: Vec<(usize, Vec<u64>)> = reads
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (i, r.signal_rows.clone()))
-                .collect();
-            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
-
-            // Windowed decode + batched detect (GPU CNN = one call/window; LLR /
-            // CPU-CNN = parallel per read), then GBM classify reusing the signal.
-            for window in bulk.chunks(DETECT_WINDOW) {
-                let signals: Vec<Option<Vec<i16>>> = window
-                    .par_iter()
-                    .map(|(_, chunks)| decode_chunks(chunks))
-                    .collect();
-                let bounds = detector.detect_batch(&signals);
-                window.par_iter().enumerate().for_each(|(k, (i, chunks))| {
-                    let read = &reads[*i];
-                    if let Some(signal) = &signals[k] {
-                        let (s, e) = bounds[k];
-                        let (barcode, conf) =
-                            classify_one_cpu_gbm(read, signal, s, e, &predictor, fp);
-                        route(
-                            routers,
-                            class_tx,
-                            read.for_writing(read.run_info_index),
-                            barcode,
-                            chunks.clone(),
-                            run_infos.clone(),
-                            conf,
-                        );
-                    }
-                    pb.inc(1);
-                });
-            }
-        }
-    }
-    Ok(())
+    drive_blocks(&args.input, |sigs, items| {
+        // Batch-detect the whole block, then GBM-classify reusing each decoded
+        // signal. GBM is `Sync` and read-only, so a plain parallel walk (no
+        // per-worker workspace like the SVM path).
+        let bounds = detector.detect_batch(&sigs);
+        sigs.into_par_iter().zip(bounds).zip(items).for_each(
+            |((signal, (s, e)), (read, chunks, run_infos))| {
+                if let Some(signal) = signal {
+                    let (barcode, conf) =
+                        classify_one_cpu_gbm(&read, &signal, s, e, &predictor, fp);
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        barcode,
+                        chunks,
+                        run_infos,
+                        conf,
+                    );
+                }
+                pb.inc(1);
+            },
+        );
+    })
 }
 
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a
