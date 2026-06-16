@@ -81,6 +81,56 @@ pub fn decompress_signal(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     svb16::decode(&svb_encoded, sample_count)
 }
 
+/// Decompress only the **first `max_samples`** of a VBZ chunk that holds
+/// `total_samples`. Bit-identical to `decompress_signal(...)[..n]` where
+/// `n = min(max_samples, total_samples)`.
+///
+/// The SVB16 layout is `[keys: ceil(total/8)][values]`, and a 1-byte vs 2-byte
+/// value flag lives in the keys. So we ZSTD-*stream* just the keys, sum the
+/// value bytes for the first `n` samples, stream that many more bytes, and stop
+/// — skipping ZSTD work for the unread tail. For a long read (mRNA) where only
+/// the first ~`max_obs_trace` samples feed the adapter detector, this avoids
+/// decompressing the entire transcript.
+pub fn decompress_signal_prefix(
+    data: &[u8],
+    total_samples: usize,
+    max_samples: usize,
+) -> Result<Vec<i16>> {
+    use std::io::Read;
+
+    let n = max_samples.min(total_samples);
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // No truncation possible / worthwhile — decode the whole chunk.
+    if n == total_samples {
+        return decompress_signal(data, total_samples);
+    }
+    if data.is_empty() {
+        return Err(Error::Decompression(
+            "VBZ data is empty but sample_count > 0".to_string(),
+        ));
+    }
+
+    let mut decoder = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| Error::Decompression(format!("ZSTD init failed: {}", e)))?;
+
+    // Keys are sized for the chunk's *total* samples, then the value section.
+    let keys_len = svb16::key_length(total_samples);
+    let mut keys = vec![0u8; keys_len];
+    decoder
+        .read_exact(&mut keys)
+        .map_err(|e| Error::Decompression(format!("ZSTD read (keys) failed: {}", e)))?;
+
+    let values_len = svb16::value_bytes(&keys, n);
+    let mut values = vec![0u8; values_len];
+    decoder
+        .read_exact(&mut values)
+        .map_err(|e| Error::Decompression(format!("ZSTD read (values) failed: {}", e)))?;
+
+    svb16::decode_prefix(&keys, &values, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +150,46 @@ mod tests {
         let compressed = compress_signal(&samples).unwrap();
         let decompressed = decompress_signal(&compressed, samples.len()).unwrap();
         assert_eq!(decompressed, samples);
+    }
+
+    #[test]
+    fn test_decompress_prefix_matches_full() {
+        // Deterministic signal with a mix of small (1-byte) and large (2-byte)
+        // deltas so the key bits vary across the prefix boundary.
+        let mut s: u64 = 0x1234_5678_9abc_def1;
+        let samples: Vec<i16> = (0..5000)
+            .map(|i| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // alternate small ramps and big jumps
+                if i % 7 == 0 {
+                    (s >> 48) as i16 // big jump -> 2-byte delta
+                } else {
+                    (i as i16 % 5) - 2 // small -> 1-byte delta
+                }
+            })
+            .collect();
+        let total = samples.len();
+        let compressed = compress_signal(&samples).unwrap();
+        let full = decompress_signal(&compressed, total).unwrap();
+
+        for &n in &[
+            0usize,
+            1,
+            2,
+            6,
+            7,
+            8,
+            99,
+            100,
+            4096,
+            total - 1,
+            total,
+            total + 10,
+        ] {
+            let pref = decompress_signal_prefix(&compressed, total, n).unwrap();
+            let want = &full[..n.min(total)];
+            assert_eq!(pref.as_slice(), want, "prefix mismatch at n={n}");
+        }
     }
 
     #[test]
