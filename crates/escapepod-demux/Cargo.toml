@@ -49,10 +49,10 @@ tempfile = "3"
 
 [features]
 default = []
-# CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
-# tract-onnx). Users supply an ONNX file produced by
-# `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC
-# 4.0 and must not be bundled with this crate.
+# CNN-based adapter detection: runs a user-supplied boundary-CNN ONNX graph
+# (`[B,1,L] -> [B,2,L]`) through tract-onnx on the CPU. Architecture-agnostic
+# (escapepod-models' adapter_rna004 TCN, or an ADAPTed BoundariesCNN export —
+# those weights are CC BY-NC 4.0 and must not be bundled). No GPU CNN path.
 cnn-detect = ["dep:tract-onnx"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run

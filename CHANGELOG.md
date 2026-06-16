@@ -16,6 +16,21 @@
   reusable kernels. They are **not** used by `escpod demux`: measurement shows
   the prep stages run faster on a multi-core CPU than on the GPU.
 
+### Removed
+
+- The **GPU CNN adapter-detection path** (`demux detect --method cnn --gpu`,
+  plus the `--cnn-weights` flag and `scripts/dump_adapter_cnn_weights.py`). Its
+  hand-written CUDA kernels were hardcoded to ADAPTed's `BoundariesCNN`
+  topology (3× Conv1d + ConvTranspose1d, fixed K=7/C=64) and could not run any
+  other architecture — including escapepod-models' replacement TCN. CNN
+  detection (`--method cnn`) now runs **only** through the architecture-agnostic
+  tract-onnx CPU path (`adapter_cnn.rs`), which accepts any `[B,1,L] -> [B,2,L]`
+  ONNX graph. This is not a regression at typical scales: `detect` is dominated
+  by POD5 read + signal prep, not CNN compute, so the CPU path is as fast or
+  faster (the GPU flag's own help already said as much). Removing it also drops
+  the CC-BY-NC `.weights` dumper. If a GPU CNN path is ever needed again, add an
+  ONNX-generic backend (e.g. ORT CUDA EP) rather than a per-architecture kernel.
+
 ### Changed
 
 - The LLR detect `--downscale` default is now **10** (the WarpDemuX-native
