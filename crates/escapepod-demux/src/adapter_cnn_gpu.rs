@@ -23,6 +23,23 @@ use ort::value::Tensor;
 use crate::adapter_cnn::{decode_adapter_end, group_by_len, prep_adapter_signal};
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
+/// Max input elements (`rows × len`) per onnxruntime call — caps the on-device
+/// batch so the largest length-group is split into chunks that fit GPU memory.
+/// Default 16,777,216 (~64 MB of f32 input; activations scale by the model's
+/// channel count) is comfortable on a 24 GB device for the default cap length;
+/// override via `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` for a smaller/larger GPU.
+fn gpu_batch_elems() -> usize {
+    use std::sync::OnceLock;
+    static ELEMS: OnceLock<usize> = OnceLock::new();
+    *ELEMS.get_or_init(|| {
+        std::env::var("ESCAPEPOD_CNN_GPU_BATCH_ELEMS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16_777_216)
+    })
+}
+
 /// Batched boundary-CNN adapter-end detector backed by onnxruntime + CUDA.
 ///
 /// `ort::Session::run` takes `&mut self`, so the session sits behind a `Mutex`:
@@ -112,9 +129,15 @@ impl AdapterCnnGpu {
         out
     }
 
-    /// Run each exact-length group as one unpadded onnxruntime batch, writing
+    /// Run each exact-length group as unpadded onnxruntime batches, writing
     /// `Ok`/`Err` into `out` at each read's original index. `out` must already
     /// be sized to `prepped.len()` (with too-short defaults in place).
+    ///
+    /// A group is split into sub-batches of at most [`gpu_batch_elems`] input
+    /// elements (rows × len), so the "every read longer than the prep cap" group
+    /// — which can be hundreds of thousands of rows on a large run — never
+    /// becomes a single device allocation that exceeds GPU memory. Splitting is
+    /// bit-identical: same length, no padding, the batch axis is independent.
     fn run_grouped(
         &self,
         prepped: &[Option<Vec<f32>>],
@@ -123,45 +146,49 @@ impl AdapterCnnGpu {
     ) {
         let cfg = self.config;
         for (len, group) in group_by_len(prepped, valid_idx) {
-            let run = (|| -> Result<Vec<usize>, AdapterCnnError> {
-                let g = group.len();
-                let mut data = vec![0f32; g * len];
-                for (row, &i) in group.iter().enumerate() {
-                    data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
-                }
-                let input = Tensor::from_array(([g, 1, len], data))
-                    .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                let mut session = self.session.lock().expect("ort session mutex poisoned");
-                let outputs = session
-                    .run(ort::inputs![input])
-                    .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                let (shape, scores) = outputs[0]
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                // Expect row-major `[group, 2, length_out]`.
-                if shape.len() != 3 || shape[0] as usize != g || shape[1] != 2 {
-                    return Err(AdapterCnnError::BadShape {
-                        got: shape.iter().map(|&d| d as usize).collect(),
-                    });
-                }
-                let length_out = shape[2] as usize;
-                Ok((0..g)
-                    .map(|row| {
-                        // Channel-0 (adapter_end) of row `row`.
-                        let base = row * 2 * length_out;
-                        decode_adapter_end(&cfg, length_out, len, |k| scores[base + k])
-                    })
-                    .collect())
-            })();
-            match run {
-                Ok(ends) => {
-                    for (&i, end) in group.iter().zip(ends) {
-                        out[i] = Ok(end);
+            let rows_per_call = (gpu_batch_elems() / len.max(1)).max(1);
+            for sub in group.chunks(rows_per_call) {
+                let run = (|| -> Result<Vec<usize>, AdapterCnnError> {
+                    let g = sub.len();
+                    let mut data = vec![0f32; g * len];
+                    for (row, &i) in sub.iter().enumerate() {
+                        data[row * len..(row + 1) * len]
+                            .copy_from_slice(prepped[i].as_ref().unwrap());
                     }
-                }
-                Err(e) => {
-                    for &i in &group {
-                        out[i] = Err(e.clone());
+                    let input = Tensor::from_array(([g, 1, len], data))
+                        .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+                    let mut session = self.session.lock().expect("ort session mutex poisoned");
+                    let outputs = session
+                        .run(ort::inputs![input])
+                        .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+                    let (shape, scores) = outputs[0]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+                    // Expect row-major `[sub, 2, length_out]`.
+                    if shape.len() != 3 || shape[0] as usize != g || shape[1] != 2 {
+                        return Err(AdapterCnnError::BadShape {
+                            got: shape.iter().map(|&d| d as usize).collect(),
+                        });
+                    }
+                    let length_out = shape[2] as usize;
+                    Ok((0..g)
+                        .map(|row| {
+                            // Channel-0 (adapter_end) of row `row`.
+                            let base = row * 2 * length_out;
+                            decode_adapter_end(&cfg, length_out, len, |k| scores[base + k])
+                        })
+                        .collect())
+                })();
+                match run {
+                    Ok(ends) => {
+                        for (&i, end) in sub.iter().zip(ends) {
+                            out[i] = Ok(end);
+                        }
+                    }
+                    Err(e) => {
+                        for &i in sub {
+                            out[i] = Err(e.clone());
+                        }
                     }
                 }
             }
