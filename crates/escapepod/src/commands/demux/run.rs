@@ -107,9 +107,12 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// Classify on the GPU (batched DTW) instead of per-read on the CPU. CPU
-    /// prep stays parallel and continuously feeds the GPU. Requires `--features gpu`.
-    #[cfg(feature = "gpu")]
+    /// Use the GPU where this pipeline supports it: batched DTW-SVM classify
+    /// (`--features gpu`) and/or batched CNN adapter detection with
+    /// `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and feeds
+    /// the GPU; CPU falls back automatically for stages without a GPU path
+    /// (e.g. GBM classify).
+    #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
     #[arg(long)]
     pub gpu: bool,
 
@@ -149,7 +152,10 @@ impl Default for FpParams {
     }
 }
 
-/// Adapter detector — LLR (always available) or CNN (opt-in).
+/// Adapter detector — LLR (always available), CPU CNN (`cnn-detect`), or
+/// batched GPU CNN (`cnn-gpu`). The fused pipeline always detects through
+/// [`Detector::detect_batch`] so the GPU variant runs as one onnxruntime call
+/// per block instead of per read.
 enum Detector {
     Llr {
         min_adapter: usize,
@@ -158,6 +164,8 @@ enum Detector {
     },
     #[cfg(feature = "cnn-detect")]
     Cnn(Box<escapepod_demux::AdapterCnn>),
+    #[cfg(feature = "cnn-gpu")]
+    CnnGpu(Box<escapepod_demux::AdapterCnnGpu>),
 }
 
 impl Detector {
@@ -187,7 +195,49 @@ impl Detector {
                 let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
                 (0, cnn.detect_adapter_end(&sig_f32).unwrap_or(0))
             }
+            // Per-read is a degenerate single-read batch; the producers always go
+            // through `detect_batch`, so this is only a correctness fallback.
+            #[cfg(feature = "cnn-gpu")]
+            Detector::CnnGpu(gpu) => {
+                let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
+                let end = gpu
+                    .detect_adapter_end_batch(&[&sig_f32])
+                    .into_iter()
+                    .next()
+                    .and_then(Result::ok)
+                    .unwrap_or(0);
+                (0, end)
+            }
         }
+    }
+
+    /// Per-read `(start, end)` for a whole window of decoded signals (`None` =
+    /// decode failed → `(0, 0)`, routed as unclassified). GPU CNN runs as one
+    /// batched onnxruntime call (length-grouped); LLR and CPU CNN run per read
+    /// in parallel. Bit-identical to calling [`Self::detect`] on each signal.
+    fn detect_batch(&self, signals: &[Option<Vec<i16>>]) -> Vec<(usize, usize)> {
+        #[cfg(feature = "cnn-gpu")]
+        if let Detector::CnnGpu(gpu) = self {
+            let cfg = gpu.config();
+            let prepped: Vec<Option<Vec<f32>>> = signals
+                .par_iter()
+                .map(|s| {
+                    s.as_ref().and_then(|v| {
+                        let f: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+                        cfg.prep(&f)
+                    })
+                })
+                .collect();
+            return gpu
+                .detect_prepped(&prepped)
+                .into_iter()
+                .map(|r| (0usize, r.unwrap_or(0)))
+                .collect();
+        }
+        signals
+            .par_iter()
+            .map(|s| s.as_ref().map_or((0, 0), |v| self.detect(v)))
+            .collect()
     }
 }
 
@@ -376,9 +426,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             }
         }
         ClassifyModel::Gbm(gbm) => {
-            #[cfg(feature = "gpu")]
-            if args.gpu {
-                tracing::warn!("GBM classify is CPU-only; ignoring --gpu in the fused pipeline.");
+            // GBM classify is CPU-only; with `--method cnn` the GPU still
+            // accelerates adapter detection, so only warn when `--gpu` can do
+            // nothing (CPU classify + CPU detect).
+            #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
+            if args.gpu && args.method != "cnn" {
+                tracing::warn!(
+                    "--gpu has no effect here: GBM classify is CPU-only and \
+                     `--method {}` detection is CPU-only (use `--method cnn` for \
+                     GPU adapter detection).",
+                    args.method
+                );
             }
             produce_cpu_gbm(&args, &detector, gbm, fp, &routers, class_tx.as_ref(), &pb)
         }
@@ -414,6 +472,12 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     timer.report(profile);
     Ok(())
 }
+
+/// Reads decoded + detected together per producer step. Bounds peak decoded-
+/// signal memory and sizes the GPU detect batch (bigger ⇒ bigger length groups,
+/// fewer onnxruntime calls). Detection over a window is one batched GPU call or
+/// one parallel CPU sweep; classification then reuses the decoded signal.
+const DETECT_WINDOW: usize = 8192;
 
 /// CPU producer: per Arrow batch, decode + detect + fingerprint + classify in
 /// parallel, routing each read directly to its barcode writer.
@@ -455,31 +519,44 @@ fn produce_cpu(
                 .collect();
             let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
-            // One SVM workspace per rayon worker (not per read): classify scores
-            // each read against tens of thousands of training fingerprints, and
-            // `SvmWorkspace` holds the reusable scratch (DTW row buffers,
-            // distances, kernel, coupling matrices). Sharing it across reads on a
-            // worker avoids re-allocating that scratch for every read.
-            bulk.par_iter().for_each_init(
-                || SvmWorkspace::for_model(predictor.model()),
-                |ws, (i, chunks)| {
-                    let read = &reads[*i];
-                    if let Some((barcode, conf)) =
-                        classify_one_cpu(read, chunks, detector, &predictor, fp, ws)
-                    {
-                        route(
-                            routers,
-                            class_tx,
-                            read.for_writing(read.run_info_index),
-                            barcode,
-                            chunks.clone(),
-                            run_infos.clone(),
-                            conf,
-                        );
-                    }
-                    pb.inc(1);
-                },
-            );
+            // Decode + detect + classify in windows. Decoding a window up front
+            // lets GPU CNN detection run as one batched call (and bounds peak
+            // decoded-signal memory); LLR / CPU-CNN detect per read in parallel.
+            // The single-stream bulk load above (one ascending sweep, #72) is
+            // unchanged — windowing only splits the in-memory CPU work.
+            for window in bulk.chunks(DETECT_WINDOW) {
+                let signals: Vec<Option<Vec<i16>>> = window
+                    .par_iter()
+                    .map(|(_, chunks)| decode_chunks(chunks))
+                    .collect();
+                let bounds = detector.detect_batch(&signals);
+                // One SVM workspace per rayon worker (not per read): classify
+                // scores each read against tens of thousands of training
+                // fingerprints, and `SvmWorkspace` holds the reusable scratch
+                // (DTW row buffers, distances, kernel, coupling). Sharing it
+                // across reads on a worker avoids re-allocating per read.
+                window.par_iter().enumerate().for_each_init(
+                    || SvmWorkspace::for_model(predictor.model()),
+                    |ws, (k, (i, chunks))| {
+                        let read = &reads[*i];
+                        if let Some(signal) = &signals[k] {
+                            let (s, e) = bounds[k];
+                            let (barcode, conf) =
+                                classify_one_cpu(read, signal, s, e, &predictor, fp, ws);
+                            route(
+                                routers,
+                                class_tx,
+                                read.for_writing(read.run_info_index),
+                                barcode,
+                                chunks.clone(),
+                                run_infos.clone(),
+                                conf,
+                            );
+                        }
+                        pb.inc(1);
+                    },
+                );
+            }
         }
     }
     Ok(())
@@ -499,24 +576,23 @@ fn decode_chunks(chunks: &[CompressedSignalChunk]) -> Option<Vec<i16>> {
     Some(signal)
 }
 
-/// Classify a single read from its already-in-memory compressed signal chunks
-/// (decode → detect → fingerprint → SVM). Returns `(barcode, confidence)`; the
-/// caller already holds the chunks for routing.
+/// Classify a single read from its decoded signal and precomputed adapter
+/// boundaries (fingerprint → SVM). Returns `(barcode, confidence)`; the caller
+/// holds the chunks for routing. Detection is done in batch by the producer.
 fn classify_one_cpu(
     read: &ReadData,
-    chunks: &[CompressedSignalChunk],
-    detector: &Detector,
+    signal: &[i16],
+    s: usize,
+    e: usize,
     predictor: &SvmPredictor,
     fp: FpParams,
     ws: &mut SvmWorkspace,
-) -> Option<(String, f64)> {
-    let signal = decode_chunks(chunks)?;
-    let (s, e) = detector.detect(&signal);
+) -> (String, f64) {
     if e <= s {
-        return Some((UNCLASSIFIED.to_string(), 0.0));
+        return (UNCLASSIFIED.to_string(), 0.0);
     }
     let Some(features) = extract_fingerprint_from_signal(
-        &signal,
+        signal,
         s,
         e,
         fp.num_segments,
@@ -527,10 +603,10 @@ fn classify_one_cpu(
         fp.keep_last,
         false,
     ) else {
-        return Some((UNCLASSIFIED.to_string(), 0.0));
+        return (UNCLASSIFIED.to_string(), 0.0);
     };
     let (_probs, result) = predictor.predict_with_workspace(&features.values, ws);
-    Some((barcode_label(result.predicted_barcode), result.confidence))
+    (barcode_label(result.predicted_barcode), result.confidence)
 }
 
 /// GBM producer: same fused, single-stream-I/O structure as [`produce_cpu`],
@@ -571,45 +647,54 @@ fn produce_cpu_gbm(
                 .collect();
             let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
-            bulk.par_iter().for_each(|(i, chunks)| {
-                let read = &reads[*i];
-                if let Some((barcode, conf)) =
-                    classify_one_cpu_gbm(read, chunks, detector, &predictor, fp)
-                {
-                    route(
-                        routers,
-                        class_tx,
-                        read.for_writing(read.run_info_index),
-                        barcode,
-                        chunks.clone(),
-                        run_infos.clone(),
-                        conf,
-                    );
-                }
-                pb.inc(1);
-            });
+            // Windowed decode + batched detect (GPU CNN = one call/window; LLR /
+            // CPU-CNN = parallel per read), then GBM classify reusing the signal.
+            for window in bulk.chunks(DETECT_WINDOW) {
+                let signals: Vec<Option<Vec<i16>>> = window
+                    .par_iter()
+                    .map(|(_, chunks)| decode_chunks(chunks))
+                    .collect();
+                let bounds = detector.detect_batch(&signals);
+                window.par_iter().enumerate().for_each(|(k, (i, chunks))| {
+                    let read = &reads[*i];
+                    if let Some(signal) = &signals[k] {
+                        let (s, e) = bounds[k];
+                        let (barcode, conf) =
+                            classify_one_cpu_gbm(read, signal, s, e, &predictor, fp);
+                        route(
+                            routers,
+                            class_tx,
+                            read.for_writing(read.run_info_index),
+                            barcode,
+                            chunks.clone(),
+                            run_infos.clone(),
+                            conf,
+                        );
+                    }
+                    pb.inc(1);
+                });
+            }
         }
     }
     Ok(())
 }
 
-/// GBM counterpart to [`classify_one_cpu`]: decode → detect → fingerprint → GBM
-/// tree walk. Returns `(barcode, confidence)`; unfingerprintable reads route to
-/// `unclassified` (matching the SVM path), undecodable reads are dropped.
+/// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a
+/// decoded signal and precomputed boundaries. Returns `(barcode, confidence)`;
+/// unfingerprintable reads route to `unclassified` (matching the SVM path).
 fn classify_one_cpu_gbm(
     read: &ReadData,
-    chunks: &[CompressedSignalChunk],
-    detector: &Detector,
+    signal: &[i16],
+    s: usize,
+    e: usize,
     predictor: &GbmPredictor,
     fp: FpParams,
-) -> Option<(String, f64)> {
-    let signal = decode_chunks(chunks)?;
-    let (s, e) = detector.detect(&signal);
+) -> (String, f64) {
     if e <= s {
-        return Some((UNCLASSIFIED.to_string(), 0.0));
+        return (UNCLASSIFIED.to_string(), 0.0);
     }
     let Some(features) = extract_fingerprint_from_signal(
-        &signal,
+        signal,
         s,
         e,
         fp.num_segments,
@@ -620,11 +705,11 @@ fn classify_one_cpu_gbm(
         fp.keep_last,
         false,
     ) else {
-        return Some((UNCLASSIFIED.to_string(), 0.0));
+        return (UNCLASSIFIED.to_string(), 0.0);
     };
     match predictor.predict(&features.values) {
-        Ok((_probs, result)) => Some((barcode_label(result.predicted_barcode), result.confidence)),
-        Err(_) => Some((UNCLASSIFIED.to_string(), 0.0)),
+        Ok((_probs, result)) => (barcode_label(result.predicted_barcode), result.confidence),
+        Err(_) => (UNCLASSIFIED.to_string(), 0.0),
     }
 }
 
@@ -708,60 +793,70 @@ fn produce_gpu(
                 let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
                 type Prepped = (ReadData, Option<Vec<f64>>, Vec<CompressedSignalChunk>);
-                let prepped: Vec<Option<Prepped>> = bulk
-                    .par_iter()
-                    .map(|(i, chunks)| -> Option<Prepped> {
-                        let read = &reads[*i];
-                        let signal = decode_chunks(chunks)?;
-                        let (s, e) = detector.detect(&signal);
-                        let features = if e > s {
-                            extract_fingerprint_from_signal(
-                                &signal,
-                                s,
-                                e,
-                                fp.num_segments,
-                                fp.window_width,
-                                NormMethod::ZScore,
-                                read.read_id,
-                                fp.min_separation,
-                                fp.keep_last,
-                                false,
-                            )
-                            .map(|f| f.values)
-                        } else {
-                            None
-                        };
-                        Some((
-                            read.for_writing(read.run_info_index),
-                            features,
-                            chunks.clone(),
-                        ))
-                    })
-                    .collect();
-                pb.inc(reads.len() as u64);
+                // Windowed: decode once, batch-detect (GPU CNN = one call/window;
+                // LLR / CPU-CNN = parallel per read), then parallel fingerprint.
+                for window in bulk.chunks(DETECT_WINDOW) {
+                    let signals: Vec<Option<Vec<i16>>> = window
+                        .par_iter()
+                        .map(|(_, chunks)| decode_chunks(chunks))
+                        .collect();
+                    let bounds = detector.detect_batch(&signals);
+                    let prepped: Vec<Option<Prepped>> = window
+                        .par_iter()
+                        .enumerate()
+                        .map(|(k, (i, chunks))| -> Option<Prepped> {
+                            let read = &reads[*i];
+                            let signal = signals[k].as_ref()?;
+                            let (s, e) = bounds[k];
+                            let features = if e > s {
+                                extract_fingerprint_from_signal(
+                                    signal,
+                                    s,
+                                    e,
+                                    fp.num_segments,
+                                    fp.window_width,
+                                    NormMethod::ZScore,
+                                    read.read_id,
+                                    fp.min_separation,
+                                    fp.keep_last,
+                                    false,
+                                )
+                                .map(|f| f.values)
+                            } else {
+                                None
+                            };
+                            Some((
+                                read.for_writing(read.run_info_index),
+                                features,
+                                chunks.clone(),
+                            ))
+                        })
+                        .collect();
+                    pb.inc(window.len() as u64);
 
-                for (read, fp_opt, chunks) in prepped.into_iter().flatten() {
-                    match fp_opt {
-                        Some(values) => {
-                            fps.push(values);
-                            metas.push((read, chunks, run_infos.clone()));
+                    for (read, fp_opt, chunks) in prepped.into_iter().flatten() {
+                        match fp_opt {
+                            Some(values) => {
+                                fps.push(values);
+                                metas.push((read, chunks, run_infos.clone()));
+                            }
+                            None => route(
+                                routers,
+                                class_tx,
+                                read,
+                                UNCLASSIFIED.to_string(),
+                                chunks,
+                                run_infos.clone(),
+                                0.0,
+                            ),
                         }
-                        None => route(
-                            routers,
-                            class_tx,
-                            read,
-                            UNCLASSIFIED.to_string(),
-                            chunks,
-                            run_infos.clone(),
-                            0.0,
-                        ),
                     }
-                }
-                if fps.len() >= GPU_BATCH {
-                    let block = (std::mem::take(&mut fps), std::mem::take(&mut metas));
-                    block_tx
-                        .send(block)
-                        .map_err(|_| anyhow::anyhow!("GPU thread hung up"))?;
+                    if fps.len() >= GPU_BATCH {
+                        let block = (std::mem::take(&mut fps), std::mem::take(&mut metas));
+                        block_tx
+                            .send(block)
+                            .map_err(|_| anyhow::anyhow!("GPU thread hung up"))?;
+                    }
                 }
             }
         }
@@ -860,6 +955,15 @@ fn build_detector(args: &RunArgs) -> anyhow::Result<Detector> {
                     .cnn_model
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
+                // `--gpu` with `--method cnn` runs detection on the GPU (one
+                // batched onnxruntime call per block) when built with cnn-gpu.
+                #[cfg(feature = "cnn-gpu")]
+                if args.gpu {
+                    return Ok(Detector::CnnGpu(Box::new(
+                        escapepod_demux::AdapterCnnGpu::load(path)
+                            .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
+                    )));
+                }
                 Ok(Detector::Cnn(Box::new(
                     escapepod_demux::AdapterCnn::load(path)
                         .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?,
