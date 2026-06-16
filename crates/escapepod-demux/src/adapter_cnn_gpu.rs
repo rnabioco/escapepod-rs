@@ -23,11 +23,15 @@ use ort::value::Tensor;
 use crate::adapter_cnn::{decode_adapter_end, group_by_len, prep_adapter_signal};
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
-/// Max input elements (`rows × len`) per onnxruntime call — caps the on-device
-/// batch so the largest length-group is split into chunks that fit GPU memory.
-/// Default 16,777,216 (~64 MB of f32 input; activations scale by the model's
-/// channel count) is comfortable on a 24 GB device for the default cap length;
-/// override via `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` for a smaller/larger GPU.
+/// Starting cap on input elements (`rows × len`) per onnxruntime call. The
+/// largest length-group (every read longer than the prep cap collapses onto one
+/// length — up to hundreds of thousands of reads) is split into chunks of this
+/// size; a chunk that still OOMs is halved and retried (see `run_grouped`), so
+/// this only needs to be a reasonable *first* guess, not exact. Conv activations
+/// scale with `rows × len × channels`; the default 4,194,304 (~5k rows at the
+/// 806 cap length) fits the rna004 TCN (128 channels) on a 24 GB device with
+/// headroom (measured: ~10k rows OOMs, ~5k fits). Override with
+/// `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` to start larger/smaller.
 fn gpu_batch_elems() -> usize {
     use std::sync::OnceLock;
     static ELEMS: OnceLock<usize> = OnceLock::new();
@@ -36,7 +40,7 @@ fn gpu_batch_elems() -> usize {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(16_777_216)
+            .unwrap_or(4_194_304)
     })
 }
 
@@ -134,9 +138,10 @@ impl AdapterCnnGpu {
     /// be sized to `prepped.len()` (with too-short defaults in place).
     ///
     /// A group is split into sub-batches of at most [`gpu_batch_elems`] input
-    /// elements (rows × len), so the "every read longer than the prep cap" group
-    /// — which can be hundreds of thousands of rows on a large run — never
-    /// becomes a single device allocation that exceeds GPU memory. Splitting is
+    /// elements (rows × len). If a sub-batch still hits a GPU out-of-memory
+    /// error (conv activations scale with the model's channel count, which the
+    /// element cap can't know), it is halved and retried — so detection adapts
+    /// to the device/model instead of silently failing those reads. Splitting is
     /// bit-identical: same length, no padding, the batch axis is independent.
     fn run_grouped(
         &self,
@@ -144,46 +149,26 @@ impl AdapterCnnGpu {
         valid_idx: &[usize],
         out: &mut [Result<usize, AdapterCnnError>],
     ) {
-        let cfg = self.config;
         for (len, group) in group_by_len(prepped, valid_idx) {
-            let rows_per_call = (gpu_batch_elems() / len.max(1)).max(1);
-            for sub in group.chunks(rows_per_call) {
-                let run = (|| -> Result<Vec<usize>, AdapterCnnError> {
-                    let g = sub.len();
-                    let mut data = vec![0f32; g * len];
-                    for (row, &i) in sub.iter().enumerate() {
-                        data[row * len..(row + 1) * len]
-                            .copy_from_slice(prepped[i].as_ref().unwrap());
-                    }
-                    let input = Tensor::from_array(([g, 1, len], data))
-                        .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                    let mut session = self.session.lock().expect("ort session mutex poisoned");
-                    let outputs = session
-                        .run(ort::inputs![input])
-                        .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                    let (shape, scores) = outputs[0]
-                        .try_extract_tensor::<f32>()
-                        .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                    // Expect row-major `[sub, 2, length_out]`.
-                    if shape.len() != 3 || shape[0] as usize != g || shape[1] != 2 {
-                        return Err(AdapterCnnError::BadShape {
-                            got: shape.iter().map(|&d| d as usize).collect(),
-                        });
-                    }
-                    let length_out = shape[2] as usize;
-                    Ok((0..g)
-                        .map(|row| {
-                            // Channel-0 (adapter_end) of row `row`.
-                            let base = row * 2 * length_out;
-                            decode_adapter_end(&cfg, length_out, len, |k| scores[base + k])
-                        })
-                        .collect())
-                })();
-                match run {
+            let start_rows = (gpu_batch_elems() / len.max(1)).max(1);
+            // Work stack of `[lo, hi)` index ranges into `group`. On OOM a range
+            // is split in half and pushed back, shrinking until it fits.
+            let mut ranges: Vec<(usize, usize)> = (0..group.len())
+                .step_by(start_rows)
+                .map(|lo| (lo, (lo + start_rows).min(group.len())))
+                .collect();
+            while let Some((lo, hi)) = ranges.pop() {
+                let sub = &group[lo..hi];
+                match self.run_one(prepped, sub, len) {
                     Ok(ends) => {
                         for (&i, end) in sub.iter().zip(ends) {
                             out[i] = Ok(end);
                         }
+                    }
+                    Err(e) if hi - lo > 1 && is_out_of_memory(&e) => {
+                        let mid = lo + (hi - lo) / 2;
+                        ranges.push((mid, hi));
+                        ranges.push((lo, mid));
                     }
                     Err(e) => {
                         for &i in sub {
@@ -194,4 +179,50 @@ impl AdapterCnnGpu {
             }
         }
     }
+
+    /// One onnxruntime call over `sub` reads (all of prepped length `len`),
+    /// returning each read's adapter_end. Unpadded `[sub.len(), 1, len]`.
+    fn run_one(
+        &self,
+        prepped: &[Option<Vec<f32>>],
+        sub: &[usize],
+        len: usize,
+    ) -> Result<Vec<usize>, AdapterCnnError> {
+        let cfg = self.config;
+        let g = sub.len();
+        let mut data = vec![0f32; g * len];
+        for (row, &i) in sub.iter().enumerate() {
+            data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
+        }
+        let input = Tensor::from_array(([g, 1, len], data))
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        let mut session = self.session.lock().expect("ort session mutex poisoned");
+        let outputs = session
+            .run(ort::inputs![input])
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        let (shape, scores) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        // Expect row-major `[sub, 2, length_out]`.
+        if shape.len() != 3 || shape[0] as usize != g || shape[1] != 2 {
+            return Err(AdapterCnnError::BadShape {
+                got: shape.iter().map(|&d| d as usize).collect(),
+            });
+        }
+        let length_out = shape[2] as usize;
+        Ok((0..g)
+            .map(|row| {
+                // Channel-0 (adapter_end) of row `row`.
+                let base = row * 2 * length_out;
+                decode_adapter_end(&cfg, length_out, len, |k| scores[base + k])
+            })
+            .collect())
+    }
+}
+
+/// Heuristic: does this onnxruntime error look like a GPU allocation failure?
+/// (CUDA EP surfaces OOM as a failed `Conv`/alloc with a BFCArena message.)
+fn is_out_of_memory(e: &AdapterCnnError) -> bool {
+    matches!(e, AdapterCnnError::Run(m)
+        if m.contains("Failed to allocate") || m.contains("out of memory") || m.contains("CUDA_ERROR_OUT_OF_MEMORY"))
 }
