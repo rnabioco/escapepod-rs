@@ -23,25 +23,52 @@ use ort::value::Tensor;
 use crate::adapter_cnn::{decode_adapter_end, group_by_len, prep_adapter_signal};
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
-/// Starting cap on input elements (`rows × len`) per onnxruntime call. The
-/// largest length-group (every read longer than the prep cap collapses onto one
-/// length — up to hundreds of thousands of reads) is split into chunks of this
-/// size; a chunk that still OOMs is halved and retried (see `run_grouped`), so
-/// this only needs to be a reasonable *first* guess, not exact. Conv activations
-/// scale with `rows × len × channels`; the default 4,194,304 (~5k rows at the
-/// 806 cap length) fits the rna004 TCN (128 channels) on a 24 GB device with
-/// headroom (measured: ~10k rows OOMs, ~5k fits). Override with
-/// `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` to start larger/smaller.
-fn gpu_batch_elems() -> usize {
-    use std::sync::OnceLock;
-    static ELEMS: OnceLock<usize> = OnceLock::new();
-    *ELEMS.get_or_init(|| {
-        std::env::var("ESCAPEPOD_CNN_GPU_BATCH_ELEMS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(4_194_304)
-    })
+/// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
+/// call, scaled to the device's memory. The largest length-group (every read
+/// longer than the prep cap collapses onto one length — up to hundreds of
+/// thousands of reads) is split into chunks of this size; a chunk that still
+/// OOMs is halved and retried (`run_grouped`), so this is a *starting* guess,
+/// not a hard limit.
+///
+/// Resolution order: `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` env override → scaled from
+/// total VRAM (`total_bytes / BYTES_PER_ELEM`) → a fixed fallback. Conv
+/// activations scale with `rows × len × channels`, so on a 24 GB device ~5k
+/// rows at the 806 cap length (~4.2M elems) fit but ~10k OOM (measured) — i.e.
+/// ~24 GB / 5500 bytes-per-element. Using total VRAM means an 80 GB A100/H100
+/// gets ~3× larger batches automatically, while the halve-retry covers any
+/// over-estimate (e.g. a model with more channels).
+fn resolve_batch_elems() -> usize {
+    /// Empirical peak device bytes per input element (`rows × len`) at the OOM
+    /// boundary for the rna004 TCN — folds in channel count and the number of
+    /// live conv activations, with headroom.
+    const BYTES_PER_ELEM: usize = 5500;
+    const FALLBACK: usize = 4_194_304;
+
+    if let Some(n) = std::env::var("ESCAPEPOD_CNN_GPU_BATCH_ELEMS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    match cuda_total_mem_bytes() {
+        Some(total) => (total / BYTES_PER_ELEM).clamp(2_000_000, 64_000_000),
+        None => FALLBACK,
+    }
+}
+
+/// Total memory (bytes) of the CUDA device the CUDA EP will use (ordinal 0,
+/// after `CUDA_VISIBLE_DEVICES`). `None` if the driver/device can't be queried.
+fn cuda_total_mem_bytes() -> Option<usize> {
+    use cudarc::driver::result;
+    // SAFETY: these are read-only CUDA driver queries. `cuInit` is idempotent
+    // (ort also initializes the driver) and device-property queries need no
+    // context; any failure just yields `None` (we fall back to a fixed cap).
+    unsafe {
+        result::init().ok()?;
+        let device = result::device::get(0).ok()?;
+        result::device::total_mem(device).ok()
+    }
 }
 
 /// Batched boundary-CNN adapter-end detector backed by onnxruntime + CUDA.
@@ -53,6 +80,8 @@ fn gpu_batch_elems() -> usize {
 pub struct AdapterCnnGpu {
     session: Mutex<Session>,
     config: AdapterCnnConfig,
+    /// Starting per-call input-element cap, scaled to this device's VRAM at load.
+    batch_elems: usize,
 }
 
 impl AdapterCnnGpu {
@@ -75,6 +104,7 @@ impl AdapterCnnGpu {
         Ok(Self {
             session: Mutex::new(session),
             config,
+            batch_elems: resolve_batch_elems(),
         })
     }
 
@@ -150,7 +180,7 @@ impl AdapterCnnGpu {
         out: &mut [Result<usize, AdapterCnnError>],
     ) {
         for (len, group) in group_by_len(prepped, valid_idx) {
-            let start_rows = (gpu_batch_elems() / len.max(1)).max(1);
+            let start_rows = (self.batch_elems / len.max(1)).max(1);
             // Work stack of `[lo, hi)` index ranges into `group`. On OOM a range
             // is split in half and pushed back, shrinking until it fits.
             let mut ranges: Vec<(usize, usize)> = (0..group.len())

@@ -69,7 +69,7 @@ cnn-detect = ["dep:tract-onnx"]
 # ONNX graph through onnxruntime's CUDA execution provider (`ort`, load-dynamic).
 # Builds on `cnn-detect` for the shared preprocessing/decoding. Needs a
 # CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
-cnn-gpu = ["cnn-detect", "dep:ort"]
+cnn-gpu = ["cnn-detect", "dep:ort", "dep:cudarc"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
 # time, not build time. Also pulls cudarc directly so the post-DTW SVM

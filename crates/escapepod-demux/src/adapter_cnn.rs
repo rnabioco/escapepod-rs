@@ -25,12 +25,21 @@ use thiserror::Error;
 use tract_onnx::prelude::*;
 
 /// Parameters controlling the CNN detector. Defaults match ADAPTed's
-/// `rna004_130bps@v0.2.4.toml` `[core]` block.
+/// `rna004_130bps@v0.2.4.toml` `[core]` block and escapepod-models' training
+/// config.
 #[derive(Debug, Clone, Copy)]
 pub struct AdapterCnnConfig {
     pub min_obs_adapter: usize,
     pub max_obs_adapter: usize,
     pub downscale_factor: usize,
+    /// End of the signal window the model was trained/normalized over
+    /// (`signal[min_obs_adapter:max_obs_trace]`). Normalization statistics and
+    /// the model input are taken from this bounded window — NOT the whole read.
+    /// Critical for long reads (mRNA): normalizing over an entire multi-hundred-k
+    /// transcript gives the CNN statistics it never saw in training. For reads
+    /// shorter than this (tRNA) the window clamps to the read end, so bounding
+    /// is a no-op. Matches escapepod-models `DataConfig.max_obs_trace`.
+    pub max_obs_trace: usize,
 }
 
 impl Default for AdapterCnnConfig {
@@ -39,6 +48,7 @@ impl Default for AdapterCnnConfig {
             min_obs_adapter: 1000,
             max_obs_adapter: 6500,
             downscale_factor: 10,
+            max_obs_trace: 16000,
         }
     }
 }
@@ -358,7 +368,16 @@ pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> 
     if signal_pa.len() <= cfg.min_obs_adapter + cfg.downscale_factor {
         return None;
     }
-    let tail = &signal_pa[cfg.min_obs_adapter..];
+    // Bound the window to `[min_obs_adapter:max_obs_trace]` — the window the
+    // model was normalized/trained over. Clamps to the read end for short reads
+    // (tRNA: a no-op vs the whole tail), and stops at max_obs_trace for long
+    // reads (mRNA: avoids normalizing over the entire transcript). Only this
+    // prefix is ever needed, so callers may decode just up to `max_obs_trace`.
+    let end = cfg
+        .max_obs_trace
+        .max(cfg.min_obs_adapter)
+        .min(signal_pa.len());
+    let tail = &signal_pa[cfg.min_obs_adapter..end];
     let mut normalized = median_mad_normalize(&mean_pool(tail, cfg.downscale_factor));
     let search_window =
         cfg.max_obs_adapter.saturating_sub(cfg.min_obs_adapter) / cfg.downscale_factor;
