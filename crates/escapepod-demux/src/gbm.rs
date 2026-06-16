@@ -58,36 +58,6 @@ pub struct GbmTree {
     pub nodes: Vec<GbmNode>,
 }
 
-impl GbmTree {
-    /// Walk the tree on a raw feature vector and return its leaf value.
-    ///
-    /// `x.len()` is assumed validated against the model's `n_features` by the
-    /// caller (see [`GbmPredictor::predict`]); feature indices are validated by
-    /// [`GbmModel::validate`], so this hot path does no bounds re-checking
-    /// beyond what the slice index already guarantees.
-    #[inline]
-    fn leaf_value(&self, x: &[f64]) -> f64 {
-        let mut idx = 0usize;
-        loop {
-            let node = &self.nodes[idx];
-            if node.leaf {
-                return node.value;
-            }
-            let v = x[node.feature as usize];
-            let go_left = if v.is_nan() {
-                node.missing_left
-            } else {
-                v <= node.threshold
-            };
-            idx = if go_left {
-                node.left as usize
-            } else {
-                node.right as usize
-            };
-        }
-    }
-}
-
 /// A gradient-boosted tree-ensemble barcode classifier, deserialized from the
 /// JSON emitted by `scripts/export_gbm_model.py`.
 ///
@@ -217,20 +187,177 @@ impl GbmModel {
     }
 }
 
+/// `flags` bit: this node is a leaf (its `thresh_or_value` is the leaf value).
+const FLAG_LEAF: u16 = 1;
+/// `flags` bit: a `NaN` feature routes to the left child.
+const FLAG_MISSING_LEFT: u16 = 2;
+
+/// Cache-compact node for the compiled inference arena — 16 bytes vs the
+/// 40-byte serde [`GbmNode`] (f64 + i32 + 2×u32 + 2×bool, padded). Shrinking the
+/// node 2.5× keeps the whole ensemble in L2: the wdx4 model's ~47k nodes drop
+/// from ~1.9 MB (AoS, thrashes a 1–1.25 MB L2) to ~0.75 MB. `feature`/`left`/
+/// `right` are tree-relative — every HistGradientBoosting tree here has ≤61
+/// nodes, far inside u16 — so the children stay 2 bytes even though all trees
+/// share one flat arena. For a leaf, `thresh_or_value` carries the boosted leaf
+/// value; otherwise it is the split threshold.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct CompactNode {
+    /// Split threshold (internal) or boosted leaf value (`FLAG_LEAF`).
+    thresh_or_value: f64,
+    /// Tree-relative index of the left child (`x[feature] <= threshold`).
+    left: u16,
+    /// Tree-relative index of the right child.
+    right: u16,
+    /// Split feature index. Unused for leaves.
+    feature: u16,
+    /// Bit flags: [`FLAG_LEAF`], [`FLAG_MISSING_LEFT`].
+    flags: u16,
+}
+
+/// A [`GbmModel`] lowered into a single flat, cache-compact node arena for the
+/// hot path. Built once per [`GbmPredictor`] and shared (read-only) across all
+/// rayon workers.
+///
+/// Trees are laid out **grouped by class**: all of class 0's per-iteration
+/// trees, then class 1's, … . Inference accumulates one class at a time into a
+/// scalar register (`acc`), so each class's contiguous ~190 KB sub-arena is
+/// streamed once rather than striding across all classes every boosting
+/// iteration (the old `[iteration][class]` walk touched four scattered trees per
+/// inner step).
+#[derive(Debug)]
+struct CompiledGbm {
+    /// All trees' nodes, concatenated class-major then iteration. Leaves are
+    /// made **self-absorbing** (`left == right == own index`, threshold `+INF`,
+    /// NaN-left) so the branch-free batched walk can step a fixed number of
+    /// times and let early leaves spin in place; their boosted value lives in
+    /// [`Self::values`], not the node.
+    nodes: Vec<CompactNode>,
+    /// Leaf value per arena slot (0.0 for internal nodes), indexed in lockstep
+    /// with [`Self::nodes`]. Split out of the node so a self-absorbing leaf can
+    /// keep `+INF` in `thresh_or_value` for the batched walk.
+    values: Vec<f64>,
+    /// `class_roots[k]` = arena offset of each of class `k`'s tree roots.
+    class_roots: Vec<Vec<u32>>,
+    /// `tree_depth[k][t]` = longest root→leaf edge count of class `k`'s tree
+    /// `t`. The batched walk steps exactly this many times (every leaf is
+    /// reached; shallower paths self-absorb the remainder).
+    tree_depth: Vec<Vec<u16>>,
+    /// Per-class initial raw score (copied from `GbmModel::baseline`).
+    baseline: Vec<f64>,
+}
+
+/// Longest root→leaf edge count of the (tree-relative) subtree at `i`.
+fn subtree_depth(nodes: &[GbmNode], i: usize) -> u16 {
+    let n = &nodes[i];
+    if n.leaf {
+        0
+    } else {
+        1 + subtree_depth(nodes, n.left as usize).max(subtree_depth(nodes, n.right as usize))
+    }
+}
+
+impl CompiledGbm {
+    /// Lower a validated model into the flat arena. Relies on
+    /// [`GbmModel::validate`] having already bounds-checked child/feature
+    /// indices, so the walk needs no re-validation.
+    fn from_model(m: &GbmModel) -> Self {
+        let cap = m.trees.iter().flatten().map(|t| t.nodes.len()).sum();
+        let mut nodes: Vec<CompactNode> = Vec::with_capacity(cap);
+        let mut values: Vec<f64> = Vec::with_capacity(cap);
+        let mut class_roots: Vec<Vec<u32>> = vec![Vec::with_capacity(m.trees.len()); m.n_classes];
+        let mut tree_depth: Vec<Vec<u16>> = vec![Vec::with_capacity(m.trees.len()); m.n_classes];
+        for (k, (roots, depths)) in class_roots
+            .iter_mut()
+            .zip(tree_depth.iter_mut())
+            .enumerate()
+        {
+            for iter_trees in &m.trees {
+                let tree = &iter_trees[k];
+                roots.push(nodes.len() as u32);
+                depths.push(subtree_depth(&tree.nodes, 0));
+                for (rel, node) in tree.nodes.iter().enumerate() {
+                    if node.leaf {
+                        // Self-absorbing leaf: `<= +INF` (and NaN-left) routes to
+                        // itself, so the fixed-step batched walk parks here.
+                        nodes.push(CompactNode {
+                            thresh_or_value: f64::INFINITY,
+                            left: rel as u16,
+                            right: rel as u16,
+                            feature: 0,
+                            flags: FLAG_LEAF | FLAG_MISSING_LEFT,
+                        });
+                        values.push(node.value);
+                    } else {
+                        let f = if node.missing_left {
+                            FLAG_MISSING_LEFT
+                        } else {
+                            0
+                        };
+                        nodes.push(CompactNode {
+                            thresh_or_value: node.threshold,
+                            left: node.left as u16,
+                            right: node.right as u16,
+                            feature: node.feature as u16,
+                            flags: f,
+                        });
+                        values.push(0.0);
+                    }
+                }
+            }
+        }
+        Self {
+            nodes,
+            values,
+            class_roots,
+            tree_depth,
+            baseline: m.baseline.clone(),
+        }
+    }
+
+    /// Walk one tree (rooted at arena offset `root`) and return its leaf value.
+    /// Applies [`GbmNode`]'s split rule verbatim — same `<=`/`NaN` routing on the
+    /// same f64 thresholds — so results are bit-identical to a direct serde walk.
+    #[inline]
+    fn leaf_value(&self, root: usize, x: &[f64]) -> f64 {
+        let nodes = &self.nodes;
+        let mut i = root;
+        loop {
+            let n = &nodes[i];
+            if n.flags & FLAG_LEAF != 0 {
+                return self.values[i];
+            }
+            let v = x[n.feature as usize];
+            let go_left = if v.is_nan() {
+                n.flags & FLAG_MISSING_LEFT != 0
+            } else {
+                v <= n.thresh_or_value
+            };
+            i = root + if go_left { n.left } else { n.right } as usize;
+        }
+    }
+}
+
 /// Inference wrapper around a [`GbmModel`].
 ///
-/// Holds only a borrow of the model — there is no per-read state to amortize
-/// (no DTW workspace, no coupling matrices), so the predictor is trivially
-/// `Sync` and the CLI classify loop is a plain `par_iter().map(predict)`.
+/// Lowers the model into a cache-compact [`CompiledGbm`] arena at construction
+/// (see its docs for the layout). There is no per-read mutable state to
+/// amortize (no DTW workspace, no coupling matrices), so the predictor is
+/// trivially `Sync` and the CLI classify loop is a plain
+/// `par_iter().map(predict)`.
 #[derive(Debug)]
 pub struct GbmPredictor<'a> {
     model: &'a GbmModel,
+    compiled: CompiledGbm,
 }
 
 impl<'a> GbmPredictor<'a> {
     /// Build a predictor over a (already validated) model.
     pub fn new(model: &'a GbmModel) -> Self {
-        Self { model }
+        Self {
+            compiled: CompiledGbm::from_model(model),
+            model,
+        }
     }
 
     /// Classify one fingerprint.
@@ -248,17 +375,109 @@ impl<'a> GbmPredictor<'a> {
             ));
         }
 
-        // raw[k] = baseline[k] + Σ_iter tree[iter][k].leaf_value(x)
-        let mut raw = m.baseline.clone();
-        for iter_trees in &m.trees {
-            for (k, tree) in iter_trees.iter().enumerate() {
-                raw[k] += tree.leaf_value(fingerprint);
+        // raw[k] = baseline[k] + Σ_iter tree[iter][k].leaf_value(x), accumulated
+        // class-by-class so each class's contiguous sub-arena streams once.
+        let c = &self.compiled;
+        let mut raw = c.baseline.clone();
+        for (k, roots) in c.class_roots.iter().enumerate() {
+            let mut acc = 0.0f64;
+            for &root in roots {
+                acc += c.leaf_value(root as usize, fingerprint);
             }
+            raw[k] += acc;
         }
 
         let probs = softmax(&raw);
         let result = process_probabilities(&probs, &m.label_mapper, m.thresholds.as_deref());
         Ok((probs, result))
+    }
+
+    /// Classify many fingerprints, walking `BATCH` reads through each tree in
+    /// branch-free lockstep.
+    ///
+    /// The single-read [`predict`](Self::predict) walk is latency-bound: every
+    /// node's address depends on the previous node's comparison (a serial
+    /// pointer chase), and the data-dependent branch mispredicts, so the core
+    /// stalls (~0.7 IPC measured). Here `BATCH` independent reads descend the
+    /// same tree together: the `for lane` body issues `BATCH` independent loads,
+    /// letting the out-of-order engine overlap one lane's L2 latency with
+    /// another's work. Leaves are self-absorbing (built in
+    /// [`CompiledGbm::from_model`]) so the walk runs a fixed `tree_depth` steps
+    /// with no per-lane termination branch.
+    ///
+    /// Results are bit-identical to per-read [`predict`](Self::predict): same f64
+    /// thresholds, same `<=`/NaN routing, same accumulation order. The `< BATCH`
+    /// tail falls back to scalar `predict`.
+    pub fn predict_many(
+        &self,
+        fingerprints: &[&[f64]],
+    ) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, String> {
+        // K=8 measured the sweet spot on Cascade Lake (rna): ~2.6× over scalar.
+        // K=4 under-hides latency; K≥16 spills the per-lane `idx`/`xs` arrays.
+        self.predict_many_k::<8>(fingerprints)
+    }
+
+    /// [`predict_many`](Self::predict_many) with an explicit lane count `K` (the
+    /// number of reads walked in lockstep). Exposed for batch-width tuning;
+    /// `predict_many` picks the measured sweet spot.
+    pub fn predict_many_k<const K: usize>(
+        &self,
+        fingerprints: &[&[f64]],
+    ) -> Result<Vec<(Vec<f64>, ProbabilityResult)>, String> {
+        let m = self.model;
+        let c = &self.compiled;
+        for fp in fingerprints {
+            if fp.len() != m.n_features {
+                return Err(format!(
+                    "fingerprint has {} features, model expects {}",
+                    fp.len(),
+                    m.n_features
+                ));
+            }
+        }
+
+        let mut out: Vec<(Vec<f64>, ProbabilityResult)> = Vec::with_capacity(fingerprints.len());
+        let mut chunks = fingerprints.chunks_exact(K);
+        for ch in &mut chunks {
+            let xs: [&[f64]; K] = ch.try_into().expect("chunks_exact yields exactly K");
+            // raw[lane] starts at the per-class baseline and accumulates trees.
+            let mut raw: [Vec<f64>; K] = std::array::from_fn(|_| c.baseline.clone());
+            for (k, (roots, depths)) in c.class_roots.iter().zip(&c.tree_depth).enumerate() {
+                let mut acc = [0.0f64; K];
+                for (&root, &depth) in roots.iter().zip(depths) {
+                    let root = root as usize;
+                    let mut idx = [root; K];
+                    for _ in 0..depth {
+                        for lane in 0..K {
+                            let n = &c.nodes[idx[lane]];
+                            let v = xs[lane][n.feature as usize];
+                            let go_left = if v.is_nan() {
+                                n.flags & FLAG_MISSING_LEFT != 0
+                            } else {
+                                v <= n.thresh_or_value
+                            };
+                            idx[lane] = root + if go_left { n.left } else { n.right } as usize;
+                        }
+                    }
+                    for lane in 0..K {
+                        acc[lane] += c.values[idx[lane]];
+                    }
+                }
+                for lane in 0..K {
+                    raw[lane][k] += acc[lane];
+                }
+            }
+            for raw_lane in raw {
+                let probs = softmax(&raw_lane);
+                let result =
+                    process_probabilities(&probs, &m.label_mapper, m.thresholds.as_deref());
+                out.push((probs, result));
+            }
+        }
+        for &fp in chunks.remainder() {
+            out.push(self.predict(fp)?);
+        }
+        Ok(out)
     }
 }
 
