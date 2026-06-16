@@ -33,6 +33,17 @@ linfa-svm = { version = "0.8", optional = true }
 # user supplies the model file at runtime (weights are CC BY-NC).
 tract-onnx = { workspace = true, optional = true }
 
+# GPU boundary-CNN inference (opt-in via `cnn-gpu`). onnxruntime via the `ort`
+# crate, CUDA execution provider. `load-dynamic` dlopens onnxruntime at runtime
+# (nothing needed at build time); set `ORT_DYLIB_PATH` to a CUDA-enabled
+# libonnxruntime to run. Architecture-agnostic — same `[B,1,L] -> [B,2,L]`
+# contract as the tract CPU path.
+ort = { version = "=2.0.0-rc.12", optional = true, features = [
+    "cuda",
+    "load-dynamic",
+    "ndarray",
+] }
+
 # CUDA driver bindings for the on-device SVM pipeline (RBF + OvO
 # decision). Opt-in via the `gpu` feature, same as the DTW kernel itself.
 cudarc = { workspace = true, optional = true }
@@ -54,6 +65,11 @@ default = []
 # (escapepod-models' adapter_rna004 TCN, or an ADAPTed BoundariesCNN export —
 # those weights are CC BY-NC 4.0 and must not be bundled). No GPU CNN path.
 cnn-detect = ["dep:tract-onnx"]
+# Batched GPU CNN/TCN adapter detection: runs the same `[B,1,L] -> [B,2,L]`
+# ONNX graph through onnxruntime's CUDA execution provider (`ort`, load-dynamic).
+# Builds on `cnn-detect` for the shared preprocessing/decoding. Needs a
+# CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
+cnn-gpu = ["cnn-detect", "dep:ort"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
 # time, not build time. Also pulls cudarc directly so the post-DTW SVM
