@@ -162,6 +162,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     let results: Vec<ReadBoundaries> = process_reads_par(
         &args.input,
         Some(&progress_bar),
+        None, // LLR scans the full read
         |read_id, num_samples, signal| {
             let normalized = normalize_signal(signal);
 
@@ -383,10 +384,16 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                         let prepped: Vec<(Uuid, u64, Option<Vec<f32>>)> = window
                             .par_iter()
                             .map(|r| {
-                                let p = extractor.get_signal(&r.signal_rows).ok().and_then(|s| {
-                                    let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
-                                    cfg.prep(&f)
-                                });
+                                // Only the leading `max_obs_trace` samples feed the
+                                // CNN; skip decompressing the rest (matters for long
+                                // mRNA reads).
+                                let p = extractor
+                                    .get_signal_prefix(&r.signal_rows, cfg.max_obs_trace)
+                                    .ok()
+                                    .and_then(|s| {
+                                        let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
+                                        cfg.prep(&f)
+                                    });
                                 (r.read_id, r.num_samples, p)
                             })
                             .collect();
@@ -416,9 +423,11 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         configure_thread_pool(args.threads);
         let cnn = escapepod_demux::AdapterCnn::load(cnn_model_path)
             .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
+        let decode_bound = Some(cnn.config().max_obs_trace);
         process_reads_par(
             &args.input,
             Some(&progress_bar),
+            decode_bound, // CNN only needs the leading max_obs_trace samples
             |read_id, num_samples, signal| {
                 let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
                 boundaries(read_id, num_samples, cnn.detect_adapter_end(&sig_f32))
