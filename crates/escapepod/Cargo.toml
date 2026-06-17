@@ -95,6 +95,10 @@ cli = [
 # CNN-based adapter detection (requires a local ADAPTed-exported .onnx model
 # at runtime; weights are CC BY-NC 4.0 and not bundled).
 cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
+# Batched GPU CNN/TCN adapter detection via onnxruntime CUDA (`escpod demux
+# detect --method cnn --gpu`). Implies `cnn-detect` for the shared CPU path and
+# preprocessing. Needs a CUDA-enabled libonnxruntime + visible GPU at runtime.
+cnn-gpu = ["cnn-detect", "escapepod-demux/cnn-gpu"]
 experimental = []
 # GPU-accelerated DTW for demux classify and train-svm (requires CUDA
 # driver + libnvrtc at runtime).

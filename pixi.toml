@@ -36,17 +36,33 @@ build-python = "maturin develop --manifest-path crates/escapepod-python/Cargo.to
 test-python = { cmd = "pytest tests/python/ -v", depends-on = ["build-python"] }
 test-compat = "python tests/compat/test_pod5_compat.py"
 
-# GPU (CUDA) feature for escpod's `--features gpu` path. Provides the runtime
-# NVRTC library that cudarc dlopens on first use. Activate with
-# `pixi shell -e gpu` or `pixi run -e gpu cargo test --features gpu ...`.
+# GPU (CUDA) feature. Covers two runtime paths, both `load-dynamic`/dlopen
+# (nothing needed at build time):
+#   * `--features gpu`      — cudarc dlopens libnvrtc for the GPU DTW kernels.
+#   * `--features cnn-gpu`  — the `ort` CUDA execution provider for batched CNN
+#     adapter detection. ORT 1.24's CUDA EP dlopens cublas/cublasLt/cudart/cufft
+#     AND cuDNN 9; without them it fails with
+#     `libcublasLt.so.12: cannot open shared object file` and silently falls back
+#     to CPU. We pull the whole CUDA 12 runtime from conda-forge so `pixi -e gpu`
+#     is self-contained (no cross-repo env on LD_LIBRARY_PATH). See the memory
+#     `reference-cnn-gpu-ort-runtime-setup` for the full story.
+# Activate with `pixi shell -e gpu` or `pixi run -e gpu …` on a GPU node.
 [feature.gpu.dependencies]
-cuda-nvrtc = ">=12"
+cuda-nvrtc = ">=12"        # GPU DTW (cudarc)
 cuda-version = "12.*"
+libcublas = "*"            # ort CUDA EP: libcublas.so.12 + libcublasLt.so.12
+cuda-cudart = "*"          # ort CUDA EP: libcudart.so.12
+libcufft = "*"             # ort CUDA EP: libcufft.so.11
+cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9 (ORT 1.24 needs cuDNN 9)
 
-# Make `$CONDA_PREFIX/lib` visible to cudarc's dlopen — the conda-forge
-# cuda-nvrtc package does not ship an activation hook that sets this.
+# Make `$CONDA_PREFIX/lib` visible to the dlopen paths above (cudarc's libnvrtc
+# and ort's CUDA EP deps) — the conda-forge CUDA packages ship no activation
+# hook that sets this. `ORT_DYLIB_PATH` points `ort` (load-dynamic) at a
+# CUDA-enabled libonnxruntime 1.24.x; the manual onnxruntime-gpu download lives
+# under ~/ortgpu (not on PyPI/conda for this exact build). Override it if yours
+# is elsewhere.
 [feature.gpu.activation]
-env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH", ORT_DYLIB_PATH = "$HOME/ortgpu/onnxruntime/capi/libonnxruntime.so.1.24.4" }
 
 # WarpDemuX benchmark feature. Neither `warpdemux` nor `adapted` is on
 # PyPI, so we pip-install them editable from the cloned repos under

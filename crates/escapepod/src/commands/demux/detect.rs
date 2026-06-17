@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use tracing::info;
 #[cfg(feature = "cnn-detect")]
 use tracing::warn;
+#[cfg(feature = "cnn-detect")]
+use uuid::Uuid;
 
 /// Arguments for the detect subcommand.
 #[derive(Debug, clap::Args)]
@@ -59,7 +61,8 @@ pub struct DetectArgs {
     /// contract via `--cnn-model` — e.g. escapepod-models' `adapter_rna004`
     /// (CC-BY), or an ADAPTed `BoundariesCNN` exported with
     /// `scripts/export_adapter_cnn_to_onnx.py` (those weights are CC BY-NC 4.0
-    /// and not bundled). CPU-only; no GPU CNN path.
+    /// and not bundled). Runs batched on the CPU by default; pass `--gpu` (with
+    /// a `--features cnn-gpu` build) for onnxruntime CUDA inference.
     #[arg(
         long,
         default_value = "llr",
@@ -72,6 +75,13 @@ pub struct DetectArgs {
     #[cfg(feature = "cnn-detect")]
     #[arg(long, value_name = "FILE", help_heading = "Advanced Options")]
     pub cnn_model: Option<PathBuf>,
+
+    /// Run `--method cnn` inference on the GPU via onnxruntime CUDA, instead of
+    /// the batched CPU tract path. Requires a `--features cnn-gpu` build and a
+    /// visible CUDA device + onnxruntime shared library at runtime.
+    #[cfg(feature = "cnn-gpu")]
+    #[arg(long, help_heading = "Advanced Options")]
+    pub gpu: bool,
 
     /// Number of threads for parallel processing (default: all CPUs)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
@@ -152,6 +162,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     let results: Vec<ReadBoundaries> = process_reads_par(
         &args.input,
         Some(&progress_bar),
+        None, // LLR scans the full read
         |read_id, num_samples, signal| {
             let normalized = normalize_signal(signal);
 
@@ -229,14 +240,18 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
 /// Run the detect subcommand using a boundary-CNN ONNX model (opt-in).
 ///
-/// Runs a user-supplied `[B,1,L] -> [B,2,L]` ONNX graph through tract-onnx
-/// (CPU). Works with any such model — escapepod-models' `adapter_rna004`
-/// (CC-BY) or an ADAPTed `BoundariesCNN` export (CC BY-NC; not bundled). See
-/// `scripts/export_adapter_cnn_to_onnx.py`.
+/// CPU runs the model one read at a time through tract-onnx; `--gpu` (on a
+/// `cnn-gpu` build) runs it batched through onnxruntime's CUDA execution
+/// provider, which is where the large speedup lives — the TCN is
+/// inference-bound and tract has no efficient batched conv. Works with any
+/// model on the `[B,1,L] -> [B,2,L]` contract — escapepod-models'
+/// `adapter_rna004` (CC-BY) or an ADAPTed `BoundariesCNN` export (CC BY-NC; not
+/// bundled). See `scripts/export_adapter_cnn_to_onnx.py`.
 #[cfg(feature = "cnn-detect")]
 fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     use crate::commands::profile::PhaseTimer;
-    use escapepod_demux::AdapterCnn;
+    use escapepod_demux::AdapterCnnError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let mut timer = PhaseTimer::new();
     timer.phase("Detect adapters (CNN)");
@@ -247,14 +262,20 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
 
+    #[cfg(feature = "cnn-gpu")]
+    let use_gpu = args.gpu;
+    #[cfg(not(feature = "cnn-gpu"))]
+    let use_gpu = false;
+
     warn!(
         "boundary CNN runs the model you supply via --cnn-model; respect that \
          model's license (e.g. ADAPTed-derived weights are CC BY-NC 4.0).",
     );
 
     info!(
-        "{} adapter boundaries using boundary CNN",
+        "{} adapter boundaries using boundary CNN ({})",
         style::action("Detecting"),
+        if use_gpu { "GPU" } else { "CPU" },
     );
     info!(
         "{} {} POD5 file(s)",
@@ -272,11 +293,6 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         style::path(args.output.display())
     );
 
-    configure_thread_pool(args.threads);
-
-    let cnn =
-        AdapterCnn::load(cnn_model_path).map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
-
     let total = total_read_count(&args.input);
     info!(
         "{} {} reads to process",
@@ -286,25 +302,138 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
 
     let progress_bar = create_progress_bar(total as u64, "Detecting (CNN)")?;
 
-    let results: Vec<ReadBoundaries> = process_reads_par(
-        &args.input,
-        Some(&progress_bar),
-        |read_id, num_samples, signal| {
-            // MAD normalization inside the CNN's `prepare_data` is
-            // scale-invariant, so raw i16 → f32 matches the pA-calibrated
-            // path WarpDemuX uses bit-for-bit post-normalization.
-            let signal_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
-            let adapter_end = cnn.detect_adapter_end(&signal_f32).unwrap_or(0);
-            ReadBoundaries {
-                read_id,
-                num_samples,
-                // ADAPTed's CNN sets adapter_start=0 always — boundary
-                // detection on this path is single-ended.
-                adapter_start: 0,
-                adapter_end,
+    // Count failures so a broken model surfaces loudly instead of silently
+    // writing adapter_end=0 for every read (the v1.0.0 static-shape trap).
+    let too_short = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    // ADAPTed's CNN sets adapter_start=0 always — this path is single-ended.
+    let boundaries = |read_id: Uuid, num_samples: u64, end: Result<usize, AdapterCnnError>| {
+        let adapter_end = match end {
+            Ok(e) => e,
+            Err(AdapterCnnError::SignalTooShort { .. }) => {
+                too_short.fetch_add(1, Ordering::Relaxed);
+                0
             }
-        },
-    )?;
+            Err(_) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                0
+            }
+        };
+        ReadBoundaries {
+            read_id,
+            num_samples,
+            adapter_start: 0,
+            adapter_end,
+        }
+    };
+
+    let results: Vec<ReadBoundaries> = if use_gpu {
+        // GPU: a dedicated consumer thread builds the ort session — overlapping
+        // the (multi-second) CUDA/cuDNN init with the producers' first decodes —
+        // then runs each prepped block batched. CPU producers use the full pool
+        // to decode + prep in parallel and feed blocks through a small bounded
+        // channel (double-buffered, so the GPU isn't starved).
+        #[cfg(feature = "cnn-gpu")]
+        {
+            use escapepod_demux::AdapterCnnConfig;
+            use escapepod_signal::Reader;
+            use rayon::prelude::*;
+            use std::sync::mpsc::sync_channel;
+
+            configure_thread_pool(args.threads);
+
+            // Reads per block: bigger ⇒ bigger same-length groups ⇒ fewer, larger
+            // onnxruntime calls. Bounded at 2 in flight to cap memory.
+            const GPU_BLOCK: usize = 16_384;
+            let cfg = AdapterCnnConfig::default();
+            type Block = (Vec<(Uuid, u64)>, Vec<Option<Vec<f32>>>);
+            let (tx, rx) = sync_channel::<Block>(2);
+
+            let model_path = cnn_model_path.clone();
+            let pb = &progress_bar;
+            let bnd = &boundaries;
+            std::thread::scope(|scope| -> anyhow::Result<Vec<ReadBoundaries>> {
+                let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<ReadBoundaries>> {
+                    let gpu = escapepod_demux::AdapterCnnGpu::load(&model_path)
+                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
+                    let mut out = Vec::new();
+                    for (meta, prepped) in rx.iter() {
+                        let ends = gpu.detect_prepped(&prepped);
+                        pb.inc(meta.len() as u64);
+                        for (end, (read_id, num_samples)) in ends.into_iter().zip(meta) {
+                            out.push(bnd(read_id, num_samples, end));
+                        }
+                    }
+                    Ok(out)
+                });
+
+                // Producers: per file, sort reads by length (so each block's reads
+                // share lengths ⇒ big exact-length groups), then decode + i16→f32 +
+                // prep in parallel and push blocks. MAD-norm is scale-invariant, so
+                // raw i16 → f32 matches the pA path bit-for-bit post-normalization.
+                for path in &args.input {
+                    let reader = Reader::open(path)?;
+                    let mut reads: Vec<_> = reader
+                        .reads()?
+                        .filter_map(Result::ok)
+                        .filter(|r| !r.signal_rows.is_empty())
+                        .collect();
+                    reads.sort_by_key(|r| r.num_samples);
+                    let extractor = reader.signal_extractor()?;
+                    for window in reads.chunks(GPU_BLOCK) {
+                        let prepped: Vec<(Uuid, u64, Option<Vec<f32>>)> = window
+                            .par_iter()
+                            .map(|r| {
+                                // Only the leading `max_obs_trace` samples feed the
+                                // CNN; skip decompressing the rest (matters for long
+                                // mRNA reads).
+                                let p = extractor
+                                    .get_signal_prefix(&r.signal_rows, cfg.max_obs_trace)
+                                    .ok()
+                                    .and_then(|s| {
+                                        let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
+                                        cfg.prep(&f)
+                                    });
+                                (r.read_id, r.num_samples, p)
+                            })
+                            .collect();
+                        let mut meta = Vec::with_capacity(prepped.len());
+                        let mut preps = Vec::with_capacity(prepped.len());
+                        for (id, ns, p) in prepped {
+                            meta.push((id, ns));
+                            preps.push(p);
+                        }
+                        if tx.send((meta, preps)).is_err() {
+                            break; // GPU thread died; its error surfaces at join
+                        }
+                    }
+                }
+                drop(tx);
+                gpu_handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("GPU detection thread panicked"))?
+            })?
+        }
+        #[cfg(not(feature = "cnn-gpu"))]
+        unreachable!("--gpu is unavailable without the cnn-gpu feature")
+    } else {
+        // CPU: per-read tract. tract has no efficient batched conv (batching it
+        // measured *slower*), so the fine-grained per-read parallelism across
+        // many reads is the better CPU schedule.
+        configure_thread_pool(args.threads);
+        let cnn = escapepod_demux::AdapterCnn::load(cnn_model_path)
+            .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
+        let decode_bound = Some(cnn.config().max_obs_trace);
+        process_reads_par(
+            &args.input,
+            Some(&progress_bar),
+            decode_bound, // CNN only needs the leading max_obs_trace samples
+            |read_id, num_samples, signal| {
+                let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
+                boundaries(read_id, num_samples, cnn.detect_adapter_end(&sig_f32))
+            },
+        )?
+    };
 
     progress_bar.finish_with_message("complete");
 
@@ -324,6 +453,18 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         }
     }
     writer.flush()?;
+
+    let too_short = too_short.into_inner();
+    let failed = failed.into_inner();
+    if too_short > 0 {
+        warn!("{too_short} read(s) too short for CNN detection — wrote adapter_end=0");
+    }
+    if failed > 0 {
+        warn!(
+            "{failed} read(s) failed CNN inference — wrote adapter_end=0; \
+             check that the model honours the [B, 1, L] -> [B, 2, L] contract",
+        );
+    }
 
     info!(
         "{} boundaries written to {}",

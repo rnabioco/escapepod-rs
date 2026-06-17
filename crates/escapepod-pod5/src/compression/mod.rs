@@ -7,4 +7,4 @@
 pub mod svb16;
 pub mod vbz;
 
-pub use vbz::{compress_signal, decompress_signal};
+pub use vbz::{compress_signal, decompress_signal, decompress_signal_prefix};
