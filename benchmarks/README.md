@@ -268,6 +268,33 @@ startup, memory-mapped I/O, and tight Arrow iteration — but the
 absolute times are tens to hundreds of milliseconds either way. This
 matters for interactive use; it doesn't change pipeline wall-clock.
 
+## GPU vs CPU TCN adapter detection (2026-06-16)
+
+Decision benchmark for running the escapepod-models `adapter_rna004@v1.0.1` TCN
+(`demux detect --method cnn`) on GPU. Input: `bench_wdx/sub20k/sub.pod5` (20k
+RNA004 tRNA reads, mean 10,206 samples → downscaled TCN input L≈920). CPU =
+rna 16c; GPU = A30 via onnxruntime CUDA EP (probe `bench_tcn_gpu/ort_probe.py`).
+
+**`detect --method cnn` is inference-bound, not I/O-bound.** LLR detect on the
+same read+decode path is **0.25 s / 20k**; the CNN/TCN path is **77.49 s / 20k**
+→ inference is **~99.6 %** of wall-clock. (The #80 "detect is POD5-read + prep
+bound, not CNN-compute bound" reasoning holds for LLR, *not* the TCN.)
+
+| Inference path | reads/s | vs current |
+|---|---:|---:|
+| CPU tract per-read (current `escpod`) | 258 | 1× |
+| CPU onnxruntime, batched B=1024 | 738 | 2.9× |
+| **GPU onnxruntime, batched B=1024 (A30)** | **25,656** | **~99×** |
+| I/O+decode floor (LLR, same path) | ~80,000 | — |
+
+GPU is **~99×** over the current tract path and **~35×** over the best
+CPU-batched path; batching alone (no CUDA) is a **2.9×** partial win. Verdict:
+**GO** — clears the ≥1.5× gate by a wide margin. Right mechanism is the `ort`
+crate + CUDA execution provider (architecture-agnostic, any `[B,1,L]->[B,2,L]`
+ONNX) — **not** reverting #80's BoundariesCNN-locked CUDA kernel, which cannot
+run the TCN. Numbers are synthetic fixed-L throughput; a production path needs
+length-bucketing and GPU-vs-tract `adapter_end` parity on real signals.
+
 ## Running Benchmarks
 
 ```bash

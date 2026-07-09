@@ -44,6 +44,11 @@ __pycache__/
 # Demux benchmark/parity scratch (size-tier pod5s, matrix.tsv, mismatch dumps).
 /.demux_matrix_out/
 /.parity_out*/
+# GPU TCN + warpdemux parity benchmark scratch (pod5 subsets, CSV calls, ad-hoc
+# scripts, out dirs) and the GPU-feature cargo target dir.
+/bench_tcn_gpu/
+/bench_wdx/
+/target-gpu/
 
 # Built documentation
 site/
