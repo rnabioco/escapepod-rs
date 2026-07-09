@@ -782,46 +782,33 @@ pub fn dtw_distance_matrix_blocked(
 ) -> Array2<f32> {
     let n_queries = queries.len();
     let n_refs = references.len();
+    let bs = block_size.max(1);
 
-    let mut result = Array2::zeros((n_queries, n_refs));
-
-    // Generate block indices
-    let blocks: Vec<_> = (0..n_queries)
-        .step_by(block_size)
-        .flat_map(|i| {
-            (0..n_refs).step_by(block_size).map(move |j| {
-                let i_end = (i + block_size).min(n_queries);
-                let j_end = (j + block_size).min(n_refs);
-                (i, i_end, j, j_end)
-            })
-        })
-        .collect();
-
-    // Compute blocks in parallel
-    let block_results: Vec<_> = blocks
-        .par_iter()
-        .map(|&(i_start, i_end, j_start, j_end)| {
-            let mut block = Array2::zeros((i_end - i_start, j_end - j_start));
-            for i in i_start..i_end {
-                for j in j_start..j_end {
-                    block[[i - i_start, j - j_start]] =
-                        dtw_distance(&queries[i], &references[j], window);
+    // One row-major result buffer written in place: no per-block `Array2` to
+    // allocate and no separate reassembly pass. Rows are partitioned into
+    // contiguous blocks of `bs` rows so each rayon task owns a disjoint slice
+    // of `data`; within a task the columns are still walked in cache-friendly
+    // blocks of `bs`.
+    let stride = n_refs.max(1);
+    let mut data = vec![0.0f32; n_queries * n_refs];
+    data.par_chunks_mut(bs * stride)
+        .enumerate()
+        .for_each(|(blk, rows)| {
+            let i_start = blk * bs;
+            let n_rows = rows.len() / stride;
+            for j_start in (0..n_refs).step_by(bs) {
+                let j_end = (j_start + bs).min(n_refs);
+                for r in 0..n_rows {
+                    let q = queries[i_start + r].as_slice();
+                    let row = &mut rows[r * n_refs..(r + 1) * n_refs];
+                    for j in j_start..j_end {
+                        row[j] = dtw_distance(q, references[j].as_slice(), window);
+                    }
                 }
             }
-            (i_start, i_end, j_start, j_end, block)
-        })
-        .collect();
+        });
 
-    // Assemble result matrix
-    for (i_start, i_end, j_start, j_end, block) in block_results {
-        for i in i_start..i_end {
-            for j in j_start..j_end {
-                result[[i, j]] = block[[i - i_start, j - j_start]];
-            }
-        }
-    }
-
-    result
+    Array2::from_shape_vec((n_queries, n_refs), data).expect("Failed to create distance matrix")
 }
 
 #[cfg(test)]
