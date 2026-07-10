@@ -30,11 +30,18 @@ numpy = "*"
 maturin = ">=1.9,<2"
 pytest = "*"
 pod5 = ">=0.3.36,<0.4"
+ruff = ">=0.15.21, <0.16"
+ty = ">=0.0.58, <0.0.59"
 
 [feature.python-test.tasks]
 build-python = "maturin develop --manifest-path crates/escapepod-python/Cargo.toml"
 test-python = { cmd = "pytest tests/python/ -v", depends-on = ["build-python"] }
 test-compat = "python tests/compat/test_pod5_compat.py"
+lint-python = "ruff check tests/python && ruff format --check tests/python"
+# ty resolves `import escapepod` from the built extension, so build first.
+typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escapepod.pyi", depends-on = [
+  "build-python",
+] }
 
 # GPU (CUDA) feature. Covers two runtime paths, both `load-dynamic`/dlopen
 # (nothing needed at build time):

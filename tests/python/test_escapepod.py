@@ -10,7 +10,9 @@ import escapepod
 
 # Locate a small test POD5 file relative to repo root
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-TEST_POD5 = REPO_ROOT / "ext" / "dorado" / "tests" / "data" / "pod5" / "single_na24385.pod5"
+TEST_POD5 = (
+    REPO_ROOT / "ext" / "dorado" / "tests" / "data" / "pod5" / "single_na24385.pod5"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +66,24 @@ class TestReader:
     def test_open_nonexistent(self):
         with pytest.raises(IOError):
             escapepod.Reader("/nonexistent/path.pod5")
+
+    def test_open_invalid_raises_pod5error(self):
+        """A file that exists but isn't POD5 raises the library's Pod5Error."""
+        with tempfile.NamedTemporaryFile(suffix=".pod5", delete=False) as f:
+            f.write(b"not a pod5 file, just some bytes\n" * 32)
+            path = f.name
+        try:
+            assert issubclass(escapepod.Pod5Error, Exception)
+            with pytest.raises(escapepod.Pod5Error):
+                escapepod.Reader(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_prefetch_signal(self, reader):
+        """prefetch_signal is a no-op hint; signal stays readable afterwards."""
+        reader.prefetch_signal()
+        read = reader.reads()[0]
+        assert len(reader.get_signal(read)) == read.num_samples
 
     def test_context_manager(self):
         if not TEST_POD5.exists():
@@ -219,7 +239,9 @@ class TestSignal:
         read = reader.reads()[0]
         raw = reader.get_signal(read)
         pa = reader.get_signal_pa(read)
-        expected = (raw.astype(np.float32) + read.calibration_offset) * read.calibration_scale
+        expected = (
+            raw.astype(np.float32) + read.calibration_offset
+        ) * read.calibration_scale
         np.testing.assert_allclose(pa, expected, rtol=1e-5)
 
     def test_get_signals_bulk(self, reader):
@@ -400,6 +422,83 @@ class TestRunInfoConstructor:
         finally:
             Path(path).unlink(missing_ok=True)
 
+    def test_all_fields_round_trip(self):
+        """Every RunInfo field should survive a write/read cycle.
+
+        Each field gets a distinct value so a dropped or swapped column fails
+        loudly, rather than passing because two fields share a default. Asserts
+        are spelled out (not a ``getattr`` loop) so each getter is exercised
+        explicitly and a failure names the exact field.
+        """
+        ri = escapepod.RunInfo(
+            "acq-full",
+            acquisition_start_time=111,
+            adc_max=2000,
+            adc_min=-2000,
+            experiment_name="exp",
+            flow_cell_id="FC-1",
+            flow_cell_product_code="FLO-PRO114",
+            protocol_name="sequencing/run",
+            protocol_run_id="run-abc",
+            protocol_start_time=222,
+            sample_id="sample-42",
+            sample_rate=5000,
+            sequencing_kit="SQK-RNA004",
+            sequencer_position="X1",
+            sequencer_position_type="promethion",
+            software="escapepod-test",
+            system_name="sys-name",
+            system_type="sys-type",
+            context_tags={"ctx_key": "ctx_val"},
+            tracking_id={"trk_key": "trk_val"},
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".pod5", delete=False) as f:
+            path = f.name
+        try:
+            with escapepod.Writer(path) as w:
+                w.add_run_info(ri)
+                w.add_read(
+                    read_id="11111111-2222-3333-4444-555555555555",
+                    read_number=1,
+                    start_sample=0,
+                    channel=1,
+                    well=1,
+                    pore_type="not_set",
+                    calibration_offset=0.0,
+                    calibration_scale=1.0,
+                    median_before=100.0,
+                    end_reason="signal_positive",
+                    end_reason_forced=False,
+                    run_info_index=0,
+                    num_minknow_events=0,
+                    signal=np.arange(50, dtype=np.int16),
+                )
+            with escapepod.Reader(path) as r:
+                out = r.run_infos[0]
+                assert out.acquisition_id == "acq-full"
+                assert out.acquisition_start_time == 111
+                assert out.adc_max == 2000
+                assert out.adc_min == -2000
+                assert out.experiment_name == "exp"
+                assert out.flow_cell_id == "FC-1"
+                assert out.flow_cell_product_code == "FLO-PRO114"
+                assert out.protocol_name == "sequencing/run"
+                assert out.protocol_run_id == "run-abc"
+                assert out.protocol_start_time == 222
+                assert out.sample_id == "sample-42"
+                assert out.sample_rate == 5000
+                assert out.sequencing_kit == "SQK-RNA004"
+                assert out.sequencer_position == "X1"
+                assert out.sequencer_position_type == "promethion"
+                assert out.software == "escapepod-test"
+                assert out.system_name == "sys-name"
+                assert out.system_type == "sys-type"
+                assert out.context_tags == {"ctx_key": "ctx_val"}
+                assert out.tracking_id == {"trk_key": "trk_val"}
+        finally:
+            Path(path).unlink(missing_ok=True)
+
 
 class TestReadDataConstructor:
     def test_minimal(self):
@@ -434,6 +533,8 @@ class TestReadDataConstructor:
                 num_reads_since_mux_change=12,
                 time_since_mux_change=4.2,
                 open_pore_level=180.0,
+                expected_open_pore_level=175.0,
+                selected_read_level=190.0,
             )
             sig = np.arange(500, dtype=np.int16)
             with escapepod.Writer(path) as w:
@@ -454,6 +555,9 @@ class TestReadDataConstructor:
                 assert out.num_reads_since_mux_change == 12
                 assert out.time_since_mux_change == pytest.approx(4.2)
                 assert out.open_pore_level == pytest.approx(180.0)
+                # POD5 schema V5 fields.
+                assert out.expected_open_pore_level == pytest.approx(175.0)
+                assert out.selected_read_level == pytest.approx(190.0)
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -628,6 +732,13 @@ class TestDatasetReader:
         assert ds.read_count == 5
         assert len(ds) == 5
 
+    def test_paths(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        paths = ds.paths
+        assert isinstance(paths, list)
+        assert len(paths) == ds.file_count
+        assert all(str(p).endswith(".pod5") for p in paths)
+
     def test_non_recursive_skips_subdir(self, dataset_dir):
         ds = escapepod.DatasetReader(dataset_dir, recursive=False)
         assert ds.file_count == 1
@@ -749,14 +860,14 @@ class TestDataFrame:
         assert len(d["read_id"]) == reader.read_count
 
     def test_to_pandas(self, dataset_dir):
-        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pandas")
         ds = escapepod.DatasetReader(dataset_dir)
         df = ds.to_pandas()
         assert list(df["read_id"]) and len(df) == 5
         assert "calibration_scale" in df.columns
 
     def test_to_polars(self, dataset_dir):
-        pl = pytest.importorskip("polars")
+        pytest.importorskip("polars")
         ds = escapepod.DatasetReader(dataset_dir)
         df = ds.to_polars()
         assert df.height == 5
@@ -768,7 +879,9 @@ class TestCalibrateSignalArray:
         read = reader.reads()[0]
         adc = reader.get_signal(read)
         pa = read.calibrate_signal_array(adc)
-        expected = (adc.astype(np.float32) + read.calibration_offset) * read.calibration_scale
+        expected = (
+            adc.astype(np.float32) + read.calibration_offset
+        ) * read.calibration_scale
         np.testing.assert_allclose(pa, expected, rtol=1e-5)
 
 

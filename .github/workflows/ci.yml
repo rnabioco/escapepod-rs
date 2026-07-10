@@ -100,6 +100,10 @@ jobs:
         with:
           environments: python-test
           cache: true
+      - name: Lint Python (ruff)
+        run: pixi run -e python-test lint-python
+      - name: Type-check Python (ty)
+        run: pixi run -e python-test typecheck-python
       - name: Build and test Python bindings
         run: pixi run -e python-test test-python
 
