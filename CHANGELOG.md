@@ -43,6 +43,26 @@
   `sam` 0.85, `bgzf` 0.47, `core` 0.20, `csi` 0.56). `ndarray` is held at 0.16
   — the `linfa` SVM stack still pins it, so 0.17 is blocked upstream.
 
+### Performance
+
+- Codebase-wide optimization/refactor sweep (#86), all bit-identical output:
+  - **Resquiggle adaptive banded DP ~31% faster** — the per-base traceback no
+    longer heap-allocates a `Vec` per base; the whole read shares one flat
+    buffer.
+  - **O(1) POD5 read-batch access** — `read_batch(i)` / `read_ids_from_batch(i)`
+    now seek via the Arrow IPC footer instead of decoding every preceding batch.
+    Iterating a many-read-batch file (e.g. the Python `Reader` read iterator)
+    drops from O(B²) to O(B) batch decodes: ~10× faster random batch access and
+    ~2.6× faster full-file iteration on a 1.65M-read / 166-batch file.
+  - **Signal median computations are O(n) instead of O(n log n)** — the SVM
+    kernel γ-heuristic, Theil–Sen rescale, and resquiggle dwell median now use
+    `select_nth_unstable` instead of a full sort.
+  - Smaller per-read allocations on the demux/classify and fingerprint hot
+    paths (MAD-normalization scratch reuse, Platt coupling workspace sized once).
+- Internal consolidation with no behavior change: six duplicated median impls
+  unified into `escapepod-signal::stats`; the SVM RBF-kernel mapping and the
+  CPU/GPU CNN batch packing/scatter each live in one shared helper.
+
 ### Fixed
 
 - Resolved a PyPI name collision: both the `escapepod` CLI crate and the
