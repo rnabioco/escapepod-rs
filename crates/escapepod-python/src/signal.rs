@@ -100,6 +100,7 @@ impl PyKmerTable {
         scale_iters = 2,
         dwell_target = 4.0,
         dwell_weight = 0.5,
+        seed = None,
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -112,6 +113,7 @@ fn py_refine_signal_map<'py>(
     scale_iters: usize,
     dwell_target: f32,
     dwell_weight: f32,
+    seed: Option<u64>,
 ) -> PyResult<(Bound<'py, PyArray1<i64>>, f32, f32, f32)> {
     let settings = RefineSettings {
         refinement_algo: RefineAlgo::DwellPenalty {
@@ -124,6 +126,7 @@ fn py_refine_signal_map<'py>(
         rescale_algo: RescaleAlgo::TheilSen {
             filter: RescaleFilterParams::default(),
             max_points: 200,
+            seed,
         },
         rough_rescale_algo: RoughRescaleAlgo::LeastSquares {
             quantiles: RoughRescaleAlgo::default_quantiles(),
