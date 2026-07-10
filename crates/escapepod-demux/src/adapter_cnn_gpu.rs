@@ -20,7 +20,9 @@ use ort::execution_providers::CUDAExecutionProvider;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::adapter_cnn::{decode_adapter_end, group_by_len, prep_adapter_signal};
+use crate::adapter_cnn::{
+    decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
+};
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
 /// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
@@ -190,21 +192,16 @@ impl AdapterCnnGpu {
             while let Some((lo, hi)) = ranges.pop() {
                 let sub = &group[lo..hi];
                 match self.run_one(prepped, sub, len) {
-                    Ok(ends) => {
-                        for (&i, end) in sub.iter().zip(ends) {
-                            out[i] = Ok(end);
-                        }
-                    }
+                    // OOM on a splittable range: halve and retry. Splitting is
+                    // bit-identical — same length, no padding, batch axis is
+                    // independent.
                     Err(e) if hi - lo > 1 && is_out_of_memory(&e) => {
                         let mid = lo + (hi - lo) / 2;
                         ranges.push((mid, hi));
                         ranges.push((lo, mid));
                     }
-                    Err(e) => {
-                        for &i in sub {
-                            out[i] = Err(e.clone());
-                        }
-                    }
+                    // Success, or a terminal error → scatter into out.
+                    result => scatter_group(out, sub, result),
                 }
             }
         }
@@ -220,10 +217,7 @@ impl AdapterCnnGpu {
     ) -> Result<Vec<usize>, AdapterCnnError> {
         let cfg = self.config;
         let g = sub.len();
-        let mut data = vec![0f32; g * len];
-        for (row, &i) in sub.iter().enumerate() {
-            data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
-        }
+        let data = pack_batch(prepped, sub, len);
         let input = Tensor::from_array(([g, 1, len], data))
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let mut session = self.session.lock().expect("ort session mutex poisoned");
