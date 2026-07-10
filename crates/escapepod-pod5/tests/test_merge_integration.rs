@@ -125,9 +125,9 @@ fn merge_preserves_signal_bytewise() {
 
     merge_files(&[a, b], &merged, &MergeOptions::default(), None).expect("merge_files");
 
-    // Exercise both the sequential get_signal path (hits the SignalBatchMetadata
-    // lookup) and the parallel SignalExtractor path (uses ArrowIpcFooter). Both
-    // must agree with the pre-merge signals.
+    // Exercise both the Reader::get_signal path and the parallel
+    // SignalExtractor path (both slice compressed bytes from the mmap via the
+    // signal ArrowIpcFooter). Both must agree with the pre-merge signals.
     let reader = Reader::open(&merged).unwrap();
     let extractor = reader.signal_extractor().unwrap();
     let mut checked = 0;

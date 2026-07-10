@@ -227,7 +227,6 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
             reads
                 .par_iter()
                 .filter_map(|r| {
-                    let signal = extractor.get_signal(&r.signal_rows).ok()?;
                     let boundaries = boundaries_map.get(&r.read_id)?;
                     let (region_start, region_end) = if use_full_adapter {
                         (boundaries.adapter_start, boundaries.adapter_end)
@@ -240,6 +239,18 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                     if region_end <= region_start {
                         return None;
                     }
+                    // Only the adapter window is ever read by
+                    // `extract_fingerprint_from_signal` (up to `region_end` plus
+                    // the keep_last BOUNDARY_PADDING_SAMPLES), so decode just that
+                    // prefix instead of the whole (potentially transcript-length)
+                    // read. `get_signal_prefix` returns `min(bound, total)`
+                    // samples, so this is bit-identical to
+                    // `get_signal(..)[..bound]` and the downstream
+                    // `.min(signal.len())` clamp stays a no-op.
+                    let decode_to = region_end.saturating_add(100);
+                    let signal = extractor
+                        .get_signal_prefix(&r.signal_rows, decode_to)
+                        .ok()?;
                     let fp = extract_fingerprint_from_signal(
                         &signal,
                         region_start,
