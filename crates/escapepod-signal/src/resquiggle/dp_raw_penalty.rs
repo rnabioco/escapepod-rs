@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 //! Banded Viterbi DP with a caller-supplied short-dwell penalty table.
 //!
