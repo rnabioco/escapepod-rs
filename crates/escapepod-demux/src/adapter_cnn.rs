@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tract_onnx::prelude::*;
+use tract_onnx::tract_core::model::TypedRunnableModel;
 
 /// Parameters controlling the CNN detector. Defaults match ADAPTed's
 /// `rna004_130bps@v0.2.4.toml` `[core]` block and escapepod-models' training
@@ -77,11 +78,10 @@ pub enum AdapterCnnError {
     SignalTooShort { len: usize, required: usize },
 }
 
-type Plan = SimplePlan<
-    TypedFact,
-    Box<dyn TypedOp>,
-    tract_onnx::prelude::Graph<TypedFact, Box<dyn TypedOp>>,
->;
+// tract 0.23 renamed the 3-parameter `SimplePlan<F, O, M>` to the 2-parameter
+// `RunnableModel<F, O>` (aliased `TypedRunnableModel` for typed graphs), and
+// `into_runnable()` now hands back an `Arc<_>` directly.
+type Plan = TypedRunnableModel;
 
 /// CNN adapter-end detector. Build once via [`AdapterCnn::load`] and reuse
 /// across many reads; the ONNX plan is immutable so the handle is `Sync`.
@@ -112,7 +112,7 @@ impl AdapterCnn {
             .into_runnable()
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         let detector = Self {
-            plan: Arc::new(model),
+            plan: model,
             config,
         };
         // Validate the `[_, 2, _]` output contract once at load, with a dummy
@@ -136,7 +136,7 @@ impl AdapterCnn {
             .run(tvec!(input.into()))
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let scores = outputs[0]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let shape = scores.shape();
         if shape.len() != 3 || shape[1] != 2 {
@@ -172,7 +172,7 @@ impl AdapterCnn {
             .run(tvec!(input.into()))
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let scores = outputs[0]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
 
         let shape = scores.shape();
@@ -252,7 +252,7 @@ impl AdapterCnn {
                     .run(tvec!(input.into()))
                     .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
                 let scores = outputs[0]
-                    .to_array_view::<f32>()
+                    .to_plain_array_view::<f32>()
                     .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
                 let shape = scores.shape();
                 if shape.len() != 3 || shape[0] != g || shape[1] != 2 {
