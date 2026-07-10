@@ -125,12 +125,12 @@ jobs:
         run: pixi run -e python-test test-compat
 
   msrv:
-    name: MSRV (1.92)
+    name: MSRV (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
