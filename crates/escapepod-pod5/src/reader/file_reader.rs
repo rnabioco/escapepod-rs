@@ -1,7 +1,7 @@
 //! Main POD5 file reader.
 
 use crate::CompressedSignalChunk;
-use crate::arrow_helpers::{BatchFieldExtractor, ReadsBatchView};
+use crate::arrow_helpers::{BatchFieldExtractor, ReadColumns, ReadsBatchView};
 use crate::arrow_ipc::ArrowIpcFooter;
 use crate::compression;
 use crate::error::{Error, Result};
@@ -304,6 +304,26 @@ impl Reader {
             }
         }
         Ok(out)
+    }
+
+    /// Collect every read's metadata into a [`ReadColumns`] struct-of-arrays.
+    ///
+    /// The columnar counterpart to [`Self::collect_all_reads`]: it skips the
+    /// per-read `ReadData` (and its `signal_rows` `Vec`) and fills numeric
+    /// columns by a bulk slice copy from each batch's Arrow buffers. This is the
+    /// fast backing for the Python `to_dict`/`to_pandas`/`to_polars` metadata
+    /// exports, where `signal_rows` is never used.
+    pub fn read_columns(&self) -> Result<ReadColumns> {
+        let mut cols = ReadColumns::default();
+        if let Ok(n) = self.read_count() {
+            cols.reserve(n);
+        }
+        for batch_result in self.read_batches()? {
+            let batch = batch_result?;
+            let view = ReadsBatchView::new(&batch, false)?;
+            view.append_columns(&mut cols)?;
+        }
+        Ok(cols)
     }
 
     /// Iterate the reads-table batches as raw Arrow `RecordBatch`es.

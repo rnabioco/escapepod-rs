@@ -4,7 +4,7 @@
 //! Arrow RecordBatches, reducing code duplication across the reader module.
 
 use crate::error::{Error, Result};
-use crate::types::{PoreType, ReadData, Uuid};
+use crate::types::{EndReason, PoreType, ReadData, Uuid};
 use arrow::array::{
     Array, AsArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, Int16Array,
     ListArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -284,6 +284,98 @@ fn optional_typed<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) ->
     batch.column_by_name(name)?.as_any().downcast_ref::<T>()
 }
 
+/// Append an optional f32 column, filling `default` × `n` when the column is
+/// absent — matching `ReadsBatchView::read`'s `.map(..).unwrap_or(default)`.
+fn extend_opt_f32(dst: &mut Vec<f32>, arr: Option<&Float32Array>, n: usize, default: f32) {
+    match arr {
+        Some(a) => dst.extend_from_slice(a.values()),
+        None => dst.resize(dst.len() + n, default),
+    }
+}
+
+/// u32 counterpart to [`extend_opt_f32`].
+fn extend_opt_u32(dst: &mut Vec<u32>, arr: Option<&UInt32Array>, n: usize, default: u32) {
+    match arr {
+        Some(a) => dst.extend_from_slice(a.values()),
+        None => dst.resize(dst.len() + n, default),
+    }
+}
+
+/// Read metadata in **struct-of-arrays** form — one `Vec` per field, every
+/// read's value at the same index.
+///
+/// This is the columnar counterpart to a `Vec<ReadData>`: it omits `signal_rows`
+/// (the per-read row-index list, unused by metadata consumers) and lets the
+/// numeric columns be filled by a bulk slice copy straight from the Arrow buffers
+/// instead of one `ReadData` struct — with three heap strings and a `Vec` — per
+/// read. Populate it with [`Reader::read_columns`](crate::Reader::read_columns);
+/// the Python bindings hand each `Vec` to numpy zero-copy.
+#[derive(Debug, Default, Clone)]
+pub struct ReadColumns {
+    pub read_id: Vec<Uuid>,
+    pub read_number: Vec<u32>,
+    pub start_sample: Vec<u64>,
+    pub channel: Vec<u16>,
+    pub well: Vec<u8>,
+    pub pore_type: Vec<PoreType>,
+    pub calibration_offset: Vec<f32>,
+    pub calibration_scale: Vec<f32>,
+    pub median_before: Vec<f32>,
+    pub end_reason: Vec<EndReason>,
+    pub end_reason_forced: Vec<bool>,
+    pub run_info_index: Vec<u32>,
+    pub num_minknow_events: Vec<u64>,
+    pub num_samples: Vec<u64>,
+    pub tracked_scaling_scale: Vec<f32>,
+    pub tracked_scaling_shift: Vec<f32>,
+    pub predicted_scaling_scale: Vec<f32>,
+    pub predicted_scaling_shift: Vec<f32>,
+    pub num_reads_since_mux_change: Vec<u32>,
+    pub time_since_mux_change: Vec<f32>,
+    pub open_pore_level: Vec<f32>,
+    pub expected_open_pore_level: Vec<f32>,
+    pub selected_read_level: Vec<f32>,
+}
+
+impl ReadColumns {
+    /// Number of reads accumulated (all columns share this length).
+    pub fn len(&self) -> usize {
+        self.read_id.len()
+    }
+
+    /// Whether any reads have been accumulated.
+    pub fn is_empty(&self) -> bool {
+        self.read_id.is_empty()
+    }
+
+    /// Reserve capacity across every column.
+    pub(crate) fn reserve(&mut self, n: usize) {
+        self.read_id.reserve(n);
+        self.read_number.reserve(n);
+        self.start_sample.reserve(n);
+        self.channel.reserve(n);
+        self.well.reserve(n);
+        self.pore_type.reserve(n);
+        self.calibration_offset.reserve(n);
+        self.calibration_scale.reserve(n);
+        self.median_before.reserve(n);
+        self.end_reason.reserve(n);
+        self.end_reason_forced.reserve(n);
+        self.run_info_index.reserve(n);
+        self.num_minknow_events.reserve(n);
+        self.num_samples.reserve(n);
+        self.tracked_scaling_scale.reserve(n);
+        self.tracked_scaling_shift.reserve(n);
+        self.predicted_scaling_scale.reserve(n);
+        self.predicted_scaling_shift.reserve(n);
+        self.num_reads_since_mux_change.reserve(n);
+        self.time_since_mux_change.reserve(n);
+        self.open_pore_level.reserve(n);
+        self.expected_open_pore_level.reserve(n);
+        self.selected_read_level.reserve(n);
+    }
+}
+
 /// Resolved typed columns for a reads-table `RecordBatch`.
 ///
 /// Construct once per batch with `ReadsBatchView::new`, then call `read(row)`
@@ -551,5 +643,111 @@ impl<'a> ReadsBatchView<'a> {
                 .unwrap_or(0.0),
             signal_rows,
         })
+    }
+
+    /// Append every row of this batch to a [`ReadColumns`] struct-of-arrays.
+    ///
+    /// Numeric columns are filled by a bulk slice copy from the Arrow buffers;
+    /// only `read_id` and the two dictionary-encoded columns (`pore_type`,
+    /// `end_reason`) need a per-row step. Value-for-value identical to calling
+    /// [`Self::read`] on each row and reading its fields — the optional-column
+    /// defaults and dictionary lookups match `read()` exactly — but without
+    /// allocating a `ReadData` (or its `signal_rows` `Vec`) per read.
+    pub fn append_columns(&self, cols: &mut ReadColumns) -> Result<()> {
+        let n = self.num_rows();
+        cols.reserve(n);
+
+        for row in 0..n {
+            cols.read_id.push(
+                Uuid::from_slice(self.read_id.value(row))
+                    .map_err(|e| Error::InvalidUuid(e.to_string()))?,
+            );
+            let pkey = self.pore_type_keys.value(row);
+            cols.pore_type.push(
+                self.pore_type_values
+                    .get(pkey as usize)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let ekey = self.end_reason_keys.value(row);
+            cols.end_reason.push(
+                self.end_reason_values
+                    .value(ekey as usize)
+                    .parse()
+                    .unwrap_or_default(),
+            );
+            cols.end_reason_forced
+                .push(self.end_reason_forced.value(row));
+        }
+
+        cols.read_number
+            .extend_from_slice(self.read_number.values());
+        cols.start_sample.extend_from_slice(self.start.values());
+        cols.channel.extend_from_slice(self.channel.values());
+        cols.well.extend_from_slice(self.well.values());
+        cols.calibration_offset
+            .extend_from_slice(self.calibration_offset.values());
+        cols.calibration_scale
+            .extend_from_slice(self.calibration_scale.values());
+        cols.median_before
+            .extend_from_slice(self.median_before.values());
+        cols.num_minknow_events
+            .extend_from_slice(self.num_minknow_events.values());
+        cols.num_samples
+            .extend_from_slice(self.num_samples.values());
+        cols.run_info_index
+            .extend(self.run_info_keys.values().iter().map(|&k| k as u32));
+
+        extend_opt_f32(
+            &mut cols.tracked_scaling_scale,
+            self.tracked_scaling_scale,
+            n,
+            1.0,
+        );
+        extend_opt_f32(
+            &mut cols.tracked_scaling_shift,
+            self.tracked_scaling_shift,
+            n,
+            0.0,
+        );
+        extend_opt_f32(
+            &mut cols.predicted_scaling_scale,
+            self.predicted_scaling_scale,
+            n,
+            1.0,
+        );
+        extend_opt_f32(
+            &mut cols.predicted_scaling_shift,
+            self.predicted_scaling_shift,
+            n,
+            0.0,
+        );
+        extend_opt_u32(
+            &mut cols.num_reads_since_mux_change,
+            self.num_reads_since_mux_change,
+            n,
+            0,
+        );
+        extend_opt_f32(
+            &mut cols.time_since_mux_change,
+            self.time_since_mux_change,
+            n,
+            0.0,
+        );
+        extend_opt_f32(&mut cols.open_pore_level, self.open_pore_level, n, 0.0);
+        extend_opt_f32(
+            &mut cols.expected_open_pore_level,
+            self.expected_open_pore_level,
+            n,
+            0.0,
+        );
+        extend_opt_f32(
+            &mut cols.selected_read_level,
+            self.selected_read_level,
+            n,
+            0.0,
+        );
+
+        Ok(())
     }
 }

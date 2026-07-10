@@ -535,13 +535,110 @@ pub(crate) fn reads_to_columns<'py>(
     Ok(c.dict)
 }
 
-/// Wrap a column dict in a `pandas.DataFrame`, importing pandas lazily so the
-/// dependency is only required by callers that ask for a frame.
-pub(crate) fn columns_to_pandas<'py>(
+/// Build a column dict directly from a [`ReadColumns`](escapepod_signal::ReadColumns)
+/// struct-of-arrays — the fast path for whole-file metadata exports.
+///
+/// The numeric `Vec`s are handed to numpy by move (no copy); only `read_id` and
+/// the two dictionary-encoded columns need per-row string conversion. This skips
+/// the per-read `ReadData` materialization that [`reads_to_columns`] pays, which
+/// dominates `to_pandas` wall time at scale (see #98).
+pub(crate) fn columns_to_dict<'py>(
     py: Python<'py>,
-    reads: &[&escapepod_signal::ReadData],
+    cols: escapepod_signal::ReadColumns,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "read_id",
+        cols.read_id
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item("read_number", PyArray1::from_vec(py, cols.read_number))?;
+    dict.set_item("start_sample", PyArray1::from_vec(py, cols.start_sample))?;
+    dict.set_item("channel", PyArray1::from_vec(py, cols.channel))?;
+    dict.set_item("well", PyArray1::from_vec(py, cols.well))?;
+    dict.set_item(
+        "pore_type",
+        cols.pore_type
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "calibration_offset",
+        PyArray1::from_vec(py, cols.calibration_offset),
+    )?;
+    dict.set_item(
+        "calibration_scale",
+        PyArray1::from_vec(py, cols.calibration_scale),
+    )?;
+    dict.set_item("median_before", PyArray1::from_vec(py, cols.median_before))?;
+    dict.set_item(
+        "end_reason",
+        cols.end_reason
+            .iter()
+            .map(|e| e.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "end_reason_forced",
+        PyArray1::from_vec(py, cols.end_reason_forced),
+    )?;
+    dict.set_item(
+        "run_info_index",
+        PyArray1::from_vec(py, cols.run_info_index),
+    )?;
+    dict.set_item(
+        "num_minknow_events",
+        PyArray1::from_vec(py, cols.num_minknow_events),
+    )?;
+    dict.set_item("num_samples", PyArray1::from_vec(py, cols.num_samples))?;
+    dict.set_item(
+        "tracked_scaling_scale",
+        PyArray1::from_vec(py, cols.tracked_scaling_scale),
+    )?;
+    dict.set_item(
+        "tracked_scaling_shift",
+        PyArray1::from_vec(py, cols.tracked_scaling_shift),
+    )?;
+    dict.set_item(
+        "predicted_scaling_scale",
+        PyArray1::from_vec(py, cols.predicted_scaling_scale),
+    )?;
+    dict.set_item(
+        "predicted_scaling_shift",
+        PyArray1::from_vec(py, cols.predicted_scaling_shift),
+    )?;
+    dict.set_item(
+        "num_reads_since_mux_change",
+        PyArray1::from_vec(py, cols.num_reads_since_mux_change),
+    )?;
+    dict.set_item(
+        "time_since_mux_change",
+        PyArray1::from_vec(py, cols.time_since_mux_change),
+    )?;
+    dict.set_item(
+        "open_pore_level",
+        PyArray1::from_vec(py, cols.open_pore_level),
+    )?;
+    dict.set_item(
+        "expected_open_pore_level",
+        PyArray1::from_vec(py, cols.expected_open_pore_level),
+    )?;
+    dict.set_item(
+        "selected_read_level",
+        PyArray1::from_vec(py, cols.selected_read_level),
+    )?;
+    Ok(dict)
+}
+
+/// Wrap a prebuilt column dict in a `pandas.DataFrame`, importing pandas lazily
+/// so the dependency is only required by callers that ask for a frame.
+pub(crate) fn dict_to_pandas<'py>(
+    py: Python<'py>,
+    cols: Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let cols = reads_to_columns(py, reads)?;
     let pandas = py.import("pandas").map_err(|_| {
         pyo3::exceptions::PyImportError::new_err(
             "pandas is required for to_pandas(); install pandas or use to_dict()",
@@ -550,12 +647,11 @@ pub(crate) fn columns_to_pandas<'py>(
     pandas.call_method1("DataFrame", (cols,))
 }
 
-/// Wrap a column dict in a `polars.DataFrame`, importing polars lazily.
-pub(crate) fn columns_to_polars<'py>(
+/// Wrap a prebuilt column dict in a `polars.DataFrame`, importing polars lazily.
+pub(crate) fn dict_to_polars<'py>(
     py: Python<'py>,
-    reads: &[&escapepod_signal::ReadData],
+    cols: Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let cols = reads_to_columns(py, reads)?;
     let polars = py.import("polars").map_err(|_| {
         pyo3::exceptions::PyImportError::new_err(
             "polars is required for to_polars(); install polars or use to_dict()",

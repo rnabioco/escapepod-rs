@@ -248,7 +248,8 @@ impl PyDatasetReader {
     ) -> PyResult<Bound<'py, PyAny>> {
         let reads = self.collect_inner(selection, missing_ok)?;
         let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
-        crate::read_data::columns_to_pandas(py, &refs)
+        let dict = crate::read_data::reads_to_columns(py, &refs)?;
+        crate::read_data::dict_to_pandas(py, dict)
     }
 
     /// Read metadata across the dataset as a `polars.DataFrame`.
@@ -261,7 +262,8 @@ impl PyDatasetReader {
     ) -> PyResult<Bound<'py, PyAny>> {
         let reads = self.collect_inner(selection, missing_ok)?;
         let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
-        crate::read_data::columns_to_polars(py, &refs)
+        let dict = crate::read_data::reads_to_columns(py, &refs)?;
+        crate::read_data::dict_to_polars(py, dict)
     }
 
     /// Raw ADC signal for a read as a numpy int16 array.
