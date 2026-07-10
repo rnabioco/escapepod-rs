@@ -59,6 +59,12 @@ pub enum RescaleAlgo {
     TheilSen {
         filter: RescaleFilterParams,
         max_points: usize,
+        /// RNG seed for the point subsample when there are more than
+        /// `max_points` filtered levels. `Some(seed)` makes the subsample (and
+        /// therefore the rescale/refined map) reproducible; `None` samples from
+        /// an unseeded RNG, so results vary across runs. Downstream ML pipelines
+        /// that need deterministic features should set a seed.
+        seed: Option<u64>,
     },
 }
 
@@ -78,6 +84,14 @@ impl RescaleAlgo {
             Self::LeastSquares { .. } => 0,
         }
     }
+
+    /// Subsample RNG seed (Theil-Sen only; `None` = unseeded/random).
+    pub fn seed(&self) -> Option<u64> {
+        match self {
+            Self::TheilSen { seed, .. } => *seed,
+            Self::LeastSquares { .. } => None,
+        }
+    }
 }
 
 impl Default for RescaleAlgo {
@@ -85,6 +99,7 @@ impl Default for RescaleAlgo {
         Self::TheilSen {
             filter: RescaleFilterParams::default(),
             max_points: 1000,
+            seed: None,
         }
     }
 }

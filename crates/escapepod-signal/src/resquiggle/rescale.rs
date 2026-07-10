@@ -74,7 +74,14 @@ pub fn rough_rescale(
         }
         RoughRescaleAlgo::TheilSen { .. } => {
             // max_points=0 to prevent subsetting (only a handful of quantile values)
-            theil_sen(&norm_signal_quantiles, &level_quantiles, shift, scale, 0)?
+            theil_sen(
+                &norm_signal_quantiles,
+                &level_quantiles,
+                shift,
+                scale,
+                0,
+                None,
+            )?
         }
         RoughRescaleAlgo::None => unreachable!(),
     };
@@ -156,6 +163,7 @@ fn theil_sen(
     shift: f32,
     scale: f32,
     max_points: usize,
+    seed: Option<u64>,
 ) -> Result<(f32, f32)> {
     if x.len() != y.len() {
         bail!("theil_sen: length mismatch {} vs {}", x.len(), y.len());
@@ -165,7 +173,7 @@ fn theil_sen(
     let mut slopes = Vec::new();
 
     if max_points > 0 && n > max_points {
-        let indices = random_subset(n, max_points);
+        let indices = random_subset(n, max_points, seed);
         for i in 0..max_points {
             let xi = x[indices[i]];
             let yi = y[indices[i]];
@@ -218,8 +226,20 @@ fn theil_sen(
 }
 
 /// Random subset of indices.
-fn random_subset(vec_len: usize, downsampled_len: usize) -> Vec<usize> {
-    (0..vec_len).sample(&mut rand::rng(), downsampled_len)
+///
+/// With `seed = Some(s)` the subsample is reproducible (same inputs → same
+/// subset → same rescale/refined map); with `seed = None` it draws from an
+/// unseeded RNG and varies across runs. Downstream ML pipelines that need
+/// deterministic features should pass a seed.
+fn random_subset(vec_len: usize, downsampled_len: usize, seed: Option<u64>) -> Vec<usize> {
+    match seed {
+        Some(s) => {
+            use rand::SeedableRng;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(s);
+            (0..vec_len).sample(&mut rng, downsampled_len)
+        }
+        None => (0..vec_len).sample(&mut rand::rng(), downsampled_len),
+    }
 }
 
 /// Precise rescale using filtered base-level statistics.
@@ -339,7 +359,7 @@ pub fn rescale(
         .collect();
 
     match rescale_algo {
-        RescaleAlgo::TheilSen { .. } => theil_sen_with_drift(
+        RescaleAlgo::TheilSen { seed, .. } => theil_sen_with_drift(
             &norm_signal,
             &levels_filtered,
             &time_filtered,
@@ -347,6 +367,7 @@ pub fn rescale(
             scale,
             drift,
             max_points,
+            *seed,
         ),
         RescaleAlgo::LeastSquares { .. } => least_squares_with_drift(
             &norm_signal,
@@ -453,6 +474,7 @@ fn least_squares_with_drift(
 ///
 /// 1. Estimate drift via OLS of residuals on time
 /// 2. Detrend signal, then apply existing Theil-Sen for shift/scale
+#[allow(clippy::too_many_arguments)]
 fn theil_sen_with_drift(
     norm_signal: &[f32],
     levels: &[f32],
@@ -461,6 +483,7 @@ fn theil_sen_with_drift(
     scale: f32,
     drift: f32,
     max_points: usize,
+    seed: Option<u64>,
 ) -> Result<(f32, f32, f32)> {
     let n = norm_signal.len();
     if n != levels.len() || n != time.len() {
@@ -499,7 +522,7 @@ fn theil_sen_with_drift(
         .map(|(&x, &t)| x + c * t)
         .collect();
 
-    let (new_shift, new_scale) = theil_sen(&detrended, levels, shift, scale, max_points)?;
+    let (new_shift, new_scale) = theil_sen(&detrended, levels, shift, scale, max_points, seed)?;
 
     // Update drift: c was in normalized-signal units, convert back to raw-signal units
     // drift_update = -c * new_scale (since norm = (raw - shift - drift*t) / scale)
@@ -599,7 +622,7 @@ mod tests {
         // y = x
         let x = vec![0.0, 1.0, 2.0, 3.0, 4.0];
         let y = vec![0.0, 1.0, 2.0, 3.0, 4.0];
-        let (new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
+        let (new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0, None).unwrap();
         assert!((new_shift - 0.0).abs() < 1e-6, "shift={}", new_shift);
         assert!((new_scale - 1.0).abs() < 1e-6, "scale={}", new_scale);
     }
@@ -609,7 +632,7 @@ mod tests {
         // y = 2x + 1
         let x = vec![0.0, 1.0, 2.0, 3.0];
         let y = vec![1.0, 3.0, 5.0, 7.0];
-        let (new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
+        let (new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0, None).unwrap();
         // median_slope = 2.0 (all slopes are exactly 2)
         // shift_est = -intercept/slope = -1.0/2.0 = -0.5
         // scale_est = 1/2 = 0.5
@@ -624,7 +647,7 @@ mod tests {
         // y = x with one outlier
         let x = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let y = vec![0.0, 1.0, 2.0, 100.0, 4.0, 5.0, 6.0]; // outlier at index 3
-        let (_new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0).unwrap();
+        let (_new_shift, new_scale) = theil_sen(&x, &y, 0.0, 1.0, 0, None).unwrap();
         // With the outlier, median slope should still be close to 1.0
         assert!(
             (new_scale - 1.0).abs() < 0.5,
@@ -635,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_theil_sen_length_mismatch() {
-        let result = theil_sen(&[1.0, 2.0], &[1.0], 0.0, 1.0, 0);
+        let result = theil_sen(&[1.0, 2.0], &[1.0], 0.0, 1.0, 0, None);
         assert!(result.is_err());
     }
 

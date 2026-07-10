@@ -391,4 +391,5 @@ def refine_signal_map(
     scale_iters: int = 2,
     dwell_target: float = 4.0,
     dwell_weight: float = 0.5,
+    seed: Optional[int] = None,
 ) -> tuple[npt.NDArray[np.int64], float, float, float]: ...
