@@ -12,9 +12,15 @@ on:
 permissions:
   contents: read
 
+# Only one docs deploy at a time; cancel a superseded build.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 

@@ -5,13 +5,17 @@ on:
     tags:
       - 'v*'
 
+# Default to read-only; only the `release` job that publishes the GitHub
+# Release is granted write. The build/verify jobs run dependency build
+# scripts and never need a write-capable token.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos-verify:
     name: macOS verify
     runs-on: macos-latest
+    timeout-minutes: 20
     env:
       RUSTFLAGS: -Dwarnings
     steps:
@@ -27,6 +31,8 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: macos-verify
     runs-on: ${{ matrix.os }}
+    # aarch64-musl (peak ~6 min) also compiles `cross` from git first; 30 is safe.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +104,10 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only this job needs write — it creates the GitHub Release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -109,18 +119,28 @@ jobs:
 
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd artifacts
           sha256sum escpod-* > SHA256SUMS.txt
 
       - name: Extract changelog for this version
         id: changelog
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md not found — cannot build release notes"
+            exit 1
+          fi
           # Extract the section between this version's header and the next
           body=$(awk -v ver="$version" '
             /^## / { if (found) exit; if ($0 ~ ver) found=1; next }
             found { print }
           ' CHANGELOG.md)
+          if [ -z "${body// /}" ]; then
+            echo "::warning::No CHANGELOG.md section matched $version — release notes will be sparse"
+            body="Release $GITHUB_REF_NAME. See CHANGELOG.md for details."
+          fi
           # Write to file to preserve newlines
           echo "$body" > release_notes.md
 

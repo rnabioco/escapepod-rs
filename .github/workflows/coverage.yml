@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,6 +16,8 @@ jobs:
   coverage:
     name: llvm-cov
     runs-on: ubuntu-latest
+    # ~8 min typical (instrumented double-run: lcov + html); 25 covers cold.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
         with:

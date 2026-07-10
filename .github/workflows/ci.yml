@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: CI only ever reads the tree. Elevate per-job if needed.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+# Never cancel main-branch pushes — key on ref so each PR/branch is independent.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -14,6 +24,7 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -23,6 +34,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +52,8 @@ jobs:
   test-features:
     name: Test (escapepod-demux + train)
     runs-on: ubuntu-latest
+    # Worst observed was 11 min on a cold linfa-svm rebuild; 25 gives headroom.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -59,6 +73,7 @@ jobs:
   doctest:
     name: Doctest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # nextest does not run doctests; keep them alive on a separate job.
     steps:
       - uses: actions/checkout@v6
@@ -69,6 +84,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -79,6 +95,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -90,6 +107,8 @@ jobs:
   python:
     name: Python bindings
     runs-on: ubuntu-latest
+    # pixi solve + maturin build dominate; 25 covers a cold pixi cache.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
         with:
@@ -110,6 +129,7 @@ jobs:
   compat:
     name: POD5 compat
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
         with:
@@ -127,6 +147,7 @@ jobs:
   msrv:
     name: MSRV (1.92)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
