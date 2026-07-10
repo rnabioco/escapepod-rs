@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use escapepod_signal::RecordBatch;
+use escapepod_signal::ReadsBatchView;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
@@ -373,9 +373,7 @@ impl PyReader {
             reader: slf.into(),
             num_batches,
             batch_idx: 0,
-            current_batch: None,
-            batch_row: 0,
-            batch_num_rows: 0,
+            current: Vec::new().into_iter(),
         })
     }
 }
@@ -437,29 +435,25 @@ impl PyReader {
                 }
                 Ok(reads)
             }
-            None => {
-                let mut result = Vec::new();
-                for read_result in self.inner.reads().map_err(to_py_err)? {
-                    result.push(read_result.map_err(to_py_err)?);
-                }
-                Ok(result)
-            }
+            // Resolve columns once per batch via `ReadsBatchView` rather than
+            // once per row (`reads()`'s per-row `column_by_name` lookups).
+            None => self.inner.collect_all_reads().map_err(to_py_err),
         }
     }
 }
 
 /// Iterator over reads in a POD5 file (Python protocol).
 ///
-/// Iterates batch-by-batch to avoid lifetime issues between
-/// the Rust reader and the Python GC.
+/// Streams one batch at a time: each batch's rows are decoded once (columns
+/// resolved once per batch via `ReadsBatchView`, not per row) and yielded
+/// lazily, so a whole-file iteration never materializes more than one batch of
+/// `ReadData` at once.
 #[pyclass]
 struct PyReadIterator {
     reader: Py<PyReader>,
     num_batches: usize,
     batch_idx: usize,
-    current_batch: Option<RecordBatch>,
-    batch_row: usize,
-    batch_num_rows: usize,
+    current: std::vec::IntoIter<escapepod_signal::ReadData>,
 }
 
 #[pymethods]
@@ -470,17 +464,11 @@ impl PyReadIterator {
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyReadData>> {
         loop {
-            // If we have rows left in the current batch, yield one
-            if self.batch_row < self.batch_num_rows {
-                let batch = self.current_batch.as_ref().unwrap();
-                let row = self.batch_row;
-                self.batch_row += 1;
-                let inner =
-                    escapepod_signal::Reader::read_from_batch(batch, row).map_err(to_py_err)?;
+            if let Some(inner) = self.current.next() {
                 return Ok(Some(PyReadData { inner }));
             }
 
-            // Load next batch
+            // Current batch drained — decode the next one.
             if self.batch_idx >= self.num_batches {
                 return Ok(None);
             }
@@ -491,10 +479,14 @@ impl PyReadIterator {
                 .inner
                 .read_batch(self.batch_idx)
                 .map_err(to_py_err)?;
-            self.batch_num_rows = batch.num_rows();
-            self.current_batch = Some(batch);
-            self.batch_row = 0;
             self.batch_idx += 1;
+
+            let view = ReadsBatchView::new(&batch, false).map_err(to_py_err)?;
+            let mut rows = Vec::with_capacity(view.num_rows());
+            for row in 0..view.num_rows() {
+                rows.push(view.read(row).map_err(to_py_err)?);
+            }
+            self.current = rows.into_iter();
         }
     }
 }
