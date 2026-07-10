@@ -60,9 +60,9 @@ cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --fea
 
 ## License
 
-MIT, except the `resquiggle` module
-(`crates/escapepod-signal/src/resquiggle/`), which is GPL-3.0-or-later.
-Per-file SPDX identifiers are authoritative.
+MIT. The `resquiggle` module is an independent implementation of algorithms
+inspired by fishnet (see Acknowledgments), not a derivative of its source, and
+is MIT-licensed like the rest of the workspace.
 
 ## Acknowledgments
 
