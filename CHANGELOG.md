@@ -4,6 +4,18 @@
 
 ### Added
 
+- **POD5 reads-table schema V5**: the `expected_open_pore_level` and
+  `selected_read_level` fields (both `float32`), introduced upstream in pod5
+  0.3.44, are now read, written, merged/filtered, surfaced in `view`/`inspect`
+  (and as selectable output fields), and exposed on the Python `ReadData` /
+  `Writer.add_read` API. Files escapepod writes are now stamped `pod5_version`
+  0.3.44 and verified readable by the reference ONT `pod5` reader; existing
+  V0–V4 files still read, with the new fields defaulting to 0.0.
+- Defensive pre-mmap probe when opening a POD5 file: the header and footer are
+  read through ordinary I/O before the file is memory-mapped, so a truncated
+  file or an archive "stub" (unresident data on HSM/tape-backed filesystems)
+  surfaces a recoverable error instead of an uncatchable SIGBUS on first page
+  fault. Mirrors upstream pod5 0.3.37; set `POD5_DISABLE_MMAP_OPEN=1` to skip.
 - `escpod demux <file> --model M -d OUT` now runs a **fused, streaming
   pipeline** by default: each read's signal is decoded once, then detect +
   fingerprint + classify run in a single pass and reads are routed

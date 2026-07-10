@@ -39,6 +39,8 @@ class ReadData:
         time_since_mux_change: float = 0.0,
         num_samples: int = 0,
         open_pore_level: float = 0.0,
+        expected_open_pore_level: float = 0.0,
+        selected_read_level: float = 0.0,
         signal_rows: Optional[list[int]] = None,
     ) -> None: ...
     @property
@@ -83,6 +85,10 @@ class ReadData:
     def num_samples(self) -> int: ...
     @property
     def open_pore_level(self) -> float: ...
+    @property
+    def expected_open_pore_level(self) -> float: ...
+    @property
+    def selected_read_level(self) -> float: ...
     @property
     def signal_rows(self) -> list[int]: ...
     def calibrate_signal_array(
@@ -325,6 +331,8 @@ class Writer:
         num_reads_since_mux_change: int = 0,
         time_since_mux_change: float = 0.0,
         open_pore_level: float = 0.0,
+        expected_open_pore_level: float = 0.0,
+        selected_read_level: float = 0.0,
     ) -> None: ...
     def add_read_data(
         self, read: ReadData, signal: npt.NDArray[np.int16]

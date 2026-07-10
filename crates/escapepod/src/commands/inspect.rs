@@ -267,6 +267,16 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
                     style::key("open_pore_level"),
                     style::value(read.open_pore_level)
                 );
+                println!(
+                    "{}: {}",
+                    style::key("expected_open_pore_level"),
+                    style::value(read.expected_open_pore_level)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("selected_read_level"),
+                    style::value(read.selected_read_level)
+                );
                 println!();
                 println!(
                     "{}: {}",

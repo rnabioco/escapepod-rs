@@ -5,7 +5,7 @@ use crate::arrow_helpers::{BatchFieldExtractor, ReadsBatchView};
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
-use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
+use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid};
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
@@ -54,6 +54,64 @@ pub struct Reader {
     file_path: Option<PathBuf>,
 }
 
+/// Probe the POD5 header and footer through ordinary buffered I/O *before* the
+/// file is memory-mapped.
+///
+/// Memory-mapping a truncated file or an archive "stub" — a placeholder whose
+/// size is correct in metadata but whose data is not actually resident, common
+/// on HSM / tape-backed filesystems — and then faulting a page whose backing
+/// store is unavailable raises SIGBUS, an uncatchable signal that aborts the
+/// process. Reading the same bytes with `read()` instead surfaces a recoverable
+/// [`std::io::Error`]. We touch only the header and footer, where POD5 keeps its
+/// structural metadata; this catches the overwhelmingly common stub / truncation
+/// case at `open()` for the cost of two small reads, mirroring upstream pod5
+/// 0.3.37. It does not guarantee the interior signal pages are resident, so a
+/// partially-materialised stub can still SIGBUS on a later scan — the same
+/// scope upstream chose. Structural validation is left to `parse_footer`, which
+/// runs against the mmap immediately afterwards.
+fn probe_header_footer(file: &File) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Trailer laid out at end-of-file: footer_len(8) + section_marker + trailing
+    // signature(8).
+    const TRAILER: u64 = 8 + SECTION_MARKER_LENGTH as u64 + 8;
+
+    let file_len = file.metadata()?.len();
+    // Too small to be a POD5 file — let the signature / footer checks that run
+    // after mmap produce the precise diagnostic.
+    if file_len < 8 + TRAILER {
+        return Ok(());
+    }
+
+    let mut reader: &File = file;
+
+    // Header signature page.
+    let mut header = [0u8; 8];
+    reader.seek(SeekFrom::Start(0))?;
+    reader.read_exact(&mut header)?;
+
+    // Footer trailer (footer_len + section marker + trailing signature).
+    let mut trailer = [0u8; TRAILER as usize];
+    reader.seek(SeekFrom::Start(file_len - TRAILER))?;
+    reader.read_exact(&mut trailer)?;
+    let footer_len = i64::from_le_bytes(trailer[0..8].try_into().unwrap());
+
+    // Fault the FlatBuffer footer + FOOTER magic too when the recorded length is
+    // plausible. Bounded by the file itself and capped at 1 MiB so a corrupt
+    // length can never trigger a huge read — parse_footer re-validates from the
+    // mmap regardless.
+    if (0..=file_len as i64).contains(&footer_len) {
+        let region = ((footer_len as u64) + 8).min(1 << 20);
+        if let Some(start) = (file_len - TRAILER).checked_sub(region) {
+            let mut sink = vec![0u8; region as usize];
+            reader.seek(SeekFrom::Start(start))?;
+            reader.read_exact(&mut sink)?;
+        }
+    }
+
+    Ok(())
+}
+
 impl Reader {
     /// Open a POD5 file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -64,6 +122,16 @@ impl Reader {
     pub fn open_with_cache_size<P: AsRef<Path>>(path: P, cache_size: usize) -> Result<Self> {
         let file_path = path.as_ref().to_path_buf();
         let file = File::open(&file_path)?;
+
+        // Defensive pre-mmap probe (see `probe_header_footer`). Reading the
+        // structural metadata through ordinary I/O first turns the common
+        // truncated-file / archive-stub failure into a recoverable error
+        // instead of an uncatchable SIGBUS on first page fault. Set
+        // `POD5_DISABLE_MMAP_OPEN=1` to skip it and map straight away.
+        if std::env::var_os("POD5_DISABLE_MMAP_OPEN").is_none() {
+            probe_header_footer(&file)?;
+        }
+
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Hint the OS to stream the mapping. POD5 access is overwhelmingly a

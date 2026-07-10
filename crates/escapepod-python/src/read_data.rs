@@ -47,6 +47,8 @@ impl PyReadData {
         time_since_mux_change = 0.0,
         num_samples = 0,
         open_pore_level = 0.0,
+        expected_open_pore_level = 0.0,
+        selected_read_level = 0.0,
         signal_rows = None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -72,6 +74,8 @@ impl PyReadData {
         time_since_mux_change: f32,
         num_samples: u64,
         open_pore_level: f32,
+        expected_open_pore_level: f32,
+        selected_read_level: f32,
         signal_rows: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
@@ -100,6 +104,8 @@ impl PyReadData {
                 time_since_mux_change,
                 num_samples,
                 open_pore_level,
+                expected_open_pore_level,
+                selected_read_level,
                 signal_rows: signal_rows.unwrap_or_default(),
             },
         })
@@ -208,6 +214,16 @@ impl PyReadData {
     #[getter]
     fn open_pore_level(&self) -> f32 {
         self.inner.open_pore_level
+    }
+
+    #[getter]
+    fn expected_open_pore_level(&self) -> f32 {
+        self.inner.expected_open_pore_level
+    }
+
+    #[getter]
+    fn selected_read_level(&self) -> f32 {
+        self.inner.selected_read_level
     }
 
     #[getter]
@@ -568,6 +584,20 @@ pub(crate) fn reads_to_columns<'py>(
     dict.set_item(
         "open_pore_level",
         reads.iter().map(|r| r.open_pore_level).collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "expected_open_pore_level",
+        reads
+            .iter()
+            .map(|r| r.expected_open_pore_level)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "selected_read_level",
+        reads
+            .iter()
+            .map(|r| r.selected_read_level)
+            .collect::<Vec<_>>(),
     )?;
     Ok(dict)
 }

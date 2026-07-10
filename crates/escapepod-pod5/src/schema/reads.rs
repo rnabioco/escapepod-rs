@@ -17,6 +17,7 @@ pub const UUID_EXTENSION_NAME: &str = "minknow.uuid";
 /// V3: channel, well, pore_type, calibration_offset, calibration_scale,
 ///     end_reason, end_reason_forced, run_info
 /// V4: open_pore_level
+/// V5: expected_open_pore_level, selected_read_level
 pub fn reads_schema() -> Schema {
     Schema::new(vec![
         // V0 fields
@@ -69,6 +70,9 @@ pub fn reads_schema() -> Schema {
         ),
         // V4 fields
         Field::new("open_pore_level", DataType::Float32, false),
+        // V5 fields
+        Field::new("expected_open_pore_level", DataType::Float32, false),
+        Field::new("selected_read_level", DataType::Float32, false),
     ])
 }
 

@@ -129,6 +129,10 @@ impl PyWriter {
     ///     Seconds since last mux change (default: 0.0).
     /// open_pore_level : float, optional
     ///     Estimated open pore current (default: 0.0).
+    /// expected_open_pore_level : float, optional
+    ///     Expected open pore current level for this read (POD5 V5; default: 0.0).
+    /// selected_read_level : float, optional
+    ///     Selected pore level for this read (POD5 V5; default: 0.0).
     #[pyo3(signature = (
         read_id,
         read_number,
@@ -152,6 +156,8 @@ impl PyWriter {
         num_reads_since_mux_change=0,
         time_since_mux_change=0.0,
         open_pore_level=0.0,
+        expected_open_pore_level=0.0,
+        selected_read_level=0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_read(
@@ -178,6 +184,8 @@ impl PyWriter {
         num_reads_since_mux_change: u32,
         time_since_mux_change: f32,
         open_pore_level: f32,
+        expected_open_pore_level: f32,
+        selected_read_level: f32,
     ) -> PyResult<()> {
         let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
             .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
@@ -209,6 +217,8 @@ impl PyWriter {
             time_since_mux_change,
             num_samples: sample_count,
             open_pore_level,
+            expected_open_pore_level,
+            selected_read_level,
             signal_rows: Vec::new(), // Writer populates this
         };
 
