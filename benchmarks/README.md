@@ -325,6 +325,38 @@ export (its metadata is already an Arrow table, so `to_pandas` is near-free,
 whereas escapepod builds the frame) and on tiny random-access selections. The
 escapepod-only batched `get_signals` case has no pod5 API equivalent.
 
+### Larger file (20k reads)
+
+A 20 000-read subset of a 2 GB real run
+(`ThrRS_ser_b6.pod5`, 220k reads total; subset written via `--limit 20000`).
+Node: `rna`, escapepod 0.5.1 vs pod5 0.3.39, 5 runs / 1 warmup.
+
+| Benchmark | escapepod | pod5 | speedup |
+|---|---:|---:|---:|
+| open + metadata | 133 µs | 612 µs | **4.59×** |
+| read_ids | 2.54 ms | 2.64 ms | 1.04× |
+| iterate read metadata | 21.4 ms | 17.4 ms | 0.81× |
+| read all signal (int16) | 541.2 ms | 758.8 ms | **1.40×** |
+| read all signal (pA) | 551.0 ms | 1.047 s | **1.90×** |
+| metadata → pandas | 75.7 ms | 8.2 ms | 0.11× |
+| random-access selection (500) | 1.18 ms | 835 µs | 0.71× |
+| read all signal (batched, `get_signals`) | 602.3 ms | — | esc-only |
+
+The picture holds and sharpens at scale: escapepod's signal-decode lead widens
+(pA 1.63× → **1.90×**), while two gaps stand out as optimization targets rather
+than noise:
+
+- **`metadata → pandas` gets *worse* with size** (0.16× → 0.11×). `to_dict`/
+  `to_pandas` build Python **lists of boxed scalars** per column
+  (`reads_to_columns` in `crates/escapepod-python/src/read_data.rs`), which
+  pandas then re-parses into numpy arrays; pod5 goes Arrow→pandas columnar with
+  no per-element boxing. Building numpy arrays (or an Arrow table) directly for
+  the numeric columns should close most of this. Tracked in a follow-up issue.
+- **batched `get_signals` doesn't beat the per-read loop** (602 ms vs 541 ms).
+  It currently materializes every signal twice (decoded `Vec<i16>` → numpy) and
+  clones a read-id `String` per read, so it changes the memory profile without a
+  decode speedup — `get_signal_bulk` doesn't yet group row fetches by batch.
+
 **Why random-access selection is slower:** the test file has no `.p5i` index
 sidecar, so escapepod's `reads(selection=…)` falls back to a linear scan of the
 whole reads table — decoding every read_id and testing set membership, O(total
