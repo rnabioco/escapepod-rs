@@ -343,19 +343,26 @@ Node: `rna`, escapepod 0.5.1 vs pod5 0.3.39, 5 runs / 1 warmup.
 | read all signal (batched, `get_signals`) | 602.3 ms | — | esc-only |
 
 The picture holds and sharpens at scale: escapepod's signal-decode lead widens
-(pA 1.63× → **1.90×**), while two gaps stand out as optimization targets rather
-than noise:
+(pA 1.63× → **1.90×**). One gap stands out as a real optimization target:
 
 - **`metadata → pandas` gets *worse* with size** (0.16× → 0.11×). `to_dict`/
-  `to_pandas` build Python **lists of boxed scalars** per column
-  (`reads_to_columns` in `crates/escapepod-python/src/read_data.rs`), which
-  pandas then re-parses into numpy arrays; pod5 goes Arrow→pandas columnar with
-  no per-element boxing. Building numpy arrays (or an Arrow table) directly for
-  the numeric columns should close most of this. Tracked in a follow-up issue.
-- **batched `get_signals` doesn't beat the per-read loop** (602 ms vs 541 ms).
-  It currently materializes every signal twice (decoded `Vec<i16>` → numpy) and
-  clones a read-id `String` per read, so it changes the memory profile without a
-  decode speedup — `get_signal_bulk` doesn't yet group row fetches by batch.
+  `to_pandas` built Python **lists of boxed scalars** per column, which pandas
+  then re-parsed into numpy arrays; pod5 goes Arrow→pandas columnar with no
+  per-element boxing. **Fixed in #99** by emitting numpy columns directly
+  (`to_pandas` 4k: 15.3 → 8.0 ms, 0.16× → 0.36×). The residual is upstream
+  `ReadData` materialization in `collect_inner` (~63 % of wall at 220k reads:
+  heap `Uuid`/`pore_type`/`end_reason` strings + an unused `signal_rows` `Vec`
+  per read) — building columns straight from the Arrow batch is tracked in #98.
+
+The `get_signals` (batched) row looked slower here (602 ms vs the per-read
+541 ms), but a controlled A/B rules that out as a measurement artifact:
+`get_signal_bulk` is batch-grouped + rayon-parallel VBZ decode, and on the same
+reads at 16 threads it runs **427 ms vs 526 ms per-read (1.23×)**, scaling 2.8×
+from 1→16 threads. Per-read decode is single-threaded and flat across thread
+count, so `get_signals` is the right API for bulk signal — the batched number
+above just reflects run-to-run variance on that particular subset, not a
+regression. (A streaming/iterator variant that avoids materializing every signal
+at once would cut its peak memory, but is not needed for throughput.)
 
 **Why random-access selection is slower:** the test file has no `.p5i` index
 sidecar, so escapepod's `reads(selection=…)` falls back to a linear scan of the
