@@ -39,8 +39,8 @@ pub use escapepod_pod5::{
 pub use escapepod_pod5::{
     ALL_FIELDS, CompressedSignalChunk, DEFAULT_FIELDS, EndReason, Error, FieldError, MergeOptions,
     MergePhase, MergeProgress, MergeResult, PoreType, PredefinedDictionaries, Progress,
-    ProgressCallback, ReadData, ReadIndex, Reader, ReadsBatchView, RecordBatch, RepackOptions,
-    RepackResult, Result, RunInfoData, SignalExtractor, SignalType, Statistics, Uuid, Writer,
-    WriterOptions, compute_n50, compute_statistics, determine_fields, get_field_value, merge_files,
-    parse_uuid_flexible, repack_files, write_field_value,
+    ProgressCallback, ReadColumns, ReadData, ReadIndex, Reader, ReadsBatchView, RecordBatch,
+    RepackOptions, RepackResult, Result, RunInfoData, SignalExtractor, SignalType, Statistics,
+    Uuid, Writer, WriterOptions, compute_n50, compute_statistics, determine_fields,
+    get_field_value, merge_files, parse_uuid_flexible, repack_files, write_field_value,
 };

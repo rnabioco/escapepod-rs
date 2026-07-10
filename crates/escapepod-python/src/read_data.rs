@@ -460,155 +460,185 @@ impl PyRunInfo {
 ///
 /// Scalar metadata fields only — signal is fetched separately. Column names
 /// mirror `ReadData`'s properties so the frame matches the object surface.
+/// Accumulates read metadata into a column dict, one column at a time.
+///
+/// `num` emits a numpy array; `strs` emits a Python list (object dtype).
+/// pandas and polars wrap a numpy array as a column without re-boxing, whereas a
+/// Python list of scalars forces a per-element parse on DataFrame construction —
+/// the dominant cost for wide metadata frames (see benchmarks #98). Only 3 of
+/// ~23 columns are strings, so the numeric fast path covers the bulk.
+struct ColumnSet<'py, 'r> {
+    py: Python<'py>,
+    dict: Bound<'py, PyDict>,
+    reads: &'r [&'r escapepod_signal::ReadData],
+}
+
+impl<'py, 'r> ColumnSet<'py, 'r> {
+    fn num<T: numpy::Element>(
+        &self,
+        name: &str,
+        get: impl Fn(&escapepod_signal::ReadData) -> T,
+    ) -> PyResult<()> {
+        let col: Vec<T> = self.reads.iter().map(|&r| get(r)).collect();
+        self.dict.set_item(name, PyArray1::from_vec(self.py, col))
+    }
+
+    fn strs<'a, S: pyo3::IntoPyObject<'py>>(
+        &self,
+        name: &str,
+        get: impl Fn(&'a escapepod_signal::ReadData) -> S,
+    ) -> PyResult<()>
+    where
+        'r: 'a,
+    {
+        let col: Vec<S> = self.reads.iter().map(|&r| get(r)).collect();
+        self.dict.set_item(name, col)
+    }
+}
+
 pub(crate) fn reads_to_columns<'py>(
     py: Python<'py>,
     reads: &[&escapepod_signal::ReadData],
 ) -> PyResult<Bound<'py, PyDict>> {
+    let c = ColumnSet {
+        py,
+        dict: PyDict::new(py),
+        reads,
+    };
+
+    c.strs("read_id", |r| r.read_id.to_string())?;
+    c.num("read_number", |r| r.read_number)?;
+    c.num("start_sample", |r| r.start_sample)?;
+    c.num("channel", |r| r.channel)?;
+    c.num("well", |r| r.well)?;
+    c.strs("pore_type", |r| r.pore_type.as_str())?;
+    c.num("calibration_offset", |r| r.calibration_offset)?;
+    c.num("calibration_scale", |r| r.calibration_scale)?;
+    c.num("median_before", |r| r.median_before)?;
+    c.strs("end_reason", |r| r.end_reason.as_str())?;
+    c.num("end_reason_forced", |r| r.end_reason_forced)?;
+    c.num("run_info_index", |r| r.run_info_index)?;
+    c.num("num_minknow_events", |r| r.num_minknow_events)?;
+    c.num("num_samples", |r| r.num_samples)?;
+    c.num("tracked_scaling_scale", |r| r.tracked_scaling_scale)?;
+    c.num("tracked_scaling_shift", |r| r.tracked_scaling_shift)?;
+    c.num("predicted_scaling_scale", |r| r.predicted_scaling_scale)?;
+    c.num("predicted_scaling_shift", |r| r.predicted_scaling_shift)?;
+    c.num("num_reads_since_mux_change", |r| {
+        r.num_reads_since_mux_change
+    })?;
+    c.num("time_since_mux_change", |r| r.time_since_mux_change)?;
+    c.num("open_pore_level", |r| r.open_pore_level)?;
+    c.num("expected_open_pore_level", |r| r.expected_open_pore_level)?;
+    c.num("selected_read_level", |r| r.selected_read_level)?;
+
+    Ok(c.dict)
+}
+
+/// Build a column dict directly from a [`ReadColumns`](escapepod_signal::ReadColumns)
+/// struct-of-arrays — the fast path for whole-file metadata exports.
+///
+/// The numeric `Vec`s are handed to numpy by move (no copy); only `read_id` and
+/// the two dictionary-encoded columns need per-row string conversion. This skips
+/// the per-read `ReadData` materialization that [`reads_to_columns`] pays, which
+/// dominates `to_pandas` wall time at scale (see #98).
+pub(crate) fn columns_to_dict<'py>(
+    py: Python<'py>,
+    cols: escapepod_signal::ReadColumns,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         "read_id",
-        reads
+        cols.read_id
             .iter()
-            .map(|r| r.read_id.to_string())
+            .map(|u| u.to_string())
             .collect::<Vec<_>>(),
     )?;
-    dict.set_item(
-        "read_number",
-        reads.iter().map(|r| r.read_number).collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "start_sample",
-        reads.iter().map(|r| r.start_sample).collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "channel",
-        reads.iter().map(|r| r.channel).collect::<Vec<_>>(),
-    )?;
-    dict.set_item("well", reads.iter().map(|r| r.well).collect::<Vec<_>>())?;
+    dict.set_item("read_number", PyArray1::from_vec(py, cols.read_number))?;
+    dict.set_item("start_sample", PyArray1::from_vec(py, cols.start_sample))?;
+    dict.set_item("channel", PyArray1::from_vec(py, cols.channel))?;
+    dict.set_item("well", PyArray1::from_vec(py, cols.well))?;
     dict.set_item(
         "pore_type",
-        reads
+        cols.pore_type
             .iter()
-            .map(|r| r.pore_type.as_str())
+            .map(|p| p.as_str())
             .collect::<Vec<_>>(),
     )?;
     dict.set_item(
         "calibration_offset",
-        reads
-            .iter()
-            .map(|r| r.calibration_offset)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.calibration_offset),
     )?;
     dict.set_item(
         "calibration_scale",
-        reads
-            .iter()
-            .map(|r| r.calibration_scale)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.calibration_scale),
     )?;
-    dict.set_item(
-        "median_before",
-        reads.iter().map(|r| r.median_before).collect::<Vec<_>>(),
-    )?;
+    dict.set_item("median_before", PyArray1::from_vec(py, cols.median_before))?;
     dict.set_item(
         "end_reason",
-        reads
+        cols.end_reason
             .iter()
-            .map(|r| r.end_reason.as_str())
+            .map(|e| e.as_str())
             .collect::<Vec<_>>(),
     )?;
     dict.set_item(
         "end_reason_forced",
-        reads
-            .iter()
-            .map(|r| r.end_reason_forced)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.end_reason_forced),
     )?;
     dict.set_item(
         "run_info_index",
-        reads.iter().map(|r| r.run_info_index).collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.run_info_index),
     )?;
     dict.set_item(
         "num_minknow_events",
-        reads
-            .iter()
-            .map(|r| r.num_minknow_events)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.num_minknow_events),
     )?;
-    dict.set_item(
-        "num_samples",
-        reads.iter().map(|r| r.num_samples).collect::<Vec<_>>(),
-    )?;
+    dict.set_item("num_samples", PyArray1::from_vec(py, cols.num_samples))?;
     dict.set_item(
         "tracked_scaling_scale",
-        reads
-            .iter()
-            .map(|r| r.tracked_scaling_scale)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.tracked_scaling_scale),
     )?;
     dict.set_item(
         "tracked_scaling_shift",
-        reads
-            .iter()
-            .map(|r| r.tracked_scaling_shift)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.tracked_scaling_shift),
     )?;
     dict.set_item(
         "predicted_scaling_scale",
-        reads
-            .iter()
-            .map(|r| r.predicted_scaling_scale)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.predicted_scaling_scale),
     )?;
     dict.set_item(
         "predicted_scaling_shift",
-        reads
-            .iter()
-            .map(|r| r.predicted_scaling_shift)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.predicted_scaling_shift),
     )?;
     dict.set_item(
         "num_reads_since_mux_change",
-        reads
-            .iter()
-            .map(|r| r.num_reads_since_mux_change)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.num_reads_since_mux_change),
     )?;
     dict.set_item(
         "time_since_mux_change",
-        reads
-            .iter()
-            .map(|r| r.time_since_mux_change)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.time_since_mux_change),
     )?;
     dict.set_item(
         "open_pore_level",
-        reads.iter().map(|r| r.open_pore_level).collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.open_pore_level),
     )?;
     dict.set_item(
         "expected_open_pore_level",
-        reads
-            .iter()
-            .map(|r| r.expected_open_pore_level)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.expected_open_pore_level),
     )?;
     dict.set_item(
         "selected_read_level",
-        reads
-            .iter()
-            .map(|r| r.selected_read_level)
-            .collect::<Vec<_>>(),
+        PyArray1::from_vec(py, cols.selected_read_level),
     )?;
     Ok(dict)
 }
 
-/// Wrap a column dict in a `pandas.DataFrame`, importing pandas lazily so the
-/// dependency is only required by callers that ask for a frame.
-pub(crate) fn columns_to_pandas<'py>(
+/// Wrap a prebuilt column dict in a `pandas.DataFrame`, importing pandas lazily
+/// so the dependency is only required by callers that ask for a frame.
+pub(crate) fn dict_to_pandas<'py>(
     py: Python<'py>,
-    reads: &[&escapepod_signal::ReadData],
+    cols: Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let cols = reads_to_columns(py, reads)?;
     let pandas = py.import("pandas").map_err(|_| {
         pyo3::exceptions::PyImportError::new_err(
             "pandas is required for to_pandas(); install pandas or use to_dict()",
@@ -617,12 +647,11 @@ pub(crate) fn columns_to_pandas<'py>(
     pandas.call_method1("DataFrame", (cols,))
 }
 
-/// Wrap a column dict in a `polars.DataFrame`, importing polars lazily.
-pub(crate) fn columns_to_polars<'py>(
+/// Wrap a prebuilt column dict in a `polars.DataFrame`, importing polars lazily.
+pub(crate) fn dict_to_polars<'py>(
     py: Python<'py>,
-    reads: &[&escapepod_signal::ReadData],
+    cols: Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let cols = reads_to_columns(py, reads)?;
     let polars = py.import("polars").map_err(|_| {
         pyo3::exceptions::PyImportError::new_err(
             "polars is required for to_polars(); install polars or use to_dict()",

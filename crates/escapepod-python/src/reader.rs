@@ -147,9 +147,7 @@ impl PyReader {
         selection: Option<Vec<String>>,
         missing_ok: bool,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let reads = self.collect_inner(selection, missing_ok)?;
-        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
-        crate::read_data::reads_to_columns(py, &refs)
+        self.build_columns(py, selection, missing_ok)
     }
 
     /// Read metadata as a `pandas.DataFrame` (pandas imported lazily).
@@ -160,9 +158,8 @@ impl PyReader {
         selection: Option<Vec<String>>,
         missing_ok: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let reads = self.collect_inner(selection, missing_ok)?;
-        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
-        crate::read_data::columns_to_pandas(py, &refs)
+        let cols = self.build_columns(py, selection, missing_ok)?;
+        crate::read_data::dict_to_pandas(py, cols)
     }
 
     /// Read metadata as a `polars.DataFrame` (polars imported lazily).
@@ -173,9 +170,8 @@ impl PyReader {
         selection: Option<Vec<String>>,
         missing_ok: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let reads = self.collect_inner(selection, missing_ok)?;
-        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
-        crate::read_data::columns_to_polars(py, &refs)
+        let cols = self.build_columns(py, selection, missing_ok)?;
+        crate::read_data::dict_to_polars(py, cols)
     }
 
     /// Look up a single read by UUID string.
@@ -385,6 +381,32 @@ impl PyReader {
 }
 
 impl PyReader {
+    /// Build a metadata column dict, shared by `to_dict`/`to_pandas`/`to_polars`.
+    ///
+    /// With no selection this takes the fast columnar path (`read_columns`),
+    /// filling numeric columns by bulk slice copy straight from the Arrow buffers
+    /// and skipping per-read `ReadData` materialization. A selection falls back to
+    /// the random-access `collect_inner` path, where the read count is small and
+    /// per-read `ReadData` cost is not the bottleneck.
+    fn build_columns<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        match selection {
+            None => {
+                let cols = self.inner.read_columns().map_err(to_py_err)?;
+                crate::read_data::columns_to_dict(py, cols)
+            }
+            Some(sel) => {
+                let reads = self.collect_inner(Some(sel), missing_ok)?;
+                let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+                crate::read_data::reads_to_columns(py, &refs)
+            }
+        }
+    }
+
     /// Collect read metadata, optionally filtered by a selection of IDs.
     ///
     /// Shared backing for `reads`, `get_reads`, `to_dict`, and `to_pandas`.

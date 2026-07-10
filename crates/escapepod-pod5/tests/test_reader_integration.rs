@@ -124,3 +124,76 @@ fn reader_reports_metadata() {
     assert!(!reader.file_identifier().is_empty());
     assert!(reader.software().contains("escapepod"));
 }
+
+#[test]
+fn read_columns_matches_collect_all_reads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("columns.pod5");
+    write_fixture(&path, "reader_columns", N_READS, SAMPLES_PER_READ);
+
+    let reader = Reader::open(&path).unwrap();
+    let reads = reader.collect_all_reads().unwrap();
+    let cols = reader.read_columns().unwrap();
+
+    assert_eq!(cols.len(), reads.len());
+    // Compare floats by bit pattern so NaN (common in scaling fields) counts as
+    // equal to itself — the columnar path must be byte-identical to `read()`.
+    let bits = |x: f32| x.to_bits();
+    for (i, r) in reads.iter().enumerate() {
+        assert_eq!(cols.read_id[i], r.read_id, "read_id[{i}]");
+        assert_eq!(cols.read_number[i], r.read_number, "read_number[{i}]");
+        assert_eq!(cols.start_sample[i], r.start_sample, "start_sample[{i}]");
+        assert_eq!(cols.channel[i], r.channel, "channel[{i}]");
+        assert_eq!(cols.well[i], r.well, "well[{i}]");
+        assert_eq!(
+            cols.pore_type[i].as_str(),
+            r.pore_type.as_str(),
+            "pore_type[{i}]"
+        );
+        assert_eq!(bits(cols.calibration_offset[i]), bits(r.calibration_offset));
+        assert_eq!(bits(cols.calibration_scale[i]), bits(r.calibration_scale));
+        assert_eq!(bits(cols.median_before[i]), bits(r.median_before));
+        assert_eq!(
+            cols.end_reason[i].as_str(),
+            r.end_reason.as_str(),
+            "end_reason[{i}]"
+        );
+        assert_eq!(cols.end_reason_forced[i], r.end_reason_forced);
+        assert_eq!(cols.run_info_index[i], r.run_info_index);
+        assert_eq!(cols.num_minknow_events[i], r.num_minknow_events);
+        assert_eq!(cols.num_samples[i], r.num_samples);
+        assert_eq!(
+            bits(cols.tracked_scaling_scale[i]),
+            bits(r.tracked_scaling_scale)
+        );
+        assert_eq!(
+            bits(cols.tracked_scaling_shift[i]),
+            bits(r.tracked_scaling_shift)
+        );
+        assert_eq!(
+            bits(cols.predicted_scaling_scale[i]),
+            bits(r.predicted_scaling_scale)
+        );
+        assert_eq!(
+            bits(cols.predicted_scaling_shift[i]),
+            bits(r.predicted_scaling_shift)
+        );
+        assert_eq!(
+            cols.num_reads_since_mux_change[i],
+            r.num_reads_since_mux_change
+        );
+        assert_eq!(
+            bits(cols.time_since_mux_change[i]),
+            bits(r.time_since_mux_change)
+        );
+        assert_eq!(bits(cols.open_pore_level[i]), bits(r.open_pore_level));
+        assert_eq!(
+            bits(cols.expected_open_pore_level[i]),
+            bits(r.expected_open_pore_level)
+        );
+        assert_eq!(
+            bits(cols.selected_read_level[i]),
+            bits(r.selected_read_level)
+        );
+    }
+}
