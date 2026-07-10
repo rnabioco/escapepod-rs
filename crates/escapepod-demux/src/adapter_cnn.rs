@@ -440,21 +440,12 @@ pub(crate) fn group_by_len(
     groups.into_iter().collect()
 }
 
-/// Median via a copy-and-select. `O(n log n)` sort is fine for our sizes
-/// (signal lengths of a few thousand post-downscale), and is NaN-tolerant
-/// — NaNs sink to the end of the sort via `partial_cmp` + `Ordering::Equal`.
+/// Median of the finite values. The finite-only filter matters here (NaN/inf
+/// must not skew the adapter MAD); the shared O(n) helper returns 0.0 for the
+/// resulting empty slice, matching the previous behavior.
 fn median(xs: &[f32]) -> f32 {
     let mut v: Vec<f32> = xs.iter().copied().filter(|x| x.is_finite()).collect();
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_unstable_by(|a, b| a.total_cmp(b));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    }
+    escapepod_signal::stats::median_via_select(&mut v)
 }
 
 #[cfg(test)]

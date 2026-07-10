@@ -356,30 +356,9 @@ pub fn detect_adapter(
 /// Uses `select_nth_unstable` for O(N) performance instead of O(N log N) sort.
 /// For even-length arrays, returns the lower-middle element (acceptable for comparisons).
 fn median_slice(data: &[f32]) -> f32 {
-    if data.is_empty() {
-        return 0.0;
-    }
-
-    let mut buf = data.to_vec();
-    let mid = buf.len() / 2;
-
-    // select_nth_unstable partitions so that element at mid is the nth smallest
-    // This is O(N) average case vs O(N log N) for full sort
-    buf.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-
-    if buf.len().is_multiple_of(2) && mid > 0 {
-        // For even length, need to also find max of left partition for true median
-        // Since we're only using this for comparisons, approximate with lower middle
-        // To get exact even-length median:
-        let left_max = buf[..mid]
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .copied()
-            .unwrap_or(buf[mid]);
-        (left_max + buf[mid]) / 2.0
-    } else {
-        buf[mid]
-    }
+    // Copy so the caller's borrowed slice is untouched, then delegate to the
+    // shared O(n) median (bit-identical: same total_cmp order, empty -> 0.0).
+    crate::stats::median_via_select(&mut data.to_vec())
 }
 
 #[cfg(test)]

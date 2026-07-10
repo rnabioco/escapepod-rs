@@ -266,20 +266,12 @@ fn kruskal_h(samples: &[&[usize]]) -> f64 {
     (12.0 / (total * (total + 1.0))) * sum - 3.0 * (total + 1.0)
 }
 
-/// Median of an f32 slice (makes a sorted copy).
+/// Median of an f32 slice (`None` for empty), via the shared O(n) selection.
 fn median_f32(data: &[f32]) -> Option<f32> {
     if data.is_empty() {
         return None;
     }
-    let mut sorted = data.to_vec();
-    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-
-    let len = sorted.len();
-    Some(if len % 2 == 1 {
-        sorted[len / 2]
-    } else {
-        (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
-    })
+    Some(crate::stats::median_via_select(&mut data.to_vec()))
 }
 
 #[cfg(test)]
