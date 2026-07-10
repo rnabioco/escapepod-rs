@@ -23,7 +23,7 @@ required-features = ["gpu"]
 anyhow = { workspace = true }
 escapepod-pod5 = { workspace = true }
 flate2 = "1"
-ndarray = "0.16"
+ndarray = "0.17"
 rand = "0.10"
 rayon = { workspace = true }
 uuid = { workspace = true }
