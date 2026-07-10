@@ -23,8 +23,14 @@ import os
 import escapepod
 
 # Public classes whose members should be exercised, plus module-level names.
-CLASSES = ["Reader", "DatasetReader", "Writer", "ReadData", "RunInfo"]
-MODULE_LEVEL = {"create_run_info": "func", "Pod5Error": "exc"}
+CLASSES = ["Reader", "DatasetReader", "Writer", "ReadData", "RunInfo", "KmerTable"]
+MODULE_LEVEL = {
+    "create_run_info": "func",
+    "Pod5Error": "exc",
+    "mad_normalize": "func",
+    "normalize_signal": "func",
+    "refine_signal_map": "func",
+}
 _THIS = os.path.basename(__file__)
 
 
