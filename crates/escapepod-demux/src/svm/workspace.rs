@@ -77,8 +77,11 @@ impl SvmWorkspace {
         self.pair_probs.reserve(n_pairs);
         self.class_scores.reserve(k);
         self.class_counts.reserve(k);
-        self.r.reserve(k * k);
-        self.q.reserve(k * k);
+        // Size the k×k coupling matrices to their final length once so
+        // `couple_probabilities_with` can overwrite them in place, skipping the
+        // per-call clear()+resize() zero-fill (it writes every entry it reads).
+        self.r.resize(k * k, 0.0);
+        self.q.resize(k * k, 0.0);
         self.p.reserve(k);
         self.qp.reserve(k);
     }

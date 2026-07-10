@@ -3,7 +3,16 @@
 //! A barcode fingerprint is a normalized sequence of signal features (e.g., event means)
 //! that can be used for barcode identification via DTW distance computation.
 
+use std::cell::RefCell;
+
 use uuid::Uuid;
+
+thread_local! {
+    /// Scratch buffer for median/MAD normalization, reused across calls so the
+    /// per-read demux fingerprint path doesn't allocate a fresh copy of the
+    /// values every call.
+    static MEDIAN_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Normalization method for fingerprints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,21 +186,27 @@ pub fn normalize_fingerprint(fp: &mut Fingerprint, method: NormMethod) {
             }
         }
         NormMethod::Median => {
-            // Median + MAD via select_nth_unstable (O(n) expected), reusing the
-            // abs-deviation buffer. Two full sorts would be O(n log n) each.
-            let mut buf = fp.values.clone();
-            let median = median_via_select(&mut buf);
+            // Median + MAD via select_nth_unstable (O(n) expected). The scratch
+            // buffer (a copy of the values, then their abs-deviations) is reused
+            // across calls via a thread-local, so the per-read demux path
+            // doesn't allocate a fresh Vec every fingerprint. Two full sorts
+            // would be O(n log n) each.
+            MEDIAN_SCRATCH.with_borrow_mut(|buf| {
+                buf.clear();
+                buf.extend_from_slice(&fp.values);
+                let median = median_via_select(buf);
 
-            for (v, slot) in fp.values.iter().zip(buf.iter_mut()) {
-                *slot = (*v - median).abs();
-            }
-            let mad = median_via_select(&mut buf);
-
-            if mad > 0.0 {
-                for val in &mut fp.values {
-                    *val = (*val - median) / mad;
+                for (v, slot) in fp.values.iter().zip(buf.iter_mut()) {
+                    *slot = (*v - median).abs();
                 }
-            }
+                let mad = median_via_select(buf);
+
+                if mad > 0.0 {
+                    for val in &mut fp.values {
+                        *val = (*val - median) / mad;
+                    }
+                }
+            });
         }
         NormMethod::Mean => {
             let mean = compute_mean(&fp.values);

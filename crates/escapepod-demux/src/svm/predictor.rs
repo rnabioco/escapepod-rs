@@ -406,8 +406,14 @@ impl<'a> SvmPredictor<'a> {
         // Flat k×k row-major layout for r and q. We hand them to slice views
         // below so the inner loops see `&[f64]` / `&mut [f64]` and can get
         // vectorized by the autovectorizer.
-        ws.r.clear();
-        ws.r.resize(kk, 0.0);
+        // Sized to kk once in `SvmWorkspace::for_model`; only a fresh `new()`
+        // workspace still needs the initial fill. Every off-diagonal entry is
+        // overwritten below and the diagonal is never read, so no per-call
+        // zeroing is required on the hot path.
+        if ws.r.len() != kk {
+            ws.r.clear();
+            ws.r.resize(kk, 0.0);
+        }
         let r = ws.r.as_mut_slice();
 
         let mut pair_idx = 0;
@@ -422,8 +428,12 @@ impl<'a> SvmPredictor<'a> {
 
         // Build Q matrix: Q[t][t] = sum_{j!=t} r[j][t]^2
         //                  Q[t][j] = -r[j][t] * r[t][j]  (j != t)
-        ws.q.clear();
-        ws.q.resize(kk, 0.0);
+        // Same as `r`: sized once, and every entry (including the diagonal) is
+        // written each call, so the fill is only needed for a fresh workspace.
+        if ws.q.len() != kk {
+            ws.q.clear();
+            ws.q.resize(kk, 0.0);
+        }
         let q = ws.q.as_mut_slice();
         for t in 0..k {
             let mut diag = 0.0;

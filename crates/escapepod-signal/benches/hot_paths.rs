@@ -24,7 +24,9 @@ use std::hint::black_box;
 
 use escapepod_signal::compression::vbz;
 use escapepod_signal::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
+use escapepod_signal::resquiggle::adaptive_dp::adaptive_banded_dp;
 use escapepod_signal::resquiggle::dp::{ViterbiBuffers, dp_step_buffered};
+use escapepod_signal::resquiggle::types::RefineAlgo;
 
 /// Read ESCAPEPOD_BENCH_THREADS and pre-configure the rayon global pool.
 /// No-op if the env var isn't set or rayon has already been initialized.
@@ -120,6 +122,41 @@ fn bench_dp_step(c: &mut Criterion) {
     group.finish();
 }
 
+/// Full adaptive banded DP over a whole read (many bases), unlike
+/// `bench_dp_step` which measures a single band step. This exercises the
+/// per-base traceback bookkeeping — the hot path for the traceback-allocation
+/// audit item — so the win scales with `n_bases`.
+fn bench_adaptive_dp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resquiggle_adaptive_dp");
+    let bandwidth = 100usize;
+    // (n_bases, samples-per-base) — long reads are where the allocation bites.
+    for &(n_bases, dwell) in &[(200usize, 10usize), (1000, 10)] {
+        let signal_len = n_bases * dwell;
+        let signal = pseudo_floats(signal_len, 0x5165);
+        let levels = pseudo_floats(n_bases, 0x1EE1);
+        // Monotonic signal-position map of length n_bases + 1, evenly spaced.
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| (i * signal_len) / n_bases).collect();
+        group.throughput(Throughput::Elements(n_bases as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_bases}bases")),
+            &n_bases,
+            |bench, _| {
+                bench.iter(|| {
+                    adaptive_banded_dp(
+                        black_box(&signal),
+                        black_box(&levels),
+                        black_box(bandwidth),
+                        black_box(&initial_map),
+                        black_box(&RefineAlgo::Viterbi),
+                        black_box(None),
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_fingerprint_mad(c: &mut Criterion) {
     let mut group = c.benchmark_group("fingerprint_mad_normalize");
     for &len in &[64usize, 200, 1000] {
@@ -189,6 +226,7 @@ criterion_group!(
     benches,
     bench_dtw,
     bench_dp_step,
+    bench_adaptive_dp,
     bench_fingerprint_mad,
     bench_vbz_roundtrip,
     bench_dtw_matrix,
