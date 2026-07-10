@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Keep criterion output stable and less noisy in CI.
@@ -19,12 +22,14 @@ jobs:
   bench:
     name: criterion baseline vs. main
     runs-on: ubuntu-latest
+    # ~17 min typical; builds + benches both `main` and HEAD, so give room.
+    timeout-minutes: 40
     # Don't gate releases on bench noise; surface regressions via the
     # check output but keep the job non-blocking until we have a stable
     # baseline.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Need full history so we can check out `main` as a baseline.
           fetch-depth: 0
