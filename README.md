@@ -40,20 +40,22 @@ matter; sub-second commands (`inspect`, `view`) are omitted. Measured with
 
 ## Install
 
+The `escpod` binary lives in the `escapepod-cli` crate.
+
 Default build (stable commands only):
 
 ```bash
-cargo install --git https://github.com/rnabioco/escapepod-rs
+cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
 ```
 
 Opt into experimental commands:
 
 ```bash
 # repack, resquiggle, index
-cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
+cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features experimental
 
 # barcode demultiplexing
-cargo install --git https://github.com/rnabioco/escapepod-rs --features demux
+cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features demux
 ```
 
 ## License
