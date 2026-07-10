@@ -114,27 +114,12 @@ impl<'a> SvmPredictor<'a> {
     ///
     /// Score for each class (higher = more similar to that class)
     pub fn kernel_weighted_scores(&self, kernel_values: &[f64]) -> Vec<f64> {
-        let n_classes = self.model.n_classes;
-        let mut class_scores = vec![0.0; n_classes];
-        let mut class_counts = vec![0usize; n_classes];
-
-        // Accumulate kernel-weighted votes for each class. The class index
-        // for each training sample was pre-resolved in `new()`.
-        for (i, class_opt) in self.training_class.iter().enumerate() {
-            if let Some(class_idx) = *class_opt {
-                class_scores[class_idx] += kernel_values[i];
-                class_counts[class_idx] += 1;
-            }
-        }
-
-        // Normalize by class size to avoid bias toward larger classes
-        for (score, count) in class_scores.iter_mut().zip(class_counts.iter()) {
-            if *count > 0 {
-                *score /= *count as f64;
-            }
-        }
-
-        class_scores
+        // Allocating convenience wrapper over the workspace-backed impl so the
+        // accumulate/normalize logic lives in exactly one place.
+        let mut scores = Vec::new();
+        let mut counts = Vec::new();
+        self.kernel_weighted_scores_into(kernel_values, &mut scores, &mut counts);
+        scores
     }
 
     /// Workspace-backed variant. Reuses `scores` / `counts` buffers across

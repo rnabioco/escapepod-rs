@@ -19,7 +19,7 @@ use super::workspace::SvmWorkspace;
 ///
 /// Kernel values (similarity scores)
 pub fn distances_to_kernel(distances: &[f64], params: &KernelParams) -> Vec<f64> {
-    distances.iter().map(|&d| kernel_value(d, params)).collect()
+    distances_to_kernel_iter(distances, params).collect()
 }
 
 /// In-place variant of [`distances_to_kernel`] that writes into a caller-owned
@@ -30,7 +30,16 @@ pub(super) fn distances_to_kernel_into(
     out: &mut Vec<f64>,
 ) {
     out.clear();
-    out.extend(distances.iter().map(|&d| kernel_value(d, params)));
+    out.extend(distances_to_kernel_iter(distances, params));
+}
+
+/// Shared RBF-kernel mapping backing both [`distances_to_kernel`] and
+/// [`distances_to_kernel_into`], so the `exp(-gamma * d^power)` map lives once.
+fn distances_to_kernel_iter<'a>(
+    distances: &'a [f64],
+    params: &'a KernelParams,
+) -> impl Iterator<Item = f64> + 'a {
+    distances.iter().map(move |&d| kernel_value(d, params))
 }
 
 /// Compute one RBF kernel value: `exp(-gamma * distance^power)`.

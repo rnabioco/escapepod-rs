@@ -244,10 +244,7 @@ impl AdapterCnn {
         for (len, group) in group_by_len(&prepped, &valid_idx) {
             let run = (|| -> Result<Vec<usize>, AdapterCnnError> {
                 let g = group.len();
-                let mut data = vec![0f32; g * len];
-                for (row, &i) in group.iter().enumerate() {
-                    data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
-                }
+                let data = pack_batch(&prepped, &group, len);
                 let input = Tensor::from_shape(&[g, 1, len], &data)
                     .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
                 let outputs = self
@@ -268,18 +265,7 @@ impl AdapterCnn {
                     .map(|row| decode_adapter_end(&cfg, length_out, len, |k| scores[[row, 0, k]]))
                     .collect())
             })();
-            match run {
-                Ok(ends) => {
-                    for (&i, end) in group.iter().zip(ends) {
-                        out[i] = Ok(end);
-                    }
-                }
-                Err(e) => {
-                    for &i in &group {
-                        out[i] = Err(e.clone());
-                    }
-                }
-            }
+            scatter_group(&mut out, &group, run);
         }
         out
     }
@@ -438,6 +424,41 @@ pub(crate) fn group_by_len(
         groups.entry(len).or_default().push(i);
     }
     groups.into_iter().collect()
+}
+
+/// Pack a set of same-length prepped signals into a row-major `[g, 1, len]` f32
+/// batch buffer, gathered from `prepped` at `indices`. No padding — every row is
+/// exactly `len`. Shared by the CPU (tract) and GPU (onnxruntime) batch paths so
+/// the batch layout stays byte-identical between backends.
+pub(crate) fn pack_batch(prepped: &[Option<Vec<f32>>], indices: &[usize], len: usize) -> Vec<f32> {
+    let mut data = vec![0f32; indices.len() * len];
+    for (row, &i) in indices.iter().enumerate() {
+        data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
+    }
+    data
+}
+
+/// Scatter a group/sub-batch's inference `result` into `out` at each read's
+/// original index: `Ok` writes each read's decoded adapter-end in order; `Err`
+/// clones the error to every read in the group. Shared by the CPU and GPU batch
+/// paths (which resolve `indices` per whole-group and per sub-batch respectively).
+pub(crate) fn scatter_group(
+    out: &mut [Result<usize, AdapterCnnError>],
+    indices: &[usize],
+    result: Result<Vec<usize>, AdapterCnnError>,
+) {
+    match result {
+        Ok(ends) => {
+            for (&i, end) in indices.iter().zip(ends) {
+                out[i] = Ok(end);
+            }
+        }
+        Err(e) => {
+            for &i in indices {
+                out[i] = Err(e.clone());
+            }
+        }
+    }
 }
 
 /// Median of the finite values. The finite-only filter matters here (NaN/inf
