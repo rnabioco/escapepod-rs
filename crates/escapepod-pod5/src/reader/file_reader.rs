@@ -203,10 +203,9 @@ impl Reader {
             });
         }
 
-        // Skip to the desired batch
-        for _ in 0..index {
-            reader.next();
-        }
+        // Seek directly to the batch via the IPC footer's block offsets (O(1))
+        // instead of decoding every preceding batch.
+        reader.set_index(index)?;
 
         reader
             .next()
@@ -569,7 +568,11 @@ impl Reader {
         for (read_idx, (key, _)) in reads.iter().enumerate() {
             let chunks = &mut result_chunks[read_idx];
             chunks.sort_by_key(|(idx, _)| *idx);
-            let signal: Vec<i16> = chunks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+            // Pre-size the concatenated signal so the flat_map doesn't grow-and-
+            // realloc; the total length is the sum of the per-chunk lengths.
+            let total: usize = chunks.iter().map(|(_, s)| s.len()).sum();
+            let mut signal = Vec::with_capacity(total);
+            signal.extend(chunks.iter().flat_map(|(_, s)| s.iter().copied()));
             results.push((key.clone(), signal));
         }
 
@@ -639,10 +642,9 @@ impl Reader {
         }
 
         let mut results = Vec::with_capacity(reads.len());
-        for (read_idx, (key, _)) in reads.iter().enumerate() {
-            let chunks = &mut per_read[read_idx];
+        for ((key, _), mut chunks) in reads.iter().zip(per_read) {
             chunks.sort_by_key(|(idx, _)| *idx);
-            let v: Vec<CompressedSignalChunk> = chunks.drain(..).map(|(_, c)| c).collect();
+            let v: Vec<CompressedSignalChunk> = chunks.into_iter().map(|(_, c)| c).collect();
             results.push((key.clone(), v));
         }
 
@@ -946,8 +948,6 @@ impl Reader {
     /// This is much faster than iterating over all reads when you only need the IDs,
     /// as it uses Arrow column projection to avoid loading other columns.
     pub fn read_ids(&self) -> Result<Vec<Uuid>> {
-        use arrow::array::{Array, AsArray};
-
         let embedded = self
             .footer
             .reads_table()
@@ -958,24 +958,29 @@ impl Reader {
 
         let mut read_ids = Vec::new();
         for batch_result in reader {
-            let batch = batch_result?;
-            // The projected batch will have read_id as column 0
-            if let Some(col) = batch.column(0).as_fixed_size_binary_opt() {
-                for row in 0..col.len() {
-                    if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
-                        read_ids.push(uuid);
-                    }
-                }
-            }
+            Self::extract_uuids_from_batch(&batch_result?, &mut read_ids);
         }
 
         Ok(read_ids)
     }
 
+    /// Append every valid read-id UUID from column 0 (a `FixedSizeBinaryArray`)
+    /// of a read_id-projected reads batch to `out`. Rows that don't parse as a
+    /// UUID are skipped; a non-binary column 0 contributes nothing.
+    fn extract_uuids_from_batch(batch: &RecordBatch, out: &mut Vec<Uuid>) {
+        use arrow::array::{Array, AsArray};
+        if let Some(col) = batch.column(0).as_fixed_size_binary_opt() {
+            out.reserve(col.len());
+            for row in 0..col.len() {
+                if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
+                    out.push(uuid);
+                }
+            }
+        }
+    }
+
     /// Get read IDs from a specific batch efficiently (reads only the read_id column).
     pub fn read_ids_from_batch(&self, batch_idx: usize) -> Result<Vec<Uuid>> {
-        use arrow::array::{Array, AsArray};
-
         let embedded = self
             .footer
             .reads_table()
@@ -991,10 +996,9 @@ impl Reader {
             });
         }
 
-        // Skip to the desired batch
-        for _ in 0..batch_idx {
-            reader.next();
-        }
+        // Seek directly to the batch via the IPC footer's block offsets (O(1))
+        // instead of decoding every preceding batch.
+        reader.set_index(batch_idx)?;
 
         let batch = reader.next().ok_or_else(|| Error::BatchIndexOutOfBounds {
             index: batch_idx,
@@ -1002,13 +1006,7 @@ impl Reader {
         })??;
 
         let mut read_ids = Vec::new();
-        if let Some(col) = batch.column(0).as_fixed_size_binary_opt() {
-            for row in 0..col.len() {
-                if let Ok(uuid) = Uuid::from_slice(col.value(row)) {
-                    read_ids.push(uuid);
-                }
-            }
-        }
+        Self::extract_uuids_from_batch(&batch, &mut read_ids);
 
         Ok(read_ids)
     }
@@ -1053,6 +1051,7 @@ impl Reader {
                         field: "read_id".to_string(),
                         message: "Expected FixedSizeBinaryArray".to_string(),
                     })?;
+            entries.reserve(col.len());
             for row in 0..col.len() {
                 let bytes = col.value(row);
                 if bytes.len() == 16 {
