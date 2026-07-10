@@ -10,7 +10,9 @@ import escapepod
 
 # Locate a small test POD5 file relative to repo root
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-TEST_POD5 = REPO_ROOT / "ext" / "dorado" / "tests" / "data" / "pod5" / "single_na24385.pod5"
+TEST_POD5 = (
+    REPO_ROOT / "ext" / "dorado" / "tests" / "data" / "pod5" / "single_na24385.pod5"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +239,9 @@ class TestSignal:
         read = reader.reads()[0]
         raw = reader.get_signal(read)
         pa = reader.get_signal_pa(read)
-        expected = (raw.astype(np.float32) + read.calibration_offset) * read.calibration_scale
+        expected = (
+            raw.astype(np.float32) + read.calibration_offset
+        ) * read.calibration_scale
         np.testing.assert_allclose(pa, expected, rtol=1e-5)
 
     def test_get_signals_bulk(self, reader):
@@ -856,14 +860,14 @@ class TestDataFrame:
         assert len(d["read_id"]) == reader.read_count
 
     def test_to_pandas(self, dataset_dir):
-        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pandas")
         ds = escapepod.DatasetReader(dataset_dir)
         df = ds.to_pandas()
         assert list(df["read_id"]) and len(df) == 5
         assert "calibration_scale" in df.columns
 
     def test_to_polars(self, dataset_dir):
-        pl = pytest.importorskip("polars")
+        pytest.importorskip("polars")
         ds = escapepod.DatasetReader(dataset_dir)
         df = ds.to_polars()
         assert df.height == 5
@@ -875,7 +879,9 @@ class TestCalibrateSignalArray:
         read = reader.reads()[0]
         adc = reader.get_signal(read)
         pa = read.calibrate_signal_array(adc)
-        expected = (adc.astype(np.float32) + read.calibration_offset) * read.calibration_scale
+        expected = (
+            adc.astype(np.float32) + read.calibration_offset
+        ) * read.calibration_scale
         np.testing.assert_allclose(pa, expected, rtol=1e-5)
 
 
