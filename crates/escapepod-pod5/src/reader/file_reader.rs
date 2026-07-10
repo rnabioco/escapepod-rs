@@ -2,6 +2,7 @@
 
 use crate::CompressedSignalChunk;
 use crate::arrow_helpers::{BatchFieldExtractor, ReadsBatchView};
+use crate::arrow_ipc::ArrowIpcFooter;
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::footer::{self, Footer};
@@ -15,11 +16,9 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::RwLock;
 
 use super::read_index::{P5I_MAGIC, P5I_VERSION, ReadIndex};
 use super::read_iter::{ReadIterator, extract_read_from_batch};
-use super::signal_cache::{SignalBatchCache, SignalBatchMetadata};
 use super::signal_extractor::SignalExtractor;
 
 /// Signal-row + calibration data for a single read, returned by
@@ -43,10 +42,13 @@ pub struct Reader {
     footer: Footer,
     /// Cached run info data.
     run_info_cache: Vec<RunInfoData>,
-    /// Signal batch metadata for O(1) batch lookup (lazy — computed on first use).
-    signal_metadata: OnceLock<Option<SignalBatchMetadata>>,
-    /// LRU cache for signal batches (thread-safe for parallel operations).
-    signal_cache: RwLock<SignalBatchCache>,
+    /// Parsed Arrow IPC footer of the signal table (lazy — computed on first
+    /// signal access). Owns only per-batch offset/row-count descriptors, so
+    /// signal fetches locate a row and slice its compressed bytes straight out
+    /// of the mmap via [`ArrowIpcFooter::extract_signal_rows`] — no whole-batch
+    /// Arrow deserialization. `None` when the file has no signal table or the
+    /// footer can't be parsed (callers fall back to the Arrow reader path).
+    signal_ipc_footer: OnceLock<Option<ArrowIpcFooter>>,
     /// Cached read UUID index: UUID → (batch_idx, row_within_batch).
     /// Lazily built on first lookup via `.p5i` sidecar or column-projected scan.
     read_index: OnceLock<ReadIndex>,
@@ -118,8 +120,11 @@ impl Reader {
         Self::open_with_cache_size(path, DEFAULT_MAX_CACHED_BATCHES)
     }
 
-    /// Open a POD5 file with a custom signal batch cache size.
-    pub fn open_with_cache_size<P: AsRef<Path>>(path: P, cache_size: usize) -> Result<Self> {
+    /// Open a POD5 file. The `cache_size` argument is retained for API
+    /// compatibility but no longer used: signal is now read via a zero-copy,
+    /// lock-free path that slices compressed bytes directly from the mmap, so
+    /// there is no per-batch cache to size.
+    pub fn open_with_cache_size<P: AsRef<Path>>(path: P, _cache_size: usize) -> Result<Self> {
         let file_path = path.as_ref().to_path_buf();
         let file = File::open(&file_path)?;
 
@@ -164,54 +169,35 @@ impl Reader {
             mmap,
             footer,
             run_info_cache,
-            signal_metadata: OnceLock::new(),
-            signal_cache: RwLock::new(SignalBatchCache::new(cache_size)),
+            signal_ipc_footer: OnceLock::new(),
             read_index: OnceLock::new(),
             file_path: Some(file_path),
         })
     }
 
-    /// Load signal batch metadata for efficient batch lookup.
+    /// Lazily parse and cache the signal table's Arrow IPC footer.
     ///
-    /// Uses the Arrow IPC footer (a few KB at the end of the signal table)
-    /// to extract per-batch row counts, avoiding deserialization of the first
-    /// signal batch (which can be 50-100MB on large files). Storing the full
-    /// cumulative-rows prefix lets lookups handle non-uniform batch sizes —
-    /// critical for files produced by `merge_files`, where each source file
-    /// contributes its own batches verbatim.
-    fn load_signal_metadata(mmap: &Mmap, footer: &Footer) -> Result<Option<SignalBatchMetadata>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
-
-        let embedded = match footer.signal_table() {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        let start = embedded.offset as usize;
-        let end = start + embedded.length as usize;
-
-        if end > mmap.len() {
-            return Err(Error::InvalidFooter(
-                "Signal table extends beyond file".to_string(),
-            ));
-        }
-
-        let slice = &mmap[start..end];
-        let ipc_footer = ArrowIpcFooter::parse(slice)?;
-
-        if ipc_footer.record_batches.is_empty() || ipc_footer.total_rows == 0 {
-            return Ok(None);
-        }
-
-        let mut cumulative_rows = Vec::with_capacity(ipc_footer.record_batches.len() + 1);
-        cumulative_rows.push(0u64);
-        let mut running = 0u64;
-        for batch in &ipc_footer.record_batches {
-            running += batch.row_count;
-            cumulative_rows.push(running);
-        }
-
-        Ok(Some(SignalBatchMetadata { cumulative_rows }))
+    /// Reads only the footer (a few KB at the end of the signal table) to
+    /// enumerate per-batch offsets and row counts, avoiding deserialization of
+    /// any signal batch (which can be 50-100 MB on large files). The parsed
+    /// footer owns nothing but these descriptors, so signal fetches locate a
+    /// row and slice its compressed bytes straight out of the mmap. Returns
+    /// `None` when the file has no signal table, the table extends past EOF, or
+    /// the footer is empty/unparseable — callers fall back to the Arrow reader.
+    fn signal_ipc_footer(&self) -> Option<&ArrowIpcFooter> {
+        self.signal_ipc_footer
+            .get_or_init(|| {
+                let embedded = self.footer.signal_table()?;
+                let start = embedded.offset as usize;
+                let end = start + embedded.length as usize;
+                let slice = self.mmap.get(start..end)?;
+                let footer = ArrowIpcFooter::parse(slice).ok()?;
+                if footer.record_batches.is_empty() || footer.total_rows == 0 {
+                    return None;
+                }
+                Some(footer)
+            })
+            .as_ref()
     }
 
     /// Get the file identifier (UUID).
@@ -406,91 +392,28 @@ impl Reader {
 
     /// Get signal data for a read.
     ///
-    /// The `signal_rows` parameter should be the signal row indices from the read record.
-    /// Uses O(1) batch lookup and LRU caching for efficient repeated access.
+    /// The `signal_rows` parameter should be the signal row indices from the
+    /// read record. Slices each row's compressed bytes directly out of the
+    /// mmap via the cached signal footer and VBZ-decodes only that row — it
+    /// never deserializes the surrounding batch. Thread-safe and lock-free:
+    /// the same primitive backs the parallel [`SignalExtractor`].
     pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
-        // Lazily compute signal metadata on first use
-        let metadata = self
-            .signal_metadata
-            .get_or_init(|| Self::load_signal_metadata(&self.mmap, &self.footer).unwrap_or(None));
+        let Some(footer) = self.signal_ipc_footer() else {
+            // No parseable signal footer (missing table / edge case): fall back
+            // to Arrow's own IPC reader.
+            return self.get_signal_fallback(signal_rows);
+        };
 
-        if let Some(metadata) = metadata {
-            return self.get_signal_optimized(signal_rows, metadata);
+        let signal_bytes = self.signal_table_bytes()?;
+        let raw_chunks = footer.extract_signal_rows(signal_rows, signal_bytes)?;
+        let total_samples: usize = raw_chunks.iter().map(|c| c.samples as usize).sum();
+        let mut all_samples = Vec::with_capacity(total_samples);
+        for chunk in &raw_chunks {
+            let decompressed =
+                compression::decompress_signal(chunk.signal, chunk.samples as usize)?;
+            all_samples.extend_from_slice(&decompressed);
         }
-
-        // Fallback to original implementation for files without signal table
-        self.get_signal_fallback(signal_rows)
-    }
-
-    /// Optimized signal retrieval using O(1) batch lookup and LRU cache.
-    fn get_signal_optimized(
-        &self,
-        signal_rows: &[u64],
-        metadata: &SignalBatchMetadata,
-    ) -> Result<Vec<i16>> {
-        let embedded = self
-            .footer
-            .signal_table()
-            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
-
-        let mut all_samples = Vec::new();
-
-        for &row_idx in signal_rows {
-            let (batch_idx, local_row) =
-                metadata
-                    .locate(row_idx)
-                    .ok_or_else(|| Error::BatchIndexOutOfBounds {
-                        index: row_idx as usize,
-                        max: metadata.num_batches(),
-                    })?;
-
-            // Try a shared read lock first — cache hits dominate and the
-            // atomic access counter lets us update LRU without an exclusive
-            // lock, removing contention among parallel readers.
-            let samples = {
-                let cache = self.signal_cache.read().unwrap();
-                if let Some(batch) = cache.get(batch_idx) {
-                    self.extract_signal_from_batch(batch, local_row)?
-                } else {
-                    drop(cache);
-
-                    let batch = self.load_signal_batch(embedded, batch_idx)?;
-                    let samples = self.extract_signal_from_batch(&batch, local_row)?;
-
-                    self.signal_cache.write().unwrap().insert(batch_idx, batch);
-
-                    samples
-                }
-            };
-
-            all_samples.extend(samples);
-        }
-
         Ok(all_samples)
-    }
-
-    /// Load a specific signal batch by index.
-    fn load_signal_batch(
-        &self,
-        embedded: &crate::footer::EmbeddedFile,
-        batch_idx: usize,
-    ) -> Result<RecordBatch> {
-        let mut reader = self.create_arrow_reader(embedded)?;
-
-        // Seek directly to the desired batch via the IPC footer's block
-        // offsets. The previous `for _ in 0..batch_idx { reader.next() }`
-        // skip-loop *decoded* every preceding batch (O(N) materialize +
-        // memcpy/memset per call, O(N^2) over a scan), which dominated cold
-        // demux reads on a network FS. `set_index` is an O(1) seek.
-        reader.set_index(batch_idx)?;
-
-        reader
-            .next()
-            .ok_or_else(|| Error::BatchIndexOutOfBounds {
-                index: batch_idx,
-                max: reader.num_batches(),
-            })?
-            .map_err(Error::from)
     }
 
     /// Fallback signal retrieval for edge cases (no signal metadata).
@@ -783,126 +706,37 @@ impl Reader {
     /// Get compressed signal chunks for specific row indices only.
     /// This is more efficient than get_all_signal_compressed() when only a subset
     /// of reads are needed (e.g., for filter operations).
-    /// Uses O(1) batch lookup and LRU caching for repeated access.
+    ///
+    /// Slices each requested row's compressed bytes directly out of the mmap via
+    /// the cached signal footer — no whole-batch Arrow deserialization. For many
+    /// rows in one call, prefer [`Self::get_compressed_signal_bulk`], which reads
+    /// batches in ascending file order for sequential I/O.
     pub fn get_compressed_signal_for_rows(
         &self,
         signal_rows: &[u64],
     ) -> Result<Vec<CompressedSignalChunk>> {
-        // Lazily compute signal metadata on first use
-        let metadata = self
-            .signal_metadata
-            .get_or_init(|| Self::load_signal_metadata(&self.mmap, &self.footer).unwrap_or(None));
-
-        if let Some(metadata) = metadata {
-            return self.get_compressed_signal_optimized(signal_rows, metadata);
-        }
-
-        // Fallback: load all and filter (less efficient)
-        let all_signal = self.get_all_signal_compressed()?;
-        let mut result = Vec::with_capacity(signal_rows.len());
-        for &idx in signal_rows {
-            if let Some(chunk) = all_signal.get(idx as usize) {
-                result.push(chunk.clone());
-            }
-        }
-        Ok(result)
-    }
-
-    /// Optimized compressed signal retrieval using O(1) batch lookup and LRU cache.
-    fn get_compressed_signal_optimized(
-        &self,
-        signal_rows: &[u64],
-        metadata: &SignalBatchMetadata,
-    ) -> Result<Vec<CompressedSignalChunk>> {
-        let embedded = self
-            .footer
-            .signal_table()
-            .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
-
-        let mut result = Vec::with_capacity(signal_rows.len());
-
-        for &row_idx in signal_rows {
-            let (batch_idx, local_row) =
-                metadata
-                    .locate(row_idx)
-                    .ok_or_else(|| Error::BatchIndexOutOfBounds {
-                        index: row_idx as usize,
-                        max: metadata.num_batches(),
-                    })?;
-
-            // Shared read lock on the hit path; upgrade to write only on miss.
-            let chunk = {
-                let cache = self.signal_cache.read().unwrap();
-                if let Some(batch) = cache.get(batch_idx) {
-                    self.extract_single_compressed_chunk(batch, local_row)?
-                } else {
-                    drop(cache);
-                    let batch = self.load_signal_batch(embedded, batch_idx)?;
-                    let chunk = self.extract_single_compressed_chunk(&batch, local_row)?;
-                    self.signal_cache.write().unwrap().insert(batch_idx, batch);
-                    chunk
+        let Some(footer) = self.signal_ipc_footer() else {
+            // Fallback: load all and filter (less efficient)
+            let all_signal = self.get_all_signal_compressed()?;
+            let mut result = Vec::with_capacity(signal_rows.len());
+            for &idx in signal_rows {
+                if let Some(chunk) = all_signal.get(idx as usize) {
+                    result.push(chunk.clone());
                 }
-            };
+            }
+            return Ok(result);
+        };
 
-            result.push(chunk);
-        }
-
-        Ok(result)
-    }
-
-    /// Extract a single compressed signal chunk from a batch row.
-    fn extract_single_compressed_chunk(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> Result<CompressedSignalChunk> {
-        use arrow::array::AsArray;
-        use arrow::datatypes::UInt32Type;
-
-        let read_id_col = batch
-            .column_by_name("read_id")
-            .ok_or_else(|| Error::MissingField("read_id column".to_string()))?;
-        let signal_col = batch
-            .column_by_name("signal")
-            .ok_or_else(|| Error::MissingField("signal column".to_string()))?;
-        let samples_col = batch
-            .column_by_name("samples")
-            .ok_or_else(|| Error::MissingField("samples column".to_string()))?;
-
-        let read_id_array =
-            read_id_col
-                .as_fixed_size_binary_opt()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "read_id".to_string(),
-                    message: "Expected FixedSizeBinaryArray".to_string(),
-                })?;
-
-        let signal_array =
-            signal_col
-                .as_binary_opt::<i64>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected LargeBinaryArray".to_string(),
-                })?;
-
-        let samples_array = samples_col
-            .as_primitive_opt::<UInt32Type>()
-            .ok_or_else(|| Error::InvalidField {
-                field: "samples".to_string(),
-                message: "Expected UInt32Array".to_string(),
-            })?;
-
-        let read_id_bytes = read_id_array.value(row);
-        let read_id =
-            Uuid::from_slice(read_id_bytes).map_err(|e| Error::InvalidUuid(e.to_string()))?;
-        let compressed_data = signal_array.value(row);
-        let samples = samples_array.value(row);
-
-        Ok(CompressedSignalChunk {
-            read_id,
-            samples,
-            data: Arc::from(compressed_data),
-        })
+        let signal_bytes = self.signal_table_bytes()?;
+        let raw_chunks = footer.extract_signal_rows(signal_rows, signal_bytes)?;
+        Ok(raw_chunks
+            .iter()
+            .map(|raw| CompressedSignalChunk {
+                read_id: Uuid::from_bytes(raw.read_id),
+                samples: raw.samples,
+                data: Arc::from(raw.signal),
+            })
+            .collect())
     }
 
     /// Extract compressed signal chunks from a batch.

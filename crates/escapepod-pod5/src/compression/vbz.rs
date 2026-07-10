@@ -102,9 +102,20 @@ pub fn decompress_signal_prefix(
     if n == 0 {
         return Ok(Vec::new());
     }
-    // No truncation possible / worthwhile — decode the whole chunk.
-    if n == total_samples {
-        return decompress_signal(data, total_samples);
+    // Streaming a prefix out of ZSTD is slower *per byte* than one-shot
+    // `decode_all` — it decodes block-by-block through a `read_exact` loop and
+    // always inflates the full keys section (sized for `total_samples`). It only
+    // pays off when the skipped tail is large. When the requested prefix is a
+    // big fraction of the chunk, one-shot decode + truncate is faster overall:
+    // measured on ~10k-sample reads, a ~40%-prefix stream lost to a full decode.
+    // Gate at 1/4 — stream only when we can skip ≥75% of the samples — so mRNA
+    // (tiny adapter window in a long transcript) still streams while short reads
+    // fall back to the fast path. Both branches are bit-identical to
+    // `decompress_signal(..)[..n]`.
+    if n.saturating_mul(4) >= total_samples {
+        let mut full = decompress_signal(data, total_samples)?;
+        full.truncate(n);
+        return Ok(full);
     }
     if data.is_empty() {
         return Err(Error::Decompression(
