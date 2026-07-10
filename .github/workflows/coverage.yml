@@ -19,7 +19,7 @@ jobs:
     # ~8 min typical (instrumented double-run: lcov + html); 25 covers cold.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 

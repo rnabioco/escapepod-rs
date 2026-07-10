@@ -29,7 +29,7 @@ jobs:
     # baseline.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Need full history so we can check out `main` as a baseline.
           fetch-depth: 0
