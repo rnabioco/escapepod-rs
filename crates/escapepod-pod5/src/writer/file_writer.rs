@@ -286,6 +286,15 @@ impl Writer {
         Ok(idx)
     }
 
+    /// Record a read's pore-type and end-reason in the writer dictionaries.
+    /// In predefined-dictionary mode this fails if a value isn't in the
+    /// predefined list. Shared by `add_read` and `add_read_with_compressed_signal`.
+    fn track_dictionaries(&mut self, read: &ReadData) -> Result<()> {
+        self.get_pore_type_index(read.pore_type.as_str())?;
+        self.get_end_reason_index(read.end_reason.as_str())?;
+        Ok(())
+    }
+
     /// Add a read with its signal data.
     pub fn add_read(&mut self, read: ReadData, signal: &[i16]) -> Result<()> {
         if self.finalized {
@@ -317,8 +326,7 @@ impl Writer {
         }
 
         // Track dictionary entries (may fail in predefined mode)
-        self.get_pore_type_index(read.pore_type.as_str())?;
-        self.get_end_reason_index(read.end_reason.as_str())?;
+        self.track_dictionaries(&read)?;
 
         self.pending_reads.push(PendingRead {
             data: read,
@@ -362,8 +370,7 @@ impl Writer {
         }
 
         // Track dictionary entries (may fail in predefined mode)
-        self.get_pore_type_index(read.pore_type.as_str())?;
-        self.get_end_reason_index(read.end_reason.as_str())?;
+        self.track_dictionaries(&read)?;
 
         self.pending_reads.push(PendingRead {
             data: read,
@@ -519,8 +526,7 @@ impl Writer {
         }
 
         // Track dictionary entries (may fail in predefined mode)
-        self.get_pore_type_index(read.pore_type.as_str())?;
-        self.get_end_reason_index(read.end_reason.as_str())?;
+        self.track_dictionaries(&read)?;
 
         self.pending_reads.push(PendingRead {
             data: read,
