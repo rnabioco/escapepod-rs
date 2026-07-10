@@ -197,7 +197,7 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
 pub mod gpu_pipeline {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use ndarray::Array2;
 
     use escapepod_signal::dtw::{
@@ -210,7 +210,7 @@ pub mod gpu_pipeline {
     /// Persistent device-side state for the on-GPU SVM pipeline.
     pub struct GpuSvmContext<'a> {
         ctx: &'a GpuDtwContext,
-        device: Arc<CudaDevice>,
+        stream: Arc<CudaStream>,
         // Pre-loaded kernels.
         dtw_func: cudarc::driver::CudaFunction,
         rbf_func: cudarc::driver::CudaFunction,
@@ -246,7 +246,7 @@ pub mod gpu_pipeline {
             model: &DtwSvmModel,
             max_chunk_q: usize,
         ) -> Result<Self, GpuDtwError> {
-            let device = ctx.device().clone();
+            let stream = ctx.stream().clone();
 
             let dtw_func = ctx.function(DTW_MODULE_NAME, DTW_KERNEL_NAME)?;
             let rbf_func = ctx.function(SVM_MODULE_NAME, RBF_KERNEL_NAME)?;
@@ -266,8 +266,8 @@ pub mod gpu_pipeline {
                 }
                 r_off.push(flat_r.len() as i32);
             }
-            let refs_dev = device.htod_sync_copy(&flat_r)?;
-            let r_off_dev = device.htod_sync_copy(&r_off)?;
+            let refs_dev = stream.clone_htod(&flat_r)?;
+            let r_off_dev = stream.clone_htod(&r_off)?;
 
             // Build the flat OvO coef table on host. Size: n_pairs × n_sv.
             //
@@ -357,16 +357,16 @@ pub mod gpu_pipeline {
                 }
             }
 
-            let coef_dev = device.htod_sync_copy(&coef_flat)?;
-            let intercept_dev = device.htod_sync_copy(&intercept_f32)?;
+            let coef_dev = stream.clone_htod(&coef_flat)?;
+            let intercept_dev = stream.clone_htod(&intercept_f32)?;
 
             // Persistent output buffers sized for the maximum chunk.
-            let dist_dev = device.alloc_zeros::<f32>(max_chunk_q * n_sv)?;
-            let decisions_dev = device.alloc_zeros::<f32>(max_chunk_q * n_pairs)?;
+            let dist_dev = stream.alloc_zeros::<f32>(max_chunk_q * n_sv)?;
+            let decisions_dev = stream.alloc_zeros::<f32>(max_chunk_q * n_pairs)?;
 
             Ok(Self {
                 ctx,
-                device,
+                stream,
                 dtw_func,
                 rbf_func,
                 decision_func,
@@ -416,8 +416,8 @@ pub mod gpu_pipeline {
                 }
                 q_off.push(flat_q.len() as i32);
             }
-            let queries_dev = self.device.htod_sync_copy(&flat_q)?;
-            let q_off_dev = self.device.htod_sync_copy(&q_off)?;
+            let queries_dev = self.stream.clone_htod(&flat_q)?;
+            let q_off_dev = self.stream.clone_htod(&q_off)?;
 
             if max_n > i32::MAX as usize || self.max_m > i32::MAX as usize {
                 return Err(GpuDtwError::InputTooLarge {
@@ -459,23 +459,26 @@ pub mod gpu_pipeline {
                 shared_mem_bytes,
             };
 
+            let n_q_i = n_q as i32;
+            let n_sv_i = self.n_sv as i32;
+            let max_n_i = max_n as i32;
+            let max_m_i = self.max_m as i32;
+            let penalty = self.penalty;
+            let mut builder = self.stream.launch_builder(&self.dtw_func);
+            builder
+                .arg(&queries_dev)
+                .arg(&q_off_dev)
+                .arg(&self.refs_dev)
+                .arg(&self.r_off_dev)
+                .arg(&mut self.dist_dev)
+                .arg(&n_q_i)
+                .arg(&n_sv_i)
+                .arg(&max_n_i)
+                .arg(&max_m_i)
+                .arg(&window_i32)
+                .arg(&penalty);
             unsafe {
-                self.dtw_func.clone().launch(
-                    dtw_cfg,
-                    (
-                        &queries_dev,
-                        &q_off_dev,
-                        &self.refs_dev,
-                        &self.r_off_dev,
-                        &mut self.dist_dev,
-                        n_q as i32,
-                        self.n_sv as i32,
-                        max_n as i32,
-                        self.max_m as i32,
-                        window_i32,
-                        self.penalty,
-                    ),
-                )?;
+                builder.launch(dtw_cfg)?;
             }
 
             // ---- RBF in-place ---------------------------------------------------
@@ -489,11 +492,16 @@ pub mod gpu_pipeline {
                 block_dim: (rbf_block, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let gamma = self.gamma;
+            let power = self.power;
+            let mut builder = self.stream.launch_builder(&self.rbf_func);
+            builder
+                .arg(&mut self.dist_dev)
+                .arg(&n_cells_i64)
+                .arg(&gamma)
+                .arg(&power);
             unsafe {
-                self.rbf_func.clone().launch(
-                    rbf_cfg,
-                    (&mut self.dist_dev, n_cells_i64, self.gamma, self.power),
-                )?;
+                builder.launch(rbf_cfg)?;
             }
 
             // ---- OvO decision ---------------------------------------------------
@@ -502,19 +510,18 @@ pub mod gpu_pipeline {
                 block_dim: (32, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let n_pairs_i = self.n_pairs as i32;
+            let mut builder = self.stream.launch_builder(&self.decision_func);
+            builder
+                .arg(&self.dist_dev)
+                .arg(&n_q_i)
+                .arg(&n_sv_i)
+                .arg(&n_pairs_i)
+                .arg(&self.coef_dev)
+                .arg(&self.intercept_dev)
+                .arg(&mut self.decisions_dev);
             unsafe {
-                self.decision_func.clone().launch(
-                    dec_cfg,
-                    (
-                        &self.dist_dev,
-                        n_q as i32,
-                        self.n_sv as i32,
-                        self.n_pairs as i32,
-                        &self.coef_dev,
-                        &self.intercept_dev,
-                        &mut self.decisions_dev,
-                    ),
-                )?;
+                builder.launch(dec_cfg)?;
             }
 
             // ---- dtoh just the decisions table -----------------------------
@@ -528,8 +535,7 @@ pub mod gpu_pipeline {
             // cudarc's CudaSlice supports slicing via `.try_clone()` +
             // index, but the simplest path is a sized helper:
             let decisions_view = self.decisions_dev.slice(0..total_out);
-            self.device
-                .dtoh_sync_copy_into(&decisions_view, &mut host_out)?;
+            self.stream.memcpy_dtoh(&decisions_view, &mut host_out)?;
 
             Ok(Array2::from_shape_vec((n_q, self.n_pairs), host_out)
                 .expect("shape matches by construction"))
@@ -542,7 +548,7 @@ pub mod gpu_pipeline {
     fn _keep_alive_check<'a>(c: &GpuSvmContext<'a>) {
         let _ = (
             &c.ctx,
-            &c.device,
+            &c.stream,
             &c.refs_dev,
             &c.r_off_dev,
             &c.coef_dev,
