@@ -4,6 +4,24 @@
 
 ### Added
 
+- **Native GBM (gradient-boosted tree-ensemble) barcode classifier** for
+  `demux classify` / fused `demux`, alongside the existing DTW+SVM path.
+  Fingerprints are scored directly by a distilled tree ensemble (no DTW),
+  loaded from the same auto-detected model surface. Fused-pipeline support
+  is included, so `escpod demux --model gbm.json …` routes reads end-to-end.
+- **Architecture-agnostic GPU CNN/TCN adapter detection** (`demux detect
+  --method cnn --gpu`, feature `cnn-gpu`): runs any `[B,1,L] -> [B,2,L]`
+  ONNX graph batched through onnxruntime's CUDA execution provider via the
+  `ort` crate (`load-dynamic` — needs a CUDA-enabled `libonnxruntime` on
+  `ORT_DYLIB_PATH` and a visible GPU at run time, nothing at build time).
+  TCN detect is inference-bound, so this pays off (~7.6× end-to-end on an
+  A30 at 20k reads). This is the ONNX-generic backend anticipated by the
+  removal of the old arch-locked CUDA kernel below — it replaces it without
+  hardcoding a topology.
+- **pod5-parity Python API**: a multi-file `DatasetReader`, `to_dict` /
+  `to_pandas` / `to_polars` exporters, `missing_ok` handling,
+  `calibrate_signal_array`, `Writer.add_reads`, and per-read `byte_count`,
+  bringing the `escapepod` bindings closer to the reference `pod5` package.
 - **POD5 reads-table schema V5**: the `expected_open_pore_level` and
   `selected_read_level` fields (both `float32`), introduced upstream in pod5
   0.3.44, are now read, written, merged/filtered, surfaced in `view`/`inspect`
@@ -41,22 +59,47 @@
   by POD5 read + signal prep, not CNN compute, so the CPU path is as fast or
   faster (the GPU flag's own help already said as much). Removing it also drops
   the CC-BY-NC `.weights` dumper. If a GPU CNN path is ever needed again, add an
-  ONNX-generic backend (e.g. ORT CUDA EP) rather than a per-architecture kernel.
+  ONNX-generic backend (e.g. ORT CUDA EP) rather than a per-architecture
+  kernel — which is exactly what the new `cnn-gpu` path (see **Added**) does.
 
 ### Changed
 
+- **CLI output split into logs vs. data.** All status/progress/warning output
+  now flows through `tracing` to **stderr** (`timestamp LEVEL [target] message`),
+  while command *data* (TSV/CSV rows, `inspect`/`summary` reports, ID lists)
+  stays on **stdout**, so it can be piped/redirected independently of logs.
+  Default level is `info`; control it with `-v`/`-vv`/`-q` or `RUST_LOG`.
+  Progress bars auto-hide under `-q`.
+- **Minimum supported Rust version raised to 1.95** (from 1.92).
 - The LLR detect `--downscale` default is now **10** (the WarpDemuX-native
   mode) for `demux` and `demux detect`, up from 1. This makes detect — the
   dominant prep stage — ~5× faster, with ~98% barcode agreement versus
   full-resolution (ds=1). Pass `--downscale 1` to restore full-resolution
   detect.
 - Dependency bumps (no behavior change): Arrow ecosystem `arrow` + `parquet`
-  58 → 59, `tabled` 0.20 → 0.21, and the `noodles-*` BAM stack (`bam` 0.90,
-  `sam` 0.85, `bgzf` 0.47, `core` 0.20, `csi` 0.56). `ndarray` is held at 0.16
-  — the `linfa` SVM stack still pins it, so 0.17 is blocked upstream.
+  58 → 59, `tabled` 0.20 → 0.21, the `noodles-*` BAM stack (`bam` 0.90,
+  `sam` 0.85, `bgzf` 0.47, `core` 0.20, `csi` 0.56), `ndarray` 0.16 → 0.17,
+  `cudarc` 0.12 → 0.19, and `tract-onnx` 0.21 → 0.23.
 
 ### Performance
 
+- **Demux classify DTW is much faster, bit-identical.** Per-call DTW
+  allocation eliminated from the SVM classifier (~1.8×), then extended with
+  lane-parallel SIMD DTW (8 signals/vector) covering windowed/penalty models
+  as well — together a large end-to-end speedup on the DTW-bound path.
+- **GBM classify ~3.1× faster** (compact tree arena + 8-read batched walk),
+  bit-identical.
+- **Cold-read demux I/O fixed.** Signal is now read in a single sequential
+  memory-mapped stream with O(1) Arrow-batch seeks and dictionary pre-scan /
+  readahead, instead of per-read random access across many threads (which
+  degraded to demand-paging on cold files). Removes the large-POD5 startup
+  stall and the cold-read throughput cliff.
+- **Zero-copy single-read signal fetch** with adaptive prefix decode
+  (#94): the reader's per-read signal path avoids materializing intermediate
+  buffers, and fingerprint prep streams only the needed prefix.
+- **Faster Python read iteration**: per-batch column resolution for the lazy
+  `for rd in reader:` iterator and `reads()`, plus numpy-backed metadata
+  columns for `to_dict` / `to_pandas` / `to_polars`.
 - Codebase-wide optimization/refactor sweep (#86), all bit-identical output:
   - **Resquiggle adaptive banded DP ~31% faster** — the per-base traceback no
     longer heap-allocates a `Vec` per base; the whole read shares one flat
