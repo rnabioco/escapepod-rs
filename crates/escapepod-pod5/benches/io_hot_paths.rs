@@ -123,6 +123,8 @@ fn sample_read(run_info_idx: u32, read_number: u32, num_samples: u64) -> ReadDat
         time_since_mux_change: 0.0,
         num_samples,
         open_pore_level: 220.0,
+        expected_open_pore_level: 0.0,
+        selected_read_level: 0.0,
         signal_rows: Vec::new(),
     }
 }

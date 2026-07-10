@@ -13,8 +13,12 @@ pub const POD5_SIGNATURE: [u8; 8] = [0x8B, b'P', b'O', b'D', b'\r', b'\n', 0x1A,
 pub const FOOTER_MAGIC: [u8; 8] = *b"FOOTER\0\0";
 
 /// Current POD5 specification version.
+///
+/// Stamped into each written file's `MINKNOW:pod5_version` metadata and footer.
+/// Tracks the upstream release whose reads-table schema we emit — currently V5
+/// (`expected_open_pore_level`, `selected_read_level`), introduced in 0.3.44.
 /// See: <https://pod5-file-format.readthedocs.io/en/latest/SPECIFICATION.html>
-pub const POD5_VERSION: &str = "0.3.10";
+pub const POD5_VERSION: &str = "0.3.44";
 
 /// Length of section marker UUIDs in bytes.
 pub const SECTION_MARKER_LENGTH: usize = 16;
@@ -212,6 +216,10 @@ pub struct ReadData {
     pub num_samples: u64,
     /// Estimated open pore current level.
     pub open_pore_level: f32,
+    /// Expected open pore current level for this read (POD5 V5).
+    pub expected_open_pore_level: f32,
+    /// Selected pore level for this read (POD5 V5).
+    pub selected_read_level: f32,
     /// Signal row indices into the signal table.
     pub signal_rows: Vec<u64>,
 }
@@ -240,6 +248,8 @@ impl Default for ReadData {
             time_since_mux_change: 0.0,
             num_samples: 0,
             open_pore_level: 0.0,
+            expected_open_pore_level: 0.0,
+            selected_read_level: 0.0,
             signal_rows: Vec::new(),
         }
     }
@@ -273,6 +283,8 @@ impl ReadData {
             time_since_mux_change: self.time_since_mux_change,
             num_samples: self.num_samples,
             open_pore_level: self.open_pore_level,
+            expected_open_pore_level: self.expected_open_pore_level,
+            selected_read_level: self.selected_read_level,
             signal_rows: Vec::new(),
         }
     }

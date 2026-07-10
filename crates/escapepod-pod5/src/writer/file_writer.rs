@@ -633,6 +633,9 @@ impl Writer {
             StringDictionaryBuilder::new();
         // V4 builders
         let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
+        // V5 builders
+        let mut expected_open_pore_level_builder = Float32Builder::with_capacity(num_reads);
+        let mut selected_read_level_builder = Float32Builder::with_capacity(num_reads);
 
         for pending in self.pending_reads.drain(..) {
             let read = &pending.data;
@@ -675,6 +678,9 @@ impl Writer {
             }
             // V4
             open_pore_level_builder.append_value(read.open_pore_level);
+            // V5
+            expected_open_pore_level_builder.append_value(read.expected_open_pore_level);
+            selected_read_level_builder.append_value(read.selected_read_level);
         }
 
         let arrays: Vec<ArrayRef> = vec![
@@ -705,6 +711,9 @@ impl Writer {
             Arc::new(run_info_builder.finish()),
             // V4
             Arc::new(open_pore_level_builder.finish()),
+            // V5
+            Arc::new(expected_open_pore_level_builder.finish()),
+            Arc::new(selected_read_level_builder.finish()),
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), arrays)?;
@@ -1074,6 +1083,8 @@ mod tests {
             time_since_mux_change: 0.0,
             num_samples,
             open_pore_level: 220.0,
+            expected_open_pore_level: 0.0,
+            selected_read_level: 0.0,
             signal_rows: Vec::new(),
         }
     }
@@ -1145,6 +1156,8 @@ mod tests {
             time_since_mux_change: 0.0,
             num_samples: 1000,
             open_pore_level: 220.0,
+            expected_open_pore_level: 0.0,
+            selected_read_level: 0.0,
             signal_rows: Vec::new(), // Populated by writer
         };
 
@@ -1241,6 +1254,8 @@ mod tests {
                 time_since_mux_change: 0.0,
                 num_samples: 500,
                 open_pore_level: 220.0,
+                expected_open_pore_level: 0.0,
+                selected_read_level: 0.0,
                 signal_rows: Vec::new(),
             };
 

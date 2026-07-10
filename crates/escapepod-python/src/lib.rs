@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod dataset;
 mod error;
 mod read_data;
 mod reader;
@@ -10,6 +11,7 @@ mod writer;
 fn escapepod(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<reader::PyReader>()?;
+    m.add_class::<dataset::PyDatasetReader>()?;
     m.add_class::<read_data::PyReadData>()?;
     m.add_class::<read_data::PyRunInfo>()?;
     m.add_class::<writer::PyWriter>()?;

@@ -322,6 +322,9 @@ pub struct ReadsBatchView<'a> {
     run_info_keys: &'a Int16Array,
     // V4
     open_pore_level: Option<&'a Float32Array>,
+    // V5
+    expected_open_pore_level: Option<&'a Float32Array>,
+    selected_read_level: Option<&'a Float32Array>,
 }
 
 impl<'a> ReadsBatchView<'a> {
@@ -430,6 +433,11 @@ impl<'a> ReadsBatchView<'a> {
             )?,
             run_info_keys: run_info_dict.keys(),
             open_pore_level,
+            expected_open_pore_level: optional_typed::<Float32Array>(
+                batch,
+                "expected_open_pore_level",
+            ),
+            selected_read_level: optional_typed::<Float32Array>(batch, "selected_read_level"),
         })
     }
 
@@ -533,6 +541,14 @@ impl<'a> ReadsBatchView<'a> {
                 .unwrap_or(0.0),
             num_samples: self.num_samples.value(row),
             open_pore_level: self.open_pore_level.map(|a| a.value(row)).unwrap_or(0.0),
+            expected_open_pore_level: self
+                .expected_open_pore_level
+                .map(|a| a.value(row))
+                .unwrap_or(0.0),
+            selected_read_level: self
+                .selected_read_level
+                .map(|a| a.value(row))
+                .unwrap_or(0.0),
             signal_rows,
         })
     }

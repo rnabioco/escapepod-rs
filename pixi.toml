@@ -27,7 +27,7 @@ python = ">=3.10"
 numpy = "*"
 
 [feature.python-test.pypi-dependencies]
-maturin = ">=1.8,<2"
+maturin = ">=1.9,<2"
 pytest = "*"
 pod5 = ">=0.3.36,<0.4"
 
