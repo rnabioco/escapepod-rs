@@ -295,6 +295,101 @@ ONNX) — **not** reverting #80's BoundariesCNN-locked CUDA kernel, which cannot
 run the TCN. Numbers are synthetic fixed-L throughput; a production path needs
 length-bucketing and GPU-vs-tract `adapter_end` parity on real signals.
 
+## Python library: escapepod vs pod5 (2026-07-09)
+
+Harness: `benchmarks/benchmark_python.py` (wrapper `benchmark_python.sh`).
+Unlike `benchmark.sh` — which times the `escpod` vs `pod5` **CLIs** with
+hyperfine — this exercises the two **Python libraries** in-process, so the
+numbers reflect library work, not interpreter startup + import. Each case runs
+the same logical operation through both libraries, warms up, times several
+repetitions, and reports the median; a checksum asserts the two libraries agree
+(int16 signal is bit-identical, pA sums match within last-ULP float32 drift).
+
+Input: `ext/WarpDemuX/test_data/demux/4000_rna004.pod5` (81 MB, 4000 reads).
+Node: `rna` partition, `escapepod` 0.5.1 vs `pod5` 0.3.39, 7 runs / 2 warmup.
+
+| Benchmark | escapepod | pod5 | speedup |
+|---|---:|---:|---:|
+| open + metadata | 4.21 ms | 16.50 ms | **3.92×** |
+| read_ids | 476 µs | 541 µs | 1.14× |
+| iterate read metadata | 4.20 ms | 3.52 ms | 0.84× |
+| read all signal (int16) | 209.7 ms | 264.1 ms | **1.26×** |
+| read all signal (pA) | 217.4 ms | 355.0 ms | **1.63×** |
+| metadata → pandas | 15.3 ms | 2.5 ms | 0.16× |
+| random-access selection | 333 µs | 162 µs | 0.49× |
+| read all signal (batched, `get_signals`) | 284.1 ms | — | esc-only |
+
+speedup = pod5 median / escapepod median (>1 ⇒ escapepod faster). escapepod wins
+on file open and signal decode (VBZ + calibration); pod5 wins on the pandas
+export (its metadata is already an Arrow table, so `to_pandas` is near-free,
+whereas escapepod builds the frame) and on tiny random-access selections. The
+escapepod-only batched `get_signals` case has no pod5 API equivalent.
+
+### Larger file (20k reads)
+
+A 20 000-read subset of a 2 GB real run
+(`ThrRS_ser_b6.pod5`, 220k reads total; subset written via `--limit 20000`).
+Node: `rna`, escapepod 0.5.1 vs pod5 0.3.39, 5 runs / 1 warmup.
+
+| Benchmark | escapepod | pod5 | speedup |
+|---|---:|---:|---:|
+| open + metadata | 133 µs | 612 µs | **4.59×** |
+| read_ids | 2.54 ms | 2.64 ms | 1.04× |
+| iterate read metadata | 21.4 ms | 17.4 ms | 0.81× |
+| read all signal (int16) | 541.2 ms | 758.8 ms | **1.40×** |
+| read all signal (pA) | 551.0 ms | 1.047 s | **1.90×** |
+| metadata → pandas | 75.7 ms | 8.2 ms | 0.11× |
+| random-access selection (500) | 1.18 ms | 835 µs | 0.71× |
+| read all signal (batched, `get_signals`) | 602.3 ms | — | esc-only |
+
+The picture holds and sharpens at scale: escapepod's signal-decode lead widens
+(pA 1.63× → **1.90×**). One gap stands out as a real optimization target:
+
+- **`metadata → pandas` gets *worse* with size** (0.16× → 0.11×). `to_dict`/
+  `to_pandas` built Python **lists of boxed scalars** per column, which pandas
+  then re-parsed into numpy arrays; pod5 goes Arrow→pandas columnar with no
+  per-element boxing. **Fixed in #99** by emitting numpy columns directly
+  (`to_pandas` 4k: 15.3 → 8.0 ms, 0.16× → 0.36×). The residual is upstream
+  `ReadData` materialization in `collect_inner` (~63 % of wall at 220k reads:
+  heap `Uuid`/`pore_type`/`end_reason` strings + an unused `signal_rows` `Vec`
+  per read) — building columns straight from the Arrow batch is tracked in #98.
+
+The `get_signals` (batched) row looked slower here (602 ms vs the per-read
+541 ms), but a controlled A/B rules that out as a measurement artifact:
+`get_signal_bulk` is batch-grouped + rayon-parallel VBZ decode, and on the same
+reads at 16 threads it runs **427 ms vs 526 ms per-read (1.23×)**, scaling 2.8×
+from 1→16 threads. Per-read decode is single-threaded and flat across thread
+count, so `get_signals` is the right API for bulk signal — the batched number
+above just reflects run-to-run variance on that particular subset, not a
+regression. (A streaming/iterator variant that avoids materializing every signal
+at once would cut its peak memory, but is not needed for throughput.)
+
+**Why random-access selection is slower:** the test file has no `.p5i` index
+sidecar, so escapepod's `reads(selection=…)` falls back to a linear scan of the
+whole reads table — decoding every read_id and testing set membership, O(total
+reads) — while pod5 resolves the selection against an in-memory read-id index,
+O(selection). Building the index first (`reader.build_index()`, or shipping the
+`.p5i`) drops escapepod from 0.47 ms → 0.21 ms, on par with pod5's 0.16–0.23 ms.
+The table reports the default (no-index) path; for repeated random access on one
+reader, call `build_index()` once up front.
+
+### Reproducing
+
+```bash
+# Rebuild the extension first if the Rust bindings changed — a stale wheel would
+# benchmark an old API (the wrapper warns if installed version != workspace).
+pixi run -e python-test maturin develop --release \
+    --manifest-path crates/escapepod-python/Cargo.toml
+
+# Small file (runs anywhere)
+./benchmarks/benchmark_python.sh ext/WarpDemuX/test_data/demux/4000_rna004.pod5
+
+# Large file — cap the signal loops to N reads (writes a subset first) and run
+# under SLURM so it's off the 2-core login node
+srun -p rna -c 32 --mem=32G ./benchmarks/benchmark_python.sh \
+    big.pod5 --limit 20000 --runs 5 --json /tmp/pybench.json
+```
+
 ## Running Benchmarks
 
 ```bash
@@ -309,3 +404,6 @@ cargo build --release
 
 - `hyperfine`: `cargo install hyperfine` or system package manager
 - `pod5`: `pip install pod5` or `pixi add pod5`
+- Python-library benchmark (`benchmark_python.sh`): both `escapepod` and `pod5`
+  in the `python-test` pixi env — `pixi run -e python-test maturin develop
+  --release --manifest-path crates/escapepod-python/Cargo.toml`
