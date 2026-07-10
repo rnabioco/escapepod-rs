@@ -11,7 +11,7 @@ use crate::read_data::{PyReadData, PyRunInfo};
 /// Convert raw ADC samples to picoamperes: `(adc + offset) * scale`.
 ///
 /// Uses `mul_add` so LLVM can emit FMA on AVX2+ and keep the loop tight.
-fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
+pub(crate) fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
     let bias = offset * scale;
     raw.iter()
         .map(|&adc| f32::from(adc).mul_add(scale, bias))
@@ -119,38 +119,63 @@ impl PyReader {
     /// ----------
     /// selection : list[str], optional
     ///     Read IDs to retrieve. If None, returns all reads.
+    /// missing_ok : bool, optional
+    ///     If False (default), raise KeyError when any requested ID is absent.
+    ///     If True, silently skip missing IDs. Ignored when selection is None.
     ///
     /// Returns
     /// -------
     /// list[ReadData]
-    #[pyo3(signature = (selection=None))]
-    fn reads(&self, selection: Option<Vec<String>>) -> PyResult<Vec<PyReadData>> {
-        match selection {
-            Some(read_ids) => {
-                let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
-                    .iter()
-                    .map(|s| {
-                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
-                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
-                        })
-                    })
-                    .collect::<PyResult<_>>()?;
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn reads(&self, selection: Option<Vec<String>>, missing_ok: bool) -> PyResult<Vec<PyReadData>> {
+        Ok(self
+            .collect_inner(selection, missing_ok)?
+            .into_iter()
+            .map(|inner| PyReadData { inner })
+            .collect())
+    }
 
-                let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
-                Ok(reads
-                    .into_iter()
-                    .map(|inner| PyReadData { inner })
-                    .collect())
-            }
-            None => {
-                let mut result = Vec::new();
-                for read_result in self.inner.reads().map_err(to_py_err)? {
-                    let inner = read_result.map_err(to_py_err)?;
-                    result.push(PyReadData { inner });
-                }
-                Ok(result)
-            }
-        }
+    /// Read metadata as a column-oriented dict (one list per field).
+    ///
+    /// Construct a DataFrame with `pd.DataFrame(reader.to_dict())` (pandas) or
+    /// `pl.DataFrame(reader.to_dict())` (polars) without a hard dependency on
+    /// either. Signal is not included; fetch it via `get_signal`.
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let reads = self.collect_inner(selection, missing_ok)?;
+        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+        crate::read_data::reads_to_columns(py, &refs)
+    }
+
+    /// Read metadata as a `pandas.DataFrame` (pandas imported lazily).
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn to_pandas<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let reads = self.collect_inner(selection, missing_ok)?;
+        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+        crate::read_data::columns_to_pandas(py, &refs)
+    }
+
+    /// Read metadata as a `polars.DataFrame` (polars imported lazily).
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn to_polars<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let reads = self.collect_inner(selection, missing_ok)?;
+        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+        crate::read_data::columns_to_polars(py, &refs)
     }
 
     /// Look up a single read by UUID string.
@@ -175,17 +200,13 @@ impl PyReader {
     ///
     /// Uses indexed batch-skipping when a .p5i sidecar exists,
     /// otherwise falls back to a single-pass scan with early exit.
-    fn get_reads(&self, read_ids: Vec<String>) -> PyResult<Vec<PyReadData>> {
-        let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
-            .iter()
-            .map(|s| {
-                escapepod_signal::utils::parse_uuid_flexible(s)
-                    .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))
-            })
-            .collect::<PyResult<_>>()?;
-
-        let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
-        Ok(reads
+    ///
+    /// If `missing_ok` is False (default), raises KeyError when any requested
+    /// ID is absent; set it True to silently skip missing IDs.
+    #[pyo3(signature = (read_ids, missing_ok=false))]
+    fn get_reads(&self, read_ids: Vec<String>, missing_ok: bool) -> PyResult<Vec<PyReadData>> {
+        Ok(self
+            .collect_inner(Some(read_ids), missing_ok)?
             .into_iter()
             .map(|inner| PyReadData { inner })
             .collect())
@@ -277,6 +298,21 @@ impl PyReader {
             .collect()
     }
 
+    /// Number of stored (VBZ-compressed) signal bytes for a read.
+    ///
+    /// Matches `pod5.ReadRecord.byte_count`. Sums the compressed chunk sizes
+    /// without decompressing.
+    fn byte_count(&self, py: Python<'_>, read: &PyReadData) -> PyResult<usize> {
+        let signal_rows = read.inner.signal_rows.clone();
+        py.detach(|| {
+            let chunks = self
+                .inner
+                .get_compressed_signal_for_rows(&signal_rows)
+                .map_err(to_py_err)?;
+            Ok(chunks.iter().map(|c| c.data.len()).sum())
+        })
+    }
+
     // -- Index management --------------------------------------------------
 
     /// Check if a .p5i sidecar index exists for this file.
@@ -345,6 +381,48 @@ impl PyReader {
             batch_row: 0,
             batch_num_rows: 0,
         })
+    }
+}
+
+impl PyReader {
+    /// Collect read metadata, optionally filtered by a selection of IDs.
+    ///
+    /// Shared backing for `reads`, `get_reads`, `to_dict`, and `to_pandas`.
+    fn collect_inner(
+        &self,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Vec<escapepod_signal::ReadData>> {
+        match selection {
+            Some(read_ids) => {
+                let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
+                    .iter()
+                    .map(|s| {
+                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
+                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
+                        })
+                    })
+                    .collect::<PyResult<_>>()?;
+
+                let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
+                if !missing_ok && reads.len() != target_ids.len() {
+                    let missing = target_ids.len() - reads.len();
+                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "{missing} of {} requested read id(s) not found \
+                         (pass missing_ok=True to ignore)",
+                        target_ids.len()
+                    )));
+                }
+                Ok(reads)
+            }
+            None => {
+                let mut result = Vec::new();
+                for read_result in self.inner.reads().map_err(to_py_err)? {
+                    result.push(read_result.map_err(to_py_err)?);
+                }
+                Ok(result)
+            }
+        }
     }
 }
 

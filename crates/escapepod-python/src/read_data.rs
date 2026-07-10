@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
+use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::error::to_py_err;
+use crate::reader::adc_to_pa;
 use crate::writer::parse_end_reason;
 
 /// A single read's metadata from a POD5 file.
@@ -212,6 +215,25 @@ impl PyReadData {
         self.inner.signal_rows.clone()
     }
 
+    /// Calibrate an int16 ADC signal array to picoamperes using this read's
+    /// calibration, returning a float32 numpy array.
+    ///
+    /// Matches `pod5.ReadRecord.calibrate_signal_array`; applies
+    /// `pA = (ADC + calibration_offset) * calibration_scale`.
+    fn calibrate_signal_array<'py>(
+        &self,
+        py: Python<'py>,
+        signal_adc: &Bound<'py, PyArray1<i16>>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let raw: Vec<i16> = signal_adc.to_vec()?;
+        let pa = adc_to_pa(
+            &raw,
+            self.inner.calibration_offset,
+            self.inner.calibration_scale,
+        );
+        Ok(PyArray1::from_vec(py, pa))
+    }
+
     fn __eq__(&self, other: &Self) -> bool {
         self.inner.read_id == other.inner.read_id
     }
@@ -415,4 +437,166 @@ impl PyRunInfo {
     fn __repr__(&self) -> String {
         format!("{}", self.inner)
     }
+}
+
+/// Build a column-oriented dict of read metadata suitable for constructing a
+/// pandas/polars DataFrame (`pd.DataFrame(reader.to_dict())`).
+///
+/// Scalar metadata fields only — signal is fetched separately. Column names
+/// mirror `ReadData`'s properties so the frame matches the object surface.
+pub(crate) fn reads_to_columns<'py>(
+    py: Python<'py>,
+    reads: &[&escapepod_signal::ReadData],
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "read_id",
+        reads
+            .iter()
+            .map(|r| r.read_id.to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "read_number",
+        reads.iter().map(|r| r.read_number).collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "start_sample",
+        reads.iter().map(|r| r.start_sample).collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "channel",
+        reads.iter().map(|r| r.channel).collect::<Vec<_>>(),
+    )?;
+    dict.set_item("well", reads.iter().map(|r| r.well).collect::<Vec<_>>())?;
+    dict.set_item(
+        "pore_type",
+        reads
+            .iter()
+            .map(|r| r.pore_type.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "calibration_offset",
+        reads
+            .iter()
+            .map(|r| r.calibration_offset)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "calibration_scale",
+        reads
+            .iter()
+            .map(|r| r.calibration_scale)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "median_before",
+        reads.iter().map(|r| r.median_before).collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "end_reason",
+        reads
+            .iter()
+            .map(|r| r.end_reason.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "end_reason_forced",
+        reads
+            .iter()
+            .map(|r| r.end_reason_forced)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "run_info_index",
+        reads.iter().map(|r| r.run_info_index).collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "num_minknow_events",
+        reads
+            .iter()
+            .map(|r| r.num_minknow_events)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "num_samples",
+        reads.iter().map(|r| r.num_samples).collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "tracked_scaling_scale",
+        reads
+            .iter()
+            .map(|r| r.tracked_scaling_scale)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "tracked_scaling_shift",
+        reads
+            .iter()
+            .map(|r| r.tracked_scaling_shift)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "predicted_scaling_scale",
+        reads
+            .iter()
+            .map(|r| r.predicted_scaling_scale)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "predicted_scaling_shift",
+        reads
+            .iter()
+            .map(|r| r.predicted_scaling_shift)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "num_reads_since_mux_change",
+        reads
+            .iter()
+            .map(|r| r.num_reads_since_mux_change)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "time_since_mux_change",
+        reads
+            .iter()
+            .map(|r| r.time_since_mux_change)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "open_pore_level",
+        reads.iter().map(|r| r.open_pore_level).collect::<Vec<_>>(),
+    )?;
+    Ok(dict)
+}
+
+/// Wrap a column dict in a `pandas.DataFrame`, importing pandas lazily so the
+/// dependency is only required by callers that ask for a frame.
+pub(crate) fn columns_to_pandas<'py>(
+    py: Python<'py>,
+    reads: &[&escapepod_signal::ReadData],
+) -> PyResult<Bound<'py, PyAny>> {
+    let cols = reads_to_columns(py, reads)?;
+    let pandas = py.import("pandas").map_err(|_| {
+        pyo3::exceptions::PyImportError::new_err(
+            "pandas is required for to_pandas(); install pandas or use to_dict()",
+        )
+    })?;
+    pandas.call_method1("DataFrame", (cols,))
+}
+
+/// Wrap a column dict in a `polars.DataFrame`, importing polars lazily.
+pub(crate) fn columns_to_polars<'py>(
+    py: Python<'py>,
+    reads: &[&escapepod_signal::ReadData],
+) -> PyResult<Bound<'py, PyAny>> {
+    let cols = reads_to_columns(py, reads)?;
+    let polars = py.import("polars").map_err(|_| {
+        pyo3::exceptions::PyImportError::new_err(
+            "polars is required for to_polars(); install polars or use to_dict()",
+        )
+    })?;
+    polars.call_method1("DataFrame", (cols,))
 }

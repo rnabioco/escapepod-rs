@@ -562,3 +562,247 @@ class TestIndex:
             count = reader.build_index()
             assert count == reader.read_count
             assert reader.has_index
+
+
+# ---------------------------------------------------------------------------
+# Helpers for tests that need synthetic multi-file datasets
+# ---------------------------------------------------------------------------
+
+
+def _write_pod5(path, read_ids, samples_per_read=500, acq_id="ds-acq"):
+    """Write a small POD5 with one read per id and return the id list."""
+    ri = escapepod.create_run_info(acquisition_id=acq_id, sample_rate=4000)
+    with escapepod.Writer(str(path)) as writer:
+        ri_idx = writer.add_run_info(ri)
+        for i, rid in enumerate(read_ids):
+            signal = np.arange(samples_per_read, dtype=np.int16) + i
+            writer.add_read(
+                read_id=rid,
+                read_number=i,
+                start_sample=i * samples_per_read,
+                channel=i + 1,
+                well=1,
+                pore_type="not_set",
+                calibration_offset=10.0,
+                calibration_scale=0.2,
+                median_before=200.0,
+                end_reason="signal_positive",
+                end_reason_forced=False,
+                run_info_index=ri_idx,
+                num_minknow_events=0,
+                signal=signal,
+            )
+    return read_ids
+
+
+# Two files' worth of stable UUIDs
+_IDS_A = [f"aaaaaaaa-0000-0000-0000-{i:012d}" for i in range(3)]
+_IDS_B = [f"bbbbbbbb-0000-0000-0000-{i:012d}" for i in range(2)]
+
+
+@pytest.fixture
+def single_file():
+    """A single synthetic POD5 with the file-A reads (no external fixture)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "single.pod5"
+        _write_pod5(path, _IDS_A, acq_id="acq-single")
+        yield path
+
+
+@pytest.fixture
+def dataset_dir():
+    """A directory holding two POD5 files (3 + 2 reads), with a subdir file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write_pod5(root / "file_a.pod5", _IDS_A, acq_id="acq-a")
+        sub = root / "sub"
+        sub.mkdir()
+        _write_pod5(sub / "file_b.pod5", _IDS_B, acq_id="acq-b")
+        yield root
+
+
+class TestDatasetReader:
+    def test_open_directory_recursive(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        assert ds.file_count == 2
+        assert ds.read_count == 5
+        assert len(ds) == 5
+
+    def test_non_recursive_skips_subdir(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir, recursive=False)
+        assert ds.file_count == 1
+        assert ds.read_count == 3
+
+    def test_open_list_of_files(self, dataset_dir):
+        files = [dataset_dir / "file_a.pod5", dataset_dir / "sub" / "file_b.pod5"]
+        ds = escapepod.DatasetReader(files)
+        assert ds.file_count == 2
+        assert set(ds.read_ids()) == set(_IDS_A + _IDS_B)
+
+    def test_empty_directory_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="no POD5 files"):
+                escapepod.DatasetReader(tmpdir)
+
+    def test_iteration(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        seen = [r.read_id for r in ds]
+        assert set(seen) == set(_IDS_A + _IDS_B)
+        assert len(seen) == 5
+
+    def test_context_manager(self, dataset_dir):
+        with escapepod.DatasetReader(dataset_dir) as ds:
+            assert ds.read_count == 5
+
+    def test_run_infos_deduped(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        acqs = {ri.acquisition_id for ri in ds.run_infos}
+        assert acqs == {"acq-a", "acq-b"}
+
+    def test_selection_across_files(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        sel = [_IDS_A[0], _IDS_B[1]]
+        reads = ds.reads(selection=sel)
+        assert {r.read_id for r in reads} == set(sel)
+
+    def test_selection_missing_raises(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        bogus = "cccccccc-0000-0000-0000-000000000000"
+        with pytest.raises(KeyError):
+            ds.reads(selection=[_IDS_A[0], bogus])
+
+    def test_selection_missing_ok(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        bogus = "cccccccc-0000-0000-0000-000000000000"
+        reads = ds.reads(selection=[_IDS_A[0], bogus], missing_ok=True)
+        assert {r.read_id for r in reads} == {_IDS_A[0]}
+
+    def test_signal_routing(self, dataset_dir):
+        """Signal for a read in file B must come from file B, not A."""
+        ds = escapepod.DatasetReader(dataset_dir)
+        # Read index 1 in file_b was written with signal arange(500)+1
+        read = ds.reads(selection=[_IDS_B[1]])[0]
+        sig = ds.get_signal(read)
+        np.testing.assert_array_equal(sig, np.arange(500, dtype=np.int16) + 1)
+
+    def test_bulk_signals_order_preserved(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        reads = ds.reads(selection=_IDS_A + _IDS_B)
+        results = ds.get_signals(reads)
+        by_id = {rid: sig for rid, sig in results}
+        assert set(by_id) == set(_IDS_A + _IDS_B)
+        # file_a read 0 -> arange+0, file_b read 1 -> arange+1
+        np.testing.assert_array_equal(by_id[_IDS_A[0]], np.arange(500, dtype=np.int16))
+
+    def test_signal_pa_calibrated(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        read = ds.reads(selection=[_IDS_A[0]])[0]
+        pa = ds.get_signal_pa(read)
+        expected = (np.arange(500, dtype=np.float32) + 10.0) * 0.2
+        np.testing.assert_allclose(pa, expected, rtol=1e-5)
+
+    def test_byte_count(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        read = ds.reads(selection=[_IDS_B[1]])[0]
+        n = ds.byte_count(read)
+        # Compressed size is positive and smaller than the raw int16 payload.
+        assert 0 < n < read.num_samples * 2
+
+
+class TestMissingOk:
+    def test_reader_selection_missing_raises(self, single_file):
+        reader = escapepod.Reader(str(single_file))
+        good = _IDS_A[0]
+        bogus = "cccccccc-0000-0000-0000-000000000000"
+        with pytest.raises(KeyError):
+            reader.reads(selection=[good, bogus])
+
+    def test_reader_selection_missing_ok(self, single_file):
+        reader = escapepod.Reader(str(single_file))
+        good = _IDS_A[0]
+        bogus = "cccccccc-0000-0000-0000-000000000000"
+        reads = reader.reads(selection=[good, bogus], missing_ok=True)
+        assert len(reads) == 1
+
+    def test_get_reads_missing_ok(self, single_file):
+        reader = escapepod.Reader(str(single_file))
+        good = _IDS_A[0]
+        bogus = "cccccccc-0000-0000-0000-000000000000"
+        assert len(reader.get_reads([good, bogus], missing_ok=True)) == 1
+        with pytest.raises(KeyError):
+            reader.get_reads([good, bogus])
+
+
+class TestDataFrame:
+    def test_to_dict_columns(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        d = ds.to_dict()
+        assert d["read_id"] and len(d["read_id"]) == 5
+        assert "num_samples" in d
+        assert "channel" in d
+        # every column has the same length
+        assert len({len(v) for v in d.values()}) == 1
+
+    def test_reader_to_dict(self, single_file):
+        reader = escapepod.Reader(str(single_file))
+        d = reader.to_dict()
+        assert len(d["read_id"]) == reader.read_count
+
+    def test_to_pandas(self, dataset_dir):
+        pd = pytest.importorskip("pandas")
+        ds = escapepod.DatasetReader(dataset_dir)
+        df = ds.to_pandas()
+        assert list(df["read_id"]) and len(df) == 5
+        assert "calibration_scale" in df.columns
+
+    def test_to_polars(self, dataset_dir):
+        pl = pytest.importorskip("polars")
+        ds = escapepod.DatasetReader(dataset_dir)
+        df = ds.to_polars()
+        assert df.height == 5
+
+
+class TestCalibrateSignalArray:
+    def test_calibrate(self, single_file):
+        reader = escapepod.Reader(str(single_file))
+        read = reader.reads()[0]
+        adc = reader.get_signal(read)
+        pa = read.calibrate_signal_array(adc)
+        expected = (adc.astype(np.float32) + read.calibration_offset) * read.calibration_scale
+        np.testing.assert_allclose(pa, expected, rtol=1e-5)
+
+
+class TestByteCount:
+    def test_reader_byte_count(self, single_file):
+        reader = escapepod.Reader(str(single_file))
+        read = reader.reads()[0]
+        n = reader.byte_count(read)
+        assert 0 < n < read.num_samples * 2
+
+
+class TestBatchWrite:
+    def test_add_reads_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "batch.pod5"
+            ri = escapepod.create_run_info(acquisition_id="batch-acq")
+            reads = [
+                escapepod.ReadData(read_id=rid, channel=i + 1)
+                for i, rid in enumerate(_IDS_A)
+            ]
+            signals = [np.arange(300, dtype=np.int16) + i for i in range(len(reads))]
+
+            with escapepod.Writer(str(path)) as w:
+                w.add_run_info(ri)
+                w.add_reads(reads, signals)
+
+            with escapepod.Reader(str(path)) as r:
+                assert r.read_count == len(_IDS_A)
+                assert set(r.read_ids()) == set(_IDS_A)
+
+    def test_add_reads_length_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad.pod5"
+            with escapepod.Writer(str(path)) as w:
+                reads = [escapepod.ReadData(read_id=_IDS_A[0])]
+                with pytest.raises(ValueError, match="same length"):
+                    w.add_reads(reads, [])

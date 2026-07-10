@@ -229,6 +229,39 @@ impl PyWriter {
             .map_err(to_py_err)
     }
 
+    /// Add many reads at once from parallel lists of ReadData and signals.
+    ///
+    /// Equivalent to calling `add_read_data` for each pair, but in a single
+    /// call (mirrors `pod5.Writer.add_reads`). `reads` and `signals` must be
+    /// the same length.
+    fn add_reads(
+        &mut self,
+        reads: Vec<PyRef<'_, crate::read_data::PyReadData>>,
+        signals: Vec<Bound<'_, PyArray1<i16>>>,
+    ) -> PyResult<()> {
+        if reads.len() != signals.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "reads and signals must be the same length ({} != {})",
+                reads.len(),
+                signals.len()
+            )));
+        }
+        // Materialize signals before touching the writer so a bad array errors
+        // out before any read is committed.
+        let signal_vecs: Vec<Vec<i16>> = signals
+            .iter()
+            .map(|s| s.to_vec())
+            .collect::<Result<_, _>>()?;
+
+        let writer = self.writer_mut()?;
+        for (read, signal) in reads.iter().zip(&signal_vecs) {
+            writer
+                .add_read(read.inner.clone(), signal)
+                .map_err(to_py_err)?;
+        }
+        Ok(())
+    }
+
     /// Finalize and close the POD5 file.
     fn close(&mut self) -> PyResult<()> {
         if let Some(writer) = self.inner.take() {
