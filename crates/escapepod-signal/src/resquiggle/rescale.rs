@@ -193,7 +193,9 @@ fn theil_sen(
         bail!("theil_sen: all slopes are zero");
     }
 
-    let median_slope = median_unsorted(&mut slopes)?;
+    // slopes is non-empty (guarded above); shared median returns 0.0 for empty,
+    // which the `== 0.0` check below would reject anyway.
+    let median_slope = crate::stats::median_via_select(&mut slopes);
 
     if median_slope == 0.0 {
         bail!("theil_sen: median slope is zero");
@@ -204,7 +206,7 @@ fn theil_sen(
         .zip(y.iter())
         .map(|(&xi, &yi)| yi - median_slope * xi)
         .collect();
-    let median_intercept = median_unsorted(&mut intercepts)?;
+    let median_intercept = crate::stats::median_via_select(&mut intercepts);
 
     let shift_est = -median_intercept / median_slope;
     let scale_est = 1.0 / median_slope;
@@ -218,26 +220,6 @@ fn theil_sen(
 /// Random subset of indices.
 fn random_subset(vec_len: usize, downsampled_len: usize) -> Vec<usize> {
     (0..vec_len).sample(&mut rand::rng(), downsampled_len)
-}
-
-/// Median of an unsorted slice via `select_nth_unstable` (O(n) expected).
-///
-/// Reorders `v` in place. Uses `f32::total_cmp` for a total order.
-fn median_unsorted(v: &mut [f32]) -> Result<f32> {
-    if v.is_empty() {
-        bail!("median of empty slice");
-    }
-    let len = v.len();
-    let mid = len / 2;
-    let (lo_part, pivot, _) = v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    let upper = *pivot;
-    Ok(if len.is_multiple_of(2) {
-        // Lower-median element is the max of the below-`mid` partition.
-        let lower = lo_part.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        (lower + upper) / 2.0
-    } else {
-        upper
-    })
 }
 
 /// Precise rescale using filtered base-level statistics.
@@ -654,39 +636,6 @@ mod tests {
     #[test]
     fn test_theil_sen_length_mismatch() {
         let result = theil_sen(&[1.0, 2.0], &[1.0], 0.0, 1.0, 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_median_unsorted_odd() {
-        let mut v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        assert!((median_unsorted(&mut v).unwrap() - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_unsorted_even() {
-        let mut v = vec![1.0, 2.0, 3.0, 4.0];
-        assert!((median_unsorted(&mut v).unwrap() - 2.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_unsorted_unordered_input() {
-        // Order-independence: shuffled inputs give the same median.
-        let mut odd = vec![5.0, 3.0, 1.0, 4.0, 2.0];
-        assert!((median_unsorted(&mut odd).unwrap() - 3.0).abs() < 1e-6);
-        let mut even = vec![4.0, 1.0, 3.0, 2.0];
-        assert!((median_unsorted(&mut even).unwrap() - 2.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_unsorted_single() {
-        let mut v = vec![42.0];
-        assert!((median_unsorted(&mut v).unwrap() - 42.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_unsorted_empty() {
-        let result = median_unsorted(&mut []);
         assert!(result.is_err());
     }
 
