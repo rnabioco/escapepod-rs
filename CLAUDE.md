@@ -8,7 +8,7 @@ escapepod-rs is a pure Rust implementation for reading and writing POD5 files, t
 
 ## Requirements
 
-- Rust 1.92 or later (matches `workspace.package.rust-version`)
+- Rust 1.95 or later (matches `workspace.package.rust-version`)
 
 ## Build Commands
 
