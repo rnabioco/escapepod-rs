@@ -155,3 +155,25 @@ jobs:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  features:
+    name: Feature builds (gpu / cnn)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # The default jobs never compile the opt-in features, so a dependency bump
+    # to cudarc / tract-onnx / ort can break these builds while every other
+    # check stays green — exactly how the cudarc and tract-onnx Dependabot PRs
+    # slipped through. cudarc and ort use runtime dynamic loading, so this only
+    # needs a `cargo check` — no CUDA toolkit, libonnxruntime, or GPU required.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: gpu — DTW/SVM CUDA path (cudarc, escapepod-signal)
+        run: cargo check -p escapepod-signal --features gpu
+      - name: gpu — demux batch classify (cudarc, escapepod-demux)
+        run: cargo check -p escapepod-demux --features gpu
+      - name: cnn-detect — CPU TCN adapter detect (tract-onnx)
+        run: cargo check -p escapepod-demux --features cnn-detect
+      - name: cnn-gpu — GPU TCN adapter detect (ort + cudarc)
+        run: cargo check -p escapepod-demux --features cnn-gpu
