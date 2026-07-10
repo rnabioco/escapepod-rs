@@ -344,6 +344,31 @@ fn main() {
         vbz19_bytes += svb16_zstd_size(r, 19);
     }
 
+    // Our SVB16 front end WITHOUT zstd (isolates what the zstd pass buys).
+    let mut ours_svb_bytes = 0usize;
+    for r in &reads {
+        ours_svb_bytes += svb16::encode(r).unwrap().len();
+    }
+
+    // Third-party `svb` crate (Psy-Fer): SIMD VBZ/SVB16 front end + exzd (patched
+    // exceptions ~ PForDelta). Round-trip verified; both are zstd-free layers.
+    let mut svb_vbz_bytes = 0usize;
+    let mut svb_exzd_bytes = 0usize;
+    for r in &reads {
+        let e_vbz = svb::encode_vbz(r);
+        assert!(
+            svb::decode_vbz(&e_vbz, r.len()).unwrap() == *r,
+            "svb vbz round-trip"
+        );
+        svb_vbz_bytes += e_vbz.len();
+        let e_exzd = svb::encode_exzd(r);
+        assert!(
+            svb::decode_exzd(&e_exzd).unwrap() == *r,
+            "svb exzd round-trip"
+        );
+        svb_exzd_bytes += e_exzd.len();
+    }
+
     // Timing: best-of-N total wall time over all reads.
     const ROUNDS: usize = 5;
     let bench = |f: &dyn Fn()| {
@@ -384,6 +409,43 @@ fn main() {
         }
     });
 
+    // Our SVB16-only (no zstd) enc/dec.
+    let ours_svb_enc: Vec<Vec<u8>> = reads.iter().map(|r| svb16::encode(r).unwrap()).collect();
+    let ours_svb_enc_t = bench(&|| {
+        for r in &reads {
+            std::hint::black_box(svb16::encode(r).unwrap());
+        }
+    });
+    let ours_svb_dec_t = bench(&|| {
+        for (e, r) in ours_svb_enc.iter().zip(&reads) {
+            std::hint::black_box(svb16::decode(e, r.len()).unwrap());
+        }
+    });
+
+    // svb crate: vbz + exzd enc/dec.
+    let svb_vbz_enc: Vec<Vec<u8>> = reads.iter().map(|r| svb::encode_vbz(r)).collect();
+    let svb_exzd_enc: Vec<Vec<u8>> = reads.iter().map(|r| svb::encode_exzd(r)).collect();
+    let svb_vbz_enc_t = bench(&|| {
+        for r in &reads {
+            std::hint::black_box(svb::encode_vbz(r));
+        }
+    });
+    let svb_vbz_dec_t = bench(&|| {
+        for (e, r) in svb_vbz_enc.iter().zip(&reads) {
+            std::hint::black_box(svb::decode_vbz(e, r.len()).unwrap());
+        }
+    });
+    let svb_exzd_enc_t = bench(&|| {
+        for r in &reads {
+            std::hint::black_box(svb::encode_exzd(r));
+        }
+    });
+    let svb_exzd_dec_t = bench(&|| {
+        for e in svb_exzd_enc.iter() {
+            std::hint::black_box(svb::decode_exzd(e).unwrap());
+        }
+    });
+
     let mbps = |t: f64| raw_bytes as f64 / 1e6 / t;
     let ratio = |b: usize| raw_bytes as f64 / b as f64;
     let bps = |b: usize| b as f64 * 8.0 / total_samples as f64;
@@ -397,11 +459,11 @@ fn main() {
     );
     println!();
     println!(
-        "{:<8} {:>10} {:>8} {:>10} {:>12} {:>12}",
+        "{:<10} {:>10} {:>8} {:>10} {:>12} {:>12}",
         "codec", "bytes", "ratio", "bits/samp", "enc MB/s", "dec MB/s"
     );
     println!(
-        "{:<8} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
         "VBZ(z1)",
         vbz_bytes,
         ratio(vbz_bytes),
@@ -410,7 +472,7 @@ fn main() {
         mbps(vbz_dec_t)
     );
     println!(
-        "{:<8} {:>10} {:>8.3} {:>10.3} {:>12} {:>12}",
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12} {:>12}",
         "+z9",
         vbz9_bytes,
         ratio(vbz9_bytes),
@@ -419,7 +481,7 @@ fn main() {
         "~vbz"
     );
     println!(
-        "{:<8} {:>10} {:>8.3} {:>10.3} {:>12} {:>12}",
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12} {:>12}",
         "+z19",
         vbz19_bytes,
         ratio(vbz19_bytes),
@@ -428,7 +490,34 @@ fn main() {
         "~vbz"
     );
     println!(
-        "{:<8} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
+        "svb16(ours)",
+        ours_svb_bytes,
+        ratio(ours_svb_bytes),
+        bps(ours_svb_bytes),
+        mbps(ours_svb_enc_t),
+        mbps(ours_svb_dec_t)
+    );
+    println!(
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
+        "svb::vbz",
+        svb_vbz_bytes,
+        ratio(svb_vbz_bytes),
+        bps(svb_vbz_bytes),
+        mbps(svb_vbz_enc_t),
+        mbps(svb_vbz_dec_t)
+    );
+    println!(
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
+        "svb::exzd",
+        svb_exzd_bytes,
+        ratio(svb_exzd_bytes),
+        bps(svb_exzd_bytes),
+        mbps(svb_exzd_enc_t),
+        mbps(svb_exzd_dec_t)
+    );
+    println!(
+        "{:<10} {:>10} {:>8.3} {:>10.3} {:>12.1} {:>12.1}",
         "rice",
         rice_bytes,
         ratio(rice_bytes),
@@ -437,6 +526,18 @@ fn main() {
         mbps(rice_dec_t)
     );
     println!();
+    println!(
+        "svb::vbz vs our svb16(no-zstd): size {:+.1}%   enc {:.2}x   dec {:.2}x",
+        (svb_vbz_bytes as f64 / ours_svb_bytes as f64 - 1.0) * 100.0,
+        ours_svb_enc_t / svb_vbz_enc_t,
+        ours_svb_dec_t / svb_vbz_dec_t
+    );
+    println!(
+        "svb::exzd vs VBZ(z1): size {:+.1}%   enc {:.2}x   dec {:.2}x",
+        (svb_exzd_bytes as f64 / vbz_bytes as f64 - 1.0) * 100.0,
+        vbz_enc_t / svb_exzd_enc_t,
+        vbz_dec_t / svb_exzd_dec_t
+    );
     println!(
         "rice vs +z19 size: {:+.1}%   (decode: +z19 ~= VBZ speed, rice {:.2}x VBZ)",
         (rice_bytes as f64 / vbz19_bytes as f64 - 1.0) * 100.0,
