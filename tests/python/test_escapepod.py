@@ -925,7 +925,7 @@ class TestBatchWrite:
 KMER_TABLE = REPO_ROOT / "data" / "kmer_models" / "rna004_9mer_levels_v1.txt.gz"
 
 
-class TestSignal:
+class TestSignalBindings:
     """escapepod-signal bindings: normalization, kmer levels, refinement."""
 
     def test_mad_normalize(self):
