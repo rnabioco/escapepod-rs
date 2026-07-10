@@ -59,7 +59,9 @@ pub use svm_kernels::{
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaFunction, DriverError, LaunchAsync, LaunchConfig};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::{CompileError, compile_ptx};
 use ndarray::Array2;
 use thiserror::Error;
@@ -96,7 +98,20 @@ pub enum GpuDtwError {
 /// Build once and reuse across many `distance_matrix` calls — NVRTC compilation
 /// and module load are amortized that way.
 pub struct GpuDtwContext {
-    device: Arc<CudaDevice>,
+    /// CUDA context (device's primary context). Kept alive for the lifetime of
+    /// the handle and exposed so downstream crates can reach the device.
+    ctx: Arc<CudaContext>,
+    /// Default stream — every memory transfer and kernel launch runs here, so
+    /// operations are serialized without explicit synchronization.
+    stream: Arc<CudaStream>,
+    // cudarc 0.19 has no device-global function registry keyed by module name;
+    // functions are loaded from a module handle, so we hold each module.
+    dtw_module: Arc<CudaModule>,
+    svm_module: Arc<CudaModule>,
+    svb16_module: Arc<CudaModule>,
+    ttest_fp_module: Arc<CudaModule>,
+    llr_module: Arc<CudaModule>,
+    llr_block_module: Arc<CudaModule>,
 }
 
 impl GpuDtwContext {
@@ -111,55 +126,41 @@ impl GpuDtwContext {
     /// keeping the load here means downstream callers don't have to learn
     /// a second NVRTC compile cycle.
     pub fn new_on_device(ordinal: usize) -> Result<Self, GpuDtwError> {
-        let device = CudaDevice::new(ordinal)?;
+        let ctx = CudaContext::new(ordinal)?;
+        let stream = ctx.default_stream();
 
-        let dtw_ptx = compile_ptx(kernel::KERNEL_SRC)?;
-        device.load_ptx(dtw_ptx, MODULE_NAME, &[KERNEL_NAME])?;
+        let dtw_module = ctx.load_module(compile_ptx(kernel::KERNEL_SRC)?)?;
+        let svm_module = ctx.load_module(compile_ptx(SVM_KERNEL_SRC)?)?;
+        let svb16_module = ctx.load_module(compile_ptx(svb16_kernel::KERNEL_SRC)?)?;
+        let ttest_fp_module = ctx.load_module(compile_ptx(ttest_fp_kernel::KERNEL_SRC)?)?;
+        let llr_module = ctx.load_module(compile_ptx(llr_detect_kernel::KERNEL_SRC)?)?;
+        let llr_block_module =
+            ctx.load_module(compile_ptx(llr_detect_block_kernel::KERNEL_SRC)?)?;
 
-        let svm_ptx = compile_ptx(SVM_KERNEL_SRC)?;
-        device.load_ptx(
-            svm_ptx,
-            SVM_MODULE_NAME,
-            &[RBF_KERNEL_NAME, OVO_DECISION_KERNEL_NAME],
-        )?;
-
-        let svb16_ptx = compile_ptx(svb16_kernel::KERNEL_SRC)?;
-        device.load_ptx(
-            svb16_ptx,
-            svb16_kernel::MODULE_NAME,
-            &[svb16_kernel::KERNEL_NAME],
-        )?;
-
-        let ttest_fp_ptx = compile_ptx(ttest_fp_kernel::KERNEL_SRC)?;
-        device.load_ptx(
-            ttest_fp_ptx,
-            ttest_fp_kernel::MODULE_NAME,
-            &[ttest_fp_kernel::KERNEL_NAME],
-        )?;
-
-        let llr_ptx = compile_ptx(llr_detect_kernel::KERNEL_SRC)?;
-        device.load_ptx(
-            llr_ptx,
-            llr_detect_kernel::MODULE_NAME,
-            &[llr_detect_kernel::KERNEL_NAME],
-        )?;
-
-        let llr_block_ptx = compile_ptx(llr_detect_block_kernel::KERNEL_SRC)?;
-        device.load_ptx(
-            llr_block_ptx,
-            llr_detect_block_kernel::MODULE_NAME,
-            &[llr_detect_block_kernel::KERNEL_NAME],
-        )?;
-
-        Ok(Self { device })
+        Ok(Self {
+            ctx,
+            stream,
+            dtw_module,
+            svm_module,
+            svb16_module,
+            ttest_fp_module,
+            llr_module,
+            llr_block_module,
+        })
     }
 
-    /// Borrow the underlying `Arc<CudaDevice>`. Lets downstream crates
-    /// (escapepod-demux's GPU classify path) launch their own kernels —
-    /// notably the RBF + OvO decision kernels we pre-load above — without
-    /// having to spin up a second context.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Borrow the CUDA context. Lets downstream crates query the device or
+    /// build their own streams sharing this context.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    /// Borrow the default stream. Downstream crates (escapepod-demux's GPU
+    /// classify path) issue their memory transfers and kernel launches here so
+    /// they share ordering with this context's own work — replaces the old
+    /// `device()` accessor now that memory/launch live on the stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// Look up a pre-loaded kernel by `(module_name, kernel_name)`.
@@ -169,9 +170,22 @@ impl GpuDtwContext {
         module: &'static str,
         kernel_name: &'static str,
     ) -> Result<CudaFunction, GpuDtwError> {
-        self.device
-            .get_func(module, kernel_name)
-            .ok_or(GpuDtwError::KernelMissing(kernel_name))
+        let module = if module == DTW_MODULE_NAME {
+            &self.dtw_module
+        } else if module == SVM_MODULE_NAME {
+            &self.svm_module
+        } else if module == svb16_kernel::MODULE_NAME {
+            &self.svb16_module
+        } else if module == ttest_fp_kernel::MODULE_NAME {
+            &self.ttest_fp_module
+        } else if module == llr_detect_kernel::MODULE_NAME {
+            &self.llr_module
+        } else if module == llr_detect_block_kernel::MODULE_NAME {
+            &self.llr_block_module
+        } else {
+            return Err(GpuDtwError::KernelMissing(kernel_name));
+        };
+        module.load_function(kernel_name).map_err(GpuDtwError::from)
     }
 
     /// Compute an (n_queries × n_refs) banded DTW distance matrix on the GPU.
@@ -225,12 +239,12 @@ impl GpuDtwContext {
         let (flat_q, q_off) = flatten_with_offsets(queries)?;
         let (flat_r, r_off) = flatten_with_offsets(references)?;
 
-        let dev = &self.device;
-        let queries_dev = dev.htod_sync_copy(&flat_q)?;
-        let q_off_dev = dev.htod_sync_copy(&q_off)?;
-        let refs_dev = dev.htod_sync_copy(&flat_r)?;
-        let r_off_dev = dev.htod_sync_copy(&r_off)?;
-        let mut out_dev = dev.alloc_zeros::<f32>(n_q * n_r)?;
+        let stream = &self.stream;
+        let queries_dev = stream.clone_htod(&flat_q)?;
+        let q_off_dev = stream.clone_htod(&q_off)?;
+        let refs_dev = stream.clone_htod(&flat_r)?;
+        let r_off_dev = stream.clone_htod(&r_off)?;
+        let mut out_dev = stream.alloc_zeros::<f32>(n_q * n_r)?;
 
         // Sakoe–Chiba band. `-1` = no constraint; otherwise pass an i32.
         let window_i32: i32 = match window {
@@ -271,33 +285,34 @@ impl GpuDtwContext {
             shared_mem_bytes,
         };
 
-        let func = dev
-            .get_func(MODULE_NAME, KERNEL_NAME)
-            .ok_or(GpuDtwError::KernelMissing(KERNEL_NAME))?;
+        let func = self.function(MODULE_NAME, KERNEL_NAME)?;
 
+        let n_q_i = n_q as i32;
+        let n_r_i = n_r as i32;
+        let max_n_i = max_n as i32;
+        let max_m_i = max_m as i32;
+        // No warping penalty for the plain distance matrix (used by training /
+        // reference-mode). The SVM batch path launches this kernel directly
+        // with the model's penalty.
+        let penalty = 0.0f32;
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&queries_dev)
+            .arg(&q_off_dev)
+            .arg(&refs_dev)
+            .arg(&r_off_dev)
+            .arg(&mut out_dev)
+            .arg(&n_q_i)
+            .arg(&n_r_i)
+            .arg(&max_n_i)
+            .arg(&max_m_i)
+            .arg(&window_i32)
+            .arg(&penalty);
         unsafe {
-            func.launch(
-                cfg,
-                (
-                    &queries_dev,
-                    &q_off_dev,
-                    &refs_dev,
-                    &r_off_dev,
-                    &mut out_dev,
-                    n_q as i32,
-                    n_r as i32,
-                    max_n as i32,
-                    max_m as i32,
-                    window_i32,
-                    // No warping penalty for the plain distance matrix (used by
-                    // training / reference-mode). The SVM batch path launches
-                    // this kernel directly with the model's penalty.
-                    0.0f32,
-                ),
-            )?;
+            builder.launch(cfg)?;
         }
 
-        let host_out = dev.dtoh_sync_copy(&out_dev)?;
+        let host_out = stream.clone_dtoh(&out_dev)?;
         Ok(Array2::from_shape_vec((n_q, n_r), host_out).expect("shape matches"))
     }
 
@@ -349,12 +364,12 @@ impl GpuDtwContext {
             out_off.push(oacc);
         }
 
-        let dev = &self.device;
-        let data_dev = dev.htod_sync_copy(&data_flat)?;
-        let data_off_dev = dev.htod_sync_copy(&data_off)?;
-        let counts_dev = dev.htod_sync_copy(&counts)?;
-        let out_off_dev = dev.htod_sync_copy(&out_off)?;
-        let mut out_dev = dev.alloc_zeros::<i16>(total_out.max(1))?;
+        let stream = &self.stream;
+        let data_dev = stream.clone_htod(&data_flat)?;
+        let data_off_dev = stream.clone_htod(&data_off)?;
+        let counts_dev = stream.clone_htod(&counts)?;
+        let out_off_dev = stream.clone_htod(&out_off)?;
+        let mut out_dev = stream.alloc_zeros::<i16>(total_out.max(1))?;
 
         const THREADS: u32 = 256;
         let blocks = (n as u32).div_ceil(THREADS);
@@ -363,24 +378,21 @@ impl GpuDtwContext {
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let func = dev
-            .get_func(svb16_kernel::MODULE_NAME, svb16_kernel::KERNEL_NAME)
-            .ok_or(GpuDtwError::KernelMissing(svb16_kernel::KERNEL_NAME))?;
+        let func = self.function(svb16_kernel::MODULE_NAME, svb16_kernel::KERNEL_NAME)?;
+        let n_i = n as i32;
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&data_dev)
+            .arg(&data_off_dev)
+            .arg(&counts_dev)
+            .arg(&out_off_dev)
+            .arg(&mut out_dev)
+            .arg(&n_i);
         unsafe {
-            func.launch(
-                cfg,
-                (
-                    &data_dev,
-                    &data_off_dev,
-                    &counts_dev,
-                    &out_off_dev,
-                    &mut out_dev,
-                    n as i32,
-                ),
-            )?;
+            builder.launch(cfg)?;
         }
 
-        let host_out = dev.dtoh_sync_copy(&out_dev)?;
+        let host_out = stream.clone_dtoh(&out_dev)?;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             let s = out_off[i] as usize;
@@ -518,20 +530,20 @@ impl GpuDtwContext {
         params[ttest_fp_kernel::P_MAX_CAND] = max_cand as i32;
         params[ttest_fp_kernel::P_PAD] = pad as i32;
 
-        let dev = &self.device;
-        let sig_dev = dev.htod_sync_copy(&sig_flat)?;
-        let sig_off_dev = dev.htod_sync_copy(&sig_off)?;
-        let as_dev = dev.htod_sync_copy(&adapter_start)?;
-        let ae_dev = dev.htod_sync_copy(&adapter_end)?;
-        let params_dev = dev.htod_sync_copy(&params)?;
+        let stream = &self.stream;
+        let sig_dev = stream.clone_htod(&sig_flat)?;
+        let sig_off_dev = stream.clone_htod(&sig_off)?;
+        let as_dev = stream.clone_htod(&adapter_start)?;
+        let ae_dev = stream.clone_htod(&adapter_end)?;
+        let params_dev = stream.clone_htod(&params)?;
 
         // Merged scratch: A|B share one f32 region, cumsum|cumsum_sq one f64.
-        let mut scratch_f32 = dev.alloc_zeros::<f32>(bn * 2 * max_len)?;
-        let mut scratch_f64 = dev.alloc_zeros::<f64>(bn * 2 * (max_len + 1))?;
-        let mut tscores = dev.alloc_zeros::<f64>(bn * max_cand)?;
-        let mut peaks = dev.alloc_zeros::<i32>(bn * max_cand)?;
-        let mut out = dev.alloc_zeros::<f32>(bn * keep_last)?;
-        let mut out_len = dev.alloc_zeros::<i32>(bn)?;
+        let mut scratch_f32 = stream.alloc_zeros::<f32>(bn * 2 * max_len)?;
+        let mut scratch_f64 = stream.alloc_zeros::<f64>(bn * 2 * (max_len + 1))?;
+        let mut tscores = stream.alloc_zeros::<f64>(bn * max_cand)?;
+        let mut peaks = stream.alloc_zeros::<i32>(bn * max_cand)?;
+        let mut out = stream.alloc_zeros::<f32>(bn * keep_last)?;
+        let mut out_len = stream.alloc_zeros::<i32>(bn)?;
 
         const THREADS: u32 = 128;
         let blocks = (bn as u32).div_ceil(THREADS);
@@ -540,30 +552,26 @@ impl GpuDtwContext {
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let func = dev
-            .get_func(ttest_fp_kernel::MODULE_NAME, ttest_fp_kernel::KERNEL_NAME)
-            .ok_or(GpuDtwError::KernelMissing(ttest_fp_kernel::KERNEL_NAME))?;
+        let func = self.function(ttest_fp_kernel::MODULE_NAME, ttest_fp_kernel::KERNEL_NAME)?;
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&sig_dev)
+            .arg(&sig_off_dev)
+            .arg(&as_dev)
+            .arg(&ae_dev)
+            .arg(&params_dev)
+            .arg(&mut scratch_f32)
+            .arg(&mut scratch_f64)
+            .arg(&mut tscores)
+            .arg(&mut peaks)
+            .arg(&mut out)
+            .arg(&mut out_len);
         unsafe {
-            func.launch(
-                cfg,
-                (
-                    &sig_dev,
-                    &sig_off_dev,
-                    &as_dev,
-                    &ae_dev,
-                    &params_dev,
-                    &mut scratch_f32,
-                    &mut scratch_f64,
-                    &mut tscores,
-                    &mut peaks,
-                    &mut out,
-                    &mut out_len,
-                ),
-            )?;
+            builder.launch(cfg)?;
         }
 
-        let host_out = dev.dtoh_sync_copy(&out)?;
-        let host_len = dev.dtoh_sync_copy(&out_len)?;
+        let host_out = stream.clone_dtoh(&out)?;
+        let host_len = stream.clone_dtoh(&out_len)?;
 
         for (b, &i) in batch.iter().enumerate() {
             let k = host_len[b] as usize; // 0 == no fingerprint produced
@@ -681,17 +689,17 @@ impl GpuDtwContext {
         params[llr_detect_kernel::P_BORDER_TRIM] = border_trim as i32;
         params[llr_detect_kernel::P_DOWNSCALE] = downscale.max(1) as i32;
 
-        let dev = &self.device;
-        let sig_dev = dev.htod_sync_copy(&sig_flat)?;
-        let off_dev = dev.htod_sync_copy(&off)?;
-        let params_dev = dev.htod_sync_copy(&params)?;
-        let mut norm = dev.alloc_zeros::<f32>(total)?;
-        let mut processed = dev.alloc_zeros::<f32>(total)?;
-        let mut medbuf = dev.alloc_zeros::<f32>(total)?;
-        let mut cumsum = dev.alloc_zeros::<f64>(total)?;
-        let mut cumsumsq = dev.alloc_zeros::<f64>(total)?;
-        let mut out_start = dev.alloc_zeros::<i32>(bn)?;
-        let mut out_end = dev.alloc_zeros::<i32>(bn)?;
+        let stream = &self.stream;
+        let sig_dev = stream.clone_htod(&sig_flat)?;
+        let off_dev = stream.clone_htod(&off)?;
+        let params_dev = stream.clone_htod(&params)?;
+        let mut norm = stream.alloc_zeros::<f32>(total)?;
+        let mut processed = stream.alloc_zeros::<f32>(total)?;
+        let mut medbuf = stream.alloc_zeros::<f32>(total)?;
+        let mut cumsum = stream.alloc_zeros::<f64>(total)?;
+        let mut cumsumsq = stream.alloc_zeros::<f64>(total)?;
+        let mut out_start = stream.alloc_zeros::<i32>(bn)?;
+        let mut out_end = stream.alloc_zeros::<i32>(bn)?;
 
         let (cfg, func) = if block {
             // One block per read, fixed 128 threads (matches BLK in the kernel).
@@ -700,14 +708,10 @@ impl GpuDtwContext {
                 block_dim: (llr_detect_block_kernel::BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let func = dev
-                .get_func(
-                    llr_detect_block_kernel::MODULE_NAME,
-                    llr_detect_block_kernel::KERNEL_NAME,
-                )
-                .ok_or(GpuDtwError::KernelMissing(
-                    llr_detect_block_kernel::KERNEL_NAME,
-                ))?;
+            let func = self.function(
+                llr_detect_block_kernel::MODULE_NAME,
+                llr_detect_block_kernel::KERNEL_NAME,
+            )?;
             (cfg, func)
         } else {
             const THREADS: u32 = 64;
@@ -717,34 +721,30 @@ impl GpuDtwContext {
                 block_dim: (THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let func = dev
-                .get_func(
-                    llr_detect_kernel::MODULE_NAME,
-                    llr_detect_kernel::KERNEL_NAME,
-                )
-                .ok_or(GpuDtwError::KernelMissing(llr_detect_kernel::KERNEL_NAME))?;
+            let func = self.function(
+                llr_detect_kernel::MODULE_NAME,
+                llr_detect_kernel::KERNEL_NAME,
+            )?;
             (cfg, func)
         };
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&sig_dev)
+            .arg(&off_dev)
+            .arg(&params_dev)
+            .arg(&mut norm)
+            .arg(&mut processed)
+            .arg(&mut medbuf)
+            .arg(&mut cumsum)
+            .arg(&mut cumsumsq)
+            .arg(&mut out_start)
+            .arg(&mut out_end);
         unsafe {
-            func.launch(
-                cfg,
-                (
-                    &sig_dev,
-                    &off_dev,
-                    &params_dev,
-                    &mut norm,
-                    &mut processed,
-                    &mut medbuf,
-                    &mut cumsum,
-                    &mut cumsumsq,
-                    &mut out_start,
-                    &mut out_end,
-                ),
-            )?;
+            builder.launch(cfg)?;
         }
 
-        let hs = dev.dtoh_sync_copy(&out_start)?;
-        let he = dev.dtoh_sync_copy(&out_end)?;
+        let hs = stream.clone_dtoh(&out_start)?;
+        let he = stream.clone_dtoh(&out_end)?;
         for b in 0..bn {
             result[b] = (hs[b].max(0) as usize, he[b].max(0) as usize);
         }
