@@ -919,3 +919,49 @@ class TestBatchWrite:
                 reads = [escapepod.ReadData(read_id=_IDS_A[0])]
                 with pytest.raises(ValueError, match="same length"):
                     w.add_reads(reads, [])
+
+
+# Kmer level table shipped with escapepod, used to exercise the signal bindings.
+KMER_TABLE = REPO_ROOT / "data" / "kmer_models" / "rna004_9mer_levels_v1.txt.gz"
+
+
+class TestSignal:
+    """escapepod-signal bindings: normalization, kmer levels, refinement."""
+
+    def test_mad_normalize(self):
+        sig = np.arange(100, dtype=np.float32)
+        out = escapepod.mad_normalize(sig)
+        assert out.shape == sig.shape
+        assert out.dtype == np.float32
+
+    def test_normalize_signal_i16(self):
+        sig = np.arange(100, dtype=np.int16)
+        out = escapepod.normalize_signal(sig)
+        assert out.shape == sig.shape
+        assert out.dtype == np.float32
+
+    def test_kmer_table(self):
+        kt = escapepod.KmerTable.from_file(str(KMER_TABLE))
+        assert kt.k == 9
+        assert isinstance(kt.get("A" * 9), float)
+        levels = kt.extract_levels("ACGT" * 5)
+        assert levels.dtype == np.float32
+        assert levels.shape[0] == 20
+
+    def test_refine_signal_map(self):
+        kt = escapepod.KmerTable.from_file(str(KMER_TABLE))
+        rng = np.random.RandomState(0)
+        seq = "".join(rng.choice(list("ACGT"), 40))
+        levels = kt.extract_levels(seq).astype(np.float32)
+        boundaries = sorted(rng.choice(range(1, 400), 40, replace=False).tolist())
+        sig_map = [0] + boundaries
+        signal = escapepod.mad_normalize(rng.randn(sig_map[-1]).astype(np.float32))
+        refined, scale, shift, drift = escapepod.refine_signal_map(
+            signal, sig_map, levels, half_bandwidth=5, scale_iters=2
+        )
+        assert refined.dtype == np.int64
+        assert len(refined) == len(sig_map)
+        assert np.all(np.diff(refined) > 0)
+        assert isinstance(scale, float)
+        assert isinstance(shift, float)
+        assert isinstance(drift, float)
