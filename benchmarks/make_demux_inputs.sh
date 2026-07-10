@@ -48,7 +48,7 @@ done
 
 if [ ! -x "$ESCPOD_BIN" ]; then
     echo "error: escpod binary not found/executable: $ESCPOD_BIN" >&2
-    echo "       build with: cargo build --release -p escapepod --features 'demux train cnn-detect'" >&2
+    echo "       build with: cargo build --release -p escapepod-cli --features 'demux train cnn-detect'" >&2
     exit 1
 fi
 

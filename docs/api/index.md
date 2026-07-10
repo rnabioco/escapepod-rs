@@ -20,7 +20,7 @@ The workspace is split into five crates:
 | `escapepod-pod5` | POD5 format I/O (reader, writer, VBZ, footer, block-level merge/filter/subset) |
 | `escapepod-signal` | Signal algorithms (DTW, resquiggle, segmentation); **re-exports the full `escapepod-pod5` surface** |
 | `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing (DTW + SVM classifier, optional CNN adapter detection and GPU acceleration) |
-| `escapepod` | The `escpod` CLI binary (default `cli` feature) plus an optional umbrella library re-exporting the layers below |
+| `escapepod-cli` | The `escpod` CLI binary (default `cli` feature) plus an optional umbrella library (imported as `escapepod_cli`) re-exporting the layers below |
 | `escapepod-python` | pyo3 bindings |
 
 ### escapepod-pod5
@@ -45,7 +45,7 @@ Barcode demultiplexing. Separate crate; the CLI pulls it in only when built with
 
 ### escapepod
 
-The `escpod` binary, built by the default `cli` feature — so `cargo install escapepod` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod::signal`) without the CLI's dependency tree. Stable commands (built with `cli`): `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`. Experimental commands live behind Cargo features — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Stable commands (built with `cli`): `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`. Experimental commands live behind Cargo features — see below.
 
 ## Quick Reference
 

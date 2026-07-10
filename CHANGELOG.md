@@ -64,6 +64,13 @@
 
 ### Changed
 
+- **The CLI crate is renamed `escapepod` → `escapepod-cli`**, matching its
+  `escapepod-{pod5,signal,demux}` siblings and making its role explicit. The
+  `escpod` binary name is unchanged, and installation is unchanged
+  (`cargo install --git …`). Library consumers of the umbrella crate now
+  import it as `escapepod_cli` (e.g. `use escapepod_cli::signal`) instead of
+  `escapepod`. (The `escapepod` name on PyPI already belongs to the Python
+  bindings, so this also removes the crate-name overlap.)
 - **CLI output split into logs vs. data.** All status/progress/warning output
   now flows through `tracing` to **stderr** (`timestamp LEVEL [target] message`),
   while command *data* (TSV/CSV rows, `inspect`/`summary` reports, ID lists)

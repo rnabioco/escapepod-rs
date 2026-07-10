@@ -100,13 +100,13 @@ pixi run -e warpdemux-bench install-warpdemux
 
 # CPU build (default)
 srun -p rna -A rbi -c 32 cargo build --release \
-    -p escapepod --features "demux train"
+    -p escapepod-cli --features "demux train"
 
 # GPU build (adds --gpu variant)
 pixi install -e gpu
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     pixi run -e gpu cargo build --release \
-    -p escapepod --features "demux train gpu"
+    -p escapepod-cli --features "demux train gpu"
 
 # Run — auto-dispatches to the right SLURM partition
 ./benchmarks/benchmark_demux.sh                       # CPU only, WDX4

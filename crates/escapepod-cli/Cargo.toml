@@ -1,5 +1,5 @@
 [package]
-name = "escapepod"
+name = "escapepod-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,10 +10,11 @@ license.workspace = true
 keywords = ["bioinformatics", "cli", "nanopore", "pod5", "sequencing"]
 categories = ["command-line-utilities", "science"]
 
-# The `escpod` binary is the primary artifact: `cargo install escapepod`
-# builds it via the default `cli` feature. Library-only consumers can opt out
-# with `default-features = false` and pick the layers they want (pod5/signal/
-# demux), which keeps clap/noodles/etc. out of their dependency graph.
+# The `escpod` binary is the primary artifact: this crate builds it via the
+# default `cli` feature. Library-only consumers can opt out with
+# `default-features = false` and pick the layers they want (pod5/signal/demux),
+# which keeps clap/noodles/etc. out of their dependency graph. The library is
+# imported as `escapepod_cli` (e.g. `use escapepod_cli::signal`).
 [[bin]]
 name = "escpod"
 path = "src/main.rs"
@@ -55,7 +56,7 @@ uuid = { workspace = true, optional = true }
 walkdir = { version = "2", optional = true }
 
 [features]
-# `cargo install escapepod` ships the `escpod` CLI out of the box.
+# The `cli` feature ships the `escpod` CLI out of the box.
 default = ["cli"]
 
 # Library re-export layers. `signal` pulls the pod5 layer transitively.

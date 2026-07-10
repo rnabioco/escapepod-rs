@@ -136,7 +136,7 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p escapepod
+      - run: cargo build --release -p escapepod-cli
       - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           environments: python-test

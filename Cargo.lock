@@ -792,7 +792,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "escapepod"
+name = "escapepod-cli"
 version = "0.5.1"
 dependencies = [
  "anyhow",

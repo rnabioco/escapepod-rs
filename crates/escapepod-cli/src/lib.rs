@@ -3,7 +3,7 @@
 //! The headline artifact of this crate is the **`escpod` command-line tool**:
 //!
 //! ```sh
-//! cargo install escapepod   # installs the `escpod` binary
+//! cargo install --git https://github.com/rnabioco/escapepod-rs   # installs the `escpod` binary
 //! ```
 //!
 //! This library surface is secondary. It is an umbrella that re-exports the
@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! # Library only — no clap/noodles/etc.:
-//! escapepod = { version = "0.5", default-features = false, features = ["signal"] }
+//! escapepod-cli = { version = "0.5", default-features = false, features = ["signal"] }
 //! ```
 //!
 //! | Module       | Crate                                                            | Feature   |
@@ -28,8 +28,8 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "signal")]
-//! # fn main() -> Result<(), escapepod::signal::Error> {
-//! use escapepod::signal::Reader;
+//! # fn main() -> Result<(), escapepod_cli::signal::Error> {
+//! use escapepod_cli::signal::Reader;
 //!
 //! let reader = Reader::open("example.pod5")?;
 //! for read_result in reader.reads()? {
