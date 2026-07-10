@@ -209,12 +209,16 @@ fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
         return 1.0;
     }
     let mut dwells: Vec<usize> = seq_to_signal_map.windows(2).map(|w| w[1] - w[0]).collect();
-    dwells.sort_unstable();
     let n = dwells.len();
+    let mid = n / 2;
+    // Median via select_nth_unstable (O(n) expected) instead of a full sort.
+    let (lo_part, pivot, _) = dwells.select_nth_unstable(mid);
+    let upper = *pivot;
     if n % 2 == 1 {
-        dwells[n / 2] as f32
+        upper as f32
     } else {
-        (dwells[n / 2 - 1] + dwells[n / 2]) as f32 / 2.0
+        let lower = *lo_part.iter().max().unwrap();
+        (lower + upper) as f32 / 2.0
     }
 }
 

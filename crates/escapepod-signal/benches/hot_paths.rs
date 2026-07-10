@@ -222,6 +222,58 @@ fn bench_dtw_matrix(c: &mut Criterion) {
     group.finish();
 }
 
+/// Direct A/B of median-of-slice via full `sort_unstable` (old) vs
+/// `select_nth_unstable` (the Phase 2 change), across the array sizes the real
+/// call sites see: 64-1024 (resquiggle `median_dwell`), ~16k (theil_sen
+/// pairwise slopes), ~256k (SVM-training kernel median). `select_nth` is O(n)
+/// vs O(n log n) but carries a larger constant, so this pins the crossover —
+/// both variants pay the same per-iteration clone, so the sort-vs-select gap at
+/// each size is apples-to-apples.
+fn bench_median_select_vs_sort(c: &mut Criterion) {
+    fn median_sort(v: &mut [f32]) -> f32 {
+        v.sort_unstable_by(|a, b| a.total_cmp(b));
+        let n = v.len();
+        if n.is_multiple_of(2) {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        } else {
+            v[n / 2]
+        }
+    }
+    fn median_select(v: &mut [f32]) -> f32 {
+        let n = v.len();
+        let mid = n / 2;
+        let (lo, pivot, _) = v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        let upper = *pivot;
+        if n.is_multiple_of(2) {
+            let lower = lo.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            (lower + upper) / 2.0
+        } else {
+            upper
+        }
+    }
+
+    let mut group = c.benchmark_group("median_select_vs_sort");
+    for &len in &[64usize, 256, 1024, 16_384, 262_144] {
+        let data = pseudo_floats(len, 0x5057 + len as u64);
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::new("sort", len), &len, |b, _| {
+            b.iter_batched_ref(
+                || data.clone(),
+                |v| black_box(median_sort(black_box(v))),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("select", len), &len, |b, _| {
+            b.iter_batched_ref(
+                || data.clone(),
+                |v| black_box(median_select(black_box(v))),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dtw,
@@ -230,5 +282,6 @@ criterion_group!(
     bench_fingerprint_mad,
     bench_vbz_roundtrip,
     bench_dtw_matrix,
+    bench_median_select_vs_sort,
 );
 criterion_main!(benches);

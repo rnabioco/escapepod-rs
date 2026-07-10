@@ -193,8 +193,9 @@ fn theil_sen(
         bail!("theil_sen: all slopes are zero");
     }
 
-    slopes.sort_unstable_by(|a, b| a.total_cmp(b));
-    let median_slope = median_sorted(&slopes)?;
+    // slopes is non-empty (guarded above); shared median returns 0.0 for empty,
+    // which the `== 0.0` check below would reject anyway.
+    let median_slope = crate::stats::median_via_select(&mut slopes);
 
     if median_slope == 0.0 {
         bail!("theil_sen: median slope is zero");
@@ -205,8 +206,7 @@ fn theil_sen(
         .zip(y.iter())
         .map(|(&xi, &yi)| yi - median_slope * xi)
         .collect();
-    intercepts.sort_unstable_by(|a, b| a.total_cmp(b));
-    let median_intercept = median_sorted(&intercepts)?;
+    let median_intercept = crate::stats::median_via_select(&mut intercepts);
 
     let shift_est = -median_intercept / median_slope;
     let scale_est = 1.0 / median_slope;
@@ -220,19 +220,6 @@ fn theil_sen(
 /// Random subset of indices.
 fn random_subset(vec_len: usize, downsampled_len: usize) -> Vec<usize> {
     (0..vec_len).sample(&mut rand::rng(), downsampled_len)
-}
-
-/// Median of a sorted slice.
-fn median_sorted(sorted: &[f32]) -> Result<f32> {
-    if sorted.is_empty() {
-        bail!("median of empty slice");
-    }
-    let len = sorted.len();
-    Ok(if len.is_multiple_of(2) {
-        (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
-    } else {
-        sorted[len / 2]
-    })
 }
 
 /// Precise rescale using filtered base-level statistics.
@@ -296,13 +283,12 @@ pub fn rescale(
         );
     }
 
-    // Dwell quantiles for filtering
+    // Dwell quantiles for filtering. `calculate_quantiles` sorts internally,
+    // so the previous outer clone()+sort was redundant; requesting both
+    // quantiles in one call also collapses the two internal sorts into one.
     let (dwell_lower_val, dwell_upper_val) = {
-        let mut sorted_dwells = dwells.clone();
-        sorted_dwells.sort_unstable_by(|a, b| a.total_cmp(b));
-        let low = calculate_quantiles(&sorted_dwells, &[dwell_lower])?[0];
-        let high = calculate_quantiles(&sorted_dwells, &[dwell_upper])?[0];
-        (low, high)
+        let bounds = calculate_quantiles(&dwells, &[dwell_lower, dwell_upper])?;
+        (bounds[0], bounds[1])
     };
 
     let levels_mean = levels.iter().sum::<f32>() / levels.len() as f32;
@@ -650,30 +636,6 @@ mod tests {
     #[test]
     fn test_theil_sen_length_mismatch() {
         let result = theil_sen(&[1.0, 2.0], &[1.0], 0.0, 1.0, 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_median_sorted_odd() {
-        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        assert!((median_sorted(&v).unwrap() - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_sorted_even() {
-        let v = vec![1.0, 2.0, 3.0, 4.0];
-        assert!((median_sorted(&v).unwrap() - 2.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_sorted_single() {
-        let v = vec![42.0];
-        assert!((median_sorted(&v).unwrap() - 42.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_median_sorted_empty() {
-        let result = median_sorted(&[]);
         assert!(result.is_err());
     }
 

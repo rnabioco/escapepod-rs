@@ -26,6 +26,7 @@
 pub mod dtw;
 pub mod resquiggle;
 pub mod segmentation;
+pub mod stats;
 
 // Format layer (POD5 I/O) lives in escapepod-pod5. Re-export its modules and
 // types so downstream consumers can pull in both layers via this crate.
