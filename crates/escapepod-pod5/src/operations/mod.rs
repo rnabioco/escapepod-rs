@@ -11,7 +11,7 @@ mod subset;
 
 pub use filter::{
     FilterCriteria, FilterOptions, FilterResult, filter_files, filter_files_with_criteria,
-    read_ids_from_file, subset_file,
+    read_ids_from_file, subset_file, subset_files,
 };
 pub use repack::{RepackOptions, RepackResult, repack_files};
 pub use split::parse_barcode_mapping;

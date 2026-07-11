@@ -85,6 +85,10 @@ Examples:
 Examples:
   escpod demux split input.pod5 --classifications classifications.csv --output-dir demuxed/
   escpod demux split *.pod5 --classifications classifications.csv -d out/ --prefix bc
+
+Reads each input once and routes every read to its barcode's writer (rather than
+re-scanning per barcode). This keeps the full input resident while writing, so
+peak memory tracks input size — size --mem accordingly for large runs.
 ")]
     Split(SplitArgs),
 
