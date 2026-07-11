@@ -53,6 +53,29 @@
   background: transparent;
 }
 
+/* Nanopore squiggle watermark behind the header + footer meta bar. Medium grey
+   at low alpha (baked into the PNG) so it reads on the dark scheme and Material's
+   light fallback alike. Layered as a ::before so it sits above each element's own
+   background but under the content — scheme-agnostic, and it does NOT touch the
+   header's sticky positioning (sticky already anchors the absolute ::before). */
+.md-footer-meta {
+  position: relative;
+}
+.md-header > *,
+.md-footer-meta > * {
+  position: relative;
+  z-index: 1;
+}
+.md-header::before,
+.md-footer-meta::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url("../images/squiggle-header.png") center / 100% 100% no-repeat;
+  pointer-events: none;
+  z-index: 0;
+}
+
 /* Headings: bright, with a faint purple rule under h2 */
 [data-md-color-scheme="slate"] .md-typeset h1 {
   color: #f4f1ff;
