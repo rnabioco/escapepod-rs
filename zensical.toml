@@ -28,18 +28,24 @@ nav = [
     { "resquiggle" = "experimental/resquiggle.md" },
     { "demux" = "experimental/demux.md" },
   ] },
-  { "Library" = [
+  { "Python API" = [
+    { "Overview" = "python/index.md" },
+    { "Reading Files" = "python/reading.md" },
+    { "Writing Files" = "python/writing.md" },
+    { "Signal Processing" = "python/signal.md" },
+  ] },
+  { "Rust Library" = [
     { "Overview" = "library/index.md" },
     { "Reading Files" = "library/reading.md" },
     { "Writing Files" = "library/writing.md" },
     { "Data Types" = "library/types.md" },
   ] },
+  { "Rust API Reference" = "api/index.md" },
   { "File Format" = [
     { "Overview" = "format/index.md" },
     { "Container Structure" = "format/container.md" },
     { "Signal Compression" = "format/compression.md" },
   ] },
-  { "API Reference" = "api/index.md" },
 ]
 
 [project.theme]
