@@ -445,31 +445,16 @@ fn assemble_output(
     Ok(matching_count)
 }
 
-/// Split the reads of a single POD5 file into multiple outputs in one pass.
+/// Scan one reader's reads table a single time, partitioning the reads present
+/// in `read_to_group` into `group name -> reads` (in input read order).
 ///
-/// Unlike calling [`filter_files`] once per output group — which re-opens and
-/// re-scans the whole input for every group — this opens the input once, scans
-/// the reads table a single time to partition matching reads by their target
-/// group, then writes every group's file in parallel against the one shared
-/// mmap. Reads absent from `read_to_group` are dropped.
-///
-/// `read_to_group` maps each read UUID to the basename of its output file
-/// (joined onto `output_dir`). Returns `(output_name, reads_written)` per group.
-pub fn subset_file<P: AsRef<Path>>(
-    input: P,
-    read_to_group: &HashMap<Uuid, String>,
-    output_dir: &Path,
-    options: FilterOptions,
-) -> Result<Vec<(String, u64)>> {
-    let reader = Reader::open(input.as_ref())?;
-    let signal_bytes = reader.signal_table_bytes()?;
-    let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
-    let run_infos = reader.run_infos().to_vec();
-
-    // Single pass over the reads table, partitioning matching reads by group.
-    // Batches are scanned in parallel; per-batch partitions are merged in
-    // batch order so each group keeps input read order (its signal-row prefix
-    // sums depend on it).
+/// Batches are scanned in parallel; per-batch partitions are merged in batch
+/// order so each group keeps input read order (its signal-row prefix sums
+/// depend on it). Returned group keys borrow the names from `read_to_group`.
+fn partition_reads_by_group<'a>(
+    reader: &Reader,
+    read_to_group: &'a HashMap<Uuid, String>,
+) -> Result<HashMap<&'a str, Vec<ReadData>>> {
     let batches: Vec<RecordBatch> = reader.read_batches()?.collect::<Result<Vec<_>>>()?;
 
     let per_batch: Vec<HashMap<&str, Vec<ReadData>>> = batches
@@ -493,25 +478,99 @@ pub fn subset_file<P: AsRef<Path>>(
             groups.entry(group).or_default().extend(reads);
         }
     }
+    Ok(groups)
+}
 
-    // Write each group's output in parallel, all sharing the one reader/mmap.
-    // The per-source extraction inside `assemble_output` is a single-element
-    // parallel pass here; the real fan-out is across groups. Nested rayon is
-    // bounded by the global pool (CLI `-t`).
-    let group_list: Vec<(&str, Vec<ReadData>)> = groups.into_iter().collect();
+/// Split the reads of a single POD5 file into multiple outputs in one pass.
+///
+/// Convenience wrapper around [`subset_files`] for a single input. See there
+/// for semantics.
+pub fn subset_file<P: AsRef<Path> + Sync>(
+    input: P,
+    read_to_group: &HashMap<Uuid, String>,
+    output_dir: &Path,
+    options: FilterOptions,
+) -> Result<Vec<(String, u64)>> {
+    subset_files(
+        std::slice::from_ref(&input),
+        read_to_group,
+        output_dir,
+        options,
+    )
+}
+
+/// Split the reads of one or more POD5 files into multiple outputs in one pass.
+///
+/// Unlike calling [`filter_files`] once per output group — which re-opens and
+/// re-scans every input for every group — this opens each input once, scans its
+/// reads table a single time to partition matching reads by their target group,
+/// then writes every group's file in parallel. A group whose reads span several
+/// inputs is assembled from all of them (in input order); reads absent from
+/// `read_to_group` are dropped.
+///
+/// `read_to_group` maps each read UUID to the basename of its output file
+/// (joined onto `output_dir`). Returns `(output_name, reads_written)` per group.
+pub fn subset_files<P: AsRef<Path> + Sync>(
+    inputs: &[P],
+    read_to_group: &HashMap<Uuid, String>,
+    output_dir: &Path,
+    options: FilterOptions,
+) -> Result<Vec<(String, u64)>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Phase 1: open each input and partition its reads by group, in parallel
+    // across inputs. Each reader stays alive so its mmap backs the chunks the
+    // assembler borrows in phase 2.
+    type InputCtx<'a> = (
+        Reader,
+        ArrowIpcFooter,
+        Vec<RunInfoData>,
+        HashMap<&'a str, Vec<ReadData>>,
+    );
+    let input_paths: Vec<&Path> = inputs.iter().map(|p| p.as_ref()).collect();
+    let per_input: Vec<InputCtx<'_>> = input_paths
+        .par_iter()
+        .map(|path| -> Result<InputCtx<'_>> {
+            let reader = Reader::open(path)?;
+            let signal_bytes = reader.signal_table_bytes()?;
+            let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+            let run_infos = reader.run_infos().to_vec();
+            let groups = partition_reads_by_group(&reader, read_to_group)?;
+            Ok((reader, signal_footer, run_infos, groups))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Union of every group name that received at least one read.
+    let mut all_groups: HashSet<&str> = HashSet::new();
+    for (_, _, _, groups) in &per_input {
+        all_groups.extend(groups.keys().copied());
+    }
+
+    // Phase 2: write each group's output in parallel. Each output gathers one
+    // `OutputSource` per input that contributed reads (in input order), so a
+    // group spanning multiple inputs is assembled from all their mmaps at once.
+    // Nested rayon (across groups, then across sources inside `assemble_output`)
+    // is bounded by the global pool (CLI `-t`).
+    let group_list: Vec<&str> = all_groups.into_iter().collect();
     let results: Vec<Result<(String, u64)>> = group_list
         .par_iter()
-        .map(|(name, reads)| {
-            let output_path = output_dir.join(name);
-            let source = OutputSource {
-                reader: &reader,
-                signal_footer: &signal_footer,
-                run_infos: &run_infos,
-                matching_reads: reads,
-            };
-            let matched =
-                assemble_output(&output_path, std::slice::from_ref(&source), &options, None)?;
-            Ok(((*name).to_string(), matched))
+        .map(|&group| {
+            let sources: Vec<OutputSource<'_>> = per_input
+                .iter()
+                .filter_map(|(reader, signal_footer, run_infos, groups)| {
+                    groups.get(group).map(|reads| OutputSource {
+                        reader,
+                        signal_footer,
+                        run_infos: run_infos.as_slice(),
+                        matching_reads: reads.as_slice(),
+                    })
+                })
+                .collect();
+            let output_path = output_dir.join(group);
+            let matched = assemble_output(&output_path, &sources, &options, None)?;
+            Ok((group.to_string(), matched))
         })
         .collect();
 
