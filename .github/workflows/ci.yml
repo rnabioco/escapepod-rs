@@ -177,3 +177,5 @@ jobs:
         run: cargo check -p escapepod-demux --features cnn-detect
       - name: cnn-gpu — GPU TCN adapter detect (ort + cudarc)
         run: cargo check -p escapepod-demux --features cnn-gpu
+      - name: models-download — k-mer model prefetch (ureq rustls + sha2)
+        run: cargo check -p escapepod-cli --features models-download

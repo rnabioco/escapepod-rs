@@ -280,7 +280,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 - `bam-filter`: Filter reads based on paired BAM file (mapped status, region, quality)
 - `repack`: Repack files for optimized storage
 - `subset`: Split reads into multiple files based on CSV mapping
-- `resquiggle`: Refine signal-to-base mapping using banded DP with POD5 signal and BAM move tables
+- `resquiggle`: Refine signal-to-base mapping using banded DP with POD5 signal and BAM move tables. Takes a k-mer level table via `--kmer-table <path>` or a named model via `--kmer-model <name>` (DNA + RNA; `dna_r10.4.1_e8.2_400bps`, `rna004`, …). Named models resolve from a local cache (`$ESCAPEPOD_KMER_CACHE` → `$XDG_CACHE_HOME/escapepod/kmer_models` → `~/.cache/…`) that is **never** populated at runtime — build with `--features models-download` and prefetch on a networked login node (`escpod resquiggle models fetch --all`) before submitting compute jobs (Alpine/Beevol compute nodes can't reach GitHub). Tables come from nanoporetech/kmer_models (MPL-2.0), pinned to a commit + sha256; the code path uses `ureq`/rustls so the static-musl release stays OpenSSL-free.
 - `demux`: Barcode demultiplexing workflow with subcommands:
   - `detect`: LLR-based adapter boundary detection
   - `fingerprint`: T-test segmentation for barcode fingerprints
