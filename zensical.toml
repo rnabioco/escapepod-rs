@@ -5,6 +5,7 @@ site_url = "https://rnabioco.github.io/escapepod-rs/"
 repo_url = "https://github.com/rnabioco/escapepod-rs"
 repo_name = "rnabioco/escapepod-rs"
 copyright = "Copyright &copy; 2025 RNA Bioscience Initiative"
+extra_css = ["stylesheets/space.css"]
 
 nav = [
   { "Home" = "index.md" },
@@ -60,19 +61,22 @@ features = [
   "content.code.annotate",
 ]
 
-[[project.theme.palette]]
-scheme = "default"
-primary = "indigo"
-accent = "indigo"
-toggle.icon = "material/brightness-7"
-toggle.name = "Switch to dark mode"
-
+# "Space" theme — nebula purple + radioactive lime, on deep space. Dark scheme
+# (slate) is listed first so it's the default; solar orange and the exact
+# shades are layered in stylesheets/space.css. Toggle still switches to light.
 [[project.theme.palette]]
 scheme = "slate"
-primary = "indigo"
-accent = "indigo"
+primary = "purple"
+accent = "lime"
 toggle.icon = "material/brightness-4"
 toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "purple"
+accent = "deep-orange"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
 
 # Line numbers are opt-in per fence via `linenums="1"` (see docs authoring/
 # code-blocks). We only tag actual code (Rust API/library examples); command,
