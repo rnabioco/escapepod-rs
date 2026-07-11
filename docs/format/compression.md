@@ -53,7 +53,7 @@ Benefits:
 
 Maps signed integers to unsigned for efficient variable-length encoding:
 
-```rust
+```rust linenums="1"
 fn zigzag_encode(val: i16) -> u16 {
     ((val << 1) ^ (val >> 15)) as u16
 }
@@ -115,7 +115,7 @@ Data:      [05, 2C 01, 0C, E8 03, 08]
 
 ### Encoding Algorithm
 
-```rust
+```rust linenums="1"
 fn svb16_encode(values: &[u16]) -> Vec<u8> {
     let key_len = (values.len() + 7) / 8;
     let mut keys = vec![0u8; key_len];
@@ -139,7 +139,7 @@ fn svb16_encode(values: &[u16]) -> Vec<u8> {
 
 ### Decoding Algorithm
 
-```rust
+```rust linenums="1"
 fn svb16_decode(data: &[u8], count: usize) -> Vec<u16> {
     let key_len = (count + 7) / 8;
     let keys = &data[..key_len];
@@ -196,7 +196,7 @@ Final result: **30-40% of original size**
 
 Reverse the pipeline:
 
-```rust
+```rust linenums="1"
 pub fn decompress_signal(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     // 1. ZSTD decompress
     let svb_data = zstd::decode_all(data)?;

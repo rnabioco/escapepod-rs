@@ -68,10 +68,12 @@ accent = "indigo"
 toggle.icon = "material/brightness-4"
 toggle.name = "Switch to light mode"
 
+# Line numbers are opt-in per fence via `linenums="1"` (see docs authoring/
+# code-blocks). We only tag actual code (Rust API/library examples); command,
+# config, data, and output blocks stay clean. NOTE: `line_spans`/`anchor_linenums`
+# reroute highlighting into an inline-span mode that suppresses the per-fence
+# line-number gutter, so they are intentionally left off.
 [project.markdown_extensions.pymdownx.highlight]
-anchor_linenums = true
-line_spans = "__span"
-linenums = true
 pygments_lang_class = true
 
 [project.markdown_extensions.pymdownx.inlinehilite]

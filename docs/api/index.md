@@ -51,7 +51,7 @@ The `escpod` binary, built by the default `cli` feature — so `cargo install --
 
 ### Opening Files
 
-```rust
+```rust linenums="1"
 use escapepod_signal::Reader;
 
 let reader = Reader::open("file.pod5")?;
@@ -59,7 +59,7 @@ let reader = Reader::open("file.pod5")?;
 
 ### Creating Files
 
-```rust
+```rust linenums="1"
 use escapepod_signal::{Writer, WriterOptions};
 
 let writer = Writer::create("output.pod5", WriterOptions::default())?;
@@ -67,7 +67,7 @@ let writer = Writer::create("output.pod5", WriterOptions::default())?;
 
 ### Read Iteration
 
-```rust
+```rust linenums="1"
 for read in reader.reads()? {
     println!("{}: {} samples", read.read_id, read.num_samples);
 }
@@ -75,20 +75,20 @@ for read in reader.reads()? {
 
 ### Signal Access
 
-```rust
+```rust linenums="1"
 let signal: Vec<i16> = reader.get_signal(&read)?;
 ```
 
 ### Run Info
 
-```rust
+```rust linenums="1"
 let run_info = reader.get_run_info(read.run_info_index)?;
 println!("Sample rate: {} Hz", run_info.sample_rate);
 ```
 
 ### Writing Reads
 
-```rust
+```rust linenums="1"
 writer.add_run_info(run_info)?;
 writer.add_read(read_data, &signal)?;
 writer.finish()?;
@@ -96,7 +96,7 @@ writer.finish()?;
 
 ## Error Handling
 
-```rust
+```rust linenums="1"
 use escapepod_signal::Error;
 
 match result {

@@ -63,7 +63,7 @@ escpod filter -i read_ids.txt -o filtered.pod5 experiment.pod5
 
 ### Reading a POD5 File
 
-```rust
+```rust linenums="1"
 use escapepod_signal::{Reader, Result};
 
 fn main() -> Result<()> {
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
 
 ### Accessing Run Information
 
-```rust
+```rust linenums="1"
 use escapepod_signal::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
@@ -117,7 +117,7 @@ for run_info in reader.run_infos() {
 
 ### Writing a POD5 File
 
-```rust
+```rust linenums="1"
 use escapepod_signal::{Writer, WriterOptions, ReadData, RunInfoData};
 
 fn main() -> escapepod_signal::Result<()> {

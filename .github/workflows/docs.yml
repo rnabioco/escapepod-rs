@@ -33,10 +33,15 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install zensical
+        # Pin to the version validated in pixi.lock; an unpinned install lets
+        # CI drift to whatever zensical is latest, which is its own flakiness.
+        run: pip install "zensical==0.0.50"
 
       - name: Build documentation
-        run: zensical build --strict
+        # --clean forces a cold cache. zensical's incremental cache makes strict
+        # link validation nondeterministic (links to cached-but-not-reprocessed
+        # pages spuriously report "page does not exist"); a cold build is stable.
+        run: zensical build --clean --strict
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
