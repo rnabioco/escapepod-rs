@@ -369,6 +369,36 @@ mod tests {
         assert_eq!(decoded, samples);
     }
 
+    /// Full int16-range random round-trip, ported from upstream
+    /// `svb16_scalar_tests.cpp` (which fuzzes the whole `[min, max]` range rather
+    /// than the hand-picked boundary values above). Exercises both the
+    /// dispatched `encode`/`decode` (SIMD when the CPU supports it) and the
+    /// `_scalar` reference, and asserts the dispatched encode is byte-identical
+    /// to the scalar reference — the same guarantee `svb16_x64_tests.cpp` checks.
+    #[test]
+    fn test_full_range_random_roundtrip() {
+        let mut s: u64 = 0x1234_5678_9abc_def1;
+        // 4096 is not a multiple of 8, so the scalar key/tail path is exercised.
+        let samples: Vec<i16> = (0..4093)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 48) as i16
+            })
+            .collect();
+
+        let enc = encode(&samples).unwrap();
+        assert_eq!(decode(&enc, samples.len()).unwrap(), samples);
+
+        let enc_scalar = encode_scalar(&samples).unwrap();
+        assert_eq!(decode_scalar(&enc_scalar, samples.len()).unwrap(), samples);
+        assert_eq!(
+            enc, enc_scalar,
+            "dispatched encode must match scalar encode"
+        );
+    }
+
     #[test]
     fn test_validate() {
         let samples: Vec<i16> = (0..100).collect();
