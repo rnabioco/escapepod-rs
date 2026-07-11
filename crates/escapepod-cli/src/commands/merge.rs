@@ -19,13 +19,15 @@ pub fn run(
     force: bool,
     profile: bool,
 ) -> anyhow::Result<()> {
-    // Configure rayon thread pool if threads specified
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok(); // Ignore error if pool already initialized
-    }
+    // Bound the parallelism. Merge scales across input files, but like the
+    // other block-copy commands it does NOT default to all CPUs (see
+    // DEFAULT_THREADS) — that is antisocial on a shared node for a largely
+    // I/O-bound copy. Raise it with `-t` on a machine you own.
+    let num_threads = threads.unwrap_or(crate::commands::DEFAULT_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if pool already initialized
 
     check_output_writable(&output, force)?;
 
