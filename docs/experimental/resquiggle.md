@@ -57,7 +57,8 @@ escpod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-b, --bam <FILE>` | Input BAM file with move table (`mv` tag) (required) |
-| `-k, --kmer-table <FILE>` | Tab-delimited kmer level table file (required) |
+| `-k, --kmer-table <FILE>` | Tab-delimited kmer level table file (mutually exclusive with `--kmer-model`) |
+| `--kmer-model <NAME>` | Named k-mer model resolved from the local cache, e.g. `dna_r10.4.1_e8.2_400bps` (see [K-mer models](#k-mer-models); mutually exclusive with `--kmer-table`) |
 | `-o, --output <FILE>` | Output BAM file (required) |
 | `--algo <ALGO>` | Refinement algorithm: `dwell-penalty` (default) or `viterbi` |
 | `--iterations <N>` | Number of refinement iterations (default: 1) |
@@ -69,6 +70,67 @@ escpod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
 | `--rna` | RNA mode: reverse raw signal to match basecaller's 5'→3' orientation |
 | `-j, --threads <N>` | Number of threads for parallel processing |
 | `-h, --help` | Print help |
+
+## K-mer models
+
+Resquiggle aligns signal against a table of expected k-mer levels. You can either
+point at a file directly (`--kmer-table <path>`) or refer to one of Oxford
+Nanopore's canonical tables by name (`--kmer-model <name>`), resolved from a local
+cache.
+
+| Model name | Chemistry | k |
+|------------|-----------|---|
+| `dna_r10.4.1_e8.2_400bps` | DNA, R10.4.1 (400 bps) | 9 |
+| `dna_r10.4.1_e8.2_260bps` | DNA, R10.4.1 (260 bps) | 9 |
+| `rna004` | RNA004 | 9 |
+| `rna_r9.4_180mv_70bps` | RNA, R9.4 | 5 |
+
+These tables come from [nanoporetech/kmer_models](https://github.com/nanoporetech/kmer_models)
+(MPL-2.0) and are **not vendored** — they are downloaded on demand into a cache and
+pinned to a specific upstream commit + sha256, so results are reproducible and
+integrity-checked.
+
+### Prefetch on a networked node (HPC)
+
+Downloading requires the `models-download` Cargo feature, and **runtime never
+touches the network** — a `--kmer-model` that isn't cached errors with a hint
+rather than hanging. On clusters where compute nodes can't reach the internet,
+prefetch from a login node *before* submitting jobs:
+
+```bash
+# built with:  cargo build --release --features models-download
+escpod resquiggle models list                       # show models + cache status
+escpod resquiggle models path                        # print the cache directory
+escpod resquiggle models fetch dna_r10.4.1_e8.2_400bps
+escpod resquiggle models fetch --all                 # grab every model
+
+# then, on a compute node (offline is fine — resolves from cache):
+escpod resquiggle reads.pod5 -b calls.bam --kmer-model dna_r10.4.1_e8.2_400bps -o refined.bam
+```
+
+The cache location is `$ESCAPEPOD_KMER_CACHE`, else
+`$XDG_CACHE_HOME/escapepod/kmer_models`, else `$HOME/.cache/escapepod/kmer_models`.
+Cached files are named `<model-name>.txt` (e.g. `dna_r10.4.1_e8.2_400bps.txt`).
+
+!!! tip "Put the cache on shared scratch (HPC)"
+    The default falls back to `$HOME`, which on many clusters is small-quota and
+    sometimes not mounted on compute nodes. Prefetch resolves the cache directory
+    once — so if `$HOME` and the compute node disagree, a job can't find models the
+    login node downloaded. Point the cache at a shared scratch filesystem that's
+    visible everywhere, and export it in **both** the prefetch shell and the job
+    script (the four models total ~23 MB):
+
+    ```bash
+    export ESCAPEPOD_KMER_CACHE=/scratch/$USER/escapepod/kmer_models
+
+    # login node (networked): populate the cache
+    escpod resquiggle models fetch --all
+
+    # job script (same export): resolves from scratch, no network needed
+    #SBATCH ...
+    export ESCAPEPOD_KMER_CACHE=/scratch/$USER/escapepod/kmer_models
+    escpod resquiggle reads.pod5 -b calls.bam --kmer-model rna004 -o refined.bam
+    ```
 
 ## Input Requirements
 

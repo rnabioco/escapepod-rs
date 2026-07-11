@@ -38,7 +38,12 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # Python bindings
 pyo3 = { version = "0.29", features = ["extension-module"] }
 rayon = "1"
+# k-mer model prefetch (opt-in via `models-download`). rustls (not native-tls)
+# so the static-musl release binary stays self-contained — the transitive ureq
+# from `ort` uses native-tls→openssl, which we deliberately avoid here.
+sha2 = "0.10"
 thiserror = "2"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Structured logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
