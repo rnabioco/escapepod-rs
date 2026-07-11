@@ -2,8 +2,8 @@
 //!
 //! Uses raw byte extraction from mmap without Arrow deserialization.
 
-use crate::arrow_ipc::ArrowIpcFooter;
 use crate::arrow_helpers::ReadsBatchView;
+use crate::arrow_ipc::ArrowIpcFooter;
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
@@ -397,8 +397,7 @@ fn assemble_output(
 
     // Borrow each source's run_infos for dedup — avoids deep-cloning every
     // RunInfoData (each carries 13 Strings + 2 HashMaps).
-    let per_source_run_infos: Vec<&[RunInfoData]> =
-        sources.iter().map(|s| s.run_infos).collect();
+    let per_source_run_infos: Vec<&[RunInfoData]> = sources.iter().map(|s| s.run_infos).collect();
     let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_source_run_infos);
 
     // Build a flat view of every matching read with the prefix-sum
