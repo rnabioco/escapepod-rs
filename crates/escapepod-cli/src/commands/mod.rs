@@ -1,9 +1,10 @@
 //! CLI command implementations.
 
-/// Default rayon pool size for the block-copy commands (`filter`, `subset`,
-/// `merge`) when `-t` is not given. Deliberately small: these commands are
-/// largely I/O-bound copies, so defaulting to all CPUs would monopolize a
-/// shared node for little gain. Users raise it with `-t` on a machine they own.
+/// Default rayon pool size for the block-copy / bulk-file commands (`filter`,
+/// `subset`, `merge`, `index`) when `-t` is not given. Deliberately small:
+/// these commands are largely I/O-bound and fan out across files, so defaulting
+/// to all CPUs would monopolize a shared node for little gain. Users raise it
+/// with `-t` on a machine they own.
 pub const DEFAULT_THREADS: usize = 8;
 
 pub mod bam_filter;

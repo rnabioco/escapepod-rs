@@ -18,13 +18,15 @@ use crate::util::collect_pod5_inputs;
 /// written next to the POD5 file by appending `.p5i` to the full
 /// filename (e.g. `reads.pod5` → `reads.pod5.p5i`).
 pub fn run(inputs: Vec<PathBuf>, force: bool, threads: Option<usize>) -> anyhow::Result<()> {
-    // Configure rayon thread pool if threads specified
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok(); // Ignore error if pool already initialized
-    }
+    // Bound the parallelism. Like the other block-copy commands, indexing does
+    // NOT default to all CPUs (see DEFAULT_THREADS) — it fans out across files
+    // and writes only small sidecars, so grabbing a whole shared node is
+    // wasteful. Raise it with `-t` on a machine you own.
+    let num_threads = threads.unwrap_or(crate::commands::DEFAULT_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if pool already initialized
 
     let files = collect_pod5_inputs(&inputs)?;
 
