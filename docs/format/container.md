@@ -101,7 +101,7 @@ table EmbeddedFile {
 4. Use offsets to locate each table
 5. Parse Arrow IPC streams on demand
 
-```rust
+```rust linenums="1"
 // Pseudocode
 let file_len = file.metadata().len();
 let sig_end = &file[file_len - 8..];

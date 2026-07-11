@@ -135,6 +135,10 @@ zensical = "*"
 [feature.docs.tasks]
 docs-build = "zensical build"
 docs-serve = "zensical serve"
+# Mirrors the CI docs gate. --clean forces a cold cache: zensical's incremental
+# cache makes --strict link validation nondeterministic (cached pages spuriously
+# report "page does not exist"), so run the strict check against a fresh cache.
+docs-check = "zensical build --clean --strict"
 
 # Fast local dev builds via mold. The task wrappers use `mold -run`, which
 # intercepts the linker exec via LD_PRELOAD and works with the system gcc

@@ -36,7 +36,7 @@ escpod filter -i interesting_reads.txt -o subset.pod5 experiment.pod5
 
 ### Library
 
-```rust
+```rust linenums="1"
 use escapepod_signal::Reader;
 
 let reader = Reader::open("experiment.pod5")?;

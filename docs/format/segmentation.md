@@ -493,7 +493,7 @@ Benefits:
 
 ### LLR Module
 
-```rust
+```rust linenums="1"
 use escapepod_signal::segmentation::{LlrTrace, detect_adapter};
 
 // Create trace from signal
@@ -511,7 +511,7 @@ let (adapter_start, adapter_end) = detect_adapter(&signal, min_obs, border_trim)
 
 ### T-test Module
 
-```rust
+```rust linenums="1"
 use escapepod_signal::segmentation::{
     windowed_ttest,
     find_changepoints,
@@ -534,7 +534,7 @@ let segments = segment_signal(&signal, window_width, num_changepoints, min_separ
 
 ### DTW Module
 
-```rust
+```rust linenums="1"
 use escapepod_signal::dtw::{dtw_distance, dtw_distance_matrix};
 
 // Single distance

@@ -26,7 +26,7 @@ pulling in signal-processing code.
 
 ## Quick Example
 
-```rust
+```rust linenums="1"
 use escapepod_signal::{Reader, Writer, WriterOptions, ReadData, RunInfoData};
 
 // Read a POD5 file
@@ -56,7 +56,7 @@ writer.finish()?;
 
 All operations return `Result<T, escapepod_signal::Error>`. The error type provides detailed information about what went wrong:
 
-```rust
+```rust linenums="1"
 use escapepod_signal::{Reader, Error};
 
 match Reader::open("file.pod5") {
