@@ -25,9 +25,21 @@ pub fn run(
     end_reason: Option<Vec<String>>,
     exclude_end_reason: Option<Vec<String>>,
     output: PathBuf,
+    threads: Option<usize>,
     force: bool,
     profile: bool,
 ) -> anyhow::Result<()> {
+    // Bound the combined width of the per-file, per-batch, and
+    // per-signal-batch parallelism. Unlike merge/demux, filter does NOT
+    // default to all CPUs — grabbing a whole (often shared) node for what is
+    // largely an I/O-bound copy is antisocial. Default to a small fixed pool;
+    // raise it with `-t` when the box is yours.
+    let num_threads = threads.unwrap_or(crate::commands::DEFAULT_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if pool already initialized
+
     check_output_writable(&output, force)?;
 
     let mut timer = PhaseTimer::new();

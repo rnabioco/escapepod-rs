@@ -16,9 +16,19 @@ pub fn run(
     input: PathBuf,
     csv_file: PathBuf,
     output_dir: PathBuf,
+    threads: Option<usize>,
     force: bool,
     profile: bool,
 ) -> anyhow::Result<()> {
+    // Bound the combined width of the per-group and per-batch parallelism.
+    // Like `filter`, subset does NOT default to all CPUs (see DEFAULT_THREADS);
+    // raise it with `-t` on a machine you own.
+    let num_threads = threads.unwrap_or(crate::commands::DEFAULT_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if pool already initialized
+
     let mut timer = PhaseTimer::new();
     timer.phase("Parse CSV mapping");
 

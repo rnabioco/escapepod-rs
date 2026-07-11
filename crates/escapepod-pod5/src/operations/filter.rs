@@ -3,6 +3,7 @@
 //! Uses raw byte extraction from mmap without Arrow deserialization.
 
 use crate::arrow_ipc::ArrowIpcFooter;
+use crate::arrow_helpers::ReadsBatchView;
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
@@ -11,6 +12,7 @@ use crate::utils::pod5_assembler::{
     FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
 use crate::utils::table_builders::{SchemaMetadata, build_reads_table_remapped};
+use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -211,13 +213,32 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 let matching = reader.reads_by_ids(target_ids)?;
                 (matching, total)
             } else {
-                // collect_all_reads resolves columns once per batch.
-                let all_reads: Vec<ReadData> = reader.collect_all_reads()?;
-                let total = all_reads.len();
-                let matching = all_reads
-                    .into_iter()
-                    .filter(|read| criteria.matches(read))
-                    .collect();
+                // Scan the reads table in parallel across its record batches.
+                // Matching is independent per batch, and concatenating the
+                // per-batch results in batch order preserves file read order —
+                // which the downstream signal-row prefix sums (`flat_reads`)
+                // rely on. Nested under the outer per-file `par_iter`; the
+                // global rayon pool bounds the combined width (CLI `-t`).
+                let batches: Vec<RecordBatch> =
+                    reader.read_batches()?.collect::<Result<Vec<_>>>()?;
+                let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+                let per_batch: Vec<Vec<ReadData>> = batches
+                    .par_iter()
+                    .map(|batch| -> Result<Vec<ReadData>> {
+                        let view = ReadsBatchView::new(batch, false)?;
+                        let mut matched = Vec::new();
+                        for row in 0..view.num_rows() {
+                            let read = view.read(row)?;
+                            if criteria.matches(&read) {
+                                matched.push(read);
+                            }
+                        }
+                        Ok(matched)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let matching: Vec<ReadData> = per_batch.into_iter().flatten().collect();
                 (matching, total)
             };
 

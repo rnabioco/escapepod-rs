@@ -222,6 +222,10 @@ At least one filter criterion must be specified.
         #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
 
+        /// Number of threads for parallel processing (default: 8)
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
+
         /// Overwrite the output file if it already exists
         #[arg(short, long)]
         force: bool,
@@ -331,6 +335,10 @@ Each unique 'output' value creates a separate POD5 file.
         /// Output directory
         #[arg(short, long, default_value = ".", value_name = "DIR")]
         output_dir: PathBuf,
+
+        /// Number of threads for parallel processing (default: 8)
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
 
         /// Overwrite existing files
         #[arg(short, long)]
@@ -537,6 +545,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            threads,
             force,
             profile,
         } => commands::filter::run(
@@ -547,6 +556,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            threads,
             force,
             profile,
         ),
@@ -577,9 +587,10 @@ fn main() -> anyhow::Result<()> {
             input,
             csv,
             output_dir,
+            threads,
             force,
             profile,
-        } => commands::subset::run(input, csv, output_dir, force, profile),
+        } => commands::subset::run(input, csv, output_dir, threads, force, profile),
 
         Commands::Summary(args) => commands::summary::run(args),
 
