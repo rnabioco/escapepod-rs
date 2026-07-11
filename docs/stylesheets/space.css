@@ -155,3 +155,12 @@
 [data-md-color-scheme="default"] .md-typeset h3 {
   color: #6c2bd9;
 }
+/* Opaque search pill in light mode so the header squiggle doesn't show through
+   the translucent default. Only needed on the lighter purple header — the
+   dark-scheme pill already sits over the squiggle opaquely. Darker purple keeps
+   the white search text/icon readable; the active/expanded search (white bg) is
+   more specific and still wins. */
+[data-md-color-scheme="default"] .md-search__form,
+[data-md-color-scheme="default"] .md-search__form:hover {
+  background-color: #591bb0;
+}
