@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use bstr::ByteSlice;
 use clap::Args;
 use rayon::prelude::*;
@@ -23,26 +23,60 @@ use sam::alignment::record_buf::data::field::Value;
 use sam::alignment::record_buf::data::field::value::Array;
 use sam::header::record::value::map::{Map, Program, program::tag as pg_tag};
 
+use crate::commands::resquiggle_models::{self, ModelsCommand};
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{count_bam_records, resolve_pod5_inputs};
 
+/// Top-level `resquiggle` arguments: either the refine run (default) or a
+/// `models` management subcommand. Mirrors the `demux` nesting so the run's
+/// required args are negated when a subcommand is given.
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ResquiggleArgs {
-    /// Input POD5 file or directory
-    pub input: PathBuf,
+    /// Management subcommands. Omit to run the resquiggle refinement.
+    #[command(subcommand)]
+    pub command: Option<ResquiggleCommand>,
+
+    /// Refinement arguments (used when no subcommand is given).
+    #[command(flatten)]
+    pub run: ResquiggleRunArgs,
+}
+
+/// Resquiggle subcommands (auxiliary to the default refine run).
+#[derive(clap::Subcommand, Debug)]
+pub enum ResquiggleCommand {
+    /// Manage k-mer level models (download / list the local cache)
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+}
+
+#[derive(Args)]
+pub struct ResquiggleRunArgs {
+    /// Input POD5 file or directory. (Required for a refine run; validated at
+    /// runtime so the `models` subcommand isn't forced to provide it.)
+    #[arg(value_name = "INPUT")]
+    pub input: Option<PathBuf>,
 
     /// Input BAM file with move table (mv tag)
-    #[arg(short, long, required = true)]
-    pub bam: PathBuf,
+    #[arg(short, long)]
+    pub bam: Option<PathBuf>,
 
-    /// Tab-delimited kmer level table file
-    #[arg(short, long, required = true)]
-    pub kmer_table: PathBuf,
+    /// Tab-delimited kmer level table file (mutually exclusive with --kmer-model)
+    #[arg(short, long)]
+    pub kmer_table: Option<PathBuf>,
+
+    /// Named k-mer model resolved from the local cache, e.g.
+    /// `dna_r10.4.1_e8.2_400bps` (see `escpod resquiggle models list`).
+    /// Mutually exclusive with --kmer-table.
+    #[arg(long, value_name = "NAME")]
+    pub kmer_model: Option<String>,
 
     /// Output BAM file
-    #[arg(short, long, required = true)]
-    pub output: PathBuf,
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
 
     /// Refinement algorithm
     #[arg(long, default_value = "dwell-penalty", value_parser = parse_algo, help_heading = "Advanced Options")]
@@ -149,6 +183,39 @@ fn parse_rescale(s: &str) -> Result<RescaleAlgo, String> {
 }
 
 pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
+    if let Some(ResquiggleCommand::Models { command }) = args.command {
+        return resquiggle_models::run(command);
+    }
+    run_resquiggle(args.run)
+}
+
+fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
+    // Required args are optional at the clap level (so the `models` subcommand
+    // isn't forced to supply them); validate them here.
+    let input = args
+        .input
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing required argument <INPUT> (POD5 file or directory)"))?;
+    let bam = args
+        .bam
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing required argument --bam <BAM>"))?;
+    let output = args
+        .output
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing required argument --output <OUTPUT>"))?;
+
+    // Resolve the k-mer level table from --kmer-table or --kmer-model.
+    let kmer_table_path = match (&args.kmer_table, &args.kmer_model) {
+        (Some(_), Some(_)) => bail!("pass either --kmer-table or --kmer-model, not both"),
+        (None, None) => bail!(
+            "provide a k-mer level table: --kmer-table <path> or --kmer-model <name> \
+             (see 'escpod resquiggle models list')"
+        ),
+        (Some(path), None) => path.clone(),
+        (None, Some(name)) => resquiggle_models::resolve(name)?,
+    };
+
     // Configure thread pool
     if let Some(threads) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -190,20 +257,20 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     info!(
         "{} kmer table from {}",
         style::action("Loading"),
-        style::path(args.kmer_table.display())
+        style::path(kmer_table_path.display())
     );
-    let mut kmer_table = KmerTable::from_file(&args.kmer_table)?;
+    let mut kmer_table = KmerTable::from_file(&kmer_table_path)?;
     if settings.normalize_levels {
         kmer_table.fix_gauge()?;
         info!("applied MAD normalization to kmer levels");
     }
 
     // --- Phase 2: Index all POD5 reads ---
-    let pod5_files = resolve_pod5_inputs(&args.input)?;
+    let pod5_files = resolve_pod5_inputs(input)?;
     let pod5_spinner = create_spinner("Indexing")?;
     pod5_spinner.set_message(format!(
         "POD5 data from {} ({})",
-        args.input.display(),
+        input.display(),
         if pod5_files.len() > 1 {
             format!("{} files", pod5_files.len())
         } else {
@@ -253,10 +320,10 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         .collect::<escapepod_signal::Result<_>>()?;
 
     // --- Phase 3: Stream BAM, refine in parallel, write asynchronously ---
-    let bam_total = count_bam_records(&args.bam)?;
+    let bam_total = count_bam_records(bam)?;
     info!("BAM contains {} records", bam_total);
 
-    let file = std::fs::File::open(&args.bam)?;
+    let file = std::fs::File::open(bam)?;
     let worker_count = args
         .threads
         .and_then(std::num::NonZeroUsize::new)
@@ -312,7 +379,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
     // Spawn writer thread — receives ordered chunks via channel
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<RecordBuf>>(2);
     let header_clone = header.clone();
-    let output_path = args.output.clone();
+    let output_path = output.to_path_buf();
     let writer_handle = std::thread::spawn(move || -> anyhow::Result<usize> {
         let output_file = std::fs::File::create(&output_path)?;
         let encoder = bgzf::io::MultithreadedWriter::with_worker_count(worker_count, output_file);
@@ -413,7 +480,7 @@ pub fn run(args: ResquiggleArgs) -> anyhow::Result<()> {
         style::count(refined),
         errors,
         style::count(written),
-        style::path(args.output.display())
+        style::path(output.display())
     );
     if errors > 0 {
         let reasons = ctx.skip_reasons.lock().unwrap();
