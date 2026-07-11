@@ -95,6 +95,36 @@ srun -p rna -c 32 --mem=32G pixi run -e dev test
 srun -p rna -c 48 --mem=64G pixi run escpod demux fingerprint …
 ```
 
+### Running on Alpine (CU Boulder RMACC/ACCESS)
+
+The `rna`/`gpu` partitions above are the **Beevol** (CU Anschutz) cluster. On
+**Alpine** the SLURM model differs: every partition needs an **explicit `--qos=`
+matched to the partition** plus `-A amc-general` (the CU Anschutz allocation) — the
+partition name alone is not enough. Translation:
+
+| Purpose | Beevol | Alpine |
+|---|---|---|
+| CPU build / test / bench | `srun -p rna -c 32 --mem=32G` | `srun -p amilan --qos=normal -A amc-general -c 32 --mem=32G` |
+| CPU full node (throughput) | `srun -p rna -c 48` | `srun -p amilan --qos=normal -A amc-general -c 64 --mem=120G` |
+| GPU test / bench | `srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1` | `srun -p aa100 --qos=gpu-normal -A amc-general -c 16 --gres=gpu:1` |
+| Light build (login is 2 cores) | login node | `srun -p acompile --qos=compile -A amc-general -c 16 --mem=32G` |
+
+QOS↔partition: amilan→`normal`|`long`; aa100/al40→`gpu-normal`|`gpu-long`;
+acompile→`compile`; atesting→`testing` (1 h cap). Default mem is 3840 MB/core.
+
+Notes specific to Alpine:
+- `amilan` nodes are AMD EPYC Milan, 2×32 = **64 physical cores, no hyperthreading**,
+  245 GB. So the Beevol "`-c 48` fills a socket / `-c 64` crosses NUMA" tuning does
+  **not** apply — `-c N` is N physical cores; one full node is 64 across 2 sockets.
+- GPU CUDA work must use `aa100` (A100) or `al40` (L40). `ami100` is AMD/ROCm and
+  **cannot** run the CUDA `gpu`/`cnn-gpu` features.
+- All of amilan/aa100/acompile are Zen3 x86-64, so the pinned `target-cpu=x86-64-v3`
+  baseline is portable across them — build once, run anywhere, no SIGILL risk.
+- Toolchain lives in pixi, not on the bare PATH: `-e dev` (mold + cargo-nextest),
+  `-e warpdemux-bench` (hyperfine + pod5, for `benchmarks/benchmark.sh`), `-e gpu`
+  (CUDA runtime / libnvrtc). Wrap invocations accordingly, e.g.
+  `srun -p amilan --qos=normal -A amc-general -c 32 --mem=32G pixi run -e dev test`.
+
 ## Benchmarking & Profiling
 
 ### Build profiles

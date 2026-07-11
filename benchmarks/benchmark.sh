@@ -9,10 +9,15 @@ set -e
 
 POD5_DIR="${1:-.}"
 ESCAPEPOD_BIN="./target/release/escpod"
-POD5_BIN="$(cd /beevol/home/jhessel/devel/rnabioco/escapepod-rs && pixi run which pod5)"
-OUTPUT_DIR="/tmp/escapepod_benchmark"
-WARMUP=1
-RUNS=3
+# Resolve `pod5` from PATH — run this script inside a pixi env that provides it
+# (e.g. `pixi run -e warpdemux-bench ./benchmarks/benchmark.sh <dir>`, which ships
+# both hyperfine and pod5). Avoids hardcoding any machine-specific checkout path.
+POD5_BIN="$(command -v pod5 || echo pod5)"
+# Override with OUTPUT_DIR=... when inputs are large — merge writes a full copy
+# of the dataset here per run, which can overflow a small node-local /tmp.
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/escapepod_benchmark}"
+WARMUP="${WARMUP:-1}"
+RUNS="${RUNS:-3}"
 
 # Check dependencies
 if ! command -v hyperfine &> /dev/null; then
