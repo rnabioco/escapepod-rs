@@ -393,7 +393,10 @@ mod tests {
 
         let enc_scalar = encode_scalar(&samples).unwrap();
         assert_eq!(decode_scalar(&enc_scalar, samples.len()).unwrap(), samples);
-        assert_eq!(enc, enc_scalar, "dispatched encode must match scalar encode");
+        assert_eq!(
+            enc, enc_scalar,
+            "dispatched encode must match scalar encode"
+        );
     }
 
     #[test]
