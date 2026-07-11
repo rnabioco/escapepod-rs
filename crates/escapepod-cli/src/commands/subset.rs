@@ -1,16 +1,16 @@
 //! Subset command implementation.
 //!
-//! Splits reads into multiple output files based on a CSV mapping.
-//! Uses the optimized filter_files() path for each output group.
+//! Splits reads into multiple output files based on a CSV mapping, in a single
+//! pass over the input (see `subset_file`): the input is scanned once and each
+//! read routed to its group's writer, rather than re-scanning the whole input
+//! once per output group.
 
 use crate::commands::profile::PhaseTimer;
 use crate::style;
-use escapepod_signal::operations::{FilterOptions, filter_files, parse_csv_mapping};
-use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use escapepod_signal::operations::{FilterOptions, parse_csv_mapping, subset_file};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::info;
-use uuid::Uuid;
 
 pub fn run(
     input: PathBuf,
@@ -39,16 +39,9 @@ pub fn run(
         anyhow::bail!("No valid mappings found in CSV file");
     }
 
-    // Group read IDs by output file
-    let mut groups: HashMap<String, HashSet<Uuid>> = HashMap::new();
-    for (read_id, output_name) in &mapping {
-        groups
-            .entry(output_name.clone())
-            .or_default()
-            .insert(*read_id);
-    }
-
-    let num_groups = groups.len();
+    // Unique output files (a group) — one per distinct value in the mapping.
+    let unique_outputs: HashSet<&String> = mapping.values().collect();
+    let num_groups = unique_outputs.len();
     let total_reads = mapping.len();
 
     info!(
@@ -63,7 +56,7 @@ pub fn run(
 
     // Check for existing files if not forcing
     if !force {
-        for output_name in groups.keys() {
+        for output_name in &unique_outputs {
             let output_path = output_dir.join(output_name);
             if output_path.exists() {
                 anyhow::bail!(
@@ -79,26 +72,17 @@ pub fn run(
         read_batch_size: 10_000,
     };
 
-    timer.phase("Filter & write groups");
-    // Process all output groups in parallel using the optimized filter path
-    let group_list: Vec<_> = groups.into_iter().collect();
-    let results: Vec<anyhow::Result<(String, u64)>> = group_list
-        .par_iter()
-        .map(|(output_name, group_ids)| {
-            let output_path = output_dir.join(output_name);
-            let input_files = [&input];
-            let result =
-                filter_files(&input_files, &output_path, group_ids, options.clone(), None)?;
-            Ok((output_name.clone(), result.matched_reads))
-        })
-        .collect();
+    timer.phase("Split (single pass)");
+    // One pass over the input: scan the reads table once, partition by group,
+    // then write every group's file in parallel against the shared mmap.
+    let mut results = subset_file(&input, &mapping, &output_dir, options)?;
+    // Deterministic report order (group write order is nondeterministic).
+    results.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut total_matched = 0u64;
     let mut group_rows: Vec<(PathBuf, u64)> = Vec::new();
-    for result in results {
-        let (name, matched) = result?;
-        let output_path = output_dir.join(&name);
-        group_rows.push((output_path, matched));
+    for (name, matched) in &results {
+        group_rows.push((output_dir.join(name), *matched));
         total_matched += matched;
     }
 
