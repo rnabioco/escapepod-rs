@@ -416,7 +416,7 @@ Examples:
         #[arg(short, long)]
         force: bool,
 
-        /// Number of threads for parallel processing (default: all CPUs)
+        /// Number of threads for parallel processing (default: 8)
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
     },
