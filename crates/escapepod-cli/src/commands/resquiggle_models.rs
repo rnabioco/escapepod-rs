@@ -76,11 +76,7 @@ fn find(name: &str) -> Option<&'static ModelEntry> {
 
 /// Comma-separated list of known model names, for error messages.
 fn known_names() -> String {
-    MODELS
-        .iter()
-        .map(|m| m.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")
 }
 
 /// Resolve the on-disk cache directory for k-mer models.
@@ -115,7 +111,10 @@ fn cache_path(entry: &ModelEntry) -> Result<PathBuf> {
 /// from a networked node. Loading is left to `KmerTable::from_file`.
 pub fn resolve(name: &str) -> Result<PathBuf> {
     let Some(entry) = find(name) else {
-        bail!("unknown k-mer model '{name}'; known models: {}", known_names());
+        bail!(
+            "unknown k-mer model '{name}'; known models: {}",
+            known_names()
+        );
     };
     let path = cache_path(entry)?;
     if !path.exists() {
@@ -186,10 +185,15 @@ fn list() -> Result<()> {
 fn fetch(name: Option<String>, all: bool) -> Result<()> {
     match (name, all) {
         (Some(_), true) => bail!("pass either a model name or --all, not both"),
-        (None, false) => bail!("specify a model name or --all; see 'escpod resquiggle models list'"),
+        (None, false) => {
+            bail!("specify a model name or --all; see 'escpod resquiggle models list'")
+        }
         (Some(name), false) => {
             let Some(entry) = find(&name) else {
-                bail!("unknown k-mer model '{name}'; known models: {}", known_names());
+                bail!(
+                    "unknown k-mer model '{name}'; known models: {}",
+                    known_names()
+                );
             };
             fetch_entry(entry)
         }
@@ -259,7 +263,12 @@ fn fetch_entry(entry: &ModelEntry) -> Result<()> {
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("moving {} into place at {}", tmp.display(), dest.display()))?;
 
-    info!("cached {} ({} bytes) -> {}", entry.name, body.len(), dest.display());
+    info!(
+        "cached {} ({} bytes) -> {}",
+        entry.name,
+        body.len(),
+        dest.display()
+    );
     Ok(())
 }
 
@@ -347,11 +356,14 @@ mod tests {
 
     #[test]
     fn resolve_uncached_model_hints_prefetch() {
-        temp_env(&[("ESCAPEPOD_KMER_CACHE", Some("/nonexistent/escpod-cache"))], || {
-            let err = resolve("rna004").unwrap_err().to_string();
-            assert!(err.contains("not cached"), "{err}");
-            assert!(err.contains("models fetch rna004"), "{err}");
-        });
+        temp_env(
+            &[("ESCAPEPOD_KMER_CACHE", Some("/nonexistent/escpod-cache"))],
+            || {
+                let err = resolve("rna004").unwrap_err().to_string();
+                assert!(err.contains("not cached"), "{err}");
+                assert!(err.contains("models fetch rna004"), "{err}");
+            },
+        );
     }
 
     /// Set env vars for the duration of `f`, restoring prior values after.
