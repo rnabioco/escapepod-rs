@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 (2026-07-11)
+
 ### Added
 
 - **Native GBM (gradient-boosted tree-ensemble) barcode classifier** for
@@ -22,6 +24,12 @@
   `to_pandas` / `to_polars` exporters, `missing_ok` handling,
   `calibrate_signal_array`, `Writer.add_reads`, and per-read `byte_count`,
   bringing the `escapepod` bindings closer to the reference `pod5` package.
+- **Python bindings for the signal layer**: `normalize`, a `KmerTable`
+  wrapper, and `refine_signal_map` are now exposed from `escapepod-signal`,
+  so the resquiggle/normalization primitives are usable from Python.
+- `-t` / `--threads` on `filter`, `subset`, and `merge` (matching `demux`)
+  to cap the worker pool; these commands now default to a bounded pool of 8
+  threads instead of grabbing every CPU on a shared node.
 - **POD5 reads-table schema V5**: the `expected_open_pore_level` and
   `selected_read_level` fields (both `float32`), introduced upstream in pod5
   0.3.44, are now read, written, merged/filtered, surfaced in `view`/`inspect`
@@ -78,6 +86,10 @@
   Default level is `info`; control it with `-v`/`-vv`/`-q` or `RUST_LOG`.
   Progress bars auto-hide under `-q`.
 - **Minimum supported Rust version raised to 1.95** (from 1.92).
+- The **resquiggle module is relicensed to MIT** as an independent
+  implementation, bringing it in line with the rest of the workspace.
+- The Theil–Sen rescale **subsample seed is now configurable** (`resquiggle
+  --seed`), making refinement runs bit-for-bit reproducible.
 - The LLR detect `--downscale` default is now **10** (the WarpDemuX-native
   mode) for `demux` and `demux detect`, up from 1. This makes detect — the
   dominant prep stage — ~5× faster, with ~98% barcode agreement versus
@@ -107,6 +119,12 @@
 - **Faster Python read iteration**: per-batch column resolution for the lazy
   `for rd in reader:` iterator and `reads()`, plus numpy-backed metadata
   columns for `to_dict` / `to_pandas` / `to_polars`.
+- **Parallelized bulk-file copies**: `filter`, `subset`, and `merge` now
+  copy reads across threads (bounded default pool of 8; `-t` to override),
+  and the experimental `index` command adopts the same bounded default
+  instead of inheriting rayon's all-CPU global pool.
+- **Single-pass `demux split`**: reads are routed to per-barcode outputs in
+  one pass, and the `--unclassified` flag now works correctly.
 - Codebase-wide optimization/refactor sweep (#86), all bit-identical output:
   - **Resquiggle adaptive banded DP ~31% faster** — the per-base traceback no
     longer heap-allocates a `Vec` per base; the whole read shares one flat

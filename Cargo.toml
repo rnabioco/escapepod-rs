@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/rnabioco/escapepod-rs"
@@ -22,9 +22,9 @@ clap = { version = "4", features = ["derive"] }
 # GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
 cudarc = { version = "0.19", default-features = false, features = ["cuda-12020", "driver", "nvrtc", "std", "dynamic-loading"] }
 # Workspace crates
-escapepod-demux = { path = "crates/escapepod-demux", version = "0.5.1" }
-escapepod-pod5 = { path = "crates/escapepod-pod5", version = "0.5.1" }
-escapepod-signal = { path = "crates/escapepod-signal", version = "0.5.1" }
+escapepod-demux = { path = "crates/escapepod-demux", version = "0.6.0" }
+escapepod-pod5 = { path = "crates/escapepod-pod5", version = "0.6.0" }
+escapepod-signal = { path = "crates/escapepod-signal", version = "0.6.0" }
 # Serialization
 flatbuffers = "25"
 indicatif = "0.18"
