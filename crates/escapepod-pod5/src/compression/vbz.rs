@@ -251,6 +251,40 @@ mod tests {
         );
     }
 
+    /// Port of the upstream python `test_signal_tools.test_round_trip_chunked`
+    /// (+ its `_empty` sibling): a signal split into arbitrarily sized chunks,
+    /// each compressed independently, must decompress and concatenate back to
+    /// the original, with the chunk lengths summing to the sample count. This is
+    /// exactly the invariant the file writer relies on when it splits a read at
+    /// `max_signal_chunk_size` and the reader concatenates the rows.
+    #[test]
+    fn test_round_trip_chunked() {
+        // Full int16-range deterministic signal (xorshift64).
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let signal: Vec<i16> = (0..12_345)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 48) as i16
+            })
+            .collect();
+
+        // Chunk sizes spanning tiny, mid, exact-length and over-length; 0-length
+        // input is covered by `test_compress_decompress_empty`.
+        for &chunk_size in &[1usize, 7, 250, 999, 12_345, 20_000] {
+            let mut lengths = Vec::new();
+            let mut roundtrip = Vec::new();
+            for chunk in signal.chunks(chunk_size) {
+                let compressed = compress_signal(chunk).unwrap();
+                lengths.push(chunk.len());
+                roundtrip.extend(decompress_signal(&compressed, chunk.len()).unwrap());
+            }
+            assert_eq!(lengths.iter().sum::<usize>(), signal.len());
+            assert_eq!(roundtrip, signal, "chunk_size={chunk_size}");
+        }
+    }
+
     #[test]
     fn test_compress_decompress_extreme_values() {
         let samples = vec![

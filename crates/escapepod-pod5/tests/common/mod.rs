@@ -1,4 +1,8 @@
 //! Shared helpers for escapepod-pod5 integration tests.
+//!
+//! Each integration-test binary compiles this module independently and uses a
+//! different subset of the helpers, so unused items here are expected per-binary.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;
