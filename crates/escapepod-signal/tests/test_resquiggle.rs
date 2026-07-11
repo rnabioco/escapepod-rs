@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //
 //! Integration test: compare escapepod resquiggle output against fishnet reference.
 //!

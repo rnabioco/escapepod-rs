@@ -4,6 +4,7 @@ mod dataset;
 mod error;
 mod read_data;
 mod reader;
+mod signal;
 mod writer;
 
 /// Python bindings for the escapepod POD5 library.
@@ -17,5 +18,6 @@ fn escapepod(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<writer::PyWriter>()?;
     m.add_function(wrap_pyfunction!(writer::create_run_info, m)?)?;
     m.add("Pod5Error", m.py().get_type::<error::Pod5Error>())?;
+    signal::register(m)?;
     Ok(())
 }

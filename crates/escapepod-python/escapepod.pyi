@@ -368,3 +368,28 @@ def create_run_info(
     context_tags: Optional[dict[str, str]] = None,
     tracking_id: Optional[dict[str, str]] = None,
 ) -> RunInfo: ...
+
+# --- Signal processing (escapepod-signal) --------------------------------
+
+class KmerTable:
+    """A kmer level table loaded from a ``kmer\\tlevel`` file (gzip supported)."""
+
+    @staticmethod
+    def from_file(path: Union[str, PathLike[str]]) -> "KmerTable": ...
+    @property
+    def k(self) -> int: ...
+    def get(self, kmer: str) -> float: ...
+    def extract_levels(self, seq: str) -> npt.NDArray[np.float32]: ...
+
+def mad_normalize(signal: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]: ...
+def normalize_signal(signal: npt.NDArray[np.int16]) -> npt.NDArray[np.float32]: ...
+def refine_signal_map(
+    signal: npt.NDArray[np.float32],
+    seq_to_signal_map: list[int],
+    expected_levels: npt.NDArray[np.float32],
+    half_bandwidth: int = 5,
+    scale_iters: int = 2,
+    dwell_target: float = 4.0,
+    dwell_weight: float = 0.5,
+    seed: Optional[int] = None,
+) -> tuple[npt.NDArray[np.int64], float, float, float]: ...

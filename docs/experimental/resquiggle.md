@@ -395,7 +395,7 @@ escpod resquiggle reads.pod5 \
 
 The resquiggle algorithms are inspired by:
 
-- **Banded DP refinement and signal rescaling**: Inspired by [fishnet](https://www.researchsquare.com/article/rs-8345719/v1) by Brickner et al., licensed under GPL-3.0.
+- **Banded DP refinement and signal rescaling**: Inspired by [fishnet](https://www.researchsquare.com/article/rs-8345719/v1) by Brickner et al. This is an independent implementation of the published algorithm, not a derivative of fishnet's source.
 
 ## Notes
 

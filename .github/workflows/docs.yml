@@ -9,8 +9,11 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+# Pages deploy needs id-token + pages write; the artifact upload only reads the repo.
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
 # Only one docs deploy at a time; cancel a superseded build.
 concurrency:
@@ -35,12 +38,19 @@ jobs:
       - name: Build documentation
         run: zensical build --strict
 
-      - name: Deploy to Netlify
-        if: github.ref == 'refs/heads/main'
-        uses: nwtgck/actions-netlify@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          publish-dir: ./site
-          production-deploy: true
-        env:
-          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          path: ./site
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
