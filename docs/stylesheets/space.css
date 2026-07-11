@@ -1,0 +1,134 @@
+/* ==========================================================================
+   escapepod — "space" theme
+   nebula purple · solar orange · radioactive lime, on a deep-space background.
+
+   Layered on Material's palette (purple primary + lime accent, set in
+   zensical.toml). Colour roles:
+     purple  — structure, headings, links, brand
+     lime    — interaction: link hover, focus, active accent
+     orange  — emphasis: "you are here" nav, marks, callout tint
+   ========================================================================== */
+
+:root {
+  --space-purple:      #b57bff; /* nebula (light, for text/links on dark) */
+  --space-purple-mid:  #9d5cf0;
+  --space-purple-deep: #7b2fd6;
+  --space-orange:      #ff9e3d; /* solar flare */
+  --space-lime:        #b6f24a; /* radioactive */
+}
+
+/* ======================= Dark = deep space (default) ===================== */
+[data-md-color-scheme="slate"] {
+  --md-hue: 265; /* purple-tinted greys */
+
+  --md-default-bg-color:          #0b0a16; /* deep space */
+  --md-default-bg-color--light:   #14121f;
+  --md-default-bg-color--lighter: #1c1930;
+  --md-default-bg-color--lightest:#241f3d;
+  --md-default-fg-color:          #e9e7f6;
+  --md-default-fg-color--light:   #cbc7e2;
+  --md-default-fg-color--lighter: #8f8ab0;
+  --md-default-fg-color--lightest:#4a4568;
+
+  --md-primary-fg-color:  #14121f; /* header/nav base (gradient added below) */
+  --md-primary-bg-color:  #f4f1ff;
+  --md-footer-bg-color:   #08070f;
+  --md-footer-fg-color:   #cbc7e2;
+
+  --md-typeset-a-color:   var(--space-purple);   /* links */
+  --md-accent-fg-color:   var(--space-lime);     /* link hover / accent */
+
+  --md-code-bg-color:     #100e1c;
+  --md-code-fg-color:     #d8d4ec;
+
+  color-scheme: dark;
+}
+
+/* Nebula gradient across the top bar + tabs */
+[data-md-color-scheme="slate"] .md-header {
+  background: linear-gradient(100deg, #1c0f3d 0%, #171334 42%, #0b0a16 100%);
+  box-shadow: 0 1px 0 0 rgba(181, 123, 255, 0.16);
+}
+[data-md-color-scheme="slate"] .md-tabs {
+  background: transparent;
+}
+
+/* Headings: bright, with a faint purple rule under h2 */
+[data-md-color-scheme="slate"] .md-typeset h1 {
+  color: #f4f1ff;
+  font-weight: 700;
+}
+[data-md-color-scheme="slate"] .md-typeset h2 {
+  border-bottom: 1px solid rgba(181, 123, 255, 0.18);
+  padding-bottom: 0.15em;
+}
+[data-md-color-scheme="slate"] .md-typeset h3 {
+  color: var(--space-purple);
+}
+
+/* Orange = "you are here" and emphasis */
+[data-md-color-scheme="slate"] .md-nav__link--active,
+[data-md-color-scheme="slate"] .md-nav__link--active > .md-ellipsis,
+[data-md-color-scheme="slate"] .md-nav__item--active > .md-nav__link {
+  color: var(--space-orange);
+}
+[data-md-color-scheme="slate"] .md-typeset mark {
+  background: rgba(255, 158, 61, 0.26);
+  color: #ffd9ad;
+}
+
+/* Inline code gets a lime pop; blocks get a subtle purple frame */
+[data-md-color-scheme="slate"] .md-typeset code:not(.highlight code):not(pre code) {
+  color: var(--space-lime);
+  background: rgba(182, 242, 74, 0.08);
+}
+[data-md-color-scheme="slate"] .md-typeset .highlight,
+[data-md-color-scheme="slate"] .md-typeset pre {
+  border: 1px solid rgba(181, 123, 255, 0.14);
+  border-radius: 8px;
+}
+
+/* Tables + admonitions echo the palette */
+[data-md-color-scheme="slate"] .md-typeset table:not([class]) th {
+  background: rgba(123, 47, 214, 0.18);
+  color: #f4f1ff;
+}
+[data-md-color-scheme="slate"] .md-typeset .admonition,
+[data-md-color-scheme="slate"] .md-typeset details {
+  border-left-color: var(--space-purple-mid);
+}
+
+/* Buttons / search / selection */
+[data-md-color-scheme="slate"] .md-typeset .md-button {
+  color: var(--space-purple);
+  border-color: var(--space-purple);
+}
+[data-md-color-scheme="slate"] .md-typeset .md-button:hover {
+  background: var(--space-lime);
+  border-color: var(--space-lime);
+  color: #0b0a16;
+}
+[data-md-color-scheme="slate"] ::selection {
+  background: rgba(123, 47, 214, 0.5);
+}
+
+/* ========================= Light (alternate) ============================= */
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color:  #6c2bd9; /* purple header */
+  --md-primary-fg-color--light: #8b5cf6;
+  --md-primary-fg-color--dark:  #591bb0;
+  --md-primary-bg-color:  #ffffff;
+  --md-typeset-a-color:   #7b2fd6; /* purple links */
+  --md-accent-fg-color:   #e8590c; /* orange hover */
+}
+[data-md-color-scheme="default"] .md-nav__link--active,
+[data-md-color-scheme="default"] .md-nav__item--active > .md-nav__link {
+  color: #e8590c;
+}
+[data-md-color-scheme="default"] .md-typeset code:not(.highlight code):not(pre code) {
+  color: #4c1d95;
+  background: rgba(101, 43, 176, 0.07);
+}
+[data-md-color-scheme="default"] .md-typeset h3 {
+  color: #6c2bd9;
+}
