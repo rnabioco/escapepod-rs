@@ -34,7 +34,21 @@ escpod merge -o combined.pod5 run1.pod5 run2.pod5
 escpod filter -i interesting_reads.txt -o subset.pod5 experiment.pod5
 ```
 
-### Library
+### Python
+
+A `pod5`-compatible package backed by the same Rust engine — see the
+[Python API](python/index.md).
+
+```python
+import escapepod
+
+with escapepod.Reader("experiment.pod5") as reader:
+    for read in reader:
+        signal = reader.get_signal(read)   # numpy int16
+        print(f"{read.read_id}: {read.num_samples} samples")
+```
+
+### Rust
 
 ```rust
 use escapepod_signal::Reader;
@@ -57,6 +71,7 @@ for read in reader.reads()? {
 
 ## Documentation
 
+- [Python API](python/index.md) - Reading and writing POD5 from Python
 - [CLI Reference](cli/index.md) - Command-line tool documentation
-- [Library Guide](library/index.md) - Using escapepod in your Rust projects
+- [Rust Library](library/index.md) - Using escapepod in your Rust projects
 - [File Format](format/index.md) - Technical details of the POD5 format

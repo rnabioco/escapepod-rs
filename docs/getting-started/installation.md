@@ -56,7 +56,21 @@ escpod --version
 escpod --help
 ```
 
-## Using the Library
+## Installing the Python package
+
+The `escapepod` Python package provides a `pod5`-compatible API. PyPI wheels
+are planned; until then, build it from a checkout with
+[maturin](https://www.maturin.rs/):
+
+```bash
+pip install maturin
+maturin develop --release --manifest-path crates/escapepod-python/Cargo.toml
+```
+
+This installs `escapepod` into the active environment. See the
+[Python API](../python/index.md) for usage.
+
+## Using the Rust Library
 
 The workspace splits the library layer in two: `escapepod-pod5` for format
 I/O and `escapepod-signal` for signal-processing algorithms. `escapepod-signal`
