@@ -1085,6 +1085,7 @@ mod tests {
                     // Also exercise the AVX-512 kernel directly when the host
                     // supports it (the public dispatcher keeps it opt-in, so it
                     // wouldn't otherwise run in the default test config).
+                    #[cfg(target_arch = "x86_64")]
                     let mut got_avx512 = Vec::new();
                     #[cfg(target_arch = "x86_64")]
                     if std::arch::is_x86_feature_detected!("avx512f") {
@@ -1103,9 +1104,7 @@ mod tests {
                         got_avx512 = got_baseline.clone();
                     }
                     #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        got_avx512 = got_baseline.clone();
-                    }
+                    let got_avx512 = got_baseline.clone();
 
                     assert_eq!(got_dispatch.len(), n_train);
                     assert_eq!(got_baseline.len(), n_train);
