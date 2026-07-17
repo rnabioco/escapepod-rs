@@ -41,7 +41,7 @@ indicatif = { workspace = true, optional = true }
 noodles-bam = { version = "0.90", optional = true }
 noodles-bgzf = { version = "0.47", optional = true }
 noodles-core = { version = "0.20", optional = true }
-noodles-csi = { version = "0.56", optional = true }
+noodles-csi = { version = "0.57", optional = true }
 noodles-sam = { version = "0.85", optional = true }
 owo-colors = { version = "4", optional = true }
 parquet = { workspace = true, optional = true }
