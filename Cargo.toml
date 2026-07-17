@@ -41,7 +41,7 @@ rayon = "1"
 # k-mer model prefetch (opt-in via `models-download`). rustls (not native-tls)
 # so the static-musl release binary stays self-contained — the transitive ureq
 # from `ort` uses native-tls→openssl, which we deliberately avoid here.
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Structured logging
