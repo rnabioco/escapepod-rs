@@ -618,6 +618,106 @@ class TestWriterDropWarning:
             Path(path).unlink(missing_ok=True)
 
 
+class TestAtomicWrite:
+    """Output must appear only when the file is complete.
+
+    The writer stages into a temp file beside the destination and renames it
+    into place on close(), so an abandoned write leaves the destination alone
+    rather than a headerless stump.
+    """
+
+    @staticmethod
+    def _add_one(w, read_id, run_info_id="atomic-acq"):
+        ri_idx = w.add_run_info(escapepod.RunInfo(run_info_id))
+        w.add_read(
+            read_id=read_id,
+            read_number=1,
+            start_sample=0,
+            channel=1,
+            well=1,
+            pore_type="not_set",
+            calibration_offset=0.0,
+            calibration_scale=1.0,
+            median_before=200.0,
+            end_reason="signal_positive",
+            end_reason_forced=False,
+            run_info_index=ri_idx,
+            num_minknow_events=0,
+            signal=np.arange(100, dtype=np.int16),
+        )
+
+    @staticmethod
+    def _strays(d):
+        return [q.name for q in Path(d).iterdir() if q.name.startswith(".escpod-tmp-")]
+
+    def test_abort_writes_no_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "out.pod5"
+
+            w = escapepod.Writer(str(path))
+            self._add_one(w, "11111111-2222-3333-4444-555555555555")
+            w.abort()
+
+            assert not path.exists()
+            assert not self._strays(d)
+
+    def test_abort_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "out.pod5"
+            w = escapepod.Writer(str(path))
+            self._add_one(w, "11111111-2222-3333-4444-555555555555")
+            w.abort()
+            w.abort()  # second call is a no-op, not an error
+            assert not path.exists()
+
+    def test_abort_preserves_an_existing_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "out.pod5"
+            kept = "11111111-2222-3333-4444-555555555555"
+
+            with escapepod.Writer(str(path)) as w:
+                self._add_one(w, kept, "original-acq")
+            original = path.read_bytes()
+
+            w = escapepod.Writer(str(path))
+            self._add_one(w, "99999999-8888-7777-6666-555555555555", "replacement")
+            w.abort()
+
+            assert path.read_bytes() == original
+            with escapepod.Reader(str(path)) as r:
+                assert r.read_count == 1
+                assert r.reads()[0].read_id == kept
+            assert not self._strays(d)
+
+    def test_context_manager_discards_output_on_exception(self):
+        """Leaving the block via an exception means the caller never finished
+        describing the file, so nothing should be committed."""
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "out.pod5"
+
+            with pytest.raises(RuntimeError, match="boom"):
+                with escapepod.Writer(str(path)) as w:
+                    self._add_one(w, "11111111-2222-3333-4444-555555555555")
+                    raise RuntimeError("boom")
+
+            assert not path.exists()
+            assert not self._strays(d)
+
+    def test_context_manager_commits_on_clean_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "out.pod5"
+            read_id = "11111111-2222-3333-4444-555555555555"
+
+            with escapepod.Writer(str(path)) as w:
+                self._add_one(w, read_id)
+
+            with escapepod.Reader(str(path)) as r:
+                assert r.read_count == 1
+                assert r.reads()[0].read_id == read_id
+            assert not self._strays(d)
+
+
 class TestCreateRunInfo:
     def test_minimal(self):
         ri = escapepod.create_run_info("test-acq")
