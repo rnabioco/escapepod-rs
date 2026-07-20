@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.6.1 (2026-07-20)
+
+### Fixed
+
+- POD5 archives are now written **atomically**: output is staged to a
+  temporary file and renamed into place on completion, so an interrupted or
+  failed write can no longer leave a truncated/partial `.pod5` at the target
+  path.
+
+### Build / Tooling
+
+- Dependency bumps: `noodles-bam` 0.91, `noodles-sam` 0.86, `noodles-bgzf`
+  0.48, `noodles-csi` 0.57, `sha2` 0.11, and the grouped cargo minor/patch
+  and GitHub Actions updates.
+
 ## 0.6.0 (2026-07-11)
 
 ### Added
