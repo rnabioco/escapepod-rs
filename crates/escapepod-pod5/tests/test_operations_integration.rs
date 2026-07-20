@@ -24,6 +24,7 @@ fn filter_opts() -> FilterOptions {
     FilterOptions {
         signal_batch_size: 100,
         read_batch_size: 1000,
+        ..Default::default()
     }
 }
 
@@ -74,6 +75,7 @@ fn repack_preserves_all_reads_and_signal() {
         signal_batch_size: 100,
         read_batch_size: 1000,
         force: false,
+        ..Default::default()
     };
     let result = repack_files(&[(&input, &output)], opts, None);
     assert_eq!(result.files_processed, 1);
@@ -146,7 +148,8 @@ fn subset_partitions_reads_across_inputs() {
     }
 
     let results = subset_files(&[&in_a, &in_b], &read_to_group, &out_dir, filter_opts()).unwrap();
-    let counts: HashMap<String, u64> = results.into_iter().collect();
+    assert!(results.failures.is_empty(), "{:?}", results.failures);
+    let counts: HashMap<String, u64> = results.groups.into_iter().collect();
 
     for (group, ids) in &want {
         assert_eq!(

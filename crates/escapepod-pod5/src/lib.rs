@@ -56,7 +56,10 @@ pub use reader::ReadIndex;
 pub use reader::Reader;
 pub use reader::SignalExtractor;
 pub use types::{EndReason, PoreType, ReadData, RunInfoData, SignalType, Uuid};
-pub use writer::{PredefinedDictionaries, Writer, WriterOptions};
+pub use writer::{
+    AtomicFile, Durability, PredefinedDictionaries, Writer, WriterOptions,
+    abort_all_in_flight_writes,
+};
 
 // Re-export Arrow types needed for batch-level operations
 pub use arrow::record_batch::RecordBatch;

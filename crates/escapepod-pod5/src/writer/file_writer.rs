@@ -7,6 +7,7 @@ use crate::schema::{reads_schema, run_info_schema, signal_schema};
 use crate::types::{
     FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid,
 };
+use crate::writer::atomic::{AtomicFile, Durability};
 use arrow::array::{
     ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder,
     LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
@@ -41,6 +42,9 @@ pub struct WriterOptions {
     /// Predefined dictionaries for multi-batch consistency.
     /// When set, all dictionary values must exist in the predefined lists.
     pub predefined_dictionaries: Option<PredefinedDictionaries>,
+    /// How hard to push bytes to stable storage before the file is renamed
+    /// into place. Defaults to [`Durability::None`] — rename only.
+    pub durability: Durability,
 }
 
 impl Default for WriterOptions {
@@ -52,6 +56,7 @@ impl Default for WriterOptions {
             compress_signal: true,
             software: format!("escapepod-rs {}", env!("CARGO_PKG_VERSION")),
             predefined_dictionaries: None,
+            durability: Durability::default(),
         }
     }
 }
@@ -129,12 +134,23 @@ pub struct Writer {
 
     // Predefined dictionary mode
     use_predefined_dictionaries: bool,
+
+    // Cleanup guard for the staging file. Taken by `finish`/`abort`; while it
+    // is still `Some`, dropping the writer unlinks the partial output and
+    // leaves the destination untouched.
+    atomic: Option<AtomicFile>,
 }
 
 impl Writer {
     /// Create a new POD5 file for writing.
+    ///
+    /// Nothing appears at `path` until [`finish`](Self::finish) succeeds:
+    /// bytes are staged in a temp file alongside it and renamed into place at
+    /// the end. Dropping the writer without finishing discards the partial
+    /// output and leaves any pre-existing file at `path` intact.
     pub fn create<P: AsRef<Path>>(path: P, options: WriterOptions) -> Result<Self> {
-        let file = File::create(path)?;
+        let atomic = AtomicFile::with_durability(path, options.durability)?;
+        let file = atomic.reopen()?;
         // Use 2MB buffer for efficient I/O
         let mut file = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
 
@@ -207,6 +223,7 @@ impl Writer {
             section_marker,
             finalized: false,
             use_predefined_dictionaries: use_predefined,
+            atomic: Some(atomic),
             options,
         })
     }
@@ -1007,9 +1024,38 @@ impl Writer {
         // Write signature
         file.write_all(&POD5_SIGNATURE)?;
 
+        // Release the buffered handle before committing: `commit` syncs and
+        // renames the underlying file but cannot flush a buffer it doesn't own.
         file.flush()?;
+        drop(file);
+
+        self.atomic.take().ok_or(Error::WriterFinalized)?.commit()?;
+
         self.finalized = true;
         Ok(())
+    }
+
+    /// Discard the file being written without finalizing it.
+    ///
+    /// The destination is left untouched, or absent if it never existed. Use
+    /// this instead of simply dropping the writer when you want the cleanup
+    /// error rather than a silent unlink.
+    pub fn abort(mut self) -> Result<()> {
+        self.atomic.take().ok_or(Error::WriterFinalized)?.abort()
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Reaching here with the guard still held means `finish` never
+        // completed — either the caller dropped us or `finish` bailed partway.
+        // Either way the destination must not be touched, so let the guard
+        // drop and unlink the staging file.
+        //
+        // After a successful `finish` the guard is already `None`, which is
+        // what keeps this a no-op on the happy path (`finish` consumes `self`,
+        // so this always runs).
+        drop(self.atomic.take());
     }
 }
 

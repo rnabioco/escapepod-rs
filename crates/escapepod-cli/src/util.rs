@@ -81,6 +81,45 @@ pub fn check_output_writable(output: &Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Stable identity for a path that may not exist yet.
+///
+/// An output path usually has no file to canonicalize, so resolve its parent
+/// and re-attach the filename. Returns `None` when even the parent is
+/// unresolvable, in which case the caller should not claim a collision.
+fn resolve_for_compare(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path.file_name()?;
+    std::fs::canonicalize(parent).ok().map(|p| p.join(name))
+}
+
+/// Reject an output path that is also one of the inputs.
+///
+/// Writing over an input is survivable — output is staged and renamed, so the
+/// inputs stay readable on their original inode for the whole run — but it
+/// consumes a source file the user probably meant to keep, and it is almost
+/// always a typo or an over-broad glob rather than an intent.
+pub fn check_output_not_input(output: &Path, inputs: &[PathBuf]) -> anyhow::Result<()> {
+    let Some(resolved_output) = resolve_for_compare(output) else {
+        return Ok(());
+    };
+    for input in inputs {
+        if resolve_for_compare(input).as_deref() == Some(resolved_output.as_path()) {
+            anyhow::bail!(
+                "Output {} is also an input. Choose a different output path \
+                 (or drop it from the inputs) so the source file is not replaced.",
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolve multiple input paths to a flat list of POD5 files.
 ///
 /// Each input can be a file or directory. Directories are expanded recursively.

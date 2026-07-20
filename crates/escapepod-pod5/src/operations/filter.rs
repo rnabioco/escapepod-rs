@@ -12,6 +12,7 @@ use crate::utils::pod5_assembler::{
     FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
 use crate::utils::table_builders::{SchemaMetadata, build_reads_table_remapped};
+use crate::writer::atomic::{AtomicFile, Durability};
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -104,6 +105,8 @@ pub struct FilterOptions {
     pub signal_batch_size: u32,
     /// Reads per batch.
     pub read_batch_size: u32,
+    /// How hard to push bytes to stable storage before renaming into place.
+    pub durability: Durability,
 }
 
 impl Default for FilterOptions {
@@ -111,6 +114,7 @@ impl Default for FilterOptions {
         Self {
             signal_batch_size: 1_000,
             read_batch_size: 10_000,
+            durability: Durability::default(),
         }
     }
 }
@@ -370,10 +374,14 @@ fn assemble_output(
 
     let schema_meta = SchemaMetadata::new();
 
-    let file = File::create(output_path)?;
+    // Stage into a temp file alongside the destination; nothing appears at
+    // `output_path` until the commit below. Any `?` between here and there
+    // drops the guard, which unlinks the partial file and leaves an existing
+    // destination untouched.
+    let atomic = AtomicFile::with_durability(output_path, options.durability)?;
     // 128 MiB buffer matches merge.rs and avoids many small syscalls when
     // the reads/run_info tables are flushed at the end.
-    let mut file = BufWriter::with_capacity(128 * 1024 * 1024, file);
+    let mut file = BufWriter::with_capacity(128 * 1024 * 1024, atomic.reopen()?);
 
     // Write POD5 header
     file.write_all(&POD5_SIGNATURE)?;
@@ -442,6 +450,11 @@ fn assemble_output(
         &reads_table_bytes,
     )?;
 
+    // Release the buffered handle before the rename so nothing is left unwritten.
+    file.flush()?;
+    drop(file);
+    atomic.commit()?;
+
     Ok(matching_count)
 }
 
@@ -481,6 +494,25 @@ fn partition_reads_by_group<'a>(
     Ok(groups)
 }
 
+/// Outcome of a subset/split, reported per group.
+///
+/// Groups are written in parallel and independently, so one failing group does
+/// not invalidate the others. Both lists are sorted by group name.
+#[derive(Debug, Default)]
+pub struct SubsetOutcome {
+    /// Groups written successfully, as (output name, reads written).
+    pub groups: Vec<(String, u64)>,
+    /// Groups that failed. These produced no output file at all.
+    pub failures: Vec<(String, Error)>,
+}
+
+impl SubsetOutcome {
+    /// Total reads written across all successful groups.
+    pub fn reads_written(&self) -> u64 {
+        self.groups.iter().map(|(_, n)| n).sum()
+    }
+}
+
 /// Split the reads of a single POD5 file into multiple outputs in one pass.
 ///
 /// Convenience wrapper around [`subset_files`] for a single input. See there
@@ -490,7 +522,7 @@ pub fn subset_file<P: AsRef<Path> + Sync>(
     read_to_group: &HashMap<Uuid, String>,
     output_dir: &Path,
     options: FilterOptions,
-) -> Result<Vec<(String, u64)>> {
+) -> Result<SubsetOutcome> {
     subset_files(
         std::slice::from_ref(&input),
         read_to_group,
@@ -509,15 +541,15 @@ pub fn subset_file<P: AsRef<Path> + Sync>(
 /// `read_to_group` are dropped.
 ///
 /// `read_to_group` maps each read UUID to the basename of its output file
-/// (joined onto `output_dir`). Returns `(output_name, reads_written)` per group.
+/// (joined onto `output_dir`).
 pub fn subset_files<P: AsRef<Path> + Sync>(
     inputs: &[P],
     read_to_group: &HashMap<Uuid, String>,
     output_dir: &Path,
     options: FilterOptions,
-) -> Result<Vec<(String, u64)>> {
+) -> Result<SubsetOutcome> {
     if inputs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SubsetOutcome::default());
     }
 
     // Phase 1: open each input and partition its reads by group, in parallel
@@ -554,7 +586,8 @@ pub fn subset_files<P: AsRef<Path> + Sync>(
     // Nested rayon (across groups, then across sources inside `assemble_output`)
     // is bounded by the global pool (CLI `-t`).
     let group_list: Vec<&str> = all_groups.into_iter().collect();
-    let results: Vec<Result<(String, u64)>> = group_list
+    type GroupResult = std::result::Result<(String, u64), (String, Error)>;
+    let results: Vec<GroupResult> = group_list
         .par_iter()
         .map(|&group| {
             let sources: Vec<OutputSource<'_>> = per_input
@@ -569,12 +602,27 @@ pub fn subset_files<P: AsRef<Path> + Sync>(
                 })
                 .collect();
             let output_path = output_dir.join(group);
-            let matched = assemble_output(&output_path, &sources, &options, None)?;
-            Ok((group.to_string(), matched))
+            match assemble_output(&output_path, &sources, &options, None) {
+                Ok(matched) => Ok((group.to_string(), matched)),
+                Err(e) => Err((group.to_string(), e)),
+            }
         })
         .collect();
 
-    results.into_iter().collect()
+    // Report every group's outcome rather than collapsing to the first error
+    // and discarding the rest: groups are written in parallel, so "the first
+    // error" is nondeterministic and says nothing about what else happened.
+    // Failed groups leave no file behind, so a re-run is clean.
+    let mut outcome = SubsetOutcome::default();
+    for result in results {
+        match result {
+            Ok(group) => outcome.groups.push(group),
+            Err(failure) => outcome.failures.push(failure),
+        }
+    }
+    outcome.groups.sort_by(|a, b| a.0.cmp(&b.0));
+    outcome.failures.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(outcome)
 }
 
 /// `Write` adapter that counts the bytes flowing through. The Arrow IPC

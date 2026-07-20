@@ -2,6 +2,7 @@
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
+use escapepod_signal::Durability;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
@@ -88,8 +89,40 @@ struct Cli {
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// How hard to push output to stable storage before it is renamed into
+    /// place. Output files are always staged and renamed, so an interrupted
+    /// run never leaves a partial archive at the destination; this controls
+    /// only whether the bytes are also durable against a machine crash.
+    ///
+    /// `none` (default) is fastest and appropriate on scratch filesystems
+    /// where output is regenerable. `file` fsyncs each output; `full` also
+    /// fsyncs the directory, so the rename itself survives a crash.
+    #[arg(long, global = true, value_enum, default_value_t = FsyncMode::None)]
+    fsync: FsyncMode,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+/// CLI spelling of [`Durability`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum FsyncMode {
+    /// Rename only — no fsync.
+    None,
+    /// fsync each output file before renaming it into place.
+    File,
+    /// Also fsync the parent directory after the rename.
+    Full,
+}
+
+impl From<FsyncMode> for Durability {
+    fn from(m: FsyncMode) -> Self {
+        match m {
+            FsyncMode::None => Durability::None,
+            FsyncMode::File => Durability::File,
+            FsyncMode::Full => Durability::FileAndDir,
+        }
+    }
 }
 
 // The `Demux` variant carries the fused-pipeline arg struct, which is wide by
@@ -491,6 +524,35 @@ fn feature_disabled(command: &str, feature: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Remove staging files on interrupt or termination.
+///
+/// Output is staged and renamed, so a signal already leaves the destination
+/// alone — but the process dies before any `Drop` runs, so the staging files
+/// themselves would be left behind. On a cluster the SIGTERM case is the
+/// common one: SLURM sends it on `scancel` and at walltime expiry.
+fn install_signal_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANDLING: AtomicBool = AtomicBool::new(false);
+
+    // `ctrlc` dispatches this on a thread it spawned rather than in real
+    // signal context, so locking and file removal here are legitimate.
+    let result = ctrlc::set_handler(|| {
+        if HANDLING.swap(true, Ordering::SeqCst) {
+            // A second signal while the first cleanup is still running (for
+            // example, wedged on an unresponsive network filesystem) must
+            // still get the user out.
+            std::process::exit(130);
+        }
+        eprintln!("\nInterrupted — discarding incomplete output...");
+        escapepod_signal::abort_all_in_flight_writes();
+        std::process::exit(130);
+    });
+
+    if let Err(e) = result {
+        tracing::debug!("could not install signal handler: {e}");
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -510,6 +572,10 @@ fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    install_signal_handler();
+
+    let durability = Durability::from(cli.fsync);
 
     match cli.command {
         Commands::View {
@@ -535,7 +601,15 @@ fn main() -> anyhow::Result<()> {
             threads,
             force,
             profile,
-        } => commands::merge::run(inputs, output, duplicate_ok, threads, force, profile),
+        } => commands::merge::run(
+            inputs,
+            output,
+            duplicate_ok,
+            threads,
+            force,
+            profile,
+            durability,
+        ),
 
         Commands::Filter {
             input,
@@ -559,6 +633,7 @@ fn main() -> anyhow::Result<()> {
             threads,
             force,
             profile,
+            durability,
         ),
 
         Commands::BamFilter {
@@ -570,7 +645,9 @@ fn main() -> anyhow::Result<()> {
             quality,
             force,
             profile,
-        } => commands::bam_filter::run(input, bam, output, mapped, region, quality, force, profile),
+        } => commands::bam_filter::run(
+            input, bam, output, mapped, region, quality, force, profile, durability,
+        ),
 
         #[cfg(feature = "experimental")]
         Commands::Repack {
@@ -578,7 +655,7 @@ fn main() -> anyhow::Result<()> {
             output_dir,
             force,
             profile,
-        } => commands::repack::run(inputs, output_dir, force, profile),
+        } => commands::repack::run(inputs, output_dir, force, profile, durability),
 
         #[cfg(not(feature = "experimental"))]
         Commands::Repack { .. } => feature_disabled("repack", "experimental"),
@@ -590,7 +667,7 @@ fn main() -> anyhow::Result<()> {
             threads,
             force,
             profile,
-        } => commands::subset::run(input, csv, output_dir, threads, force, profile),
+        } => commands::subset::run(input, csv, output_dir, threads, force, profile, durability),
 
         Commands::Summary(args) => commands::summary::run(args),
 

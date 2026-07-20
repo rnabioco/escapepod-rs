@@ -2,12 +2,13 @@
 
 use super::utils::configure_thread_pool;
 use crate::style;
+use escapepod_signal::Durability;
 use escapepod_signal::operations::{FilterOptions, parse_barcode_mapping, subset_files};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use tabled::{builder::Builder, settings::Style};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Arguments for the split subcommand.
@@ -37,6 +38,10 @@ pub struct SplitArgs {
     /// Number of threads for parallel processing (default: all CPUs)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
+
+    /// Overwrite existing per-barcode output files
+    #[arg(long)]
+    pub force: bool,
 
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
@@ -132,18 +137,42 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Refuse to clobber a previous run's output unless asked. Checked up front
+    // so a long split doesn't run only to overwrite files at the very end.
+    if !args.force {
+        for filename in file_to_barcode.keys() {
+            let path = args.output_dir.join(filename);
+            if path.exists() {
+                anyhow::bail!(
+                    "Output file {} already exists. Use --force to overwrite.",
+                    path.display()
+                );
+            }
+        }
+    }
+
     // Single pass over the inputs: scan each once, route every read to its
     // barcode's writer, rather than re-scanning every input once per barcode.
     let options = FilterOptions {
         signal_batch_size: 1_000,
         read_batch_size: 10_000,
+        durability: Durability::default(),
     };
-    let mut results = subset_files(&args.input, &read_to_group, &args.output_dir, options)?;
-    // Deterministic report order (group write order is nondeterministic).
-    results.sort_by(|a, b| a.0.cmp(&b.0));
+    // `SubsetOutcome` already sorts both lists by group name, so the report
+    // order is deterministic even though groups are written in parallel.
+    let results = subset_files(&args.input, &read_to_group, &args.output_dir, options)?;
 
-    let mut barcode_stats = Vec::with_capacity(results.len());
-    for (filename, read_count) in &results {
+    // Each failed barcode produced no file at all; name them rather than
+    // reporting a partial split as if it were complete.
+    if !results.failures.is_empty() {
+        for (group, err) in &results.failures {
+            error!("{}: {}", style::path(group), err);
+        }
+        anyhow::bail!("{} barcode file(s) failed to write", results.failures.len());
+    }
+
+    let mut barcode_stats = Vec::with_capacity(results.groups.len());
+    for (filename, read_count) in &results.groups {
         let output_path = args.output_dir.join(filename);
         let file_size = fs::metadata(&output_path)?.len();
         let barcode = file_to_barcode

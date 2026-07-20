@@ -7,16 +7,18 @@ use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::collect_pod5_inputs;
-use escapepod_signal::{RepackOptions, repack_files};
+use escapepod_signal::{Durability, RepackOptions, repack_files};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{error, warn};
 
 pub fn run(
     inputs: Vec<PathBuf>,
     output_dir: PathBuf,
     force: bool,
     profile: bool,
+    durability: Durability,
 ) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
     timer.phase("Resolve inputs");
@@ -63,6 +65,7 @@ pub fn run(
 
     let options = RepackOptions {
         force,
+        durability,
         ..RepackOptions::default()
     };
 
@@ -91,14 +94,22 @@ pub fn run(
     );
 
     if result.files_skipped > 0 {
-        println!(
-            "  {} {} file(s) skipped",
-            style::action("Warning:"),
+        warn!(
+            "{} file(s) skipped because the output already exists (use --force)",
             style::count(result.files_skipped as u64)
         );
     }
 
     timer.report(profile);
+
+    // A file that failed partway produced no output, so name it rather than
+    // folding it into a count the user can't act on.
+    if !result.failures.is_empty() {
+        for (path, message) in &result.failures {
+            error!("{}: {}", style::path(path.display()), message);
+        }
+        anyhow::bail!("{} file(s) failed to repack", result.failures.len());
+    }
 
     Ok(())
 }
