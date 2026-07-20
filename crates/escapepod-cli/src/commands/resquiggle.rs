@@ -324,12 +324,8 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
     info!("BAM contains {} records", bam_total);
 
     let file = std::fs::File::open(bam)?;
-    let worker_count = args
-        .threads
-        .and_then(std::num::NonZeroUsize::new)
-        .or_else(|| std::thread::available_parallelism().ok())
-        .unwrap_or(std::num::NonZeroUsize::MIN);
-    let decoder = bgzf::io::MultithreadedReader::with_worker_count(worker_count, file);
+    // Worker count comes from the global rayon pool, configured from `--threads` above.
+    let decoder = bgzf::io::MultithreadedReader::new(file);
     let mut bam_reader = bam::io::Reader::from(decoder);
     let mut header = bam_reader.read_header()?;
 
@@ -382,7 +378,7 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
     let output_path = output.to_path_buf();
     let writer_handle = std::thread::spawn(move || -> anyhow::Result<usize> {
         let output_file = std::fs::File::create(&output_path)?;
-        let encoder = bgzf::io::MultithreadedWriter::with_worker_count(worker_count, output_file);
+        let encoder = bgzf::io::MultithreadedWriter::new(output_file);
         let mut writer = bam::io::Writer::from(encoder);
         writer.write_header(&header_clone)?;
 
