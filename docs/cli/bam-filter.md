@@ -2,7 +2,7 @@
 
 Filter reads from a POD5 file based on a paired BAM file. Supports filtering by mapped status, genomic region, and mapping quality.
 
-![escpod filter](../images/bam-filter.gif)
+![escpod bam-filter](../images/bam-filter.gif)
 
 ## Usage
 
@@ -24,7 +24,7 @@ escpod bam-filter -b <BAM> -o <OUTPUT> [OPTIONS] <INPUT>
 | `-o, --output <FILE>` | Output POD5 file (required) |
 | `--mapped` | Keep only mapped reads |
 | `--region <REGION>` | Filter by genomic region (chr or chr:start-end) |
-| `-q, --quality <MAPQ>` | Minimum mapping quality |
+| `--quality <MAPQ>` | Minimum mapping quality |
 | `-h, --help` | Print help |
 
 ## Examples
@@ -54,7 +54,7 @@ escpod bam-filter -b aligned.bam -o region.pod5 --region chr1:1000000-2000000 ex
 Keep only high-quality alignments:
 
 ```bash
-escpod bam-filter -b aligned.bam -o high_quality.pod5 -q 30 experiment.pod5
+escpod bam-filter -b aligned.bam -o high_quality.pod5 --quality 30 experiment.pod5
 ```
 
 ### Combined Filters
@@ -63,7 +63,7 @@ Combine multiple filter criteria:
 
 ```bash
 escpod bam-filter -b aligned.bam -o filtered.pod5 \
-    --mapped --region chr1 -q 20 experiment.pod5
+    --mapped --region chr1 --quality 20 experiment.pod5
 ```
 
 ### Process a Directory
