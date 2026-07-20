@@ -1,6 +1,10 @@
 # escapepod
 
-🚧 **escapepod is under active development.** Caveat emptor. 🚧
+> [!WARNING]
+> **escapepod is alpha quality and under active development.** APIs, CLI flags,
+> and output formats may change without notice, and bugs are expected. Verify
+> results against the official ONT `pod5` tools before relying on it for
+> anything important.
 
 A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
