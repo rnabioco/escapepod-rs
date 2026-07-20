@@ -4,13 +4,14 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::{check_output_writable, collect_pod5_inputs};
-use escapepod_signal::{MergeOptions, MergePhase, MergeProgress, merge_files};
+use crate::util::{check_output_not_input, check_output_writable, collect_pod5_inputs};
+use escapepod_signal::{Durability, MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     inputs: Vec<PathBuf>,
     output: PathBuf,
@@ -18,6 +19,7 @@ pub fn run(
     threads: Option<usize>,
     force: bool,
     profile: bool,
+    durability: Durability,
 ) -> anyhow::Result<()> {
     // Bound the parallelism. Merge scales across input files, but like the
     // other block-copy commands it does NOT default to all CPUs (see
@@ -32,6 +34,7 @@ pub fn run(
     check_output_writable(&output, force)?;
 
     let all_files = collect_pod5_inputs(&inputs)?;
+    check_output_not_input(&output, &all_files)?;
 
     let num_files = all_files.len();
     info!(
@@ -44,6 +47,7 @@ pub fn run(
     let options = MergeOptions {
         duplicate_ok,
         read_batch_size: 100_000,
+        durability,
     };
 
     // Create progress bar

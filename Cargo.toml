@@ -19,6 +19,10 @@ byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
+# Signal trapping so an interrupted run cleans up its staging files. The
+# `termination` feature adds SIGTERM/SIGHUP, which is the case that matters on
+# a cluster: SLURM sends SIGTERM on `scancel` and at walltime expiry.
+ctrlc = { version = "3", features = ["termination"] }
 # GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
 cudarc = { version = "0.19", default-features = false, features = ["cuda-12020", "driver", "nvrtc", "std", "dynamic-loading"] }
 # Workspace crates

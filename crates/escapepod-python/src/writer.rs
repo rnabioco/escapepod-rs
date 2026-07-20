@@ -273,9 +273,22 @@ impl PyWriter {
     }
 
     /// Finalize and close the POD5 file.
+    ///
+    /// The output appears at its destination only once this succeeds.
     fn close(&mut self) -> PyResult<()> {
         if let Some(writer) = self.inner.take() {
             writer.finish().map_err(to_py_err)?;
+        }
+        Ok(())
+    }
+
+    /// Discard the file being written without finalizing it.
+    ///
+    /// Nothing is left at the destination, and any file that was already
+    /// there is untouched.
+    fn abort(&mut self) -> PyResult<()> {
+        if let Some(writer) = self.inner.take() {
+            writer.abort().map_err(to_py_err)?;
         }
         Ok(())
     }
@@ -293,7 +306,14 @@ impl PyWriter {
         exc_val: Option<&Bound<'_, PyAny>>,
         exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        self.close()?;
+        // Leaving the block via an exception means the caller never finished
+        // describing the file, so committing a half-populated archive would be
+        // wrong. Staging makes discarding it possible.
+        if exc_type.is_some() {
+            self.abort()?;
+        } else {
+            self.close()?;
+        }
         Ok(false) // Don't suppress exceptions
     }
 }
@@ -333,7 +353,7 @@ impl Drop for PyWriter {
             let msg = if finish_result.is_ok() {
                 c"escapepod.Writer was not explicitly closed; finalized on garbage collection. Use a `with` block or call .close()."
             } else {
-                c"escapepod.Writer was not explicitly closed and finalization failed; output file may be corrupt."
+                c"escapepod.Writer was not explicitly closed and finalization failed; no output file was written."
             };
             if let Err(e) = PyErr::warn(
                 py,

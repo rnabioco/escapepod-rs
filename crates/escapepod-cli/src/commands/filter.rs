@@ -7,7 +7,8 @@
 use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::{check_output_writable, resolve_pod5_inputs};
+use crate::util::{check_output_not_input, check_output_writable, resolve_pod5_inputs};
+use escapepod_signal::Durability;
 use escapepod_signal::operations::{
     FilterCriteria, FilterOptions, filter_files_with_criteria, read_ids_from_file,
 };
@@ -28,6 +29,7 @@ pub fn run(
     threads: Option<usize>,
     force: bool,
     profile: bool,
+    durability: Durability,
 ) -> anyhow::Result<()> {
     // Bound the combined width of the per-file, per-batch, and
     // per-signal-batch parallelism. Unlike merge/demux, filter does NOT
@@ -47,6 +49,7 @@ pub fn run(
 
     // Resolve input to list of POD5 files (supports directories)
     let files = resolve_pod5_inputs(&input)?;
+    check_output_not_input(&output, &files)?;
     let is_directory = files.len() > 1;
 
     // Build filter criteria
@@ -161,6 +164,7 @@ pub fn run(
     let options = FilterOptions {
         signal_batch_size: 1_000,
         read_batch_size: 10_000,
+        durability,
     };
 
     timer.phase("Filter & write");

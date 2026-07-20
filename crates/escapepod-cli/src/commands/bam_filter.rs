@@ -7,8 +7,11 @@
 use crate::commands::profile::PhaseTimer;
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
-use crate::util::{check_output_writable, ensure_bai_index, resolve_pod5_inputs};
+use crate::util::{
+    check_output_not_input, check_output_writable, ensure_bai_index, resolve_pod5_inputs,
+};
 use bstr::ByteSlice;
+use escapepod_signal::Durability;
 use escapepod_signal::operations::{FilterOptions, filter_files};
 use escapepod_signal::parse_uuid_flexible;
 use noodles_bam as bam;
@@ -30,6 +33,7 @@ pub fn run(
     min_quality: Option<u8>,
     force: bool,
     profile: bool,
+    durability: Durability,
 ) -> anyhow::Result<()> {
     check_output_writable(&output, force)?;
 
@@ -38,6 +42,7 @@ pub fn run(
 
     // Resolve input to list of POD5 files (supports directories)
     let files = resolve_pod5_inputs(&input)?;
+    check_output_not_input(&output, &files)?;
     let is_directory = files.len() > 1;
 
     info!(
@@ -107,6 +112,7 @@ pub fn run(
     let options = FilterOptions {
         signal_batch_size: 1_000,
         read_batch_size: 10_000,
+        durability,
     };
 
     timer.phase("Filter & write");

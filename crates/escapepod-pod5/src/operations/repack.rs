@@ -2,12 +2,12 @@
 //!
 //! Repacks POD5 files using block-level signal copying (no decompression/recompression).
 
-use crate::{Reader, ReadsBatchView, Result, Writer, WriterOptions};
+use crate::{Durability, Reader, ReadsBatchView, Result, Writer, WriterOptions};
 use rayon::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tempfile::NamedTempFile;
 
 /// Options for the repack operation.
 #[derive(Debug, Clone)]
@@ -18,6 +18,8 @@ pub struct RepackOptions {
     pub read_batch_size: u32,
     /// Force overwrite existing files.
     pub force: bool,
+    /// How hard to push bytes to stable storage before renaming into place.
+    pub durability: Durability,
 }
 
 impl Default for RepackOptions {
@@ -26,6 +28,7 @@ impl Default for RepackOptions {
             signal_batch_size: 1_000,
             read_batch_size: 10_000,
             force: false,
+            durability: Durability::default(),
         }
     }
 }
@@ -37,8 +40,12 @@ pub struct RepackResult {
     pub total_reads: u64,
     /// Number of files processed.
     pub files_processed: usize,
-    /// Number of files skipped (errors).
+    /// Number of files skipped because the output already existed and
+    /// `force` was not set. These were never written.
     pub files_skipped: usize,
+    /// Files that failed partway, as (input path, error message). Distinct
+    /// from `files_skipped`: these were attempted and did not produce output.
+    pub failures: Vec<(PathBuf, String)>,
 }
 
 use crate::progress::{Progress, ProgressCallback};
@@ -54,29 +61,18 @@ fn repack_single_file(
     let input = input.as_ref();
     let output = output.as_ref();
 
-    // Check if input and output resolve to the same file
-    let input_canonical = std::fs::canonicalize(input)?;
-    let same_file = output.exists()
-        && std::fs::canonicalize(output)
-            .map(|o| o == input_canonical)
-            .unwrap_or(false);
-
-    // Use a temp file if writing to the same location as input
-    let (actual_output, temp_file): (std::path::PathBuf, Option<NamedTempFile>) = if same_file {
-        let temp = NamedTempFile::new_in(output.parent().unwrap_or(std::path::Path::new(".")))?;
-        (temp.path().to_path_buf(), Some(temp))
-    } else {
-        (output.to_path_buf(), None)
-    };
-
+    // Repacking in place needs no special case: the writer stages into a temp
+    // file and renames, and the reader's mmap keeps the original inode alive
+    // until it is dropped below.
     let reader = Reader::open(input)?;
 
     let writer_options = WriterOptions {
         signal_batch_size: options.signal_batch_size,
         read_batch_size: options.read_batch_size,
+        durability: options.durability,
         ..WriterOptions::default()
     };
-    let mut writer = Writer::create(&actual_output, writer_options)?;
+    let mut writer = Writer::create(output, writer_options)?;
 
     // Copy run infos
     for run_info in reader.run_infos() {
@@ -106,13 +102,11 @@ fn repack_single_file(
         }
     }
 
+    // Release the mapping before the rename. Harmless on Unix, where the old
+    // inode outlives the directory entry, but Windows refuses to replace a
+    // file that is still mapped.
+    drop(reader);
     writer.finish()?;
-
-    // If we used a temp file, rename it to the output
-    if let Some(temp) = temp_file {
-        drop(reader); // Release the memory map
-        temp.persist(output).map_err(std::io::Error::other)?;
-    }
 
     Ok(count)
 }
@@ -140,6 +134,7 @@ pub fn repack_files<P: AsRef<Path> + Sync, Q: AsRef<Path> + Sync>(
     let total_reads = Arc::new(AtomicU64::new(0));
     let files_done = Arc::new(AtomicU64::new(0));
     let files_skipped = Arc::new(AtomicU64::new(0));
+    let failures = Mutex::new(Vec::new());
 
     file_pairs.par_iter().for_each(|(input, output)| {
         let output_path = output.as_ref();
@@ -161,8 +156,12 @@ pub fn repack_files<P: AsRef<Path> + Sync, Q: AsRef<Path> + Sync>(
             Ok(reads) => {
                 total_reads.fetch_add(reads, Ordering::Relaxed);
             }
-            Err(_) => {
-                files_skipped.fetch_add(1, Ordering::Relaxed);
+            Err(e) => {
+                // A file that failed mid-write is not the same as one we chose
+                // to skip, and the caller can't act on a bare count.
+                if let Ok(mut f) = failures.lock() {
+                    f.push((input.as_ref().to_path_buf(), e.to_string()));
+                }
             }
         }
 
@@ -176,11 +175,14 @@ pub fn repack_files<P: AsRef<Path> + Sync, Q: AsRef<Path> + Sync>(
     });
 
     let skipped = files_skipped.load(Ordering::Relaxed) as usize;
+    let mut failures = failures.into_inner().unwrap_or_default();
+    failures.sort_by(|a, b| a.0.cmp(&b.0));
 
     RepackResult {
         total_reads: total_reads.load(Ordering::Relaxed),
-        files_processed: total_files - skipped,
+        files_processed: total_files - skipped - failures.len(),
         files_skipped: skipped,
+        failures,
     }
 }
 
