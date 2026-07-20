@@ -125,9 +125,15 @@ python scripts/patch_adapted_dataclass.py ext/ADAPTed/adapted/config && \
 pip install --no-build-isolation --no-deps -e ext/ADAPTed -e ext/WarpDemuX
 """
 
-# Documentation feature
+# Documentation feature. `vhs` renders the terminal-demo gifs under
+# docs/images/ from the tapes in docs/tapes/ (it pulls in ttyd + ffmpeg).
 [feature.docs.dependencies]
 python = ">=3.10"
+vhs = ">=0.11"
+# The tapes pin `Set FontFamily "Source Code Pro"`, which this metapackage
+# provides. Without a real monospace font installed vhs silently falls back to
+# a proportional face and the gifs render with stretched, uneven glyphs.
+fonts-conda-forge = "*"
 
 [feature.docs.pypi-dependencies]
 zensical = "*"
@@ -135,6 +141,9 @@ zensical = "*"
 [feature.docs.tasks]
 docs-build = "zensical build"
 docs-serve = "zensical serve"
+# Re-render every docs/images/*.gif from docs/tapes/*.tape. Builds the release
+# binary first and puts it on PATH, so the gifs always show current CLI output.
+docs-tapes = "./docs/tapes/generate.sh"
 # Mirrors the CI docs gate. --clean forces a cold cache: zensical's incremental
 # cache makes --strict link validation nondeterministic (cached pages spuriously
 # report "page does not exist"), so run the strict check against a fresh cache.

@@ -4,7 +4,7 @@
 Output docs/images/readme.gif
 
 Set Shell "bash"
-Set FontFamily "FiraCode Nerd Font Mono"
+Set FontFamily "Source Code Pro"
 Set FontSize 16
 Set Width 900
 Set Height 600
@@ -47,7 +47,7 @@ Enter
 Sleep 4s
 Ctrl+L
 
-Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
+Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped --quality 10 -o /tmp/filtered.pod5"
 Enter
 Sleep 4s
 Ctrl+L
