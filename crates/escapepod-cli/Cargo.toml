@@ -39,7 +39,7 @@ ctrlc = { workspace = true, optional = true }
 flate2 = { version = "1", optional = true }
 indicatif = { workspace = true, optional = true }
 # BAM file support
-noodles-bam = { version = "0.90", optional = true }
+noodles-bam = { version = "0.91", optional = true }
 noodles-bgzf = { version = "0.47", optional = true }
 noodles-core = { version = "0.20", optional = true }
 noodles-csi = { version = "0.56", optional = true }
