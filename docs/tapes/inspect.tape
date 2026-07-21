@@ -5,7 +5,7 @@ Set Shell "bash"
 Set FontFamily "Source Code Pro"
 Set FontSize 16
 Set Width 900
-Set Height 500
+Set Height 600
 Set LetterSpacing 0
 Set LineHeight 1.2
 Set Padding 20

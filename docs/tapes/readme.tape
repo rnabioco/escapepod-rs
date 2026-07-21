@@ -16,17 +16,23 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
+# Reset any output from a previous render so escpod doesn't refuse to overwrite
+Hide
+Type "rm -f /tmp/ids.txt /tmp/filtered.pod5 /tmp/bam-filtered.pod5"
+Enter
+Show
+
 Type "escpod summary data/drna/yeast_trna_reads.pod5"
 Enter
 Sleep 4s
 Ctrl+L
 
-Type "escpod view data/drna/yeast_trna_reads.pod5"
+Type "escpod view data/drna/yeast_trna_reads.pod5 --include read_id,channel,end_reason | head -6"
 Enter
 Sleep 3s
 Ctrl+L
 
-Type "escpod view data/drna/yeast_trna_reads.pod5 --ids"
+Type "escpod view data/drna/yeast_trna_reads.pod5 --ids | head -6"
 Enter
 Sleep 3s
 Ctrl+L
@@ -47,7 +53,13 @@ Enter
 Sleep 4s
 Ctrl+L
 
-Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped --quality 10 -o /tmp/filtered.pod5"
+Type 'escpod bam-filter data/drna/yeast_trna_reads.pod5 \'
+Enter
+Type '  -b data/drna/yeast_trna_mappings.bam \'
+Enter
+Type '  --mapped --quality 10 \'
+Enter
+Type '  -o /tmp/bam-filtered.pod5'
 Enter
 Sleep 4s
 Ctrl+L

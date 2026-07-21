@@ -880,6 +880,7 @@ dependencies = [
  "escapepod-signal",
  "flate2",
  "indicatif",
+ "libc",
  "noodles-bam",
  "noodles-bgzf",
  "noodles-core",

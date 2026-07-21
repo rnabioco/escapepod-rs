@@ -14,6 +14,12 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
+# Reset any output from a previous render so escpod doesn't refuse to overwrite
+Hide
+Type "rm -rf /tmp/mapping.csv /tmp/subsets"
+Enter
+Show
+
 Type "echo 'read_id,output' > /tmp/mapping.csv"
 Enter
 Sleep 300ms
