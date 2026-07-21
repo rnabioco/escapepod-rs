@@ -58,8 +58,16 @@ escpod --help
 
 ## Installing the Python package
 
-The `escapepod` Python package provides a `pod5`-compatible API. PyPI wheels
-are planned; until then, build it from a checkout with
+The `escapepod` Python package provides a `pod5`-compatible API. Install it
+from PyPI:
+
+```bash
+pip install escapepod
+```
+
+Wheels are published for CPython 3.9+ (abi3) on Linux (x86_64/aarch64,
+manylinux + musllinux) and macOS (x86_64/arm64). To build from a checkout
+instead (or on an unsupported platform), use
 [maturin](https://www.maturin.rs/):
 
 ```bash

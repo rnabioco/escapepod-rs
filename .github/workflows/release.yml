@@ -150,3 +150,95 @@ jobs:
           body_path: release_notes.md
           files: |
             artifacts/*
+
+  # ---------------------------------------------------------------------------
+  # Python wheels → PyPI. Independent of the CLI `release` job above so a wheel
+  # failure never blocks the GitHub Release (and vice versa). One abi3 wheel per
+  # platform (pyo3 `abi3-py39`), covering CPython 3.9+.
+  # ---------------------------------------------------------------------------
+  wheels:
+    name: Wheel ${{ matrix.target }} (${{ matrix.manylinux }})
+    needs: macos-verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            manylinux: auto
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            manylinux: auto
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            manylinux: musllinux_1_2
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            manylinux: musllinux_1_2
+          # `manylinux` is ignored on macOS but keeps the matrix rows uniform.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            manylinux: auto
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist -m crates/escapepod-python/Cargo.toml
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: dist/*.whl
+
+  sdist:
+    name: sdist
+    needs: macos-verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          command: sdist
+          args: --out dist -m crates/escapepod-python/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Trusted Publishing (OIDC) — no API token. Requires a PyPI publisher
+    # configured for env `pypi`, repo rnabioco/escapepod-rs, workflow release.yml.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels and sdist
+        uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
