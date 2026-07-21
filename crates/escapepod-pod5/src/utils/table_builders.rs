@@ -242,6 +242,8 @@ struct PartitionArrays {
     end_reason_forced: BooleanArray,
     run_info_keys: Int16Array,
     open_pore_level: Float32Array,
+    expected_open_pore_level: Float32Array,
+    selected_read_level: Float32Array,
 }
 
 /// View of one row that's about to be emitted to the output reads
@@ -336,6 +338,8 @@ fn build_partition_inner<R: PartitionRow>(
     let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
     let mut run_info_keys_builder = Int16Builder::with_capacity(num_reads);
     let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
+    let mut expected_open_pore_level_builder = Float32Builder::with_capacity(num_reads);
+    let mut selected_read_level_builder = Float32Builder::with_capacity(num_reads);
 
     for row in rows {
         let read = row.read();
@@ -383,6 +387,10 @@ fn build_partition_inner<R: PartitionRow>(
 
         // V4 fields
         open_pore_level_builder.append_value(read.open_pore_level);
+
+        // V5 fields
+        expected_open_pore_level_builder.append_value(read.expected_open_pore_level);
+        selected_read_level_builder.append_value(read.selected_read_level);
     }
 
     PartitionArrays {
@@ -408,6 +416,8 @@ fn build_partition_inner<R: PartitionRow>(
         end_reason_forced: end_reason_forced_builder.finish(),
         run_info_keys: run_info_keys_builder.finish(),
         open_pore_level: open_pore_level_builder.finish(),
+        expected_open_pore_level: expected_open_pore_level_builder.finish(),
+        selected_read_level: selected_read_level_builder.finish(),
     }
 }
 
@@ -523,6 +533,8 @@ pub(crate) fn build_reads_table(
     let calibration_scale_array = concat_arrays!(calibration_scale, Float32Array);
     let end_reason_forced_array = concat_arrays!(end_reason_forced, BooleanArray);
     let open_pore_level_array = concat_arrays!(open_pore_level, Float32Array);
+    let expected_open_pore_level_array = concat_arrays!(expected_open_pore_level, Float32Array);
+    let selected_read_level_array = concat_arrays!(selected_read_level, Float32Array);
 
     // Concatenate dictionary key arrays and create DictionaryArrays
     let pore_type_keys_refs: Vec<&dyn Array> = partition_arrays
@@ -596,6 +608,9 @@ pub(crate) fn build_reads_table(
         run_info_array,
         // V4
         open_pore_level_array,
+        // V5
+        expected_open_pore_level_array,
+        selected_read_level_array,
     ];
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
@@ -725,6 +740,8 @@ pub(crate) fn build_reads_table_remapped(
     let calibration_scale_array = concat_arrays!(calibration_scale, Float32Array);
     let end_reason_forced_array = concat_arrays!(end_reason_forced, BooleanArray);
     let open_pore_level_array = concat_arrays!(open_pore_level, Float32Array);
+    let expected_open_pore_level_array = concat_arrays!(expected_open_pore_level, Float32Array);
+    let selected_read_level_array = concat_arrays!(selected_read_level, Float32Array);
 
     let pore_type_keys_refs: Vec<&dyn Array> = partition_arrays
         .iter()
@@ -792,6 +809,8 @@ pub(crate) fn build_reads_table_remapped(
         end_reason_forced_array,
         run_info_array,
         open_pore_level_array,
+        expected_open_pore_level_array,
+        selected_read_level_array,
     ];
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;

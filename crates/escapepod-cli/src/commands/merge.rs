@@ -4,12 +4,14 @@
 
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::{check_output_writable, collect_pod5_inputs};
-use escapepod_signal::{MergeOptions, MergePhase, MergeProgress, merge_files};
+use crate::util::{check_output_not_input, check_output_writable, collect_pod5_inputs};
+use escapepod_signal::{Durability, MergeOptions, MergePhase, MergeProgress, merge_files};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tracing::info;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     inputs: Vec<PathBuf>,
     output: PathBuf,
@@ -17,21 +19,25 @@ pub fn run(
     threads: Option<usize>,
     force: bool,
     profile: bool,
+    durability: Durability,
 ) -> anyhow::Result<()> {
-    // Configure rayon thread pool if threads specified
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok(); // Ignore error if pool already initialized
-    }
+    // Bound the parallelism. Merge scales across input files, but like the
+    // other block-copy commands it does NOT default to all CPUs (see
+    // DEFAULT_THREADS) — that is antisocial on a shared node for a largely
+    // I/O-bound copy. Raise it with `-t` on a machine you own.
+    let num_threads = threads.unwrap_or(crate::commands::DEFAULT_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if pool already initialized
 
     check_output_writable(&output, force)?;
 
     let all_files = collect_pod5_inputs(&inputs)?;
+    check_output_not_input(&output, &all_files)?;
 
     let num_files = all_files.len();
-    eprintln!(
+    info!(
         "{} {} files into {}",
         style::action("Merging"),
         style::count(num_files),
@@ -41,6 +47,7 @@ pub fn run(
     let options = MergeOptions {
         duplicate_ok,
         read_batch_size: 100_000,
+        durability,
     };
 
     // Create progress bar
@@ -111,7 +118,7 @@ pub fn run(
 
     progress_bar.finish_and_clear();
 
-    eprintln!(
+    info!(
         "{} {} reads into {}",
         style::action("Merged"),
         style::count(result.reads_written),
@@ -119,7 +126,7 @@ pub fn run(
     );
 
     if result.duplicates_skipped > 0 {
-        eprintln!(
+        info!(
             "{} {} duplicate reads",
             style::note_label("Skipped"),
             style::warning(result.duplicates_skipped)

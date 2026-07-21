@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.92 or later
+- Rust 1.95 or later
 - Cargo (comes with Rust)
 
 ## Installing the CLI
@@ -56,7 +56,29 @@ escpod --version
 escpod --help
 ```
 
-## Using the Library
+## Installing the Python package
+
+The `escapepod` Python package provides a `pod5`-compatible API. Install it
+from PyPI:
+
+```bash
+pip install escapepod
+```
+
+Wheels are published for CPython 3.9+ (abi3) on Linux (x86_64/aarch64,
+manylinux + musllinux) and macOS (x86_64/arm64). To build from a checkout
+instead (or on an unsupported platform), use
+[maturin](https://www.maturin.rs/):
+
+```bash
+pip install maturin
+maturin develop --release --manifest-path crates/escapepod-python/Cargo.toml
+```
+
+This installs `escapepod` into the active environment. See the
+[Python API](../python/index.md) for usage.
+
+## Using the Rust Library
 
 The workspace splits the library layer in two: `escapepod-pod5` for format
 I/O and `escapepod-signal` for signal-processing algorithms. `escapepod-signal`

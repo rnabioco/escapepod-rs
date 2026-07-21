@@ -81,6 +81,67 @@ pub fn decompress_signal(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     svb16::decode(&svb_encoded, sample_count)
 }
 
+/// Decompress only the **first `max_samples`** of a VBZ chunk that holds
+/// `total_samples`. Bit-identical to `decompress_signal(...)[..n]` where
+/// `n = min(max_samples, total_samples)`.
+///
+/// The SVB16 layout is `[keys: ceil(total/8)][values]`, and a 1-byte vs 2-byte
+/// value flag lives in the keys. So we ZSTD-*stream* just the keys, sum the
+/// value bytes for the first `n` samples, stream that many more bytes, and stop
+/// — skipping ZSTD work for the unread tail. For a long read (mRNA) where only
+/// the first ~`max_obs_trace` samples feed the adapter detector, this avoids
+/// decompressing the entire transcript.
+pub fn decompress_signal_prefix(
+    data: &[u8],
+    total_samples: usize,
+    max_samples: usize,
+) -> Result<Vec<i16>> {
+    use std::io::Read;
+
+    let n = max_samples.min(total_samples);
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // Streaming a prefix out of ZSTD is slower *per byte* than one-shot
+    // `decode_all` — it decodes block-by-block through a `read_exact` loop and
+    // always inflates the full keys section (sized for `total_samples`). It only
+    // pays off when the skipped tail is large. When the requested prefix is a
+    // big fraction of the chunk, one-shot decode + truncate is faster overall:
+    // measured on ~10k-sample reads, a ~40%-prefix stream lost to a full decode.
+    // Gate at 1/4 — stream only when we can skip ≥75% of the samples — so mRNA
+    // (tiny adapter window in a long transcript) still streams while short reads
+    // fall back to the fast path. Both branches are bit-identical to
+    // `decompress_signal(..)[..n]`.
+    if n.saturating_mul(4) >= total_samples {
+        let mut full = decompress_signal(data, total_samples)?;
+        full.truncate(n);
+        return Ok(full);
+    }
+    if data.is_empty() {
+        return Err(Error::Decompression(
+            "VBZ data is empty but sample_count > 0".to_string(),
+        ));
+    }
+
+    let mut decoder = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| Error::Decompression(format!("ZSTD init failed: {}", e)))?;
+
+    // Keys are sized for the chunk's *total* samples, then the value section.
+    let keys_len = svb16::key_length(total_samples);
+    let mut keys = vec![0u8; keys_len];
+    decoder
+        .read_exact(&mut keys)
+        .map_err(|e| Error::Decompression(format!("ZSTD read (keys) failed: {}", e)))?;
+
+    let values_len = svb16::value_bytes(&keys, n);
+    let mut values = vec![0u8; values_len];
+    decoder
+        .read_exact(&mut values)
+        .map_err(|e| Error::Decompression(format!("ZSTD read (values) failed: {}", e)))?;
+
+    svb16::decode_prefix(&keys, &values, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +161,46 @@ mod tests {
         let compressed = compress_signal(&samples).unwrap();
         let decompressed = decompress_signal(&compressed, samples.len()).unwrap();
         assert_eq!(decompressed, samples);
+    }
+
+    #[test]
+    fn test_decompress_prefix_matches_full() {
+        // Deterministic signal with a mix of small (1-byte) and large (2-byte)
+        // deltas so the key bits vary across the prefix boundary.
+        let mut s: u64 = 0x1234_5678_9abc_def1;
+        let samples: Vec<i16> = (0..5000)
+            .map(|i| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // alternate small ramps and big jumps
+                if i % 7 == 0 {
+                    (s >> 48) as i16 // big jump -> 2-byte delta
+                } else {
+                    (i as i16 % 5) - 2 // small -> 1-byte delta
+                }
+            })
+            .collect();
+        let total = samples.len();
+        let compressed = compress_signal(&samples).unwrap();
+        let full = decompress_signal(&compressed, total).unwrap();
+
+        for &n in &[
+            0usize,
+            1,
+            2,
+            6,
+            7,
+            8,
+            99,
+            100,
+            4096,
+            total - 1,
+            total,
+            total + 10,
+        ] {
+            let pref = decompress_signal_prefix(&compressed, total, n).unwrap();
+            let want = &full[..n.min(total)];
+            assert_eq!(pref.as_slice(), want, "prefix mismatch at n={n}");
+        }
     }
 
     #[test]
@@ -148,6 +249,40 @@ mod tests {
             original_size,
             compressed.len()
         );
+    }
+
+    /// Port of the upstream python `test_signal_tools.test_round_trip_chunked`
+    /// (+ its `_empty` sibling): a signal split into arbitrarily sized chunks,
+    /// each compressed independently, must decompress and concatenate back to
+    /// the original, with the chunk lengths summing to the sample count. This is
+    /// exactly the invariant the file writer relies on when it splits a read at
+    /// `max_signal_chunk_size` and the reader concatenates the rows.
+    #[test]
+    fn test_round_trip_chunked() {
+        // Full int16-range deterministic signal (xorshift64).
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let signal: Vec<i16> = (0..12_345)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 48) as i16
+            })
+            .collect();
+
+        // Chunk sizes spanning tiny, mid, exact-length and over-length; 0-length
+        // input is covered by `test_compress_decompress_empty`.
+        for &chunk_size in &[1usize, 7, 250, 999, 12_345, 20_000] {
+            let mut lengths = Vec::new();
+            let mut roundtrip = Vec::new();
+            for chunk in signal.chunks(chunk_size) {
+                let compressed = compress_signal(chunk).unwrap();
+                lengths.push(chunk.len());
+                roundtrip.extend(decompress_signal(&compressed, chunk.len()).unwrap());
+            }
+            assert_eq!(lengths.iter().sum::<usize>(), signal.len());
+            assert_eq!(roundtrip, signal, "chunk_size={chunk_size}");
+        }
     }
 
     #[test]

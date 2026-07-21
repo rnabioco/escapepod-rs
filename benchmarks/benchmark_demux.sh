@@ -2,7 +2,17 @@
 # Benchmark `escpod demux` against WarpDemuX.
 #
 # Usage:
-#   ./benchmarks/benchmark_demux.sh [--gpu] [--no-srun] [pod5_file]
+#   ./benchmarks/benchmark_demux.sh [--gpu] [--no-srun] \
+#       [--model NAME] [--out-dir DIR] [--emit-tsv FILE] [pod5_file]
+#
+#   --model NAME    WarpDemuX model basename (default WDX4_rna004_v1_0); the
+#                   .joblib under ext/WarpDemuX/.../model_files is converted to
+#                   benchmarks/.NAME.json on first use. Try WDX6_rna004_v1_0,
+#                   WDX10_rna004_v1_0 for larger DTW workloads.
+#   --out-dir DIR   Output/scratch dir (default /tmp/demux_benchmark). Set a
+#                   unique dir per cell when sweeping a matrix.
+#   --emit-tsv FILE Append a machine-readable summary row (model, pod5, n_reads,
+#                   device, escpod_s, wdx_s, speedup, agree%, agree@conf>=0.5%).
 #
 # SLURM: by default the script auto-dispatches itself onto a compute node
 #   via `srun` if not already inside a SLURM job (login node has 2 cores
@@ -41,12 +51,23 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 USE_GPU=0
 NO_SRUN=0
 POD5_FILE=""
-for arg in "$@"; do
-    case "$arg" in
-        --gpu)      USE_GPU=1 ;;
-        --no-srun)  NO_SRUN=1 ;;
-        *)          POD5_FILE="$arg" ;;
+MODEL_NAME="WDX4_rna004_v1_0"
+OUT_DIR_OVERRIDE=""
+EMIT_TSV=""
+ORIG_ARGS=("$@")
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gpu)        USE_GPU=1 ;;
+        --no-srun)    NO_SRUN=1 ;;
+        --model)      MODEL_NAME="$2"; shift ;;
+        --model=*)    MODEL_NAME="${1#*=}" ;;
+        --out-dir)    OUT_DIR_OVERRIDE="$2"; shift ;;
+        --out-dir=*)  OUT_DIR_OVERRIDE="${1#*=}" ;;
+        --emit-tsv)   EMIT_TSV="$2"; shift ;;
+        --emit-tsv=*) EMIT_TSV="${1#*=}" ;;
+        *)            POD5_FILE="$1" ;;
     esac
+    shift
 done
 
 : "${POD5_FILE:=$PROJECT_ROOT/ext/WarpDemuX/test_data/demux/4000_rna004.pod5}"
@@ -64,7 +85,7 @@ if [ -z "${SLURM_JOB_ID:-}" ] && [ "$NO_SRUN" -eq 0 ]; then
         fi
         echo ">>> Re-dispatching under srun ${SRUN_ARGS[*]}"
         # Preserve explicit arg set, add --no-srun so the child doesn't recurse.
-        child_args=("${@}")
+        child_args=("${ORIG_ARGS[@]}")
         child_args+=(--no-srun)
         exec srun "${SRUN_ARGS[@]}" "$0" "${child_args[@]}"
     fi
@@ -76,11 +97,11 @@ THREADS="${SLURM_CPUS_PER_TASK:-${THREADS:-4}}"
 
 # Binaries / wrappers
 ESCAPEPOD_BIN="$PROJECT_ROOT/target/release/escpod"
-WDX_MODEL_JOBLIB="$PROJECT_ROOT/ext/WarpDemuX/warpdemux/models/model_files/WDX4_rna004_v1_0.joblib"
-WDX_MODEL_JSON="$PROJECT_ROOT/benchmarks/.wdx4_rna004.json"
+WDX_MODEL_JOBLIB="$PROJECT_ROOT/ext/WarpDemuX/warpdemux/models/model_files/${MODEL_NAME}.joblib"
+WDX_MODEL_JSON="$PROJECT_ROOT/benchmarks/.${MODEL_NAME}.json"
 PIXI_WDX="pixi run -e warpdemux-bench --manifest-path $PROJECT_ROOT/pixi.toml"
 
-OUTPUT_DIR="/tmp/demux_benchmark"
+OUTPUT_DIR="${OUT_DIR_OVERRIDE:-/tmp/demux_benchmark}"
 WARMUP=1
 RUNS=3
 
@@ -89,6 +110,7 @@ echo "escpod demux vs WarpDemuX Benchmark"
 echo "========================================"
 echo "Input:    $POD5_FILE"
 echo "Size:     $(du -h "$POD5_FILE" | cut -f1)"
+echo "Model:    $MODEL_NAME"
 echo "GPU path: $([[ $USE_GPU -eq 1 ]] && echo enabled || echo disabled)"
 echo "Threads:  $THREADS (SLURM_JOB_ID=${SLURM_JOB_ID:-none})"
 echo ""
@@ -122,7 +144,7 @@ mkdir -p "$OUTPUT_DIR"/{escpod,wdx}
 
 # One-time model export (cheap, cache between runs).
 if [ ! -f "$WDX_MODEL_JSON" ]; then
-    echo ">>> Exporting WarpDemuX WDX4 model -> escpod SVM JSON"
+    echo ">>> Exporting WarpDemuX $MODEL_NAME model -> escpod SVM JSON"
     $PIXI_WDX python "$PROJECT_ROOT/scripts/convert_warpdemux_model.py" \
         "$WDX_MODEL_JOBLIB" "$WDX_MODEL_JSON" > /dev/null
 fi
@@ -193,12 +215,12 @@ if [ $USE_GPU -eq 1 ]; then
     echo "    escpod GPU total:  ${ESCPOD_GPU_TIME}s"
 fi
 
-echo ">>> WarpDemuX: warpdemux demux -m WDX4_rna004_v1_0"
+echo ">>> WarpDemuX: warpdemux demux -m $MODEL_NAME"
 t0=$(date +%s.%N)
 $PIXI_WDX warpdemux demux \
     -i "$POD5_FILE" \
     -o "$OUTPUT_DIR/wdx_out" \
-    -m WDX4_rna004_v1_0 \
+    -m "$MODEL_NAME" \
     --ncores "$THREADS" \
     --save_boundaries true \
     2>&1 | tail -5
@@ -214,12 +236,14 @@ WDX_RUN_DIR=$(find "$OUTPUT_DIR/wdx_out" -maxdepth 1 -type d -name "warpdemux_*"
 # ----------------------------------------------------------------------
 echo ""
 echo "=== Bench 3: Classification Agreement ==="
+SUMMARY_JSON="$OUTPUT_DIR/summary.json"
 if [ -n "$WDX_RUN_DIR" ] && [ -d "$WDX_RUN_DIR/predictions" ]; then
     $PIXI_WDX python "$PROJECT_ROOT/scripts/compare_demux_results.py" \
         --escapepod-b "$OUTPUT_DIR/escpod_cpu/classifications.csv" \
         --warpdemux "$WDX_RUN_DIR/predictions" \
         --boundaries-escapepod "$OUTPUT_DIR/escpod_cpu/boundaries.csv" \
-        --boundaries-warpdemux "$WDX_RUN_DIR/boundaries"
+        --boundaries-warpdemux "$WDX_RUN_DIR/boundaries" \
+        --summary-json "$SUMMARY_JSON"
 else
     echo "    skip: WarpDemuX predictions dir not found ($WDX_RUN_DIR)"
 fi
@@ -257,3 +281,38 @@ if [ -n "$ESCPOD_CPU_TIME" ] && [ -n "$WDX_TIME" ]; then
 fi
 echo ""
 echo "Raw outputs: $OUTPUT_DIR"
+
+# ----------------------------------------------------------------------
+# Machine-readable row(s) for the matrix orchestrator.
+#   model  pod5  n_reads  device  escpod_time  wdx_time  speedup  agree%  agree@conf>=0.5%
+# Agreement is measured on the CPU classifications; the GPU row reuses it
+# (GPU classify is the same pipeline, only the DTW backend differs).
+# ----------------------------------------------------------------------
+if [ -n "$EMIT_TSV" ]; then
+    if [ ! -f "$EMIT_TSV" ]; then
+        printf 'model\tpod5\tn_reads\tdevice\tescpod_s\twdx_s\tspeedup\tagree_pct\tagree_conf_pct\n' > "$EMIT_TSV"
+    fi
+    POD5_BASE="$(basename "$POD5_FILE")"
+    python3 - "$EMIT_TSV" "$MODEL_NAME" "$POD5_BASE" "$SUMMARY_JSON" \
+        "$ESCPOD_CPU_TIME" "${ESCPOD_GPU_TIME:-}" "$WDX_TIME" "$USE_GPU" <<'PY'
+import json, sys
+tsv, model, pod5, summ, cpu_s, gpu_s, wdx_s, use_gpu = sys.argv[1:9]
+try:
+    s = json.load(open(summ))
+    n = s["n_common"]; agree = f"{s['agreement_pct']:.2f}"
+    agree_c = f"{s['agreement_conf_ge_0.5_pct']:.2f}"
+except Exception:
+    n = 0; agree = agree_c = "NA"
+def row(dev, esc):
+    if not esc:
+        return
+    esc = float(esc)
+    sp = f"{float(wdx_s)/esc:.2f}" if wdx_s and esc > 0 else "NA"
+    with open(tsv, "a") as f:
+        f.write(f"{model}\t{pod5}\t{n}\t{dev}\t{esc:.3f}\t{float(wdx_s):.3f}\t{sp}\t{agree}\t{agree_c}\n")
+row("cpu", cpu_s)
+if use_gpu == "1":
+    row("gpu", gpu_s)
+PY
+    echo "Appended matrix row(s) -> $EMIT_TSV"
+fi

@@ -1,20 +1,47 @@
 # escapepod
 
-🚧 **escapepod is under active development.** Caveat emptor. 🚧
+> [!WARNING]
+> **escapepod is alpha quality and under active development.** APIs, CLI flags,
+> and output formats may change without notice, and bugs are expected. Verify
+> results against the official ONT `pod5` tools before relying on it for
+> anything important.
 
 A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
-[![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ![escapepod demo](docs/images/readme.gif)
 
 ## Highlights
 
-- **Fast** - Up to 47x faster than Python pod5 tools
+- **Fast** - Up to 9x faster than Python pod5 tools on large-file operations
 - **Memory efficient** - Memory-mapped I/O for large files
 - **Full featured** - View, inspect, merge, filter, subset
 - **BAM integration** - Filter reads by alignment status
+- **Crash-safe writes** - Output is staged and renamed into place, so an
+  interrupted run never leaves a corrupt archive or damages an existing one
+
+### Output durability
+
+Every POD5 archive is written to a temporary file beside its destination and
+renamed into place only once it is complete and valid. An error, a panic, or a
+Ctrl-C therefore leaves the destination either untouched (if a file was already
+there) or absent — never truncated. `escpod` also traps SIGINT and SIGTERM
+(the latter is what SLURM sends on `scancel` and at walltime expiry) to remove
+staging files on the way out.
+
+Renaming does not by itself make the bytes durable against a machine crash.
+Use `--fsync file` to sync each output before it is renamed, or `--fsync full`
+to also sync the directory. The default is `--fsync none`, which is the right
+trade on scratch filesystems where output is cheap to regenerate.
+
+If a run is killed outright (`kill -9`, node failure), staging files may be
+left behind. They are identifiable by prefix:
+
+```bash
+find <output-dir> -name '.escpod-tmp-*'
+```
 
 Experimental features — `repack`, `resquiggle`, `index`, and barcode
 demultiplexing (`demux`) — live behind Cargo feature flags. See the
@@ -27,38 +54,42 @@ no `nvcc` needed at build time, only the CUDA driver + libnvrtc at run.
 
 ## Performance
 
+Numbers are for the I/O-bound operations where runtime is large enough to
+matter; sub-second commands (`inspect`, `view`) are omitted. Measured with
+`benchmarks/benchmark.sh` (hyperfine, 3 runs) versus the official Python `pod5`
+(v0.3.36) on ~500k RNA004 reads (two ~250k-read files).
+
 | Command | escapepod | pod5 | Speedup |
 |---------|-----------|------|---------|
-| inspect | 36 ms | 1.7 s | **47x** |
-| view | 238 ms | 4.5 s | **19x** |
-| filter | 513 ms | 4.7 s | **9x** |
-| subset | 2.8 s | 8.3 s | **3x** |
-| merge | 3.0 s | 4.1 s | **1.4x** |
+| filter | 361 ms | 3.4 s | **9.3x** |
+| subset | 1.4 s | 5.1 s | **3.6x** |
+| merge | 2.0 s | 6.7 s | **3.3x** |
 
 ## Install
+
+The `escpod` binary lives in the `escapepod-cli` crate.
 
 Default build (stable commands only):
 
 ```bash
-cargo install --git https://github.com/rnabioco/escapepod-rs
+cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
 ```
 
 Opt into experimental commands:
 
 ```bash
 # repack, resquiggle, index
-cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
+cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features experimental
 
 # barcode demultiplexing
-cargo install --git https://github.com/rnabioco/escapepod-rs --features demux
+cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features demux
 ```
 
 ## License
 
-MIT, with one exception: the `resquiggle` module under
-`crates/escapepod-signal/src/resquiggle/` is licensed under GPL-3.0-or-later
-because it is inspired by [fishnet](https://github.com/dnbrckr/fishnet)
-(Brickner et al.). Per-file SPDX identifiers are authoritative.
+MIT. The `resquiggle` module is an independent implementation of algorithms
+inspired by fishnet (see Acknowledgments), not a derivative of its source, and
+is MIT-licensed like the rest of the workspace.
 
 ## Acknowledgments
 
@@ -100,13 +131,16 @@ from the [KleistLab](https://github.com/KleistLab):
   `scripts/export_adapter_cnn_to_onnx.py`) and accept ADAPTed's license
   terms separately.
 
-### Signal-to-base resquiggle — fishnet
+### Signal-to-base resquiggle
 
 - **[fishnet](https://www.researchsquare.com/article/rs-8345719/v1)** by
   Brickner et al. The banded DP refinement and signal rescaling in
-  `escapepod-signal::resquiggle` is inspired by fishnet. Per the original
-  authors' GPL-3.0 license, those source files are tagged
-  `SPDX-License-Identifier: GPL-3.0-or-later`.
+  `escapepod-signal::resquiggle` is inspired by fishnet.
+- **[Remora](https://github.com/nanoporetech/remora)** — Oxford Nanopore
+  Technologies. Referenced for signal-to-sequence anchoring conventions.
+- **[nanopolish](https://github.com/jts/nanopolish)** by Jared Simpson
+  et al. Referenced for its event-alignment approach to signal-to-base
+  assignment.
 
 ### Signal compression
 

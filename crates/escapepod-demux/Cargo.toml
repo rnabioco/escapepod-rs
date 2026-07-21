@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "WarpDemuX-compatible barcode demultiplexing for Oxford Nanopore POD5 data (DTW + SVM, optional CNN adapter detection and GPU acceleration)."
-readme = "../README.md"
+readme.workspace = true
 repository.workspace = true
 license.workspace = true
 keywords = ["barcode", "demultiplex", "nanopore", "pod5", "svm"]
@@ -18,7 +18,7 @@ name = "classify"
 anyhow = { workspace = true }
 escapepod-pod5 = { workspace = true }
 escapepod-signal = { workspace = true }
-ndarray = "0.16"
+ndarray = "0.17"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +32,17 @@ linfa-svm = { version = "0.8", optional = true }
 # CNN adapter detection (opt-in via `cnn-detect`). Pure-Rust ONNX runtime;
 # user supplies the model file at runtime (weights are CC BY-NC).
 tract-onnx = { workspace = true, optional = true }
+
+# GPU boundary-CNN inference (opt-in via `cnn-gpu`). onnxruntime via the `ort`
+# crate, CUDA execution provider. `load-dynamic` dlopens onnxruntime at runtime
+# (nothing needed at build time); set `ORT_DYLIB_PATH` to a CUDA-enabled
+# libonnxruntime to run. Architecture-agnostic — same `[B,1,L] -> [B,2,L]`
+# contract as the tract CPU path.
+ort = { version = "=2.0.0-rc.12", optional = true, features = [
+    "cuda",
+    "load-dynamic",
+    "ndarray",
+] }
 
 # CUDA driver bindings for the on-device SVM pipeline (RBF + OvO
 # decision). Opt-in via the `gpu` feature, same as the DTW kernel itself.
@@ -49,11 +60,16 @@ tempfile = "3"
 
 [features]
 default = []
-# CNN-based adapter detection (port of ADAPTed's BoundariesCNN through
-# tract-onnx). Users supply an ONNX file produced by
-# `scripts/export_adapter_cnn_to_onnx.py`; ADAPTed weights are CC BY-NC
-# 4.0 and must not be bundled with this crate.
+# CNN-based adapter detection: runs a user-supplied boundary-CNN ONNX graph
+# (`[B,1,L] -> [B,2,L]`) through tract-onnx on the CPU. Architecture-agnostic
+# (escapepod-models' adapter_rna004 TCN, or an ADAPTed BoundariesCNN export —
+# those weights are CC BY-NC 4.0 and must not be bundled). No GPU CNN path.
 cnn-detect = ["dep:tract-onnx"]
+# Batched GPU CNN/TCN adapter detection: runs the same `[B,1,L] -> [B,2,L]`
+# ONNX graph through onnxruntime's CUDA execution provider (`ort`, load-dynamic).
+# Builds on `cnn-detect` for the shared preprocessing/decoding. Needs a
+# CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
+cnn-gpu = ["cnn-detect", "dep:ort", "dep:cudarc"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
 # time, not build time. Also pulls cudarc directly so the post-DTW SVM

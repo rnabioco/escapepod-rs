@@ -108,6 +108,7 @@ fn build_svm_model_platt(n_classes: usize, per_class: usize, feature_len: usize)
             power: 2.0,
         },
         window: None,
+        penalty: 0.0,
         label_mapper,
         thresholds: None,
         prob_a: Some(vec![-1.0; n_pairs]),
@@ -148,6 +149,7 @@ fn build_svm_model(n_classes: usize, per_class: usize, feature_len: usize) -> Dt
             power: 2.0,
         },
         window: None,
+        penalty: 0.0,
         label_mapper,
         thresholds: None,
         prob_a: None,
@@ -192,6 +194,7 @@ fn bench_compute_distances(c: &mut Criterion) {
                         black_box(&query),
                         black_box(&model.training_fingerprints),
                         None,
+                        0.0,
                     )
                 });
             },
@@ -206,7 +209,7 @@ fn bench_svm_pipeline(c: &mut Criterion) {
     for &(n_classes, per_class, flen) in &[(32usize, 4usize, 150usize), (96, 4, 150)] {
         let model = build_svm_model(n_classes, per_class, flen);
         let query = pseudo_floats_f64(flen, 0xF00DCAFE);
-        let distances = compute_distances(&query, &model.training_fingerprints, None);
+        let distances = compute_distances(&query, &model.training_fingerprints, None, 0.0);
         let kernel_values = distances_to_kernel(&distances, &model.kernel_params);
         let predictor = SvmPredictor::new(&model);
 

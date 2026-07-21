@@ -1,4 +1,8 @@
 //! Shared helpers for escapepod-pod5 integration tests.
+//!
+//! Each integration-test binary compiles this module independently and uses a
+//! different subset of the helpers, so unused items here are expected per-binary.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,6 +57,8 @@ pub fn make_read(run_info_idx: u32, read_number: u32, num_samples: u64) -> ReadD
         time_since_mux_change: 0.0,
         num_samples,
         open_pore_level: 220.0,
+        expected_open_pore_level: 0.0,
+        selected_read_level: 0.0,
         signal_rows: Vec::new(),
     }
 }

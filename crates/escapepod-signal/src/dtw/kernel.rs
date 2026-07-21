@@ -78,12 +78,17 @@ pub fn distance_to_kernel_auto(distances: &Array2<f32>, power: f32) -> (Array2<f
         return (distance_to_kernel(distances, gamma, power), gamma);
     }
 
-    dist_vec.sort_unstable_by(|a, b| a.total_cmp(b));
-    let median = if dist_vec.len().is_multiple_of(2) {
-        let mid = dist_vec.len() / 2;
-        (dist_vec[mid - 1] + dist_vec[mid]) / 2.0
+    // Median via select_nth_unstable (O(n) expected) instead of a full sort.
+    let n = dist_vec.len();
+    let mid = n / 2;
+    let (lo_part, pivot, _) = dist_vec.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let upper = *pivot;
+    let median = if n.is_multiple_of(2) {
+        // Lower-median element is the max of the below-`mid` partition.
+        let lower = lo_part.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        (lower + upper) / 2.0
     } else {
-        dist_vec[dist_vec.len() / 2]
+        upper
     };
 
     // Median heuristic for gamma

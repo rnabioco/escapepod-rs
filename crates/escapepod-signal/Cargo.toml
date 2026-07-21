@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Signal-processing algorithms (DTW, resquiggle, segmentation) for Oxford Nanopore POD5 data. Barcode demultiplexing lives in the companion `escapepod-demux` crate."
-readme = "../README.md"
+readme.workspace = true
 repository.workspace = true
 license.workspace = true
 keywords = ["bioinformatics", "nanopore", "pod5", "sequencing"]
@@ -23,7 +23,7 @@ required-features = ["gpu"]
 anyhow = { workspace = true }
 escapepod-pod5 = { workspace = true }
 flate2 = "1"
-ndarray = "0.16"
+ndarray = "0.17"
 rand = "0.10"
 rayon = { workspace = true }
 uuid = { workspace = true }
@@ -35,9 +35,9 @@ thiserror = { workspace = true, optional = true }
 [dev-dependencies]
 arrow = { workspace = true }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-noodles-bam = "0.88"
-noodles-sam = "0.84"
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
+noodles-bam = "0.91"
+noodles-sam = "0.86"
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 tempfile = "3"
 
 [features]

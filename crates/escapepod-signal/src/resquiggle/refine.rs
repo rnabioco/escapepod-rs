@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Inspired by fishnet, licensed under the GNU General Public License v3.0.
+// SPDX-License-Identifier: MIT
+// Algorithm inspired by fishnet (Brickner et al.); independent implementation.
 
 //! Top-level refinement pipeline: iterative DP + rescale loop.
 
@@ -208,18 +208,22 @@ fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
     if seq_to_signal_map.len() < 2 {
         return 1.0;
     }
-    // `array_windows` (Rust 1.94) yields `&[usize; 2]`, so the destructure
-    // below is bounds-check-free vs the indexed `w[0]`/`w[1]` on `windows(2)`.
+    // `array_windows` yields `&[usize; 2]`, so the destructure below is
+    // bounds-check-free vs the indexed `w[0]`/`w[1]` on `windows(2)`.
     let mut dwells: Vec<usize> = seq_to_signal_map
         .array_windows::<2>()
         .map(|[lo, hi]| hi - lo)
         .collect();
-    dwells.sort_unstable();
     let n = dwells.len();
+    let mid = n / 2;
+    // Median via select_nth_unstable (O(n) expected) instead of a full sort.
+    let (lo_part, pivot, _) = dwells.select_nth_unstable(mid);
+    let upper = *pivot;
     if n % 2 == 1 {
-        dwells[n / 2] as f32
+        upper as f32
     } else {
-        (dwells[n / 2 - 1] + dwells[n / 2]) as f32 / 2.0
+        let lower = *lo_part.iter().max().unwrap();
+        (lower + upper) as f32 / 2.0
     }
 }
 

@@ -129,6 +129,10 @@ impl PyWriter {
     ///     Seconds since last mux change (default: 0.0).
     /// open_pore_level : float, optional
     ///     Estimated open pore current (default: 0.0).
+    /// expected_open_pore_level : float, optional
+    ///     Expected open pore current level for this read (POD5 V5; default: 0.0).
+    /// selected_read_level : float, optional
+    ///     Selected pore level for this read (POD5 V5; default: 0.0).
     #[pyo3(signature = (
         read_id,
         read_number,
@@ -152,6 +156,8 @@ impl PyWriter {
         num_reads_since_mux_change=0,
         time_since_mux_change=0.0,
         open_pore_level=0.0,
+        expected_open_pore_level=0.0,
+        selected_read_level=0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_read(
@@ -178,6 +184,8 @@ impl PyWriter {
         num_reads_since_mux_change: u32,
         time_since_mux_change: f32,
         open_pore_level: f32,
+        expected_open_pore_level: f32,
+        selected_read_level: f32,
     ) -> PyResult<()> {
         let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
             .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
@@ -209,6 +217,8 @@ impl PyWriter {
             time_since_mux_change,
             num_samples: sample_count,
             open_pore_level,
+            expected_open_pore_level,
+            selected_read_level,
             signal_rows: Vec::new(), // Writer populates this
         };
 
@@ -229,10 +239,56 @@ impl PyWriter {
             .map_err(to_py_err)
     }
 
+    /// Add many reads at once from parallel lists of ReadData and signals.
+    ///
+    /// Equivalent to calling `add_read_data` for each pair, but in a single
+    /// call (mirrors `pod5.Writer.add_reads`). `reads` and `signals` must be
+    /// the same length.
+    fn add_reads(
+        &mut self,
+        reads: Vec<PyRef<'_, crate::read_data::PyReadData>>,
+        signals: Vec<Bound<'_, PyArray1<i16>>>,
+    ) -> PyResult<()> {
+        if reads.len() != signals.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "reads and signals must be the same length ({} != {})",
+                reads.len(),
+                signals.len()
+            )));
+        }
+        // Materialize signals before touching the writer so a bad array errors
+        // out before any read is committed.
+        let signal_vecs: Vec<Vec<i16>> = signals
+            .iter()
+            .map(|s| s.to_vec())
+            .collect::<Result<_, _>>()?;
+
+        let writer = self.writer_mut()?;
+        for (read, signal) in reads.iter().zip(&signal_vecs) {
+            writer
+                .add_read(read.inner.clone(), signal)
+                .map_err(to_py_err)?;
+        }
+        Ok(())
+    }
+
     /// Finalize and close the POD5 file.
+    ///
+    /// The output appears at its destination only once this succeeds.
     fn close(&mut self) -> PyResult<()> {
         if let Some(writer) = self.inner.take() {
             writer.finish().map_err(to_py_err)?;
+        }
+        Ok(())
+    }
+
+    /// Discard the file being written without finalizing it.
+    ///
+    /// Nothing is left at the destination, and any file that was already
+    /// there is untouched.
+    fn abort(&mut self) -> PyResult<()> {
+        if let Some(writer) = self.inner.take() {
+            writer.abort().map_err(to_py_err)?;
         }
         Ok(())
     }
@@ -250,7 +306,14 @@ impl PyWriter {
         exc_val: Option<&Bound<'_, PyAny>>,
         exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        self.close()?;
+        // Leaving the block via an exception means the caller never finished
+        // describing the file, so committing a half-populated archive would be
+        // wrong. Staging makes discarding it possible.
+        if exc_type.is_some() {
+            self.abort()?;
+        } else {
+            self.close()?;
+        }
         Ok(false) // Don't suppress exceptions
     }
 }
@@ -290,7 +353,7 @@ impl Drop for PyWriter {
             let msg = if finish_result.is_ok() {
                 c"escapepod.Writer was not explicitly closed; finalized on garbage collection. Use a `with` block or call .close()."
             } else {
-                c"escapepod.Writer was not explicitly closed and finalization failed; output file may be corrupt."
+                c"escapepod.Writer was not explicitly closed and finalization failed; no output file was written."
             };
             if let Err(e) = PyErr::warn(
                 py,

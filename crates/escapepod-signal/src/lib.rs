@@ -26,6 +26,7 @@
 pub mod dtw;
 pub mod resquiggle;
 pub mod segmentation;
+pub mod stats;
 
 // Format layer (POD5 I/O) lives in escapepod-pod5. Re-export its modules and
 // types so downstream consumers can pull in both layers via this crate.
@@ -36,10 +37,11 @@ pub use escapepod_pod5::{
 };
 
 pub use escapepod_pod5::{
-    ALL_FIELDS, CompressedSignalChunk, DEFAULT_FIELDS, EndReason, Error, FieldError, MergeOptions,
-    MergePhase, MergeProgress, MergeResult, PoreType, PredefinedDictionaries, Progress,
-    ProgressCallback, ReadData, ReadIndex, Reader, ReadsBatchView, RecordBatch, RepackOptions,
-    RepackResult, Result, RunInfoData, SignalExtractor, SignalType, Statistics, Uuid, Writer,
-    WriterOptions, compute_n50, compute_statistics, determine_fields, get_field_value, merge_files,
-    parse_uuid_flexible, repack_files, write_field_value,
+    ALL_FIELDS, AtomicFile, CompressedSignalChunk, DEFAULT_FIELDS, Durability, EndReason, Error,
+    FieldError, MergeOptions, MergePhase, MergeProgress, MergeResult, PoreType,
+    PredefinedDictionaries, Progress, ProgressCallback, ReadColumns, ReadData, ReadIndex, Reader,
+    ReadsBatchView, RecordBatch, RepackOptions, RepackResult, Result, RunInfoData, SignalExtractor,
+    SignalType, Statistics, Uuid, Writer, WriterOptions, abort_all_in_flight_writes, compute_n50,
+    compute_statistics, determine_fields, get_field_value, merge_files, parse_uuid_flexible,
+    repack_files, write_field_value,
 };

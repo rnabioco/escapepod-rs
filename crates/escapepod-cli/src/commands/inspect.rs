@@ -4,6 +4,7 @@ use crate::style;
 use crate::util::resolve_pod5_inputs;
 use escapepod_signal::{Reader, ReadsBatchView};
 use std::path::PathBuf;
+use tracing::warn;
 
 pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     let files = resolve_pod5_inputs(&input)?;
@@ -30,9 +31,8 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
             Ok(r) => r,
             Err(e) => {
                 if is_directory {
-                    eprintln!(
-                        "  {} skipping {} ({})",
-                        style::warning_label("Warning:"),
+                    warn!(
+                        "skipping {} ({})",
                         style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
                         e
                     );
@@ -138,9 +138,8 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
             Ok(r) => r,
             Err(e) => {
                 if is_directory {
-                    eprintln!(
-                        "{} skipping {} ({})",
-                        style::warning_label("Warning:"),
+                    warn!(
+                        "skipping {} ({})",
                         style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
                         e
                     );
@@ -155,9 +154,8 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
             Ok(b) => b,
             Err(e) => {
                 if is_directory {
-                    eprintln!(
-                        "{} cannot read {} ({})",
-                        style::warning_label("Warning:"),
+                    warn!(
+                        "cannot read {} ({})",
                         style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
                         e
                     );
@@ -268,6 +266,16 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
                     "{}: {}",
                     style::key("open_pore_level"),
                     style::value(read.open_pore_level)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("expected_open_pore_level"),
+                    style::value(read.expected_open_pore_level)
+                );
+                println!(
+                    "{}: {}",
+                    style::key("selected_read_level"),
+                    style::value(read.selected_read_level)
                 );
                 println!();
                 println!(

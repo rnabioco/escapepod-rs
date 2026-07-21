@@ -11,6 +11,7 @@ use crate::utils::pod5_assembler::{
     ProcessedRead, deduplicate_run_infos, write_post_signal_sections,
 };
 use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer, build_reads_table};
+use crate::writer::atomic::{AtomicFile, Durability};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -28,6 +29,8 @@ pub struct MergeOptions {
     pub duplicate_ok: bool,
     /// Number of reads per batch in output file.
     pub read_batch_size: u32,
+    /// How hard to push bytes to stable storage before renaming into place.
+    pub durability: Durability,
 }
 
 impl Default for MergeOptions {
@@ -35,6 +38,7 @@ impl Default for MergeOptions {
         Self {
             duplicate_ok: false,
             read_batch_size: 100_000,
+            durability: Durability::default(),
         }
     }
 }
@@ -182,6 +186,15 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     let section_marker = Uuid::new_v4();
     let schema_meta = SchemaMetadata::new();
 
+    // Stage the output alongside its destination. The guard is held on this
+    // thread for the whole merge so that any failure — including a panic in
+    // the writer thread — unlinks the partial file on unwind and leaves an
+    // existing destination untouched. This is also what makes an in-place
+    // merge safe: the inputs stay mapped on their original inode and only a
+    // directory entry is swapped at the end.
+    let atomic = AtomicFile::with_durability(output.as_ref(), options.durability)?;
+    let staging = atomic.reopen()?;
+
     let (mut file, signal_end, signal_rows) =
         thread::scope(|scope| -> Result<(File, usize, u64)> {
             // Channel for sending byte slices to writer thread
@@ -189,10 +202,8 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
             let (tx, rx) = mpsc::sync_channel::<&[u8]>(32);
 
             // Spawn writer thread within scope - can borrow from parent
-            let output_path = output.as_ref();
             let writer_handle = scope.spawn(move || -> std::io::Result<(File, usize)> {
-                let file = File::create(output_path)?;
-                let mut file = BufWriter::with_capacity(MERGE_WRITE_BUFFER_SIZE, file);
+                let mut file = BufWriter::with_capacity(MERGE_WRITE_BUFFER_SIZE, staging);
 
                 // Write POD5 header
                 file.write_all(&POD5_SIGNATURE)?;
@@ -377,6 +388,11 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         &all_run_infos,
         &reads_table_bytes,
     )?;
+
+    // Everything is written; release our handle and move the file into place.
+    file.flush()?;
+    drop(file);
+    atomic.commit()?;
 
     Ok(MergeResult {
         reads_written: total_reads,

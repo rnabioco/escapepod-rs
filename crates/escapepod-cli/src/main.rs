@@ -2,6 +2,7 @@
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
+use escapepod_signal::Durability;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
@@ -13,8 +14,12 @@ mod style;
 mod util;
 
 /// Terse event formatter for `escpod` logs: `YYYY-MM-DD HH:MM:SS  LEVEL [target] message`.
-/// Targets inside the `escapepod` library are shown without the crate prefix
-/// to keep lines short; external targets are printed verbatim.
+///
+/// The CLI's own events (target `escpod` / `escpod::*`) are the primary status
+/// channel, so their target is omitted entirely to keep status lines clean
+/// (`… INFO Merging 2 files …`). `escapepod_signal::` targets are shown without
+/// the crate prefix; all other (library/external) targets are printed verbatim
+/// so `-v` can attribute them.
 struct EscpodFormatter;
 
 impl<S, N> FormatEvent<S, N> for EscpodFormatter
@@ -33,7 +38,9 @@ where
         write!(writer, " {:>5}", event.metadata().level())?;
 
         let target = event.metadata().target();
-        if let Some(module) = target.strip_prefix("escapepod_signal::") {
+        if target == "escpod" || target.starts_with("escpod::") {
+            // CLI's own status output — no target label.
+        } else if let Some(module) = target.strip_prefix("escapepod_signal::") {
             write!(writer, " [{module}]")?;
         } else if target != "escapepod_cli" && target != "escapepod" {
             write!(writer, " [{target}]")?;
@@ -77,15 +84,52 @@ struct Cli {
     #[arg(short = 'q', long, global = true)]
     quiet: bool,
 
-    /// Increase log verbosity. `-v` = info, `-vv` = debug, `-vvv` = trace.
-    /// `RUST_LOG` takes precedence when set.
+    /// Increase log verbosity. Status messages show by default (info);
+    /// `-v` = debug, `-vv` = trace. `RUST_LOG` takes precedence when set.
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// How hard to push output to stable storage before it is renamed into
+    /// place. Output files are always staged and renamed, so an interrupted
+    /// run never leaves a partial archive at the destination; this controls
+    /// only whether the bytes are also durable against a machine crash.
+    ///
+    /// `none` (default) is fastest and appropriate on scratch filesystems
+    /// where output is regenerable. `file` fsyncs each output; `full` also
+    /// fsyncs the directory, so the rename itself survives a crash.
+    #[arg(long, global = true, value_enum, default_value_t = FsyncMode::None)]
+    fsync: FsyncMode,
 
     #[command(subcommand)]
     command: Commands,
 }
 
+/// CLI spelling of [`Durability`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum FsyncMode {
+    /// Rename only — no fsync.
+    None,
+    /// fsync each output file before renaming it into place.
+    File,
+    /// Also fsync the parent directory after the rename.
+    Full,
+}
+
+impl From<FsyncMode> for Durability {
+    fn from(m: FsyncMode) -> Self {
+        match m {
+            FsyncMode::None => Durability::None,
+            FsyncMode::File => Durability::File,
+            FsyncMode::Full => Durability::FileAndDir,
+        }
+    }
+}
+
+// The `Demux` variant carries the fused-pipeline arg struct, which is wide by
+// nature (one field per pipeline knob). Boxing a clap `Args` variant is awkward,
+// and a `Commands` value is constructed exactly once at startup — the size
+// asymmetry is irrelevant here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// View read summaries from a POD5 file as TSV
@@ -159,7 +203,7 @@ Examples:
         #[arg(long)]
         duplicate_ok: bool,
 
-        /// Number of threads for parallel processing (default: all CPUs)
+        /// Number of threads for parallel processing (default: 8)
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
 
@@ -210,6 +254,10 @@ At least one filter criterion must be specified.
         /// Output POD5 file
         #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
+
+        /// Number of threads for parallel processing (default: 8)
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
 
         /// Overwrite the output file if it already exists
         #[arg(short, long)]
@@ -321,6 +369,10 @@ Each unique 'output' value creates a separate POD5 file.
         #[arg(short, long, default_value = ".", value_name = "DIR")]
         output_dir: PathBuf,
 
+        /// Number of threads for parallel processing (default: 8)
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
+
         /// Overwrite existing files
         #[arg(short, long)]
         force: bool,
@@ -397,7 +449,7 @@ Examples:
         #[arg(short, long)]
         force: bool,
 
-        /// Number of threads for parallel processing (default: all CPUs)
+        /// Number of threads for parallel processing (default: 8)
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
     },
@@ -472,24 +524,85 @@ fn feature_disabled(command: &str, feature: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Remove staging files on interrupt or termination.
+///
+/// Output is staged and renamed, so a signal already leaves the destination
+/// alone — but the process dies before any `Drop` runs, so the staging files
+/// themselves would be left behind. On a cluster the SIGTERM case is the
+/// common one: SLURM sends it on `scancel` and at walltime expiry.
+fn install_signal_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANDLING: AtomicBool = AtomicBool::new(false);
+
+    // `ctrlc` dispatches this on a thread it spawned rather than in real
+    // signal context, so locking and file removal here are legitimate.
+    let result = ctrlc::set_handler(|| {
+        if HANDLING.swap(true, Ordering::SeqCst) {
+            // A second signal while the first cleanup is still running (for
+            // example, wedged on an unresponsive network filesystem) must
+            // still get the user out.
+            std::process::exit(130);
+        }
+        eprintln!("\nInterrupted — discarding incomplete output...");
+        escapepod_signal::abort_all_in_flight_writes();
+        std::process::exit(130);
+    });
+
+    if let Err(e) = result {
+        tracing::debug!("could not install signal handler: {e}");
+    }
+}
+
+/// Restore the default `SIGPIPE` disposition.
+///
+/// The Rust runtime ignores `SIGPIPE`, which turns a closed downstream reader
+/// into an `EPIPE` that our `writeln!`/`println!` calls surface as
+/// `Error: Broken pipe`. Resetting to `SIG_DFL` makes `escpod view … | head`
+/// (or `| less`, etc.) terminate quietly like any other Unix tool.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: `signal(2)` with `SIG_DFL` is async-signal-safe and called once,
+    // before any threads are spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> anyhow::Result<()> {
+    reset_sigpipe();
+
     let cli = Cli::parse();
 
     // Verbosity → log level. `RUST_LOG` always wins if set.
+    // Status/progress output is emitted at INFO, so INFO is the default level
+    // (status visible out of the box); `-q` drops to errors only.
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
-        (_, 0) => "warn",
-        (_, 1) => "info",
-        (_, 2) => "debug",
+        (_, 0) => "info",
+        (_, 1) => "debug",
         _ => "trace",
     };
     tracing_subscriber::fmt()
+        // Our status lines carry ANSI from the `style::*` helpers (already
+        // TTY/NO_COLOR-gated). tracing-subscriber 0.3.20+ sanitizes ANSI in the
+        // `message` field by default, which would render those escapes as
+        // literal `\x1b[...]` text; opt out so trusted color passes through.
+        // Must precede `event_format` — the setter is only exposed while the
+        // event format is still the default `Format`.
+        .with_ansi_sanitization(false)
         .event_format(EscpodFormatter)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
         .with_writer(std::io::stderr)
         .init();
+
+    install_signal_handler();
+
+    let durability = Durability::from(cli.fsync);
 
     match cli.command {
         Commands::View {
@@ -515,7 +628,15 @@ fn main() -> anyhow::Result<()> {
             threads,
             force,
             profile,
-        } => commands::merge::run(inputs, output, duplicate_ok, threads, force, profile),
+        } => commands::merge::run(
+            inputs,
+            output,
+            duplicate_ok,
+            threads,
+            force,
+            profile,
+            durability,
+        ),
 
         Commands::Filter {
             input,
@@ -525,6 +646,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            threads,
             force,
             profile,
         } => commands::filter::run(
@@ -535,8 +657,10 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
+            threads,
             force,
             profile,
+            durability,
         ),
 
         Commands::BamFilter {
@@ -548,7 +672,9 @@ fn main() -> anyhow::Result<()> {
             quality,
             force,
             profile,
-        } => commands::bam_filter::run(input, bam, output, mapped, region, quality, force, profile),
+        } => commands::bam_filter::run(
+            input, bam, output, mapped, region, quality, force, profile, durability,
+        ),
 
         #[cfg(feature = "experimental")]
         Commands::Repack {
@@ -556,7 +682,7 @@ fn main() -> anyhow::Result<()> {
             output_dir,
             force,
             profile,
-        } => commands::repack::run(inputs, output_dir, force, profile),
+        } => commands::repack::run(inputs, output_dir, force, profile, durability),
 
         #[cfg(not(feature = "experimental"))]
         Commands::Repack { .. } => feature_disabled("repack", "experimental"),
@@ -565,9 +691,10 @@ fn main() -> anyhow::Result<()> {
             input,
             csv,
             output_dir,
+            threads,
             force,
             profile,
-        } => commands::subset::run(input, csv, output_dir, force, profile),
+        } => commands::subset::run(input, csv, output_dir, threads, force, profile, durability),
 
         Commands::Summary(args) => commands::summary::run(args),
 
@@ -592,5 +719,66 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(not(feature = "experimental"))]
         Commands::Index { .. } => feature_disabled("index", "experimental"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// In-memory sink so we can inspect the bytes the subscriber actually writes.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Regression guard for the literal `\x1b[...]` bug.
+    ///
+    /// tracing-subscriber 0.3.20+ sanitizes ANSI in the `message` field by
+    /// default, which escapes the trusted color codes our `style::*` helpers
+    /// emit into the literal 4-char text `\x1b[...]` (visible verbatim in the
+    /// demo GIFs and any color terminal). The subscriber opts out via
+    /// `.with_ansi_sanitization(false)`; assert that a raw ESC byte in a message
+    /// passes through unchanged and is not textualized.
+    #[test]
+    fn message_ansi_passes_through_unsanitized() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi_sanitization(false)
+            .event_format(EscpodFormatter)
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Embed a raw ESC directly so the assertion is independent of
+            // `style::use_color()`'s cached TTY detection.
+            tracing::info!("{} done", "\u{1b}[32mgreen\u{1b}[0m");
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains('\u{1b}'), "expected raw ESC byte in: {out:?}");
+        assert!(
+            !out.contains("\\x1b"),
+            "message ANSI was sanitized to literal text: {out:?}"
+        );
     }
 }

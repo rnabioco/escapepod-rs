@@ -24,7 +24,9 @@ use std::hint::black_box;
 
 use escapepod_signal::compression::vbz;
 use escapepod_signal::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
+use escapepod_signal::resquiggle::adaptive_dp::adaptive_banded_dp;
 use escapepod_signal::resquiggle::dp::{ViterbiBuffers, dp_step_buffered};
+use escapepod_signal::resquiggle::types::RefineAlgo;
 
 /// Read ESCAPEPOD_BENCH_THREADS and pre-configure the rayon global pool.
 /// No-op if the env var isn't set or rayon has already been initialized.
@@ -120,6 +122,41 @@ fn bench_dp_step(c: &mut Criterion) {
     group.finish();
 }
 
+/// Full adaptive banded DP over a whole read (many bases), unlike
+/// `bench_dp_step` which measures a single band step. This exercises the
+/// per-base traceback bookkeeping — the hot path for the traceback-allocation
+/// audit item — so the win scales with `n_bases`.
+fn bench_adaptive_dp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resquiggle_adaptive_dp");
+    let bandwidth = 100usize;
+    // (n_bases, samples-per-base) — long reads are where the allocation bites.
+    for &(n_bases, dwell) in &[(200usize, 10usize), (1000, 10)] {
+        let signal_len = n_bases * dwell;
+        let signal = pseudo_floats(signal_len, 0x5165);
+        let levels = pseudo_floats(n_bases, 0x1EE1);
+        // Monotonic signal-position map of length n_bases + 1, evenly spaced.
+        let initial_map: Vec<usize> = (0..=n_bases).map(|i| (i * signal_len) / n_bases).collect();
+        group.throughput(Throughput::Elements(n_bases as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_bases}bases")),
+            &n_bases,
+            |bench, _| {
+                bench.iter(|| {
+                    adaptive_banded_dp(
+                        black_box(&signal),
+                        black_box(&levels),
+                        black_box(bandwidth),
+                        black_box(&initial_map),
+                        black_box(&RefineAlgo::Viterbi),
+                        black_box(None),
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_fingerprint_mad(c: &mut Criterion) {
     let mut group = c.benchmark_group("fingerprint_mad_normalize");
     for &len in &[64usize, 200, 1000] {
@@ -185,12 +222,66 @@ fn bench_dtw_matrix(c: &mut Criterion) {
     group.finish();
 }
 
+/// Direct A/B of median-of-slice via full `sort_unstable` (old) vs
+/// `select_nth_unstable` (the Phase 2 change), across the array sizes the real
+/// call sites see: 64-1024 (resquiggle `median_dwell`), ~16k (theil_sen
+/// pairwise slopes), ~256k (SVM-training kernel median). `select_nth` is O(n)
+/// vs O(n log n) but carries a larger constant, so this pins the crossover —
+/// both variants pay the same per-iteration clone, so the sort-vs-select gap at
+/// each size is apples-to-apples.
+fn bench_median_select_vs_sort(c: &mut Criterion) {
+    fn median_sort(v: &mut [f32]) -> f32 {
+        v.sort_unstable_by(|a, b| a.total_cmp(b));
+        let n = v.len();
+        if n.is_multiple_of(2) {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        } else {
+            v[n / 2]
+        }
+    }
+    fn median_select(v: &mut [f32]) -> f32 {
+        let n = v.len();
+        let mid = n / 2;
+        let (lo, pivot, _) = v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        let upper = *pivot;
+        if n.is_multiple_of(2) {
+            let lower = lo.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            (lower + upper) / 2.0
+        } else {
+            upper
+        }
+    }
+
+    let mut group = c.benchmark_group("median_select_vs_sort");
+    for &len in &[64usize, 256, 1024, 16_384, 262_144] {
+        let data = pseudo_floats(len, 0x5057 + len as u64);
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::new("sort", len), &len, |b, _| {
+            b.iter_batched_ref(
+                || data.clone(),
+                |v| black_box(median_sort(black_box(v))),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("select", len), &len, |b, _| {
+            b.iter_batched_ref(
+                || data.clone(),
+                |v| black_box(median_select(black_box(v))),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dtw,
     bench_dp_step,
+    bench_adaptive_dp,
     bench_fingerprint_mad,
     bench_vbz_roundtrip,
     bench_dtw_matrix,
+    bench_median_select_vs_sort,
 );
 criterion_main!(benches);

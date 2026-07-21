@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,8 +16,10 @@ jobs:
   coverage:
     name: llvm-cov
     runs-on: ubuntu-latest
+    # ~8 min typical (instrumented double-run: lcov + html); 25 covers cold.
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -49,7 +54,7 @@ jobs:
         run: cargo llvm-cov report --summary-only --fail-under-lines 60
 
       - name: Upload LCOV report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
           path: lcov.info
@@ -65,7 +70,7 @@ jobs:
           --features escapepod-demux/train
           --html --output-dir coverage-html
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-html

@@ -3,7 +3,18 @@
 //! A barcode fingerprint is a normalized sequence of signal features (e.g., event means)
 //! that can be used for barcode identification via DTW distance computation.
 
+use std::cell::RefCell;
+
 use uuid::Uuid;
+
+use crate::stats::median_via_select;
+
+thread_local! {
+    /// Scratch buffer for median/MAD normalization, reused across calls so the
+    /// per-read demux fingerprint path doesn't allocate a fresh copy of the
+    /// values every call.
+    static MEDIAN_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Normalization method for fingerprints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,21 +188,27 @@ pub fn normalize_fingerprint(fp: &mut Fingerprint, method: NormMethod) {
             }
         }
         NormMethod::Median => {
-            // Median + MAD via select_nth_unstable (O(n) expected), reusing the
-            // abs-deviation buffer. Two full sorts would be O(n log n) each.
-            let mut buf = fp.values.clone();
-            let median = median_via_select(&mut buf);
+            // Median + MAD via select_nth_unstable (O(n) expected). The scratch
+            // buffer (a copy of the values, then their abs-deviations) is reused
+            // across calls via a thread-local, so the per-read demux path
+            // doesn't allocate a fresh Vec every fingerprint. Two full sorts
+            // would be O(n log n) each.
+            MEDIAN_SCRATCH.with_borrow_mut(|buf| {
+                buf.clear();
+                buf.extend_from_slice(&fp.values);
+                let median = median_via_select(buf);
 
-            for (v, slot) in fp.values.iter().zip(buf.iter_mut()) {
-                *slot = (*v - median).abs();
-            }
-            let mad = median_via_select(&mut buf);
-
-            if mad > 0.0 {
-                for val in &mut fp.values {
-                    *val = (*val - median) / mad;
+                for (v, slot) in fp.values.iter().zip(buf.iter_mut()) {
+                    *slot = (*v - median).abs();
                 }
-            }
+                let mad = median_via_select(buf);
+
+                if mad > 0.0 {
+                    for val in &mut fp.values {
+                        *val = (*val - median) / mad;
+                    }
+                }
+            });
         }
         NormMethod::Mean => {
             let mean = compute_mean(&fp.values);
@@ -227,31 +244,6 @@ fn compute_std(values: &[f32], mean: f32) -> f32 {
         .sum::<f32>()
         / values.len() as f32;
     variance.sqrt()
-}
-
-/// Median of an unsorted `&mut [f32]` slice via `select_nth_unstable` (O(n) expected).
-///
-/// The slice is partially reordered in place. Uses `f32::total_cmp` for a total
-/// ordering so NaN doesn't cause a panic. Returns 0.0 for an empty slice.
-fn median_via_select(data: &mut [f32]) -> f32 {
-    let n = data.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let mid = n / 2;
-    let (_, pivot, _) = data.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    let hi = *pivot;
-    if n.is_multiple_of(2) {
-        // After select_nth, data[..mid] is an unsorted partition of values <= hi.
-        // Max of that partition is the lower median element.
-        let lo = data[..mid]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        (lo + hi) / 2.0
-    } else {
-        hi
-    }
 }
 
 #[cfg(test)]

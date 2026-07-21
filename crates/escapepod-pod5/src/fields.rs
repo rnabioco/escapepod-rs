@@ -22,6 +22,8 @@ pub const ALL_FIELDS: &[&str] = &[
     "calibration_scale",
     "run_info",
     "open_pore_level",
+    "expected_open_pore_level",
+    "selected_read_level",
 ];
 
 /// Default fields when no include/exclude specified.
@@ -40,7 +42,7 @@ pub const DEFAULT_FIELDS: &[&str] = &[
 pub enum FieldError {
     /// An unknown field was specified.
     #[error(
-        "Unknown field '{0}'. Available fields: read_id, channel, well, pore_type, read_number, start_sample, median_before, end_reason, end_reason_forced, num_samples, num_minknow_events, calibration_offset, calibration_scale, run_info, open_pore_level"
+        "Unknown field '{0}'. Available fields: read_id, channel, well, pore_type, read_number, start_sample, median_before, end_reason, end_reason_forced, num_samples, num_minknow_events, calibration_offset, calibration_scale, run_info, open_pore_level, expected_open_pore_level, selected_read_level"
     )]
     UnknownField(String),
 
@@ -168,6 +170,8 @@ pub fn get_field_value(read: &ReadData, field: &str) -> String {
         "calibration_scale" => format!("{:.6}", read.calibration_scale),
         "run_info" => read.run_info_index.to_string(),
         "open_pore_level" => format!("{:.2}", read.open_pore_level),
+        "expected_open_pore_level" => format!("{:.2}", read.expected_open_pore_level),
+        "selected_read_level" => format!("{:.2}", read.selected_read_level),
         _ => String::new(),
     }
 }
@@ -201,6 +205,8 @@ pub fn write_field_value<W: std::io::Write>(
         "calibration_scale" => write!(writer, "{:.6}", read.calibration_scale),
         "run_info" => write!(writer, "{}", read.run_info_index),
         "open_pore_level" => write!(writer, "{:.2}", read.open_pore_level),
+        "expected_open_pore_level" => write!(writer, "{:.2}", read.expected_open_pore_level),
+        "selected_read_level" => write!(writer, "{:.2}", read.selected_read_level),
         _ => Ok(()),
     }
 }

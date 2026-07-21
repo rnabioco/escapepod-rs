@@ -4,7 +4,7 @@ The `Reader` struct provides efficient access to POD5 file contents.
 
 ## Opening a File
 
-```rust
+```rust linenums="1"
 use escapepod_signal::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
@@ -14,7 +14,7 @@ The file is memory-mapped for efficient access. The reader validates the file si
 
 ## File Information
 
-```rust
+```rust linenums="1"
 // Number of reads in the file
 let count = reader.read_count()?;
 
@@ -29,7 +29,7 @@ for (i, run_info) in reader.run_infos().iter().enumerate() {
 
 ## Iterating Over Reads
 
-```rust
+```rust linenums="1"
 // Iterate over all reads
 for read in reader.reads()? {
     println!("Read: {}", read.read_id);
@@ -43,7 +43,7 @@ for read in reader.reads()? {
 
 Signal data is stored separately and must be explicitly requested:
 
-```rust
+```rust linenums="1"
 // Get signal for a specific read
 let signal: Vec<i16> = reader.get_signal(&read)?;
 
@@ -56,7 +56,7 @@ println!("First 10 samples: {:?}", &signal[..10.min(signal.len())]);
 
 The signal is stored as raw ADC values. Convert to picoamps (pA) using calibration:
 
-```rust
+```rust linenums="1"
 fn to_picoamps(signal: &[i16], offset: f32, scale: f32) -> Vec<f32> {
     signal.iter()
         .map(|&s| (s as f32 + offset) * scale)
@@ -70,7 +70,7 @@ let pa_signal = to_picoamps(&signal, read.calibration_offset, read.calibration_s
 
 Filter reads by their UUIDs:
 
-```rust
+```rust linenums="1"
 use uuid::Uuid;
 use std::collections::HashSet;
 
@@ -88,7 +88,7 @@ for read in reader.reads()? {
 
 Get all read IDs in the file:
 
-```rust
+```rust linenums="1"
 let all_ids = reader.read_ids()?;
 println!("File contains {} reads", all_ids.len());
 ```
@@ -97,7 +97,7 @@ println!("File contains {} reads", all_ids.len());
 
 For advanced use cases, access raw Arrow batches:
 
-```rust
+```rust linenums="1"
 for batch_idx in 0..reader.read_batch_count()? {
     let batch = reader.read_batch(batch_idx)?;
     println!("Batch {} has {} rows", batch_idx, batch.num_rows());
@@ -108,7 +108,7 @@ for batch_idx in 0..reader.read_batch_count()? {
 
 Access run information by index:
 
-```rust
+```rust linenums="1"
 // Get run info for a read
 let run_info = reader.get_run_info(read.run_info_index)?;
 
@@ -125,7 +125,7 @@ The reader uses memory-mapping, so:
 - Large files don't consume proportional RAM
 - Multiple readers can share the same memory-mapped data
 
-```rust
+```rust linenums="1"
 // Safe to open very large files
 let reader = Reader::open("large_file.pod5")?;  // Doesn't load entire file
 ```

@@ -10,8 +10,10 @@
 //!   via linfa-svm ([`train_svm`] and friends).
 //! - Optional `gpu` feature: batched GPU DTW matrix (routed through
 //!   `escapepod-signal`'s CUDA kernel) for classify and training.
-//! - Optional `cnn-detect` feature: port of ADAPTed's `BoundariesCNN` for
-//!   adapter-end detection via tract-onnx ([`AdapterCnn`]).
+//! - Optional `cnn-detect` feature: adapter-end detection by running an
+//!   exported boundary-CNN ONNX graph through tract-onnx ([`AdapterCnn`]).
+//!   This is CPU-only and architecture-agnostic (any `[B,1,L] -> [B,2,L]`
+//!   graph); there is no GPU CNN path.
 //!
 //! # Model workflow
 //!
@@ -53,6 +55,7 @@
 
 mod classify;
 mod fingerprint;
+mod gbm;
 mod model;
 mod probability;
 mod svm;
@@ -62,6 +65,9 @@ mod train;
 
 #[cfg(feature = "cnn-detect")]
 pub mod adapter_cnn;
+
+#[cfg(feature = "cnn-gpu")]
+pub mod adapter_cnn_gpu;
 
 pub use fingerprint::{
     BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
@@ -74,6 +80,7 @@ pub use classify::{ClassificationResult, classify_from_distances, classify_read}
 #[cfg(feature = "gpu")]
 pub use classify::{classify_reads_gpu, classify_reads_gpu_with_ctx};
 
+pub use gbm::{GbmModel, GbmNode, GbmPredictor, GbmTree, load_gbm_model};
 pub use model::{
     AnyModel, DtwSvmModel, KernelParams, WarpDemuxModel, load_any_model, load_model, load_svm_model,
 };
@@ -95,3 +102,6 @@ pub use train::*;
 
 #[cfg(feature = "cnn-detect")]
 pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError};
+
+#[cfg(feature = "cnn-gpu")]
+pub use adapter_cnn_gpu::AdapterCnnGpu;

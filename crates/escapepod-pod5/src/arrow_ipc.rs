@@ -4,6 +4,7 @@
 //! raw byte copying of record batches without full deserialization.
 
 use crate::error::{Error, Result};
+use rayon::prelude::*;
 
 /// Magic bytes at start and end of Arrow IPC files.
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
@@ -513,45 +514,77 @@ impl ArrowIpcFooter {
             }
         }
 
+        // Parse batches in parallel. Each batch is an independent IPC block
+        // (`ParsedBatch::parse` only reads offset arrays into the mmap — no
+        // decompression), and its rows scatter into disjoint `result_idx`
+        // slots, so there is no cross-batch dependency. On a single-file
+        // filter this is the phase that moves the bulk data, so parallelizing
+        // here is what lets one file use more than one core. Nested under the
+        // caller's per-file `par_iter`, the combined width is bounded by the
+        // global rayon pool (cap it with the CLI `-t`).
+        let batch_entries: Vec<(usize, Vec<(usize, u64)>)> = batch_rows.into_iter().collect();
+
+        let per_batch: Vec<Vec<(usize, RawSignalChunk<'a>)>> = batch_entries
+            .into_par_iter()
+            .map(
+                |(batch_idx, rows)| -> Result<Vec<(usize, RawSignalChunk<'a>)>> {
+                    let batch = &self.record_batches[batch_idx];
+                    let batch_bytes = ipc_bytes.get(batch.byte_range()).ok_or_else(|| {
+                        Error::InvalidArrowIpc("Batch range out of bounds".into())
+                    })?;
+                    let num_rows = batch.row_count as usize;
+
+                    let parsed =
+                        ParsedBatch::parse(batch_bytes, batch.metadata_length as usize, num_rows)?;
+
+                    let mut out = Vec::with_capacity(rows.len());
+                    for (result_idx, local_row) in rows {
+                        let row = local_row as usize;
+
+                        // Extract read_id
+                        let read_id_offset = row * 16;
+                        let read_id_bytes: [u8; 16] =
+                            slice_at(parsed.read_id_data, read_id_offset, 16)?
+                                .try_into()
+                                .map_err(|_| Error::InvalidState("Invalid read_id".into()))?;
+
+                        // Extract signal
+                        let offset_start = row * 8;
+                        let offset_end = (row + 1) * 8;
+                        let signal_start =
+                            read_i64_le(parsed.signal_offsets, offset_start)? as usize;
+                        let signal_end = read_i64_le(parsed.signal_offsets, offset_end)? as usize;
+                        let signal_bytes = parsed
+                            .signal_data
+                            .get(signal_start..signal_end)
+                            .ok_or_else(|| {
+                                Error::InvalidState("signal data out of bounds".into())
+                            })?;
+
+                        // Extract samples
+                        let samples_offset = row * 4;
+                        let samples = read_u32_le(parsed.samples_data, samples_offset)?;
+
+                        out.push((
+                            result_idx,
+                            RawSignalChunk {
+                                read_id: read_id_bytes,
+                                signal: signal_bytes,
+                                samples,
+                            },
+                        ));
+                    }
+                    Ok(out)
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+
+        // Scatter each batch's rows back into original request order. Slots are
+        // disjoint across batches, so a plain sequential scatter is correct.
         let mut results: Vec<Option<RawSignalChunk<'a>>> = vec![None; signal_rows.len()];
-
-        for (batch_idx, rows) in batch_rows {
-            let batch = &self.record_batches[batch_idx];
-            let batch_bytes = ipc_bytes
-                .get(batch.byte_range())
-                .ok_or_else(|| Error::InvalidArrowIpc("Batch range out of bounds".into()))?;
-            let num_rows = batch.row_count as usize;
-
-            let parsed = ParsedBatch::parse(batch_bytes, batch.metadata_length as usize, num_rows)?;
-
-            for (result_idx, local_row) in rows {
-                let row = local_row as usize;
-
-                // Extract read_id
-                let read_id_offset = row * 16;
-                let read_id_bytes: [u8; 16] = slice_at(parsed.read_id_data, read_id_offset, 16)?
-                    .try_into()
-                    .map_err(|_| Error::InvalidState("Invalid read_id".into()))?;
-
-                // Extract signal
-                let offset_start = row * 8;
-                let offset_end = (row + 1) * 8;
-                let signal_start = read_i64_le(parsed.signal_offsets, offset_start)? as usize;
-                let signal_end = read_i64_le(parsed.signal_offsets, offset_end)? as usize;
-                let signal_bytes = parsed
-                    .signal_data
-                    .get(signal_start..signal_end)
-                    .ok_or_else(|| Error::InvalidState("signal data out of bounds".into()))?;
-
-                // Extract samples
-                let samples_offset = row * 4;
-                let samples = read_u32_le(parsed.samples_data, samples_offset)?;
-
-                results[result_idx] = Some(RawSignalChunk {
-                    read_id: read_id_bytes,
-                    signal: signal_bytes,
-                    samples,
-                });
+        for chunk_list in per_batch {
+            for (result_idx, chunk) in chunk_list {
+                results[result_idx] = Some(chunk);
             }
         }
 

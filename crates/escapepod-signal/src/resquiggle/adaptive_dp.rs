@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 //! Adaptive banded DP (Suzuki & Kasahara, 2017).
 //!
@@ -44,10 +44,17 @@ pub fn adaptive_banded_dp(
     // We need to record band boundaries and traceback for the final path
     let mut band_starts: Vec<usize> = Vec::with_capacity(n_bases);
     let mut band_ends: Vec<usize> = Vec::with_capacity(n_bases);
-    let mut all_traceback: Vec<Vec<i32>> = Vec::with_capacity(n_bases);
 
     // Rolling score buffers (sized for maximum possible bandwidth)
     let max_bw = bandwidth + 2;
+
+    // Traceback for every base, concatenated into one flat buffer to avoid a
+    // per-base heap allocation (the old `Vec<Vec<i32>>` did one `to_vec()` per
+    // base). `base_offsets[i]..base_offsets[i + 1]` spans base i's band; both
+    // are built incrementally as each base is processed.
+    let mut flat_traceback: Vec<i32> = Vec::with_capacity(n_bases * max_bw);
+    let mut base_offsets: Vec<usize> = Vec::with_capacity(n_bases + 1);
+    base_offsets.push(0);
     let mut prev_scores = vec![f32::INFINITY; max_bw];
     let mut curr_scores = vec![f32::INFINITY; max_bw];
     let mut curr_traceback = vec![0i32; max_bw];
@@ -100,7 +107,8 @@ pub fn adaptive_banded_dp(
         .fold(f32::INFINITY, f32::min);
     best_min_score = best_min_score.min(current_min);
 
-    all_traceback.push(curr_traceback[..bw0].to_vec());
+    flat_traceback.extend_from_slice(&curr_traceback[..bw0]);
+    base_offsets.push(flat_traceback.len());
     std::mem::swap(&mut prev_scores, &mut curr_scores);
 
     let mut prev_bs = bs0;
@@ -193,25 +201,17 @@ pub fn adaptive_banded_dp(
             return initial_map.to_vec();
         }
 
-        all_traceback.push(curr_traceback[..bw].to_vec());
+        flat_traceback.extend_from_slice(&curr_traceback[..bw]);
+        base_offsets.push(flat_traceback.len());
         std::mem::swap(&mut prev_scores, &mut curr_scores);
 
         prev_bs = bs;
         prev_bw = bw;
     }
 
-    // Build Band and traceback
+    // Build Band and traceback (flat_traceback / base_offsets were assembled
+    // incrementally during the forward pass).
     let band = Band::new(band_starts.clone(), band_ends.clone(), true);
-
-    let mut base_offsets = Vec::with_capacity(n_bases + 1);
-    base_offsets.push(0);
-    let mut offset = 0;
-    for i in 0..n_bases {
-        offset += band_ends[i] - band_starts[i];
-        base_offsets.push(offset);
-    }
-
-    let flat_traceback: Vec<i32> = all_traceback.into_iter().flatten().collect();
 
     let mut path = vec![0usize; n_bases + 1];
     banded_traceback(&mut path, &band, &base_offsets, &flat_traceback);

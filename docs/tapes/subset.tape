@@ -2,7 +2,7 @@
 Output docs/images/subset.gif
 
 Set Shell "bash"
-Set FontFamily "FiraCode Nerd Font Mono"
+Set FontFamily "Fira Code"
 Set FontSize 16
 Set Width 900
 Set Height 550
@@ -13,6 +13,13 @@ Set Theme "Dracula"
 Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
+
+# Reset any output from a previous render so escpod doesn't refuse to overwrite
+Hide
+Type "rm -rf /tmp/mapping.csv /tmp/subsets"
+Enter
+Ctrl+L
+Show
 
 Type "echo 'read_id,output' > /tmp/mapping.csv"
 Enter

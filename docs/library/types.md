@@ -6,7 +6,7 @@ Core data structures used throughout the library.
 
 Represents a single nanopore read.
 
-```rust
+```rust linenums="1"
 pub struct ReadData {
     /// Unique identifier for the read
     pub read_id: Uuid,
@@ -60,7 +60,7 @@ pub struct ReadData {
 
 ### Converting Signal to Physical Units
 
-```rust
+```rust linenums="1"
 fn adc_to_picoamps(adc: i16, read: &ReadData) -> f32 {
     (adc as f32 + read.calibration_offset) * read.calibration_scale
 }
@@ -70,7 +70,7 @@ fn adc_to_picoamps(adc: i16, read: &ReadData) -> f32 {
 
 Metadata about a sequencing run.
 
-```rust
+```rust linenums="1"
 pub struct RunInfoData {
     /// Unique acquisition identifier
     pub acquisition_id: String,
@@ -148,7 +148,7 @@ pub struct RunInfoData {
 
 Why a read ended.
 
-```rust
+```rust linenums="1"
 pub enum EndReason {
     Unknown,
     MuxChange,
@@ -172,7 +172,7 @@ pub enum EndReason {
 
 Error types returned by library operations.
 
-```rust
+```rust linenums="1"
 pub enum Error {
     /// I/O error
     Io(std::io::Error),
@@ -199,7 +199,7 @@ pub enum Error {
 
 ### Error Handling Example
 
-```rust
+```rust linenums="1"
 use escapepod_signal::{Reader, Error};
 
 fn process_file(path: &str) -> Result<(), String> {
@@ -219,7 +219,7 @@ fn process_file(path: &str) -> Result<(), String> {
 
 Configuration for file writing.
 
-```rust
+```rust linenums="1"
 pub struct WriterOptions {
     /// Enable VBZ signal compression (default: true)
     pub signal_compression: bool,
@@ -233,7 +233,7 @@ pub struct WriterOptions {
 
 Read IDs are UUIDs stored as 16-byte fixed-size binary:
 
-```rust
+```rust linenums="1"
 use uuid::Uuid;
 
 // Parse from string

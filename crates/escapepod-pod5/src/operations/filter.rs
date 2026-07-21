@@ -2,6 +2,7 @@
 //!
 //! Uses raw byte extraction from mmap without Arrow deserialization.
 
+use crate::arrow_helpers::ReadsBatchView;
 use crate::arrow_ipc::ArrowIpcFooter;
 use crate::error::{Error, Result};
 use crate::reader::Reader;
@@ -11,8 +12,10 @@ use crate::utils::pod5_assembler::{
     FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
 use crate::utils::table_builders::{SchemaMetadata, build_reads_table_remapped};
+use crate::writer::atomic::{AtomicFile, Durability};
+use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -102,6 +105,8 @@ pub struct FilterOptions {
     pub signal_batch_size: u32,
     /// Reads per batch.
     pub read_batch_size: u32,
+    /// How hard to push bytes to stable storage before renaming into place.
+    pub durability: Durability,
 }
 
 impl Default for FilterOptions {
@@ -109,6 +114,7 @@ impl Default for FilterOptions {
         Self {
             signal_batch_size: 1_000,
             read_batch_size: 10_000,
+            durability: Durability::default(),
         }
     }
 }
@@ -190,8 +196,6 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         return Err(Error::InvalidState("No filter criteria specified".into()));
     }
 
-    let num_files = input_files.len();
-
     // Phase 1: Open files and identify matching reads in parallel
     let input_paths: Vec<&Path> = input_files.iter().map(|p| p.as_ref()).collect();
 
@@ -211,13 +215,32 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 let matching = reader.reads_by_ids(target_ids)?;
                 (matching, total)
             } else {
-                // collect_all_reads resolves columns once per batch.
-                let all_reads: Vec<ReadData> = reader.collect_all_reads()?;
-                let total = all_reads.len();
-                let matching = all_reads
-                    .into_iter()
-                    .filter(|read| criteria.matches(read))
-                    .collect();
+                // Scan the reads table in parallel across its record batches.
+                // Matching is independent per batch, and concatenating the
+                // per-batch results in batch order preserves file read order —
+                // which the downstream signal-row prefix sums (`flat_reads`)
+                // rely on. Nested under the outer per-file `par_iter`; the
+                // global rayon pool bounds the combined width (CLI `-t`).
+                let batches: Vec<RecordBatch> =
+                    reader.read_batches()?.collect::<Result<Vec<_>>>()?;
+                let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+                let per_batch: Vec<Vec<ReadData>> = batches
+                    .par_iter()
+                    .map(|batch| -> Result<Vec<ReadData>> {
+                        let view = ReadsBatchView::new(batch, false)?;
+                        let mut matched = Vec::new();
+                        for row in 0..view.num_rows() {
+                            let read = view.read(row)?;
+                            if criteria.matches(&read) {
+                                matched.push(read);
+                            }
+                        }
+                        Ok(matched)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let matching: Vec<ReadData> = per_batch.into_iter().flatten().collect();
                 (matching, total)
             };
 
@@ -239,37 +262,83 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         .iter()
         .map(|m| m.total_read_count as u64)
         .sum();
-    let matching_count: u64 = file_metadata
+    // Phases 2 & 3: extract signal and assemble the single output file.
+    // Borrow each file's owned reader/footer/reads so the shared assembler
+    // can hold the mmap-backed chunks without cloning.
+    let sources: Vec<OutputSource<'_>> = file_metadata
         .iter()
-        .map(|m| m.matching_reads.len() as u64)
-        .sum();
+        .map(|m| OutputSource {
+            reader: &m.reader,
+            signal_footer: &m.signal_footer,
+            run_infos: &m.run_infos,
+            matching_reads: &m.matching_reads,
+        })
+        .collect();
 
-    // Phase 2: Extract signal data in parallel across files.
+    let matched = assemble_output(output_path.as_ref(), &sources, &options, progress.as_ref())?;
+
+    Ok(FilterResult {
+        total_reads: total_read_count,
+        matched_reads: matched,
+        read_errors: 0,
+        signal_errors: 0,
+    })
+}
+
+/// One source file's borrowed contribution to an output POD5 file: the reader
+/// (which owns the mmap the extracted chunks borrow from), its parsed signal
+/// footer, its run infos, and the reads selected for this output (in the order
+/// they should appear).
+struct OutputSource<'a> {
+    reader: &'a Reader,
+    signal_footer: &'a ArrowIpcFooter,
+    run_infos: &'a [RunInfoData],
+    matching_reads: &'a [ReadData],
+}
+
+/// Extract the selected signal and assemble one POD5 output file from a set of
+/// borrowed source files, returning the number of reads written.
+///
+/// Shared by the multi-file `filter` path (many sources → one output) and the
+/// single-pass `subset` path (one shared reader → one source per output). The
+/// per-source extraction runs in parallel; chunks are concatenated in source
+/// order so the reads-table's per-read signal-row prefix sums line up with the
+/// signal table.
+fn assemble_output(
+    output_path: &Path,
+    sources: &[OutputSource<'_>],
+    options: &FilterOptions,
+    progress: Option<&ProgressCallback>,
+) -> Result<u64> {
+    let num_sources = sources.len();
+    let matching_count: u64 = sources.iter().map(|s| s.matching_reads.len() as u64).sum();
+
+    // Phase 2: Extract signal data in parallel across sources.
     //
-    // Each file's mmap is independent so extraction parallelizes per file.
-    // Each chunk is held as a `&[u8]` into the source mmap (kept alive by
-    // `file_metadata`'s readers) — never copied to the heap. On a 26 GB
-    // POD5 this avoids ~26 GB of `Arc<[u8]>` heap allocation that would
-    // otherwise OOM modest SLURM allocations.
+    // Each source's mmap is independent so extraction parallelizes per source.
+    // Each chunk is held as a `&[u8]` into the source mmap (kept alive by the
+    // caller's readers) — never copied to the heap. On a 26 GB POD5 this avoids
+    // ~26 GB of `Arc<[u8]>` heap allocation that would otherwise OOM modest
+    // SLURM allocations.
     type SignalChunks<'a> = Vec<(&'a [u8], u32)>;
 
-    let extractions: Vec<Result<SignalChunks<'_>>> = file_metadata
+    let extractions: Vec<Result<SignalChunks<'_>>> = sources
         .par_iter()
-        .map(|metadata| {
-            if metadata.matching_reads.is_empty() {
+        .map(|source| {
+            if source.matching_reads.is_empty() {
                 return Ok(Vec::new());
             }
 
-            let signal_bytes = metadata.reader.signal_table_bytes()?;
+            let signal_bytes = source.reader.signal_table_bytes()?;
 
-            // Collect all signal rows needed from this file
-            let signal_row_indices: Vec<u64> = metadata
+            // Collect all signal rows needed from this source
+            let signal_row_indices: Vec<u64> = source
                 .matching_reads
                 .iter()
                 .flat_map(|read| read.signal_rows.iter().copied())
                 .collect();
 
-            let raw_chunks = metadata
+            let raw_chunks = source
                 .signal_footer
                 .extract_signal_rows(&signal_row_indices, signal_bytes)?;
 
@@ -282,21 +351,21 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         })
         .collect();
 
-    let file_extractions: Vec<SignalChunks<'_>> =
+    let source_extractions: Vec<SignalChunks<'_>> =
         extractions.into_iter().collect::<Result<Vec<_>>>()?;
 
-    // Flatten file extractions into a single chunk list in source-file order.
+    // Flatten source extractions into a single chunk list in source order.
     // Order matters: the reads-table's per-read signal-row prefix sums (built
-    // below into `flat_reads`) walk source files in this same order, so chunk
-    // N of the signal table must correspond to signal-row N of the output.
-    let total_chunks: usize = file_extractions.iter().map(|e| e.len()).sum();
+    // below into `flat_reads`) walk sources in this same order, so chunk N of
+    // the signal table must correspond to signal-row N of the output.
+    let total_chunks: usize = source_extractions.iter().map(|e| e.len()).sum();
     let mut signal_chunks: Vec<(&[u8], u32)> = Vec::with_capacity(total_chunks);
-    for (file_idx, chunks) in file_extractions.iter().enumerate() {
+    for (source_idx, chunks) in source_extractions.iter().enumerate() {
         signal_chunks.extend_from_slice(chunks);
-        if let Some(ref cb) = progress {
+        if let Some(cb) = progress {
             cb(Progress {
-                current: file_idx as u64 + 1,
-                total: num_files as u64,
+                current: source_idx as u64 + 1,
+                total: num_sources as u64,
             });
         }
     }
@@ -305,10 +374,14 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
 
     let schema_meta = SchemaMetadata::new();
 
-    let file = File::create(output_path.as_ref())?;
+    // Stage into a temp file alongside the destination; nothing appears at
+    // `output_path` until the commit below. Any `?` between here and there
+    // drops the guard, which unlinks the partial file and leaves an existing
+    // destination untouched.
+    let atomic = AtomicFile::with_durability(output_path, options.durability)?;
     // 128 MiB buffer matches merge.rs and avoids many small syscalls when
     // the reads/run_info tables are flushed at the end.
-    let mut file = BufWriter::with_capacity(128 * 1024 * 1024, file);
+    let mut file = BufWriter::with_capacity(128 * 1024 * 1024, atomic.reopen()?);
 
     // Write POD5 header
     file.write_all(&POD5_SIGNATURE)?;
@@ -330,13 +403,10 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     // force a flush of the 128 MiB BufWriter.
     let signal_end = POD5_SIGNATURE.len() + 16 + signal_table_bytes_written;
 
-    // Borrow each file's run_infos for dedup — avoids deep-cloning every
+    // Borrow each source's run_infos for dedup — avoids deep-cloning every
     // RunInfoData (each carries 13 Strings + 2 HashMaps).
-    let per_file_run_infos: Vec<&[RunInfoData]> = file_metadata
-        .iter()
-        .map(|m| m.run_infos.as_slice())
-        .collect();
-    let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
+    let per_source_run_infos: Vec<&[RunInfoData]> = sources.iter().map(|s| s.run_infos).collect();
+    let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_source_run_infos);
 
     // Build a flat view of every matching read with the prefix-sum
     // signal-row offset and remapped run_info dict key baked in. Each
@@ -348,9 +418,9 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
     // remap work per row.
     let mut flat_reads: Vec<FlatReadRef<'_>> = Vec::with_capacity(matching_count as usize);
     let mut signal_row_cursor: u64 = 0;
-    for metadata in &file_metadata {
-        for read in &metadata.matching_reads {
-            let run_info_key = metadata
+    for source in sources {
+        for read in source.matching_reads {
+            let run_info_key = source
                 .run_infos
                 .get(read.run_info_index as usize)
                 .and_then(|ri| run_info_map.get(&ri.acquisition_id).copied())
@@ -380,12 +450,179 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         &reads_table_bytes,
     )?;
 
-    Ok(FilterResult {
-        total_reads: total_read_count,
-        matched_reads: matching_count,
-        read_errors: 0,
-        signal_errors: 0,
-    })
+    // Release the buffered handle before the rename so nothing is left unwritten.
+    file.flush()?;
+    drop(file);
+    atomic.commit()?;
+
+    Ok(matching_count)
+}
+
+/// Scan one reader's reads table a single time, partitioning the reads present
+/// in `read_to_group` into `group name -> reads` (in input read order).
+///
+/// Batches are scanned in parallel; per-batch partitions are merged in batch
+/// order so each group keeps input read order (its signal-row prefix sums
+/// depend on it). Returned group keys borrow the names from `read_to_group`.
+fn partition_reads_by_group<'a>(
+    reader: &Reader,
+    read_to_group: &'a HashMap<Uuid, String>,
+) -> Result<HashMap<&'a str, Vec<ReadData>>> {
+    let batches: Vec<RecordBatch> = reader.read_batches()?.collect::<Result<Vec<_>>>()?;
+
+    let per_batch: Vec<HashMap<&str, Vec<ReadData>>> = batches
+        .par_iter()
+        .map(|batch| -> Result<HashMap<&str, Vec<ReadData>>> {
+            let view = ReadsBatchView::new(batch, false)?;
+            let mut local: HashMap<&str, Vec<ReadData>> = HashMap::new();
+            for row in 0..view.num_rows() {
+                let read = view.read(row)?;
+                if let Some(group) = read_to_group.get(&read.read_id) {
+                    local.entry(group.as_str()).or_default().push(read);
+                }
+            }
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut groups: HashMap<&str, Vec<ReadData>> = HashMap::new();
+    for local in per_batch {
+        for (group, reads) in local {
+            groups.entry(group).or_default().extend(reads);
+        }
+    }
+    Ok(groups)
+}
+
+/// Outcome of a subset/split, reported per group.
+///
+/// Groups are written in parallel and independently, so one failing group does
+/// not invalidate the others. Both lists are sorted by group name.
+#[derive(Debug, Default)]
+pub struct SubsetOutcome {
+    /// Groups written successfully, as (output name, reads written).
+    pub groups: Vec<(String, u64)>,
+    /// Groups that failed. These produced no output file at all.
+    pub failures: Vec<(String, Error)>,
+}
+
+impl SubsetOutcome {
+    /// Total reads written across all successful groups.
+    pub fn reads_written(&self) -> u64 {
+        self.groups.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Split the reads of a single POD5 file into multiple outputs in one pass.
+///
+/// Convenience wrapper around [`subset_files`] for a single input. See there
+/// for semantics.
+pub fn subset_file<P: AsRef<Path> + Sync>(
+    input: P,
+    read_to_group: &HashMap<Uuid, String>,
+    output_dir: &Path,
+    options: FilterOptions,
+) -> Result<SubsetOutcome> {
+    subset_files(
+        std::slice::from_ref(&input),
+        read_to_group,
+        output_dir,
+        options,
+    )
+}
+
+/// Split the reads of one or more POD5 files into multiple outputs in one pass.
+///
+/// Unlike calling [`filter_files`] once per output group — which re-opens and
+/// re-scans every input for every group — this opens each input once, scans its
+/// reads table a single time to partition matching reads by their target group,
+/// then writes every group's file in parallel. A group whose reads span several
+/// inputs is assembled from all of them (in input order); reads absent from
+/// `read_to_group` are dropped.
+///
+/// `read_to_group` maps each read UUID to the basename of its output file
+/// (joined onto `output_dir`).
+pub fn subset_files<P: AsRef<Path> + Sync>(
+    inputs: &[P],
+    read_to_group: &HashMap<Uuid, String>,
+    output_dir: &Path,
+    options: FilterOptions,
+) -> Result<SubsetOutcome> {
+    if inputs.is_empty() {
+        return Ok(SubsetOutcome::default());
+    }
+
+    // Phase 1: open each input and partition its reads by group, in parallel
+    // across inputs. Each reader stays alive so its mmap backs the chunks the
+    // assembler borrows in phase 2.
+    type InputCtx<'a> = (
+        Reader,
+        ArrowIpcFooter,
+        Vec<RunInfoData>,
+        HashMap<&'a str, Vec<ReadData>>,
+    );
+    let input_paths: Vec<&Path> = inputs.iter().map(|p| p.as_ref()).collect();
+    let per_input: Vec<InputCtx<'_>> = input_paths
+        .par_iter()
+        .map(|path| -> Result<InputCtx<'_>> {
+            let reader = Reader::open(path)?;
+            let signal_bytes = reader.signal_table_bytes()?;
+            let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+            let run_infos = reader.run_infos().to_vec();
+            let groups = partition_reads_by_group(&reader, read_to_group)?;
+            Ok((reader, signal_footer, run_infos, groups))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Union of every group name that received at least one read.
+    let mut all_groups: HashSet<&str> = HashSet::new();
+    for (_, _, _, groups) in &per_input {
+        all_groups.extend(groups.keys().copied());
+    }
+
+    // Phase 2: write each group's output in parallel. Each output gathers one
+    // `OutputSource` per input that contributed reads (in input order), so a
+    // group spanning multiple inputs is assembled from all their mmaps at once.
+    // Nested rayon (across groups, then across sources inside `assemble_output`)
+    // is bounded by the global pool (CLI `-t`).
+    let group_list: Vec<&str> = all_groups.into_iter().collect();
+    type GroupResult = std::result::Result<(String, u64), (String, Error)>;
+    let results: Vec<GroupResult> = group_list
+        .par_iter()
+        .map(|&group| {
+            let sources: Vec<OutputSource<'_>> = per_input
+                .iter()
+                .filter_map(|(reader, signal_footer, run_infos, groups)| {
+                    groups.get(group).map(|reads| OutputSource {
+                        reader,
+                        signal_footer,
+                        run_infos: run_infos.as_slice(),
+                        matching_reads: reads.as_slice(),
+                    })
+                })
+                .collect();
+            let output_path = output_dir.join(group);
+            match assemble_output(&output_path, &sources, &options, None) {
+                Ok(matched) => Ok((group.to_string(), matched)),
+                Err(e) => Err((group.to_string(), e)),
+            }
+        })
+        .collect();
+
+    // Report every group's outcome rather than collapsing to the first error
+    // and discarding the rest: groups are written in parallel, so "the first
+    // error" is nondeterministic and says nothing about what else happened.
+    // Failed groups leave no file behind, so a re-run is clean.
+    let mut outcome = SubsetOutcome::default();
+    for result in results {
+        match result {
+            Ok(group) => outcome.groups.push(group),
+            Err(failure) => outcome.failures.push(failure),
+        }
+    }
+    outcome.groups.sort_by(|a, b| a.0.cmp(&b.0));
+    outcome.failures.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(outcome)
 }
 
 /// `Write` adapter that counts the bytes flowing through. The Arrow IPC

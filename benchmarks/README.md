@@ -41,40 +41,53 @@ on much larger inputs where DTW dominates; the
 `hot_paths_gpu` microbench at 8192 × 40 fingerprints measures a 7.7×
 speedup on the kernel in isolation.
 
-### Classification agreement (`compare_demux_results.py`)
+### Classification agreement — parity ladder (2026-06-14 update)
 
-Using the **same** SVM model (`WDX4_rna004_v1_0`). Layered tests while
-closing the gap:
+The stage-isolation harness `benchmarks/benchmark_demux_parity.sh` runs
+four layers that swap escpod stages in one at a time, so the agreement
+drop between adjacent layers attributes any gap to a specific stage. All
+layers classify with the **same** converted `WDX4_rna004_v1_0` model and
+are compared against WarpDemuX's own predictions.
 
-| Experiment | Input | Agreement |
-|---|---|---:|
-| Layer A: WDX boundaries + WDX fingerprints → `escpod classify` | `barcode_fpts_0.npz` → CSV | **97.14 %** (100 % on conf ≥ 0.5, r = 0.9958) |
-| Layer B, LLR detect (escpod default) | — | **93.37 %** |
-| Layer B, CNN detect (`--method cnn`) | — | **96.95 %** |
+| Layer | boundaries / fingerprints | overall | conf ≥ 0.5 |
+|---|---|---:|---:|
+| A — WDX bounds + WDX fpts → `escpod classify` | WDX / WDX | **99.63 %** | **100.00 %** |
+| B-bounds — WDX bounds + escpod fpt | WDX / escpod | 99.61 % | 100.00 % |
+| B-cnn — escpod CNN detect (`--method cnn`) | escpod / escpod | **99.26 %** | 100.00 % |
+| B-llr — escpod LLR detect (default) | escpod / escpod | 94.14 % | 96.34 % |
 
-Layer A showed early that the SVM / DTW / kernel / Platt pipeline is
-faithful. Closing the original Layer-B gap (23 % → ~97 %) required
-three fixes, all in fingerprint extraction:
+**Confident reads (conf ≥ 0.5) are at 100 % parity through Layer B-cnn.**
 
-1. **Extract padding.** WDX's `sig_extract.padding = 100` — the
-   adapter region fed to clipping + segmentation is
-   `signal[adapter_start-100 : adapter_end+100]`, not
-   `signal[adapter_start : adapter_end]`. Missing this shifted every
-   changepoint and the retained last-25 segment means. **Biggest
-   single contributor.**
-2. **scipy-matching `find_changepoints`.** Local-max detection switched
-   to strict `>` with scipy-style plateau-midpoint collapse; removed
-   the `t_score > 0.0` filter. Verified by direct Rust-vs-scipy
-   comparison: the two produce bit-identical peak sets on real
-   adapter signals.
-3. **CNN adapter detection (`--method cnn`).** Ports ADAPTed's
-   `BoundariesCNN` through tract-onnx. Closes most of the LLR vs CNN
-   boundary gap (CNN reaches Layer-A ceiling; LLR stops a few points
-   short because the LLR detector occasionally disagrees with the CNN
-   on adapter_end by ≥ 20 samples).
+#### The DTW warping-penalty fix (97.1 % → 99.6 % ceiling)
 
-The remaining ~3 % on the LLR path and ~0.1 % on the CNN path trace to
-boundary-detection differences on hard reads — not a compat bug.
+Earlier the Layer-A ceiling sat at **97.14 %** — even with identical WDX
+boundaries *and* fingerprints, `escpod classify` disagreed ~2.9 %. The
+root cause was the DTW distance: WarpDemuX models carry a
+`dtaidistance` warping **`penalty`** (`WDX4` = 0.1) added to the two
+non-diagonal (expansion / compression) DP transitions, and escpod
+applied none. Plumbing it through (`DtwSvmModel.penalty`, extracted by
+`convert_warpdemux_model.py`; applied in `dtw_distance_penalty`) lifts
+Layer A to **99.63 %** and confident reads to **100 %**.
+
+Subtlety that bit once: `dtaidistance`'s penalty is expressed in
+*non-squared* distance space while escpod's DP accumulates squared local
+costs, so each warp step adds **`penalty²`** (verified directly:
+`dtaidistance.dtw.distance([0,0,0],[0], penalty=0.1) == sqrt(2·0.1²)`).
+Adding the raw `penalty` over-penalizes 10× and *regresses* parity to
+~80 %. The GPU kernel applies the identical `penalty²` so `--gpu`
+classify matches CPU (test: `gpu_svm_batch::parity_svm_classify_batch_penalty`).
+
+The remaining Layer-A 0.37 % are all low-confidence near-ties
+(`wdx_conf < 0.5`) that flip on f32-vs-f64 DTW rounding — escpod keeps
+f32 DTW for throughput; the residual is below the confident-call gate.
+
+Earlier work (still in place) closed the original 23 % → 97 % Layer-B
+gap with three fingerprint-extraction fixes: WDX's `sig_extract.padding
+= 100`; scipy-matching `find_changepoints` (strict `>` + plateau
+midpoint); and the ADAPTed `BoundariesCNN` port (`--method cnn`). The
+residual ~5 % on the **default LLR** path (94.14 % vs B-cnn 99.26 %) is
+boundary detection — **use `--method cnn` for parity**; LLR occasionally
+disagrees with the CNN on `adapter_end` by ≥ 20 samples on hard reads.
 
 ### Reproducing
 
@@ -96,8 +109,50 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     -p escapepod-cli --features "demux train gpu"
 
 # Run — auto-dispatches to the right SLURM partition
-./benchmarks/benchmark_demux.sh          # CPU only
-./benchmarks/benchmark_demux.sh --gpu    # adds the GPU variant
+./benchmarks/benchmark_demux.sh                       # CPU only, WDX4
+./benchmarks/benchmark_demux.sh --gpu                 # adds the GPU variant
+./benchmarks/benchmark_demux.sh --model WDX10_rna004_v1_0   # larger DTW workload
+```
+
+#### Example sweep (2026-06-14, parallel fan-out; AlaRS_all20_b4 real run)
+
+`benchmark_demux_matrix.sh` across WDX4/6/10 × {4k bundled, 25k, 100k real}
+× {cpu, gpu}, 18 cells fanned out concurrently (cpu `-c 24`, gpu A30). The
+GPU classify (DTW) only earns its keep at scale; at 4k reads NVRTC compile +
+H2D transfer dominate.
+
+| model | n_reads | escpod CPU s | escpod GPU s | speedup CPU | speedup GPU |
+|---|---:|---:|---:|---:|---:|
+| WDX4  | 3,786  | 1.81  | 1.57  | 17.6× | 20.3× |
+| WDX4  | 55,864 | 30.23 | **10.00** | 3.8× | **11.5×** |
+| WDX6  | 55,864 | 43.14 | **10.71** | 2.8× | **11.1×** |
+| WDX10 | 3,786  | 2.85  | 3.53  | 12.3× | 9.9× |
+| WDX10 | 55,864 | 60.44 | **12.06** | 1.6× | **7.9×** |
+
+At 100k reads the GPU is **~5× faster than escpod-CPU** for the heaviest model
+(WDX10: 60.4 → 12.1 s) — DTW dominates and the A30 pays off. At 4k it's within
+noise or slower. Agreement (default LLR path) is 93–96% across the sweep and is
+model/boundary-bound, not affected by the device.
+
+#### Harness scripts (2026-06-14)
+
+| Script | Purpose |
+|---|---|
+| `benchmark_demux.sh` | Single cell: detect+fingerprint+classify vs WarpDemuX. Flags: `--model NAME`, `--gpu`, `--out-dir DIR`, `--emit-tsv FILE`. |
+| `make_demux_inputs.sh` | Builds reproducible size tiers (4k/25k/100k reads) from a real run via `escpod filter`; the bundled 4000-read file is always the smallest tier. |
+| `benchmark_demux_matrix.sh` | Sweeps {models} × {tiers} × {cpu,gpu}, one srun per device, → `matrix.tsv` + `matrix.md` (speed + agreement per cell). |
+| `benchmark_demux_parity.sh` | The stage-isolation ladder above. `--dump-mismatches` writes a per-read CSV for root-causing. Needs the CNN ONNX for the B-cnn layer. |
+
+```bash
+# Full speed+agreement matrix across models and dataset sizes:
+./benchmarks/benchmark_demux_matrix.sh \
+    --models "WDX4_rna004_v1_0 WDX6_rna004_v1_0 WDX10_rna004_v1_0" \
+    --tiers "4000 25000 100000" --devices "cpu gpu" --src /path/to/real_run
+
+# Parity ladder + per-read mismatch dump:
+#   (B-cnn needs scripts/export_adapter_cnn_to_onnx.py -> benchmarks/adapter_cnn_rna004.onnx,
+#    built from a local ADAPTed install; CC BY-NC weights are not redistributed.)
+./benchmarks/benchmark_demux_parity.sh --dump-mismatches
 ```
 
 ---
@@ -213,6 +268,128 @@ startup, memory-mapped I/O, and tight Arrow iteration — but the
 absolute times are tens to hundreds of milliseconds either way. This
 matters for interactive use; it doesn't change pipeline wall-clock.
 
+## GPU vs CPU TCN adapter detection (2026-06-16)
+
+Decision benchmark for running the escapepod-models `adapter_rna004@v1.0.1` TCN
+(`demux detect --method cnn`) on GPU. Input: `bench_wdx/sub20k/sub.pod5` (20k
+RNA004 tRNA reads, mean 10,206 samples → downscaled TCN input L≈920). CPU =
+rna 16c; GPU = A30 via onnxruntime CUDA EP (probe `bench_tcn_gpu/ort_probe.py`).
+
+**`detect --method cnn` is inference-bound, not I/O-bound.** LLR detect on the
+same read+decode path is **0.25 s / 20k**; the CNN/TCN path is **77.49 s / 20k**
+→ inference is **~99.6 %** of wall-clock. (The #80 "detect is POD5-read + prep
+bound, not CNN-compute bound" reasoning holds for LLR, *not* the TCN.)
+
+| Inference path | reads/s | vs current |
+|---|---:|---:|
+| CPU tract per-read (current `escpod`) | 258 | 1× |
+| CPU onnxruntime, batched B=1024 | 738 | 2.9× |
+| **GPU onnxruntime, batched B=1024 (A30)** | **25,656** | **~99×** |
+| I/O+decode floor (LLR, same path) | ~80,000 | — |
+
+GPU is **~99×** over the current tract path and **~35×** over the best
+CPU-batched path; batching alone (no CUDA) is a **2.9×** partial win. Verdict:
+**GO** — clears the ≥1.5× gate by a wide margin. Right mechanism is the `ort`
+crate + CUDA execution provider (architecture-agnostic, any `[B,1,L]->[B,2,L]`
+ONNX) — **not** reverting #80's BoundariesCNN-locked CUDA kernel, which cannot
+run the TCN. Numbers are synthetic fixed-L throughput; a production path needs
+length-bucketing and GPU-vs-tract `adapter_end` parity on real signals.
+
+## Python library: escapepod vs pod5 (2026-07-09)
+
+Harness: `benchmarks/benchmark_python.py` (wrapper `benchmark_python.sh`).
+Unlike `benchmark.sh` — which times the `escpod` vs `pod5` **CLIs** with
+hyperfine — this exercises the two **Python libraries** in-process, so the
+numbers reflect library work, not interpreter startup + import. Each case runs
+the same logical operation through both libraries, warms up, times several
+repetitions, and reports the median; a checksum asserts the two libraries agree
+(int16 signal is bit-identical, pA sums match within last-ULP float32 drift).
+
+Input: `ext/WarpDemuX/test_data/demux/4000_rna004.pod5` (81 MB, 4000 reads).
+Node: `rna` partition, `escapepod` 0.5.1 vs `pod5` 0.3.39, 7 runs / 2 warmup.
+
+| Benchmark | escapepod | pod5 | speedup |
+|---|---:|---:|---:|
+| open + metadata | 4.21 ms | 16.50 ms | **3.92×** |
+| read_ids | 476 µs | 541 µs | 1.14× |
+| iterate read metadata | 4.20 ms | 3.52 ms | 0.84× |
+| read all signal (int16) | 209.7 ms | 264.1 ms | **1.26×** |
+| read all signal (pA) | 217.4 ms | 355.0 ms | **1.63×** |
+| metadata → pandas | 15.3 ms | 2.5 ms | 0.16× |
+| random-access selection | 333 µs | 162 µs | 0.49× |
+| read all signal (batched, `get_signals`) | 284.1 ms | — | esc-only |
+
+speedup = pod5 median / escapepod median (>1 ⇒ escapepod faster). escapepod wins
+on file open and signal decode (VBZ + calibration); pod5 wins on the pandas
+export (its metadata is already an Arrow table, so `to_pandas` is near-free,
+whereas escapepod builds the frame) and on tiny random-access selections. The
+escapepod-only batched `get_signals` case has no pod5 API equivalent.
+
+### Larger file (20k reads)
+
+A 20 000-read subset of a 2 GB real run
+(`ThrRS_ser_b6.pod5`, 220k reads total; subset written via `--limit 20000`).
+Node: `rna`, escapepod 0.5.1 vs pod5 0.3.39, 5 runs / 1 warmup.
+
+| Benchmark | escapepod | pod5 | speedup |
+|---|---:|---:|---:|
+| open + metadata | 133 µs | 612 µs | **4.59×** |
+| read_ids | 2.54 ms | 2.64 ms | 1.04× |
+| iterate read metadata | 21.4 ms | 17.4 ms | 0.81× |
+| read all signal (int16) | 541.2 ms | 758.8 ms | **1.40×** |
+| read all signal (pA) | 551.0 ms | 1.047 s | **1.90×** |
+| metadata → pandas | 75.7 ms | 8.2 ms | 0.11× |
+| random-access selection (500) | 1.18 ms | 835 µs | 0.71× |
+| read all signal (batched, `get_signals`) | 602.3 ms | — | esc-only |
+
+The picture holds and sharpens at scale: escapepod's signal-decode lead widens
+(pA 1.63× → **1.90×**). One gap stands out as a real optimization target:
+
+- **`metadata → pandas` gets *worse* with size** (0.16× → 0.11×). `to_dict`/
+  `to_pandas` built Python **lists of boxed scalars** per column, which pandas
+  then re-parsed into numpy arrays; pod5 goes Arrow→pandas columnar with no
+  per-element boxing. **Fixed in #99** by emitting numpy columns directly
+  (`to_pandas` 4k: 15.3 → 8.0 ms, 0.16× → 0.36×). The residual is upstream
+  `ReadData` materialization in `collect_inner` (~63 % of wall at 220k reads:
+  heap `Uuid`/`pore_type`/`end_reason` strings + an unused `signal_rows` `Vec`
+  per read) — building columns straight from the Arrow batch is tracked in #98.
+
+The `get_signals` (batched) row looked slower here (602 ms vs the per-read
+541 ms), but a controlled A/B rules that out as a measurement artifact:
+`get_signal_bulk` is batch-grouped + rayon-parallel VBZ decode, and on the same
+reads at 16 threads it runs **427 ms vs 526 ms per-read (1.23×)**, scaling 2.8×
+from 1→16 threads. Per-read decode is single-threaded and flat across thread
+count, so `get_signals` is the right API for bulk signal — the batched number
+above just reflects run-to-run variance on that particular subset, not a
+regression. (A streaming/iterator variant that avoids materializing every signal
+at once would cut its peak memory, but is not needed for throughput.)
+
+**Why random-access selection is slower:** the test file has no `.p5i` index
+sidecar, so escapepod's `reads(selection=…)` falls back to a linear scan of the
+whole reads table — decoding every read_id and testing set membership, O(total
+reads) — while pod5 resolves the selection against an in-memory read-id index,
+O(selection). Building the index first (`reader.build_index()`, or shipping the
+`.p5i`) drops escapepod from 0.47 ms → 0.21 ms, on par with pod5's 0.16–0.23 ms.
+The table reports the default (no-index) path; for repeated random access on one
+reader, call `build_index()` once up front.
+
+### Reproducing
+
+```bash
+# Rebuild the extension first if the Rust bindings changed — a stale wheel would
+# benchmark an old API (the wrapper warns if installed version != workspace).
+pixi run -e python-test maturin develop --release \
+    --manifest-path crates/escapepod-python/Cargo.toml
+
+# Small file (runs anywhere)
+./benchmarks/benchmark_python.sh ext/WarpDemuX/test_data/demux/4000_rna004.pod5
+
+# Large file — cap the signal loops to N reads (writes a subset first) and run
+# under SLURM so it's off the 2-core login node
+srun -p rna -c 32 --mem=32G ./benchmarks/benchmark_python.sh \
+    big.pod5 --limit 20000 --runs 5 --json /tmp/pybench.json
+```
+
 ## Running Benchmarks
 
 ```bash
@@ -227,3 +404,6 @@ cargo build --release
 
 - `hyperfine`: `cargo install hyperfine` or system package manager
 - `pod5`: `pip install pod5` or `pixi add pod5`
+- Python-library benchmark (`benchmark_python.sh`): both `escapepod` and `pod5`
+  in the `python-test` pixi env — `pixi run -e python-test maturin develop
+  --release --manifest-path crates/escapepod-python/Cargo.toml`

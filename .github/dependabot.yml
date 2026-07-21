@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Keep third-party GitHub Actions patched. We pin to major-version tags
+  # (e.g. @v6) rather than commit SHAs; Dependabot is what closes the
+  # supply-chain gap by bumping those tags when upstreams cut security fixes.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Rust dependency updates for the workspace root Cargo.toml/Cargo.lock.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]

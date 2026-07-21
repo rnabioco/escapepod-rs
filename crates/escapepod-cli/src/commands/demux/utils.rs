@@ -214,9 +214,15 @@ pub fn total_read_count(input_files: &[PathBuf]) -> usize {
 /// levels, so on fixtures with few files and many reads we stop bottlenecking
 /// on file count — all CPUs stay busy. Peak signal RAM is still bounded by
 /// `rayon::current_num_threads()` reads (not total reads).
+/// `decode_bound`: when `Some(max)`, only the first `max` signal samples per
+/// read are decompressed (the ZSTD tail of the boundary chunk is skipped). Use
+/// this for consumers that look at a fixed leading window — e.g. CNN adapter
+/// detection only needs `max_obs_trace` samples regardless of read length, which
+/// matters for long mRNA transcripts. `None` decodes the full read.
 pub fn process_reads_par<F, T>(
     input_files: &[PathBuf],
     progress: Option<&indicatif::ProgressBar>,
+    decode_bound: Option<usize>,
     process: F,
 ) -> anyhow::Result<Vec<T>>
 where
@@ -248,7 +254,12 @@ where
                     let results: Vec<T> = chunk
                         .iter()
                         .filter_map(|r| {
-                            let signal = extractor.get_signal(&r.signal_rows).ok()?;
+                            let signal = match decode_bound {
+                                Some(max) => {
+                                    extractor.get_signal_prefix(&r.signal_rows, max).ok()?
+                                }
+                                None => extractor.get_signal(&r.signal_rows).ok()?,
+                            };
                             Some(process(r.read_id, r.num_samples, &signal))
                         })
                         .collect();

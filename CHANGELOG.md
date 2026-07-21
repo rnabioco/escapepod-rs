@@ -2,6 +2,214 @@
 
 ## Unreleased
 
+### Added
+
+- **PyPI publishing** for the `escapepod` Python package. The `release.yml`
+  workflow now builds abi3 wheels (CPython 3.9+) for Linux (x86_64/aarch64,
+  manylinux + musllinux) and macOS (x86_64/arm64) plus an sdist, and publishes
+  them to PyPI via Trusted Publishing (OIDC) on each `v*` tag. `pip install
+  escapepod` will work once the first tagged release lands. The bindings crate
+  gained `abi3-py39` and complete PyPI metadata (readme, license, URLs,
+  classifiers, type stubs).
+
+## 0.6.1 (2026-07-20)
+
+### Fixed
+
+- POD5 archives are now written **atomically**: output is staged to a
+  temporary file and renamed into place on completion, so an interrupted or
+  failed write can no longer leave a truncated/partial `.pod5` at the target
+  path.
+
+### Build / Tooling
+
+- Dependency bumps: `noodles-bam` 0.91, `noodles-sam` 0.86, `noodles-bgzf`
+  0.48, `noodles-csi` 0.57, `sha2` 0.11, and the grouped cargo minor/patch
+  and GitHub Actions updates.
+
+## 0.6.0 (2026-07-11)
+
+### Added
+
+- **Native GBM (gradient-boosted tree-ensemble) barcode classifier** for
+  `demux classify` / fused `demux`, alongside the existing DTW+SVM path.
+  Fingerprints are scored directly by a distilled tree ensemble (no DTW),
+  loaded from the same auto-detected model surface. Fused-pipeline support
+  is included, so `escpod demux --model gbm.json …` routes reads end-to-end.
+- **Architecture-agnostic GPU CNN/TCN adapter detection** (`demux detect
+  --method cnn --gpu`, feature `cnn-gpu`): runs any `[B,1,L] -> [B,2,L]`
+  ONNX graph batched through onnxruntime's CUDA execution provider via the
+  `ort` crate (`load-dynamic` — needs a CUDA-enabled `libonnxruntime` on
+  `ORT_DYLIB_PATH` and a visible GPU at run time, nothing at build time).
+  TCN detect is inference-bound, so this pays off (~7.6× end-to-end on an
+  A30 at 20k reads). This is the ONNX-generic backend anticipated by the
+  removal of the old arch-locked CUDA kernel below — it replaces it without
+  hardcoding a topology.
+- **pod5-parity Python API**: a multi-file `DatasetReader`, `to_dict` /
+  `to_pandas` / `to_polars` exporters, `missing_ok` handling,
+  `calibrate_signal_array`, `Writer.add_reads`, and per-read `byte_count`,
+  bringing the `escapepod` bindings closer to the reference `pod5` package.
+- **Python bindings for the signal layer**: `normalize`, a `KmerTable`
+  wrapper, and `refine_signal_map` are now exposed from `escapepod-signal`,
+  so the resquiggle/normalization primitives are usable from Python.
+- `-t` / `--threads` on `filter`, `subset`, and `merge` (matching `demux`)
+  to cap the worker pool; these commands now default to a bounded pool of 8
+  threads instead of grabbing every CPU on a shared node.
+- **POD5 reads-table schema V5**: the `expected_open_pore_level` and
+  `selected_read_level` fields (both `float32`), introduced upstream in pod5
+  0.3.44, are now read, written, merged/filtered, surfaced in `view`/`inspect`
+  (and as selectable output fields), and exposed on the Python `ReadData` /
+  `Writer.add_read` API. Files escapepod writes are now stamped `pod5_version`
+  0.3.44 and verified readable by the reference ONT `pod5` reader; existing
+  V0–V4 files still read, with the new fields defaulting to 0.0.
+- Defensive pre-mmap probe when opening a POD5 file: the header and footer are
+  read through ordinary I/O before the file is memory-mapped, so a truncated
+  file or an archive "stub" (unresident data on HSM/tape-backed filesystems)
+  surfaces a recoverable error instead of an uncatchable SIGBUS on first page
+  fault. Mirrors upstream pod5 0.3.37; set `POD5_DISABLE_MMAP_OPEN=1` to skip.
+- `escpod demux <file> --model M -d OUT` now runs a **fused, streaming
+  pipeline** by default: each read's signal is decoded once, then detect +
+  fingerprint + classify run in a single pass and reads are routed
+  (block-level compressed copy) into per-barcode POD5s — no intermediate
+  boundaries/fingerprints/classifications files. The granular
+  `detect`/`fingerprint`/`classify`/`split`/`train` subcommands remain for
+  advanced use. `--classifications` writes the per-read CSV only when asked.
+- Experimental GPU primitives (behind `--features gpu`) for the demux signal
+  chain — SVB16 decode, t-test fingerprint, LLR detect — kept as validated,
+  reusable kernels. They are **not** used by `escpod demux`: measurement shows
+  the prep stages run faster on a multi-core CPU than on the GPU.
+
+### Removed
+
+- The **GPU CNN adapter-detection path** (`demux detect --method cnn --gpu`,
+  plus the `--cnn-weights` flag and `scripts/dump_adapter_cnn_weights.py`). Its
+  hand-written CUDA kernels were hardcoded to ADAPTed's `BoundariesCNN`
+  topology (3× Conv1d + ConvTranspose1d, fixed K=7/C=64) and could not run any
+  other architecture — including escapepod-models' replacement TCN. CNN
+  detection (`--method cnn`) now runs **only** through the architecture-agnostic
+  tract-onnx CPU path (`adapter_cnn.rs`), which accepts any `[B,1,L] -> [B,2,L]`
+  ONNX graph. This is not a regression at typical scales: `detect` is dominated
+  by POD5 read + signal prep, not CNN compute, so the CPU path is as fast or
+  faster (the GPU flag's own help already said as much). Removing it also drops
+  the CC-BY-NC `.weights` dumper. If a GPU CNN path is ever needed again, add an
+  ONNX-generic backend (e.g. ORT CUDA EP) rather than a per-architecture
+  kernel — which is exactly what the new `cnn-gpu` path (see **Added**) does.
+
+### Changed
+
+- **The CLI crate is renamed `escapepod` → `escapepod-cli`**, matching its
+  `escapepod-{pod5,signal,demux}` siblings and making its role explicit. The
+  `escpod` binary name is unchanged, and installation is unchanged
+  (`cargo install --git …`). Library consumers of the umbrella crate now
+  import it as `escapepod_cli` (e.g. `use escapepod_cli::signal`) instead of
+  `escapepod`. (The `escapepod` name on PyPI already belongs to the Python
+  bindings, so this also removes the crate-name overlap.)
+- **CLI output split into logs vs. data.** All status/progress/warning output
+  now flows through `tracing` to **stderr** (`timestamp LEVEL [target] message`),
+  while command *data* (TSV/CSV rows, `inspect`/`summary` reports, ID lists)
+  stays on **stdout**, so it can be piped/redirected independently of logs.
+  Default level is `info`; control it with `-v`/`-vv`/`-q` or `RUST_LOG`.
+  Progress bars auto-hide under `-q`.
+- **Minimum supported Rust version raised to 1.95** (from 1.92).
+- The **resquiggle module is relicensed to MIT** as an independent
+  implementation, bringing it in line with the rest of the workspace.
+- The Theil–Sen rescale **subsample seed is now configurable** (`resquiggle
+  --seed`), making refinement runs bit-for-bit reproducible.
+- The LLR detect `--downscale` default is now **10** (the WarpDemuX-native
+  mode) for `demux` and `demux detect`, up from 1. This makes detect — the
+  dominant prep stage — ~5× faster, with ~98% barcode agreement versus
+  full-resolution (ds=1). Pass `--downscale 1` to restore full-resolution
+  detect.
+- Dependency bumps (no behavior change): Arrow ecosystem `arrow` + `parquet`
+  58 → 59, `tabled` 0.20 → 0.21, the `noodles-*` BAM stack (`bam` 0.90,
+  `sam` 0.85, `bgzf` 0.47, `core` 0.20, `csi` 0.56), `ndarray` 0.16 → 0.17,
+  `cudarc` 0.12 → 0.19, and `tract-onnx` 0.21 → 0.23.
+
+### Performance
+
+- **Demux classify DTW is much faster, bit-identical.** Per-call DTW
+  allocation eliminated from the SVM classifier (~1.8×), then extended with
+  lane-parallel SIMD DTW (8 signals/vector) covering windowed/penalty models
+  as well — together a large end-to-end speedup on the DTW-bound path.
+- **GBM classify ~3.1× faster** (compact tree arena + 8-read batched walk),
+  bit-identical.
+- **Cold-read demux I/O fixed.** Signal is now read in a single sequential
+  memory-mapped stream with O(1) Arrow-batch seeks and dictionary pre-scan /
+  readahead, instead of per-read random access across many threads (which
+  degraded to demand-paging on cold files). Removes the large-POD5 startup
+  stall and the cold-read throughput cliff.
+- **Zero-copy single-read signal fetch** with adaptive prefix decode
+  (#94): the reader's per-read signal path avoids materializing intermediate
+  buffers, and fingerprint prep streams only the needed prefix.
+- **Faster Python read iteration**: per-batch column resolution for the lazy
+  `for rd in reader:` iterator and `reads()`, plus numpy-backed metadata
+  columns for `to_dict` / `to_pandas` / `to_polars`.
+- **Parallelized bulk-file copies**: `filter`, `subset`, and `merge` now
+  copy reads across threads (bounded default pool of 8; `-t` to override),
+  and the experimental `index` command adopts the same bounded default
+  instead of inheriting rayon's all-CPU global pool.
+- **Single-pass `demux split`**: reads are routed to per-barcode outputs in
+  one pass, and the `--unclassified` flag now works correctly.
+- Codebase-wide optimization/refactor sweep (#86), all bit-identical output:
+  - **Resquiggle adaptive banded DP ~31% faster** — the per-base traceback no
+    longer heap-allocates a `Vec` per base; the whole read shares one flat
+    buffer.
+  - **O(1) POD5 read-batch access** — `read_batch(i)` / `read_ids_from_batch(i)`
+    now seek via the Arrow IPC footer instead of decoding every preceding batch.
+    Iterating a many-read-batch file (e.g. the Python `Reader` read iterator)
+    drops from O(B²) to O(B) batch decodes: ~10× faster random batch access and
+    ~2.6× faster full-file iteration on a 1.65M-read / 166-batch file.
+  - **Signal median computations are O(n) instead of O(n log n)** — the SVM
+    kernel γ-heuristic, Theil–Sen rescale, and resquiggle dwell median now use
+    `select_nth_unstable` instead of a full sort.
+  - Smaller per-read allocations on the demux/classify and fingerprint hot
+    paths (MAD-normalization scratch reuse, Platt coupling workspace sized once).
+- Internal consolidation with no behavior change: six duplicated median impls
+  unified into `escapepod-signal::stats`; the SVM RBF-kernel mapping and the
+  CPU/GPU CNN batch packing/scatter each live in one shared helper.
+
+### Fixed
+
+- Resolved a PyPI name collision: both the `escapepod` CLI crate and the
+  `escapepod-python` bindings crate declared `name = "escapepod"`. The PyPI
+  `escapepod` distribution is the **Python `Reader` bindings**
+  (`escapepod-python`); the `escpod` CLI now ships via `cargo install
+  escapepod` and GitHub release binaries only, so its maturin `pyproject.toml`
+  (a `bindings = "bin"` wheel) has been removed. This reverses the 0.5.1 note
+  about `pip install escapepod` installing the CLI.
+
+## 0.5.1 (2026-06-14)
+
+### Changed
+
+- The CLI now ships from the `escapepod` crate (renamed from
+  `escapepod-cli`), so `cargo install escapepod` installs the `escpod`
+  binary. The same crate doubles as an umbrella library: with
+  `default-features = false` plus `pod5` / `signal` / `demux`, it
+  re-exports each layer (e.g. `escapepod::signal`) without pulling in the
+  CLI's dependency tree. `demux` stays opt-in until it stabilizes.
+- The maturin binary wheel is published as `escapepod` (was
+  `escapepod-cli`) so `pip install escapepod` matches `cargo install`.
+
+### Fixed
+
+- Packaging `readme` pointed at a nonexistent path, which made
+  `cargo package` fail; the workspace now points every publishable crate
+  at the root `README.md`. `escapepod-python` is marked `publish = false`.
+- `demux fingerprint` (test fixture): labeled-Parquet temp files lacked a
+  `.parquet` suffix, so format detection read them as CSV and the parquet
+  loaders failed with an "invalid UTF-8" error.
+
+### Build / Tooling
+
+- Gated the `train`-only labeled-fingerprint loaders behind
+  `#[cfg(feature = "train")]`, removing dead-code warnings from
+  `--features demux` builds.
+- Bumped GitHub Actions to current majors (checkout v6, upload-artifact
+  v7, download-artifact v8, setup-python v6, setup-pixi v0.9.6,
+  action-gh-release v3, actions-netlify v4), clearing the Node 20
+  deprecation warnings.
+
 ## 0.5.0 (2026-04-27)
 
 ### Added

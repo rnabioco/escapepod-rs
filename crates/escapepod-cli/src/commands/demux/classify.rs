@@ -4,12 +4,16 @@ use super::fp_io::{read_query_fingerprints_f32, read_query_fingerprints_f64};
 use super::utils::{configure_thread_pool, parse_reference_csv};
 use crate::style;
 use anyhow::Context;
-use escapepod_demux::{AnyModel, DtwSvmModel, SvmPredictor, SvmWorkspace, load_any_model};
+use escapepod_demux::{
+    AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace, load_any_model,
+};
 use escapepod_signal::dtw::dtw_distance_matrix;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Open a streaming output writer. Detects `.gz` extension and transparently
@@ -147,10 +151,7 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     // loader now auto-detects the JSON shape. Emit a warning so scripts
     // start migrating.
     if let Some(p) = args.svm_model.take() {
-        eprintln!(
-            "{} --svm-model is deprecated; use --model (auto-detects SVM vs WarpDemux JSON).",
-            style::label("warning:"),
-        );
+        warn!("--svm-model is deprecated; use --model (auto-detects SVM vs WarpDemux JSON).",);
         if args.model.is_some() {
             anyhow::bail!("Specify only one of --model / --svm-model (they are aliases now).");
         }
@@ -170,6 +171,7 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         match load_any_model(&model_path)? {
             AnyModel::Svm(model) => run_with_svm_model(args, model_path, model),
             AnyModel::WarpDemux(_) => run_with_model(args, model_path),
+            AnyModel::Gbm(model) => run_with_gbm_model(args, model_path, model),
         }
     } else if let Some(reference_path) = args.reference.take() {
         run_with_csv(args, reference_path)
@@ -190,27 +192,27 @@ fn run_with_svm_model(
     svm_model_path: PathBuf,
     model: DtwSvmModel,
 ) -> anyhow::Result<()> {
-    println!("{} reads using SVM model", style::action("Classifying"));
-    println!(
+    info!("{} reads using SVM model", style::action("Classifying"));
+    info!(
         "{} {}",
         style::label("Fingerprints:"),
         style::path(args.fingerprints.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("SVM Model:"),
         style::path(svm_model_path.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
     );
     if args.probabilities {
-        println!("{} per-class probabilities", style::label("Including:"));
+        info!("{} per-class probabilities", style::label("Including:"));
     }
 
-    println!(
+    info!(
         "{} {} classes, {} training samples, {} support vectors",
         style::label("Model:"),
         style::count(model.n_classes),
@@ -221,7 +223,7 @@ fn run_with_svm_model(
     // Read query fingerprints
     let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
-    println!(
+    info!(
         "{} {} query fingerprints",
         style::label("Loaded:"),
         style::count(query_fps.len())
@@ -242,7 +244,7 @@ fn run_with_svm_model(
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::{DEFAULT_GPU_CHUNK_CELLS, classify_with_svm_batch_gpu_with_ctx};
-            println!("{} reads with SVM on GPU...", style::action("Classifying"));
+            info!("{} reads with SVM on GPU...", style::action("Classifying"));
             let chunk_cells = args.gpu_chunk_cells.unwrap_or(DEFAULT_GPU_CHUNK_CELLS);
             let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
@@ -256,7 +258,8 @@ fn run_with_svm_model(
             // for the write step.
             stream_svm_classifications(
                 &args.output,
-                &model,
+                &model.label_mapper,
+                model.n_classes,
                 args.probabilities,
                 gpu_results.len(),
                 |tx| {
@@ -279,33 +282,40 @@ fn run_with_svm_model(
             unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
         }
     } else {
-        println!("{} reads with SVM...", style::action("Classifying"));
+        info!("{} reads with SVM...", style::action("Classifying"));
         // Build the predictor once (label→class-index tables reused across
         // every read) and give each rayon worker its own workspace so the
         // k×k coupling matrices never re-allocate per read.
         let predictor = SvmPredictor::new(&model);
         let n = query_fps.len();
-        stream_svm_classifications(&args.output, &model, args.probabilities, n, |tx| {
-            query_fps
-                .par_iter()
-                .map_init(
-                    || SvmWorkspace::for_model(&model),
-                    |ws, (read_id, fingerprint)| {
-                        let (probs, result) = predictor.predict_with_workspace(fingerprint, ws);
-                        SvmClassifyResult {
-                            read_id: *read_id,
-                            predicted_barcode: result.predicted_barcode,
-                            confidence: result.confidence,
-                            is_confident: result.is_confident,
-                            probabilities: probs,
-                        }
-                    },
-                )
-                .for_each_with(tx.clone(), |tx, r| {
-                    tx.send(r).ok();
-                });
-            Ok(())
-        })?
+        stream_svm_classifications(
+            &args.output,
+            &model.label_mapper,
+            model.n_classes,
+            args.probabilities,
+            n,
+            |tx| {
+                query_fps
+                    .par_iter()
+                    .map_init(
+                        || SvmWorkspace::for_model(&model),
+                        |ws, (read_id, fingerprint)| {
+                            let (probs, result) = predictor.predict_with_workspace(fingerprint, ws);
+                            SvmClassifyResult {
+                                read_id: *read_id,
+                                predicted_barcode: result.predicted_barcode,
+                                confidence: result.confidence,
+                                is_confident: result.is_confident,
+                                probabilities: probs,
+                            }
+                        },
+                    )
+                    .for_each_with(tx.clone(), |tx, r| {
+                        tx.send(r).ok();
+                    });
+                Ok(())
+            },
+        )?
     };
 
     let unclassified_count = total_count - confident_count;
@@ -325,14 +335,20 @@ fn run_with_svm_model(
     Ok(())
 }
 
-/// Run classification using a trained WarpDemuX model.
-fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()> {
-    use escapepod_demux::{classify_read, load_model};
-
-    println!(
-        "{} reads using WarpDemuX model",
-        style::action("Classifying")
-    );
+/// Run classification using a trained gradient-boosted (GBM) tree model.
+///
+/// Unlike the SVM path there is no DTW, no reference bank, and no GPU branch:
+/// each fingerprint is run through the tree ensemble independently. The
+/// predictor is read-only and `Sync`, so the rayon loop shares a single
+/// `&GbmPredictor` with no per-worker workspace. Output format matches the SVM
+/// path (`read_id,predicted_barcode,confidence,is_confident[,p<NN>…]`) so
+/// downstream scoring scripts treat the two interchangeably.
+fn run_with_gbm_model(
+    args: ClassifyArgs,
+    gbm_model_path: PathBuf,
+    model: GbmModel,
+) -> anyhow::Result<()> {
+    println!("{} reads using GBM model", style::action("Classifying"));
     println!(
         "{} {}",
         style::label("Fingerprints:"),
@@ -340,20 +356,157 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
     );
     println!(
         "{} {}",
-        style::label("Model:"),
-        style::path(model_path.display())
+        style::label("GBM Model:"),
+        style::path(gbm_model_path.display())
     );
     println!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
     );
+    if args.probabilities {
+        println!("{} per-class probabilities", style::label("Including:"));
+    }
+    println!(
+        "{} {} classes, {} features, {} boosting iterations",
+        style::label("Model:"),
+        style::count(model.n_classes),
+        style::count(model.n_features),
+        style::count(model.n_iterations())
+    );
 
-    // Load the model
-    println!("{} model...", style::action("Loading"));
-    let model = load_model(&model_path)?;
+    if gpu_requested(&args) {
+        eprintln!(
+            "{} GBM inference is CPU-only; ignoring --gpu.",
+            style::label("warning:"),
+        );
+    }
+
+    let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
     println!(
+        "{} {} query fingerprints",
+        style::label("Loaded:"),
+        style::count(query_fps.len())
+    );
+
+    if query_fps.is_empty() {
+        anyhow::bail!("No valid query fingerprints found");
+    }
+
+    // Fail fast on a model/fingerprint dimension mismatch (e.g. wrong model for
+    // these fingerprints) rather than silently classifying every read as
+    // unclassified.
+    if let Some((_, first)) = query_fps.first()
+        && first.len() != model.n_features
+    {
+        anyhow::bail!(
+            "Query fingerprints have {} features but the GBM model expects {}",
+            first.len(),
+            model.n_features
+        );
+    }
+
+    println!("{} reads with GBM...", style::action("Classifying"));
+    let predictor = GbmPredictor::new(&model);
+    let n = query_fps.len();
+    let (confident_count, total_count) = stream_svm_classifications(
+        &args.output,
+        &model.label_mapper,
+        model.n_classes,
+        args.probabilities,
+        n,
+        |tx| {
+            // Classify in chunks so each rayon task runs the batched
+            // `predict_many` (walks 8 reads in lockstep down each tree, hiding
+            // the per-node L2 latency that bottlenecks a single serial walk —
+            // ~2.6× over per-read `predict`, bit-identical). The chunk is large
+            // enough to amortize rayon task overhead.
+            const CHUNK: usize = 1024;
+            query_fps
+                .par_chunks(CHUNK)
+                .for_each_with(tx.clone(), |tx, chunk| {
+                    let slices: Vec<&[f64]> = chunk.iter().map(|(_, fp)| fp.as_slice()).collect();
+                    match predictor.predict_many(&slices) {
+                        Ok(results) => {
+                            for ((read_id, _), (probs, result)) in chunk.iter().zip(results) {
+                                tx.send(SvmClassifyResult {
+                                    read_id: *read_id,
+                                    predicted_barcode: result.predicted_barcode,
+                                    confidence: result.confidence,
+                                    is_confident: result.is_confident,
+                                    probabilities: probs,
+                                })
+                                .ok();
+                            }
+                        }
+                        // A length mismatch shouldn't abort the whole batch —
+                        // emit each read as unclassified (barcode -1), mirroring
+                        // a rejected call.
+                        Err(_) => {
+                            for (read_id, _) in chunk {
+                                tx.send(SvmClassifyResult {
+                                    read_id: *read_id,
+                                    predicted_barcode: -1,
+                                    confidence: 0.0,
+                                    is_confident: false,
+                                    probabilities: Vec::new(),
+                                })
+                                .ok();
+                            }
+                        }
+                    }
+                });
+            Ok(())
+        },
+    )?;
+
+    let unclassified_count = total_count - confident_count;
+
+    info!(
+        "{} classifications written to {}",
+        style::action("Wrote"),
+        style::path(args.output.display())
+    );
+    info!(
+        "{} {} confident, {} unclassified",
+        style::label("Result:"),
+        style::count(confident_count),
+        style::warning(unclassified_count)
+    );
+
+    Ok(())
+}
+
+/// Run classification using a trained WarpDemuX model.
+fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()> {
+    use escapepod_demux::{classify_read, load_model};
+
+    info!(
+        "{} reads using WarpDemuX model",
+        style::action("Classifying")
+    );
+    info!(
+        "{} {}",
+        style::label("Fingerprints:"),
+        style::path(args.fingerprints.display())
+    );
+    info!(
+        "{} {}",
+        style::label("Model:"),
+        style::path(model_path.display())
+    );
+    info!(
+        "{} {}",
+        style::label("Output:"),
+        style::path(args.output.display())
+    );
+
+    // Load the model
+    info!("{} model...", style::action("Loading"));
+    let model = load_model(&model_path)?;
+
+    info!(
         "{} {} training samples, {} features, threshold={:.3} ({})",
         style::label("Model:"),
         style::count(model.num_samples()),
@@ -365,7 +518,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
     // Read query fingerprints
     let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
-    println!(
+    info!(
         "{} {} query fingerprints",
         style::label("Loaded:"),
         style::count(query_fps.len())
@@ -382,7 +535,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::classify_reads_gpu;
-            println!("{} reads on GPU...", style::action("Classifying"));
+            info!("{} reads on GPU...", style::action("Classifying"));
             let read_ids: Vec<Uuid> = query_fps.iter().map(|(id, _)| *id).collect();
             let fps: Vec<Vec<f64>> = query_fps.into_iter().map(|(_, fp)| fp).collect();
             let gpu_results = classify_reads_gpu(&model, &fps)
@@ -408,7 +561,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
             unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
         }
     } else {
-        println!("{} reads...", style::action("Classifying"));
+        info!("{} reads...", style::action("Classifying"));
         let n = query_fps.len();
         stream_model_classifications(&args.output, n, |tx| {
             query_fps
@@ -433,12 +586,12 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
 
     let unclassified_count = total_count - confident_count;
 
-    println!(
+    info!(
         "{} classifications written to {}",
         style::action("Wrote"),
         style::path(args.output.display())
     );
-    println!(
+    info!(
         "{} {} confident, {} unclassified",
         style::label("Result:"),
         style::count(confident_count),
@@ -450,33 +603,33 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
 
 /// Run classification using CSV reference fingerprints.
 fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<()> {
-    println!(
+    info!(
         "{} reads by barcode using DTW",
         style::action("Classifying")
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Fingerprints:"),
         style::path(args.fingerprints.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Reference:"),
         style::path(reference_path.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
     );
     if let Some(w) = args.window {
-        println!("{} {}", style::label("DTW window:"), style::value(w));
+        info!("{} {}", style::label("DTW window:"), style::value(w));
     }
 
     // Read reference fingerprints
     let reference_fps = parse_reference_csv(&reference_path)?;
 
-    println!(
+    info!(
         "{} {} reference barcodes",
         style::label("Loaded:"),
         style::count(reference_fps.len())
@@ -489,7 +642,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     // Read query fingerprints
     let query_fps = read_query_fingerprints_f32(&args.fingerprints)?;
 
-    println!(
+    info!(
         "{} {} query fingerprints",
         style::label("Loaded:"),
         style::count(query_fps.len())
@@ -513,7 +666,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         #[cfg(feature = "gpu")]
         {
             use escapepod_signal::dtw::dtw_distance_matrix_gpu;
-            println!("{} DTW distances on GPU...", style::action("Computing"));
+            info!("{} DTW distances on GPU...", style::action("Computing"));
             dtw_distance_matrix_gpu(&query_slices, &ref_slices, args.window)
                 .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?
         }
@@ -522,7 +675,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
             unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
         }
     } else {
-        println!("{} DTW distances...", style::action("Computing"));
+        info!("{} DTW distances...", style::action("Computing"));
         dtw_distance_matrix(&query_slices, &ref_slices, args.window)
     };
 
@@ -588,12 +741,12 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
     let confident_count = results.iter().filter(|r| r.is_confident).count();
     let unclassified_count = results.len() - confident_count;
 
-    println!(
+    info!(
         "{} classifications written to {}",
         style::action("Wrote"),
         style::path(args.output.display())
     );
-    println!(
+    info!(
         "{} {} confident, {} unclassified",
         style::label("Result:"),
         style::count(confident_count),
@@ -701,7 +854,8 @@ fn write_csv_classifications(path: &Path, results: &[ClassifyResult]) -> anyhow:
 /// Returns `(confident_count, total_count)`.
 fn stream_svm_classifications<F>(
     path: &Path,
-    model: &DtwSvmModel,
+    label_mapper: &HashMap<usize, i32>,
+    n_classes: usize,
     include_probabilities: bool,
     _expected: usize,
     produce: F,
@@ -719,8 +873,7 @@ where
 
     // Pre-build the barcode label strings once (instead of `format!("BC{:02}", id)`
     // per read) and the probability header once.
-    let label_mapper = model.label_mapper.clone();
-    let n_classes = model.n_classes;
+    let label_mapper = label_mapper.clone();
     let path_buf = path.to_path_buf();
 
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<(usize, usize)> {

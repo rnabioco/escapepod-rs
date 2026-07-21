@@ -55,6 +55,7 @@ mod tests {
             classes: vec![4, 5, 6],
             kernel_params: KernelParams::default(),
             window: None,
+            penalty: 0.0,
             label_mapper,
             thresholds: None,
             prob_a: None,
@@ -81,7 +82,7 @@ mod tests {
         let query = vec![0.0, 0.0, 0.0];
         let training = vec![vec![0.0, 0.0, 0.0], vec![1.0, 1.0, 1.0]];
 
-        let distances = compute_distances(&query, &training, None);
+        let distances = compute_distances(&query, &training, None, 0.0);
 
         assert!(distances[0] < 0.1); // Same vector, distance ~0
         assert!(distances[1] > distances[0]); // Different vector, larger distance
@@ -171,6 +172,7 @@ mod tests {
             classes: vec![0, 1, 2],
             kernel_params: KernelParams::default(),
             window: None,
+            penalty: 0.0,
             label_mapper,
             thresholds: None,
             prob_a: None,

@@ -121,6 +121,8 @@ pub(super) fn extract_read_from_batch(
         time_since_mux_change: ext.get_f32("time_since_mux_change").unwrap_or(0.0),
         num_samples: ext.get_u64("num_samples")?,
         open_pore_level,
+        expected_open_pore_level: ext.get_f32("expected_open_pore_level").unwrap_or(0.0),
+        selected_read_level: ext.get_f32("selected_read_level").unwrap_or(0.0),
         signal_rows: ext.get_signal_rows()?,
     })
 }

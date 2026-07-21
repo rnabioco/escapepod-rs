@@ -9,6 +9,8 @@ use noodles_csi::binning_index::ReferenceSequence as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use tracing::{info, warn};
+
 use crate::style;
 
 /// Resolve input path to a list of POD5 files.
@@ -75,6 +77,45 @@ pub fn check_output_writable(output: &Path, force: bool) -> anyhow::Result<()> {
             "Output file {} already exists. Use --force to overwrite.",
             output.display()
         );
+    }
+    Ok(())
+}
+
+/// Stable identity for a path that may not exist yet.
+///
+/// An output path usually has no file to canonicalize, so resolve its parent
+/// and re-attach the filename. Returns `None` when even the parent is
+/// unresolvable, in which case the caller should not claim a collision.
+fn resolve_for_compare(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path.file_name()?;
+    std::fs::canonicalize(parent).ok().map(|p| p.join(name))
+}
+
+/// Reject an output path that is also one of the inputs.
+///
+/// Writing over an input is survivable — output is staged and renamed, so the
+/// inputs stay readable on their original inode for the whole run — but it
+/// consumes a source file the user probably meant to keep, and it is almost
+/// always a typo or an over-broad glob rather than an intent.
+pub fn check_output_not_input(output: &Path, inputs: &[PathBuf]) -> anyhow::Result<()> {
+    let Some(resolved_output) = resolve_for_compare(output) else {
+        return Ok(());
+    };
+    for input in inputs {
+        if resolve_for_compare(input).as_deref() == Some(resolved_output.as_path()) {
+            anyhow::bail!(
+                "Output {} is also an input. Choose a different output path \
+                 (or drop it from the inputs) so the source file is not replaced.",
+                output.display()
+            );
+        }
     }
     Ok(())
 }
@@ -163,8 +204,8 @@ pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> Open
         Ok(r) => OpenResult::Ok(r),
         Err(e) => {
             if is_directory {
-                eprintln!(
-                    "Warning: skipping {} ({})",
+                warn!(
+                    "skipping {} ({})",
                     file_path.file_name().unwrap_or_default().to_string_lossy(),
                     e
                 );
@@ -190,17 +231,15 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
     // Also check for path.bai (alternative naming convention)
     let alt_bai_path = bam_path.with_extension("bai");
     if alt_bai_path.exists() {
-        eprintln!(
-            "{} Found index at {} but noodles expects {}",
-            style::note_label("Note:"),
+        info!(
+            "found index at {} but noodles expects {}",
             style::path(alt_bai_path.display()),
             style::path(bai_path.display())
         );
     }
 
-    eprintln!(
-        "{} BAI index not found, creating {}...",
-        style::info("Info:"),
+    info!(
+        "BAI index not found, creating {}...",
         style::path(bai_path.display())
     );
 
@@ -210,11 +249,7 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
     // Write the index to file
     bam::bai::fs::write(&bai_path, &index)?;
 
-    eprintln!(
-        "{} Created BAI index: {}",
-        style::action("Done:"),
-        style::path(bai_path.display())
-    );
+    info!("created BAI index: {}", style::path(bai_path.display()));
 
     Ok(bai_path)
 }
@@ -252,8 +287,8 @@ pub fn get_reads_iter_with_warning<'a>(
         Ok(iter) => OpenResult::Ok(iter),
         Err(e) => {
             if is_directory {
-                eprintln!(
-                    "Warning: cannot read {} ({})",
+                warn!(
+                    "cannot read {} ({})",
                     file_path.file_name().unwrap_or_default().to_string_lossy(),
                     e
                 );

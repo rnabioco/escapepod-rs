@@ -4,7 +4,7 @@
 use crate::model::DtwSvmModel;
 use crate::probability::{ProbabilityResult, process_probabilities};
 
-use super::kernel::{compute_distances_into, distances_to_kernel_into};
+use super::kernel::distances_to_kernel_into;
 use super::workspace::SvmWorkspace;
 
 // Re-export SvmModel as an alias for DtwSvmModel for backwards compatibility
@@ -27,6 +27,19 @@ pub struct SvmPredictor<'a> {
     /// Class index for each support vector, indexed by the support vector's
     /// local index (i.e. `sv_class[k]` is the class of `support_indices[k]`).
     sv_class: Vec<Option<usize>>,
+    /// `f32` copy of `model.training_fingerprints`, converted once at
+    /// construction. The DTW distance loop runs in `f32`; without this the
+    /// per-read hot loop would re-cast all (n_train × fp_len) values from `f64`
+    /// on every read. Constant across reads, so it belongs on the predictor.
+    training_f32: Vec<Vec<f32>>,
+    /// When every training fingerprint has the same length (the usual case),
+    /// this is `Some(len)` and `training_blocks` holds the SoA-packed bank for
+    /// the lane-parallel DTW fast path. `None` for ragged training sets, which
+    /// fall back to the scalar per-fingerprint loop.
+    train_uniform_len: Option<usize>,
+    /// SoA-packed training bank for [`dtw_distances_batch_unconstrained`].
+    /// Empty unless `train_uniform_len.is_some()`.
+    training_blocks: Vec<f32>,
 }
 
 impl<'a> SvmPredictor<'a> {
@@ -57,10 +70,34 @@ impl<'a> SvmPredictor<'a> {
             })
             .collect();
 
+        let training_f32: Vec<Vec<f32>> = model
+            .training_fingerprints
+            .iter()
+            .map(|fp| fp.iter().map(|&x| x as f32).collect())
+            .collect();
+
+        // If every training fingerprint is the same length, pre-pack the bank
+        // into the SoA block layout for the lane-parallel DTW fast path.
+        let train_uniform_len = match training_f32.first() {
+            Some(first)
+                if training_f32.iter().all(|fp| fp.len() == first.len()) && !first.is_empty() =>
+            {
+                Some(first.len())
+            }
+            _ => None,
+        };
+        let training_blocks = match train_uniform_len {
+            Some(len) => escapepod_signal::dtw::pack_training_blocks(&training_f32, len),
+            None => Vec::new(),
+        };
+
         Self {
             model,
             training_class,
             sv_class,
+            training_f32,
+            train_uniform_len,
+            training_blocks,
         }
     }
 
@@ -77,27 +114,12 @@ impl<'a> SvmPredictor<'a> {
     ///
     /// Score for each class (higher = more similar to that class)
     pub fn kernel_weighted_scores(&self, kernel_values: &[f64]) -> Vec<f64> {
-        let n_classes = self.model.n_classes;
-        let mut class_scores = vec![0.0; n_classes];
-        let mut class_counts = vec![0usize; n_classes];
-
-        // Accumulate kernel-weighted votes for each class. The class index
-        // for each training sample was pre-resolved in `new()`.
-        for (i, class_opt) in self.training_class.iter().enumerate() {
-            if let Some(class_idx) = *class_opt {
-                class_scores[class_idx] += kernel_values[i];
-                class_counts[class_idx] += 1;
-            }
-        }
-
-        // Normalize by class size to avoid bias toward larger classes
-        for (score, count) in class_scores.iter_mut().zip(class_counts.iter()) {
-            if *count > 0 {
-                *score /= *count as f64;
-            }
-        }
-
-        class_scores
+        // Allocating convenience wrapper over the workspace-backed impl so the
+        // accumulate/normalize logic lives in exactly one place.
+        let mut scores = Vec::new();
+        let mut counts = Vec::new();
+        self.kernel_weighted_scores_into(kernel_values, &mut scores, &mut counts);
+        scores
     }
 
     /// Workspace-backed variant. Reuses `scores` / `counts` buffers across
@@ -369,8 +391,14 @@ impl<'a> SvmPredictor<'a> {
         // Flat k×k row-major layout for r and q. We hand them to slice views
         // below so the inner loops see `&[f64]` / `&mut [f64]` and can get
         // vectorized by the autovectorizer.
-        ws.r.clear();
-        ws.r.resize(kk, 0.0);
+        // Sized to kk once in `SvmWorkspace::for_model`; only a fresh `new()`
+        // workspace still needs the initial fill. Every off-diagonal entry is
+        // overwritten below and the diagonal is never read, so no per-call
+        // zeroing is required on the hot path.
+        if ws.r.len() != kk {
+            ws.r.clear();
+            ws.r.resize(kk, 0.0);
+        }
         let r = ws.r.as_mut_slice();
 
         let mut pair_idx = 0;
@@ -385,8 +413,12 @@ impl<'a> SvmPredictor<'a> {
 
         // Build Q matrix: Q[t][t] = sum_{j!=t} r[j][t]^2
         //                  Q[t][j] = -r[j][t] * r[t][j]  (j != t)
-        ws.q.clear();
-        ws.q.resize(kk, 0.0);
+        // Same as `r`: sized once, and every entry (including the diagonal) is
+        // written each call, so the fill is only needed for a fresh workspace.
+        if ws.q.len() != kk {
+            ws.q.clear();
+            ws.q.resize(kk, 0.0);
+        }
         let q = ws.q.as_mut_slice();
         for t in 0..k {
             let mut diag = 0.0;
@@ -486,13 +518,42 @@ impl<'a> SvmPredictor<'a> {
         query: &[f64],
         ws: &mut SvmWorkspace,
     ) -> (Vec<f64>, ProbabilityResult) {
-        // 1) DTW distances → ws.distances
-        compute_distances_into(
-            query,
-            &self.model.training_fingerprints,
-            self.model.window,
-            ws,
-        );
+        // 1) DTW distances → ws.distances. Use the predictor's precomputed f32
+        // training set (constant across reads) and the workspace's shared DTW
+        // buffers, so a read scoring against n_train fingerprints neither
+        // re-casts the training set nor allocates per DTW call.
+        ws.query_f32.clear();
+        ws.query_f32.extend(query.iter().map(|&x| x as f32));
+        match self.train_uniform_len {
+            // Uniform-length bank → score DTW_LANES training fingerprints per
+            // SIMD batch. Handles both the unconstrained case (window=None,
+            // penalty=0) and the real WarpDemuX config (Sakoe-Chiba band +
+            // warping penalty); `dtw_distances_batch` fast-paths the former.
+            Some(len) => {
+                escapepod_signal::dtw::dtw_distances_batch(
+                    &ws.query_f32,
+                    &self.training_blocks,
+                    len,
+                    self.training_f32.len(),
+                    self.model.window,
+                    self.model.penalty,
+                    &mut ws.distances,
+                    &mut ws.dtw_batch,
+                );
+            }
+            // Fallback: ragged bank (training fingerprints of differing length)
+            // → score one fingerprint at a time, reusing the row buffers.
+            None => {
+                super::kernel::compute_distances_f32_into(
+                    &ws.query_f32,
+                    &self.training_f32,
+                    self.model.window,
+                    self.model.penalty,
+                    &mut ws.distances,
+                    &mut ws.dtw,
+                );
+            }
+        }
 
         // 2) Kernel transform. Borrow-split: we need `&ws.distances` while
         // writing `ws.kernel`.

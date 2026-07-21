@@ -58,6 +58,8 @@ fn create_test_read(run_info_idx: u32, read_number: u32, num_samples: u64) -> Re
         time_since_mux_change: 0.0,
         num_samples,
         open_pore_level: 220.0,
+        expected_open_pore_level: 0.0,
+        selected_read_level: 0.0,
         signal_rows: Vec::new(),
     }
 }
@@ -119,6 +121,37 @@ fn test_full_round_trip() -> escapepod_signal::Result<()> {
         let signal = reader.get_signal(&read.signal_rows)?;
         assert_eq!(signal.len(), 500);
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_v5_pore_level_fields_round_trip() -> escapepod_signal::Result<()> {
+    // POD5 V5 added `expected_open_pore_level` and `selected_read_level`.
+    // Verify non-zero values survive a Writer -> Reader round trip (the schema
+    // columns are written and read back, not silently dropped to the default).
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    let path = temp_file.path();
+
+    let mut writer = Writer::create(path, WriterOptions::default())?;
+    let run_info_idx = writer.add_run_info(create_test_run_info("v5_round_trip"))?;
+
+    let mut read = create_test_read(run_info_idx, 1, 500);
+    read.expected_open_pore_level = 213.5;
+    read.selected_read_level = 98.25;
+    let read_id = read.read_id;
+    writer.add_read(read, &generate_test_signal(500, 0))?;
+    writer.finish()?;
+
+    let reader = Reader::open(path)?;
+    let reads: Vec<_> = reader.reads()?.collect::<Result<Vec<_>, _>>()?;
+    let got = reads
+        .iter()
+        .find(|r| r.read_id == read_id)
+        .expect("written read should be present");
+
+    assert_eq!(got.expected_open_pore_level, 213.5);
+    assert_eq!(got.selected_read_level, 98.25);
 
     Ok(())
 }

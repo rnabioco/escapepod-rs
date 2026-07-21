@@ -32,4 +32,35 @@ impl<'a> SignalExtractor<'a> {
 
         Ok(result)
     }
+
+    /// Like [`Self::get_signal`] but decompresses only the first `max_samples`
+    /// samples, decoding just the needed prefix of the chunk that crosses the
+    /// boundary (the rest of the ZSTD stream is skipped). Identical to
+    /// `get_signal(..)[..max_samples]`. Useful when a consumer (e.g. CNN adapter
+    /// detection) only looks at a fixed leading window of a potentially long
+    /// read.
+    pub fn get_signal_prefix(&self, signal_rows: &[u64], max_samples: usize) -> Result<Vec<i16>> {
+        use crate::compression::vbz::{decompress_signal, decompress_signal_prefix};
+
+        let raw_chunks = self
+            .footer
+            .extract_signal_rows(signal_rows, self.signal_bytes)?;
+        let mut result = Vec::with_capacity(max_samples);
+        let mut remaining = max_samples;
+        for chunk in &raw_chunks {
+            if remaining == 0 {
+                break;
+            }
+            let cs = chunk.samples as usize;
+            let take = cs.min(remaining);
+            let decoded = if take == cs {
+                decompress_signal(chunk.signal, cs)?
+            } else {
+                decompress_signal_prefix(chunk.signal, cs, take)?
+            };
+            result.extend_from_slice(&decoded);
+            remaining -= take;
+        }
+        Ok(result)
+    }
 }

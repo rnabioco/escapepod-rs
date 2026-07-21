@@ -20,9 +20,36 @@ Usage:
 import argparse
 import csv
 import gzip
+import json
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+
+def agreement_summary(
+    escapepod: dict[str, dict], warpdemux: dict[str, dict]
+) -> dict:
+    """Overall and confidence-gated agreement, for machine-readable output."""
+    common_ids = set(escapepod.keys()) & set(warpdemux.keys())
+    n = len(common_ids)
+    agree = sum(
+        1 for rid in common_ids if escapepod[rid]["barcode"] == warpdemux[rid]["barcode"]
+    )
+    # Agreement restricted to reads WarpDemuX called confidently (conf >= 0.5).
+    conf_ids = [rid for rid in common_ids if warpdemux[rid]["confidence"] >= 0.5]
+    conf_agree = sum(
+        1
+        for rid in conf_ids
+        if escapepod[rid]["barcode"] == warpdemux[rid]["barcode"]
+    )
+    return {
+        "n_common": n,
+        "agreement_pct": (100.0 * agree / n) if n else 0.0,
+        "n_conf_ge_0.5": len(conf_ids),
+        "agreement_conf_ge_0.5_pct": (
+            100.0 * conf_agree / len(conf_ids) if conf_ids else 0.0
+        ),
+    }
 
 
 def read_csv(path: Path, delimiter=",") -> list[dict]:
@@ -257,6 +284,71 @@ def compute_metrics(
             print(f"  [{lo:.2f}, {hi:.2f})  {agree_bin:8d}  {len(ids_in_bin):8d}  {100*agree_bin/len(ids_in_bin):7.2f}%")
 
 
+def dump_per_read(
+    escapepod: dict[str, dict],
+    warpdemux: dict[str, dict],
+    bounds_ep: dict[str, tuple[int, int]] | None,
+    bounds_wdx: dict[str, tuple[int, int]] | None,
+    path: Path,
+) -> None:
+    """Write a per-read comparison CSV for root-causing disagreements.
+
+    One row per common read with an ``agree`` flag, both predicted barcodes,
+    both confidences, and (when boundaries are supplied for both tools) the
+    adapter_start/adapter_end deltas (escapepod - WarpDemuX). Filter to
+    ``agree == False`` to bucket mismatches by stage; keep all rows to inspect
+    how disagreements distribute across the confidence range.
+    """
+    common_ids = set(escapepod.keys()) & set(warpdemux.keys())
+    have_bounds = bool(bounds_ep) and bool(bounds_wdx)
+
+    def bc_label(bc: int) -> str:
+        return f"BC{bc:02d}" if bc >= 0 else "unclassified"
+
+    n_mismatch = 0
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = [
+            "read_id",
+            "agree",
+            "wdx_barcode",
+            "escpod_barcode",
+            "wdx_conf",
+            "escpod_conf",
+        ]
+        if have_bounds:
+            header += ["adapter_start_delta", "adapter_end_delta"]
+        writer.writerow(header)
+
+        for rid in sorted(common_ids):
+            wdx_bc = warpdemux[rid]["barcode"]
+            ep_bc = escapepod[rid]["barcode"]
+            agree = wdx_bc == ep_bc
+            if not agree:
+                n_mismatch += 1
+            row = [
+                rid,
+                int(agree),
+                bc_label(wdx_bc),
+                bc_label(ep_bc),
+                f"{warpdemux[rid]['confidence']:.6f}",
+                f"{escapepod[rid]['confidence']:.6f}",
+            ]
+            if have_bounds:
+                if rid in bounds_ep and rid in bounds_wdx:
+                    ep_s, ep_e = bounds_ep[rid]
+                    wx_s, wx_e = bounds_wdx[rid]
+                    row += [ep_s - wx_s, ep_e - wx_e]
+                else:
+                    row += ["", ""]
+            writer.writerow(row)
+
+    print(
+        f"  Wrote per-read comparison ({len(common_ids):,} reads, "
+        f"{n_mismatch:,} mismatches) -> {path}"
+    )
+
+
 def compare_boundaries(
     bounds_ep: dict[str, tuple[int, int]],
     bounds_wdx: dict[str, tuple[int, int]],
@@ -328,8 +420,44 @@ def main():
         type=Path,
         help="WarpDemuX detected boundaries CSV/dir (for boundary comparison)",
     )
+    parser.add_argument(
+        "--dump-mismatches",
+        type=Path,
+        help="Write a per-read comparison CSV (one row per common read with an "
+        "`agree` flag, both barcodes/confidences, and boundary deltas when "
+        "available). With both layers, '.a'/'.b' is inserted before the suffix.",
+    )
+    parser.add_argument(
+        "--summary-json",
+        type=Path,
+        help="Write a machine-readable agreement summary (overall + conf>=0.5) "
+        "for the layer compared (prefers --escapepod-b, else --escapepod-a).",
+    )
 
     args = parser.parse_args()
+
+    # Load boundaries up front so they can feed both the boundary stats and the
+    # per-read dump.
+    bounds_ep = bounds_wdx = None
+    if args.boundaries_escapepod and args.boundaries_warpdemux:
+        print("Loading boundaries...")
+        bounds_ep = parse_boundaries(args.boundaries_escapepod)
+        # WarpDemuX boundaries may be sharded
+        if args.boundaries_warpdemux.is_dir():
+            bounds_wdx = {}
+            for shard in sorted(args.boundaries_warpdemux.glob("detected_boundaries_*.csv.gz")):
+                bounds_wdx.update(parse_boundaries(shard))
+        else:
+            bounds_wdx = parse_boundaries(args.boundaries_warpdemux)
+
+    def dump_path_for(layer: str) -> Path | None:
+        """Suffix the dump path per-layer when more than one layer is dumped."""
+        if not args.dump_mismatches:
+            return None
+        if not (args.escapepod_a and args.escapepod_b):
+            return args.dump_mismatches
+        p = args.dump_mismatches
+        return p.with_suffix(f".{layer}{p.suffix}")
 
     # Load WarpDemuX predictions
     print(f"Loading WarpDemuX predictions from {args.warpdemux}...")
@@ -342,6 +470,8 @@ def main():
         ep_a = parse_escapepod_predictions(args.escapepod_a)
         print(f"  Loaded {len(ep_a):,} predictions")
         compute_metrics(ep_a, wdx_preds, label="Layer A (WDX boundaries)")
+        if (dp := dump_path_for("a")) is not None:
+            dump_per_read(ep_a, wdx_preds, bounds_ep, bounds_wdx, dp)
 
     # Layer B: full pipeline
     if args.escapepod_b:
@@ -349,19 +479,25 @@ def main():
         ep_b = parse_escapepod_predictions(args.escapepod_b)
         print(f"  Loaded {len(ep_b):,} predictions")
         compute_metrics(ep_b, wdx_preds, label="Layer B (LLR boundaries)")
+        if (dp := dump_path_for("b")) is not None:
+            dump_per_read(ep_b, wdx_preds, bounds_ep, bounds_wdx, dp)
 
     # Boundary comparison
-    if args.boundaries_escapepod and args.boundaries_warpdemux:
-        print(f"\nLoading boundaries...")
-        bounds_ep = parse_boundaries(args.boundaries_escapepod)
-        # WarpDemuX boundaries may be sharded
-        if args.boundaries_warpdemux.is_dir():
-            bounds_wdx = {}
-            for shard in sorted(args.boundaries_warpdemux.glob("detected_boundaries_*.csv.gz")):
-                bounds_wdx.update(parse_boundaries(shard))
-        else:
-            bounds_wdx = parse_boundaries(args.boundaries_warpdemux)
+    if bounds_ep is not None and bounds_wdx is not None:
         compare_boundaries(bounds_ep, bounds_wdx)
+
+    # Machine-readable summary for the matrix harness.
+    if args.summary_json:
+        layer = None
+        if args.escapepod_b:
+            layer = parse_escapepod_predictions(args.escapepod_b)
+        elif args.escapepod_a:
+            layer = parse_escapepod_predictions(args.escapepod_a)
+        if layer is not None:
+            summary = agreement_summary(layer, wdx_preds)
+            with open(args.summary_json, "w") as f:
+                json.dump(summary, f, indent=2)
+            print(f"\n  Wrote agreement summary -> {args.summary_json}")
 
 
 if __name__ == "__main__":

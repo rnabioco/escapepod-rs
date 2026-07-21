@@ -2,10 +2,10 @@
 Output docs/images/bam-filter.gif
 
 Set Shell "bash"
-Set FontFamily "FiraCode Nerd Font Mono"
+Set FontFamily "Fira Code"
 Set FontSize 16
 Set Width 900
-Set Height 500
+Set Height 600
 Set LetterSpacing 0
 Set LineHeight 1.2
 Set Padding 20
@@ -14,10 +14,24 @@ Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
 
-Type "escpod bam-filter data/drna/yeast_trna_reads.pod5 -b data/drna/yeast_trna_mappings.bam --mapped -q 10 -o /tmp/filtered.pod5"
+# Reset any output from a previous render so escpod doesn't refuse to overwrite
+Hide
+Type "rm -f /tmp/bam-filtered.pod5"
 Enter
-Sleep 5s
+Ctrl+L
+Show
 
-Type "escpod inspect summary /tmp/filtered.pod5"
+Type 'escpod bam-filter data/drna/yeast_trna_reads.pod5 \'
 Enter
-Sleep 3s
+Type '  -b data/drna/yeast_trna_mappings.bam \'
+Enter
+Type '  --mapped --quality 10 \'
+Enter
+Type '  -o /tmp/bam-filtered.pod5'
+Enter
+Sleep 4s
+Ctrl+L
+
+Type "escpod inspect summary /tmp/bam-filtered.pod5"
+Enter
+Sleep 4s

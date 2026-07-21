@@ -3,47 +3,7 @@
 //! Provides MAD (Median Absolute Deviation) normalization, dwell time normalization,
 //! and downscaling operations.
 
-/// Median of an unsorted slice via `select_nth_unstable` (O(n) expected).
-///
-/// The slice is partially reordered in place. Uses `f32::total_cmp`.
-///
-/// # Panics
-/// Panics if the slice is empty.
-fn median_via_select(data: &mut [f32]) -> f32 {
-    let n = data.len();
-    let mid = n / 2;
-    let (_, pivot, _) = data.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    let hi = *pivot;
-    if n.is_multiple_of(2) {
-        let lo = data[..mid]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        (lo + hi) / 2.0
-    } else {
-        hi
-    }
-}
-
-/// Compute median and MAD in O(n) expected (two `select_nth_unstable` calls).
-///
-/// Returns (median, MAD) tuple.
-///
-/// # Panics
-/// Panics if the slice is empty.
-fn median_and_mad(data: &[f32]) -> (f32, f32) {
-    // select_nth partitions in place; clone once and reuse buf for MAD.
-    let mut buf = data.to_vec();
-    let med = median_via_select(&mut buf);
-
-    // Reuse buf: overwrite with absolute deviations keyed off the original data.
-    for (v, slot) in data.iter().zip(buf.iter_mut()) {
-        *slot = (*v - med).abs();
-    }
-    let mad_val = median_via_select(&mut buf);
-
-    (med, mad_val)
-}
+use crate::stats::median_and_mad;
 
 /// Normalize signal using MAD (Median Absolute Deviation).
 ///

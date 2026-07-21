@@ -238,6 +238,55 @@ pub fn decode_scalar(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     Ok(samples)
 }
 
+/// Total value-section bytes consumed by the first `n` samples, read from the
+/// key (control) bits — 1 byte per 0-bit, 2 per 1-bit. Lets a caller decode a
+/// prefix without the rest of the value section present.
+pub fn value_bytes(keys: &[u8], n: usize) -> usize {
+    let mut total = 0;
+    for i in 0..n {
+        let two = (keys[i / 8] >> (i % 8)) & 1 == 1;
+        total += if two { 2 } else { 1 };
+    }
+    total
+}
+
+/// Decode the first `n` samples from an already-split `keys` / `values` pair,
+/// where `keys` is the full key section (sized for the chunk's total samples)
+/// and `values` holds at least the first `n` samples' bytes. Bit-identical to
+/// the first `n` entries of a full [`decode`] (zigzag + delta is sequential and
+/// starts from 0). The `keys` slice must cover the whole chunk so bit `i` lines
+/// up with sample `i`.
+pub fn decode_prefix(keys: &[u8], values: &[u8], n: usize) -> Result<Vec<i16>> {
+    let mut samples = Vec::with_capacity(n);
+    let mut data_offset = 0usize;
+    let mut prev: u16 = 0;
+    for i in 0..n {
+        let two = (keys[i / 8] >> (i % 8)) & 1 == 1;
+        let value = if two {
+            if data_offset + 2 > values.len() {
+                return Err(Error::Decompression(
+                    "SVB16 prefix truncated: expected 2-byte value".to_string(),
+                ));
+            }
+            let v = u16::from_le_bytes([values[data_offset], values[data_offset + 1]]);
+            data_offset += 2;
+            v
+        } else {
+            if data_offset >= values.len() {
+                return Err(Error::Decompression(
+                    "SVB16 prefix truncated: expected 1-byte value".to_string(),
+                ));
+            }
+            let v = values[data_offset] as u16;
+            data_offset += 1;
+            v
+        };
+        prev = prev.wrapping_add(zigzag_decode(value));
+        samples.push(prev as i16);
+    }
+    Ok(samples)
+}
+
 /// Validate SVB16 encoded data without fully decoding.
 ///
 /// Returns true if the data appears to be valid for the given sample count.
@@ -318,6 +367,36 @@ mod tests {
         let encoded = encode(&samples).unwrap();
         let decoded = decode(&encoded, samples.len()).unwrap();
         assert_eq!(decoded, samples);
+    }
+
+    /// Full int16-range random round-trip, ported from upstream
+    /// `svb16_scalar_tests.cpp` (which fuzzes the whole `[min, max]` range rather
+    /// than the hand-picked boundary values above). Exercises both the
+    /// dispatched `encode`/`decode` (SIMD when the CPU supports it) and the
+    /// `_scalar` reference, and asserts the dispatched encode is byte-identical
+    /// to the scalar reference — the same guarantee `svb16_x64_tests.cpp` checks.
+    #[test]
+    fn test_full_range_random_roundtrip() {
+        let mut s: u64 = 0x1234_5678_9abc_def1;
+        // 4096 is not a multiple of 8, so the scalar key/tail path is exercised.
+        let samples: Vec<i16> = (0..4093)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 48) as i16
+            })
+            .collect();
+
+        let enc = encode(&samples).unwrap();
+        assert_eq!(decode(&enc, samples.len()).unwrap(), samples);
+
+        let enc_scalar = encode_scalar(&samples).unwrap();
+        assert_eq!(decode_scalar(&enc_scalar, samples.len()).unwrap(), samples);
+        assert_eq!(
+            enc, enc_scalar,
+            "dispatched encode must match scalar encode"
+        );
     }
 
     #[test]

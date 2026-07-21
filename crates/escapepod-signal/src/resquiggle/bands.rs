@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Inspired by fishnet, licensed under the GNU General Public License v3.0.
+// SPDX-License-Identifier: MIT
+// Algorithm inspired by fishnet (Brickner et al.); independent implementation.
 
 //! Signal band and sequence band computation for banded dynamic programming.
 

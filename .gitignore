@@ -37,8 +37,18 @@ __pycache__/
 # scripts/export_adapter_cnn_to_onnx.py, never commit.
 /benchmarks/*.onnx
 /benchmarks/*.pth
+# Flat weight blob derived from the CC BY-NC ONNX (dump_adapter_cnn_weights.py).
+/benchmarks/*.weights
 /.bench_data/
 /.bench_output/
+# Demux benchmark/parity scratch (size-tier pod5s, matrix.tsv, mismatch dumps).
+/.demux_matrix_out/
+/.parity_out*/
+# GPU TCN + warpdemux parity benchmark scratch (pod5 subsets, CSV calls, ad-hoc
+# scripts, out dirs) and the GPU-feature cargo target dir.
+/bench_tcn_gpu/
+/bench_wdx/
+/target-gpu/
 
 # Built documentation
 site/

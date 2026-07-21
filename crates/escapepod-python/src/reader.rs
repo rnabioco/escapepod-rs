@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use escapepod_signal::RecordBatch;
+use escapepod_signal::ReadsBatchView;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
@@ -11,7 +11,7 @@ use crate::read_data::{PyReadData, PyRunInfo};
 /// Convert raw ADC samples to picoamperes: `(adc + offset) * scale`.
 ///
 /// Uses `mul_add` so LLVM can emit FMA on AVX2+ and keep the loop tight.
-fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
+pub(crate) fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
     let bias = offset * scale;
     raw.iter()
         .map(|&adc| f32::from(adc).mul_add(scale, bias))
@@ -119,38 +119,59 @@ impl PyReader {
     /// ----------
     /// selection : list[str], optional
     ///     Read IDs to retrieve. If None, returns all reads.
+    /// missing_ok : bool, optional
+    ///     If False (default), raise KeyError when any requested ID is absent.
+    ///     If True, silently skip missing IDs. Ignored when selection is None.
     ///
     /// Returns
     /// -------
     /// list[ReadData]
-    #[pyo3(signature = (selection=None))]
-    fn reads(&self, selection: Option<Vec<String>>) -> PyResult<Vec<PyReadData>> {
-        match selection {
-            Some(read_ids) => {
-                let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
-                    .iter()
-                    .map(|s| {
-                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
-                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
-                        })
-                    })
-                    .collect::<PyResult<_>>()?;
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn reads(&self, selection: Option<Vec<String>>, missing_ok: bool) -> PyResult<Vec<PyReadData>> {
+        Ok(self
+            .collect_inner(selection, missing_ok)?
+            .into_iter()
+            .map(|inner| PyReadData { inner })
+            .collect())
+    }
 
-                let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
-                Ok(reads
-                    .into_iter()
-                    .map(|inner| PyReadData { inner })
-                    .collect())
-            }
-            None => {
-                let mut result = Vec::new();
-                for read_result in self.inner.reads().map_err(to_py_err)? {
-                    let inner = read_result.map_err(to_py_err)?;
-                    result.push(PyReadData { inner });
-                }
-                Ok(result)
-            }
-        }
+    /// Read metadata as a column-oriented dict (one list per field).
+    ///
+    /// Construct a DataFrame with `pd.DataFrame(reader.to_dict())` (pandas) or
+    /// `pl.DataFrame(reader.to_dict())` (polars) without a hard dependency on
+    /// either. Signal is not included; fetch it via `get_signal`.
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        self.build_columns(py, selection, missing_ok)
+    }
+
+    /// Read metadata as a `pandas.DataFrame` (pandas imported lazily).
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn to_pandas<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cols = self.build_columns(py, selection, missing_ok)?;
+        crate::read_data::dict_to_pandas(py, cols)
+    }
+
+    /// Read metadata as a `polars.DataFrame` (polars imported lazily).
+    #[pyo3(signature = (selection=None, missing_ok=false))]
+    fn to_polars<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cols = self.build_columns(py, selection, missing_ok)?;
+        crate::read_data::dict_to_polars(py, cols)
     }
 
     /// Look up a single read by UUID string.
@@ -175,17 +196,13 @@ impl PyReader {
     ///
     /// Uses indexed batch-skipping when a .p5i sidecar exists,
     /// otherwise falls back to a single-pass scan with early exit.
-    fn get_reads(&self, read_ids: Vec<String>) -> PyResult<Vec<PyReadData>> {
-        let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
-            .iter()
-            .map(|s| {
-                escapepod_signal::utils::parse_uuid_flexible(s)
-                    .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))
-            })
-            .collect::<PyResult<_>>()?;
-
-        let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
-        Ok(reads
+    ///
+    /// If `missing_ok` is False (default), raises KeyError when any requested
+    /// ID is absent; set it True to silently skip missing IDs.
+    #[pyo3(signature = (read_ids, missing_ok=false))]
+    fn get_reads(&self, read_ids: Vec<String>, missing_ok: bool) -> PyResult<Vec<PyReadData>> {
+        Ok(self
+            .collect_inner(Some(read_ids), missing_ok)?
             .into_iter()
             .map(|inner| PyReadData { inner })
             .collect())
@@ -277,6 +294,21 @@ impl PyReader {
             .collect()
     }
 
+    /// Number of stored (VBZ-compressed) signal bytes for a read.
+    ///
+    /// Matches `pod5.ReadRecord.byte_count`. Sums the compressed chunk sizes
+    /// without decompressing.
+    fn byte_count(&self, py: Python<'_>, read: &PyReadData) -> PyResult<usize> {
+        let signal_rows = read.inner.signal_rows.clone();
+        py.detach(|| {
+            let chunks = self
+                .inner
+                .get_compressed_signal_for_rows(&signal_rows)
+                .map_err(to_py_err)?;
+            Ok(chunks.iter().map(|c| c.data.len()).sum())
+        })
+    }
+
     // -- Index management --------------------------------------------------
 
     /// Check if a .p5i sidecar index exists for this file.
@@ -341,25 +373,87 @@ impl PyReader {
             reader: slf.into(),
             num_batches,
             batch_idx: 0,
-            current_batch: None,
-            batch_row: 0,
-            batch_num_rows: 0,
+            current: Vec::new().into_iter(),
         })
+    }
+}
+
+impl PyReader {
+    /// Build a metadata column dict, shared by `to_dict`/`to_pandas`/`to_polars`.
+    ///
+    /// With no selection this takes the fast columnar path (`read_columns`),
+    /// filling numeric columns by bulk slice copy straight from the Arrow buffers
+    /// and skipping per-read `ReadData` materialization. A selection falls back to
+    /// the random-access `collect_inner` path, where the read count is small and
+    /// per-read `ReadData` cost is not the bottleneck.
+    fn build_columns<'py>(
+        &self,
+        py: Python<'py>,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        match selection {
+            None => {
+                let cols = self.inner.read_columns().map_err(to_py_err)?;
+                crate::read_data::columns_to_dict(py, cols)
+            }
+            Some(sel) => {
+                let reads = self.collect_inner(Some(sel), missing_ok)?;
+                let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+                crate::read_data::reads_to_columns(py, &refs)
+            }
+        }
+    }
+
+    /// Collect read metadata, optionally filtered by a selection of IDs.
+    ///
+    /// Shared backing for `reads`, `get_reads`, `to_dict`, and `to_pandas`.
+    fn collect_inner(
+        &self,
+        selection: Option<Vec<String>>,
+        missing_ok: bool,
+    ) -> PyResult<Vec<escapepod_signal::ReadData>> {
+        match selection {
+            Some(read_ids) => {
+                let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
+                    .iter()
+                    .map(|s| {
+                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
+                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
+                        })
+                    })
+                    .collect::<PyResult<_>>()?;
+
+                let reads = self.inner.reads_by_ids(&target_ids).map_err(to_py_err)?;
+                if !missing_ok && reads.len() != target_ids.len() {
+                    let missing = target_ids.len() - reads.len();
+                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "{missing} of {} requested read id(s) not found \
+                         (pass missing_ok=True to ignore)",
+                        target_ids.len()
+                    )));
+                }
+                Ok(reads)
+            }
+            // Resolve columns once per batch via `ReadsBatchView` rather than
+            // once per row (`reads()`'s per-row `column_by_name` lookups).
+            None => self.inner.collect_all_reads().map_err(to_py_err),
+        }
     }
 }
 
 /// Iterator over reads in a POD5 file (Python protocol).
 ///
-/// Iterates batch-by-batch to avoid lifetime issues between
-/// the Rust reader and the Python GC.
+/// Streams one batch at a time: each batch's rows are decoded once (columns
+/// resolved once per batch via `ReadsBatchView`, not per row) and yielded
+/// lazily, so a whole-file iteration never materializes more than one batch of
+/// `ReadData` at once.
 #[pyclass]
 struct PyReadIterator {
     reader: Py<PyReader>,
     num_batches: usize,
     batch_idx: usize,
-    current_batch: Option<RecordBatch>,
-    batch_row: usize,
-    batch_num_rows: usize,
+    current: std::vec::IntoIter<escapepod_signal::ReadData>,
 }
 
 #[pymethods]
@@ -370,17 +464,11 @@ impl PyReadIterator {
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyReadData>> {
         loop {
-            // If we have rows left in the current batch, yield one
-            if self.batch_row < self.batch_num_rows {
-                let batch = self.current_batch.as_ref().unwrap();
-                let row = self.batch_row;
-                self.batch_row += 1;
-                let inner =
-                    escapepod_signal::Reader::read_from_batch(batch, row).map_err(to_py_err)?;
+            if let Some(inner) = self.current.next() {
                 return Ok(Some(PyReadData { inner }));
             }
 
-            // Load next batch
+            // Current batch drained — decode the next one.
             if self.batch_idx >= self.num_batches {
                 return Ok(None);
             }
@@ -391,10 +479,14 @@ impl PyReadIterator {
                 .inner
                 .read_batch(self.batch_idx)
                 .map_err(to_py_err)?;
-            self.batch_num_rows = batch.num_rows();
-            self.current_batch = Some(batch);
-            self.batch_row = 0;
             self.batch_idx += 1;
+
+            let view = ReadsBatchView::new(&batch, false).map_err(to_py_err)?;
+            let mut rows = Vec::with_capacity(view.num_rows());
+            for row in 0..view.num_rows() {
+                rows.push(view.read(row).map_err(to_py_err)?);
+            }
+            self.current = rows.into_iter();
         }
     }
 }

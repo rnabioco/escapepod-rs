@@ -86,6 +86,8 @@ fn main() -> escapepod_signal::Result<()> {
             time_since_mux_change: 0.0,
             num_samples: size as u64,
             open_pore_level: 220.0,
+            expected_open_pore_level: 0.0,
+            selected_read_level: 0.0,
             signal_rows: Vec::new(),
         };
 

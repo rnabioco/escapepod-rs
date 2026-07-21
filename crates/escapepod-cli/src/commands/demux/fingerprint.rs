@@ -18,6 +18,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::info;
 
 /// Arguments for the fingerprint subcommand.
 #[derive(Debug, clap::Args)]
@@ -132,24 +133,24 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
             )
         };
 
-    println!("{} barcode fingerprints", style::action("Extracting"));
-    println!(
+    info!("{} barcode fingerprints", style::action("Extracting"));
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Boundaries:"),
         style::path(args.boundaries.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
     );
     if args.warpdemux_compat {
-        println!(
+        info!(
             "{} WarpDemuX-compatible (110 events, window=12, keep_last=25, zscore norm)",
             style::label("Mode:"),
         );
@@ -161,7 +162,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     // Read boundaries CSV (auto-detects escapepod vs WarpDemuX format)
     let boundaries_map = parse_boundaries_csv(&args.boundaries)?;
 
-    println!(
+    info!(
         "{} {} boundary records with valid adapters",
         style::label("Loaded:"),
         style::count(boundaries_map.len())
@@ -170,7 +171,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     // Upper bound for the progress bar: every boundary record is a candidate
     // read. Some may not appear in the POD5 corpus, in which case the bar
     // stops short of 100% — acceptable for a progress indicator.
-    println!(
+    info!(
         "{} up to {} reads to fingerprint",
         style::label("Processing:"),
         style::count(boundaries_map.len())
@@ -226,7 +227,6 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
             reads
                 .par_iter()
                 .filter_map(|r| {
-                    let signal = extractor.get_signal(&r.signal_rows).ok()?;
                     let boundaries = boundaries_map.get(&r.read_id)?;
                     let (region_start, region_end) = if use_full_adapter {
                         (boundaries.adapter_start, boundaries.adapter_end)
@@ -239,6 +239,18 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                     if region_end <= region_start {
                         return None;
                     }
+                    // Only the adapter window is ever read by
+                    // `extract_fingerprint_from_signal` (up to `region_end` plus
+                    // the keep_last BOUNDARY_PADDING_SAMPLES), so decode just that
+                    // prefix instead of the whole (potentially transcript-length)
+                    // read. `get_signal_prefix` returns `min(bound, total)`
+                    // samples, so this is bit-identical to
+                    // `get_signal(..)[..bound]` and the downstream
+                    // `.min(signal.len())` clamp stays a no-op.
+                    let decode_to = region_end.saturating_add(100);
+                    let signal = extractor
+                        .get_signal_prefix(&r.signal_rows, decode_to)
+                        .ok()?;
                     let fp = extract_fingerprint_from_signal(
                         &signal,
                         region_start,
@@ -281,7 +293,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     // read, and avoids the text parse roundtrip through polars.
     write_fingerprints(&args.output, &fingerprints)?;
 
-    eprintln!(
+    info!(
         "{} {} fingerprints written to {}",
         style::action("Extracted"),
         style::count(fingerprints.len()),

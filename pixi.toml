@@ -27,26 +27,49 @@ python = ">=3.10"
 numpy = "*"
 
 [feature.python-test.pypi-dependencies]
-maturin = ">=1.8,<2"
+maturin = ">=1.9,<2"
 pytest = "*"
 pod5 = ">=0.3.36,<0.4"
+ruff = ">=0.15.21, <0.16"
+ty = ">=0.0.58, <0.0.59"
 
 [feature.python-test.tasks]
 build-python = "maturin develop --manifest-path crates/escapepod-python/Cargo.toml"
 test-python = { cmd = "pytest tests/python/ -v", depends-on = ["build-python"] }
 test-compat = "python tests/compat/test_pod5_compat.py"
+lint-python = "ruff check tests/python && ruff format --check tests/python"
+# ty resolves `import escapepod` from the built extension, so build first.
+typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escapepod.pyi", depends-on = [
+  "build-python",
+] }
 
-# GPU (CUDA) feature for escpod's `--features gpu` path. Provides the runtime
-# NVRTC library that cudarc dlopens on first use. Activate with
-# `pixi shell -e gpu` or `pixi run -e gpu cargo test --features gpu ...`.
+# GPU (CUDA) feature. Covers two runtime paths, both `load-dynamic`/dlopen
+# (nothing needed at build time):
+#   * `--features gpu`      — cudarc dlopens libnvrtc for the GPU DTW kernels.
+#   * `--features cnn-gpu`  — the `ort` CUDA execution provider for batched CNN
+#     adapter detection. ORT 1.24's CUDA EP dlopens cublas/cublasLt/cudart/cufft
+#     AND cuDNN 9; without them it fails with
+#     `libcublasLt.so.12: cannot open shared object file` and silently falls back
+#     to CPU. We pull the whole CUDA 12 runtime from conda-forge so `pixi -e gpu`
+#     is self-contained (no cross-repo env on LD_LIBRARY_PATH). See the memory
+#     `reference-cnn-gpu-ort-runtime-setup` for the full story.
+# Activate with `pixi shell -e gpu` or `pixi run -e gpu …` on a GPU node.
 [feature.gpu.dependencies]
-cuda-nvrtc = ">=12"
+cuda-nvrtc = ">=12"        # GPU DTW (cudarc)
 cuda-version = "12.*"
+libcublas = "*"            # ort CUDA EP: libcublas.so.12 + libcublasLt.so.12
+cuda-cudart = "*"          # ort CUDA EP: libcudart.so.12
+libcufft = "*"             # ort CUDA EP: libcufft.so.11
+cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9 (ORT 1.24 needs cuDNN 9)
 
-# Make `$CONDA_PREFIX/lib` visible to cudarc's dlopen — the conda-forge
-# cuda-nvrtc package does not ship an activation hook that sets this.
+# Make `$CONDA_PREFIX/lib` visible to the dlopen paths above (cudarc's libnvrtc
+# and ort's CUDA EP deps) — the conda-forge CUDA packages ship no activation
+# hook that sets this. `ORT_DYLIB_PATH` points `ort` (load-dynamic) at a
+# CUDA-enabled libonnxruntime 1.24.x; the manual onnxruntime-gpu download lives
+# under ~/ortgpu (not on PyPI/conda for this exact build). Override it if yours
+# is elsewhere.
 [feature.gpu.activation]
-env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH", ORT_DYLIB_PATH = "$HOME/ortgpu/onnxruntime/capi/libonnxruntime.so.1.24.4" }
 
 # WarpDemuX benchmark feature. Neither `warpdemux` nor `adapted` is on
 # PyPI, so we pip-install them editable from the cloned repos under
@@ -102,7 +125,9 @@ python scripts/patch_adapted_dataclass.py ext/ADAPTed/adapted/config && \
 pip install --no-build-isolation --no-deps -e ext/ADAPTed -e ext/WarpDemuX
 """
 
-# Documentation feature
+# Documentation feature (zensical site build). Terminal-demo gif regeneration is
+# deliberately NOT here: VHS drives a headless Chromium + ffmpeg that is too heavy
+# for the cluster, so it runs macOS-local via Homebrew — see docs/tapes/README.md.
 [feature.docs.dependencies]
 python = ">=3.10"
 
@@ -112,6 +137,10 @@ zensical = "*"
 [feature.docs.tasks]
 docs-build = "zensical build"
 docs-serve = "zensical serve"
+# Mirrors the CI docs gate. --clean forces a cold cache: zensical's incremental
+# cache makes --strict link validation nondeterministic (cached pages spuriously
+# report "page does not exist"), so run the strict check against a fresh cache.
+docs-check = "zensical build --clean --strict"
 
 # Fast local dev builds via mold. The task wrappers use `mold -run`, which
 # intercepts the linker exec via LD_PRELOAD and works with the system gcc

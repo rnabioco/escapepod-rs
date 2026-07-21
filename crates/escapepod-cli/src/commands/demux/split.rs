@@ -2,11 +2,13 @@
 
 use super::utils::configure_thread_pool;
 use crate::style;
-use escapepod_signal::operations::{FilterOptions, filter_files, parse_barcode_mapping};
+use escapepod_signal::Durability;
+use escapepod_signal::operations::{FilterOptions, parse_barcode_mapping, subset_files};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use tabled::{builder::Builder, settings::Style};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Arguments for the split subcommand.
@@ -28,13 +30,18 @@ pub struct SplitArgs {
     #[arg(long, default_value = "barcode", value_name = "PREFIX")]
     pub prefix: String,
 
-    /// Include unclassified reads in a separate file
-    #[arg(long, default_value = "true", value_name = "BOOL")]
-    pub unclassified: bool,
+    /// Only write classified reads; drop unclassified instead of writing them
+    /// to a separate file
+    #[arg(long)]
+    pub classified_only: bool,
 
     /// Number of threads for parallel processing (default: all CPUs)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
+
+    /// Overwrite existing per-barcode output files
+    #[arg(long)]
+    pub force: bool,
 
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
@@ -54,21 +61,21 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
     timer.phase("Split");
     let profile = args.profile;
-    println!(
+    info!(
         "{} reads into separate POD5 files by barcode",
         style::action("Splitting"),
     );
-    println!(
+    info!(
         "{} {} POD5 file(s)",
         style::label("Input:"),
         style::count(args.input.len())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Classifications:"),
         style::path(args.classifications.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output dir:"),
         style::path(args.output_dir.display())
@@ -81,45 +88,102 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&args.output_dir)?;
 
     // Parse the classifications CSV
-    println!("{} classifications...", style::action("Loading"));
+    info!("{} classifications...", style::action("Loading"));
     let barcode_mapping = parse_barcode_mapping(&args.classifications)?;
-    println!(
+    info!(
         "{} {} classified reads",
         style::label("Loaded:"),
         style::count(barcode_mapping.len())
     );
 
-    // Group read IDs by barcode
-    let barcode_groups = group_by_barcode(&barcode_mapping);
+    // Build the read_id -> output-filename map the single-pass splitter wants,
+    // plus a filename -> barcode label lookup for the summary. Empty barcodes
+    // fold into "unclassified"; those reads are dropped (never added to the
+    // map) when --unclassified=false.
+    let mut read_to_group: HashMap<Uuid, String> = HashMap::with_capacity(barcode_mapping.len());
+    let mut file_to_barcode: HashMap<String, String> = HashMap::new();
+    let mut unique_barcodes: HashSet<&str> = HashSet::new();
+    let mut skipped_unclassified: u64 = 0;
+    for (read_id, barcode) in &barcode_mapping {
+        let barcode_key = if barcode.is_empty() {
+            "unclassified"
+        } else {
+            barcode.as_str()
+        };
+        unique_barcodes.insert(barcode_key);
 
-    // Get sorted list of barcodes for consistent processing order
-    let mut barcodes: Vec<String> = barcode_groups.keys().cloned().collect();
-    barcodes.sort();
-
-    println!(
-        "{} {} unique barcodes",
-        style::label("Found:"),
-        style::count(barcodes.len())
-    );
-
-    // Process each barcode
-    let mut barcode_stats = Vec::new();
-
-    for barcode in &barcodes {
-        // Skip unclassified if requested
-        if barcode == "unclassified" && !args.unclassified {
-            let count = barcode_groups.get(barcode).map(|s| s.len()).unwrap_or(0);
-            println!(
-                "{} {} unclassified reads (--unclassified=false)",
-                style::warning_label("Skipping"),
-                style::count(count)
-            );
+        if barcode_key == "unclassified" && args.classified_only {
+            skipped_unclassified += 1;
             continue;
         }
 
-        let read_ids = barcode_groups.get(barcode).unwrap();
-        let output = process_barcode(&args, barcode, read_ids)?;
-        barcode_stats.push(output);
+        let filename = format!("{}_{}.pod5", args.prefix, barcode_key);
+        file_to_barcode
+            .entry(filename.clone())
+            .or_insert_with(|| barcode_key.to_string());
+        read_to_group.insert(*read_id, filename);
+    }
+
+    info!(
+        "{} {} unique barcodes",
+        style::label("Found:"),
+        style::count(unique_barcodes.len())
+    );
+    if skipped_unclassified > 0 {
+        warn!(
+            "{} {} unclassified reads (--classified-only)",
+            style::warning_label("Skipping"),
+            style::count(skipped_unclassified)
+        );
+    }
+
+    // Refuse to clobber a previous run's output unless asked. Checked up front
+    // so a long split doesn't run only to overwrite files at the very end.
+    if !args.force {
+        for filename in file_to_barcode.keys() {
+            let path = args.output_dir.join(filename);
+            if path.exists() {
+                anyhow::bail!(
+                    "Output file {} already exists. Use --force to overwrite.",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // Single pass over the inputs: scan each once, route every read to its
+    // barcode's writer, rather than re-scanning every input once per barcode.
+    let options = FilterOptions {
+        signal_batch_size: 1_000,
+        read_batch_size: 10_000,
+        durability: Durability::default(),
+    };
+    // `SubsetOutcome` already sorts both lists by group name, so the report
+    // order is deterministic even though groups are written in parallel.
+    let results = subset_files(&args.input, &read_to_group, &args.output_dir, options)?;
+
+    // Each failed barcode produced no file at all; name them rather than
+    // reporting a partial split as if it were complete.
+    if !results.failures.is_empty() {
+        for (group, err) in &results.failures {
+            error!("{}: {}", style::path(group), err);
+        }
+        anyhow::bail!("{} barcode file(s) failed to write", results.failures.len());
+    }
+
+    let mut barcode_stats = Vec::with_capacity(results.groups.len());
+    for (filename, read_count) in &results.groups {
+        let output_path = args.output_dir.join(filename);
+        let file_size = fs::metadata(&output_path)?.len();
+        let barcode = file_to_barcode
+            .get(filename)
+            .cloned()
+            .unwrap_or_else(|| filename.clone());
+        barcode_stats.push(BarcodeOutput {
+            barcode,
+            read_count: *read_count,
+            file_size,
+        });
     }
 
     // Print summary table
@@ -130,94 +194,40 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Group read IDs by their barcode assignment.
-fn group_by_barcode(mapping: &HashMap<Uuid, String>) -> HashMap<String, HashSet<Uuid>> {
-    let mut groups: HashMap<String, HashSet<Uuid>> = HashMap::new();
-
-    for (read_id, barcode) in mapping {
-        let barcode_key = if barcode.is_empty() {
-            "unclassified".to_string()
-        } else {
-            barcode.clone()
-        };
-        groups.entry(barcode_key).or_default().insert(*read_id);
-    }
-
-    groups
-}
-
-/// Process a single barcode, writing matching reads to a new POD5 file.
-fn process_barcode(
-    args: &SplitArgs,
-    barcode: &str,
-    read_ids: &HashSet<Uuid>,
-) -> anyhow::Result<BarcodeOutput> {
-    let output_filename = format!("{}_{}.pod5", args.prefix, barcode);
-    let output_path = args.output_dir.join(&output_filename);
-
-    println!(
-        "{} {} ({} reads)...",
-        style::action("Processing"),
-        style::value(barcode),
-        style::count(read_ids.len())
-    );
-
-    // Use the filter operation to extract reads for this barcode
-    let options = FilterOptions {
-        signal_batch_size: 1_000,
-        read_batch_size: 10_000,
-    };
-
-    let result = filter_files(&args.input, &output_path, read_ids, options, None)?;
-
-    // Get file size
-    let file_size = fs::metadata(&output_path)?.len();
-
-    println!(
-        "  {} {} reads to {}",
-        style::action("Wrote"),
-        style::count(result.matched_reads),
-        style::path(&output_filename)
-    );
-
-    Ok(BarcodeOutput {
-        barcode: barcode.to_string(),
-        read_count: result.matched_reads,
-        file_size,
-    })
-}
-
 /// Print a summary table of all processed barcodes.
 fn print_summary(stats: &[BarcodeOutput]) {
-    println!("\n{}", style::action("Summary:"));
-    println!("{}", style::label("─".repeat(60)));
+    // Styled multi-line report; gate on verbosity instead of per-line tracing events.
+    if tracing::enabled!(tracing::Level::INFO) {
+        println!("\n{}", style::action("Summary:"));
+        println!("{}", style::label("─".repeat(60)));
 
-    let mut builder = Builder::default();
-    builder.push_record(vec!["Barcode", "Reads", "File Size"]);
+        let mut builder = Builder::default();
+        builder.push_record(vec!["Barcode", "Reads", "File Size"]);
 
-    for output in stats {
-        let size_mb = (output.file_size as f64) / (1024.0 * 1024.0);
-        builder.push_record(vec![
-            output.barcode.clone(),
-            format!("{}", output.read_count),
-            format!("{:.2} MB", size_mb),
-        ]);
+        for output in stats {
+            let size_mb = (output.file_size as f64) / (1024.0 * 1024.0);
+            builder.push_record(vec![
+                output.barcode.clone(),
+                format!("{}", output.read_count),
+                format!("{:.2} MB", size_mb),
+            ]);
+        }
+
+        let mut table = builder.build();
+        table.with(Style::rounded());
+        println!("{}", table);
+
+        let total_reads: u64 = stats.iter().map(|s| s.read_count).sum();
+        let total_size: u64 = stats.iter().map(|s| s.file_size).sum();
+        let total_size_mb = (total_size as f64) / (1024.0 * 1024.0);
+
+        println!("\n{}", style::label("─".repeat(60)));
+        println!(
+            "{} {} reads across {} files ({:.2} MB total)",
+            style::action("Split"),
+            style::count(total_reads),
+            style::count(stats.len()),
+            total_size_mb
+        );
     }
-
-    let mut table = builder.build();
-    table.with(Style::rounded());
-    println!("{}", table);
-
-    let total_reads: u64 = stats.iter().map(|s| s.read_count).sum();
-    let total_size: u64 = stats.iter().map(|s| s.file_size).sum();
-    let total_size_mb = (total_size as f64) / (1024.0 * 1024.0);
-
-    println!("\n{}", style::label("─".repeat(60)));
-    println!(
-        "{} {} reads across {} files ({:.2} MB total)",
-        style::action("Split"),
-        style::count(total_reads),
-        style::count(stats.len()),
-        total_size_mb
-    );
 }

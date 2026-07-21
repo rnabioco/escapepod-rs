@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::PathBuf;
+use tracing::info;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -110,7 +111,7 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
     timer.phase("Train");
     let profile = args.profile;
-    println!(
+    info!(
         "{} reference barcode fingerprints",
         style::action("Training")
     );
@@ -137,7 +138,7 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
 
     let unique_barcodes: HashSet<_> = assignments.values().map(|(bc, _)| bc.as_str()).collect();
 
-    println!(
+    info!(
         "{} {} read assignments across {} barcodes",
         style::label("Loaded:"),
         style::count(assignments.len()),
@@ -147,7 +148,7 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
     // Group reads by POD5 file for efficient reading
     let reads_by_file = group_reads_by_file(&assignments);
 
-    println!(
+    info!(
         "{} {} POD5 files to process",
         style::label("Files:"),
         style::count(reads_by_file.len())
@@ -159,7 +160,7 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
     // Group fingerprints by barcode
     let barcode_fingerprints = group_fingerprints_by_barcode(&all_fingerprints, &assignments);
 
-    println!(
+    info!(
         "{} {} total fingerprints extracted",
         style::label("Extracted:"),
         style::count(all_fingerprints.len())
@@ -172,12 +173,12 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
     let training_output = build_training_output(&args, &barcode_fingerprints);
     serde_json::to_writer_pretty(writer, &training_output)?;
 
-    println!(
+    info!(
         "{} reference fingerprints written to {}",
         style::action("Trained"),
         style::path(args.output.display())
     );
-    println!(
+    info!(
         "{} {} barcodes",
         style::label("Total:"),
         style::count(training_output.barcodes.len())
@@ -441,7 +442,7 @@ fn build_training_output(
             },
         );
 
-        println!(
+        info!(
             "{} {} fingerprints from {} reads",
             style::label(format!("{}:", barcode)),
             style::action("Computed consensus"),

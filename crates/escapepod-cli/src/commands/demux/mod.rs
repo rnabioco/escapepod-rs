@@ -16,6 +16,7 @@ mod classify;
 mod detect;
 mod fingerprint;
 mod fp_io;
+mod run;
 mod split;
 mod train;
 mod types;
@@ -27,6 +28,7 @@ mod train_svm;
 pub use classify::ClassifyArgs;
 pub use detect::DetectArgs;
 pub use fingerprint::FingerprintArgs;
+pub use run::RunArgs;
 pub use split::SplitArgs;
 pub use train::TrainArgs;
 
@@ -34,16 +36,27 @@ pub use train::TrainArgs;
 pub use train_svm::TrainSvmArgs;
 
 /// Main demux command arguments.
+///
+/// With no subcommand, `demux` runs the fused streaming pipeline (detect +
+/// fingerprint + classify in one pass → demultiplexed POD5). The granular
+/// `detect`/`fingerprint`/`classify`/`split`/`train*` subcommands remain for
+/// advanced/debugging use.
 #[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct DemuxArgs {
+    /// Advanced per-stage subcommands. Omit to run the fused pipeline.
     #[command(subcommand)]
-    pub command: DemuxCommand,
+    pub command: Option<DemuxCommand>,
+
+    /// Fused-pipeline arguments (used when no subcommand is given).
+    #[command(flatten)]
+    pub run: RunArgs,
 }
 
-/// Demux subcommands.
+/// Demux subcommands (advanced / per-stage).
 #[derive(Debug, clap::Subcommand)]
 pub enum DemuxCommand {
-    /// Detect adapter boundaries in reads using LLR algorithm
+    /// [advanced] Detect adapter boundaries in reads using LLR algorithm
     #[command(after_help = "\
 Examples:
   escpod demux detect input.pod5 -o boundaries.csv
@@ -72,6 +85,10 @@ Examples:
 Examples:
   escpod demux split input.pod5 --classifications classifications.csv --output-dir demuxed/
   escpod demux split *.pod5 --classifications classifications.csv -d out/ --prefix bc
+
+Reads each input once and routes every read to its barcode's writer (rather than
+re-scanning per barcode). This keeps the full input resident while writing, so
+peak memory tracks input size — size --mem accordingly for large runs.
 ")]
     Split(SplitArgs),
 
@@ -98,7 +115,11 @@ Examples:
 
 /// Run the demux command.
 pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
-    match args.command {
+    let Some(command) = args.command else {
+        // No subcommand → the fused streaming pipeline.
+        return run::run(args.run);
+    };
+    match command {
         DemuxCommand::Detect(detect_args) => detect::run(detect_args),
         DemuxCommand::Fingerprint(fingerprint_args) => fingerprint::run(fingerprint_args),
         DemuxCommand::Classify(classify_args) => classify::run(classify_args),

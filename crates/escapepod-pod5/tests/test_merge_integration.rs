@@ -8,10 +8,23 @@ mod common;
 
 use std::collections::{HashMap, HashSet};
 
-use escapepod_pod5::{MergeOptions, Reader, Uuid, merge_files};
+use escapepod_pod5::{MergeOptions, Reader, Uuid, Writer, WriterOptions, merge_files};
 use tempfile::TempDir;
 
-use common::{make_run_info, write_fixture};
+use common::{make_read, make_run_info, write_fixture};
+
+/// Write a file whose reads have the exact `ids` given (so two files can be
+/// made to share a read_id for the duplicate-handling test).
+fn write_with_ids(path: &std::path::Path, acq: &str, ids: &[Uuid], samples: u64) {
+    let mut writer = Writer::create(path, WriterOptions::default()).unwrap();
+    let run = writer.add_run_info(make_run_info(acq)).unwrap();
+    for (i, &id) in ids.iter().enumerate() {
+        let mut read = make_read(run, i as u32 + 1, samples);
+        read.read_id = id;
+        writer.add_read(read, &[(i as i16), 1, 2, 3, 4]).unwrap();
+    }
+    writer.finish().unwrap();
+}
 
 #[test]
 fn merge_two_files_preserves_all_reads() {
@@ -125,9 +138,9 @@ fn merge_preserves_signal_bytewise() {
 
     merge_files(&[a, b], &merged, &MergeOptions::default(), None).expect("merge_files");
 
-    // Exercise both the sequential get_signal path (hits the SignalBatchMetadata
-    // lookup) and the parallel SignalExtractor path (uses ArrowIpcFooter). Both
-    // must agree with the pre-merge signals.
+    // Exercise both the Reader::get_signal path and the parallel
+    // SignalExtractor path (both slice compressed bytes from the mmap via the
+    // signal ArrowIpcFooter). Both must agree with the pre-merge signals.
     let reader = Reader::open(&merged).unwrap();
     let extractor = reader.signal_extractor().unwrap();
     let mut checked = 0;
@@ -160,6 +173,42 @@ fn merge_empty_input_errors() {
         msg.to_lowercase().contains("no input") || msg.to_lowercase().contains("input"),
         "unexpected error: {msg}"
     );
+}
+
+/// A read_id present in two inputs must be emitted once and counted as a
+/// skipped duplicate under the default `duplicate_ok = false`. cf. upstream
+/// `test_merge.py::test_merge_duplicate_stopped` (which *errors*; escapepod's
+/// default instead deduplicates — this pins that contract).
+#[test]
+fn merge_duplicate_read_id_is_deduplicated() {
+    let tmp = TempDir::new().expect("tempdir");
+    let a = tmp.path().join("a.pod5");
+    let b = tmp.path().join("b.pod5");
+    let merged = tmp.path().join("merged.pod5");
+
+    let shared = Uuid::new_v4();
+    let a_only = Uuid::new_v4();
+    let b_only = Uuid::new_v4();
+
+    write_with_ids(&a, "acq_a", &[a_only, shared], 5);
+    write_with_ids(&b, "acq_b", &[shared, b_only], 5);
+
+    let result = merge_files(&[a, b], &merged, &MergeOptions::default(), None).expect("merge");
+
+    // 4 reads seen across inputs, 1 duplicate collapsed => 3 written.
+    assert_eq!(result.duplicates_skipped, 1);
+    assert_eq!(result.reads_written, 3);
+
+    let reader = Reader::open(&merged).unwrap();
+    let ids: Vec<Uuid> = reader
+        .reads()
+        .unwrap()
+        .map(|r| r.unwrap().read_id)
+        .collect();
+    assert_eq!(ids.len(), 3, "output must contain each read exactly once");
+    let unique: HashSet<Uuid> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), 3);
+    assert_eq!(unique, HashSet::from([a_only, shared, b_only]));
 }
 
 #[allow(dead_code)]

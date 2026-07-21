@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: CI only ever reads the tree. Elevate per-job if needed.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+# Never cancel main-branch pushes — key on ref so each PR/branch is independent.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -14,8 +24,9 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
@@ -23,15 +34,16 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --profile ci
       - name: Upload JUnit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: junit-test
           path: target/nextest/ci/junit.xml
@@ -40,8 +52,10 @@ jobs:
   test-features:
     name: Test (escapepod-demux + train)
     runs-on: ubuntu-latest
+    # Worst observed was 11 min on a cold linfa-svm rebuild; 25 gives headroom.
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -50,7 +64,7 @@ jobs:
       - run: cargo nextest run -p escapepod-demux --features train --profile ci
       - name: Upload JUnit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: junit-test-features
           path: target/nextest/ci/junit.xml
@@ -59,9 +73,10 @@ jobs:
   doctest:
     name: Doctest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # nextest does not run doctests; keep them alive on a separate job.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --doc --workspace
@@ -69,8 +84,9 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -79,8 +95,9 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -90,30 +107,37 @@ jobs:
   python:
     name: Python bindings
     runs-on: ubuntu-latest
+    # pixi solve + maturin build dominate; 25 covers a cold pixi cache.
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: prefix-dev/setup-pixi@v0.9.4
+      - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           environments: python-test
           cache: true
+      - name: Lint Python (ruff)
+        run: pixi run -e python-test lint-python
+      - name: Type-check Python (ty)
+        run: pixi run -e python-test typecheck-python
       - name: Build and test Python bindings
         run: pixi run -e python-test test-python
 
   compat:
     name: POD5 compat
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p escapepod-cli
-      - uses: prefix-dev/setup-pixi@v0.9.4
+      - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           environments: python-test
           cache: true
@@ -121,12 +145,37 @@ jobs:
         run: pixi run -e python-test test-compat
 
   msrv:
-    name: MSRV (1.92)
+    name: MSRV (1.95)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  features:
+    name: Feature builds (gpu / cnn)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # The default jobs never compile the opt-in features, so a dependency bump
+    # to cudarc / tract-onnx / ort can break these builds while every other
+    # check stays green — exactly how the cudarc and tract-onnx Dependabot PRs
+    # slipped through. cudarc and ort use runtime dynamic loading, so this only
+    # needs a `cargo check` — no CUDA toolkit, libonnxruntime, or GPU required.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: gpu — DTW/SVM CUDA path (cudarc, escapepod-signal)
+        run: cargo check -p escapepod-signal --features gpu
+      - name: gpu — demux batch classify (cudarc, escapepod-demux)
+        run: cargo check -p escapepod-demux --features gpu
+      - name: cnn-detect — CPU TCN adapter detect (tract-onnx)
+        run: cargo check -p escapepod-demux --features cnn-detect
+      - name: cnn-gpu — GPU TCN adapter detect (ort + cudarc)
+        run: cargo check -p escapepod-demux --features cnn-gpu
+      - name: models-download — k-mer model prefetch (ureq rustls + sha2)
+        run: cargo check -p escapepod-cli --features models-download

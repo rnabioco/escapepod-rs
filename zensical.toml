@@ -1,10 +1,11 @@
 [project]
 site_name = "escapepod-rs"
 site_description = "Rust library and CLI for Oxford Nanopore POD5 files"
-site_url = "https://escapepod-rs.netlify.app"
+site_url = "https://rnabioco.github.io/escapepod-rs/"
 repo_url = "https://github.com/rnabioco/escapepod-rs"
 repo_name = "rnabioco/escapepod-rs"
 copyright = "Copyright &copy; 2025 RNA Bioscience Initiative"
+extra_css = ["stylesheets/space.css"]
 
 nav = [
   { "Home" = "index.md" },
@@ -28,18 +29,24 @@ nav = [
     { "resquiggle" = "experimental/resquiggle.md" },
     { "demux" = "experimental/demux.md" },
   ] },
-  { "Library" = [
+  { "Python API" = [
+    { "Overview" = "python/index.md" },
+    { "Reading Files" = "python/reading.md" },
+    { "Writing Files" = "python/writing.md" },
+    { "Signal Processing" = "python/signal.md" },
+  ] },
+  { "Rust Library" = [
     { "Overview" = "library/index.md" },
     { "Reading Files" = "library/reading.md" },
     { "Writing Files" = "library/writing.md" },
     { "Data Types" = "library/types.md" },
   ] },
+  { "Rust API Reference" = "api/index.md" },
   { "File Format" = [
     { "Overview" = "format/index.md" },
     { "Container Structure" = "format/container.md" },
     { "Signal Compression" = "format/compression.md" },
   ] },
-  { "API Reference" = "api/index.md" },
 ]
 
 [project.theme]
@@ -54,24 +61,29 @@ features = [
   "content.code.annotate",
 ]
 
-[[project.theme.palette]]
-scheme = "default"
-primary = "indigo"
-accent = "indigo"
-toggle.icon = "material/brightness-7"
-toggle.name = "Switch to dark mode"
-
+# "Space" theme — nebula purple + radioactive lime, on deep space. Dark scheme
+# (slate) is listed first so it's the default; solar orange and the exact
+# shades are layered in stylesheets/space.css. Toggle still switches to light.
 [[project.theme.palette]]
 scheme = "slate"
-primary = "indigo"
-accent = "indigo"
+primary = "purple"
+accent = "lime"
 toggle.icon = "material/brightness-4"
 toggle.name = "Switch to light mode"
 
+[[project.theme.palette]]
+scheme = "default"
+primary = "purple"
+accent = "deep-orange"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+# Line numbers are opt-in per fence via `linenums="1"` (see docs authoring/
+# code-blocks). We only tag actual code (Rust API/library examples); command,
+# config, data, and output blocks stay clean. NOTE: `line_spans`/`anchor_linenums`
+# reroute highlighting into an inline-span mode that suppresses the per-fence
+# line-number gutter, so they are intentionally left off.
 [project.markdown_extensions.pymdownx.highlight]
-anchor_linenums = true
-line_spans = "__span"
-linenums = true
 pygments_lang_class = true
 
 [project.markdown_extensions.pymdownx.inlinehilite]
