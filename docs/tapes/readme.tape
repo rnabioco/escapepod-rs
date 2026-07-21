@@ -4,7 +4,7 @@
 Output docs/images/readme.gif
 
 Set Shell "bash"
-Set FontFamily "Source Code Pro"
+Set FontFamily "Fira Code"
 Set FontSize 16
 Set Width 900
 Set Height 600
