@@ -38,6 +38,8 @@ csv = { version = "1", optional = true }
 ctrlc = { workspace = true, optional = true }
 flate2 = { version = "1", optional = true }
 indicatif = { workspace = true, optional = true }
+# Reset SIGPIPE to default so `escpod view … | head` exits quietly (Unix only)
+libc = { version = "0.2", optional = true }
 # BAM file support
 noodles-bam = { version = "0.91", optional = true }
 noodles-bgzf = { version = "0.48", optional = true }
@@ -80,6 +82,7 @@ cli = [
     "dep:ctrlc",
     "dep:flate2",
     "dep:indicatif",
+    "dep:libc",
     "dep:noodles-bam",
     "dep:noodles-bgzf",
     "dep:noodles-core",

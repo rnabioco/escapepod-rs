@@ -2,10 +2,10 @@
 Output docs/images/filter.gif
 
 Set Shell "bash"
-Set FontFamily "Source Code Pro"
+Set FontFamily "Fira Code"
 Set FontSize 16
 Set Width 900
-Set Height 500
+Set Height 420
 Set LetterSpacing 0
 Set LineHeight 1.2
 Set Padding 20
@@ -13,6 +13,13 @@ Set Theme "Dracula"
 Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
+
+# Reset any output from a previous render so escpod doesn't refuse to overwrite
+Hide
+Type "rm -f /tmp/ids.txt /tmp/filtered.pod5"
+Enter
+Ctrl+L
+Show
 
 Type "escpod view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"
 Enter

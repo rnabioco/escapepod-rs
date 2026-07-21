@@ -553,7 +553,27 @@ fn install_signal_handler() {
     }
 }
 
+/// Restore the default `SIGPIPE` disposition.
+///
+/// The Rust runtime ignores `SIGPIPE`, which turns a closed downstream reader
+/// into an `EPIPE` that our `writeln!`/`println!` calls surface as
+/// `Error: Broken pipe`. Resetting to `SIG_DFL` makes `escpod view … | head`
+/// (or `| less`, etc.) terminate quietly like any other Unix tool.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: `signal(2)` with `SIG_DFL` is async-signal-safe and called once,
+    // before any threads are spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> anyhow::Result<()> {
+    reset_sigpipe();
+
     let cli = Cli::parse();
 
     // Verbosity → log level. `RUST_LOG` always wins if set.
