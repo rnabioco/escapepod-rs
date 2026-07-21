@@ -208,7 +208,12 @@ fn median_dwell(seq_to_signal_map: &[usize]) -> f32 {
     if seq_to_signal_map.len() < 2 {
         return 1.0;
     }
-    let mut dwells: Vec<usize> = seq_to_signal_map.windows(2).map(|w| w[1] - w[0]).collect();
+    // `array_windows` yields `&[usize; 2]`, so the destructure below is
+    // bounds-check-free vs the indexed `w[0]`/`w[1]` on `windows(2)`.
+    let mut dwells: Vec<usize> = seq_to_signal_map
+        .array_windows::<2>()
+        .map(|[lo, hi]| hi - lo)
+        .collect();
     let n = dwells.len();
     let mid = n / 2;
     // Median via select_nth_unstable (O(n) expected) instead of a full sort.

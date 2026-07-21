@@ -102,9 +102,11 @@ impl Band {
         let mut seq_start = vec![0usize; seq_len];
         let mut seq_end = vec![signal_len; seq_len];
 
-        // Find change points in end array
-        for (sig_idx, window) in self.end.windows(2).enumerate() {
-            if window[0] != window[1] {
+        // Find change points in end array. `array_windows::<2>()` (Rust 1.94)
+        // gives a `&[usize; 2]` to destructure, dropping the bounds checks
+        // that `window[0]`/`window[1]` on a `&[usize]` slice incur.
+        for (sig_idx, &[lo, hi]) in self.end.array_windows::<2>().enumerate() {
+            if lo != hi {
                 let lower_sig_pos = sig_idx + 1;
                 let lower_base_pos = self.end[sig_idx];
                 if lower_base_pos < seq_len {
@@ -114,8 +116,8 @@ impl Band {
         }
 
         // Find change points in start array
-        for (sig_idx, window) in self.start.windows(2).enumerate() {
-            if window[0] != window[1] {
+        for (sig_idx, &[lo, hi]) in self.start.array_windows::<2>().enumerate() {
+            if lo != hi {
                 let upper_sig_pos = sig_idx + 1;
                 let upper_base_pos = self.start[upper_sig_pos];
                 if upper_base_pos > 0 {
