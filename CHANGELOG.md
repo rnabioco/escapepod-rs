@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **PyPI publishing** for the `escapepod` Python package. The `release.yml`
+  workflow now builds abi3 wheels (CPython 3.9+) for Linux (x86_64/aarch64,
+  manylinux + musllinux) and macOS (x86_64/arm64) plus an sdist, and publishes
+  them to PyPI via Trusted Publishing (OIDC) on each `v*` tag. `pip install
+  escapepod` will work once the first tagged release lands. The bindings crate
+  gained `abi3-py39` and complete PyPI metadata (readme, license, URLs,
+  classifiers, type stubs).
+
 ## 0.6.1 (2026-07-20)
 
 ### Fixed

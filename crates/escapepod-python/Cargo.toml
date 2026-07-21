@@ -1,5 +1,6 @@
 [package]
 name = "escapepod-python"
+description = "Python bindings for escapepod — fast POD5 reader/writer (published to PyPI as `escapepod`)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

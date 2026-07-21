@@ -18,13 +18,17 @@ with escapepod.Reader("experiment.pod5") as reader:
 
 ## Installation
 
-!!! note "PyPI packaging is planned"
-    `escapepod` is not on PyPI yet. For now, build it from source with
-    [maturin](https://www.maturin.rs/). Once wheels are published the install
-    will be a plain `pip install escapepod`.
+```bash
+pip install escapepod
+```
 
-Build and install into the current environment from a checkout of the
-repository:
+Wheels are published for CPython 3.9+ (abi3) on Linux (x86_64/aarch64,
+manylinux + musllinux) and macOS (x86_64/arm64).
+
+### Building from source
+
+To build against a checkout of the repository (or on a platform without a
+prebuilt wheel), use [maturin](https://www.maturin.rs/):
 
 ```bash
 pip install maturin

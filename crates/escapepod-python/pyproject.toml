@@ -1,11 +1,28 @@
 [project]
 name = "escapepod"
+description = "Fast Python reader/writer for Oxford Nanopore POD5 files, backed by a pure Rust engine"
+readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jay Hesselberth", email = "jay.hesselberth@gmail.com" }]
+keywords = ["nanopore", "pod5", "sequencing", "bioinformatics", "signal"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/rnabioco/escapepod-rs"
+Repository = "https://github.com/rnabioco/escapepod-rs"
+Documentation = "https://rnabioco.github.io/escapepod-rs/python/"
 
 [build-system]
 requires = ["maturin>=1.9,<2"]
@@ -14,3 +31,4 @@ build-backend = "maturin"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "escapepod"
+include = ["escapepod.pyi", "py.typed"]
