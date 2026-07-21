@@ -586,6 +586,13 @@ fn main() -> anyhow::Result<()> {
         _ => "trace",
     };
     tracing_subscriber::fmt()
+        // Our status lines carry ANSI from the `style::*` helpers (already
+        // TTY/NO_COLOR-gated). tracing-subscriber 0.3.20+ sanitizes ANSI in the
+        // `message` field by default, which would render those escapes as
+        // literal `\x1b[...]` text; opt out so trusted color passes through.
+        // Must precede `event_format` — the setter is only exposed while the
+        // event format is still the default `Format`.
+        .with_ansi_sanitization(false)
         .event_format(EscpodFormatter)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
@@ -712,5 +719,66 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(not(feature = "experimental"))]
         Commands::Index { .. } => feature_disabled("index", "experimental"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// In-memory sink so we can inspect the bytes the subscriber actually writes.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Regression guard for the literal `\x1b[...]` bug.
+    ///
+    /// tracing-subscriber 0.3.20+ sanitizes ANSI in the `message` field by
+    /// default, which escapes the trusted color codes our `style::*` helpers
+    /// emit into the literal 4-char text `\x1b[...]` (visible verbatim in the
+    /// demo GIFs and any color terminal). The subscriber opts out via
+    /// `.with_ansi_sanitization(false)`; assert that a raw ESC byte in a message
+    /// passes through unchanged and is not textualized.
+    #[test]
+    fn message_ansi_passes_through_unsanitized() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi_sanitization(false)
+            .event_format(EscpodFormatter)
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Embed a raw ESC directly so the assertion is independent of
+            // `style::use_color()`'s cached TTY detection.
+            tracing::info!("{} done", "\u{1b}[32mgreen\u{1b}[0m");
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains('\u{1b}'), "expected raw ESC byte in: {out:?}");
+        assert!(
+            !out.contains("\\x1b"),
+            "message ANSI was sanitized to literal text: {out:?}"
+        );
     }
 }
