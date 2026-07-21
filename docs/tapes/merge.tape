@@ -18,6 +18,7 @@ Set BorderRadius 10
 Hide
 Type "rm -f /tmp/merged.pod5"
 Enter
+Ctrl+L
 Show
 
 Type "escpod merge data/drna/yeast_trna_reads.pod5 -o /tmp/merged.pod5"

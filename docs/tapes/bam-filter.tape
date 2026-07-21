@@ -18,6 +18,7 @@ Set BorderRadius 10
 Hide
 Type "rm -f /tmp/bam-filtered.pod5"
 Enter
+Ctrl+L
 Show
 
 Type 'escpod bam-filter data/drna/yeast_trna_reads.pod5 \'

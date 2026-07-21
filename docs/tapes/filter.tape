@@ -18,6 +18,7 @@ Set BorderRadius 10
 Hide
 Type "rm -f /tmp/ids.txt /tmp/filtered.pod5"
 Enter
+Ctrl+L
 Show
 
 Type "escpod view data/drna/yeast_trna_reads.pod5 --ids | head -2 > /tmp/ids.txt"

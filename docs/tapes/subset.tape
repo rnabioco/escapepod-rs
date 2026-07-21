@@ -18,6 +18,7 @@ Set BorderRadius 10
 Hide
 Type "rm -rf /tmp/mapping.csv /tmp/subsets"
 Enter
+Ctrl+L
 Show
 
 Type "echo 'read_id,output' > /tmp/mapping.csv"
