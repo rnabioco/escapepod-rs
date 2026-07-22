@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Auto-warmed read-id index on Python context-manager entry.** Entering a
+  `Reader` or `DatasetReader` in a `with` block now builds the in-memory
+  read-id index, so repeated `reads(selection=…)` lookups take an O(k) indexed
+  path instead of re-scanning the reads table each call (~2× faster
+  random-access selection, on par with the `pod5` package). Plain `open()` is
+  unchanged — the index stays lazy for single-pass streaming. Size-gated by
+  read count (default 5,000,000, overridable via `ESCAPEPOD_AUTOINDEX_MAX`) to
+  bound memory; this is the in-memory index, not the `.p5i` sidecar, so no
+  sidecar file is written (#97).
+
 - **PyPI publishing** for the `escapepod` Python package. The `release.yml`
   workflow now builds abi3 wheels (CPython 3.9+) for Linux (x86_64/aarch64,
   manylinux + musllinux) and macOS (x86_64/arm64) plus an sdist, and publishes
