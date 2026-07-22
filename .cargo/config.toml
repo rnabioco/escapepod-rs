@@ -14,13 +14,16 @@
 # maturin/pip pick this up, which is fine since v3 is portable across
 # any x86_64 CPU since ~2013.
 #
-# Faster linker (mold) is available via the pixi `dev` environment, which
-# installs `mold` from conda-forge and exposes wrapper tasks (`pixi run -e
-# dev build|test|check|clippy|build-rel`). Those tasks invoke
-# `mold -run cargo ...`, which intercepts the linker exec via LD_PRELOAD
-# and works with the system gcc 11.5 — no `-fuse-ld=mold` support needed.
-# No linker override is set here because the earlier conda-clang route
-# pulled in a sysroot that required glibc-static (libmvec_nonshared.a),
-# which isn't installed on the compute nodes.
+# Linker: mold is used full time inside pixi. It is engaged not by a cargo
+# linker override here but by the base `[activation]` block in pixi.toml, which
+# exports `LD_PRELOAD=$CONDA_PREFIX/lib/mold/mold-wrapper.so` +
+# `MOLD_PATH=$CONDA_PREFIX/bin/mold` for every environment. That wrapper
+# intercepts the linker exec and redirects it to mold, which works with the
+# stock system gcc 11.5 on the compute nodes — no `-fuse-ld=mold` support
+# needed (gcc gained that only in 12.1). No linker override is set here because
+# the earlier conda-clang route pulled in a sysroot that required glibc-static
+# (libmvec_nonshared.a), which isn't installed on the compute nodes; the
+# LD_PRELOAD interposer avoids that entirely and is compiler-version-agnostic.
+# CI release binaries (musl) build outside pixi and are unaffected.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=x86-64-v3"]

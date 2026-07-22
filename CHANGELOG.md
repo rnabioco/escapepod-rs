@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Build / Tooling
+
+- **mold is now the linker full time inside pixi.** The base `[activation]`
+  block exports `LD_PRELOAD=$CONDA_PREFIX/lib/mold/mold-wrapper.so` (+
+  `MOLD_PATH`) for every environment, so any `pixi run [-e <env>] cargo …` (and
+  maturin) links with mold — no more `mold -run` wrappers or `-e dev`-only mold.
+  Works with the stock system gcc 11.5 on the compute nodes (no `-fuse-ld=mold`
+  support needed) via mold's `mold-wrapper.so` interposer, and needs no
+  glibc-static. CI release builds (musl, outside pixi) are unaffected.
+
 ### Added
 
 - **PyPI publishing** for the `escapepod` Python package. The `release.yml`
