@@ -93,6 +93,8 @@ The `escapepod` Python package — a `pod5`-compatible API — is published on P
 
 ```bash
 pip install escapepod
+# or, with uv:
+uv pip install escapepod
 ```
 
 Prebuilt wheels cover CPython 3.9+ (abi3) on Linux (x86_64/aarch64, manylinux +

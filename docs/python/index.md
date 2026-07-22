@@ -20,6 +20,8 @@ with escapepod.Reader("experiment.pod5") as reader:
 
 ```bash
 pip install escapepod
+# or, with uv:
+uv pip install escapepod
 ```
 
 Wheels are published for CPython 3.9+ (abi3) on Linux (x86_64/aarch64,
