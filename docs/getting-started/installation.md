@@ -62,7 +62,7 @@ The `escapepod` Python package provides a `pod5`-compatible API. Install it
 from PyPI:
 
 ```bash
-pip install escapepod
+uv pip install escapepod
 ```
 
 Wheels are published for CPython 3.9+ (abi3) on Linux (x86_64/aarch64,
@@ -71,7 +71,7 @@ instead (or on an unsupported platform), use
 [maturin](https://www.maturin.rs/):
 
 ```bash
-pip install maturin
+uv pip install maturin
 maturin develop --release --manifest-path crates/escapepod-python/Cargo.toml
 ```
 

@@ -19,7 +19,7 @@ with escapepod.Reader("experiment.pod5") as reader:
 ## Installation
 
 ```bash
-pip install escapepod
+uv pip install escapepod
 ```
 
 Wheels are published for CPython 3.9+ (abi3) on Linux (x86_64/aarch64,
@@ -31,7 +31,7 @@ To build against a checkout of the repository (or on a platform without a
 prebuilt wheel), use [maturin](https://www.maturin.rs/):
 
 ```bash
-pip install maturin
+uv pip install maturin
 maturin develop --release --manifest-path crates/escapepod-python/Cargo.toml
 ```
 
@@ -43,7 +43,7 @@ You can also install straight from Git once you have a Rust toolchain and
 maturin available:
 
 ```bash
-pip install "git+https://github.com/rnabioco/escapepod-rs.git#subdirectory=crates/escapepod-python"
+uv pip install "git+https://github.com/rnabioco/escapepod-rs.git#subdirectory=crates/escapepod-python"
 ```
 
 Verify the install:
