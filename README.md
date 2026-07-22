@@ -67,6 +67,8 @@ matter; sub-second commands (`inspect`, `view`) are omitted. Measured with
 
 ## Install
 
+### CLI (`escpod`)
+
 The `escpod` binary lives in the `escapepod-cli` crate.
 
 Default build (stable commands only):
@@ -84,6 +86,18 @@ cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --fea
 # barcode demultiplexing
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features demux
 ```
+
+### Python library
+
+The `escapepod` Python package — a `pod5`-compatible API — is published on PyPI:
+
+```bash
+pip install escapepod
+```
+
+Prebuilt wheels cover CPython 3.9+ (abi3) on Linux (x86_64/aarch64, manylinux +
+musllinux) and macOS (x86_64/arm64). See the [Python API docs](docs/python/index.md)
+for usage and building from source.
 
 ## License
 
