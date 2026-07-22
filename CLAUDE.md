@@ -49,10 +49,16 @@ cargo clippy
 # Run the CLI (after building)
 ./target/release/escpod <command>
 
-# Fast local dev builds via mold (pixi env: dev). `mold -run` intercepts
-# the linker exec and works with system gcc 11.5 — no glibc-static needed.
-# Release artifacts shipped via GitHub Releases are built in CI against
-# musl (static); these local builds remain dynamic gnu by design.
+# mold is the linker full time: the base [activation] in pixi.toml exports
+# LD_PRELOAD=$CONDA_PREFIX/lib/mold/mold-wrapper.so for EVERY environment, so
+# any `pixi run [-e <env>] cargo …` (and maturin) links with mold — no
+# `mold -run` and no `-e dev` needed for that. Works with system gcc 11.5 (no
+# `-fuse-ld=mold` support required) and needs no glibc-static. Release
+# artifacts shipped via GitHub Releases build in CI against musl (static),
+# outside pixi, and are unaffected; local builds remain dynamic gnu by design.
+#
+# The `dev` env additionally provides cargo-nextest + convenience task wrappers
+# (which are now just bare `cargo …`, since mold is already on):
 pixi run -e dev build        # cargo build
 pixi run -e dev build-rel    # cargo build --release (dynamic gnu)
 pixi run -e dev test         # cargo nextest run
@@ -60,7 +66,7 @@ pixi run -e dev test-doc     # cargo test --doc (nextest skips doctests)
 pixi run -e dev check        # cargo check
 pixi run -e dev clippy       # cargo clippy --workspace --all-targets
 
-# mold + GPU:
+# GPU builds also link with mold (dev-gpu, or any gpu env):
 pixi run -e dev-gpu cargo build --features gpu -p escapepod-cli
 ```
 
@@ -77,13 +83,13 @@ dispatch, not a global baseline bump.
 The login node has only 2 cores — wrap any heavy build or bench in `srun -p rna`:
 
 ```bash
-# build / test — 32 logical CPUs (16 physical cores + HT) is enough
+# build / test — 32 logical CPUs (16 physical cores + HT) is enough.
+# These already link with mold (base activation, see above); no -e dev needed.
 srun -p rna -c 32 --mem=32G pixi run cargo build --release
 srun -p rna -c 32 --mem=32G pixi run cargo nextest run --workspace
 
-# With mold: swap `pixi run` for `pixi run -e dev <task>`. mold itself is
-# multithreaded on the link step, so the 32-core allocation helps both the
-# compile and the link phases.
+# The dev env adds cargo-nextest + task wrappers. mold is multithreaded on the
+# link step, so the 32-core allocation helps both compile and link phases.
 srun -p rna -c 32 --mem=32G pixi run -e dev build-rel
 srun -p rna -c 32 --mem=32G pixi run -e dev test
 
@@ -120,9 +126,10 @@ Notes specific to Alpine:
   **cannot** run the CUDA `gpu`/`cnn-gpu` features.
 - All of amilan/aa100/acompile are Zen3 x86-64, so the pinned `target-cpu=x86-64-v3`
   baseline is portable across them — build once, run anywhere, no SIGILL risk.
-- Toolchain lives in pixi, not on the bare PATH: `-e dev` (mold + cargo-nextest),
-  `-e warpdemux-bench` (hyperfine + pod5, for `benchmarks/benchmark.sh`), `-e gpu`
-  (CUDA runtime / libnvrtc). Wrap invocations accordingly, e.g.
+- Toolchain lives in pixi, not on the bare PATH: mold links every env (base
+  activation); `-e dev` adds cargo-nextest + task wrappers, `-e warpdemux-bench`
+  (hyperfine + pod5, for `benchmarks/benchmark.sh`), `-e gpu` (CUDA runtime /
+  libnvrtc). Wrap invocations accordingly, e.g.
   `srun -p amilan --qos=normal -A amc-general -c 32 --mem=32G pixi run -e dev test`.
 
 ## Benchmarking & Profiling

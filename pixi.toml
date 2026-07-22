@@ -9,9 +9,21 @@ pysam = "*"
 pandas = "*"
 pyarrow = ">=22,<23"
 pip = "*"
+# mold is a base dependency so every environment links Rust with it — see the
+# LD_PRELOAD/MOLD_PATH block below. gcc 11.5 on the compute nodes has no
+# `-fuse-ld=mold` support, so we engage mold via its `mold-wrapper.so`
+# LD_PRELOAD interposer (exactly what `mold -run` does) rather than a cargo
+# linker override in .cargo/config.toml.
+mold = ">=2.4"
 
+# LD_PRELOAD makes mold the default linker for *every* command run in any pixi
+# environment (bare `cargo build`, `cargo nextest run`, maturin, …), full time —
+# not just the dev-env task wrappers. `mold-wrapper.so` intercepts the linker
+# exec and redirects it to mold; for non-linker processes it is an inert
+# passthrough. `$CONDA_PREFIX` resolves to the active env prefix, so this works
+# uniformly across default/dev/python-test/gpu/… without hardcoding a path.
 [activation]
-env = { DORADO_VERSION = "1.4.0", DORADO_DIR = "$PIXI_PROJECT_ROOT/.pixi/tools", PATH = "$DORADO_DIR/dorado-$DORADO_VERSION-linux-x64/bin:$PATH" }
+env = { DORADO_VERSION = "1.4.0", DORADO_DIR = "$PIXI_PROJECT_ROOT/.pixi/tools", PATH = "$DORADO_DIR/dorado-$DORADO_VERSION-linux-x64/bin:$PATH", LD_PRELOAD = "$CONDA_PREFIX/lib/mold/mold-wrapper.so", MOLD_PATH = "$CONDA_PREFIX/bin/mold" }
 
 [tasks]
 install-dorado = """
@@ -142,24 +154,22 @@ docs-serve = "zensical serve"
 # report "page does not exist"), so run the strict check against a fresh cache.
 docs-check = "zensical build --clean --strict"
 
-# Fast local dev builds via mold. The task wrappers use `mold -run`, which
-# intercepts the linker exec via LD_PRELOAD and works with the system gcc
-# 11.5 on the compute nodes — no `-fuse-ld=mold` support required, and no
-# glibc-static (the previous conda-clang attempt hit that wall, see
-# .cargo/config.toml). GH Release binaries are built in CI against musl
-# and are unaffected by this feature.
+# Dev env: cargo-nextest plus convenience task wrappers. mold linking is no
+# longer opt-in here — it is on for *every* environment via the base
+# LD_PRELOAD/MOLD_PATH activation above, so these tasks no longer need the
+# `mold -run` prefix (a bare `cargo …` already links with mold). GH Release
+# binaries are built in CI against musl and are unaffected.
 [feature.dev.dependencies]
-mold = ">=2.4"
 cargo-nextest = ">=0.9"
 
 [feature.dev.tasks]
-build = "mold -run cargo build"
-build-rel = "mold -run cargo build --release"
+build = "cargo build"
+build-rel = "cargo build --release"
 # nextest does not run doctests; use the test-doc task for those.
-test = "mold -run cargo nextest run"
-test-doc = "mold -run cargo test --doc"
-check = "mold -run cargo check"
-clippy = "mold -run cargo clippy --workspace --all-targets"
+test = "cargo nextest run"
+test-doc = "cargo test --doc"
+check = "cargo check"
+clippy = "cargo clippy --workspace --all-targets"
 
 [environments]
 python-test = { features = ["python-test"], solve-group = "default" }
