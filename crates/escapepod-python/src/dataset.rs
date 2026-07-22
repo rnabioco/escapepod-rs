@@ -351,6 +351,21 @@ impl PyDatasetReader {
     // -- Context manager / dunders -----------------------------------------
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        // Warm each underlying file's in-memory read-id index on entry, so
+        // reads(selection=…) — which loops per file calling reads_by_ids —
+        // takes the O(k) indexed path instead of re-scanning (#97). Gated
+        // per file by its own read count; best-effort. The dataset's own
+        // id_index routing map is still built lazily on first use.
+        let py = slf.py();
+        let cap = crate::autoindex_max();
+        let readers = &slf.readers;
+        py.detach(|| {
+            for (_, reader) in readers {
+                if reader.read_count().unwrap_or(usize::MAX) <= cap {
+                    let _ = reader.read_index();
+                }
+            }
+        });
         slf
     }
 

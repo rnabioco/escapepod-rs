@@ -920,6 +920,41 @@ class TestDatasetReader:
         assert 0 < n < read.num_samples * 2
 
 
+class TestContextManagerIndex:
+    """Entering a reader as a context manager warms the in-memory read-id
+    index so repeated ``reads(selection=...)`` takes the O(k) indexed path
+    (#97). The OnceLock state is not observable from Python, so these assert
+    correctness/parity across the warmed and threshold-disabled (scan) paths
+    rather than the cache itself.
+    """
+
+    def test_reader_selection_warmed(self, single_file):
+        sel = _IDS_A[:2]
+        with escapepod.Reader(str(single_file)) as r:
+            reads = r.reads(selection=sel)
+            # Second call exercises the now-warmed indexed path.
+            reads_again = r.reads(selection=sel)
+        assert {x.read_id for x in reads} == set(sel)
+        assert {x.read_id for x in reads_again} == set(sel)
+
+    def test_reader_threshold_disables_autobuild(self, single_file, monkeypatch):
+        """ESCAPEPOD_AUTOINDEX_MAX=0 skips the warm-up; selection still returns
+        identical results via the scan path."""
+        monkeypatch.setenv("ESCAPEPOD_AUTOINDEX_MAX", "0")
+        sel = _IDS_A[:2]
+        with escapepod.Reader(str(single_file)) as r:
+            reads = r.reads(selection=sel)
+        assert {x.read_id for x in reads} == set(sel)
+
+    def test_dataset_selection_warmed(self, dataset_dir):
+        sel = [_IDS_A[0], _IDS_B[1]]
+        with escapepod.DatasetReader(dataset_dir) as ds:
+            reads = ds.reads(selection=sel)
+            reads_again = ds.reads(selection=sel)
+        assert {r.read_id for r in reads} == set(sel)
+        assert {r.read_id for r in reads_again} == set(sel)
+
+
 class TestMissingOk:
     def test_reader_selection_missing_raises(self, single_file):
         reader = escapepod.Reader(str(single_file))

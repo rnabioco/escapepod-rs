@@ -174,6 +174,11 @@ class Reader:
         with Reader("reads.pod5") as reader:
             for read in reader:
                 print(read.read_id)
+
+    Entering the context manager warms an in-memory read-id index so repeated
+    ``reads(selection=...)`` lookups take an O(k) indexed path instead of
+    re-scanning the reads table. Skipped for files above
+    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) to bound memory.
     """
 
     def __init__(self, path: Union[str, PathLike[str]]) -> None: ...
@@ -241,6 +246,11 @@ class DatasetReader:
         with DatasetReader("run_dir/") as ds:
             for read in ds:
                 signal = ds.get_signal(read)
+
+    Entering the context manager warms an in-memory read-id index on each
+    underlying file so repeated ``reads(selection=...)`` lookups take an O(k)
+    indexed path instead of re-scanning. Per-file, skipped for files above
+    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) to bound memory.
     """
 
     def __init__(

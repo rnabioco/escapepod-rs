@@ -338,6 +338,21 @@ impl PyReader {
     // -- Context manager protocol ------------------------------------------
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        // A context manager signals a long-lived reader with likely repeated
+        // random access, so warm the in-memory read-id index: subsequent
+        // reads(selection=…) then take the O(k) indexed path instead of
+        // re-scanning the reads table each call (#97). Gated by size to
+        // honor the ~32 B/read memory cost on very large files; best-effort,
+        // since the index is a pure optimization and must never make entering
+        // the context manager fail.
+        let py = slf.py();
+        let n = slf.inner.read_count().unwrap_or(usize::MAX);
+        if n <= crate::autoindex_max() {
+            let inner = &slf.inner;
+            py.detach(|| {
+                let _ = inner.read_index();
+            });
+        }
         slf
     }
 

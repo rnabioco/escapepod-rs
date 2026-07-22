@@ -7,6 +7,17 @@ mod reader;
 mod signal;
 mod writer;
 
+/// Max read count for which entering a reader as a context manager
+/// auto-builds the in-memory read-id index. Above this, entry is a no-op
+/// and random-access selection falls back to the scan path. Overridable
+/// via the `ESCAPEPOD_AUTOINDEX_MAX` environment variable.
+pub(crate) fn autoindex_max() -> usize {
+    std::env::var("ESCAPEPOD_AUTOINDEX_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000)
+}
+
 /// Python bindings for the escapepod POD5 library.
 #[pymodule]
 fn escapepod(m: &Bound<'_, PyModule>) -> PyResult<()> {
