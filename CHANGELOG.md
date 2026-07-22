@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.2 (2026-07-22)
+
 ### Build / Tooling
 
 - **mold is now the linker full time inside pixi.** The base `[activation]`
@@ -31,6 +33,21 @@
   escapepod` will work once the first tagged release lands. The bindings crate
   gained `abi3-py39` and complete PyPI metadata (readme, license, URLs,
   classifiers, type stubs).
+
+### Performance
+
+- **Resquiggle hot paths** (band construction and refinement) iterate with
+  `array_windows` instead of manual index arithmetic, dropping redundant bounds
+  checks from the inner loops (#61).
+
+### Fixed
+
+- **Status output no longer escapes ANSI.** The `tracing` formatter was
+  escaping ANSI control sequences, so styled status/progress output rendered as
+  literal escape codes; it now emits proper styling (#142).
+- **Quiet `SIGPIPE` on piped output.** Piping CLI output into a consumer that
+  closes early (e.g. `| head`) no longer produces a broken-pipe error — the CLI
+  exits cleanly on a closed downstream pipe (#140).
 
 ## 0.6.1 (2026-07-20)
 
