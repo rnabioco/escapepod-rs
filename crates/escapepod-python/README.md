@@ -14,8 +14,6 @@ considerably faster.
 ## Install
 
 ```bash
-pip install escapepod
-# or, with uv:
 uv pip install escapepod
 ```
 

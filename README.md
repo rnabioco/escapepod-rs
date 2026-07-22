@@ -92,8 +92,6 @@ cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --fea
 The `escapepod` Python package — a `pod5`-compatible API — is published on PyPI:
 
 ```bash
-pip install escapepod
-# or, with uv:
 uv pip install escapepod
 ```
 

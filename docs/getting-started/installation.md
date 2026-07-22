@@ -62,8 +62,6 @@ The `escapepod` Python package provides a `pod5`-compatible API. Install it
 from PyPI:
 
 ```bash
-pip install escapepod
-# or, with uv:
 uv pip install escapepod
 ```
 
@@ -73,7 +71,7 @@ instead (or on an unsupported platform), use
 [maturin](https://www.maturin.rs/):
 
 ```bash
-pip install maturin
+uv pip install maturin
 maturin develop --release --manifest-path crates/escapepod-python/Cargo.toml
 ```
 
