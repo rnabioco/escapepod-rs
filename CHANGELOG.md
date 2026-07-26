@@ -2,6 +2,111 @@
 
 ## Unreleased
 
+## 0.6.3 (2026-07-26)
+
+### Added
+
+- **`demux` is now part of the default `cli` feature**, so the standard
+  `escpod` build ships barcode demultiplexing without a rebuild. It pulls in
+  zero new third-party crates (ndarray/serde_json/rayon/uuid were already in
+  the graph). The accelerator features `train`, `gpu`, `cnn-detect`, and
+  `cnn-gpu` remain opt-in because they need extra toolchains or a CUDA
+  runtime (#150).
+
+### Fixed
+
+- **`mad_normalize` no longer aborts on a constant signal.** A dead pore or
+  flat read produced a zero MAD that panicked; since release builds use
+  `panic = "abort"`, a single bad read killed a multi-hour job (#150).
+- **Short fingerprints are no longer emitted silently.**
+  `extract_fingerprint_from_signal` treated `keep_last` as a maximum rather
+  than an exact width, so a truncated fingerprint could reach the classifier.
+  GBM errored out, but DTW/SVM scored the truncated query and reported a
+  confident *wrong* barcode. Observed in real data at 1 ragged row in 9,894
+  (#150).
+- **`read_query_csv` validates row width.** Malformed cells were dropped
+  silently; the labeled loader had guarded this for a while, the query loader
+  never did (#150).
+- **A GBM classify failure no longer discards its whole chunk.** One failing
+  read dropped all 1,024 reads in the chunk instead of just itself (#150).
+- **`filter`/`subset` write real read IDs into the signal table.** The
+  `read_id` column was zero-filled, diverging from ONT's own tooling and from
+  the schema's documented "UUID for consistency checking" purpose. Files still
+  loaded and round-tripped losslessly because the reads table is the authority
+  for the read→signal mapping, so nothing read the column — but any tool that
+  used it for the check it is named for would have rejected every file
+  `escpod filter`/`subset` ever produced (#151).
+- **`demux train` output is reproducible.** Grouping iterated a `HashMap`, so
+  `std_dev` summation order — and its low bits — varied run to run, and
+  `TrainingOutput::barcodes` was a `HashMap`, so serde emitted barcodes in a
+  different order each process. Results are now sorted by read index and the
+  map is a `BTreeMap`; three consecutive runs are byte-identical (#152).
+
+### Performance
+
+- **Fused `demux` pipeline is 2.3× faster on GBM models** (151.0 s → 65.1 s on
+  1.22M reads / 10.4 GB, 48 cores; CPU utilization 511% → 1273%), and 1.27×
+  on DTW-SVM. The pipeline was neither compute- nor I/O-bound — it ran faster
+  at 8 threads than at 48, because block fill never overlapped with processing
+  and the dominant barcode's writer channel blocked rayon workers that could
+  not then be stolen from. Per-barcode counts are unchanged, and the staged
+  `detect`/`fingerprint` subcommands still produce byte-identical output
+  (#150).
+- **DTW-SVM classify is faster, bit-identically.** `DTW_LANES` 16→32 and
+  `decision_function` now skips support vectors that cannot contribute to a
+  class pair: per-read predict 150.1 → 110.4 µs (−26.4%), and the 20-class
+  decision function 366.9 → 26.7 µs (−92.7%), which matters for wider barcode
+  designs (#150).
+- **`filter` is 2.29× faster and `subset` 1.74×** (51.3 s → 22.4 s and 37.9 s
+  → 21.8 s on 1.22M reads / 10.4 GB, 48 CPUs). The signal-table copy ran
+  inline with the IPC writes on one thread, so every page fault stalled the
+  thread that then issued the write — 75% of profile samples in `memmove` plus
+  kernel page-fault time at 24% CPU. Batches now build across rayon and are
+  written in order, with lookahead bounded to 16 batches in flight. `merge` is
+  deliberately untouched: it copies whole Arrow IPC blocks and patches footer
+  offsets, so it never rebuilds batches (#151).
+- **`demux train` is 8.7× faster** (231.5 s → 26.5 s on 200k assigned reads,
+  48 cores; CPU utilization 86% → 1199%). `extract_fingerprints` parallelized
+  only *across files*, so the common single-POD5 training run was effectively
+  serial regardless of `-t`. It now walks files sequentially — one ascending
+  mmap sweep per Arrow batch, preserving the single-stream I/O — and
+  parallelizes inside each batch. Consensus fingerprints are bit-identical
+  (#152).
+- **`demux train-svm` no longer computes an all-pairs DTW distance matrix and
+  its RBF kernel matrix.** Both were discarded: their only consumer took the
+  kernel as an ignored parameter, so ever since the SMO fit was removed the
+  emitted model has been a function of the labels alone. At N=50,000 the
+  command now runs in 0.27 s / 25 MB, where the matrices alone would have
+  wanted ~40 GB — the memory wall that `--max-per-class` exists to work around
+  (#152).
+
+### Changed
+
+- **The `gpu` DTW-classify feature is now marked experimental.** On a full
+  node it measured *slower* than the CPU: 113.0 s on 64 cores versus 132.4 s
+  with `--gpu` on an A30 (0.85×), plus ~2.2 GB more RSS. The apparent win
+  disappears once the CPU gets the whole node instead of 16 of 64 cores. GPU
+  **CNN adapter detection** (`--method cnn --gpu`) remains the GPU path that
+  pays off (#150).
+- **`demux train-svm --window` and `--gpu` now warn** that they do not affect
+  the fit, instead of silently appearing effective (#152).
+- `compute_distance_matrix`, `distance_to_kernel_matrix`, and
+  `train_svm_from_distances` stay public and tested, so a real SVM fit can be
+  wired back in without a signature change (#152).
+
+### Build / Tooling
+
+- The signal `RecordBatch` builder is shared between `filter`/`subset` and the
+  incremental `Writer` (`build_signal_batch` + `SignalRow` in
+  `utils::table_builders`) rather than duplicated (#151).
+- New `test_table_conformance` guardrail in the CI compat suite snapshots all
+  three embedded Arrow tables from a pod5-written and an escapepod-written
+  file and diffs schema plus contents, resolving signal `read_id` through each
+  read's `signal_rows`. Validated as a guardrail: it fails against a pre-fix
+  binary. Adds an `ESCPOD_BIN` override so the suite can target an arbitrary
+  build (#151).
+- Dependency bumps: `clap` 4.6.4, `libc` 0.2.189, and `actions/setup-python` 7.
+
 ## 0.6.2 (2026-07-22)
 
 ### Build / Tooling
