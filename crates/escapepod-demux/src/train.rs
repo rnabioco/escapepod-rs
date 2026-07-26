@@ -3,11 +3,18 @@
 //! This module provides training functionality for DTW-SVM models,
 //! only available with the `train` feature.
 //!
-//! The training process:
+//! The intended training process is:
 //! 1. Compute DTW distance matrix between all training fingerprints
 //! 2. Convert distances to RBF kernel: K = exp(-gamma * dist^power)
 //! 3. Train SVM on the kernel matrix
 //! 4. Export model parameters for inference
+//!
+//! **Steps 1–3 are not what currently runs.** The SMO fit was removed (see
+//! `TODO(svm-real-fit)`), leaving a kernel-weighted-voting stub whose output is
+//! a function of the labels alone. Steps 1 and 2 therefore produced matrices
+//! that nothing read, so [`train_svm`] no longer computes them — see the cost
+//! note there. [`compute_distance_matrix`] and [`distance_to_kernel_matrix`]
+//! remain available (and tested) for when a real fit is wired back in.
 
 use std::collections::HashMap;
 
@@ -155,35 +162,79 @@ pub fn compute_distance_matrix_gpu_with_ctx(
 /// # Returns
 ///
 /// A trained `DtwSvmModel` ready for inference.
+/// # Cost note
+///
+/// This used to call [`compute_distance_matrix`] first. It no longer does,
+/// because **the result was discarded unused**: the only consumer was
+/// [`distance_to_kernel_matrix`], whose output is passed to
+/// `train_binary_svm`/`train_multiclass_svm` as an ignored `_kernel_matrix`
+/// parameter. Ever since the real SMO fit was removed (see
+/// `TODO(svm-real-fit)` on [`train_multiclass_svm`]), the emitted model has
+/// depended only on `fingerprints`, `labels` and `config` — the O(N²) all-pairs
+/// DTW and the O(N²) RBF exponentiation were pure dead work.
+///
+/// Verified by construction and by experiment: varying `--window`, `--gamma`
+/// and `--power` (the only inputs to those two matrices) changes nothing in the
+/// serialized model except the verbatim copies of those values in its own
+/// metadata fields. `test_window_does_not_affect_fit` pins this.
+///
+/// When a real fit lands, it should take the distance matrix back — via
+/// [`train_svm_from_distances`], which still accepts one.
 pub fn train_svm(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
     config: &TrainConfig,
 ) -> Result<DtwSvmModel, anyhow::Error> {
-    let distance_matrix = compute_distance_matrix(&fingerprints, config.window);
-    train_svm_from_distances(fingerprints, labels, distance_matrix, config)
+    fit_from_labels(fingerprints, labels, config)
 }
 
-/// GPU variant of [`train_svm`]: computes the DTW distance matrix on the GPU,
-/// then runs the existing CPU kernel + SVM training logic.
+/// GPU variant of [`train_svm`].
+///
+/// Same dead-work caveat as [`train_svm`]: the distance matrix this used to
+/// compute on the device fed only the discarded kernel matrix, so the GPU pass
+/// is skipped and this is now identical to the CPU path. Kept as a distinct
+/// entry point so the `--gpu` flag keeps working and so a real fit can wire the
+/// device matrix back in.
 #[cfg(feature = "gpu")]
 pub fn train_svm_gpu(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
     config: &TrainConfig,
 ) -> Result<DtwSvmModel, anyhow::Error> {
-    let distance_matrix = compute_distance_matrix_gpu(&fingerprints, config.window)
-        .map_err(|e| anyhow::anyhow!("GPU DTW failed: {e}"))?;
-    train_svm_from_distances(fingerprints, labels, distance_matrix, config)
+    fit_from_labels(fingerprints, labels, config)
 }
 
-/// Shared back half of training: given a precomputed DTW distance matrix,
-/// build the RBF kernel, fit the SVM (binary or OvO multiclass), and package
-/// the model. Used by both [`train_svm`] (CPU DTW) and [`train_svm_gpu`].
+/// Back half of training given a precomputed DTW distance matrix.
+///
+/// The matrix is currently only shape-checked, not used — see the cost note on
+/// [`train_svm`]. This entry point exists so a real fit can consume a matrix
+/// (CPU- or GPU-computed) without changing its signature.
 pub fn train_svm_from_distances(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
     distance_matrix: Array2<f64>,
+    config: &TrainConfig,
+) -> Result<DtwSvmModel, anyhow::Error> {
+    if distance_matrix.nrows() != fingerprints.len()
+        || distance_matrix.ncols() != fingerprints.len()
+    {
+        anyhow::bail!(
+            "Distance matrix shape {:?} does not match {} fingerprints",
+            distance_matrix.shape(),
+            fingerprints.len()
+        );
+    }
+
+    fit_from_labels(fingerprints, labels, config)
+}
+
+/// The fit as it actually stands: derive the OvO weight layout from the class
+/// labels and package the model. Deliberately takes no distance/kernel matrix,
+/// because the current `train_binary_svm`/`train_multiclass_svm` bodies ignore
+/// one (`TODO(svm-real-fit)`).
+fn fit_from_labels(
+    fingerprints: Vec<Vec<f64>>,
+    labels: Vec<i32>,
     config: &TrainConfig,
 ) -> Result<DtwSvmModel, anyhow::Error> {
     if fingerprints.len() != labels.len() {
@@ -196,16 +247,6 @@ pub fn train_svm_from_distances(
 
     if fingerprints.is_empty() {
         anyhow::bail!("No training data provided");
-    }
-
-    if distance_matrix.nrows() != fingerprints.len()
-        || distance_matrix.ncols() != fingerprints.len()
-    {
-        anyhow::bail!(
-            "Distance matrix shape {:?} does not match {} fingerprints",
-            distance_matrix.shape(),
-            fingerprints.len()
-        );
     }
 
     // Get unique classes
@@ -232,32 +273,18 @@ pub fn train_svm_from_distances(
         .map(|(idx, &label)| (label, idx))
         .collect();
 
-    // Convert to kernel matrix
-    let kernel_matrix = distance_to_kernel_matrix(&distance_matrix, config.gamma, config.power);
-
-    // Convert labels to class indices for linfa
+    // Convert labels to class indices
     let target_indices: Vec<usize> = labels
         .iter()
         .map(|&l| *label_to_idx.get(&l).unwrap())
         .collect();
 
-    // For binary classification, use linfa-svm directly
-    // For multiclass, we'll use One-vs-Rest
     if n_classes == 2 {
-        train_binary_svm(
-            fingerprints,
-            labels,
-            &kernel_matrix,
-            &target_indices,
-            &label_mapper,
-            unique_labels,
-            config,
-        )
+        train_binary_svm(fingerprints, labels, &label_mapper, unique_labels, config)
     } else {
         train_multiclass_svm(
             fingerprints,
             labels,
-            &kernel_matrix,
             &target_indices,
             &label_mapper,
             unique_labels,
@@ -275,8 +302,6 @@ pub fn train_svm_from_distances(
 fn train_binary_svm(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
-    _kernel_matrix: &Array2<f64>,
-    _target_indices: &[usize],
     label_mapper: &HashMap<usize, i32>,
     classes: Vec<i32>,
     config: &TrainConfig,
@@ -326,7 +351,6 @@ fn train_binary_svm(
 fn train_multiclass_svm(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
-    _kernel_matrix: &Array2<f64>,
     target_indices: &[usize],
     label_mapper: &HashMap<usize, i32>,
     classes: Vec<i32>,
@@ -442,6 +466,59 @@ mod tests {
 
         assert_eq!(model.n_classes, 2);
         assert_eq!(model.n_samples(), 4);
+    }
+
+    /// Pins the cost note on [`train_svm`]: the DTW distance matrix and the RBF
+    /// kernel matrix do not influence the fitted model, so skipping them is
+    /// output-preserving. `window` is the sole input to the distance matrix, and
+    /// `gamma`/`power` the sole extra inputs to the kernel matrix; none may move
+    /// anything but the metadata fields that echo them back.
+    ///
+    /// If a real SVM fit lands, this test *should* fail — that is the signal to
+    /// restore the matrix computation in `train_svm`, not to relax the test.
+    #[test]
+    fn test_window_does_not_affect_fit() {
+        let fingerprints: Vec<Vec<f64>> = (0..24)
+            .map(|i| {
+                let c = (i % 3) as f64;
+                (0..12).map(|j| c + 0.1 * ((i * j) % 7) as f64).collect()
+            })
+            .collect();
+        let labels: Vec<i32> = (0..24).map(|i| i % 3).collect();
+
+        let fit = |window, gamma, power| {
+            let config = TrainConfig {
+                gamma,
+                power,
+                window,
+                ..TrainConfig::default()
+            };
+            train_svm(fingerprints.clone(), labels.clone(), &config).unwrap()
+        };
+
+        let base = fit(None, 1.0, 1.0);
+        for (window, gamma, power) in [(Some(1), 1.0, 1.0), (Some(64), 1.0, 1.0), (None, 7.5, 3.0)]
+        {
+            let other = fit(window, gamma, power);
+            assert_eq!(base.dual_coef, other.dual_coef);
+            assert_eq!(base.intercept, other.intercept);
+            assert_eq!(base.support_indices, other.support_indices);
+            assert_eq!(base.classes, other.classes);
+            assert_eq!(base.training_fingerprints, other.training_fingerprints);
+            assert_eq!(base.training_labels, other.training_labels);
+        }
+    }
+
+    /// `train_svm_from_distances` still validates the matrix shape even though
+    /// it no longer consumes the values.
+    #[test]
+    fn test_from_distances_rejects_wrong_shape() {
+        let fingerprints = vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 2.0]];
+        let labels = vec![0, 1, 1];
+        let bad = Array2::<f64>::zeros((2, 2));
+        assert!(
+            train_svm_from_distances(fingerprints, labels, bad, &TrainConfig::default()).is_err()
+        );
     }
 
     #[test]

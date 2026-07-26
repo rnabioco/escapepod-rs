@@ -7,7 +7,7 @@ use super::fp_io::read_labeled_fingerprints;
 use crate::style;
 use escapepod_demux::{TrainConfig, train_svm};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Arguments for the train-svm subcommand.
 #[derive(Debug, clap::Args)]
@@ -154,16 +154,23 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
         config.c
     );
 
-    // Train the SVM — GPU path for the all-pairs DTW when requested, CPU
-    // otherwise.
+    // The fit is currently label-only: the all-pairs DTW distance matrix and
+    // the RBF kernel matrix built from it are not consumed by the model that
+    // gets written (see the cost note on `escapepod_demux::train_svm`), so they
+    // are no longer computed. Say so rather than letting the flags that feed
+    // them look effective.
+    if args.window.is_some() || gpu_requested(&args) {
+        warn!(
+            "--window/--gpu configure the all-pairs DTW distance matrix, which the current \
+             SVM fit does not consume; they affect only the values recorded in the model \
+             metadata. Classification honours the recorded window."
+        );
+    }
+
     let model = if gpu_requested(&args) {
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::train_svm_gpu;
-            info!(
-                "{} DTW distance matrix on GPU...",
-                style::action("Computing")
-            );
             train_svm_gpu(fingerprints, labels, &config)?
         }
         #[cfg(not(feature = "gpu"))]
@@ -171,7 +178,6 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
             unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
         }
     } else {
-        info!("{} DTW distance matrix...", style::action("Computing"));
         train_svm(fingerprints, labels, &config)?
     };
 
