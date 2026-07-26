@@ -127,6 +127,54 @@ is genuinely inference-bound.
 Both are bit-identical to the previous results (covered by parity tests).
 
 
+## vs. official `pod5` (2026-07-26)
+
+Harness: `hyperfine`, `rna` node (Gold 6240R, 2x24 cores + HT = 96 logical;
+`-c 48` = one full socket, per the CLAUDE.md guidance on not crossing NUMA).
+escapepod-rs `--release`; `pod5` 0.3.44 from the `warpdemux-bench` pixi env.
+
+Input: 1.06 GB / 122,061 reads (a 10% `filter` of `Ma_20aa.pod5`), on BeeGFS,
+outputs to node-local disk.
+
+### Bulk data operations
+
+| Command | escapepod-rs | pod5 (Python) | Speedup |
+|---|---:|---:|---:|
+| `filter`, all reads (copy-all) | **1.760 s** ± 0.020 | 4.989 s ± 0.220 | **2.83x** |
+| `filter`, 10% of reads | **0.800 s** ± 0.026 | 3.759 s ± 0.074 | **4.70x** |
+| `subset`, 2 groups | **1.342 s** ± 0.117 | 4.867 s ± 0.011 | **3.63x** |
+
+### Metadata operations
+
+| Command | escapepod-rs | pod5 (Python) | Speedup |
+|---|---:|---:|---:|
+| `inspect summary` | **36.1 ms** ± 1.3 | 1.912 s ± 0.011 | **53x** |
+| `view` (-> /dev/null) | **226 ms** ± 1.5 | 4.945 s ± 0.035 | **21.9x** |
+
+### Notes on making this comparison fair
+
+- **Pick the input size deliberately.** An earlier run of the same `filter`
+  10% comparison against the full 10.4 GB `Ma_20aa.pod5` measured only 1.23x.
+  That is not a different result, it is a different workload: the output is
+  ~1 GB either way, so both tools spend most of their time reading the same
+  10.4 GB input and the ratio collapses toward 1. Size the input so the
+  operation, not the shared read, dominates.
+- **`escpod filter -i <ids>` and `--min-samples 0` are different code paths.**
+  A pure ID list takes the `is_uuid_only` fast path (`reads_by_ids`, skipping
+  non-matching batches); a criteria filter scans the reads table. Do not
+  compare timings across the two.
+- **`pod5 subset --csv` is not the path to benchmark.** Its CSV format is one
+  row per target with every read ID inline, and parsing that was OOM-killed at
+  48 GB on this 1 GB input. The `--summary` + `--columns` table path (used
+  above) is the documented and workable one.
+- pod5's subset output totalled 2.1 GB against a 1.06 GB input, so it is not
+  writing byte-comparable output here; the wall-clock ratio above should be
+  read with that in mind.
+
+The historical numbers below used `no_aaRS_caps_deacyl_b5.pod5` (4.4 GB), which
+no longer exists on this system, so they are kept for reference rather than
+being directly comparable to the table above.
+
 Comparison of `escapepod-rs` vs the official Python `pod5` tool (v0.3.36)
 and the reference barcode-demultiplexer (WarpDemuX / ADAPTed,
 `KleistLab/WarpDemuX`).

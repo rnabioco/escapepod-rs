@@ -894,3 +894,73 @@ pub(crate) fn build_pod5_footer(
 
     Ok(fbb.finished_data().to_vec())
 }
+
+/// One row of the signal table: the owning read's ID, its compressed signal
+/// bytes, and the sample count they decode to.
+///
+/// `data` borrows — for the block-copy operations it points straight into a
+/// source file's mmap, so constructing a batch from these is what faults those
+/// pages in.
+#[derive(Clone, Copy)]
+pub struct SignalRow<'a> {
+    /// The owning read's UUID, written to the signal table's `read_id` column.
+    pub read_id: [u8; 16],
+    /// Compressed (VBZ) signal bytes for this chunk.
+    pub data: &'a [u8],
+    /// Number of samples `data` decodes to.
+    pub samples: u32,
+}
+
+/// Build one signal-table `RecordBatch`.
+///
+/// Single definition of the signal table's column layout, shared by the
+/// block-copy path (`filter`/`subset`, which rebuild batches because they
+/// retain a subset of rows) and the incremental [`crate::Writer`]. `merge`
+/// deliberately does not use this: it retains every row, so it copies whole
+/// Arrow IPC blocks through from the source mmap without rebuilding anything.
+///
+/// # `read_id`
+///
+/// Always the real read UUID. Files written by Oxford Nanopore's own tooling
+/// populate this column (verified against a `pod5_subset` output: 9,954 rows,
+/// none zero-filled), and the schema documents it as "UUID for consistency
+/// checking", so writing zeros there was a deviation. `filter`/`subset`
+/// previously did exactly that, discarding the real ID that
+/// `RawSignalChunk` had already read out of the source file.
+///
+/// `total_bytes` pre-sizes the signal value buffer. Both callers already hold
+/// the rows in a concrete collection, so summing is cheap for them and saves
+/// the builder a doubling-realloc sequence over a multi-megabyte batch.
+pub fn build_signal_batch<'a, I>(
+    schema: &Arc<arrow::datatypes::Schema>,
+    rows: I,
+    total_bytes: usize,
+) -> Result<RecordBatch>
+where
+    I: IntoIterator<Item = SignalRow<'a>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    use arrow::array::LargeBinaryBuilder;
+
+    let rows = rows.into_iter();
+    let n = rows.len();
+
+    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+    let mut signal_builder = LargeBinaryBuilder::with_capacity(n, total_bytes);
+    let mut samples_builder = UInt32Builder::with_capacity(n);
+
+    for row in rows {
+        read_id_builder.append_value(row.read_id)?;
+        signal_builder.append_value(row.data);
+        samples_builder.append_value(row.samples);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(read_id_builder.finish()) as ArrayRef,
+            Arc::new(signal_builder.finish()) as ArrayRef,
+            Arc::new(samples_builder.finish()) as ArrayRef,
+        ],
+    )?)
+}

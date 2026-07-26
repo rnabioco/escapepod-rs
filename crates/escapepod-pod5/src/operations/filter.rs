@@ -11,7 +11,9 @@ use crate::utils::parse_uuid_flexible;
 use crate::utils::pod5_assembler::{
     FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
-use crate::utils::table_builders::{SchemaMetadata, build_reads_table_remapped};
+use crate::utils::table_builders::{
+    SchemaMetadata, SignalRow, build_reads_table_remapped, build_signal_batch,
+};
 use crate::writer::atomic::{AtomicFile, Durability};
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
@@ -320,7 +322,7 @@ fn assemble_output(
     // caller's readers) — never copied to the heap. On a 26 GB POD5 this avoids
     // ~26 GB of `Arc<[u8]>` heap allocation that would otherwise OOM modest
     // SLURM allocations.
-    type SignalChunks<'a> = Vec<(&'a [u8], u32)>;
+    type SignalChunks<'a> = Vec<SignalRow<'a>>;
 
     let extractions: Vec<Result<SignalChunks<'_>>> = sources
         .par_iter()
@@ -342,9 +344,16 @@ fn assemble_output(
                 .signal_footer
                 .extract_signal_rows(&signal_row_indices, signal_bytes)?;
 
+            // Keep the source file's own read_id: the signal table's
+            // `read_id` column is populated by ONT's tooling, and
+            // `RawSignalChunk` has already read it out of the source.
             let chunks: SignalChunks<'_> = raw_chunks
                 .into_iter()
-                .map(|chunk| (chunk.signal, chunk.samples))
+                .map(|chunk| SignalRow {
+                    read_id: chunk.read_id,
+                    data: chunk.signal,
+                    samples: chunk.samples,
+                })
                 .collect();
 
             Ok(chunks)
@@ -359,7 +368,7 @@ fn assemble_output(
     // below into `flat_reads`) walk sources in this same order, so chunk N of
     // the signal table must correspond to signal-row N of the output.
     let total_chunks: usize = source_extractions.iter().map(|e| e.len()).sum();
-    let mut signal_chunks: Vec<(&[u8], u32)> = Vec::with_capacity(total_chunks);
+    let mut signal_chunks: Vec<SignalRow<'_>> = Vec::with_capacity(total_chunks);
     for (source_idx, chunks) in source_extractions.iter().enumerate() {
         signal_chunks.extend_from_slice(chunks);
         if let Some(cb) = progress {
@@ -658,54 +667,66 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 }
 
 /// Stream the signal IPC table directly to `file`, returning the number of
-/// bytes written. Peak memory is bounded by one in-flight `RecordBatch`
-/// (≤ `batch_size` chunks), independent of the total signal volume.
+/// bytes written.
+///
+/// Batches are built **in parallel** and written in order. Building a batch
+/// means faulting source pages in from the mmap and memcpy'ing them into an
+/// Arrow buffer; doing that inline with the writes made this loop single
+/// threaded and latency-bound — profiling a 10.4 GB copy showed 75% of samples
+/// in `memmove` plus kernel page-fault time, at 24% CPU (a quarter of one
+/// core). Fanning the build across rayon lets those faults and copies overlap
+/// each other while the IPC stream itself stays strictly sequential.
+///
+/// Peak memory is bounded by `lookahead × batch_size` chunks in flight,
+/// independent of total signal volume.
 fn write_raw_signal_table<W: Write>(
     file: &mut W,
-    chunks: &[(&[u8], u32)],
+    chunks: &[SignalRow<'_>],
     batch_size: u32,
     meta: &SchemaMetadata,
 ) -> Result<usize> {
     use crate::schema::signal_schema;
-    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
     use arrow::ipc::writer::FileWriter;
-    use arrow::record_batch::RecordBatch;
+    use rayon::prelude::*;
 
     let schema = Arc::new(meta.apply(signal_schema()));
+
+    // How many batches to build concurrently. Bounded so peak memory stays
+    // modest: at the default 1000-chunk batches and ~10 KB chunks this is
+    // ~10 MB per batch in flight.
+    let lookahead = rayon::current_num_threads().clamp(2, 16);
+
+    // Precompute batch boundaries so the parallel build is a pure map.
+    let ranges: Vec<(usize, usize)> = (0..chunks.len())
+        .step_by(batch_size.max(1) as usize)
+        .map(|start| {
+            (
+                start,
+                (start + batch_size.max(1) as usize).min(chunks.len()),
+            )
+        })
+        .collect();
 
     let mut counter = CountingWriter::new(file);
     {
         let mut writer = FileWriter::try_new(&mut counter, &schema)?;
 
-        let total_rows = chunks.len();
-        let mut offset = 0;
-        while offset < total_rows {
-            let end = std::cmp::min(offset + batch_size as usize, total_rows);
-            let batch_chunks = &chunks[offset..end];
+        for window in ranges.chunks(lookahead) {
+            // Build this window concurrently; `collect` preserves order, so the
+            // IPC stream is written in exactly the original chunk order (which
+            // the reads table's signal-row prefix sums depend on).
+            let built: Vec<Result<arrow::record_batch::RecordBatch>> = window
+                .par_iter()
+                .map(|&(s, e)| {
+                    let run = &chunks[s..e];
+                    let total_bytes: usize = run.iter().map(|r| r.data.len()).sum();
+                    build_signal_batch(&schema, run.iter().copied(), total_bytes)
+                })
+                .collect();
 
-            let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
-            let mut signal_builder = LargeBinaryBuilder::new();
-            let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
-
-            for (signal_data, samples) in batch_chunks {
-                // The actual read_id lives in the reads table; the signal
-                // table's read_id column is unused by the POD5 reader.
-                read_id_builder.append_value([0u8; 16])?;
-                signal_builder.append_value(*signal_data);
-                samples_builder.append_value(*samples);
+            for batch in built {
+                writer.write(&batch?)?;
             }
-
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(read_id_builder.finish()) as ArrayRef,
-                    Arc::new(signal_builder.finish()) as ArrayRef,
-                    Arc::new(samples_builder.finish()) as ArrayRef,
-                ],
-            )?;
-
-            writer.write(&batch)?;
-            offset = end;
         }
 
         writer.finish()?;

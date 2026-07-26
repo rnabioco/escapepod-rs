@@ -35,9 +35,14 @@ import pod5
 # Locate the escpod binary
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-ESCPOD = REPO_ROOT / "target" / "release" / "escpod"
-if not ESCPOD.exists():
-    ESCPOD = REPO_ROOT / "target" / "debug" / "escpod"
+# `ESCPOD_BIN` lets this run against an arbitrary build — useful for checking
+# that a guardrail actually fails against the binary it was written to catch.
+if os.environ.get("ESCPOD_BIN"):
+    ESCPOD = Path(os.environ["ESCPOD_BIN"])
+else:
+    ESCPOD = REPO_ROOT / "target" / "release" / "escpod"
+    if not ESCPOD.exists():
+        ESCPOD = REPO_ROOT / "target" / "debug" / "escpod"
 if not ESCPOD.exists():
     sys.exit("ERROR: escpod binary not found. Run 'cargo build --release' first.")
 
@@ -1002,6 +1007,137 @@ def test_existing_files() -> bool:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Test 7: Structural table conformance (raw Arrow, including unused columns)
+# ---------------------------------------------------------------------------
+
+
+def _tables(path: Path) -> dict:
+    """Snapshot every embedded Arrow table as {name: pyarrow.Table}."""
+    with pod5.Reader(path) as reader:
+        return {
+            "reads": reader.read_table.read_all(),
+            "signal": reader.signal_table.read_all(),
+            "run_info": reader.run_info_table.read_all(),
+        }
+
+
+def _same_value(a, b) -> bool:
+    """Value equality that treats NaN as equal to NaN.
+
+    The reads table's optional float columns (scaling, pore levels) are NaN
+    when absent, and `nan != nan`, so a plain `!=` reports every such column as
+    a difference.
+    """
+    if isinstance(a, float) and isinstance(b, float):
+        import math
+
+        if math.isnan(a) and math.isnan(b):
+            return True
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _reads_by_id(reads_tbl) -> dict:
+    """Reads table as {read_id_bytes: {column: value}}."""
+    cols = {name: reads_tbl.column(name).to_pylist() for name in reads_tbl.schema.names}
+    out = {}
+    for i, rid in enumerate(cols["read_id"]):
+        out[bytes(rid)] = {name: vals[i] for name, vals in cols.items()}
+    return out
+
+
+def test_table_conformance(tmpdir: Path) -> bool:
+    """Diff the raw Arrow tables of an escapepod-written file against a
+    pod5-written one, column by column.
+
+    Every other test here compares what a *reader* returns, which by
+    construction cannot see a column no reader surfaces. That blind spot let
+    `filter`/`subset` write zero-filled `read_id`s into the signal table
+    indefinitely: files round-tripped perfectly because the reads table is the
+    authority for the read -> signal mapping, so nothing observable was wrong.
+    This test compares structure instead of observable values.
+    """
+    print("\n=== Test 7: Structural table conformance ===")
+    ok = True
+
+    reference = tmpdir / "python_written.pod5"
+    if not reference.exists():
+        write_python_pod5(reference)
+
+    ids_path = tmpdir / "all_ids.txt"
+    if not ids_path.exists():
+        ids_path.write_text("\n".join(str(rid) for rid in READ_IDS) + "\n")
+
+    produced = tmpdir / "conformance.pod5"
+    run_escpod(
+        "filter", str(reference),
+        "--ids", str(ids_path),
+        "--output", str(produced),
+    )
+
+    ref = _tables(reference)
+    got = _tables(produced)
+
+    # 1. Schema conformance: same columns, same types, same order.
+    for name in ("reads", "signal", "run_info"):
+        ref_fields = [(f.name, str(f.type)) for f in ref[name].schema]
+        got_fields = [(f.name, str(f.type)) for f in got[name].schema]
+        if ref_fields != got_fields:
+            print(f"  FAIL: {name} table schema differs")
+            print(f"    pod5:      {ref_fields}")
+            print(f"    escapepod: {got_fields}")
+            ok = False
+
+    # 2. Reads table: every column, for every read — not just the handful the
+    #    Python API surfaces.
+    ref_reads = _reads_by_id(ref["reads"])
+    got_reads = _reads_by_id(got["reads"])
+    if set(ref_reads) != set(got_reads):
+        print("  FAIL: reads table read_id sets differ")
+        ok = False
+    else:
+        for rid, ref_row in ref_reads.items():
+            got_row = got_reads[rid]
+            for col, ref_val in ref_row.items():
+                # `signal` holds signal-table row indices, which legitimately
+                # renumber when the table is rebuilt; its *contents* are
+                # checked in step 3.
+                if col == "signal":
+                    continue
+                if not _same_value(got_row.get(col), ref_val):
+                    print(
+                        f"  FAIL: reads.{col} differs for {uuid.UUID(bytes=rid)}: "
+                        f"{ref_val!r} -> {got_row.get(col)!r}"
+                    )
+                    ok = False
+
+    # 3. Signal table: the read_id column must identify the owning read.
+    for label, tbls in (("pod5", ref), ("escapepod", got)):
+        sig_ids = [bytes(v) for v in tbls["signal"].column("read_id").to_pylist()]
+        zero = sum(1 for v in sig_ids if v == b"\x00" * 16)
+        if zero:
+            print(
+                f"  FAIL: {label} signal table has {zero}/{len(sig_ids)} "
+                "zero-filled read_ids"
+            )
+            ok = False
+        for rid, row in _reads_by_id(tbls["reads"]).items():
+            for sig_row in row["signal"]:
+                if sig_ids[sig_row] != rid:
+                    print(
+                        f"  FAIL: {label} signal row {sig_row} carries the wrong "
+                        f"read_id (expected {uuid.UUID(bytes=rid)})"
+                    )
+                    ok = False
+                    break
+
+    if ok:
+        print("  PASS: Arrow tables structurally match pod5's output")
+    return ok
+
+
 def main():
     print(f"Using escpod binary: {ESCPOD}")
     print(f"pod5 version: {pod5.__version__}")
@@ -1023,6 +1159,7 @@ def main():
         results["merge_round_trip"] = test_merge_round_trip(tmpdir)
         results["subset_round_trip"] = test_subset_round_trip(tmpdir)
         results["edge_cases"] = test_edge_cases(tmpdir)
+        results["table_conformance"] = test_table_conformance(tmpdir)
 
     results["existing_files"] = test_existing_files()
 
