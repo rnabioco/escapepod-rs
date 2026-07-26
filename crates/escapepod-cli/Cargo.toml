@@ -113,6 +113,10 @@ cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
 # preprocessing. Needs a CUDA-enabled libonnxruntime + visible GPU at runtime.
 cnn-gpu = ["cnn-detect", "escapepod-demux/cnn-gpu"]
 experimental = []
+# Read POD5 objects straight from S3/GCS/Azure/HTTPS instead of a local path,
+# lazily over range requests (`escpod inspect s3://bucket/reads.pod5`). Opt-in
+# because object_store + tokio are otherwise dead weight in a local-file build.
+remote = ["signal", "escapepod-signal/remote"]
 # Download k-mer level models from the pinned nanoporetech/kmer_models commit
 # into the local cache (`escpod resquiggle models fetch`). Opt-in so the default
 # release binary pulls no TLS stack; implies `experimental` (the resquiggle

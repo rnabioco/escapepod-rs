@@ -3,9 +3,11 @@
 //! Generates a comprehensive summary of POD5 file(s) with statistics and QC metrics.
 
 use crate::progress::create_progress_bar;
-use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
+use crate::util::{
+    format_bytes, format_duration_hours, format_number, open_pod5, resolve_pod5_inputs,
+};
 use chrono::{TimeZone, Utc};
-use escapepod_signal::{Reader, ReadsBatchView, RunInfoData};
+use escapepod_signal::{ReadsBatchView, RunInfoData};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -124,7 +126,7 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
             );
         }
         // Try to open the file, skip if corrupted
-        let reader = match Reader::open(path) {
+        let reader = match open_pod5(path) {
             Ok(r) => r,
             Err(e) => {
                 corrupted_files.push(path.display().to_string());
@@ -143,8 +145,11 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
             *old_version_files.entry(version.to_string()).or_insert(0) += 1;
         }
 
-        // Get file size
-        let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // Get file size. `fs::metadata` has nothing to stat for a remote
+        // object, so fall back to the size the reader already resolved.
+        let size_bytes = fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or_else(|_| reader.file_size());
 
         // Get batch count (handle errors gracefully)
         let batch_count = reader.read_batch_count().unwrap_or(0);

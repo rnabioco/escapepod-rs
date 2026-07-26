@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn test_parse_real_signal_table() {
         // Use bundled test data in data/drna
-        let test_file = std::path::Path::new("../data/drna/yeast_trna_reads.pod5");
+        let test_file = std::path::Path::new("../../data/drna/yeast_trna_reads.pod5");
         if !test_file.exists() {
             eprintln!("Skipping test - test file not found at {:?}", test_file);
             return;
@@ -899,7 +899,7 @@ mod tests {
     /// (so the test degrades to garbage-only input rather than failing).
     fn load_real_signal_bytes() -> Option<Vec<u8>> {
         for candidate in [
-            "../data/drna/yeast_trna_reads.pod5",
+            "../../data/drna/yeast_trna_reads.pod5",
             "../../ext/nanopore-dna-data/pod5/yeast_trna_reads.pod5",
         ] {
             let path = std::path::Path::new(candidate);

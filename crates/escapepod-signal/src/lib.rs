@@ -36,6 +36,8 @@ pub use escapepod_pod5::{
     compression, error, merge, operations, progress, reader, types, utils, writer,
 };
 
+#[cfg(feature = "remote")]
+pub use escapepod_pod5::RemoteSource;
 pub use escapepod_pod5::{
     ALL_FIELDS, AtomicFile, CompressedSignalChunk, DEFAULT_FIELDS, Durability, EndReason, Error,
     FieldError, MergeOptions, MergePhase, MergeProgress, MergeResult, PoreType,
@@ -45,3 +47,4 @@ pub use escapepod_pod5::{
     compute_statistics, determine_fields, get_field_value, merge_files, parse_uuid_flexible,
     repack_files, write_field_value,
 };
+pub use escapepod_pod5::{ByteSource, MemorySource, MmapSource, is_remote_url};

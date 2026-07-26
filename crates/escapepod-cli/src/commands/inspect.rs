@@ -1,8 +1,8 @@
 //! Inspect command implementation.
 
 use crate::style;
-use crate::util::resolve_pod5_inputs;
-use escapepod_signal::{Reader, ReadsBatchView};
+use crate::util::{open_pod5, resolve_pod5_inputs};
+use escapepod_signal::ReadsBatchView;
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -27,7 +27,7 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     let mut total_batches = 0usize;
 
     for file_path in &files {
-        let reader = match Reader::open(file_path) {
+        let reader = match open_pod5(file_path) {
             Ok(r) => r,
             Err(e) => {
                 if is_directory {
@@ -38,7 +38,7 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
                     );
                     continue;
                 } else {
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         };
@@ -134,7 +134,7 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
     println!("{}", "-".repeat(76));
 
     for file_path in &files {
-        let reader = match Reader::open(file_path) {
+        let reader = match open_pod5(file_path) {
             Ok(r) => r,
             Err(e) => {
                 if is_directory {
@@ -145,7 +145,7 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
                     );
                     continue;
                 } else {
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         };
@@ -190,10 +190,10 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
     let target_id: uuid::Uuid = read_id.parse()?;
 
     for file_path in &files {
-        let reader = match Reader::open(file_path) {
+        let reader = match open_pod5(file_path) {
             Ok(r) => r,
             Err(_) if is_directory => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
 
         // Use the indexed by-id lookup so this is O(1) per file when a

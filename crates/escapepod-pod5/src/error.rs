@@ -28,6 +28,10 @@ pub enum Error {
     #[error("FlatBuffer error: {0}")]
     FlatBuffer(String),
 
+    /// Failure reading a POD5 object from object storage or over HTTP.
+    #[error("Remote read error: {0}")]
+    Remote(String),
+
     /// Arrow IPC error.
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),

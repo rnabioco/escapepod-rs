@@ -103,7 +103,81 @@ impl Footer {
     }
 }
 
-/// Parse the footer from a POD5 file.
+/// Size of the fixed trailer at the very end of a POD5 file:
+/// footer length (8) + section marker (16) + signature (8).
+pub const TRAILER_LENGTH: usize = 8 + SECTION_MARKER_LENGTH + 8;
+
+/// Smallest file that can possibly hold a footer: leading signature, the
+/// trailer, the `FOOTER` magic, and a minimal FlatBuffer root.
+const MIN_FOOTER_FILE_LENGTH: u64 = (8 + TRAILER_LENGTH + 8 + 4) as u64;
+
+/// Locate the footer region — the `FOOTER\0\0` magic plus the FlatBuffer body —
+/// from the file's fixed-size trailer alone.
+///
+/// This is the seam that lets a footer be parsed without the whole file in
+/// hand: given the last [`TRAILER_LENGTH`] bytes and the object's total size,
+/// it returns the absolute byte range a caller must fetch and hand to
+/// [`parse_footer_region`]. Local readers slice that range out of the mmap;
+/// remote readers turn it into a range request.
+pub fn footer_body_range(trailer: &[u8], file_len: u64) -> Result<std::ops::Range<u64>> {
+    if file_len < MIN_FOOTER_FILE_LENGTH {
+        return Err(Error::InvalidFooter("File too small".to_string()));
+    }
+    if trailer.len() != TRAILER_LENGTH {
+        return Err(Error::InvalidFooter(format!(
+            "Footer trailer must be {TRAILER_LENGTH} bytes, got {}",
+            trailer.len()
+        )));
+    }
+
+    // Verify end signature
+    if trailer[TRAILER_LENGTH - 8..] != POD5_SIGNATURE {
+        return Err(Error::SignatureMismatch);
+    }
+
+    // Footer length sits immediately before the section marker and signature.
+    let mut cursor = Cursor::new(&trailer[..8]);
+    let footer_len = cursor.read_i64::<LittleEndian>()?;
+    if footer_len < 0 {
+        return Err(Error::InvalidFooter(format!(
+            "Negative footer length: {footer_len}"
+        )));
+    }
+    let footer_len = footer_len as u64;
+
+    let footer_len_offset = file_len - TRAILER_LENGTH as u64;
+    // The magic precedes the body, so the region is `footer_len + 8` bytes and
+    // must fit between the leading file signature and the trailer. Checked
+    // arithmetic here is what keeps a corrupt length from wrapping into a wild
+    // slice.
+    let region_len = footer_len + 8;
+    let magic_start = footer_len_offset
+        .checked_sub(region_len)
+        .filter(|start| *start >= 8)
+        .ok_or_else(|| {
+            Error::InvalidFooter(format!(
+                "Footer length {footer_len} does not fit in a {file_len}-byte file"
+            ))
+        })?;
+
+    Ok(magic_start..footer_len_offset)
+}
+
+/// Parse a footer region that begins with the `FOOTER\0\0` magic — the range
+/// reported by [`footer_body_range`].
+pub fn parse_footer_region(region: &[u8]) -> Result<Footer> {
+    if region.len() < 8 || region[..8] != FOOTER_MAGIC {
+        return Err(Error::InvalidFooter("Missing FOOTER magic".to_string()));
+    }
+    parse_flatbuffer_footer(&region[8..])
+}
+
+/// Parse the footer from a complete POD5 file image.
+///
+/// The reader itself never has the whole file in hand — it goes through
+/// [`footer_body_range`] + [`parse_footer_region`] so the same code path serves
+/// local and remote sources. This whole-file form is retained as the oracle
+/// those two are checked against.
 ///
 /// The footer is located at the end of the file with the following structure:
 /// - "FOOTER\0\0" magic (8 bytes)
@@ -111,37 +185,15 @@ impl Footer {
 /// - Footer length (8 bytes, little-endian i64)
 /// - Section marker (16 bytes)
 /// - Signature (8 bytes)
+#[cfg(test)]
 pub fn parse_footer(data: &[u8]) -> Result<Footer> {
-    let file_len = data.len();
-
-    // Minimum size check: signature(8) + section_marker(16) + footer_len(8) + magic(8) + some footer
-    if file_len < 8 + SECTION_MARKER_LENGTH + 8 + 8 + 4 {
+    let file_len = data.len() as u64;
+    if file_len < MIN_FOOTER_FILE_LENGTH {
         return Err(Error::InvalidFooter("File too small".to_string()));
     }
 
-    // Verify end signature
-    let end_sig = &data[file_len - 8..];
-    if end_sig != POD5_SIGNATURE {
-        return Err(Error::SignatureMismatch);
-    }
-
-    // Read footer length (before section marker and signature)
-    let footer_len_offset = file_len - 8 - SECTION_MARKER_LENGTH - 8;
-    let mut cursor = Cursor::new(&data[footer_len_offset..footer_len_offset + 8]);
-    let footer_len = cursor.read_i64::<LittleEndian>()? as usize;
-
-    // Calculate footer start (after FOOTER magic)
-    let footer_data_start = footer_len_offset - footer_len;
-    let magic_start = footer_data_start - 8;
-
-    // Verify FOOTER magic
-    if data[magic_start..magic_start + 8] != FOOTER_MAGIC {
-        return Err(Error::InvalidFooter("Missing FOOTER magic".to_string()));
-    }
-
-    // Parse FlatBuffer footer
-    let footer_bytes = &data[footer_data_start..footer_data_start + footer_len];
-    parse_flatbuffer_footer(footer_bytes)
+    let range = footer_body_range(&data[data.len() - TRAILER_LENGTH..], file_len)?;
+    parse_footer_region(&data[range.start as usize..range.end as usize])
 }
 
 /// Parse the FlatBuffer-encoded footer data.
@@ -434,5 +486,94 @@ mod tests {
     fn test_format_from_i16() {
         assert_eq!(Format::from_i16(0).unwrap(), Format::FeatherV2);
         assert!(Format::from_i16(99).is_err());
+    }
+
+    /// Locate a real POD5 file to parse. Returns `None` when the bundled test
+    /// data isn't present, so the suite degrades rather than fails.
+    fn real_pod5() -> Option<Vec<u8>> {
+        // Tests run with the crate directory as CWD, so the workspace-level
+        // `data/` tree is two levels up.
+        for candidate in [
+            "../../data/drna/yeast_trna_reads.pod5",
+            "../../ext/nanopore-dna-data/pod5/yeast_trna_reads.pod5",
+        ] {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    /// The seam the remote reader depends on: given only the fixed trailer and
+    /// the object's size, `footer_body_range` must point at exactly the bytes
+    /// `parse_footer` would have used from the whole file.
+    #[test]
+    fn tail_parse_matches_whole_file_parse() {
+        let Some(data) = real_pod5() else {
+            eprintln!("Skipping - no test POD5 available");
+            return;
+        };
+        let file_len = data.len() as u64;
+
+        let whole = parse_footer(&data).expect("whole-file parse failed");
+
+        let trailer = &data[data.len() - TRAILER_LENGTH..];
+        let range = footer_body_range(trailer, file_len).expect("footer_body_range failed");
+        let tail = parse_footer_region(&data[range.start as usize..range.end as usize])
+            .expect("region parse failed");
+
+        assert_eq!(whole.file_identifier, tail.file_identifier);
+        assert_eq!(whole.software, tail.software);
+        assert_eq!(whole.pod5_version, tail.pod5_version);
+        assert_eq!(whole.contents.len(), tail.contents.len());
+        for (a, b) in whole.contents.iter().zip(&tail.contents) {
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.length, b.length);
+            assert_eq!(a.content_type, b.content_type);
+        }
+
+        // The footer sits comfortably inside the tail the reader probes, which
+        // is what keeps a remote open to one round trip for the footer.
+        assert!(file_len - range.start < 64 * 1024);
+    }
+
+    /// A corrupt footer length must be rejected, not turned into a wild slice.
+    /// These inputs reach the parser straight from untrusted file bytes.
+    #[test]
+    fn corrupt_trailers_are_rejected_without_panicking() {
+        let file_len = 100_000u64;
+        let mut trailer = vec![0u8; TRAILER_LENGTH];
+        trailer[TRAILER_LENGTH - 8..].copy_from_slice(&POD5_SIGNATURE);
+
+        // Footer longer than the file.
+        trailer[..8].copy_from_slice(&(file_len as i64 * 2).to_le_bytes());
+        assert!(footer_body_range(&trailer, file_len).is_err());
+
+        // Negative footer length.
+        trailer[..8].copy_from_slice(&(-1i64).to_le_bytes());
+        assert!(footer_body_range(&trailer, file_len).is_err());
+
+        // Footer length that would place the magic inside the leading signature.
+        let overlap = file_len - TRAILER_LENGTH as u64 - 4;
+        trailer[..8].copy_from_slice(&(overlap as i64).to_le_bytes());
+        assert!(footer_body_range(&trailer, file_len).is_err());
+
+        // Plausible length but a bad end signature.
+        trailer[..8].copy_from_slice(&64i64.to_le_bytes());
+        trailer[TRAILER_LENGTH - 1] = 0xff;
+        assert!(matches!(
+            footer_body_range(&trailer, file_len),
+            Err(Error::SignatureMismatch)
+        ));
+
+        // Wrong trailer size, and a file too small to hold a footer at all.
+        assert!(footer_body_range(&trailer[..4], file_len).is_err());
+        assert!(footer_body_range(&trailer, 8).is_err());
+    }
+
+    #[test]
+    fn region_without_magic_is_rejected() {
+        assert!(parse_footer_region(b"NOTMAGIC____").is_err());
+        assert!(parse_footer_region(b"").is_err());
     }
 }
