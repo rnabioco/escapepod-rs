@@ -40,6 +40,51 @@ pub struct SvmPredictor<'a> {
     /// SoA-packed training bank for [`dtw_distances_batch_unconstrained`].
     /// Empty unless `train_uniform_len.is_some()`.
     training_blocks: Vec<f32>,
+    /// When the support vectors are grouped contiguously by class and those
+    /// groups appear in class order — the layout libsvm/sklearn exports, and
+    /// what `train.rs` produces — `class_ranges[c]` is the local-index range of
+    /// class `c`'s support vectors.
+    ///
+    /// This lets the OvO decision function touch only the support vectors that
+    /// can contribute to each pair. The full scan costs `k(k-1)/2 × n_sv` while
+    /// useful work is only `(k-1) × n_sv`, so the wasted fraction grows as
+    /// `1 - 2/k`: 60% wasted at k=5, 90% at k=20. Iterating range `i` then
+    /// range `j` visits the same support vectors in the same ascending order as
+    /// the full scan, so the accumulation order — and hence the exact
+    /// floating-point result — is unchanged; only the `+= 0.0` steps for
+    /// non-contributing support vectors are skipped.
+    ///
+    /// `None` for any other layout, which falls back to the full scan.
+    class_ranges: Option<Vec<std::ops::Range<usize>>>,
+}
+
+/// Detect the class-contiguous support-vector layout described on
+/// [`SvmPredictor::class_ranges`]. Returns `None` unless every class's support
+/// vectors form one contiguous run, the runs are in ascending class order, and
+/// together they cover all support vectors (no unclassified stragglers).
+fn class_contiguous_ranges(
+    sv_class: &[Option<usize>],
+    n_classes: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if sv_class.is_empty() || n_classes == 0 {
+        return None;
+    }
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(n_classes);
+    let mut pos = 0usize;
+    for c in 0..n_classes {
+        let start = pos;
+        while pos < sv_class.len() && sv_class[pos] == Some(c) {
+            pos += 1;
+        }
+        // An empty run is fine (a class with no SVs), but anything that is not
+        // the next class in order means the bank is not class-grouped.
+        ranges.push(start..pos);
+    }
+    if pos == sv_class.len() {
+        Some(ranges)
+    } else {
+        None
+    }
 }
 
 impl<'a> SvmPredictor<'a> {
@@ -91,6 +136,8 @@ impl<'a> SvmPredictor<'a> {
             None => Vec::new(),
         };
 
+        let class_ranges = class_contiguous_ranges(&sv_class, model.n_classes);
+
         Self {
             model,
             training_class,
@@ -98,6 +145,7 @@ impl<'a> SvmPredictor<'a> {
             training_f32,
             train_uniform_len,
             training_blocks,
+            class_ranges,
         }
     }
 
@@ -191,6 +239,16 @@ impl<'a> SvmPredictor<'a> {
         // `sv_class[sv_local_idx]` is precomputed in `new()`, so the inner
         // loop touches only Vec indexing — no HashMap probe per SV per pair.
         let mut decisions = vec![0.0; n_pairs];
+        self.ovo_decisions_into(kernel_values, &mut decisions);
+        decisions
+    }
+
+    /// The libsvm one-vs-one dual-coefficient accumulation, shared by both
+    /// [`Self::decision_function`] and [`Self::decision_function_into`].
+    ///
+    /// `decisions` must already be sized to `n_pairs`.
+    fn ovo_decisions_into(&self, kernel_values: &[f64], decisions: &mut [f64]) {
+        let n_classes = self.model.n_classes;
         let sv_class = self.sv_class.as_slice();
         let support_indices = self.model.support_indices.as_slice();
         let intercept = self.model.intercept.as_slice();
@@ -205,21 +263,37 @@ impl<'a> SvmPredictor<'a> {
                 let coef_j = dual_coef[i].as_slice();
                 let mut sum = intercept[pair_idx];
 
-                for (sv_local_idx, &sv_global_idx) in support_indices.iter().enumerate() {
-                    let coef = match sv_class[sv_local_idx] {
-                        Some(c) if c == i => coef_i[sv_local_idx],
-                        Some(c) if c == j => coef_j[sv_local_idx],
-                        _ => 0.0,
-                    };
-                    sum += coef * kernel_values[sv_global_idx];
+                match &self.class_ranges {
+                    // Class-grouped bank: visit only the two contributing runs.
+                    // `i < j` and the runs are in class order, so this is the
+                    // same ascending traversal the full scan performs — the
+                    // additions happen in the same order and produce the same
+                    // bits.
+                    Some(ranges) => {
+                        for l in ranges[i].clone() {
+                            sum += coef_i[l] * kernel_values[support_indices[l]];
+                        }
+                        for l in ranges[j].clone() {
+                            sum += coef_j[l] * kernel_values[support_indices[l]];
+                        }
+                    }
+                    // Arbitrary layout: scan every support vector.
+                    None => {
+                        for (sv_local_idx, &sv_global_idx) in support_indices.iter().enumerate() {
+                            let coef = match sv_class[sv_local_idx] {
+                                Some(c) if c == i => coef_i[sv_local_idx],
+                                Some(c) if c == j => coef_j[sv_local_idx],
+                                _ => 0.0,
+                            };
+                            sum += coef * kernel_values[sv_global_idx];
+                        }
+                    }
                 }
 
                 decisions[pair_idx] = sum;
                 pair_idx += 1;
             }
         }
-
-        decisions
     }
 
     /// Workspace-backed variant of [`Self::decision_function`]. Reuses
@@ -253,31 +327,7 @@ impl<'a> SvmPredictor<'a> {
             return;
         }
 
-        let sv_class = self.sv_class.as_slice();
-        let support_indices = self.model.support_indices.as_slice();
-        let intercept = self.model.intercept.as_slice();
-        let dual_coef = self.model.dual_coef.as_slice();
-
-        let mut pair_idx = 0;
-        for i in 0..n_classes {
-            for j in (i + 1)..n_classes {
-                let coef_i = dual_coef[j - 1].as_slice();
-                let coef_j = dual_coef[i].as_slice();
-                let mut sum = intercept[pair_idx];
-
-                for (sv_local_idx, &sv_global_idx) in support_indices.iter().enumerate() {
-                    let coef = match sv_class[sv_local_idx] {
-                        Some(c) if c == i => coef_i[sv_local_idx],
-                        Some(c) if c == j => coef_j[sv_local_idx],
-                        _ => 0.0,
-                    };
-                    sum += coef * kernel_values[sv_global_idx];
-                }
-
-                decisions[pair_idx] = sum;
-                pair_idx += 1;
-            }
-        }
+        self.ovo_decisions_into(kernel_values, decisions);
     }
 
     /// Convert OvO decision values to class votes.
@@ -604,4 +654,116 @@ impl<'a> SvmPredictor<'a> {
 pub fn classify_with_svm(model: &SvmModel, fingerprint: &[f64]) -> (Vec<f64>, ProbabilityResult) {
     let predictor = SvmPredictor::new(model);
     predictor.predict(fingerprint)
+}
+
+#[cfg(test)]
+mod ovo_layout_tests {
+    use super::*;
+    use crate::model::KernelParams;
+    use std::collections::HashMap;
+
+    /// Build a model whose support vectors are grouped contiguously by class
+    /// (the libsvm/sklearn export layout), optionally shuffled into an
+    /// interleaved order that defeats the contiguity detection.
+    fn model(n_classes: usize, per_class: usize, interleave: bool) -> DtwSvmModel {
+        let total = n_classes * per_class;
+        let mut training_labels = Vec::with_capacity(total);
+        if interleave {
+            // Round-robin labels: no class occupies a contiguous run.
+            for k in 0..total {
+                training_labels.push((k % n_classes) as i32);
+            }
+        } else {
+            for c in 0..n_classes {
+                for _ in 0..per_class {
+                    training_labels.push(c as i32);
+                }
+            }
+        }
+
+        let fingerprints: Vec<Vec<f64>> = (0..total)
+            .map(|i| (0..8).map(|j| ((i * 8 + j) % 17) as f64 * 0.11).collect())
+            .collect();
+        let n_pairs = n_classes * (n_classes - 1) / 2;
+        let dual_coef: Vec<Vec<f64>> = (0..n_classes - 1)
+            .map(|r| {
+                (0..total)
+                    .map(|i| ((r * 31 + i * 7) % 23) as f64 * 0.037 - 0.4)
+                    .collect()
+            })
+            .collect();
+
+        DtwSvmModel {
+            version: "1.0".to_string(),
+            training_fingerprints: fingerprints,
+            training_labels,
+            support_indices: (0..total).collect(),
+            dual_coef,
+            intercept: (0..n_pairs).map(|p| p as f64 * 0.05 - 0.1).collect(),
+            classes: (0..n_classes as i32).collect(),
+            kernel_params: KernelParams {
+                gamma: 1.0,
+                power: 2.0,
+            },
+            window: Some(15),
+            penalty: 0.1,
+            label_mapper: (0..n_classes)
+                .map(|c| (c, c as i32))
+                .collect::<HashMap<_, _>>(),
+            thresholds: None,
+            prob_a: None,
+            prob_b: None,
+            n_classes,
+            noise_class: false,
+            use_kernel_weighted: false,
+        }
+    }
+
+    /// The class-grouped fast path must reproduce the full scan **exactly**,
+    /// not just approximately: it skips only `+= 0.0` terms and preserves the
+    /// ascending traversal order, so every bit must match.
+    #[test]
+    fn class_grouped_ovo_is_bit_identical_to_full_scan() {
+        for &(k, per_class) in &[(2usize, 5usize), (5, 13), (8, 3)] {
+            let grouped = model(k, per_class, false);
+            let mut fast = SvmPredictor::new(&grouped);
+            assert!(
+                fast.class_ranges.is_some(),
+                "class-grouped bank should be detected for k={k}"
+            );
+
+            // Same predictor, contiguity detection disabled -> full scan.
+            fast.class_ranges = None;
+            let reference = &fast;
+
+            let kernel_values: Vec<f64> = (0..k * per_class)
+                .map(|i| ((i * 13 % 29) as f64 / 29.0).max(1e-6))
+                .collect();
+            let full = reference.decision_function(&kernel_values);
+
+            let fast_pred = SvmPredictor::new(&grouped);
+            let quick = fast_pred.decision_function(&kernel_values);
+
+            assert_eq!(full.len(), quick.len());
+            for (a, b) in full.iter().zip(&quick) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "k={k}: fast path diverged from full scan ({a} vs {b})"
+                );
+            }
+        }
+    }
+
+    /// A bank that is not class-grouped must fall back to the full scan rather
+    /// than silently reading the wrong support vectors.
+    #[test]
+    fn interleaved_bank_falls_back_to_full_scan() {
+        let interleaved = model(4, 6, true);
+        let pred = SvmPredictor::new(&interleaved);
+        assert!(
+            pred.class_ranges.is_none(),
+            "interleaved bank must not be treated as class-grouped"
+        );
+    }
 }

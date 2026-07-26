@@ -203,6 +203,80 @@ fn bench_compute_distances(c: &mut Criterion) {
     group.finish();
 }
 
+/// Build a production-shaped `DtwSvmModel`: a Sakoe-Chiba band plus a warping
+/// penalty (as every converted WarpDemuX model carries) and dual-coefficient
+/// OvO scoring rather than kernel-weighted voting.
+fn build_windowed_svm_model(n_classes: usize, per_class: usize, feature_len: usize) -> DtwSvmModel {
+    let mut model = build_svm_model(n_classes, per_class, feature_len);
+    model.window = Some(15);
+    model.penalty = 0.1;
+    model.use_kernel_weighted = false;
+    // Non-zero dual coefficients so the OvO accumulation cannot be folded away.
+    let total = n_classes * per_class;
+    for (r, row) in model.dual_coef.iter_mut().enumerate() {
+        for (i, v) in row.iter_mut().enumerate() {
+            *v = pseudo_floats_f64(1, 0x5000 + (r * total + i) as u64)[0];
+        }
+    }
+    model
+}
+
+/// Production-shaped **windowed** per-read classify.
+///
+/// This is the path `escpod demux classify` actually runs. Two things make it
+/// different from [`bench_compute_distances`], and both matter:
+///
+/// - Real models carry `window = Some(15)` / `penalty = 0.1`, so
+///   `dtw_distances_batch` uses the *windowed* lane-parallel kernel, not the
+///   unconstrained fast path.
+/// - `compute_distances` is the scalar one-pair-at-a-time helper; the shipping
+///   path goes through `predict_with_workspace`, which scores `DTW_LANES`
+///   references per SIMD batch off the SoA-packed bank.
+///
+/// Shape is the shipped WDX4 model: 851 references × 25 features, 5 classes.
+fn bench_predict_windowed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("classify_predict_windowed");
+    for &(n_classes, per_class, flen) in &[(5usize, 170usize, 25usize), (5, 680, 25)] {
+        let model = build_windowed_svm_model(n_classes, per_class, flen);
+        let predictor = SvmPredictor::new(&model);
+        let query = pseudo_floats_f64(flen, 0xF00DCAFE);
+        let total = n_classes * per_class;
+        group.throughput(Throughput::Elements(total as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{total}refs_x{flen}")),
+            &(),
+            |bench, _| {
+                let mut ws = SvmWorkspace::for_model(predictor.model());
+                bench.iter(|| predictor.predict_with_workspace(black_box(&query), &mut ws));
+            },
+        );
+    }
+    group.finish();
+}
+
+/// The OvO decision function in isolation, on the production dual-coefficient
+/// shape — it is ~11% of per-read classify once DTW is optimized.
+fn bench_decision_function_windowed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("classify_decision_windowed");
+    for &(n_classes, per_class) in &[(5usize, 170usize), (20usize, 43usize)] {
+        let model = build_windowed_svm_model(n_classes, per_class, 25);
+        let predictor = SvmPredictor::new(&model);
+        let query = pseudo_floats_f64(25, 0xF00DCAFE);
+        let mut ws = SvmWorkspace::for_model(predictor.model());
+        // Populate a realistic kernel vector via one real predict.
+        let _ = predictor.predict_with_workspace(&query, &mut ws);
+        let kernel_values = vec![0.5f64; n_classes * per_class];
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_classes}cls_{}sv", n_classes * per_class)),
+            &(),
+            |bench, _| {
+                bench.iter(|| predictor.decision_function(black_box(&kernel_values)));
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_svm_pipeline(c: &mut Criterion) {
     // Per-read pipeline after DTW: kernel transform + OvO voting.
     let mut group = c.benchmark_group("classify_svm_pipeline");
@@ -279,6 +353,8 @@ criterion_group!(
     benches,
     bench_classify_read,
     bench_compute_distances,
+    bench_predict_windowed,
+    bench_decision_function_windowed,
     bench_svm_pipeline,
     bench_svm_predict,
 );
