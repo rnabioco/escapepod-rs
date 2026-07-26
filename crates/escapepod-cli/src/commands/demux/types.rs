@@ -2,7 +2,7 @@
 //! (fingerprints, boundaries, etc.) live in [`escapepod_demux`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Barcode statistics for training output.
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,8 +29,12 @@ pub struct TrainParams {
 /// Training output JSON structure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrainingOutput {
-    /// Map of barcode name to statistics
-    pub barcodes: HashMap<String, BarcodeStats>,
+    /// Map of barcode name to statistics.
+    ///
+    /// `BTreeMap` rather than `HashMap` so the serialized JSON emits barcodes in
+    /// a stable order. With a `HashMap` the key order varied per process, so two
+    /// identical training runs produced files that would not `diff`.
+    pub barcodes: BTreeMap<String, BarcodeStats>,
     /// Training parameters used
     pub params: TrainParams,
 }

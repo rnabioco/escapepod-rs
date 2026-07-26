@@ -154,16 +154,14 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
         style::count(reads_by_file.len())
     );
 
-    // Extract fingerprints for all reads
-    let all_fingerprints = extract_fingerprints(&reads_by_file, &args, norm_method)?;
+    // Extract fingerprints, bucketed by barcode as they are produced.
+    let barcode_fingerprints = extract_fingerprints_by_barcode(&reads_by_file, &args, norm_method)?;
 
-    // Group fingerprints by barcode
-    let barcode_fingerprints = group_fingerprints_by_barcode(&all_fingerprints, &assignments);
-
+    let total_extracted: usize = barcode_fingerprints.values().map(|v| v.len()).sum();
     info!(
         "{} {} total fingerprints extracted",
         style::label("Extracted:"),
-        style::count(all_fingerprints.len())
+        style::count(total_extracted)
     );
 
     // Compute consensus fingerprints and build output
@@ -289,66 +287,113 @@ fn group_reads_by_file(
     reads_by_file
 }
 
-/// Extract fingerprints from reads based on assignments.
-fn extract_fingerprints(
+/// Extract fingerprints from the assigned reads, grouped by barcode.
+///
+/// Structured like the `fingerprint` and `detect` subcommands rather than the
+/// old per-file `par_iter`: files are walked *sequentially* (one ascending mmap
+/// sweep of the signal table per Arrow batch, #72 — fanning I/O across reads or
+/// files instead turns a 288 MB/s sequential read into N concurrent
+/// demand-paging streams), and the parallelism lives *inside* each batch, where
+/// the expensive work is. The old shape parallelized only across files, so the
+/// common single-POD5 training run used one core no matter the `-t` setting.
+///
+/// Two further savings on the way in:
+/// * rows are gated on the cheap `view.read_id(row)` before `view.read(row)`
+///   decodes all 22 fields, so reads outside the assignment set cost one UUID
+///   read instead of a full record;
+/// * fingerprints are accumulated straight into per-barcode buckets, which
+///   removes the intermediate `read_id -> fingerprint` map and the full clone
+///   of every fingerprint that the separate grouping pass used to make.
+fn extract_fingerprints_by_barcode(
     reads_by_file: &HashMap<PathBuf, Vec<(Uuid, String)>>,
     args: &TrainArgs,
     norm_method: escapepod_signal::dtw::NormMethod,
-) -> anyhow::Result<HashMap<Uuid, Vec<f32>>> {
+) -> anyhow::Result<HashMap<String, Vec<Vec<f32>>>> {
     let total_reads: usize = reads_by_file.values().map(|v| v.len()).sum();
     let progress_bar = create_progress_bar(total_reads as u64, "Processing")?;
 
-    // Inner `for read in reads.flatten()` is sequential per file, so we batch
-    // progress increments to cut cross-file atomic contention.
-    const PROGRESS_BATCH: u64 = 64;
-    let all_fingerprints: HashMap<Uuid, Vec<f32>> = reads_by_file
-        .par_iter()
-        .flat_map(|(pod5_path, read_list)| {
-            let mut fingerprints = Vec::new();
-            let read_ids: HashSet<Uuid> = read_list.iter().map(|(id, _)| *id).collect();
-            let mut pending_inc: u64 = 0;
+    let mut by_barcode: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
 
-            if let Ok(reader) = Reader::open(pod5_path)
-                && let Ok(batches) = reader.read_batches()
-            {
-                for batch_result in batches {
-                    let Ok(batch) = batch_result else { continue };
-                    let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                        continue;
-                    };
-                    for row in 0..view.num_rows() {
-                        let Ok(read) = view.read(row) else { continue };
-                        if read_ids.contains(&read.read_id)
-                            && !read.signal_rows.is_empty()
-                            && let Ok(signal) = reader.get_signal(&read.signal_rows)
-                            && let Some(fp) = extract_training_fingerprint(
-                                &signal,
-                                args,
-                                norm_method,
-                                read.read_id,
-                            )
-                        {
-                            fingerprints.push((read.read_id, fp));
-                        }
-                        pending_inc += 1;
-                        if pending_inc >= PROGRESS_BATCH {
-                            progress_bar.inc(pending_inc);
-                            pending_inc = 0;
-                        }
-                    }
-                }
-            }
-            if pending_inc > 0 {
-                progress_bar.inc(pending_inc);
+    for (pod5_path, read_list) in reads_by_file {
+        // Barcode lookup for this file's assigned reads. Borrowed, so the
+        // per-read barcode `String` is never cloned during extraction.
+        let wanted: HashMap<Uuid, &str> = read_list
+            .iter()
+            .map(|(id, bc)| (*id, bc.as_str()))
+            .collect();
+
+        let Ok(reader) = Reader::open(pod5_path) else {
+            continue;
+        };
+        let Ok(batches) = reader.read_batches() else {
+            continue;
+        };
+
+        for batch_result in batches {
+            let Ok(batch) = batch_result else { continue };
+            let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                continue;
+            };
+
+            // Metadata-only pre-filter. `read_id` is one fixed-width column;
+            // `read()` decodes the whole record, so only assigned rows pay it.
+            let reads: Vec<_> = (0..view.num_rows())
+                .filter(|&row| {
+                    view.read_id(row)
+                        .map(|id| wanted.contains_key(&id))
+                        .unwrap_or(false)
+                })
+                .filter_map(|row| view.read(row).ok())
+                .filter(|r| !r.signal_rows.is_empty())
+                .collect();
+            if reads.is_empty() {
+                continue;
             }
 
-            fingerprints
-        })
-        .collect();
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
+                continue;
+            };
+
+            // Decompress + LLR-detect + fingerprint in parallel. No decode
+            // bound: LLR normalizes over the whole read, so the full signal is
+            // genuinely needed (`signal_decode_bound()` is `None` for LLR).
+            // Tag with the read index and re-sort: `get_compressed_signal_bulk`
+            // does not promise to return rows in request order, and the
+            // per-barcode push order decides the summation order inside
+            // `compute_std_dev_fingerprint` (an f32 sum, so order changes the
+            // low bits). Sorting makes a training run reproducible — the old
+            // grouping pass iterated a `HashMap<Uuid, _>`, so it was not.
+            let mut batch_fps: Vec<(usize, &str, Vec<f32>)> = bulk
+                .par_iter()
+                .filter_map(|(i, chunks)| {
+                    let r = &reads[*i];
+                    let barcode = *wanted.get(&r.read_id)?;
+                    let signal = super::utils::decode_chunks_to(chunks, None)?;
+                    let fp = extract_training_fingerprint(&signal, args, norm_method, r.read_id)?;
+                    Some((*i, barcode, fp))
+                })
+                .collect();
+            batch_fps.sort_by_key(|(i, _, _)| *i);
+
+            for (_, barcode, fp) in batch_fps {
+                by_barcode.entry(barcode.to_string()).or_default().push(fp);
+            }
+
+            // One update per Arrow batch instead of a contended atomic add per
+            // read. Counts reads *attempted*, so the bar reflects work done
+            // even when a signal fails to decompress.
+            progress_bar.inc(reads.len() as u64);
+        }
+    }
 
     progress_bar.finish_with_message("complete");
 
-    Ok(all_fingerprints)
+    Ok(by_barcode)
 }
 
 /// Extract a fingerprint from a training read.
@@ -396,32 +441,13 @@ fn extract_training_fingerprint(
     Some(fp.values.iter().map(|&v| v as f32).collect())
 }
 
-/// Group fingerprints by barcode.
-fn group_fingerprints_by_barcode(
-    fingerprints: &HashMap<Uuid, Vec<f32>>,
-    assignments: &HashMap<Uuid, (String, PathBuf)>,
-) -> HashMap<String, Vec<Vec<f32>>> {
-    let mut barcode_fingerprints: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
-
-    for (read_id, fingerprint) in fingerprints {
-        if let Some((barcode, _)) = assignments.get(read_id) {
-            barcode_fingerprints
-                .entry(barcode.clone())
-                .or_default()
-                .push(fingerprint.clone());
-        }
-    }
-
-    barcode_fingerprints
-}
-
 /// Build the training output JSON structure.
 fn build_training_output(
     args: &TrainArgs,
     barcode_fingerprints: &HashMap<String, Vec<Vec<f32>>>,
 ) -> TrainingOutput {
     let mut training_output = TrainingOutput {
-        barcodes: HashMap::new(),
+        barcodes: std::collections::BTreeMap::new(),
         params: TrainParams {
             segment_start: args.segment_start,
             segment_end: args.segment_end,
