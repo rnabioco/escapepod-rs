@@ -169,6 +169,84 @@ pub fn normalize_downscale_into(
     }
 }
 
+/// Downscale first, then MAD-normalize — for LLR adapter detection.
+///
+/// [`normalize_downscale_into`] reproduces the historical order (normalize the
+/// full-resolution read, then downscale), which means two `select_nth` passes
+/// over the *whole* read. That was measured at ~28% of all CPU in the fused
+/// demux pipeline, and it is almost entirely avoidable: with `factor = 10` the
+/// same statistics can be computed over a signal 10× shorter.
+///
+/// Reordering is sound because [`detect_adapter`](super::detect_adapter) — the
+/// only consumer — is invariant to any positive affine transform of its input:
+///
+/// - Downscaling is linear, so `downscale((x - m) / s) == (downscale(x) - m) / s`.
+///   Both orders therefore produce affine transforms of the same signal, and
+///   differ only in *which* `(m, s)` is used.
+/// - The LLR objective is
+///   `gain = n·ln(var_full) − n_head·ln(var_head) − n_tail·ln(var_tail)`.
+///   Variance is shift-invariant and scales by `1/s²`, so each `ln` term picks
+///   up `−2·ln(s)`; because `n = n_head + n_tail` they cancel exactly and the
+///   gain — hence the argmax split — is unchanged.
+/// - The remaining decisions compare medians of segments (`median_2 > median_1`,
+///   `median_0 ≥ mean(medians)`) and two gains against each other. Medians
+///   commute with affine maps and the scale is positive, so every comparison is
+///   preserved.
+///
+/// Normalizing (rather than passing raw counts straight through, which the same
+/// invariance argument would also permit) keeps the values `O(1)`. That matters:
+/// `LlrTrace` computes variance as `sum_sq/n − mean²`, which loses precision
+/// catastrophically when the mean is large relative to the spread — exactly what
+/// raw pA-scale counts would produce.
+///
+/// This is **not** bit-identical to the historical order: the statistics come
+/// from the downscaled population, so boundaries can shift by a sample on reads
+/// where the LLR surface is nearly flat. Validate with a boundary/barcode parity
+/// run when changing it.
+pub fn downscale_normalize_into(
+    signal: &[i16],
+    factor: usize,
+    scratch: &mut SignalPrepScratch,
+    out: &mut Vec<f32>,
+) {
+    if factor == 0 {
+        panic!("Downscaling factor must be greater than 0");
+    }
+
+    out.clear();
+    if factor == 1 {
+        // Nothing to downscale; identical to `normalize_downscale_into`.
+        normalize_downscale_into(signal, 1, scratch, out);
+        return;
+    }
+
+    // Mean-pool the raw signal straight out of the i16 input — no full-length
+    // f32 intermediate.
+    let trunc = (signal.len() / factor) * factor;
+    out.reserve(trunc / factor);
+    for chunk in signal[..trunc].chunks(factor) {
+        let mut sum = 0.0f32;
+        for &x in chunk {
+            sum += x as f32;
+        }
+        out.push(sum / chunk.len() as f32);
+    }
+
+    // MAD-normalize the (now 1/factor-length) signal in place.
+    if out.len() > 10 {
+        let (med, mad) = crate::stats::median_and_mad_with_scratch(out, &mut scratch.sel);
+        if mad == 0.0 {
+            for v in out.iter_mut() {
+                *v -= med;
+            }
+        } else {
+            for v in out.iter_mut() {
+                *v = (*v - med) / mad;
+            }
+        }
+    }
+}
+
 /// Normalize signal using median-MAD with the Gaussian scale factor (1.4826).
 ///
 /// Transforms the signal to: `(signal - median) / (1.4826 * MAD)`.

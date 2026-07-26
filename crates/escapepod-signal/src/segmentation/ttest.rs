@@ -148,8 +148,25 @@ pub fn find_changepoints(
     // killing in-range neighbours at each step is the standard way to combine
     // "top-N peaks" with "no two peaks closer than k samples"; it is
     // equivalent to a non-maximum-suppression pass over the peak list.
-    let mut peak_order: Vec<usize> = (0..peaks.len()).collect();
-    peak_order.sort_unstable_by(|&a, &b| t_scores[peaks[b]].total_cmp(&t_scores[peaks[a]]));
+    // Sort a contiguous (score, peak-index) array rather than sorting indices
+    // through two levels of indirection. The old comparator did
+    // `t_scores[peaks[a]]` vs `t_scores[peaks[b]]` — two dependent random loads
+    // per comparison, over a candidate list that reaches ~L/3 on noisy signal;
+    // it measured ~4.5% of all CPU in the demux pipeline. Sorting the keys
+    // themselves is one sequential stream.
+    //
+    // The tie-break on index is deliberate. The old form used an *unstable*
+    // sort keyed only on the score, so peaks with exactly equal scores (common
+    // on plateaus) came out in an unspecified order, making the retained
+    // changepoints implementation-defined. Breaking ties by ascending position
+    // makes the result fully determined by the input.
+    let mut scored: Vec<(f64, u32)> = peaks
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (t_scores[p], i as u32))
+        .collect();
+    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let peak_order: Vec<usize> = scored.into_iter().map(|(_, i)| i as usize).collect();
 
     let mut kept = vec![false; peaks.len()];
     let mut changepoints = Vec::with_capacity(num_changepoints);

@@ -4,7 +4,7 @@ use super::utils::{configure_thread_pool, process_reads_par, total_read_count};
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::ReadBoundaries;
-use escapepod_signal::segmentation::{SignalPrepScratch, detect_adapter, normalize_downscale_into};
+use escapepod_signal::segmentation::{SignalPrepScratch, detect_adapter, downscale_normalize_into};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -184,7 +184,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
             let (adapter_start, adapter_end) = PREP.with(|cell| {
                 let (prep, processed) = &mut *cell.borrow_mut();
-                normalize_downscale_into(signal, downscale_factor, prep, processed);
+                downscale_normalize_into(signal, downscale_factor, prep, processed);
                 detect_adapter(
                     processed,
                     scaled_min_adapter.max(1),
