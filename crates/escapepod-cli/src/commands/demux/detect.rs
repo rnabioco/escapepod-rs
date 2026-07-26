@@ -201,7 +201,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
     // Write results
     let output_file = File::create(&args.output)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
 
     writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
 
@@ -438,7 +438,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     progress_bar.finish_with_message("complete");
 
     let output_file = File::create(&args.output)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
     writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
 
     let mut detected = 0;

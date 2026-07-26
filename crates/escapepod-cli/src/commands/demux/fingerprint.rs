@@ -193,40 +193,48 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     let pb_ref = &progress_bar;
     let pb_counter_ref = &pb_counter;
 
-    let fingerprints: Vec<ReadFingerprint> = args
-        .input
-        .par_iter()
-        .map(|path| -> Vec<ReadFingerprint> {
-            let Ok(reader) = Reader::open(path) else {
-                return Vec::new();
+    // One Arrow batch at a time: a single sequential, ascending-order sweep of
+    // the signal table per batch (#72), then decode + fingerprint in parallel.
+    // Fanning `get_signal_prefix` across workers per read instead turns this
+    // into N concurrent demand-paging streams, which collapses to ~0.3 MB/s on
+    // a network filesystem against 288 MB/s for one sequential sweep.
+    let mut fingerprints: Vec<ReadFingerprint> = Vec::new();
+
+    for path in &args.input {
+        let Ok(reader) = Reader::open(path) else {
+            continue;
+        };
+        let Ok(batches) = reader.read_batches() else {
+            continue;
+        };
+        for batch_result in batches {
+            let Ok(batch) = batch_result else { continue };
+            let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                continue;
             };
             // Metadata-only pre-filter: boundaries + non-empty signal_rows.
-            // Iterate by Arrow batch and resolve columns once per batch.
-            // No signal I/O yet — the signal decode is the expensive part
-            // and happens in the inner par_iter below.
-            let mut reads: Vec<_> = Vec::new();
-            let Ok(batches) = reader.read_batches() else {
-                return Vec::new();
-            };
-            for batch_result in batches {
-                let Ok(batch) = batch_result else { continue };
-                let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                    continue;
-                };
-                for row in 0..view.num_rows() {
-                    let Ok(r) = view.read(row) else { continue };
-                    if !r.signal_rows.is_empty() && boundaries_map.contains_key(&r.read_id) {
-                        reads.push(r);
-                    }
-                }
+            // Columns are resolved once per batch, not once per read.
+            let reads: Vec<_> = (0..view.num_rows())
+                .filter_map(|row| view.read(row).ok())
+                .filter(|r| !r.signal_rows.is_empty() && boundaries_map.contains_key(&r.read_id))
+                .collect();
+            if reads.is_empty() {
+                continue;
             }
-            let Ok(extractor) = reader.signal_extractor() else {
-                return Vec::new();
+
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
+                continue;
             };
 
-            reads
+            let batch_fps: Vec<ReadFingerprint> = bulk
                 .par_iter()
-                .filter_map(|r| {
+                .filter_map(|(i, chunks)| {
+                    let r = &reads[*i];
                     let boundaries = boundaries_map.get(&r.read_id)?;
                     let (region_start, region_end) = if use_full_adapter {
                         (boundaries.adapter_start, boundaries.adapter_end)
@@ -243,14 +251,11 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                     // `extract_fingerprint_from_signal` (up to `region_end` plus
                     // the keep_last BOUNDARY_PADDING_SAMPLES), so decode just that
                     // prefix instead of the whole (potentially transcript-length)
-                    // read. `get_signal_prefix` returns `min(bound, total)`
-                    // samples, so this is bit-identical to
-                    // `get_signal(..)[..bound]` and the downstream
+                    // read. Decoding `min(bound, total)` samples is bit-identical
+                    // to `get_signal(..)[..bound]`, and the downstream
                     // `.min(signal.len())` clamp stays a no-op.
                     let decode_to = region_end.saturating_add(100);
-                    let signal = extractor
-                        .get_signal_prefix(&r.signal_rows, decode_to)
-                        .ok()?;
+                    let signal = super::utils::decode_chunks_to(chunks, Some(decode_to))?;
                     let fp = extract_fingerprint_from_signal(
                         &signal,
                         region_start,
@@ -271,12 +276,10 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                     }
                     fp
                 })
-                .collect()
-        })
-        .reduce(Vec::new, |mut a, b| {
-            a.extend(b);
-            a
-        });
+                .collect();
+            fingerprints.extend(batch_fps);
+        }
+    }
 
     // Advance the bar by any reads counted but not yet reflected (tail of
     // the last PROGRESS_BATCH-sized group).
@@ -402,7 +405,7 @@ fn write_fingerprints_parquet(path: &Path, fingerprints: &[ReadFingerprint]) -> 
 /// is caller error — the extractor always emits one shape per run.
 fn write_fingerprints_csv(path: &Path, fingerprints: &[ReadFingerprint]) -> anyhow::Result<()> {
     let output_file = File::create(path)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
 
     let (fp_width, dwell_width) = match fingerprints.first() {
         Some(first) => (

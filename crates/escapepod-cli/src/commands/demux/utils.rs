@@ -1,8 +1,8 @@
 //! Shared utilities for demux subcommands.
 
 use escapepod_demux::{BarcodeFingerprint, ReadBoundaries};
-use escapepod_signal::Reader;
 use escapepod_signal::dtw::NormMethod;
+use escapepod_signal::{CompressedSignalChunk, ReadData, Reader, ReadsBatchView};
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
@@ -204,21 +204,82 @@ pub fn total_read_count(input_files: &[PathBuf]) -> usize {
         .sum()
 }
 
-/// Fan out across POD5 files and across reads within each file, processing
-/// each read in-place so signal buffers never outlive the closure.
+/// Decode (decompress) a read's in-memory compressed signal chunks into a
+/// single sample buffer, concatenated in chunk order.
+pub(super) fn decode_chunks(chunks: &[CompressedSignalChunk]) -> Option<Vec<i16>> {
+    // The overwhelmingly common case is one chunk per read; hand back its
+    // buffer directly instead of allocating a second one and memcpy'ing.
+    if let [only] = chunks {
+        return escapepod_signal::pod5::compression::decompress_signal(
+            &only.data,
+            only.samples as usize,
+        )
+        .ok();
+    }
+    let total: usize = chunks.iter().map(|c| c.samples as usize).sum();
+    let mut signal = Vec::with_capacity(total);
+    for c in chunks {
+        let decoded =
+            escapepod_signal::pod5::compression::decompress_signal(&c.data, c.samples as usize)
+                .ok()?;
+        signal.extend_from_slice(&decoded);
+    }
+    Some(signal)
+}
+
+/// Like [`decode_chunks`] but, when `decode_to` is `Some(max)`, decompresses
+/// only the first `max` samples — decoding just the needed prefix of the chunk
+/// that crosses the boundary (the rest of the ZSTD stream is skipped). For long
+/// reads (mRNA) where the adapter detector only looks at the first
+/// `max_obs_trace` samples, this avoids decompressing the whole transcript.
+/// `None` decodes the full signal (e.g. LLR, which normalizes over the read).
+pub(super) fn decode_chunks_to(
+    chunks: &[CompressedSignalChunk],
+    decode_to: Option<usize>,
+) -> Option<Vec<i16>> {
+    let Some(max) = decode_to else {
+        return decode_chunks(chunks);
+    };
+    let mut signal = Vec::with_capacity(max);
+    let mut remaining = max;
+    for c in chunks {
+        if remaining == 0 {
+            break;
+        }
+        let cs = c.samples as usize;
+        let take = cs.min(remaining);
+        let decoded = if take == cs {
+            escapepod_signal::pod5::compression::decompress_signal(&c.data, cs).ok()?
+        } else {
+            escapepod_signal::pod5::compression::decompress_signal_prefix(&c.data, cs, take).ok()?
+        };
+        signal.extend_from_slice(&decoded);
+        remaining -= take;
+    }
+    Some(signal)
+}
+
+/// Stream every read of every input file through `process`, one Arrow
+/// record-batch at a time.
 ///
-/// Nested rayon: the outer `par_iter` pairs one worker per file; within each
-/// file, read metadata is collected cheaply, then a second `par_iter` fans
-/// signal decompression + the user closure across workers using the
-/// thread-safe `SignalExtractor`. Rayon's work-stealing flows across both
-/// levels, so on fixtures with few files and many reads we stop bottlenecking
-/// on file count — all CPUs stay busy. Peak signal RAM is still bounded by
-/// `rayon::current_num_threads()` reads (not total reads).
+/// Each batch does a single sequential, ascending-order sweep of the signal
+/// table (`get_compressed_signal_bulk`) and only then fans decode + the user
+/// closure across rayon workers. This is the #72 access pattern, and it is the
+/// point of this function: the previous implementation issued a separate
+/// `get_signal` per read from N workers at once, which on a network filesystem
+/// degenerates into N concurrent demand-paging streams — measured at 0.3 MB/s
+/// cold versus 288 MB/s for one sequential sweep. It also re-parsed the Arrow
+/// batch metadata once per *read* instead of once per batch.
+///
+/// Peak signal RAM is one batch (~1000 reads), not the whole file.
+///
 /// `decode_bound`: when `Some(max)`, only the first `max` signal samples per
 /// read are decompressed (the ZSTD tail of the boundary chunk is skipped). Use
 /// this for consumers that look at a fixed leading window — e.g. CNN adapter
 /// detection only needs `max_obs_trace` samples regardless of read length, which
 /// matters for long mRNA transcripts. `None` decodes the full read.
+///
+/// Results come back in file order, then read order within each file.
 pub fn process_reads_par<F, T>(
     input_files: &[PathBuf],
     progress: Option<&indicatif::ProgressBar>,
@@ -231,52 +292,52 @@ where
 {
     use rayon::prelude::*;
 
-    // Batch progress-bar updates: under N rayon workers, `pb.inc(1)` per
-    // read is an atomic add contended across all cores. Chunking at 64
-    // cuts the contended writes 64× while keeping the bar visibly
-    // responsive (64 reads is well under 1s of wall time in practice).
-    const PROGRESS_BATCH: usize = 64;
+    let mut out: Vec<T> = Vec::new();
 
-    let per_file: anyhow::Result<Vec<Vec<T>>> = input_files
-        .par_iter()
-        .map(|path| -> anyhow::Result<Vec<T>> {
-            let reader = Reader::open(path)?;
-            let reads: Vec<_> = reader
-                .reads()?
-                .filter_map(Result::ok)
+    for path in input_files {
+        let reader = Reader::open(path)?;
+        for batch in reader.read_batches()? {
+            let batch = batch?;
+            let view = ReadsBatchView::new(&batch, false)?;
+            let reads: Vec<ReadData> = (0..view.num_rows())
+                .filter_map(|row| view.read(row).ok())
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
-            let extractor = reader.signal_extractor()?;
+            if reads.is_empty() {
+                continue;
+            }
 
-            let out: Vec<T> = reads
-                .par_chunks(PROGRESS_BATCH)
-                .flat_map(|chunk| {
-                    let results: Vec<T> = chunk
-                        .iter()
-                        .filter_map(|r| {
-                            let signal = match decode_bound {
-                                Some(max) => {
-                                    extractor.get_signal_prefix(&r.signal_rows, max).ok()?
-                                }
-                                None => extractor.get_signal(&r.signal_rows).ok()?,
-                            };
-                            Some(process(r.read_id, r.num_samples, &signal))
-                        })
-                        .collect();
-                    if let Some(pb) = progress {
-                        // Count the reads we *attempted* (chunk.len()), not
-                        // just the successful ones, so the bar reflects
-                        // work done even when signals fail to decompress.
-                        pb.inc(chunk.len() as u64);
-                    }
-                    results
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+
+            // Decode + process in parallel, tagging each result with its
+            // read index so the output keeps input order regardless of the
+            // order `get_compressed_signal_bulk` returns rows in.
+            let mut tagged: Vec<(usize, T)> = bulk
+                .par_iter()
+                .filter_map(|(i, chunks)| {
+                    let signal = decode_chunks_to(chunks, decode_bound)?;
+                    let r = &reads[*i];
+                    Some((*i, process(r.read_id, r.num_samples, &signal)))
                 })
                 .collect();
-            Ok(out)
-        })
-        .collect();
+            tagged.sort_by_key(|(i, _)| *i);
+            out.extend(tagged.into_iter().map(|(_, t)| t));
 
-    Ok(per_file?.into_iter().flatten().collect())
+            if let Some(pb) = progress {
+                // One batched update per Arrow batch rather than a contended
+                // atomic add per read. Count reads *attempted*, so the bar
+                // reflects work done even when signals fail to decompress.
+                pb.inc(reads.len() as u64);
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
