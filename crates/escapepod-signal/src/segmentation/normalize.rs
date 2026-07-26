@@ -54,6 +54,121 @@ pub fn normalize_signal(signal: &[i16]) -> Vec<f32> {
     }
 }
 
+/// Reusable buffers for [`normalize_downscale_into`].
+///
+/// Hand one of these to each rayon worker (via `for_each_init` / `map_init`)
+/// and the buffers grow once to their high-water mark instead of being
+/// reallocated per read.
+#[derive(Default, Clone, Debug)]
+pub struct SignalPrepScratch {
+    /// `i16 -> f32` cast of the raw signal, in original order.
+    cast: Vec<f32>,
+    /// Partitioning scratch for the median/MAD selection passes.
+    sel: Vec<f32>,
+}
+
+impl SignalPrepScratch {
+    /// Fresh, empty scratch. Buffers grow lazily on first use.
+    ///
+    /// `const` so callers can put one in a `thread_local!` initializer.
+    pub const fn new() -> Self {
+        Self {
+            cast: Vec::new(),
+            sel: Vec::new(),
+        }
+    }
+}
+
+/// Fused `normalize_signal` + `downscale`, writing into `out` and reusing
+/// `scratch` across calls.
+///
+/// Bit-identical to `downscale(&normalize_signal(signal)[..trunc], factor)`
+/// (with `trunc = (len / factor) * factor`), and to `normalize_signal(signal)`
+/// when `factor == 1`.
+///
+/// The point is allocation, not arithmetic. The unfused chain allocates **three
+/// full-length `f32` buffers per read** — the cast, `median_and_mad`'s internal
+/// copy, and `mad_normalize`'s `collect` — and then uses that full-resolution
+/// array only to produce the `n/factor`-length downscaled one. Read-length
+/// distributions have a long tail (one real tRNA library here has a median of
+/// 8.4 k samples but a maximum of 18.8 M), so a single outlier read costs
+/// ~225 MB of transient buffers on one worker, and several landing across a
+/// 48-thread pool at once is a genuine RSS spike. This keeps two reusable
+/// buffers per worker and writes the downscaled output directly.
+///
+/// # Panics
+/// Panics if `factor` is 0, matching [`downscale`].
+pub fn normalize_downscale_into(
+    signal: &[i16],
+    factor: usize,
+    scratch: &mut SignalPrepScratch,
+    out: &mut Vec<f32>,
+) {
+    if factor == 0 {
+        panic!("Downscaling factor must be greater than 0");
+    }
+
+    // Reusable buffers retain their high-water mark, which is the wrong
+    // behavior for a read-length distribution with rare huge outliers: one
+    // 18.8 M-sample read would otherwise pin ~150 MB on that worker for the
+    // rest of the run, on every worker that happened to see one. Release the
+    // capacity once it is both large in absolute terms and far larger than the
+    // current read needs, so the steady state tracks typical reads.
+    const RETAIN_MAX: usize = 1 << 20; // 4 MB as f32
+    if scratch.cast.capacity() > RETAIN_MAX && scratch.cast.capacity() > 2 * signal.len() {
+        scratch.cast = Vec::new();
+        scratch.sel = Vec::new();
+    }
+
+    let cast = &mut scratch.cast;
+    cast.clear();
+    cast.reserve(signal.len());
+    cast.extend(signal.iter().map(|&s| s as f32));
+
+    // `normalize_signal` leaves signals of <= 10 samples unnormalized to avoid a
+    // degenerate median/MAD; reproduce that exactly.
+    let (med, mad) = if cast.len() > 10 {
+        crate::stats::median_and_mad_with_scratch(cast, &mut scratch.sel)
+    } else {
+        (0.0, 0.0)
+    };
+    let normalize = cast.len() > 10;
+
+    // Matches `mad_normalize`: divide by MAD, or fall back to a plain median
+    // shift when MAD is zero (constant signal).
+    let apply = |x: f32| -> f32 {
+        if !normalize {
+            x
+        } else if mad == 0.0 {
+            x - med
+        } else {
+            (x - med) / mad
+        }
+    };
+
+    out.clear();
+    if factor == 1 {
+        out.reserve(cast.len());
+        out.extend(cast.iter().copied().map(apply));
+        return;
+    }
+
+    // Truncate to a whole multiple of `factor` so the trailing partial chunk is
+    // dropped, matching the historical CLI behavior and WarpDemuX's
+    // numpy-style downsampling.
+    let trunc = (cast.len() / factor) * factor;
+    out.reserve(trunc / factor);
+    for chunk in cast[..trunc].chunks(factor) {
+        // Left-to-right f32 accumulation from 0.0, exactly as
+        // `chunk.iter().sum::<f32>()` folds it.
+        let mut sum = 0.0f32;
+        for &x in chunk {
+            sum += apply(x);
+        }
+        out.push(sum / chunk.len() as f32);
+    }
+}
+
 /// Normalize signal using median-MAD with the Gaussian scale factor (1.4826).
 ///
 /// Transforms the signal to: `(signal - median) / (1.4826 * MAD)`.
@@ -396,6 +511,62 @@ mod tests {
 
     /// The whole-pipeline entry point takes raw i16 and is the one demux
     /// actually calls per read (`run.rs`, `detect.rs`).
+    /// The fused prep must reproduce the unfused
+    /// `downscale(normalize_signal(..)[..trunc], factor)` chain exactly — it is
+    /// an allocation change, not an arithmetic one.
+    #[test]
+    fn fused_normalize_downscale_is_bit_identical() {
+        let mut scratch = SignalPrepScratch::new();
+        let mut out = Vec::new();
+
+        for &len in &[0usize, 1, 5, 10, 11, 37, 100, 999, 4096, 10_007] {
+            let signal: Vec<i16> = (0..len)
+                .map(|i| {
+                    let x = i as f32 * 0.037;
+                    (500.0 + 300.0 * x.sin() + 40.0 * (x * 7.3).cos()) as i16
+                })
+                .collect();
+
+            for &factor in &[1usize, 2, 3, 10, 64] {
+                // Reference: the original unfused chain.
+                let normalized = normalize_signal(&signal);
+                let expected = if factor > 1 {
+                    let trunc = (normalized.len() / factor) * factor;
+                    downscale(&normalized[..trunc], factor)
+                } else {
+                    normalized
+                };
+
+                normalize_downscale_into(&signal, factor, &mut scratch, &mut out);
+
+                assert_eq!(
+                    out.len(),
+                    expected.len(),
+                    "len={len} factor={factor}: length differs"
+                );
+                for (i, (a, b)) in out.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "len={len} factor={factor} idx={i}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Constant signal (MAD == 0) must go through the fused path too, without
+    /// dividing by zero.
+    #[test]
+    fn fused_normalize_downscale_handles_constant_signal() {
+        let mut scratch = SignalPrepScratch::new();
+        let mut out = Vec::new();
+        let signal: Vec<i16> = vec![512; 500];
+        normalize_downscale_into(&signal, 10, &mut scratch, &mut out);
+        assert_eq!(out.len(), 50);
+        assert!(out.iter().all(|v| v.is_finite() && *v == 0.0));
+    }
+
     #[test]
     fn test_normalize_signal_constant_and_zero() {
         let flat: Vec<i16> = vec![512; 64];

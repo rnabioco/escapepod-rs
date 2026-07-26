@@ -8,15 +8,25 @@ feature flag to enable.
     These need extra toolchains or hardware and are therefore separate builds:
 
     ```bash
-    cargo build --release --features gpu          # batched GPU DTW classify (CUDA at runtime)
     cargo build --release --features cnn-detect   # CNN adapter detection (CPU, tract)
     cargo build --release --features cnn-gpu      # CNN adapter detection (onnxruntime CUDA)
     cargo build --release --features train        # train DTW-SVM models (linfa)
+    cargo build --release --features gpu          # EXPERIMENTAL: GPU DTW classify
     ```
 
     The GPU features require a CUDA driver and `libnvrtc` **at run time** (not
     build time), so GPU-enabled binaries are distributed separately from the
     static release artifacts.
+
+!!! warning "`--gpu` DTW classify is experimental and usually slower"
+    On a full node the CPU DTW beats the GPU: 113 s on 64 CPU cores vs 132 s
+    with `--gpu` on an A30 (0.85x), plus ~2.2 GB more RSS, on a 1.22M-read
+    DTW-SVM run. An apparent 1.67x speedup vanishes once the CPU is given the
+    whole node instead of 16 of 64 cores. It may still help where cores are
+    scarce relative to the DTW workload, and it does nothing for GBM models.
+
+    GPU **CNN adapter detection** (`--method cnn --gpu`, `cnn-gpu`) is the GPU
+    path that does pay off — that stage is genuinely inference-bound.
 
 Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.
 

@@ -27,7 +27,7 @@ use escapepod_demux::{
     extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
-use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
+use escapepod_signal::segmentation::{detect_adapter, normalize_downscale_into};
 use escapepod_signal::{
     CompressedSignalChunk, PredefinedDictionaries, ReadData, Reader, ReadsBatchView, RunInfoData,
     Uuid, Writer, WriterOptions,
@@ -107,13 +107,18 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// Use the GPU where this pipeline supports it: batched DTW-SVM classify
-    /// (`--features gpu`) and/or batched CNN adapter detection with
-    /// `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and feeds
-    /// the GPU; CPU falls back automatically for stages without a GPU path
-    /// (e.g. GBM classify).
+    /// [experimental] Use the GPU where this pipeline supports it: batched
+    /// DTW-SVM classify (`--features gpu`) and/or batched CNN adapter detection
+    /// with `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and
+    /// feeds the GPU; CPU falls back automatically for stages without a GPU
+    /// path (e.g. GBM classify).
+    ///
+    /// GPU DTW classify is NOT recommended on a full node — the CPU DTW is
+    /// faster there (measured 113 s CPU on 64 cores vs 132 s with `--gpu` on an
+    /// A30, plus ~2.2 GB more RSS). It may help when cores are scarce. GPU CNN
+    /// detection (`--method cnn --gpu`) is the case that does pay off.
     #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
     /// Number of threads (default: all CPUs)
@@ -168,23 +173,29 @@ enum Detector {
     CnnGpu(Box<escapepod_demux::AdapterCnnGpu>),
 }
 
+/// Per-worker scratch for the LLR detect prep (normalize + downscale).
+#[derive(Default)]
+struct DetectScratch {
+    prep: escapepod_signal::segmentation::SignalPrepScratch,
+    processed: Vec<f32>,
+}
+
 impl Detector {
-    fn detect(&self, signal: &[i16]) -> (usize, usize) {
+    /// Detect `(start, end)` for one read, reusing caller-owned buffers. The
+    /// LLR prep otherwise allocates three full-length `f32` buffers per read,
+    /// which is a real RSS spike on the long tail of the read-length
+    /// distribution (medians of ~8 k samples, maxima in the millions).
+    fn detect_with(&self, signal: &[i16], scratch: &mut DetectScratch) -> (usize, usize) {
         match self {
             Detector::Llr {
                 min_adapter,
                 border_trim,
                 downscale: ds,
             } => {
-                let normalized = normalize_signal(signal);
-                let (processed, scale) = if *ds > 1 {
-                    let trunc = (normalized.len() / ds) * ds;
-                    (downscale(&normalized[..trunc], *ds), *ds)
-                } else {
-                    (normalized, 1)
-                };
+                normalize_downscale_into(signal, *ds, &mut scratch.prep, &mut scratch.processed);
+                let scale = if *ds > 1 { *ds } else { 1 };
                 let (s, e) = detect_adapter(
-                    &processed,
+                    &scratch.processed,
                     (min_adapter / scale).max(1),
                     (border_trim / scale).max(1),
                 );
@@ -214,7 +225,7 @@ impl Detector {
     /// Per-read `(start, end)` for a whole window of decoded signals (`None` =
     /// decode failed → `(0, 0)`, routed as unclassified). GPU CNN runs as one
     /// batched onnxruntime call (length-grouped); LLR and CPU CNN run per read
-    /// in parallel. Bit-identical to calling [`Self::detect`] on each signal.
+    /// in parallel. Bit-identical to calling [`Self::detect_with`] on each signal.
     fn detect_batch(&self, signals: &[Option<Vec<i16>>]) -> Vec<(usize, usize)> {
         #[cfg(feature = "cnn-gpu")]
         if let Detector::CnnGpu(gpu) = self {
@@ -236,7 +247,9 @@ impl Detector {
         }
         signals
             .par_iter()
-            .map(|s| s.as_ref().map_or((0, 0), |v| self.detect(v)))
+            .map_init(DetectScratch::default, |scratch, s| {
+                s.as_ref().map_or((0, 0), |v| self.detect_with(v, scratch))
+            })
             .collect()
     }
 
