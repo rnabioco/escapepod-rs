@@ -11,7 +11,9 @@ use crate::utils::parse_uuid_flexible;
 use crate::utils::pod5_assembler::{
     FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
-use crate::utils::table_builders::{SchemaMetadata, build_reads_table_remapped};
+use crate::utils::table_builders::{
+    SchemaMetadata, SignalRow, build_reads_table_remapped, build_signal_batch,
+};
 use crate::writer::atomic::{AtomicFile, Durability};
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
@@ -657,41 +659,6 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
-/// Build one signal-table `RecordBatch` from a run of source chunks.
-///
-/// This is where the real work happens: `chunks` are zero-copy borrows into the
-/// mmap'd source files, so `append_value` is what faults the source pages in
-/// and copies them into the Arrow buffer.
-fn build_signal_batch(
-    batch_chunks: &[(&[u8], u32)],
-    schema: &Arc<arrow::datatypes::Schema>,
-) -> Result<arrow::record_batch::RecordBatch> {
-    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
-    use arrow::record_batch::RecordBatch;
-
-    let total_bytes: usize = batch_chunks.iter().map(|(d, _)| d.len()).sum();
-    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
-    let mut signal_builder = LargeBinaryBuilder::with_capacity(batch_chunks.len(), total_bytes);
-    let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
-
-    for (signal_data, samples) in batch_chunks {
-        // The actual read_id lives in the reads table; the signal
-        // table's read_id column is unused by the POD5 reader.
-        read_id_builder.append_value([0u8; 16])?;
-        signal_builder.append_value(*signal_data);
-        samples_builder.append_value(*samples);
-    }
-
-    Ok(RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(read_id_builder.finish()) as ArrayRef,
-            Arc::new(signal_builder.finish()) as ArrayRef,
-            Arc::new(samples_builder.finish()) as ArrayRef,
-        ],
-    )?)
-}
-
 /// Stream the signal IPC table directly to `file`, returning the number of
 /// bytes written.
 ///
@@ -743,7 +710,21 @@ fn write_raw_signal_table<W: Write>(
             // the reads table's signal-row prefix sums depend on).
             let built: Vec<Result<arrow::record_batch::RecordBatch>> = window
                 .par_iter()
-                .map(|&(s, e)| build_signal_batch(&chunks[s..e], &schema))
+                .map(|&(s, e)| {
+                    let run = &chunks[s..e];
+                    let total_bytes: usize = run.iter().map(|(d, _)| d.len()).sum();
+                    build_signal_batch(
+                        &schema,
+                        run.iter().map(|&(data, samples)| SignalRow {
+                            // The reads table is the authority for read IDs;
+                            // the POD5 reader never consults this column.
+                            read_id: [0u8; 16],
+                            data,
+                            samples,
+                        }),
+                        total_bytes,
+                    )
+                })
                 .collect();
 
             for batch in built {

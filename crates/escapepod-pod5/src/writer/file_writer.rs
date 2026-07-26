@@ -9,10 +9,9 @@ use crate::types::{
 };
 use crate::writer::atomic::{AtomicFile, Durability};
 use arrow::array::{
-    ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder,
-    LargeBinaryBuilder, ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StringDictionaryBuilder, TimestampMillisecondBuilder, UInt8Builder, UInt16Builder,
-    UInt32Builder, UInt64Builder,
+    ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Int16Builder, ListBuilder,
+    MapBuilder, MapFieldNames, StringArray, StringBuilder, StringDictionaryBuilder,
+    TimestampMillisecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::Int16Type;
 use arrow::ipc::writer::FileWriter as ArrowFileWriter;
@@ -565,28 +564,24 @@ impl Writer {
         }
 
         let schema = Arc::new(self.schema_with_metadata(signal_schema()));
-        let num_chunks = self.pending_signal.len();
-        let total_signal_bytes: usize = self.pending_signal.iter().map(|c| c.data.len()).sum();
 
-        // Build arrays - iterate directly without collecting to intermediate Vec
-        let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_chunks, 16);
-        let mut signal_builder = LargeBinaryBuilder::with_capacity(num_chunks, total_signal_bytes);
-        let mut samples_builder = UInt32Builder::with_capacity(num_chunks);
-
-        for chunk in self.pending_signal.drain(..) {
-            read_id_builder.append_value(chunk.read_id.as_bytes())?;
-            signal_builder.append_value(&chunk.data);
-            samples_builder.append_value(chunk.samples);
-        }
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(read_id_builder.finish()),
-                Arc::new(signal_builder.finish()),
-                Arc::new(samples_builder.finish()),
-            ],
+        // Shared with the block-copy path so the signal table's column layout
+        // has exactly one definition. Note this writes the *real* read ID,
+        // where `filter`/`subset` write zeros — see `build_signal_batch`.
+        let pending = std::mem::take(&mut self.pending_signal);
+        let total_signal_bytes: usize = pending.iter().map(|c| c.data.len()).sum();
+        let batch = crate::utils::table_builders::build_signal_batch(
+            &schema,
+            pending
+                .iter()
+                .map(|chunk| crate::utils::table_builders::SignalRow {
+                    read_id: *chunk.read_id.as_bytes(),
+                    data: &chunk.data,
+                    samples: chunk.samples,
+                }),
+            total_signal_bytes,
         )?;
+        drop(pending);
 
         // Write directly to file (create writer on first batch, taking ownership of file)
         // Use try_new since file is already buffered (BufWriter)

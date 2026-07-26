@@ -894,3 +894,77 @@ pub(crate) fn build_pod5_footer(
 
     Ok(fbb.finished_data().to_vec())
 }
+
+/// One row of the signal table: the owning read's ID, its compressed signal
+/// bytes, and the sample count they decode to.
+///
+/// `data` borrows — for the block-copy operations it points straight into a
+/// source file's mmap, so constructing a batch from these is what faults those
+/// pages in.
+pub struct SignalRow<'a> {
+    /// Value written to the signal table's `read_id` column. See
+    /// [`build_signal_batch`] for why callers currently disagree on this.
+    pub read_id: [u8; 16],
+    /// Compressed (VBZ) signal bytes for this chunk.
+    pub data: &'a [u8],
+    /// Number of samples `data` decodes to.
+    pub samples: u32,
+}
+
+/// Build one signal-table `RecordBatch`.
+///
+/// Single definition of the signal table's column layout, shared by the
+/// block-copy path (`filter`/`subset`, which rebuild batches because they
+/// retain a subset of rows) and the incremental [`crate::Writer`]. `merge`
+/// deliberately does not use this: it retains every row, so it copies whole
+/// Arrow IPC blocks through from the source mmap without rebuilding anything.
+///
+/// # A caveat on `read_id`
+///
+/// The two callers historically disagreed, and this function preserves that
+/// rather than silently changing anyone's output:
+///
+/// - [`crate::Writer`] writes the real read ID.
+/// - `filter`/`subset` write all zeros, on the reasoning that the reads table
+///   is the authority and the POD5 reader never consults this column.
+///
+/// Both files load correctly, but the same logical operation yields different
+/// bytes depending on which command produced it. Now that the divergence lives
+/// in one place it can be settled deliberately; doing so would change
+/// `filter`/`subset` output and wants its own change.
+/// `total_bytes` pre-sizes the signal value buffer. Both callers already hold
+/// the rows in a concrete collection, so summing is cheap for them and saves
+/// the builder a doubling-realloc sequence over a multi-megabyte batch.
+pub fn build_signal_batch<'a, I>(
+    schema: &Arc<arrow::datatypes::Schema>,
+    rows: I,
+    total_bytes: usize,
+) -> Result<RecordBatch>
+where
+    I: IntoIterator<Item = SignalRow<'a>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    use arrow::array::LargeBinaryBuilder;
+
+    let rows = rows.into_iter();
+    let n = rows.len();
+
+    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+    let mut signal_builder = LargeBinaryBuilder::with_capacity(n, total_bytes);
+    let mut samples_builder = UInt32Builder::with_capacity(n);
+
+    for row in rows {
+        read_id_builder.append_value(row.read_id)?;
+        signal_builder.append_value(row.data);
+        samples_builder.append_value(row.samples);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(read_id_builder.finish()) as ArrayRef,
+            Arc::new(signal_builder.finish()) as ArrayRef,
+            Arc::new(samples_builder.finish()) as ArrayRef,
+        ],
+    )?)
+}
