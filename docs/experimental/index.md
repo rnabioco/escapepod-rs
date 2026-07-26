@@ -10,7 +10,6 @@ with Cargo features.
 |---------|-------------|---------|
 | [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
 | [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
-| [demux](demux.md) | `--features demux` | WarpDemuX-compatible barcode demultiplexing (DTW + SVM) |
 | `index` | `--features experimental` | Build `.p5i` sidecar indexes for O(1) read-ID lookup |
 
 The `index` command is intentionally undocumented in depth — it builds a read-ID
@@ -25,11 +24,8 @@ Enable one or more features at build time:
 # Repack, resquiggle, and index
 cargo build --release --features experimental
 
-# Barcode demultiplexing
-cargo build --release --features demux
-
 # Everything
-cargo build --release --features experimental,demux
+cargo build --release --features experimental
 ```
 
 Demux has additional sub-features layered on top:

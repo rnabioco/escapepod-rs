@@ -39,7 +39,7 @@ Signal-processing algorithms, layered on top of `escapepod-pod5` (which it re-ex
 
 ### escapepod-demux
 
-Barcode demultiplexing. Separate crate; the CLI pulls it in only when built with `--features demux`.
+Barcode demultiplexing. Separate crate; included in the default CLI build (it adds no third-party dependencies), and available to library consumers via `--features demux`.
 
 **Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `train` (feature `train`), `adapter_cnn` (feature `cnn-detect`).
 

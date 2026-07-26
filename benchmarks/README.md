@@ -1,5 +1,96 @@
 # Benchmark Results
 
+## Fused demux pipeline rework (2026-07-26)
+
+Input: `Ma_20aa.pod5` — 1,220,602 reads, 10.4 GB, RNA004. Node: `rna`
+(Cascade Lake), 48 logical cores, output to node-local disk (406 MB/s
+sequential write). `escpod filter` copying the same reads block-level takes
+**50.9 s** — that is the I/O floor any demux run is measured against.
+
+| Run | Before | After | |
+|---|---:|---:|---:|
+| GBM model, 48 threads | 151.0 s | **65.1 s** | **2.32×** |
+| DTW-SVM model, 48 threads | 147.5 s | **115.8 s** | 1.27× |
+| Peak RSS (GBM) | 13.5 GB | 12.7 GB | — |
+| CPU utilization (GBM) | 511% | 1273% | — |
+
+Barcode assignments are unchanged (identical per-barcode counts), and the
+staged `detect` / `fingerprint` subcommands produce byte-identical output.
+
+The dominant fix was structural, not arithmetic. Before, `drive_blocks` filled a
+block and processed it serially, so no I/O was in flight during detect+classify;
+combined with per-barcode writer threads (86% of these reads route to one
+barcode) the pipeline left ~43 of 48 cores idle and ran **faster at 8 threads
+(108 s) than at 48 (151 s)**. Overlapping the reader with the processing loop
+and budgeting the router channels removed that inversion.
+
+Note the diagnostic value of the two models: swapping GBM for DTW-SVM used to
+cost *nothing* in wall time (151.0 → 147.5 s) despite ~6× the CPU, proving
+classification was entirely hidden. After the fix the same swap costs ~50 s —
+classify is now on the critical path, which is what makes the classifier
+optimizations and `--gpu` worth anything.
+
+### Block size (`ESCAPEPOD_DEMUX_BLOCK_MB`)
+
+GBM model, same input. The default is 128 MB; larger is worse on both axes.
+
+| MB | wall | peak RSS | CPU |
+|---:|---:|---:|---:|
+| 32 | 65.5 s | 12.53 GB | 1327% |
+| 64 | 66.2 s | 12.55 GB | 1285% |
+| **128** | **63.8 s** | 12.68 GB | 1230% |
+| 256 | 69.9 s | 12.86 GB | 1072% |
+| 512 | 74.4 s | 13.07 GB | 970% |
+
+### GPU DTW classify (A30) — does not pay off on a full node
+
+Same input and binary, run on a `gpu` node (64 cores, A30) so CPU and GPU share
+hardware. **Allocate the whole node**: the CPU core count dominates this
+comparison, and starving it produces a misleading GPU win.
+
+| DTW-SVM, A30 node | CPU | `--gpu` | |
+|---|---:|---:|---:|
+| `-c 64` (full node) | **113.0 s** | 132.4 s | GPU **0.85×** — slower |
+| `-c 16` | 206.4 s | 123.5 s | GPU 1.67× — an artifact of CPU starvation |
+
+At 64 cores the CPU DTW (lane-parallel AVX2, see `DTW_LANES`) beats the A30, and
+`--gpu` also costs ~2.2 GB extra RSS. The GPU path is worth reaching for only
+when cores are scarce relative to the DTW workload — e.g. a shared node where
+you can get a GPU but not a full socket.
+
+### Would a GPU path help GBM models? No.
+
+Measured with `examples/profile_gbm` on the shipped 5-class model (222
+iterations, 25 features), single thread on `rna`:
+
+| GBM classify | per read | throughput |
+|---|---:|---:|
+| scalar | 82.5 µs | 12.1 k reads/s |
+| **batch-8 (shipping)** | **28.6 µs** | 34.9 k reads/s |
+
+At 1.22 M reads that is ~35 core-seconds, i.e. **~4% of the 65 s pipeline**.
+Even an infinitely fast GPU GBM would return ~4% by Amdahl. And DTW — a far
+more GPU-friendly, arithmetic-dense kernel with ~4× the per-read work — already
+*loses* to the CPU on a full node (above), so a branch-heavy tree walk over a
+~1.1 MB arena that fits in L2 is a strictly worse candidate.
+
+If GPU effort is wanted, it belongs in `--method cnn` adapter detection, which
+is genuinely inference-bound.
+
+### Classifier microbenchmarks
+
+`cargo bench -p escapepod-demux --bench classify`, `rna`, per-read
+`predict_with_workspace` on the shipped WDX4 shape (851 refs × 25 features):
+
+| Change | 851 refs | 20-class decision fn |
+|---|---:|---:|
+| baseline | 150.1 µs | 366.9 µs |
+| `DTW_LANES` 16 → 32 | 121.4 µs (−18.9%) | — |
+| + class-ranged OvO decision | **110.4 µs (−26.4%)** | **26.7 µs (−92.7%)** |
+
+Both are bit-identical to the previous results (covered by parity tests).
+
+
 Comparison of `escapepod-rs` vs the official Python `pod5` tool (v0.3.36)
 and the reference barcode-demultiplexer (WarpDemuX / ADAPTed,
 `KleistLab/WarpDemuX`).

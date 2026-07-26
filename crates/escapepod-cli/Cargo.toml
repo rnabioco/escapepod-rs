@@ -70,9 +70,13 @@ pod5 = ["dep:escapepod-pod5"]
 signal = ["dep:escapepod-signal"]
 demux = ["dep:escapepod-demux"]
 
-# The `escpod` binary and everything it links. Implies the `signal` layer.
+# The `escpod` binary and everything it links. Implies the `signal` and
+# `demux` layers. `demux` is in the default build because it pulls in **no**
+# additional third-party crates — ndarray, serde_json, rayon and uuid are all
+# already in the CLI dependency graph — so shipping it costs only compile time.
 cli = [
     "signal",
+    "demux",
     "dep:anyhow",
     "dep:arrow",
     "dep:bstr",

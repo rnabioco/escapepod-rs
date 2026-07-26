@@ -1,15 +1,22 @@
 # escpod demux
 
-!!! warning "Experimental — opt-in feature"
-    Barcode demultiplexing is under active development and lives outside the
-    default build. Enable it per-invocation:
+Barcode demultiplexing ships in the default `escpod` build — it pulls in no
+third-party dependencies beyond what the CLI already links, so there is no
+feature flag to enable.
+
+!!! note "Optional accelerators are still opt-in"
+    These need extra toolchains or hardware and are therefore separate builds:
 
     ```bash
-    cargo build --release --features demux                 # library + CLI
-    cargo install --git https://github.com/rnabioco/escapepod-rs --features demux
+    cargo build --release --features gpu          # batched GPU DTW classify (CUDA at runtime)
+    cargo build --release --features cnn-detect   # CNN adapter detection (CPU, tract)
+    cargo build --release --features cnn-gpu      # CNN adapter detection (onnxruntime CUDA)
+    cargo build --release --features train        # train DTW-SVM models (linfa)
     ```
 
-    Stability, API, and classification accuracy are all subject to change.
+    The GPU features require a CUDA driver and `libnvrtc` **at run time** (not
+    build time), so GPU-enabled binaries are distributed separately from the
+    static release artifacts.
 
 Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.
 
