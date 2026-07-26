@@ -70,9 +70,13 @@ pod5 = ["dep:escapepod-pod5"]
 signal = ["dep:escapepod-signal"]
 demux = ["dep:escapepod-demux"]
 
-# The `escpod` binary and everything it links. Implies the `signal` layer.
+# The `escpod` binary and everything it links. Implies the `signal` and
+# `demux` layers. `demux` is in the default build because it pulls in **no**
+# additional third-party crates — ndarray, serde_json, rayon and uuid are all
+# already in the CLI dependency graph — so shipping it costs only compile time.
 cli = [
     "signal",
+    "demux",
     "dep:anyhow",
     "dep:arrow",
     "dep:bstr",
@@ -114,8 +118,15 @@ experimental = []
 # release binary pulls no TLS stack; implies `experimental` (the resquiggle
 # command it serves). Prefetch on a networked node; runtime never downloads.
 models-download = ["experimental", "dep:ureq", "dep:sha2"]
-# GPU-accelerated DTW for demux classify and train-svm (requires CUDA
-# driver + libnvrtc at runtime).
+# EXPERIMENTAL. GPU-accelerated DTW for demux classify and train-svm (requires
+# a CUDA driver + libnvrtc at runtime).
+#
+# Not recommended for production use as of 0.6.x: on a full node the CPU DTW is
+# *faster*. Measured on 1.22M reads with a DTW-SVM model against an A30 —
+# 113.0 s on 64 CPU cores vs 132.4 s with `--gpu` (0.85×), plus ~2.2 GB more
+# RSS. An apparent 1.67× win disappears once the CPU is given the whole node
+# rather than 16 of 64 cores. It may still help where cores are scarce relative
+# to the DTW workload. See benchmarks/README.md.
 gpu = ["demux", "escapepod-demux/gpu"]
 # Training support for demux SVM models (implies `demux`).
 train = ["demux", "escapepod-demux/train"]

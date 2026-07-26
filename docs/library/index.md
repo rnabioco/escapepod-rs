@@ -10,7 +10,7 @@ The library is split across two layers plus an optional demux crate:
 |-------|---------|
 | `escapepod-pod5` | POD5 format I/O — reader, writer, VBZ compression, footer parsing, block-level merge/filter/subset |
 | `escapepod-signal` | Signal-processing algorithms (DTW, resquiggle, segmentation) layered on top of pod5. **Re-exports the full pod5 surface** |
-| `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing. Separate crate; opt in at the CLI layer via `--features demux` |
+| `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing. Separate crate; in the default CLI build, or opt in for library use via `--features demux` |
 
 Most users should depend on `escapepod-signal` — depending on it gives you
 both the format I/O and the signal algorithms via a single dependency.

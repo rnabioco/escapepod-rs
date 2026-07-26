@@ -27,7 +27,7 @@ use escapepod_demux::{
     extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
-use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
+use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
 use escapepod_signal::{
     CompressedSignalChunk, PredefinedDictionaries, ReadData, Reader, ReadsBatchView, RunInfoData,
     Uuid, Writer, WriterOptions,
@@ -107,13 +107,18 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// Use the GPU where this pipeline supports it: batched DTW-SVM classify
-    /// (`--features gpu`) and/or batched CNN adapter detection with
-    /// `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and feeds
-    /// the GPU; CPU falls back automatically for stages without a GPU path
-    /// (e.g. GBM classify).
+    /// [experimental] Use the GPU where this pipeline supports it: batched
+    /// DTW-SVM classify (`--features gpu`) and/or batched CNN adapter detection
+    /// with `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and
+    /// feeds the GPU; CPU falls back automatically for stages without a GPU
+    /// path (e.g. GBM classify).
+    ///
+    /// GPU DTW classify is NOT recommended on a full node — the CPU DTW is
+    /// faster there (measured 113 s CPU on 64 cores vs 132 s with `--gpu` on an
+    /// A30, plus ~2.2 GB more RSS). It may help when cores are scarce. GPU CNN
+    /// detection (`--method cnn --gpu`) is the case that does pay off.
     #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
     /// Number of threads (default: all CPUs)
@@ -168,23 +173,29 @@ enum Detector {
     CnnGpu(Box<escapepod_demux::AdapterCnnGpu>),
 }
 
+/// Per-worker scratch for the LLR detect prep (normalize + downscale).
+#[derive(Default)]
+struct DetectScratch {
+    prep: escapepod_signal::segmentation::SignalPrepScratch,
+    processed: Vec<f32>,
+}
+
 impl Detector {
-    fn detect(&self, signal: &[i16]) -> (usize, usize) {
+    /// Detect `(start, end)` for one read, reusing caller-owned buffers. The
+    /// LLR prep otherwise allocates three full-length `f32` buffers per read,
+    /// which is a real RSS spike on the long tail of the read-length
+    /// distribution (medians of ~8 k samples, maxima in the millions).
+    fn detect_with(&self, signal: &[i16], scratch: &mut DetectScratch) -> (usize, usize) {
         match self {
             Detector::Llr {
                 min_adapter,
                 border_trim,
                 downscale: ds,
             } => {
-                let normalized = normalize_signal(signal);
-                let (processed, scale) = if *ds > 1 {
-                    let trunc = (normalized.len() / ds) * ds;
-                    (downscale(&normalized[..trunc], *ds), *ds)
-                } else {
-                    (normalized, 1)
-                };
+                downscale_normalize_into(signal, *ds, &mut scratch.prep, &mut scratch.processed);
+                let scale = if *ds > 1 { *ds } else { 1 };
                 let (s, e) = detect_adapter(
-                    &processed,
+                    &scratch.processed,
                     (min_adapter / scale).max(1),
                     (border_trim / scale).max(1),
                 );
@@ -214,7 +225,7 @@ impl Detector {
     /// Per-read `(start, end)` for a whole window of decoded signals (`None` =
     /// decode failed → `(0, 0)`, routed as unclassified). GPU CNN runs as one
     /// batched onnxruntime call (length-grouped); LLR and CPU CNN run per read
-    /// in parallel. Bit-identical to calling [`Self::detect`] on each signal.
+    /// in parallel. Bit-identical to calling [`Self::detect_with`] on each signal.
     fn detect_batch(&self, signals: &[Option<Vec<i16>>]) -> Vec<(usize, usize)> {
         #[cfg(feature = "cnn-gpu")]
         if let Detector::CnnGpu(gpu) = self {
@@ -236,7 +247,9 @@ impl Detector {
         }
         signals
             .par_iter()
-            .map(|s| s.as_ref().map_or((0, 0), |v| self.detect(v)))
+            .map_init(DetectScratch::default, |scratch, s| {
+                s.as_ref().map_or((0, 0), |v| self.detect_with(v, scratch))
+            })
             .collect()
     }
 
@@ -407,11 +420,24 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     // ---- Stage C: one writer thread per barcode (sharded) ----
+    //
+    // Channel depth is budgeted across barcodes rather than fixed per barcode.
+    // Each queued `Routed` owns that read's compressed bytes (~10 KB), so a
+    // fixed 4096 per barcode meant worst-case in-flight memory scaled with the
+    // barcode count — 0.5 GB at 12 barcodes, ~3.8 GB at 96. The depth still
+    // needs to be generous enough to absorb bursts: real libraries are heavily
+    // skewed (one benchmark routed 86% of 1.22 M reads to a single barcode),
+    // and when a channel fills, rayon workers block inside `for_each` on
+    // `send` — and blocked rayon workers cannot be stolen from, so one
+    // saturated writer stalls the whole pool.
+    let barcodes = barcode_set(model.label_mapper());
+    let router_depth = (ROUTER_TOTAL_SLOTS / barcodes.len().max(1)).clamp(256, 4096);
+
     let mut routers: Routers = HashMap::new();
     let mut writer_handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<usize>>)> =
         Vec::new();
-    for bc in barcode_set(model.label_mapper()) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(4096);
+    for bc in barcodes {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(router_depth);
         let path = output_dir.join(format!("{}_{}.pod5", args.prefix, bc));
         let dicts = predefined.clone();
         let handle = std::thread::spawn(move || writer_thread(rx, &path, dicts));
@@ -487,44 +513,166 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads accumulated into one detect+classify block. POD5 Arrow read-batches
-/// are small (~1000 reads), so detecting per batch makes GPU CNN fire many tiny
-/// calls; accumulating across batches into a large block groups far more
-/// same-length reads per onnxruntime call. Host cost is one block of decoded
-/// signal (bounded; trivial relative to typical node RAM). The on-device batch
-/// is separately capped by `gpu_batch_elems`.
+/// Total queued reads allowed across *all* per-barcode writer channels. Each
+/// queued read owns its compressed signal (~10 KB), so this bounds router
+/// memory at roughly 500 MB regardless of how many barcodes the model defines.
+/// Split evenly per barcode and clamped — see the router setup in `run`.
+const ROUTER_TOTAL_SLOTS: usize = 49_152;
+
+/// Upper bound on reads accumulated into one detect+classify block. POD5 Arrow
+/// read-batches are small (~1000 reads), so detecting per batch makes GPU CNN
+/// fire many tiny calls; accumulating across batches into a large block groups
+/// far more same-length reads per onnxruntime call. The on-device batch is
+/// separately capped by `gpu_batch_elems`.
 const DETECT_WINDOW: usize = 65_536;
+
+/// Upper bound on the *decoded signal bytes* held in one block.
+///
+/// A read-count cap alone does not bound memory: LLR sets no decode bound (it
+/// normalizes over the whole read), so a block holds whole reads. At 65,536
+/// reads that is ~1.8 GB on a short-read RNA library and ~9.5 GB on a long-read
+/// one — measured 13.5 GB peak RSS on a 1.22 M-read file, of which ~2.4 GB was
+/// this block (the rest is mmap'd input pages). Capping by bytes keeps the
+/// footprint flat across libraries with wildly different read lengths, while
+/// the read cap above still lets the GPU-CNN path (which decodes only ~806
+/// samples per read) fill a full 65,536-read block before this binds.
+///
+/// 128 MB measured best on 1.22 M reads; larger is worse on both wall time and
+/// RSS (512 MB: 74.4 s / 13.07 GB vs 128 MB: 63.8 s / 12.68 GB).
+const BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// Blocks queued between the reader threads and the processing loop.
+///
+/// Enough to cover a reader hiccup without inflating peak memory — measured
+/// worth ~3% on its own (56.9 s -> 55.1 s at one filler); the filler count is
+/// the larger lever.
+const BLOCK_QUEUE_DEPTH: usize = 2;
+
+/// Number of block-filling reader threads (`ESCAPEPOD_DEMUX_FILLERS`).
+///
+/// Two is the measured sweet spot; see [`fill_shard`] for the access-pattern
+/// caveat. On 1.22 M reads (BeeGFS input, 48 cores):
+///
+/// ```text
+/// fillers/queue   wall     CPU    peak RSS
+///   1 / 1        56.9 s    771%    12.2 GB
+///   2 / 2        48.4 s    918%    13.0 GB   <- default
+///   4 / 4        48.1 s    931%    14.5 GB
+///   8 / 4        48.5 s    923%    17.3 GB
+/// ```
+///
+/// One filler leaves the pipeline waiting on a single sequential sweep; a
+/// second covers that stall. Past two it is flat, and the extra blocks in
+/// flight cost real memory. Set `ESCAPEPOD_DEMUX_FILLERS=1` on a cold network
+/// filesystem where concurrent streams are known to hurt.
+fn filler_threads() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ESCAPEPOD_DEMUX_FILLERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2)
+            .min(32)
+    })
+}
+
+/// A block row for the GBM producer: decoded signal, detected adapter bounds,
+/// and the read's write-side context.
+type GbmRow = (Option<Vec<i16>>, (usize, usize), BlockItem);
 
 /// One read's context carried alongside its decoded signal through a block:
 /// the writable read record, its compressed chunks (for the block-level write),
 /// and its run-info table.
 type BlockItem = (ReadData, Vec<CompressedSignalChunk>, Arc<Vec<RunInfoData>>);
 
-/// Stream reads through the fused pipeline in large blocks: per Arrow batch do
-/// the single-stream, ascending-order signal sweep (#72) and decode in
-/// parallel, accumulate across batches up to [`DETECT_WINDOW`] reads, then hand
-/// each full block (decoded signals + per-read context, aligned) to
-/// `process_block`. Accumulating across the file's small Arrow batches is what
-/// lets GPU detection batch many reads per call.
+/// One filled block handed from the reader thread to the processing loop.
+type SignalBlock = (Vec<Option<Vec<i16>>>, Vec<BlockItem>);
+
+/// Stream reads through the fused pipeline in blocks: per Arrow batch do the
+/// single-stream, ascending-order signal sweep (#72) and decode in parallel,
+/// accumulate across batches up to [`DETECT_WINDOW`] reads or
+/// [`BLOCK_TARGET_BYTES`] of decoded signal, then hand each full block (decoded
+/// signals + per-read context, aligned) to `process_block`. Accumulating across
+/// the file's small Arrow batches is what lets GPU detection batch many reads
+/// per call.
+///
+/// Filling runs on its own thread and feeds `process_block` through a depth-1
+/// channel, so the next block's I/O and decode overlap with the current block's
+/// detect + classify. Previously these were serial: no I/O was in flight for
+/// the entire detect+classify phase, which on a 1.22 M-read benchmark left ~43
+/// of 48 cores idle and made the pipeline *slower* at 48 threads than at 8.
 fn drive_blocks(
     input: &[std::path::PathBuf],
     decode_to: Option<usize>,
     mut process_block: impl FnMut(Vec<Option<Vec<i16>>>, Vec<BlockItem>),
 ) -> anyhow::Result<()> {
-    let mut sigs: Vec<Option<Vec<i16>>> = Vec::with_capacity(DETECT_WINDOW);
-    let mut items: Vec<BlockItem> = Vec::with_capacity(DETECT_WINDOW);
+    let shards = filler_threads();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<SignalBlock>(BLOCK_QUEUE_DEPTH);
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut fillers = Vec::with_capacity(shards);
+        for shard in 0..shards {
+            let tx = tx.clone();
+            fillers.push(scope.spawn(move || fill_shard(input, decode_to, shard, shards, tx)));
+        }
+        // Drop the extra sender so `rx` ends once every shard has finished.
+        drop(tx);
+
+        for (sigs, items) in rx {
+            process_block(sigs, items);
+        }
+
+        for f in fillers {
+            f.join()
+                .map_err(|e| anyhow::anyhow!("demux reader thread panicked: {e:?}"))??;
+        }
+        Ok(())
+    })
+}
+
+/// Fill blocks from the Arrow batches assigned to `shard` (every `shards`-th
+/// batch) and send them downstream.
+///
+/// With `shards == 1` this is one sequential ascending sweep of the whole file
+/// — the #72 access pattern. Sharding hands each thread a strided subset of
+/// batches: still coarse-grained sequential I/O per thread, qualitatively
+/// unlike the per-read demand paging #72 fixed (48 threads faulting per read
+/// measured 0.3 MB/s against 288 MB/s for one sweep), but it is N concurrent
+/// streams rather than one.
+///
+/// The default of 2 was measured on BeeGFS input that had been read repeatedly
+/// and so may have been partly cached; the cold case is **not** independently
+/// validated. `ESCAPEPOD_DEMUX_FILLERS=1` restores the strict single-stream
+/// behavior if concurrent streams turn out to hurt on a cold mount.
+fn fill_shard(
+    input: &[std::path::PathBuf],
+    decode_to: Option<usize>,
+    shard: usize,
+    shards: usize,
+    tx: std::sync::mpsc::SyncSender<SignalBlock>,
+) -> anyhow::Result<()> {
+    let mut sigs: Vec<Option<Vec<i16>>> = Vec::new();
+    let mut items: Vec<BlockItem> = Vec::new();
+    let mut block_bytes = 0usize;
+
     for path in input {
         let reader = Reader::open(path)?;
         let run_infos = Arc::new(reader.run_infos().to_vec());
-        for batch in reader.read_batches()? {
+        for (bi, batch) in reader.read_batches()?.enumerate() {
+            if bi % shards != shard {
+                continue;
+            }
             let batch = batch?;
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<ReadData> = (0..view.num_rows())
                 .filter_map(|row| view.read(row).ok())
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
-            // One sequential, ascending-order sweep pulls this batch's signal
-            // (grouped by Arrow record-batch — see #72), then decode in parallel.
+            // One sequential, ascending-order sweep pulls this batch's
+            // signal (grouped by Arrow record-batch — see #72), then
+            // decode in parallel.
             let keyed: Vec<(usize, Vec<u64>)> = reads
                 .iter()
                 .enumerate()
@@ -533,22 +681,33 @@ fn drive_blocks(
             let bulk = reader.get_compressed_signal_bulk(&keyed)?;
             let decoded: Vec<Option<Vec<i16>>> = bulk
                 .par_iter()
-                .map(|(_, chunks)| decode_chunks_to(chunks, decode_to))
+                .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
                 .collect();
 
             let mut reads_opt: Vec<Option<ReadData>> = reads.into_iter().map(Some).collect();
             for ((i, chunks), sig) in bulk.into_iter().zip(decoded) {
                 let read = reads_opt[i].take().expect("each read consumed once");
+                block_bytes += sig.as_ref().map_or(0, |s| s.len() * 2)
+                    + chunks.iter().map(|c| c.data.len()).sum::<usize>();
                 sigs.push(sig);
                 items.push((read, chunks, run_infos.clone()));
             }
-            if sigs.len() >= DETECT_WINDOW {
-                process_block(std::mem::take(&mut sigs), std::mem::take(&mut items));
+
+            if sigs.len() >= DETECT_WINDOW || block_bytes >= BLOCK_TARGET_BYTES {
+                block_bytes = 0;
+                // A send error means the consumer is gone (it returned early or
+                // panicked); stop filling rather than block.
+                if tx
+                    .send((std::mem::take(&mut sigs), std::mem::take(&mut items)))
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
         }
     }
     if !sigs.is_empty() {
-        process_block(sigs, items);
+        tx.send((sigs, items)).ok();
     }
     Ok(())
 }
@@ -598,52 +757,6 @@ fn produce_cpu(
             );
         },
     )
-}
-
-/// Decode (decompress) a read's in-memory compressed signal chunks into a
-/// single sample buffer, concatenated in chunk order.
-fn decode_chunks(chunks: &[CompressedSignalChunk]) -> Option<Vec<i16>> {
-    let total: usize = chunks.iter().map(|c| c.samples as usize).sum();
-    let mut signal = Vec::with_capacity(total);
-    for c in chunks {
-        let decoded =
-            escapepod_signal::pod5::compression::decompress_signal(&c.data, c.samples as usize)
-                .ok()?;
-        signal.extend_from_slice(&decoded);
-    }
-    Some(signal)
-}
-
-/// Like [`decode_chunks`] but, when `decode_to` is `Some(max)`, decompresses
-/// only the first `max` samples — decoding just the needed prefix of the chunk
-/// that crosses the boundary (the rest of the ZSTD stream is skipped). For long
-/// reads (mRNA) where the adapter detector only looks at the first
-/// `max_obs_trace` samples, this avoids decompressing the whole transcript.
-/// `None` decodes the full signal (e.g. LLR, which normalizes over the read).
-fn decode_chunks_to(
-    chunks: &[CompressedSignalChunk],
-    decode_to: Option<usize>,
-) -> Option<Vec<i16>> {
-    let Some(max) = decode_to else {
-        return decode_chunks(chunks);
-    };
-    let mut signal = Vec::with_capacity(max);
-    let mut remaining = max;
-    for c in chunks {
-        if remaining == 0 {
-            break;
-        }
-        let cs = c.samples as usize;
-        let take = cs.min(remaining);
-        let decoded = if take == cs {
-            escapepod_signal::pod5::compression::decompress_signal(&c.data, cs).ok()?
-        } else {
-            escapepod_signal::pod5::compression::decompress_signal_prefix(&c.data, cs, take).ok()?
-        };
-        signal.extend_from_slice(&decoded);
-        remaining -= take;
-    }
-    Some(signal)
 }
 
 /// Classify a single read from its decoded signal and precomputed adapter
@@ -698,28 +811,73 @@ fn produce_cpu_gbm(
         &args.input,
         detector.signal_decode_bound(),
         |sigs, items| {
-            // Batch-detect the whole block, then GBM-classify reusing each decoded
-            // signal. GBM is `Sync` and read-only, so a plain parallel walk (no
-            // per-worker workspace like the SVM path).
+            // Batch-detect the whole block, then fingerprint + GBM-classify in
+            // chunks. The chunking exists so each rayon task can run the batched
+            // `predict_many`, which walks 8 reads in lockstep down each tree and
+            // hides the per-node L2 latency that bottlenecks a serial walk
+            // (~2.9× over per-read `predict`, bit-identical). GBM is `Sync` and
+            // read-only, so no per-worker workspace is needed.
+            const GBM_CHUNK: usize = 1024;
             let bounds = detector.detect_batch(&sigs);
-            sigs.into_par_iter().zip(bounds).zip(items).for_each(
-                |((signal, (s, e)), (read, chunks, run_infos))| {
-                    if let Some(signal) = signal {
-                        let (barcode, conf) =
-                            classify_one_cpu_gbm(&read, &signal, s, e, &predictor, fp);
-                        route(
-                            routers,
-                            class_tx,
-                            read.for_writing(read.run_info_index),
-                            barcode,
-                            chunks,
-                            run_infos,
-                            conf,
-                        );
-                    }
-                    pb.inc(1);
-                },
-            );
+            let rows: Vec<GbmRow> = sigs
+                .into_iter()
+                .zip(bounds)
+                .zip(items)
+                .map(|((sig, b), item)| (sig, b, item))
+                .collect();
+
+            rows.into_par_iter().chunks(GBM_CHUNK).for_each(|chunk| {
+                // Fingerprint the chunk first so the classifier sees a batch.
+                // `None` = undetected adapter or unfingerprintable read; those
+                // route as unclassified without reaching the model.
+                let features: Vec<Option<Vec<f64>>> = chunk
+                    .iter()
+                    .map(|(signal, (s, e), (read, _, _))| {
+                        let signal = signal.as_ref()?;
+                        fingerprint_for_gbm(read, signal, *s, *e, fp)
+                    })
+                    .collect();
+
+                let present: Vec<&[f64]> = features.iter().filter_map(|f| f.as_deref()).collect();
+                let predicted = predictor.predict_many(&present).ok();
+
+                let mut next = 0usize;
+                for ((_, _, (read, chunks, run_infos)), feat) in chunk.into_iter().zip(&features) {
+                    let (barcode, conf) = match feat {
+                        Some(_) => {
+                            let out = match &predicted {
+                                // Batched call succeeded: take this read's slot.
+                                Some(results) => {
+                                    let (_probs, r) = &results[next];
+                                    (barcode_label(r.predicted_barcode), r.confidence)
+                                }
+                                // The batch is all-or-nothing; retry this read
+                                // alone so one bad fingerprint cannot discard
+                                // the whole chunk.
+                                None => match predictor.predict(present[next]) {
+                                    Ok((_probs, r)) => {
+                                        (barcode_label(r.predicted_barcode), r.confidence)
+                                    }
+                                    Err(_) => (UNCLASSIFIED.to_string(), 0.0),
+                                },
+                            };
+                            next += 1;
+                            out
+                        }
+                        None => (UNCLASSIFIED.to_string(), 0.0),
+                    };
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        barcode,
+                        chunks,
+                        run_infos,
+                        conf,
+                    );
+                }
+                pb.inc(features.len() as u64);
+            });
         },
     )
 }
@@ -727,18 +885,19 @@ fn produce_cpu_gbm(
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a
 /// decoded signal and precomputed boundaries. Returns `(barcode, confidence)`;
 /// unfingerprintable reads route to `unclassified` (matching the SVM path).
-fn classify_one_cpu_gbm(
+/// Fingerprint one read for the GBM path. `None` when the adapter window is
+/// empty or the read cannot produce a full-width fingerprint.
+fn fingerprint_for_gbm(
     read: &ReadData,
     signal: &[i16],
     s: usize,
     e: usize,
-    predictor: &GbmPredictor,
     fp: FpParams,
-) -> (String, f64) {
+) -> Option<Vec<f64>> {
     if e <= s {
-        return (UNCLASSIFIED.to_string(), 0.0);
+        return None;
     }
-    let Some(features) = extract_fingerprint_from_signal(
+    extract_fingerprint_from_signal(
         signal,
         s,
         e,
@@ -749,13 +908,8 @@ fn classify_one_cpu_gbm(
         fp.min_separation,
         fp.keep_last,
         false,
-    ) else {
-        return (UNCLASSIFIED.to_string(), 0.0);
-    };
-    match predictor.predict(&features.values) {
-        Ok((_probs, result)) => (barcode_label(result.predicted_barcode), result.confidence),
-        Err(_) => (UNCLASSIFIED.to_string(), 0.0),
-    }
+    )
+    .map(|f| f.values)
 }
 
 /// GPU producer: parallel CPU prep (decode + detect + fingerprint) feeds a
@@ -844,7 +998,7 @@ fn produce_gpu(
                 for window in bulk.chunks(DETECT_WINDOW) {
                     let signals: Vec<Option<Vec<i16>>> = window
                         .par_iter()
-                        .map(|(_, chunks)| decode_chunks_to(chunks, decode_to))
+                        .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
                         .collect();
                     let bounds = detector.detect_batch(&signals);
                     let prepped: Vec<Option<Prepped>> = window
@@ -934,8 +1088,16 @@ fn writer_thread(
         let w = match writer.as_mut() {
             Some(w) => w,
             None => {
+                // Match `filter`/`repack` rather than taking the writer's
+                // conservative 100/1000 defaults. At 100 the writer flushes a
+                // signal batch every 100 reads, rebuilding the Arrow schema and
+                // emitting an IPC message + footer entry each time — and every
+                // downstream reader then pays per-batch parse cost over that
+                // many batches for the life of the file.
                 let opts = WriterOptions {
                     predefined_dictionaries: Some(predefined.clone()),
+                    signal_batch_size: 1_000,
+                    read_batch_size: 10_000,
                     ..Default::default()
                 };
                 writer = Some(Writer::create(path, opts)?);

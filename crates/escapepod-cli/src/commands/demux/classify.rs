@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Open a streaming output writer. Detects `.gz` extension and transparently
@@ -440,19 +440,37 @@ fn run_with_gbm_model(
                                 .ok();
                             }
                         }
-                        // A length mismatch shouldn't abort the whole batch —
-                        // emit each read as unclassified (barcode -1), mirroring
-                        // a rejected call.
+                        // The batched call is all-or-nothing, so retry the chunk
+                        // one read at a time and only reject the reads that
+                        // actually fail. Rejecting all 1024 would silently lose
+                        // three orders of magnitude more data than the defect
+                        // warrants.
                         Err(_) => {
-                            for (read_id, _) in chunk {
-                                tx.send(SvmClassifyResult {
-                                    read_id: *read_id,
-                                    predicted_barcode: -1,
-                                    confidence: 0.0,
-                                    is_confident: false,
-                                    probabilities: Vec::new(),
-                                })
-                                .ok();
+                            for ((read_id, fp), slice) in chunk.iter().zip(&slices) {
+                                let sent = match predictor.predict(slice) {
+                                    Ok((probs, result)) => SvmClassifyResult {
+                                        read_id: *read_id,
+                                        predicted_barcode: result.predicted_barcode,
+                                        confidence: result.confidence,
+                                        is_confident: result.is_confident,
+                                        probabilities: probs,
+                                    },
+                                    Err(e) => {
+                                        debug!(
+                                            "read {read_id}: GBM prediction failed \
+                                             ({} features): {e}",
+                                            fp.len()
+                                        );
+                                        SvmClassifyResult {
+                                            read_id: *read_id,
+                                            predicted_barcode: -1,
+                                            confidence: 0.0,
+                                            is_confident: false,
+                                            probabilities: Vec::new(),
+                                        }
+                                    }
+                                };
+                                tx.send(sent).ok();
                             }
                         }
                     }

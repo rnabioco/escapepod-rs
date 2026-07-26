@@ -16,10 +16,12 @@ use crate::stats::median_and_mad;
 /// * `signal` - The raw signal values to normalize
 ///
 /// # Returns
-/// A new vector containing the normalized signal values.
-///
-/// # Panics
-/// Panics if the signal is empty or if MAD is zero.
+/// A new vector containing the normalized signal values. When MAD is zero
+/// (a constant signal — a dead pore, a saturated or flat read), returns
+/// `signal - median` rather than dividing by zero, matching
+/// [`mad_normalize_robust`] and [`clip_outliers`]. Real sequencing runs do
+/// contain such reads, and this is called per read, so a panic here would
+/// abort an entire run (release builds use `panic = "abort"`).
 ///
 /// # Example
 /// ```
@@ -32,7 +34,7 @@ pub fn mad_normalize(signal: &[f32]) -> Vec<f32> {
     let (med, mad_val) = median_and_mad(signal);
 
     if mad_val == 0.0 {
-        panic!("MAD is zero - cannot normalize signal with no variation");
+        return signal.iter().map(|&x| x - med).collect();
     }
 
     signal.iter().map(|&x| (x - med) / mad_val).collect()
@@ -49,6 +51,199 @@ pub fn normalize_signal(signal: &[i16]) -> Vec<f32> {
         mad_normalize(&signal_f32)
     } else {
         signal_f32
+    }
+}
+
+/// Reusable buffers for [`normalize_downscale_into`].
+///
+/// Hand one of these to each rayon worker (via `for_each_init` / `map_init`)
+/// and the buffers grow once to their high-water mark instead of being
+/// reallocated per read.
+#[derive(Default, Clone, Debug)]
+pub struct SignalPrepScratch {
+    /// `i16 -> f32` cast of the raw signal, in original order.
+    cast: Vec<f32>,
+    /// Partitioning scratch for the median/MAD selection passes.
+    sel: Vec<f32>,
+}
+
+impl SignalPrepScratch {
+    /// Fresh, empty scratch. Buffers grow lazily on first use.
+    ///
+    /// `const` so callers can put one in a `thread_local!` initializer.
+    pub const fn new() -> Self {
+        Self {
+            cast: Vec::new(),
+            sel: Vec::new(),
+        }
+    }
+}
+
+/// Fused `normalize_signal` + `downscale`, writing into `out` and reusing
+/// `scratch` across calls.
+///
+/// Bit-identical to `downscale(&normalize_signal(signal)[..trunc], factor)`
+/// (with `trunc = (len / factor) * factor`), and to `normalize_signal(signal)`
+/// when `factor == 1`.
+///
+/// The point is allocation, not arithmetic. The unfused chain allocates **three
+/// full-length `f32` buffers per read** — the cast, `median_and_mad`'s internal
+/// copy, and `mad_normalize`'s `collect` — and then uses that full-resolution
+/// array only to produce the `n/factor`-length downscaled one. Read-length
+/// distributions have a long tail (one real tRNA library here has a median of
+/// 8.4 k samples but a maximum of 18.8 M), so a single outlier read costs
+/// ~225 MB of transient buffers on one worker, and several landing across a
+/// 48-thread pool at once is a genuine RSS spike. This keeps two reusable
+/// buffers per worker and writes the downscaled output directly.
+///
+/// # Panics
+/// Panics if `factor` is 0, matching [`downscale`].
+pub fn normalize_downscale_into(
+    signal: &[i16],
+    factor: usize,
+    scratch: &mut SignalPrepScratch,
+    out: &mut Vec<f32>,
+) {
+    if factor == 0 {
+        panic!("Downscaling factor must be greater than 0");
+    }
+
+    // Reusable buffers retain their high-water mark, which is the wrong
+    // behavior for a read-length distribution with rare huge outliers: one
+    // 18.8 M-sample read would otherwise pin ~150 MB on that worker for the
+    // rest of the run, on every worker that happened to see one. Release the
+    // capacity once it is both large in absolute terms and far larger than the
+    // current read needs, so the steady state tracks typical reads.
+    const RETAIN_MAX: usize = 1 << 20; // 4 MB as f32
+    if scratch.cast.capacity() > RETAIN_MAX && scratch.cast.capacity() > 2 * signal.len() {
+        scratch.cast = Vec::new();
+        scratch.sel = Vec::new();
+    }
+
+    let cast = &mut scratch.cast;
+    cast.clear();
+    cast.reserve(signal.len());
+    cast.extend(signal.iter().map(|&s| s as f32));
+
+    // `normalize_signal` leaves signals of <= 10 samples unnormalized to avoid a
+    // degenerate median/MAD; reproduce that exactly.
+    let (med, mad) = if cast.len() > 10 {
+        crate::stats::median_and_mad_with_scratch(cast, &mut scratch.sel)
+    } else {
+        (0.0, 0.0)
+    };
+    let normalize = cast.len() > 10;
+
+    // Matches `mad_normalize`: divide by MAD, or fall back to a plain median
+    // shift when MAD is zero (constant signal).
+    let apply = |x: f32| -> f32 {
+        if !normalize {
+            x
+        } else if mad == 0.0 {
+            x - med
+        } else {
+            (x - med) / mad
+        }
+    };
+
+    out.clear();
+    if factor == 1 {
+        out.reserve(cast.len());
+        out.extend(cast.iter().copied().map(apply));
+        return;
+    }
+
+    // Truncate to a whole multiple of `factor` so the trailing partial chunk is
+    // dropped, matching the historical CLI behavior and WarpDemuX's
+    // numpy-style downsampling.
+    let trunc = (cast.len() / factor) * factor;
+    out.reserve(trunc / factor);
+    for chunk in cast[..trunc].chunks(factor) {
+        // Left-to-right f32 accumulation from 0.0, exactly as
+        // `chunk.iter().sum::<f32>()` folds it.
+        let mut sum = 0.0f32;
+        for &x in chunk {
+            sum += apply(x);
+        }
+        out.push(sum / chunk.len() as f32);
+    }
+}
+
+/// Downscale first, then MAD-normalize — for LLR adapter detection.
+///
+/// [`normalize_downscale_into`] reproduces the historical order (normalize the
+/// full-resolution read, then downscale), which means two `select_nth` passes
+/// over the *whole* read. That was measured at ~28% of all CPU in the fused
+/// demux pipeline, and it is almost entirely avoidable: with `factor = 10` the
+/// same statistics can be computed over a signal 10× shorter.
+///
+/// Reordering is sound because [`detect_adapter`](super::detect_adapter) — the
+/// only consumer — is invariant to any positive affine transform of its input:
+///
+/// - Downscaling is linear, so `downscale((x - m) / s) == (downscale(x) - m) / s`.
+///   Both orders therefore produce affine transforms of the same signal, and
+///   differ only in *which* `(m, s)` is used.
+/// - The LLR objective is
+///   `gain = n·ln(var_full) − n_head·ln(var_head) − n_tail·ln(var_tail)`.
+///   Variance is shift-invariant and scales by `1/s²`, so each `ln` term picks
+///   up `−2·ln(s)`; because `n = n_head + n_tail` they cancel exactly and the
+///   gain — hence the argmax split — is unchanged.
+/// - The remaining decisions compare medians of segments (`median_2 > median_1`,
+///   `median_0 ≥ mean(medians)`) and two gains against each other. Medians
+///   commute with affine maps and the scale is positive, so every comparison is
+///   preserved.
+///
+/// Normalizing (rather than passing raw counts straight through, which the same
+/// invariance argument would also permit) keeps the values `O(1)`. That matters:
+/// `LlrTrace` computes variance as `sum_sq/n − mean²`, which loses precision
+/// catastrophically when the mean is large relative to the spread — exactly what
+/// raw pA-scale counts would produce.
+///
+/// This is **not** bit-identical to the historical order: the statistics come
+/// from the downscaled population, so boundaries can shift by a sample on reads
+/// where the LLR surface is nearly flat. Validate with a boundary/barcode parity
+/// run when changing it.
+pub fn downscale_normalize_into(
+    signal: &[i16],
+    factor: usize,
+    scratch: &mut SignalPrepScratch,
+    out: &mut Vec<f32>,
+) {
+    if factor == 0 {
+        panic!("Downscaling factor must be greater than 0");
+    }
+
+    out.clear();
+    if factor == 1 {
+        // Nothing to downscale; identical to `normalize_downscale_into`.
+        normalize_downscale_into(signal, 1, scratch, out);
+        return;
+    }
+
+    // Mean-pool the raw signal straight out of the i16 input — no full-length
+    // f32 intermediate.
+    let trunc = (signal.len() / factor) * factor;
+    out.reserve(trunc / factor);
+    for chunk in signal[..trunc].chunks(factor) {
+        let mut sum = 0.0f32;
+        for &x in chunk {
+            sum += x as f32;
+        }
+        out.push(sum / chunk.len() as f32);
+    }
+
+    // MAD-normalize the (now 1/factor-length) signal in place.
+    if out.len() > 10 {
+        let (med, mad) = crate::stats::median_and_mad_with_scratch(out, &mut scratch.sel);
+        if mad == 0.0 {
+            for v in out.iter_mut() {
+                *v -= med;
+            }
+        } else {
+            for v in out.iter_mut() {
+                *v = (*v - med) / mad;
+            }
+        }
     }
 }
 
@@ -89,15 +284,14 @@ pub fn mad_normalize_robust(signal: &[f32]) -> Vec<f32> {
 /// * `clip_sigma` - Number of MAD units to clip at (e.g., 5.0)
 ///
 /// # Returns
-/// A new vector containing the normalized and clipped signal values.
-///
-/// # Panics
-/// Panics if the signal is empty or if MAD is zero.
+/// A new vector containing the normalized and clipped signal values. When MAD
+/// is zero (constant signal) there is nothing to clip and no scale to divide
+/// by, so this returns `signal - median`; see [`mad_normalize`].
 pub fn mad_normalize_with_clipping(signal: &[f32], clip_sigma: f32) -> Vec<f32> {
     let (med, mad_val) = median_and_mad(signal);
 
     if mad_val == 0.0 {
-        panic!("MAD is zero - cannot normalize signal with no variation");
+        return signal.iter().map(|&x| x - med).collect();
     }
 
     let lower_bound = med - clip_sigma * mad_val;
@@ -382,11 +576,84 @@ mod tests {
         downscale(&signal, 0);
     }
 
+    /// A constant signal (dead pore / saturated read) must not abort the run:
+    /// release builds are `panic = "abort"` and this runs on every read.
     #[test]
-    #[should_panic(expected = "MAD is zero")]
     fn test_mad_normalize_constant_signal() {
         let signal = vec![5.0, 5.0, 5.0, 5.0];
-        mad_normalize(&signal);
+        assert_eq!(mad_normalize(&signal), vec![0.0, 0.0, 0.0, 0.0]);
+
+        let clipped = mad_normalize_with_clipping(&signal, 5.0);
+        assert_eq!(clipped, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// The whole-pipeline entry point takes raw i16 and is the one demux
+    /// actually calls per read (`run.rs`, `detect.rs`).
+    /// The fused prep must reproduce the unfused
+    /// `downscale(normalize_signal(..)[..trunc], factor)` chain exactly — it is
+    /// an allocation change, not an arithmetic one.
+    #[test]
+    fn fused_normalize_downscale_is_bit_identical() {
+        let mut scratch = SignalPrepScratch::new();
+        let mut out = Vec::new();
+
+        for &len in &[0usize, 1, 5, 10, 11, 37, 100, 999, 4096, 10_007] {
+            let signal: Vec<i16> = (0..len)
+                .map(|i| {
+                    let x = i as f32 * 0.037;
+                    (500.0 + 300.0 * x.sin() + 40.0 * (x * 7.3).cos()) as i16
+                })
+                .collect();
+
+            for &factor in &[1usize, 2, 3, 10, 64] {
+                // Reference: the original unfused chain.
+                let normalized = normalize_signal(&signal);
+                let expected = if factor > 1 {
+                    let trunc = (normalized.len() / factor) * factor;
+                    downscale(&normalized[..trunc], factor)
+                } else {
+                    normalized
+                };
+
+                normalize_downscale_into(&signal, factor, &mut scratch, &mut out);
+
+                assert_eq!(
+                    out.len(),
+                    expected.len(),
+                    "len={len} factor={factor}: length differs"
+                );
+                for (i, (a, b)) in out.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "len={len} factor={factor} idx={i}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Constant signal (MAD == 0) must go through the fused path too, without
+    /// dividing by zero.
+    #[test]
+    fn fused_normalize_downscale_handles_constant_signal() {
+        let mut scratch = SignalPrepScratch::new();
+        let mut out = Vec::new();
+        let signal: Vec<i16> = vec![512; 500];
+        normalize_downscale_into(&signal, 10, &mut scratch, &mut out);
+        assert_eq!(out.len(), 50);
+        assert!(out.iter().all(|v| v.is_finite() && *v == 0.0));
+    }
+
+    #[test]
+    fn test_normalize_signal_constant_and_zero() {
+        let flat: Vec<i16> = vec![512; 64];
+        let out = normalize_signal(&flat);
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|v| v.is_finite() && *v == 0.0));
+
+        let zeros: Vec<i16> = vec![0; 64];
+        assert!(normalize_signal(&zeros).iter().all(|v| v.is_finite()));
     }
 
     #[test]

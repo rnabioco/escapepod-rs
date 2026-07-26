@@ -391,10 +391,11 @@ Examples:
 ")]
     Summary(commands::summary::SummaryArgs),
 
-    /// Barcode demultiplexing workflow (experimental; requires `--features demux`)
+    /// Barcode demultiplexing workflow
     #[cfg(feature = "demux")]
     #[command(after_help = "\
 Examples:
+  escpod demux input.pod5 --model model.json -d out/   Fused pipeline (recommended)
   escpod demux detect input.pod5 -o boundaries.csv
   escpod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
   escpod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv

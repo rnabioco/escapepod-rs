@@ -326,10 +326,33 @@ fn reset_row(buf: &mut Vec<f32>, len: usize) {
 }
 
 /// Number of training fingerprints scored per SIMD batch by
-/// [`dtw_distances_batch_unconstrained`]. Sixteen `f32` lanes fill one AVX-512
-/// `zmm` register; on the `-C target-cpu=x86-64-v3` (AVX2) baseline the same
-/// block layout is consumed as two `ymm` registers per step.
-pub const DTW_LANES: usize = 16;
+/// [`dtw_distances_batch_unconstrained`] and the windowed batch kernel.
+///
+/// On the `-C target-cpu=x86-64-v3` (AVX2) baseline a block of `N` `f32` lanes
+/// is consumed as `N/8` independent `ymm` dependency chains per step. The DP
+/// carries a serial `left` dependency along each row whose critical path is
+/// ~12 cycles, so the loop is **latency-bound, not throughput-bound**: what
+/// sets the rate is how many independent chains stay in flight, and at 16 lanes
+/// (2 chains) the FP ports sit idle most of the time. Measured per-read
+/// `predict_with_workspace` on the shipped 851×25 WDX4 shape, `rna` (Cascade
+/// Lake), all bit-identical:
+///
+/// ```text
+///            851 refs          3404 refs
+/// LANES=16   150.1 us  (was)   599.4 us  (was)
+/// LANES=32   121.4 us  -18.9%  473.6 us  -20.9%
+/// LANES=64   125.0 us  -16.7%  469.7 us  -21.9%
+/// ```
+///
+/// 32 is the pick: it wins outright at the shipped WDX4 bank size, where 64
+/// starts losing to padding waste (a bank whose size is not a multiple of
+/// `DTW_LANES` pads its final block — 851 refs leaves 29 of 64 lanes idle) and
+/// to row-scratch pressure. 64 only pulls ahead on banks several times larger.
+/// Per-thread row scratch stays at `(m+1) * 32 * 4` bytes.
+///
+/// Bit-identical to the scalar path at every width (covered by the batch/scalar
+/// parity tests below) — this changes only how many DP lanes are in flight.
+pub const DTW_LANES: usize = 32;
 
 /// Reusable row buffers for [`dtw_distances_batch_unconstrained`]. Each row
 /// cell holds `DTW_LANES` independent DP states (one per training fingerprint

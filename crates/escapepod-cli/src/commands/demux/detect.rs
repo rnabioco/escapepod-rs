@@ -4,7 +4,7 @@ use super::utils::{configure_thread_pool, process_reads_par, total_read_count};
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::ReadBoundaries;
-use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
+use escapepod_signal::segmentation::{SignalPrepScratch, detect_adapter, downscale_normalize_into};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -164,29 +164,33 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
         Some(&progress_bar),
         None, // LLR scans the full read
         |read_id, num_samples, signal| {
-            let normalized = normalize_signal(signal);
+            // Per-worker scratch via a thread-local: `process_reads_par` takes
+            // an `Fn`, so there is no init hook to thread buffers through. The
+            // unfused normalize+downscale chain allocates three full-length f32
+            // buffers per read, and the read-length tail (medians of ~8 k with
+            // maxima in the millions) makes that a real RSS spike.
+            thread_local! {
+                static PREP: std::cell::RefCell<(SignalPrepScratch, Vec<f32>)> =
+                    const { std::cell::RefCell::new((SignalPrepScratch::new(), Vec::new())) };
+            }
 
-            let (processed_signal, scale_factor) = if downscale_factor > 1 {
-                // Truncate to a whole multiple of downscale_factor so the
-                // last (partial) chunk is dropped — matches the historical
-                // cli behavior and WarpDemuX's numpy-style downsampling.
-                let truncated = (normalized.len() / downscale_factor) * downscale_factor;
-                (
-                    downscale(&normalized[..truncated], downscale_factor),
-                    downscale_factor,
-                )
+            let scale_factor = if downscale_factor > 1 {
+                downscale_factor
             } else {
-                (normalized, 1)
+                1
             };
-
             let scaled_min_adapter = min_adapter / scale_factor;
             let scaled_border_trim = border_trim / scale_factor;
 
-            let (adapter_start, adapter_end) = detect_adapter(
-                &processed_signal,
-                scaled_min_adapter.max(1),
-                scaled_border_trim.max(1),
-            );
+            let (adapter_start, adapter_end) = PREP.with(|cell| {
+                let (prep, processed) = &mut *cell.borrow_mut();
+                downscale_normalize_into(signal, downscale_factor, prep, processed);
+                detect_adapter(
+                    processed,
+                    scaled_min_adapter.max(1),
+                    scaled_border_trim.max(1),
+                )
+            });
 
             ReadBoundaries {
                 read_id,
@@ -201,7 +205,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
     // Write results
     let output_file = File::create(&args.output)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
 
     writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
 
@@ -438,7 +442,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     progress_bar.finish_with_message("complete");
 
     let output_file = File::create(&args.output)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
     writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
 
     let mut detected = 0;

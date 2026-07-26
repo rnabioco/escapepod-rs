@@ -36,16 +36,30 @@ pub fn median_via_select(data: &mut [f32]) -> f32 {
 /// Returns `(median, mad)`. A single scratch copy is made and reused across
 /// both passes. Returns `(0.0, 0.0)` for an empty slice.
 pub fn median_and_mad(data: &[f32]) -> (f32, f32) {
-    // select_nth partitions in place; clone once and reuse buf for the MAD pass.
-    let mut buf = data.to_vec();
-    let med = median_via_select(&mut buf);
+    let mut buf = Vec::new();
+    median_and_mad_with_scratch(data, &mut buf)
+}
+
+/// [`median_and_mad`] using a caller-owned scratch buffer instead of allocating
+/// one per call.
+///
+/// `scratch` is overwritten; its previous contents and capacity are reused, so
+/// a hot loop over many reads allocates once at its high-water mark rather than
+/// once per read. Results are bit-identical to [`median_and_mad`].
+pub fn median_and_mad_with_scratch(data: &[f32], scratch: &mut Vec<f32>) -> (f32, f32) {
+    // select_nth partitions in place; copy once and reuse the buffer for the
+    // MAD pass.
+    scratch.clear();
+    scratch.extend_from_slice(data);
+    let buf = scratch.as_mut_slice();
+    let med = median_via_select(buf);
 
     // Overwrite buf with absolute deviations from the median (keyed off the
     // original data, whose order buf no longer shares).
     for (v, slot) in data.iter().zip(buf.iter_mut()) {
         *slot = (*v - med).abs();
     }
-    let mad = median_via_select(&mut buf);
+    let mad = median_via_select(buf);
 
     (med, mad)
 }

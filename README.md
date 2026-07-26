@@ -83,9 +83,6 @@ Opt into experimental commands:
 ```bash
 # repack, resquiggle, index
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features experimental
-
-# barcode demultiplexing
-cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features demux
 ```
 
 ### Python library
