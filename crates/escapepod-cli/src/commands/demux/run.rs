@@ -537,26 +537,44 @@ const DETECT_WINDOW: usize = 65_536;
 /// the read cap above still lets the GPU-CNN path (which decodes only ~806
 /// samples per read) fill a full 65,536-read block before this binds.
 ///
-/// Override with `ESCAPEPOD_DEMUX_BLOCK_MB` (in MiB) to retune for an unusual
-/// library or a memory-constrained node; see [`block_target_bytes`].
+/// 128 MB measured best on 1.22 M reads; larger is worse on both wall time and
+/// RSS (512 MB: 74.4 s / 13.07 GB vs 128 MB: 63.8 s / 12.68 GB).
 const BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
-/// [`BLOCK_TARGET_BYTES`], with an `ESCAPEPOD_DEMUX_BLOCK_MB` override.
+/// Blocks queued between the reader threads and the processing loop.
 ///
-/// Bigger blocks amortize per-block overhead and give GPU detection larger
-/// same-length groups; smaller blocks lower peak RSS and let the reader thread
-/// get further ahead of the classifier. Probed once — the value is fixed for
-/// the run.
-fn block_target_bytes() -> usize {
+/// Enough to cover a reader hiccup without inflating peak memory — measured
+/// worth ~3% on its own (56.9 s -> 55.1 s at one filler); the filler count is
+/// the larger lever.
+const BLOCK_QUEUE_DEPTH: usize = 2;
+
+/// Number of block-filling reader threads (`ESCAPEPOD_DEMUX_FILLERS`).
+///
+/// Two is the measured sweet spot; see [`fill_shard`] for the access-pattern
+/// caveat. On 1.22 M reads (BeeGFS input, 48 cores):
+///
+/// ```text
+/// fillers/queue   wall     CPU    peak RSS
+///   1 / 1        56.9 s    771%    12.2 GB
+///   2 / 2        48.4 s    918%    13.0 GB   <- default
+///   4 / 4        48.1 s    931%    14.5 GB
+///   8 / 4        48.5 s    923%    17.3 GB
+/// ```
+///
+/// One filler leaves the pipeline waiting on a single sequential sweep; a
+/// second covers that stall. Past two it is flat, and the extra blocks in
+/// flight cost real memory. Set `ESCAPEPOD_DEMUX_FILLERS=1` on a cold network
+/// filesystem where concurrent streams are known to hurt.
+fn filler_threads() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ESCAPEPOD_DEMUX_BLOCK_MB")
+        std::env::var("ESCAPEPOD_DEMUX_FILLERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(BLOCK_TARGET_BYTES)
+            .filter(|&n| n > 0)
+            .unwrap_or(2)
+            .min(32)
     })
 }
 
@@ -590,79 +608,108 @@ fn drive_blocks(
     decode_to: Option<usize>,
     mut process_block: impl FnMut(Vec<Option<Vec<i16>>>, Vec<BlockItem>),
 ) -> anyhow::Result<()> {
-    // Depth 1 = one block in flight behind the one being processed. Peak is
-    // therefore ~3 blocks (filling, queued, processing), which is what
-    // `BLOCK_TARGET_BYTES` is sized against.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<SignalBlock>(1);
+    let shards = filler_threads();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<SignalBlock>(BLOCK_QUEUE_DEPTH);
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
-        let filler = scope.spawn(move || -> anyhow::Result<()> {
-            let mut sigs: Vec<Option<Vec<i16>>> = Vec::new();
-            let mut items: Vec<BlockItem> = Vec::new();
-            let mut block_bytes = 0usize;
-            let target_bytes = block_target_bytes();
-
-            for path in input {
-                let reader = Reader::open(path)?;
-                let run_infos = Arc::new(reader.run_infos().to_vec());
-                for batch in reader.read_batches()? {
-                    let batch = batch?;
-                    let view = ReadsBatchView::new(&batch, false)?;
-                    let reads: Vec<ReadData> = (0..view.num_rows())
-                        .filter_map(|row| view.read(row).ok())
-                        .filter(|r| !r.signal_rows.is_empty())
-                        .collect();
-                    // One sequential, ascending-order sweep pulls this batch's
-                    // signal (grouped by Arrow record-batch — see #72), then
-                    // decode in parallel.
-                    let keyed: Vec<(usize, Vec<u64>)> = reads
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| (i, r.signal_rows.clone()))
-                        .collect();
-                    let bulk = reader.get_compressed_signal_bulk(&keyed)?;
-                    let decoded: Vec<Option<Vec<i16>>> = bulk
-                        .par_iter()
-                        .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
-                        .collect();
-
-                    let mut reads_opt: Vec<Option<ReadData>> =
-                        reads.into_iter().map(Some).collect();
-                    for ((i, chunks), sig) in bulk.into_iter().zip(decoded) {
-                        let read = reads_opt[i].take().expect("each read consumed once");
-                        block_bytes += sig.as_ref().map_or(0, |s| s.len() * 2)
-                            + chunks.iter().map(|c| c.data.len()).sum::<usize>();
-                        sigs.push(sig);
-                        items.push((read, chunks, run_infos.clone()));
-                    }
-
-                    if sigs.len() >= DETECT_WINDOW || block_bytes >= target_bytes {
-                        block_bytes = 0;
-                        // A send error means the consumer is gone (it returned
-                        // early or panicked); stop filling rather than block.
-                        if tx
-                            .send((std::mem::take(&mut sigs), std::mem::take(&mut items)))
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            if !sigs.is_empty() {
-                tx.send((sigs, items)).ok();
-            }
-            Ok(())
-        });
+        let mut fillers = Vec::with_capacity(shards);
+        for shard in 0..shards {
+            let tx = tx.clone();
+            fillers.push(scope.spawn(move || fill_shard(input, decode_to, shard, shards, tx)));
+        }
+        // Drop the extra sender so `rx` ends once every shard has finished.
+        drop(tx);
 
         for (sigs, items) in rx {
             process_block(sigs, items);
         }
 
-        filler
-            .join()
-            .map_err(|e| anyhow::anyhow!("demux reader thread panicked: {e:?}"))?
+        for f in fillers {
+            f.join()
+                .map_err(|e| anyhow::anyhow!("demux reader thread panicked: {e:?}"))??;
+        }
+        Ok(())
     })
+}
+
+/// Fill blocks from the Arrow batches assigned to `shard` (every `shards`-th
+/// batch) and send them downstream.
+///
+/// With `shards == 1` this is one sequential ascending sweep of the whole file
+/// — the #72 access pattern. Sharding hands each thread a strided subset of
+/// batches: still coarse-grained sequential I/O per thread, qualitatively
+/// unlike the per-read demand paging #72 fixed (48 threads faulting per read
+/// measured 0.3 MB/s against 288 MB/s for one sweep), but it is N concurrent
+/// streams rather than one.
+///
+/// The default of 2 was measured on BeeGFS input that had been read repeatedly
+/// and so may have been partly cached; the cold case is **not** independently
+/// validated. `ESCAPEPOD_DEMUX_FILLERS=1` restores the strict single-stream
+/// behavior if concurrent streams turn out to hurt on a cold mount.
+fn fill_shard(
+    input: &[std::path::PathBuf],
+    decode_to: Option<usize>,
+    shard: usize,
+    shards: usize,
+    tx: std::sync::mpsc::SyncSender<SignalBlock>,
+) -> anyhow::Result<()> {
+    let mut sigs: Vec<Option<Vec<i16>>> = Vec::new();
+    let mut items: Vec<BlockItem> = Vec::new();
+    let mut block_bytes = 0usize;
+
+    for path in input {
+        let reader = Reader::open(path)?;
+        let run_infos = Arc::new(reader.run_infos().to_vec());
+        for (bi, batch) in reader.read_batches()?.enumerate() {
+            if bi % shards != shard {
+                continue;
+            }
+            let batch = batch?;
+            let view = ReadsBatchView::new(&batch, false)?;
+            let reads: Vec<ReadData> = (0..view.num_rows())
+                .filter_map(|row| view.read(row).ok())
+                .filter(|r| !r.signal_rows.is_empty())
+                .collect();
+            // One sequential, ascending-order sweep pulls this batch's
+            // signal (grouped by Arrow record-batch — see #72), then
+            // decode in parallel.
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+            let decoded: Vec<Option<Vec<i16>>> = bulk
+                .par_iter()
+                .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
+                .collect();
+
+            let mut reads_opt: Vec<Option<ReadData>> = reads.into_iter().map(Some).collect();
+            for ((i, chunks), sig) in bulk.into_iter().zip(decoded) {
+                let read = reads_opt[i].take().expect("each read consumed once");
+                block_bytes += sig.as_ref().map_or(0, |s| s.len() * 2)
+                    + chunks.iter().map(|c| c.data.len()).sum::<usize>();
+                sigs.push(sig);
+                items.push((read, chunks, run_infos.clone()));
+            }
+
+            if sigs.len() >= DETECT_WINDOW || block_bytes >= BLOCK_TARGET_BYTES {
+                block_bytes = 0;
+                // A send error means the consumer is gone (it returned early or
+                // panicked); stop filling rather than block.
+                if tx
+                    .send((std::mem::take(&mut sigs), std::mem::take(&mut items)))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if !sigs.is_empty() {
+        tx.send((sigs, items)).ok();
+    }
+    Ok(())
 }
 
 /// CPU-classify producer (DTW-SVM): stream reads in large blocks

@@ -30,9 +30,14 @@ classification was entirely hidden. After the fix the same swap costs ~50 s —
 classify is now on the critical path, which is what makes the classifier
 optimizations and `--gpu` worth anything.
 
-### Block size (`ESCAPEPOD_DEMUX_BLOCK_MB`)
+### Reader tuning
 
-GBM model, same input. The default is 128 MB; larger is worse on both axes.
+Block size and reader-thread count were swept on the same input; both are now
+fixed in the code at the measured optimum. Only the filler count remains
+tunable (`ESCAPEPOD_DEMUX_FILLERS`), as the escape hatch for cold network
+filesystems — see below.
+
+Block size (GBM model). 128 MB is the pick; larger is worse on both axes:
 
 | MB | wall | peak RSS | CPU |
 |---:|---:|---:|---:|
@@ -41,6 +46,37 @@ GBM model, same input. The default is 128 MB; larger is worse on both axes.
 | **128** | **63.8 s** | 12.68 GB | 1230% |
 | 256 | 69.9 s | 12.86 GB | 1072% |
 | 512 | 74.4 s | 13.07 GB | 970% |
+
+Reader threads and queue depth, after the classifier and prep work below:
+
+| fillers / queue | wall | CPU | peak RSS |
+|---|---:|---:|---:|
+| 1 / 1 | 56.9 s | 771% | 12.2 GB |
+| **2 / 2** | **48.4 s** | 918% | 13.0 GB |
+| 4 / 4 | 48.1 s | 931% | 14.5 GB |
+| 8 / 4 | 48.5 s | 923% | 17.3 GB |
+
+A deeper queue alone is worth ~3%; the second reader thread is the real lever
+(-15%). Past two it is flat and costs real memory.
+
+**Caveat:** these runs used BeeGFS input that had been read repeatedly on a
+256 GB node, so it may have been partly page-cached. The cold case is *not*
+independently validated. Two threads doing coarse ascending sweeps of
+alternating Arrow batches is qualitatively unlike the per-read demand paging
+that #72 fixed (48 threads faulting per read measured 0.3 MB/s against
+288 MB/s for one sweep), but if a cold mount regresses, set
+`ESCAPEPOD_DEMUX_FILLERS=1`.
+
+### What the pipeline is *not* bound by
+
+Measured while tuning, so these are not re-derived:
+
+- **Not write-bound.** Sending output to `/dev/shm` instead of disk changes
+  nothing (60.3 s vs 59.8 s), and no Arrow/writer symbols appear in the profile
+  above 1% — the per-barcode writers do block-level compressed copies and
+  almost no CPU. Adding writer threads would not help.
+- **Input read is the cost.** Staging the input to node-local disk instead of
+  BeeGFS moves it from 59.8 s to 47.0 s.
 
 ### GPU DTW classify (A30) — does not pay off on a full node
 
