@@ -657,9 +657,54 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
+/// Build one signal-table `RecordBatch` from a run of source chunks.
+///
+/// This is where the real work happens: `chunks` are zero-copy borrows into the
+/// mmap'd source files, so `append_value` is what faults the source pages in
+/// and copies them into the Arrow buffer.
+fn build_signal_batch(
+    batch_chunks: &[(&[u8], u32)],
+    schema: &Arc<arrow::datatypes::Schema>,
+) -> Result<arrow::record_batch::RecordBatch> {
+    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
+    use arrow::record_batch::RecordBatch;
+
+    let total_bytes: usize = batch_chunks.iter().map(|(d, _)| d.len()).sum();
+    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
+    let mut signal_builder = LargeBinaryBuilder::with_capacity(batch_chunks.len(), total_bytes);
+    let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
+
+    for (signal_data, samples) in batch_chunks {
+        // The actual read_id lives in the reads table; the signal
+        // table's read_id column is unused by the POD5 reader.
+        read_id_builder.append_value([0u8; 16])?;
+        signal_builder.append_value(*signal_data);
+        samples_builder.append_value(*samples);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(read_id_builder.finish()) as ArrayRef,
+            Arc::new(signal_builder.finish()) as ArrayRef,
+            Arc::new(samples_builder.finish()) as ArrayRef,
+        ],
+    )?)
+}
+
 /// Stream the signal IPC table directly to `file`, returning the number of
-/// bytes written. Peak memory is bounded by one in-flight `RecordBatch`
-/// (≤ `batch_size` chunks), independent of the total signal volume.
+/// bytes written.
+///
+/// Batches are built **in parallel** and written in order. Building a batch
+/// means faulting source pages in from the mmap and memcpy'ing them into an
+/// Arrow buffer; doing that inline with the writes made this loop single
+/// threaded and latency-bound — profiling a 10.4 GB copy showed 75% of samples
+/// in `memmove` plus kernel page-fault time, at 24% CPU (a quarter of one
+/// core). Fanning the build across rayon lets those faults and copies overlap
+/// each other while the IPC stream itself stays strictly sequential.
+///
+/// Peak memory is bounded by `lookahead × batch_size` chunks in flight,
+/// independent of total signal volume.
 fn write_raw_signal_table<W: Write>(
     file: &mut W,
     chunks: &[(&[u8], u32)],
@@ -667,45 +712,43 @@ fn write_raw_signal_table<W: Write>(
     meta: &SchemaMetadata,
 ) -> Result<usize> {
     use crate::schema::signal_schema;
-    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, LargeBinaryBuilder, UInt32Builder};
     use arrow::ipc::writer::FileWriter;
-    use arrow::record_batch::RecordBatch;
+    use rayon::prelude::*;
 
     let schema = Arc::new(meta.apply(signal_schema()));
+
+    // How many batches to build concurrently. Bounded so peak memory stays
+    // modest: at the default 1000-chunk batches and ~10 KB chunks this is
+    // ~10 MB per batch in flight.
+    let lookahead = rayon::current_num_threads().clamp(2, 16);
+
+    // Precompute batch boundaries so the parallel build is a pure map.
+    let ranges: Vec<(usize, usize)> = (0..chunks.len())
+        .step_by(batch_size.max(1) as usize)
+        .map(|start| {
+            (
+                start,
+                (start + batch_size.max(1) as usize).min(chunks.len()),
+            )
+        })
+        .collect();
 
     let mut counter = CountingWriter::new(file);
     {
         let mut writer = FileWriter::try_new(&mut counter, &schema)?;
 
-        let total_rows = chunks.len();
-        let mut offset = 0;
-        while offset < total_rows {
-            let end = std::cmp::min(offset + batch_size as usize, total_rows);
-            let batch_chunks = &chunks[offset..end];
+        for window in ranges.chunks(lookahead) {
+            // Build this window concurrently; `collect` preserves order, so the
+            // IPC stream is written in exactly the original chunk order (which
+            // the reads table's signal-row prefix sums depend on).
+            let built: Vec<Result<arrow::record_batch::RecordBatch>> = window
+                .par_iter()
+                .map(|&(s, e)| build_signal_batch(&chunks[s..e], &schema))
+                .collect();
 
-            let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(batch_chunks.len(), 16);
-            let mut signal_builder = LargeBinaryBuilder::new();
-            let mut samples_builder = UInt32Builder::with_capacity(batch_chunks.len());
-
-            for (signal_data, samples) in batch_chunks {
-                // The actual read_id lives in the reads table; the signal
-                // table's read_id column is unused by the POD5 reader.
-                read_id_builder.append_value([0u8; 16])?;
-                signal_builder.append_value(*signal_data);
-                samples_builder.append_value(*samples);
+            for batch in built {
+                writer.write(&batch?)?;
             }
-
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(read_id_builder.finish()) as ArrayRef,
-                    Arc::new(signal_builder.finish()) as ArrayRef,
-                    Arc::new(samples_builder.finish()) as ArrayRef,
-                ],
-            )?;
-
-            writer.write(&batch)?;
-            offset = end;
         }
 
         writer.finish()?;
