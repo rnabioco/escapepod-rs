@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- **Lazy remote POD5 reading over range requests** (`remote` feature, off by
+  default). `escpod inspect` / `view` / `summary` now accept an `s3://`,
+  `gs://`, `az://`, or `https://` URL in place of a path and read it lazily:
+  opening transfers only the file tail and footer, and metadata commands then
+  fetch just the reads table. Inspecting a multi-GB object costs a few MB of
+  GETs instead of a full download. Credentials come from `object_store`'s
+  standard environment chain (`AWS_ACCESS_KEY_ID`, `AWS_REGION`,
+  `AWS_ENDPOINT` for MinIO and other S3-compatible services; note that an
+  `az://` URL carries no account name, so Azure also needs
+  `AZURE_STORAGE_ACCOUNT_NAME`). Build with `--features remote`; a binary
+  built without it rejects URLs with an explanatory error rather than
+  treating them as missing paths.
+
+  Signal access still materializes the whole signal table, so signal-heavy
+  commands (`demux`, `resquiggle`, `repack`, `merge`) remain a poor fit for a
+  remote object — download it first. Per-batch lazy signal is future work.
+  Writing remotely is not supported (#83, phases 0–1).
+
+- **`ByteSource` abstraction** behind the reader (`MmapSource`, `MemorySource`,
+  and the gated `RemoteSource`). `Reader` no longer holds an `Mmap` directly;
+  it asks a source for byte ranges, which come back as refcounted `Bytes`.
+  The local path stays zero-copy — ranges are views over the mapping, never
+  copies. `Reader::from_source`, `Reader::file_size`, and
+  `Reader::source_description` are new; no existing API changed.
+
+### Fixed
+
+- **POD5 footer parsing now rejects corrupt footer lengths** instead of
+  computing an out-of-range slice offset. A negative length, or one that
+  would place the footer magic before the file's leading signature, is now a
+  clean `InvalidFooter` error.
+
+- **Two `escapepod-pod5` tests had a wrong relative path to the bundled test
+  POD5** (`../data/…` rather than `../../data/…`) and had been silently
+  skipping their assertions. They now run.
+
 ## 0.6.2 (2026-07-22)
 
 ### Build / Tooling

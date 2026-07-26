@@ -35,6 +35,10 @@ indicatif = "0.18"
 # I/O
 memmap2 = "0.9"
 numpy = "0.29"
+# Lazy remote POD5 reading (opt-in via `remote`). `aws` also covers every
+# S3-compatible endpoint (MinIO, Ceph); `http` covers plain HTTPS range GETs.
+# rustls, not native-tls, so a static-musl release binary stays OpenSSL-free.
+object_store = { version = "0.12", default-features = false, features = ["aws", "gcp", "azure", "http", "tls-webpki-roots"] }
 # Parquet I/O for fingerprint tables (workspace dep so both test fixtures
 # and the CLI share the same version; features are kept default-off at
 # the workspace level so non-parquet crates don't pay).
@@ -47,7 +51,11 @@ rayon = "1"
 # from `ort` uses native-tls→openssl, which we deliberately avoid here.
 sha2 = "0.11"
 thiserror = "2"
+# Only ever driven by a shared, process-wide runtime bridging object_store's
+# async API into the synchronous Reader (see reader/remote.rs).
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
 # Structured logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

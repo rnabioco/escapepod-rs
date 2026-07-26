@@ -33,6 +33,49 @@ section.
 -V, --version  Print version information
 ```
 
+## Reading from object storage
+
+Built with the `remote` Cargo feature, `escpod summary`, `escpod view`, and
+`escpod inspect` accept a URL wherever they accept a path:
+
+```bash
+cargo install escapepod-cli --features remote
+
+escpod inspect summary s3://my-bucket/run1.pod5
+escpod view https://example.org/data/run1.pod5
+```
+
+Supported schemes are `s3://`, `gs://`, `az://`, and `http(s)://`. Reads are
+lazy: opening transfers only the file tail and footer, and the command then
+fetches just the reads table. Inspecting a multi-GB object costs a few MB of
+range requests rather than a full download — on the bundled 1.7 MB test file,
+`inspect summary`, `inspect reads`, and `view` each transfer 98 KB (5.5%) in
+four requests, and never touch the signal table.
+
+Credentials come from the standard environment chain:
+
+| Variable | Purpose |
+|---|---|
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | S3 credentials |
+| `AWS_REGION` | S3 region |
+| `AWS_ENDPOINT` | S3-compatible endpoint (MinIO, Ceph) |
+| `AWS_ALLOW_HTTP=true` | Permit a cleartext S3 endpoint |
+| `GOOGLE_SERVICE_ACCOUNT` | GCS service-account key path |
+| `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY` | Azure account and credentials |
+
+`AZURE_STORAGE_ACCOUNT_NAME` is required for `az://` — unlike an S3 or GCS
+URL, `az://container/path` carries no account name.
+
+!!! warning "Metadata commands only"
+
+    Signal is still fetched a whole table at a time, so signal-heavy commands
+    (`demux`, `resquiggle`, `repack`, `merge`, `filter`) would pull essentially
+    the entire object. Download the file first for those. Writing to a remote
+    destination is not supported — remote access is read-only.
+
+A binary built *without* the `remote` feature rejects a URL with an explanatory
+error rather than reporting it as a missing path.
+
 ## Examples
 
 ### Basic Workflow

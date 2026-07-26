@@ -46,3 +46,6 @@ default = []
 # Exposes `dtw::cuda::GpuDtwContext` and `dtw_distance_matrix_gpu`. Demux
 # consumers wire these in through the `escapepod-demux` crate.
 gpu = ["dep:cudarc", "dep:thiserror"]
+# Lazy remote POD5 reading (S3/GCS/Azure/HTTPS range requests). Forwards to the
+# pod5 layer, which owns the implementation.
+remote = ["escapepod-pod5/remote"]

@@ -13,11 +13,50 @@ use tracing::{info, warn};
 
 use crate::style;
 
+/// Whether an input path addresses a remote object.
+///
+/// The scheme list lives in the pod5 layer and is compiled there
+/// unconditionally, so this works — and [`open_pod5`] can explain itself —
+/// even in a build without the `remote` feature.
+pub fn path_is_remote_url(path: &Path) -> bool {
+    path.to_str().is_some_and(escapepod_signal::is_remote_url)
+}
+
+/// Open a POD5 input that may be either a local path or a remote URL.
+///
+/// Remote objects are read lazily over range requests, so metadata commands
+/// transfer a few MB rather than the whole file.
+pub fn open_pod5(input: &Path) -> anyhow::Result<Reader> {
+    if path_is_remote_url(input) {
+        let url = input.to_string_lossy();
+        #[cfg(feature = "remote")]
+        {
+            return Reader::open_url(&url).map_err(Into::into);
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            anyhow::bail!(
+                "Remote input {url} needs the `remote` feature; \
+                 this binary was built without it. Rebuild with \
+                 `cargo install escapepod-cli --features remote`, or download the file first."
+            );
+        }
+    }
+    Reader::open(input).map_err(Into::into)
+}
+
 /// Resolve input path to a list of POD5 files.
 ///
+/// - If the path is a remote URL, return it unchanged (no filesystem probing)
 /// - If path is a file, return it as a single-element vector
 /// - If path is a directory, find all *.pod5 files recursively
 pub fn resolve_pod5_inputs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    // A URL names exactly one object; there is no directory to walk and
+    // `is_file()` would just report false for it.
+    if path_is_remote_url(path) {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
@@ -199,8 +238,8 @@ pub enum OpenResult<T> {
 ///
 /// In directory mode, file open errors result in a warning and `Skip`.
 /// In single-file mode, errors are propagated.
-pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> OpenResult<Reader> {
-    match Reader::open(file_path) {
+pub fn open_reader_with_warning(file_path: &Path, is_directory: bool) -> OpenResult<Reader> {
+    match open_pod5(file_path) {
         Ok(r) => OpenResult::Ok(r),
         Err(e) => {
             if is_directory {
@@ -211,7 +250,7 @@ pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> Open
                 );
                 OpenResult::Skip
             } else {
-                OpenResult::Err(e.into())
+                OpenResult::Err(e)
             }
         }
     }

@@ -54,7 +54,10 @@ pub use operations::{RepackOptions, RepackResult, repack_files};
 pub use progress::{Progress, ProgressCallback};
 pub use reader::ReadIndex;
 pub use reader::Reader;
+#[cfg(feature = "remote")]
+pub use reader::RemoteSource;
 pub use reader::SignalExtractor;
+pub use reader::{ByteSource, MemorySource, MmapSource, is_remote_url};
 pub use types::{EndReason, PoreType, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{
     AtomicFile, Durability, PredefinedDictionaries, Writer, WriterOptions,

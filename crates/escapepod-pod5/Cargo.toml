@@ -14,16 +14,27 @@ categories = ["parser-implementations", "science"]
 harness = false
 name = "io_hot_paths"
 
+[features]
+default = []
+# Lazy reading of POD5 objects over S3/GCS/Azure/HTTPS range requests. Off by
+# default: it pulls in object_store + tokio, which a local-file build has no
+# use for.
+remote = ["dep:object_store", "dep:tokio", "dep:url"]
+
 [dependencies]
 anyhow = { workspace = true }
 arrow = { workspace = true }
 byteorder = { workspace = true }
+bytes = "1.9"
 csv = "1"
 flatbuffers = { workspace = true }
 memmap2 = { workspace = true }
+object_store = { workspace = true, optional = true }
 rayon = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
 

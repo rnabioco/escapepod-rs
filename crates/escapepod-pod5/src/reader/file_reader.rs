@@ -5,10 +5,11 @@ use crate::arrow_helpers::{BatchFieldExtractor, ReadColumns, ReadsBatchView};
 use crate::arrow_ipc::ArrowIpcFooter;
 use crate::compression;
 use crate::error::{Error, Result};
-use crate::footer::{self, Footer};
+use crate::footer::{self, ContentType, Footer};
 use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid};
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use memmap2::Mmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use super::byte_source::{ByteSource, MmapSource};
 use super::read_index::{P5I_MAGIC, P5I_VERSION, ReadIndex};
 use super::read_iter::{ReadIterator, extract_read_from_batch};
 use super::signal_extractor::SignalExtractor;
@@ -34,14 +36,30 @@ pub(crate) struct SignalCalibration {
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
 
+/// How much of the file tail to pull in one go when bootstrapping the footer.
+///
+/// The footer is a few hundred bytes in practice, so one 64 KiB tail read
+/// almost always covers the trailer *and* the FlatBuffer body — one round trip
+/// instead of two on a source where round trips cost something. Slicing the
+/// tail is free on an mmap, so the local path pays nothing for the headroom.
+const FOOTER_PROBE_LENGTH: u64 = 64 * 1024;
+
 /// A reader for POD5 files.
 pub struct Reader {
-    /// Memory-mapped file data.
-    mmap: Mmap,
+    /// Backing bytes of the file. Locally an mmap; ranges come back as
+    /// refcounted views over the mapping, not copies.
+    source: Arc<dyn ByteSource>,
     /// Parsed file footer.
     footer: Footer,
     /// Cached run info data.
     run_info_cache: Vec<RunInfoData>,
+    /// Reads/signal table bytes, fetched once on first use.
+    ///
+    /// Holding the table as an owned [`Bytes`] is what lets the accessors keep
+    /// handing out `&[u8]` tied to `&self` while the bytes themselves may have
+    /// come from somewhere with nothing to borrow from.
+    reads_table: OnceLock<Bytes>,
+    signal_table: OnceLock<Bytes>,
     /// Parsed Arrow IPC footer of the signal table (lazy — computed on first
     /// signal access). Owns only per-batch offset/row-count descriptors, so
     /// signal fetches locate a row and slice its compressed bytes straight out
@@ -140,6 +158,7 @@ impl Reader {
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Hint the OS to stream the mapping. POD5 access is overwhelmingly a
+
         // single front-to-back scan of the (large) signal + reads tables —
         // `view`, `filter`, `merge`, `repack`, and `demux` all read the whole
         // file once. Without a readahead hint the kernel faults mmap pages 4 KiB
@@ -154,25 +173,93 @@ impl Reader {
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
 
+        let source = MmapSource::new(mmap, file_path.display().to_string());
+        Self::from_source(Arc::new(source), Some(file_path))
+    }
+
+    /// Open a POD5 file from an arbitrary [`ByteSource`].
+    ///
+    /// Reads only the leading signature and the file tail, then whatever range
+    /// the footer points at — enough to enumerate the embedded tables without
+    /// touching signal data. `file_path` is used solely to locate a `.p5i`
+    /// sidecar and should be `None` for sources that aren't local files.
+    pub fn from_source(source: Arc<dyn ByteSource>, file_path: Option<PathBuf>) -> Result<Self> {
+        let file_len = source.len();
+
         // Verify signature at start
-        if mmap.len() < 8 || mmap[..8] != POD5_SIGNATURE {
+        if file_len < 8 || source.read_range(0, 8)?[..] != POD5_SIGNATURE {
             return Err(Error::InvalidSignature);
         }
 
-        // Parse footer
-        let footer = footer::parse_footer(&mmap)?;
+        // Bootstrap the footer from the file tail.
+        let tail_len = FOOTER_PROBE_LENGTH.min(file_len);
+        if tail_len < footer::TRAILER_LENGTH as u64 {
+            return Err(Error::InvalidFooter("File too small".to_string()));
+        }
+        let tail_start = file_len - tail_len;
+        let tail = source.read_range(tail_start, tail_len)?;
+        let trailer = &tail[tail.len() - footer::TRAILER_LENGTH..];
+        let region_range = footer::footer_body_range(trailer, file_len)?;
+
+        // The footer body is nearly always inside the tail we already have; the
+        // second fetch is the rare oversized-footer path.
+        let region = if region_range.start >= tail_start {
+            tail.slice(
+                (region_range.start - tail_start) as usize
+                    ..(region_range.end - tail_start) as usize,
+            )
+        } else {
+            source.read_range(region_range.start, region_range.end - region_range.start)?
+        };
+        let footer = footer::parse_footer_region(&region)?;
 
         // Load run info eagerly (it's usually small)
-        let run_info_cache = Self::load_run_info(&mmap, &footer)?;
+        let run_info_cache = Self::load_run_info(source.as_ref(), &footer)?;
 
         Ok(Self {
-            mmap,
+            source,
             footer,
             run_info_cache,
+            reads_table: OnceLock::new(),
+            signal_table: OnceLock::new(),
             signal_ipc_footer: OnceLock::new(),
             read_index: OnceLock::new(),
-            file_path: Some(file_path),
+            file_path,
         })
+    }
+
+    /// Open a POD5 object from object storage or an HTTPS URL, reading it
+    /// lazily over range requests.
+    ///
+    /// Supported schemes: `s3://`, `gs://`, `az://`, `http(s)://`. Opening
+    /// transfers only the file tail and footer, so `inspect`/`view`/`summary`
+    /// on a multi-GB object cost a few MB rather than a full download.
+    ///
+    /// Credentials come from the standard environment chain (for S3:
+    /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
+    /// `AWS_ENDPOINT` for S3-compatible services such as MinIO).
+    ///
+    /// Signal access still materializes the whole signal table, so
+    /// signal-heavy commands (`demux`, `resquiggle`, `repack`, `merge`) are a
+    /// poor fit for a remote object — download it first.
+    #[cfg(feature = "remote")]
+    pub fn open_url(url: &str) -> Result<Self> {
+        let source = super::remote::RemoteSource::open(url)?;
+        // No local path, so no `.p5i` sidecar lookup — the index is rebuilt
+        // from a column-projected scan if one is ever needed.
+        Self::from_source(Arc::new(source), None)
+    }
+
+    /// Describe where this reader's bytes come from (a path, or a URL).
+    pub fn source_description(&self) -> String {
+        self.source.describe()
+    }
+
+    /// Total size of the POD5 file in bytes.
+    ///
+    /// Available for remote objects too, where there is nothing to `stat`.
+    pub fn file_size(&self) -> u64 {
+        self.source.len()
     }
 
     /// Lazily parse and cache the signal table's Arrow IPC footer.
@@ -187,10 +274,7 @@ impl Reader {
     fn signal_ipc_footer(&self) -> Option<&ArrowIpcFooter> {
         self.signal_ipc_footer
             .get_or_init(|| {
-                let embedded = self.footer.signal_table()?;
-                let start = embedded.offset as usize;
-                let end = start + embedded.length as usize;
-                let slice = self.mmap.get(start..end)?;
+                let slice = self.signal_table_bytes().ok()?;
                 let footer = ArrowIpcFooter::parse(slice).ok()?;
                 if footer.record_batches.is_empty() || footer.total_rows == 0 {
                     return None;
@@ -198,6 +282,37 @@ impl Reader {
                 Some(footer)
             })
             .as_ref()
+    }
+
+    /// Fetch an embedded table's bytes, bounds-checked against the file.
+    fn fetch_table(&self, embedded: &crate::footer::EmbeddedFile, what: &str) -> Result<Bytes> {
+        let file_len = self.source.len();
+        let start = embedded.offset;
+        let end = start.saturating_add(embedded.length);
+        if start < 0 || embedded.length < 0 || end as u64 > file_len {
+            return Err(Error::InvalidFooter(format!(
+                "{what} table extends beyond file: {start}..{end} > {file_len}"
+            )));
+        }
+        self.source.read_range(start as u64, embedded.length as u64)
+    }
+
+    /// Bytes of an embedded table, fetched once and cached.
+    ///
+    /// The cache is what keeps the returned slice borrowable from `&self`
+    /// regardless of where the bytes came from, and it means a source with real
+    /// per-request cost fetches each table at most once.
+    fn cached_table_bytes<'a>(
+        &self,
+        cache: &'a OnceLock<Bytes>,
+        embedded: &crate::footer::EmbeddedFile,
+        what: &str,
+    ) -> Result<&'a [u8]> {
+        if let Some(bytes) = cache.get() {
+            return Ok(bytes);
+        }
+        let bytes = self.fetch_table(embedded, what)?;
+        Ok(cache.get_or_init(|| bytes))
     }
 
     /// Get the file identifier (UUID).
@@ -391,23 +506,13 @@ impl Reader {
         Ok(footer.total_rows as usize)
     }
 
-    /// Raw bytes of the reads table (Arrow IPC stream slice into the mmap).
+    /// Raw bytes of the reads table (Arrow IPC stream).
     fn reads_table_bytes(&self) -> Result<&[u8]> {
         let embedded = self
             .footer
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let start = embedded.offset as usize;
-        let end = start + embedded.length as usize;
-        if end > self.mmap.len() {
-            return Err(Error::InvalidFooter(format!(
-                "Reads table extends beyond file: {}..{} > {}",
-                start,
-                end,
-                self.mmap.len()
-            )));
-        }
-        Ok(&self.mmap[start..end])
+        self.cached_table_bytes(&self.reads_table, embedded, "Reads")
     }
 
     /// Get signal data for a read.
@@ -508,27 +613,17 @@ impl Reader {
     }
 
     /// Get raw bytes of the signal table for direct byte-level copying.
-    /// This returns a slice into the memory-mapped file containing the complete
-    /// Arrow IPC stream for the signal table.
+    ///
+    /// Returns the complete Arrow IPC stream for the signal table. On a local
+    /// file this is a zero-copy view of the mapping; on a source that must
+    /// actually transfer bytes it materializes the whole table, which for a
+    /// multi-GB POD5 is exactly as expensive as it sounds.
     pub fn signal_table_bytes(&self) -> Result<&[u8]> {
         let embedded = self
             .footer
             .signal_table()
             .ok_or_else(|| Error::MissingField("signal table".to_string()))?;
-
-        let start = embedded.offset as usize;
-        let end = start + embedded.length as usize;
-
-        if end > self.mmap.len() {
-            return Err(Error::InvalidFooter(format!(
-                "Signal table extends beyond file: {}..{} > {}",
-                start,
-                end,
-                self.mmap.len()
-            )));
-        }
-
-        Ok(&self.mmap[start..end])
+        self.cached_table_bytes(&self.signal_table, embedded, "Signal")
     }
 
     /// Bulk extract decompressed signal for multiple reads.
@@ -683,26 +778,10 @@ impl Reader {
     /// This hints to the OS to read pages ahead, improving sequential read performance.
     pub fn prefetch_signal(&self) {
         if let Some(embedded) = self.footer.signal_table() {
-            let start = embedded.offset as usize;
-            let end = (start + embedded.length as usize).min(self.mmap.len());
-            // Use madvise to hint sequential access
-            #[cfg(unix)]
-            {
-                let _ = self.mmap.advise_range(
-                    memmap2::Advice::WillNeed,
-                    start,
-                    end.saturating_sub(start),
-                );
-            }
-            // Fallback for non-unix: touch pages manually
-            #[cfg(not(unix))]
-            {
-                let signal_bytes = &self.mmap[start..end];
-                let _ = signal_bytes
-                    .iter()
-                    .step_by(4096)
-                    .fold(0u8, |acc, &b| acc.wrapping_add(b));
-            }
+            let start = (embedded.offset.max(0) as u64).min(self.source.len());
+            let end = ((embedded.offset.saturating_add(embedded.length)).max(0) as u64)
+                .min(self.source.len());
+            self.source.prefetch(start, end.saturating_sub(start));
         }
     }
 
@@ -1024,7 +1103,7 @@ impl Reader {
         let our_file_id = Uuid::parse_str(self.file_identifier())
             .map_err(|e| Error::InvalidUuid(e.to_string()))?;
         let stored_size = u64::from_le_bytes(header[21..29].try_into().unwrap());
-        let actual_size = self.mmap.len() as u64;
+        let actual_size = self.source.len();
         if stored_file_id != our_file_id || stored_size != actual_size {
             return Err(Error::InvalidFooter(
                 ".p5i does not match POD5 file; rebuild with `escpod index`".to_string(),
@@ -1094,7 +1173,7 @@ impl Reader {
         let file_id = Uuid::parse_str(self.file_identifier())
             .map_err(|e| Error::InvalidUuid(e.to_string()))?;
         file.write_all(file_id.as_bytes())?;
-        file.write_all(&(self.mmap.len() as u64).to_le_bytes())?;
+        file.write_all(&self.source.len().to_le_bytes())?;
         file.write_all(&(count as u32).to_le_bytes())?;
 
         // Entries — sorted by (batch_idx, row_idx) for compression locality
@@ -1521,40 +1600,37 @@ impl Reader {
         embedded: &crate::footer::EmbeddedFile,
         projection: Option<Vec<usize>>,
     ) -> Result<ArrowFileReader<Cursor<&[u8]>>> {
-        let start = embedded.offset as usize;
-        let end = start + embedded.length as usize;
-
-        if end > self.mmap.len() {
-            return Err(Error::InvalidFooter(format!(
-                "Embedded file extends beyond file end: {} + {} > {}",
-                start,
-                embedded.length,
-                self.mmap.len()
-            )));
-        }
-
-        let slice = &self.mmap[start..end];
+        // Route through the per-table cache so repeated readers over the same
+        // table reuse one fetch.
+        let slice = match embedded.content_type {
+            ContentType::ReadsTable => self.reads_table_bytes()?,
+            ContentType::SignalTable => self.signal_table_bytes()?,
+            other => {
+                return Err(Error::InvalidFooter(format!(
+                    "No cached bytes for embedded table {other:?}"
+                )));
+            }
+        };
         let cursor = Cursor::new(slice);
         ArrowFileReader::try_new(cursor, projection).map_err(Error::from)
     }
 
     /// Load run info from the run info table.
-    fn load_run_info(mmap: &Mmap, footer: &Footer) -> Result<Vec<RunInfoData>> {
+    fn load_run_info(source: &dyn ByteSource, footer: &Footer) -> Result<Vec<RunInfoData>> {
         let embedded = match footer.run_info_table() {
             Some(e) => e,
             None => return Ok(Vec::new()),
         };
 
-        let start = embedded.offset as usize;
-        let end = start + embedded.length as usize;
-
-        if end > mmap.len() {
+        let file_len = source.len();
+        let end = embedded.offset.saturating_add(embedded.length);
+        if embedded.offset < 0 || embedded.length < 0 || end as u64 > file_len {
             return Err(Error::InvalidFooter(
                 "Run info table extends beyond file".to_string(),
             ));
         }
 
-        let slice = &mmap[start..end];
+        let slice = source.read_range(embedded.offset as u64, embedded.length as u64)?;
         let cursor = Cursor::new(slice);
         let reader = ArrowFileReader::try_new(cursor, None)?;
 
