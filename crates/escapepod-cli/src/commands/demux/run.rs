@@ -407,11 +407,24 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     // ---- Stage C: one writer thread per barcode (sharded) ----
+    //
+    // Channel depth is budgeted across barcodes rather than fixed per barcode.
+    // Each queued `Routed` owns that read's compressed bytes (~10 KB), so a
+    // fixed 4096 per barcode meant worst-case in-flight memory scaled with the
+    // barcode count — 0.5 GB at 12 barcodes, ~3.8 GB at 96. The depth still
+    // needs to be generous enough to absorb bursts: real libraries are heavily
+    // skewed (one benchmark routed 86% of 1.22 M reads to a single barcode),
+    // and when a channel fills, rayon workers block inside `for_each` on
+    // `send` — and blocked rayon workers cannot be stolen from, so one
+    // saturated writer stalls the whole pool.
+    let barcodes = barcode_set(model.label_mapper());
+    let router_depth = (ROUTER_TOTAL_SLOTS / barcodes.len().max(1)).clamp(256, 4096);
+
     let mut routers: Routers = HashMap::new();
     let mut writer_handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<usize>>)> =
         Vec::new();
-    for bc in barcode_set(model.label_mapper()) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(4096);
+    for bc in barcodes {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(router_depth);
         let path = output_dir.join(format!("{}_{}.pod5", args.prefix, bc));
         let dicts = predefined.clone();
         let handle = std::thread::spawn(move || writer_thread(rx, &path, dicts));
@@ -487,70 +500,152 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads accumulated into one detect+classify block. POD5 Arrow read-batches
-/// are small (~1000 reads), so detecting per batch makes GPU CNN fire many tiny
-/// calls; accumulating across batches into a large block groups far more
-/// same-length reads per onnxruntime call. Host cost is one block of decoded
-/// signal (bounded; trivial relative to typical node RAM). The on-device batch
-/// is separately capped by `gpu_batch_elems`.
+/// Total queued reads allowed across *all* per-barcode writer channels. Each
+/// queued read owns its compressed signal (~10 KB), so this bounds router
+/// memory at roughly 500 MB regardless of how many barcodes the model defines.
+/// Split evenly per barcode and clamped — see the router setup in `run`.
+const ROUTER_TOTAL_SLOTS: usize = 49_152;
+
+/// Upper bound on reads accumulated into one detect+classify block. POD5 Arrow
+/// read-batches are small (~1000 reads), so detecting per batch makes GPU CNN
+/// fire many tiny calls; accumulating across batches into a large block groups
+/// far more same-length reads per onnxruntime call. The on-device batch is
+/// separately capped by `gpu_batch_elems`.
 const DETECT_WINDOW: usize = 65_536;
+
+/// Upper bound on the *decoded signal bytes* held in one block.
+///
+/// A read-count cap alone does not bound memory: LLR sets no decode bound (it
+/// normalizes over the whole read), so a block holds whole reads. At 65,536
+/// reads that is ~1.8 GB on a short-read RNA library and ~9.5 GB on a long-read
+/// one — measured 13.5 GB peak RSS on a 1.22 M-read file, of which ~2.4 GB was
+/// this block (the rest is mmap'd input pages). Capping by bytes keeps the
+/// footprint flat across libraries with wildly different read lengths, while
+/// the read cap above still lets the GPU-CNN path (which decodes only ~806
+/// samples per read) fill a full 65,536-read block before this binds.
+///
+/// Override with `ESCAPEPOD_DEMUX_BLOCK_MB` (in MiB) to retune for an unusual
+/// library or a memory-constrained node; see [`block_target_bytes`].
+const BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// [`BLOCK_TARGET_BYTES`], with an `ESCAPEPOD_DEMUX_BLOCK_MB` override.
+///
+/// Bigger blocks amortize per-block overhead and give GPU detection larger
+/// same-length groups; smaller blocks lower peak RSS and let the reader thread
+/// get further ahead of the classifier. Probed once — the value is fixed for
+/// the run.
+fn block_target_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ESCAPEPOD_DEMUX_BLOCK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(BLOCK_TARGET_BYTES)
+    })
+}
 
 /// One read's context carried alongside its decoded signal through a block:
 /// the writable read record, its compressed chunks (for the block-level write),
 /// and its run-info table.
 type BlockItem = (ReadData, Vec<CompressedSignalChunk>, Arc<Vec<RunInfoData>>);
 
-/// Stream reads through the fused pipeline in large blocks: per Arrow batch do
-/// the single-stream, ascending-order signal sweep (#72) and decode in
-/// parallel, accumulate across batches up to [`DETECT_WINDOW`] reads, then hand
-/// each full block (decoded signals + per-read context, aligned) to
-/// `process_block`. Accumulating across the file's small Arrow batches is what
-/// lets GPU detection batch many reads per call.
+/// One filled block handed from the reader thread to the processing loop.
+type SignalBlock = (Vec<Option<Vec<i16>>>, Vec<BlockItem>);
+
+/// Stream reads through the fused pipeline in blocks: per Arrow batch do the
+/// single-stream, ascending-order signal sweep (#72) and decode in parallel,
+/// accumulate across batches up to [`DETECT_WINDOW`] reads or
+/// [`BLOCK_TARGET_BYTES`] of decoded signal, then hand each full block (decoded
+/// signals + per-read context, aligned) to `process_block`. Accumulating across
+/// the file's small Arrow batches is what lets GPU detection batch many reads
+/// per call.
+///
+/// Filling runs on its own thread and feeds `process_block` through a depth-1
+/// channel, so the next block's I/O and decode overlap with the current block's
+/// detect + classify. Previously these were serial: no I/O was in flight for
+/// the entire detect+classify phase, which on a 1.22 M-read benchmark left ~43
+/// of 48 cores idle and made the pipeline *slower* at 48 threads than at 8.
 fn drive_blocks(
     input: &[std::path::PathBuf],
     decode_to: Option<usize>,
     mut process_block: impl FnMut(Vec<Option<Vec<i16>>>, Vec<BlockItem>),
 ) -> anyhow::Result<()> {
-    let mut sigs: Vec<Option<Vec<i16>>> = Vec::with_capacity(DETECT_WINDOW);
-    let mut items: Vec<BlockItem> = Vec::with_capacity(DETECT_WINDOW);
-    for path in input {
-        let reader = Reader::open(path)?;
-        let run_infos = Arc::new(reader.run_infos().to_vec());
-        for batch in reader.read_batches()? {
-            let batch = batch?;
-            let view = ReadsBatchView::new(&batch, false)?;
-            let reads: Vec<ReadData> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
-                .filter(|r| !r.signal_rows.is_empty())
-                .collect();
-            // One sequential, ascending-order sweep pulls this batch's signal
-            // (grouped by Arrow record-batch — see #72), then decode in parallel.
-            let keyed: Vec<(usize, Vec<u64>)> = reads
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (i, r.signal_rows.clone()))
-                .collect();
-            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
-            let decoded: Vec<Option<Vec<i16>>> = bulk
-                .par_iter()
-                .map(|(_, chunks)| decode_chunks_to(chunks, decode_to))
-                .collect();
+    // Depth 1 = one block in flight behind the one being processed. Peak is
+    // therefore ~3 blocks (filling, queued, processing), which is what
+    // `BLOCK_TARGET_BYTES` is sized against.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<SignalBlock>(1);
 
-            let mut reads_opt: Vec<Option<ReadData>> = reads.into_iter().map(Some).collect();
-            for ((i, chunks), sig) in bulk.into_iter().zip(decoded) {
-                let read = reads_opt[i].take().expect("each read consumed once");
-                sigs.push(sig);
-                items.push((read, chunks, run_infos.clone()));
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let filler = scope.spawn(move || -> anyhow::Result<()> {
+            let mut sigs: Vec<Option<Vec<i16>>> = Vec::new();
+            let mut items: Vec<BlockItem> = Vec::new();
+            let mut block_bytes = 0usize;
+            let target_bytes = block_target_bytes();
+
+            for path in input {
+                let reader = Reader::open(path)?;
+                let run_infos = Arc::new(reader.run_infos().to_vec());
+                for batch in reader.read_batches()? {
+                    let batch = batch?;
+                    let view = ReadsBatchView::new(&batch, false)?;
+                    let reads: Vec<ReadData> = (0..view.num_rows())
+                        .filter_map(|row| view.read(row).ok())
+                        .filter(|r| !r.signal_rows.is_empty())
+                        .collect();
+                    // One sequential, ascending-order sweep pulls this batch's
+                    // signal (grouped by Arrow record-batch — see #72), then
+                    // decode in parallel.
+                    let keyed: Vec<(usize, Vec<u64>)> = reads
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (i, r.signal_rows.clone()))
+                        .collect();
+                    let bulk = reader.get_compressed_signal_bulk(&keyed)?;
+                    let decoded: Vec<Option<Vec<i16>>> = bulk
+                        .par_iter()
+                        .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
+                        .collect();
+
+                    let mut reads_opt: Vec<Option<ReadData>> =
+                        reads.into_iter().map(Some).collect();
+                    for ((i, chunks), sig) in bulk.into_iter().zip(decoded) {
+                        let read = reads_opt[i].take().expect("each read consumed once");
+                        block_bytes += sig.as_ref().map_or(0, |s| s.len() * 2)
+                            + chunks.iter().map(|c| c.data.len()).sum::<usize>();
+                        sigs.push(sig);
+                        items.push((read, chunks, run_infos.clone()));
+                    }
+
+                    if sigs.len() >= DETECT_WINDOW || block_bytes >= target_bytes {
+                        block_bytes = 0;
+                        // A send error means the consumer is gone (it returned
+                        // early or panicked); stop filling rather than block.
+                        if tx
+                            .send((std::mem::take(&mut sigs), std::mem::take(&mut items)))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
             }
-            if sigs.len() >= DETECT_WINDOW {
-                process_block(std::mem::take(&mut sigs), std::mem::take(&mut items));
+            if !sigs.is_empty() {
+                tx.send((sigs, items)).ok();
             }
+            Ok(())
+        });
+
+        for (sigs, items) in rx {
+            process_block(sigs, items);
         }
-    }
-    if !sigs.is_empty() {
-        process_block(sigs, items);
-    }
-    Ok(())
+
+        filler
+            .join()
+            .map_err(|e| anyhow::anyhow!("demux reader thread panicked: {e:?}"))?
+    })
 }
 
 /// CPU-classify producer (DTW-SVM): stream reads in large blocks
@@ -598,52 +693,6 @@ fn produce_cpu(
             );
         },
     )
-}
-
-/// Decode (decompress) a read's in-memory compressed signal chunks into a
-/// single sample buffer, concatenated in chunk order.
-fn decode_chunks(chunks: &[CompressedSignalChunk]) -> Option<Vec<i16>> {
-    let total: usize = chunks.iter().map(|c| c.samples as usize).sum();
-    let mut signal = Vec::with_capacity(total);
-    for c in chunks {
-        let decoded =
-            escapepod_signal::pod5::compression::decompress_signal(&c.data, c.samples as usize)
-                .ok()?;
-        signal.extend_from_slice(&decoded);
-    }
-    Some(signal)
-}
-
-/// Like [`decode_chunks`] but, when `decode_to` is `Some(max)`, decompresses
-/// only the first `max` samples — decoding just the needed prefix of the chunk
-/// that crosses the boundary (the rest of the ZSTD stream is skipped). For long
-/// reads (mRNA) where the adapter detector only looks at the first
-/// `max_obs_trace` samples, this avoids decompressing the whole transcript.
-/// `None` decodes the full signal (e.g. LLR, which normalizes over the read).
-fn decode_chunks_to(
-    chunks: &[CompressedSignalChunk],
-    decode_to: Option<usize>,
-) -> Option<Vec<i16>> {
-    let Some(max) = decode_to else {
-        return decode_chunks(chunks);
-    };
-    let mut signal = Vec::with_capacity(max);
-    let mut remaining = max;
-    for c in chunks {
-        if remaining == 0 {
-            break;
-        }
-        let cs = c.samples as usize;
-        let take = cs.min(remaining);
-        let decoded = if take == cs {
-            escapepod_signal::pod5::compression::decompress_signal(&c.data, cs).ok()?
-        } else {
-            escapepod_signal::pod5::compression::decompress_signal_prefix(&c.data, cs, take).ok()?
-        };
-        signal.extend_from_slice(&decoded);
-        remaining -= take;
-    }
-    Some(signal)
 }
 
 /// Classify a single read from its decoded signal and precomputed adapter
@@ -844,7 +893,7 @@ fn produce_gpu(
                 for window in bulk.chunks(DETECT_WINDOW) {
                     let signals: Vec<Option<Vec<i16>>> = window
                         .par_iter()
-                        .map(|(_, chunks)| decode_chunks_to(chunks, decode_to))
+                        .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
                         .collect();
                     let bounds = detector.detect_batch(&signals);
                     let prepped: Vec<Option<Prepped>> = window
@@ -934,8 +983,16 @@ fn writer_thread(
         let w = match writer.as_mut() {
             Some(w) => w,
             None => {
+                // Match `filter`/`repack` rather than taking the writer's
+                // conservative 100/1000 defaults. At 100 the writer flushes a
+                // signal batch every 100 reads, rebuilding the Arrow schema and
+                // emitting an IPC message + footer entry each time — and every
+                // downstream reader then pays per-batch parse cost over that
+                // many batches for the life of the file.
                 let opts = WriterOptions {
                     predefined_dictionaries: Some(predefined.clone()),
+                    signal_batch_size: 1_000,
+                    read_batch_size: 10_000,
                     ..Default::default()
                 };
                 writer = Some(Writer::create(path, opts)?);
