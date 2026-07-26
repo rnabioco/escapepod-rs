@@ -901,9 +901,9 @@ pub(crate) fn build_pod5_footer(
 /// `data` borrows — for the block-copy operations it points straight into a
 /// source file's mmap, so constructing a batch from these is what faults those
 /// pages in.
+#[derive(Clone, Copy)]
 pub struct SignalRow<'a> {
-    /// Value written to the signal table's `read_id` column. See
-    /// [`build_signal_batch`] for why callers currently disagree on this.
+    /// The owning read's UUID, written to the signal table's `read_id` column.
     pub read_id: [u8; 16],
     /// Compressed (VBZ) signal bytes for this chunk.
     pub data: &'a [u8],
@@ -919,19 +919,15 @@ pub struct SignalRow<'a> {
 /// deliberately does not use this: it retains every row, so it copies whole
 /// Arrow IPC blocks through from the source mmap without rebuilding anything.
 ///
-/// # A caveat on `read_id`
+/// # `read_id`
 ///
-/// The two callers historically disagreed, and this function preserves that
-/// rather than silently changing anyone's output:
+/// Always the real read UUID. Files written by Oxford Nanopore's own tooling
+/// populate this column (verified against a `pod5_subset` output: 9,954 rows,
+/// none zero-filled), and the schema documents it as "UUID for consistency
+/// checking", so writing zeros there was a deviation. `filter`/`subset`
+/// previously did exactly that, discarding the real ID that
+/// `RawSignalChunk` had already read out of the source file.
 ///
-/// - [`crate::Writer`] writes the real read ID.
-/// - `filter`/`subset` write all zeros, on the reasoning that the reads table
-///   is the authority and the POD5 reader never consults this column.
-///
-/// Both files load correctly, but the same logical operation yields different
-/// bytes depending on which command produced it. Now that the divergence lives
-/// in one place it can be settled deliberately; doing so would change
-/// `filter`/`subset` output and wants its own change.
 /// `total_bytes` pre-sizes the signal value buffer. Both callers already hold
 /// the rows in a concrete collection, so summing is cheap for them and saves
 /// the builder a doubling-realloc sequence over a multi-megabyte batch.

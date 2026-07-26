@@ -322,7 +322,7 @@ fn assemble_output(
     // caller's readers) — never copied to the heap. On a 26 GB POD5 this avoids
     // ~26 GB of `Arc<[u8]>` heap allocation that would otherwise OOM modest
     // SLURM allocations.
-    type SignalChunks<'a> = Vec<(&'a [u8], u32)>;
+    type SignalChunks<'a> = Vec<SignalRow<'a>>;
 
     let extractions: Vec<Result<SignalChunks<'_>>> = sources
         .par_iter()
@@ -344,9 +344,16 @@ fn assemble_output(
                 .signal_footer
                 .extract_signal_rows(&signal_row_indices, signal_bytes)?;
 
+            // Keep the source file's own read_id: the signal table's
+            // `read_id` column is populated by ONT's tooling, and
+            // `RawSignalChunk` has already read it out of the source.
             let chunks: SignalChunks<'_> = raw_chunks
                 .into_iter()
-                .map(|chunk| (chunk.signal, chunk.samples))
+                .map(|chunk| SignalRow {
+                    read_id: chunk.read_id,
+                    data: chunk.signal,
+                    samples: chunk.samples,
+                })
                 .collect();
 
             Ok(chunks)
@@ -361,7 +368,7 @@ fn assemble_output(
     // below into `flat_reads`) walk sources in this same order, so chunk N of
     // the signal table must correspond to signal-row N of the output.
     let total_chunks: usize = source_extractions.iter().map(|e| e.len()).sum();
-    let mut signal_chunks: Vec<(&[u8], u32)> = Vec::with_capacity(total_chunks);
+    let mut signal_chunks: Vec<SignalRow<'_>> = Vec::with_capacity(total_chunks);
     for (source_idx, chunks) in source_extractions.iter().enumerate() {
         signal_chunks.extend_from_slice(chunks);
         if let Some(cb) = progress {
@@ -674,7 +681,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 /// independent of total signal volume.
 fn write_raw_signal_table<W: Write>(
     file: &mut W,
-    chunks: &[(&[u8], u32)],
+    chunks: &[SignalRow<'_>],
     batch_size: u32,
     meta: &SchemaMetadata,
 ) -> Result<usize> {
@@ -712,18 +719,8 @@ fn write_raw_signal_table<W: Write>(
                 .par_iter()
                 .map(|&(s, e)| {
                     let run = &chunks[s..e];
-                    let total_bytes: usize = run.iter().map(|(d, _)| d.len()).sum();
-                    build_signal_batch(
-                        &schema,
-                        run.iter().map(|&(data, samples)| SignalRow {
-                            // The reads table is the authority for read IDs;
-                            // the POD5 reader never consults this column.
-                            read_id: [0u8; 16],
-                            data,
-                            samples,
-                        }),
-                        total_bytes,
-                    )
+                    let total_bytes: usize = run.iter().map(|r| r.data.len()).sum();
+                    build_signal_batch(&schema, run.iter().copied(), total_bytes)
                 })
                 .collect();
 

@@ -168,3 +168,103 @@ fn subset_partitions_reads_across_inputs() {
         }
     }
 }
+
+/// Collect the signal table's `read_id` column, indexed by global signal row.
+fn signal_table_read_ids(path: &std::path::Path) -> Vec<[u8; 16]> {
+    use arrow::array::{Array, FixedSizeBinaryArray};
+    let reader = Reader::open(path).unwrap();
+    let mut ids = Vec::new();
+    for batch in reader.signal_batches().unwrap() {
+        let col = batch
+            .column_by_name("read_id")
+            .expect("signal table has a read_id column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("read_id is FixedSizeBinary(16)");
+        for i in 0..col.len() {
+            ids.push(col.value(i).try_into().unwrap());
+        }
+    }
+    ids
+}
+
+/// Every signal row must carry the UUID of the read that owns it.
+///
+/// Row *order* is deliberately not asserted: `filter`/`subset` rebuild the
+/// signal table and emit rows in their own order, so the association has to be
+/// checked through the reads table's `signal_rows` indices, not positionally.
+fn assert_signal_read_ids_match(path: &std::path::Path, what: &str) {
+    let sig_ids = signal_table_read_ids(path);
+    assert!(!sig_ids.is_empty(), "{what}: signal table is empty");
+
+    let zero = sig_ids.iter().filter(|v| v.iter().all(|&b| b == 0)).count();
+    assert_eq!(
+        zero,
+        0,
+        "{what}: {zero} of {} signal rows have a zero-filled read_id; ONT's own \
+         tooling populates this column and the schema documents it as \"UUID for \
+         consistency checking\"",
+        sig_ids.len()
+    );
+
+    let reader = Reader::open(path).unwrap();
+    for read in reader.reads().unwrap() {
+        let read = read.unwrap();
+        for &row in &read.signal_rows {
+            let got = sig_ids
+                .get(row as usize)
+                .unwrap_or_else(|| panic!("{what}: signal row {row} out of range"));
+            assert_eq!(
+                got,
+                read.read_id.as_bytes(),
+                "{what}: signal row {row} carries the wrong read_id"
+            );
+        }
+    }
+}
+
+/// The signal table's `read_id` column must be populated and correctly
+/// associated on every write path.
+///
+/// `filter`/`subset` used to write all zeros here. Nothing broke, which is why
+/// it survived: the reads table is the authority for the read -> signal-row
+/// mapping, so no reader ever consults this column, and the existing tests all
+/// compare decoded signal *through* the reads table. The cost was that the same
+/// logical operation produced different bytes depending on which command made
+/// the file, and diverged from ONT's own output.
+#[test]
+fn signal_table_read_ids_are_real_on_every_write_path() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.pod5");
+    let ids: Vec<Uuid> = write_file(&input, "acq-readid", 12).into_keys().collect();
+
+    // Writer (the incremental path).
+    assert_signal_read_ids_match(&input, "Writer");
+
+    // filter — rebuilds batches from a row subset.
+    let filtered = tmp.path().join("filtered.pod5");
+    let keep: HashSet<Uuid> = ids.iter().take(7).copied().collect();
+    filter_files(&[&input], &filtered, &keep, filter_opts(), None).unwrap();
+    assert_signal_read_ids_match(&filtered, "filter");
+
+    // subset — same assembler, multiple outputs.
+    let out_dir = tmp.path().join("subset");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mapping: HashMap<Uuid, String> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, format!("g{}.pod5", i % 2)))
+        .collect();
+    subset_files(&[&input], &mapping, &out_dir, filter_opts()).unwrap();
+    assert_signal_read_ids_match(&out_dir.join("g0.pod5"), "subset");
+
+    // repack — block-level copy.
+    let repacked = tmp.path().join("repacked.pod5");
+    let repack = repack_files(&[(&input, &repacked)], RepackOptions::default(), None);
+    assert!(
+        repack.failures.is_empty(),
+        "repack failed: {:?}",
+        repack.failures
+    );
+    assert_signal_read_ids_match(&repacked, "repack");
+}
