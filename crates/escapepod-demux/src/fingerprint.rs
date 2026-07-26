@@ -206,9 +206,18 @@ pub fn extract_fingerprint_from_signal(
         normalize_fingerprint(&mut all_fp, norm_method);
         fingerprint_values = all_fp.values;
 
-        if fingerprint_values.len() > n {
-            fingerprint_values = fingerprint_values[fingerprint_values.len() - n..].to_vec();
+        // `keep_last` is a fixed feature width, not a maximum: every consumer
+        // (SVM/GBM model input, the fingerprint CSV/parquet schema) requires
+        // exactly `n` values. A read whose adapter yielded fewer segments than
+        // that cannot produce a usable fingerprint, so reject it rather than
+        // emitting a short row. Returning a truncated fingerprint here was
+        // silently poisoning downstream: the GBM path errors out on the width
+        // mismatch, but the DTW/SVM path happily scores the short query and
+        // reports a confident — and wrong — barcode.
+        if fingerprint_values.len() < n {
+            return None;
         }
+        fingerprint_values = fingerprint_values[fingerprint_values.len() - n..].to_vec();
 
         if emit_dwell {
             // Dwell features take the opposite order: truncate first, then
@@ -218,9 +227,10 @@ pub fn extract_fingerprint_from_signal(
             // dominated by those early outliers — leaving the kept-tail
             // values bunched near zero. Normalizing only over the kept tail
             // keeps the dwell channel discriminative for the barcode.
-            if dwell_values.len() > n {
-                dwell_values = dwell_values[dwell_values.len() - n..].to_vec();
+            if dwell_values.len() < n {
+                return None;
             }
+            dwell_values = dwell_values[dwell_values.len() - n..].to_vec();
             dwell_values = normalize_dwell_times(&dwell_values);
             return Some(ReadFingerprint::with_dwell_times(
                 read_id,
@@ -466,5 +476,73 @@ mod tests {
         // unless there's exactly one segment (in which case the normalization
         // collapses to zero — a degenerate but legal case).
         assert!(dwells.iter().all(|v| v.is_finite()));
+    }
+}
+
+#[cfg(test)]
+mod keep_last_width_tests {
+    use super::*;
+    use escapepod_signal::dtw::NormMethod;
+
+    /// `keep_last` is a fixed width. A read whose adapter yields fewer segments
+    /// than requested must be rejected outright, never emitted as a short row —
+    /// the DTW/SVM path cannot detect the truncation and would score it as a
+    /// confident (wrong) barcode.
+    #[test]
+    fn short_adapter_is_rejected_rather_than_truncated() {
+        let read_id = uuid::Uuid::nil();
+        // A very short, nearly flat adapter window cannot yield 25 segments.
+        let signal: Vec<i16> = (0..400).map(|i| 500 + (i % 3) as i16).collect();
+
+        let fp = extract_fingerprint_from_signal(
+            &signal,
+            0,
+            signal.len(),
+            111,
+            12,
+            NormMethod::ZScore,
+            read_id,
+            Some(6),
+            Some(25),
+            false,
+        );
+
+        if let Some(fp) = fp {
+            assert_eq!(
+                fp.values.len(),
+                25,
+                "a returned fingerprint must have exactly keep_last values"
+            );
+        }
+    }
+
+    /// Whenever a fingerprint is produced with `keep_last = Some(n)`, it has
+    /// exactly `n` values — across a range of adapter lengths.
+    #[test]
+    fn keep_last_width_is_exact_when_present() {
+        let read_id = uuid::Uuid::nil();
+        for len in [600usize, 1200, 2400, 4800] {
+            let signal: Vec<i16> = (0..len)
+                .map(|i| {
+                    let x = i as f32 * 0.05;
+                    (500.0 + 80.0 * x.sin() + 25.0 * (x * 3.1).cos()) as i16
+                })
+                .collect();
+            let fp = extract_fingerprint_from_signal(
+                &signal,
+                0,
+                len,
+                111,
+                12,
+                NormMethod::ZScore,
+                read_id,
+                Some(6),
+                Some(25),
+                false,
+            );
+            if let Some(fp) = fp {
+                assert_eq!(fp.values.len(), 25, "len={len}: ragged fingerprint emitted");
+            }
+        }
     }
 }

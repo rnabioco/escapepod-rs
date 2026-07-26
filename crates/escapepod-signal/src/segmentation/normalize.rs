@@ -16,10 +16,12 @@ use crate::stats::median_and_mad;
 /// * `signal` - The raw signal values to normalize
 ///
 /// # Returns
-/// A new vector containing the normalized signal values.
-///
-/// # Panics
-/// Panics if the signal is empty or if MAD is zero.
+/// A new vector containing the normalized signal values. When MAD is zero
+/// (a constant signal — a dead pore, a saturated or flat read), returns
+/// `signal - median` rather than dividing by zero, matching
+/// [`mad_normalize_robust`] and [`clip_outliers`]. Real sequencing runs do
+/// contain such reads, and this is called per read, so a panic here would
+/// abort an entire run (release builds use `panic = "abort"`).
 ///
 /// # Example
 /// ```
@@ -32,7 +34,7 @@ pub fn mad_normalize(signal: &[f32]) -> Vec<f32> {
     let (med, mad_val) = median_and_mad(signal);
 
     if mad_val == 0.0 {
-        panic!("MAD is zero - cannot normalize signal with no variation");
+        return signal.iter().map(|&x| x - med).collect();
     }
 
     signal.iter().map(|&x| (x - med) / mad_val).collect()
@@ -89,15 +91,14 @@ pub fn mad_normalize_robust(signal: &[f32]) -> Vec<f32> {
 /// * `clip_sigma` - Number of MAD units to clip at (e.g., 5.0)
 ///
 /// # Returns
-/// A new vector containing the normalized and clipped signal values.
-///
-/// # Panics
-/// Panics if the signal is empty or if MAD is zero.
+/// A new vector containing the normalized and clipped signal values. When MAD
+/// is zero (constant signal) there is nothing to clip and no scale to divide
+/// by, so this returns `signal - median`; see [`mad_normalize`].
 pub fn mad_normalize_with_clipping(signal: &[f32], clip_sigma: f32) -> Vec<f32> {
     let (med, mad_val) = median_and_mad(signal);
 
     if mad_val == 0.0 {
-        panic!("MAD is zero - cannot normalize signal with no variation");
+        return signal.iter().map(|&x| x - med).collect();
     }
 
     let lower_bound = med - clip_sigma * mad_val;
@@ -382,11 +383,28 @@ mod tests {
         downscale(&signal, 0);
     }
 
+    /// A constant signal (dead pore / saturated read) must not abort the run:
+    /// release builds are `panic = "abort"` and this runs on every read.
     #[test]
-    #[should_panic(expected = "MAD is zero")]
     fn test_mad_normalize_constant_signal() {
         let signal = vec![5.0, 5.0, 5.0, 5.0];
-        mad_normalize(&signal);
+        assert_eq!(mad_normalize(&signal), vec![0.0, 0.0, 0.0, 0.0]);
+
+        let clipped = mad_normalize_with_clipping(&signal, 5.0);
+        assert_eq!(clipped, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// The whole-pipeline entry point takes raw i16 and is the one demux
+    /// actually calls per read (`run.rs`, `detect.rs`).
+    #[test]
+    fn test_normalize_signal_constant_and_zero() {
+        let flat: Vec<i16> = vec![512; 64];
+        let out = normalize_signal(&flat);
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|v| v.is_finite() && *v == 0.0));
+
+        let zeros: Vec<i16> = vec![0; 64];
+        assert!(normalize_signal(&zeros).iter().all(|v| v.is_finite()));
     }
 
     #[test]

@@ -30,7 +30,6 @@ use std::path::Path;
 use std::collections::HashMap;
 #[cfg(feature = "train")]
 use std::io::{BufRead, BufReader};
-#[cfg(feature = "train")]
 use tracing::warn;
 use uuid::Uuid;
 
@@ -310,33 +309,31 @@ where
 
     let lines: Vec<&str> = body.split('\n').filter(|l| !l.is_empty()).collect();
 
-    let fingerprints: Vec<(Uuid, Vec<T>)> = lines
+    // Parse each row strictly: a cell that does not parse rejects the whole
+    // row rather than silently shortening it. A short fingerprint is not a
+    // recoverable condition downstream — the SVM/DTW path would happily
+    // classify a truncated query and report a confident wrong barcode — so
+    // it must never be produced. Mirrors `parse_csv_row` in the labeled
+    // loader, which has the same guard.
+    let parsed: Vec<Option<(Uuid, Vec<T>)>> = lines
         .par_iter()
-        .filter_map(|line| {
+        .map(|line| {
             let line = line.strip_suffix('\r').unwrap_or(line);
             let mut cols = line.split(',');
-            let read_id = Uuid::parse_str(cols.next()?).ok()?;
-            // Index bookkeeping is simpler if we collect into a Vec once,
-            // then skip the barcode index. This costs a Vec per row, but
-            // the parallelism dwarfs it and each Vec lives only as long
-            // as this closure.
-            let remaining: Vec<&str> = cols.collect();
-            let values: Vec<T> = remaining
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, s)| {
-                    // skip_col is 0-indexed in the full row; we've
-                    // consumed read_id already, so the barcode column is
-                    // at skip_col - 1 in `remaining`.
-                    if let Some(sc) = skip_col
-                        && sc > 0
-                        && idx + 1 == sc
-                    {
-                        return None;
-                    }
-                    s.parse::<T>().ok()
-                })
-                .collect();
+            let read_id = Uuid::parse_str(cols.next()?.trim()).ok()?;
+            // `skip_col` is 0-indexed in the full row and we have already
+            // consumed `read_id`, so the barcode sits at `skip_col - 1`
+            // among the remaining columns.
+            let mut values: Vec<T> = Vec::with_capacity(16);
+            for (idx, s) in cols.enumerate() {
+                if let Some(sc) = skip_col
+                    && sc > 0
+                    && idx + 1 == sc
+                {
+                    continue;
+                }
+                values.push(s.trim().parse::<T>().ok()?);
+            }
             if values.is_empty() {
                 None
             } else {
@@ -344,6 +341,34 @@ where
             }
         })
         .collect();
+
+    // The first successfully parsed row establishes the expected feature
+    // width; anything that disagrees is dropped and counted rather than
+    // being passed to the classifier.
+    let expected_width = parsed
+        .iter()
+        .flatten()
+        .map(|(_, v)| v.len())
+        .next()
+        .unwrap_or(0);
+
+    let mut fingerprints = Vec::with_capacity(parsed.len());
+    let mut malformed_rows = 0usize;
+    for row in parsed {
+        match row {
+            Some((id, v)) if v.len() == expected_width => fingerprints.push((id, v)),
+            _ => malformed_rows += 1,
+        }
+    }
+
+    if malformed_rows > 0 {
+        warn!(
+            "dropped {malformed_rows} query fingerprint row(s) from '{}' that were \
+             unparseable or whose feature width did not match the expected \
+             {expected_width} (truncated CSV or NaN/empty cells)",
+            path.display(),
+        );
+    }
 
     Ok(fingerprints)
 }
