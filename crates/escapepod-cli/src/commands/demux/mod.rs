@@ -113,6 +113,27 @@ Examples:
     TrainSvm(TrainSvmArgs),
 }
 
+/// The `-t/-j` value for whichever demux stage was invoked.
+///
+/// Lives here rather than in `main` because it destructures [`DemuxCommand`].
+/// See `crate::requested_threads` for why the value is read back out of the
+/// parsed args instead of being a global clap flag.
+pub fn requested_threads(args: &DemuxArgs) -> Option<usize> {
+    match &args.command {
+        // `args_conflicts_with_subcommands`: no subcommand means the fused
+        // pipeline, whose flags live in `run`.
+        None => args.run.threads,
+        Some(DemuxCommand::Detect(a)) => a.threads,
+        Some(DemuxCommand::Fingerprint(a)) => a.threads,
+        Some(DemuxCommand::Classify(a)) => a.threads,
+        Some(DemuxCommand::Split(a)) => a.threads,
+        Some(DemuxCommand::Train(a)) => a.threads,
+        // train-svm has no --threads flag.
+        #[cfg(feature = "train")]
+        Some(DemuxCommand::TrainSvm(_)) => None,
+    }
+}
+
 /// Run the demux command.
 pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
     let Some(command) = args.command else {

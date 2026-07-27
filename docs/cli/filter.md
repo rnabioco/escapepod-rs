@@ -22,6 +22,7 @@ escpod filter -i <IDS_FILE> -o <OUTPUT> <INPUT>
 |--------|-------------|
 | `-i, --ids <FILE>` | File containing read IDs to extract (required) |
 | `-o, --output <FILE>` | Output file path (required) |
+| `-t, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ## ID File Format

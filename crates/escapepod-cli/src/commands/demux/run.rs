@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 
-use super::utils::configure_thread_pool;
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::{
@@ -121,7 +120,7 @@ pub struct RunArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
-    /// Number of threads (default: all CPUs)
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
@@ -386,7 +385,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let detector = build_detector(&args)?;
     let fp = FpParams::default();
 
-    configure_thread_pool(args.threads);
     std::fs::create_dir_all(&output_dir)?;
 
     info!("{} fused streaming demux", style::action("Running"));
@@ -1168,8 +1166,11 @@ fn build_detector(args: &RunArgs) -> anyhow::Result<Detector> {
                 #[cfg(feature = "cnn-gpu")]
                 if args.gpu {
                     return Ok(Detector::CnnGpu(Box::new(
-                        escapepod_demux::AdapterCnnGpu::load(path)
-                            .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
+                        escapepod_demux::AdapterCnnGpu::load_with_threads(
+                            path,
+                            crate::threads::width(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
                     )));
                 }
                 Ok(Detector::Cnn(Box::new(

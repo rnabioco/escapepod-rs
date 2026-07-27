@@ -1,7 +1,7 @@
 //! Classify subcommand - barcode classification using DTW distance.
 
 use super::fp_io::{read_query_fingerprints_f32, read_query_fingerprints_f64};
-use super::utils::{configure_thread_pool, parse_reference_csv};
+use super::utils::parse_reference_csv;
 use crate::style;
 use anyhow::Context;
 use escapepod_demux::{
@@ -62,9 +62,16 @@ pub struct ClassifyArgs {
     #[arg(short, long, required = true, value_name = "FILE")]
     pub output: PathBuf,
 
-    /// Number of threads for parallel processing (default: all CPUs, or
-    /// whatever the rayon global pool picks up from `RAYON_NUM_THREADS`).
-    #[arg(long, short = 'j', value_name = "N", help_heading = "Advanced Options")]
+    /// Number of threads for parallel processing (default: 16, or all
+    /// available CPUs if fewer; `RAYON_NUM_THREADS` applies when this flag
+    /// is absent).
+    #[arg(
+        short = 't',
+        long,
+        visible_short_alias = 'j',
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
     pub threads: Option<usize>,
 
     /// GPU DTW batch size in matrix cells (queries × refs). Default
@@ -157,8 +164,6 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         }
         args.model = Some(p);
     }
-
-    configure_thread_pool(args.threads);
 
     // Validate that exactly one input source was provided.
     match (args.model.is_some(), args.reference.is_some()) {
