@@ -1,6 +1,6 @@
 //! Fingerprint subcommand - extract signal features from adapter regions.
 
-use super::utils::{configure_thread_pool, parse_boundaries_csv, parse_norm_method};
+use super::utils::{parse_boundaries_csv, parse_norm_method};
 use crate::progress::create_progress_bar;
 use crate::style;
 use arrow::array::{ArrayRef, Float64Array, StringArray};
@@ -96,7 +96,7 @@ pub struct FingerprintArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub emit_dwell: bool,
 
-    /// Number of threads for parallel processing (default: all CPUs)
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
@@ -157,7 +157,6 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     }
 
     // Set thread pool size
-    configure_thread_pool(args.threads);
 
     // Read boundaries CSV (auto-detects escapepod vs WarpDemuX format)
     let boundaries_map = parse_boundaries_csv(&args.boundaries)?;

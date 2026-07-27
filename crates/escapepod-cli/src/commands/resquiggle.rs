@@ -120,7 +120,7 @@ pub struct ResquiggleRunArgs {
     #[arg(long)]
     pub rna: bool,
 
-    /// Number of threads for parallel processing (default: all CPUs)
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 }
@@ -215,14 +215,6 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
         (Some(path), None) => path.clone(),
         (None, Some(name)) => resquiggle_models::resolve(name)?,
     };
-
-    // Configure thread pool
-    if let Some(threads) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .ok(); // Ignore error if pool is already initialized
-    }
 
     // Resolve adaptive bandwidth from half_bandwidth if sentinel value
     let banding = match args.banding {

@@ -1,7 +1,7 @@
 //! Train subcommand - generate reference barcode fingerprints from known samples.
 
 use super::types::{BarcodeStats, TrainParams, TrainingOutput};
-use super::utils::{configure_thread_pool, parse_norm_method};
+use super::utils::parse_norm_method;
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::{
@@ -96,7 +96,7 @@ pub struct TrainArgs {
     )]
     pub border_trim: usize,
 
-    /// Number of threads for parallel processing (default: all CPUs)
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
@@ -125,7 +125,6 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
     let norm_method = parse_norm_method(&args.normalize)?;
 
     // Set thread pool size
-    configure_thread_pool(args.threads);
 
     // Collect barcode assignments: read_id -> (barcode, pod5_path)
     let assignments = if let Some(ref input_dir) = args.input_dir {

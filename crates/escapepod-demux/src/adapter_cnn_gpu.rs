@@ -87,18 +87,48 @@ pub struct AdapterCnnGpu {
 }
 
 impl AdapterCnnGpu {
-    /// Load an ONNX model with the default (ADAPTed/rna004) preprocessing config.
+    /// Load an ONNX model with the default (ADAPTed/rna004) preprocessing config
+    /// and onnxruntime's own choice of intra-op width.
+    ///
+    /// Prefer [`Self::load_with_threads`] from the CLI: onnxruntime's default
+    /// intra-op pool is `available_parallelism()` wide and is spawned *on top of*
+    /// rayon's, so leaving it unset puts total process threads back out of
+    /// `--threads`' reach (the GPU-side half of #155).
     pub fn load(path: impl AsRef<Path>) -> Result<Self, AdapterCnnError> {
-        Self::load_with_config(path, AdapterCnnConfig::default())
+        Self::load_with_config(path, AdapterCnnConfig::default(), None)
+    }
+
+    /// Load with the default preprocessing config and a bounded intra-op pool.
+    pub fn load_with_threads(
+        path: impl AsRef<Path>,
+        intra_threads: usize,
+    ) -> Result<Self, AdapterCnnError> {
+        Self::load_with_config(path, AdapterCnnConfig::default(), Some(intra_threads))
     }
 
     /// Load with an explicit preprocessing config, registering the CUDA EP.
+    ///
+    /// `intra_threads` bounds onnxruntime's intra-op pool; `None` leaves ORT's
+    /// default. The thread count is deliberately *not* part of
+    /// [`AdapterCnnConfig`] — that struct is `Copy` and carries preprocessing
+    /// semantics the CPU/GPU parity tests compare, so a scheduling knob has no
+    /// business in it.
     pub fn load_with_config(
         path: impl AsRef<Path>,
         config: AdapterCnnConfig,
+        intra_threads: Option<usize>,
     ) -> Result<Self, AdapterCnnError> {
-        let session = Session::builder()
-            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
+        let mut builder = Session::builder().map_err(|e| AdapterCnnError::Load(e.to_string()))?;
+        if let Some(n) = intra_threads {
+            builder = builder
+                .with_intra_threads(n.max(1))
+                .map_err(|e| AdapterCnnError::Load(e.to_string()))?
+                // Only meaningful under parallel execution mode, which we don't
+                // enable; set it anyway so the bound holds if that ever changes.
+                .with_inter_threads(1)
+                .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
+        }
+        let session = builder
             .with_execution_providers([CUDAExecutionProvider::default().build()])
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?
             .commit_from_file(path)

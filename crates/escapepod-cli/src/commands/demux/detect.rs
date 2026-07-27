@@ -1,6 +1,6 @@
 //! Detect subcommand - LLR-based adapter boundary detection.
 
-use super::utils::{configure_thread_pool, process_reads_par, total_read_count};
+use super::utils::{process_reads_par, total_read_count};
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::ReadBoundaries;
@@ -83,7 +83,7 @@ pub struct DetectArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
-    /// Number of threads for parallel processing (default: all CPUs)
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
@@ -144,7 +144,6 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     );
 
     // Set thread pool size
-    configure_thread_pool(args.threads);
 
     let total = total_read_count(&args.input);
     info!(
@@ -344,8 +343,6 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             use rayon::prelude::*;
             use std::sync::mpsc::sync_channel;
 
-            configure_thread_pool(args.threads);
-
             // Reads per block: bigger ⇒ bigger same-length groups ⇒ fewer, larger
             // onnxruntime calls. Bounded at 2 in flight to cap memory.
             const GPU_BLOCK: usize = 16_384;
@@ -358,8 +355,15 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             let bnd = &boundaries;
             std::thread::scope(|scope| -> anyhow::Result<Vec<ReadBoundaries>> {
                 let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<ReadBoundaries>> {
-                    let gpu = escapepod_demux::AdapterCnnGpu::load(&model_path)
-                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
+                    // Bound onnxruntime's intra-op pool too. Left unset it
+                    // spawns `available_parallelism()` threads alongside
+                    // rayon's, so `--threads` would not bound the process
+                    // (#155, GPU half).
+                    let gpu = escapepod_demux::AdapterCnnGpu::load_with_threads(
+                        &model_path,
+                        crate::threads::width(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
                     let mut out = Vec::new();
                     for (meta, prepped) in rx.iter() {
                         let ends = gpu.detect_prepped(&prepped);
@@ -424,7 +428,6 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         // CPU: per-read tract. tract has no efficient batched conv (batching it
         // measured *slower*), so the fine-grained per-read parallelism across
         // many reads is the better CPU schedule.
-        configure_thread_pool(args.threads);
         let cnn = escapepod_demux::AdapterCnn::load(cnn_model_path)
             .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
         let decode_bound = Some(cnn.config().max_obs_trace);

@@ -1,6 +1,5 @@
 //! Split subcommand - split reads into separate POD5 files by barcode.
 
-use super::utils::configure_thread_pool;
 use crate::style;
 use escapepod_signal::Durability;
 use escapepod_signal::operations::{FilterOptions, parse_barcode_mapping, subset_files};
@@ -35,7 +34,7 @@ pub struct SplitArgs {
     #[arg(long)]
     pub classified_only: bool,
 
-    /// Number of threads for parallel processing (default: all CPUs)
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
@@ -82,7 +81,6 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     );
 
     // Set thread pool size
-    configure_thread_pool(args.threads);
 
     // Create output directory if it doesn't exist
     fs::create_dir_all(&args.output_dir)?;

@@ -151,7 +151,7 @@ escpod demux detect <FILES>... -o <OUTPUT>
 | `--min-adapter <N>` | Minimum adapter observations (default: 200) |
 | `--border-trim <N>` | Border trim size (default: 50) |
 | `--downscale <N>` | Downscale factor for signal processing (default: 1, use 10 for WarpDemuX compatibility) |
-| `-j, --threads <N>` | Number of threads (default: 4) |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ### Output Format
@@ -291,7 +291,7 @@ escpod demux fingerprint <FILES>... --boundaries <CSV> -o <OUTPUT>
 | `--num-segments <N>` | Number of fingerprint segments (default: 10) |
 | `--window-width <N>` | T-test window width (default: 5) |
 | `--normalize <METHOD>` | Normalization method: zscore, minmax, median, none (default: zscore) |
-| `-j, --threads <N>` | Number of threads (default: 4) |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 **Note:** The `--segment-start` and `--segment-end` options define which region within the adapter to use for fingerprinting. The defaults (1000-2000) match the training parameters, ensuring consistency between training and classification.
@@ -401,7 +401,7 @@ escpod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
 | `-o, --output <FILE>` | Output classifications CSV (required) |
 | `--window <N>` | DTW window size (Sakoe-Chiba band, optional) |
 | `--threshold <F>` | Confidence threshold for classification (default: 0.8) |
-| `-j, --threads <N>` | Number of threads (default: 4) |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ### Output Format
@@ -460,7 +460,7 @@ escpod demux split <FILES>... --classifications <CSV> --output-dir <DIR>
 | `-d, --output-dir <DIR>` | Output directory for demuxed files (required) |
 | `--prefix <STR>` | Output file prefix (default: none) |
 | `--unclassified` | Include unclassified reads in separate file |
-| `-j, --threads <N>` | Number of threads (default: 4) |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ### Output Structure
@@ -558,7 +558,7 @@ escpod demux train --assignments <CSV> -o <OUTPUT>
 | `--normalize <METHOD>` | Normalization method (default: zscore) |
 | `--min-adapter <N>` | Minimum adapter observations (default: 200) |
 | `--border-trim <N>` | Border trim size (default: 50) |
-| `-j, --threads <N>` | Number of threads (default: 4) |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ### Output Format

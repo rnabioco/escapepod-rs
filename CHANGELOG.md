@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`demux detect --method cnn` honours `-t/-j` again.** It ran a full-width
+  rayon pool for every value of the flag — 18 threads and ~1550% CPU at `-j 1`
+  just as at `-j 16` — so a Slurm job could not be held to its allocation.
+  Sizing the pool happened *after* a read-counting `par_iter()` had already
+  built rayon's global pool at `available_parallelism()`; the resulting
+  `build_global()` error was discarded, making the ignored flag invisible. The
+  pool is now built once in `main` before command dispatch, so no command can
+  reorder itself into the same trap, and a failure to size it warns instead of
+  passing silently (#155).
+- **`--gpu` CNN detection bounds onnxruntime too.** Its intra-op pool was left
+  at onnxruntime's default width and spawned alongside rayon's, so `--threads`
+  did not bound the process even once the rayon half was fixed (#155).
+
+### Changed
+
+- **`-t/--threads` now defaults to 16 everywhere, capped at the CPUs actually
+  available** (`available_parallelism()`, which respects cgroup quota and CPU
+  affinity — under `srun -c 8` the default is 8). An explicit `-t/-j` is never
+  capped. This replaces two different defaults: the block-copy commands
+  (`merge`, `filter`, `subset`, `index`) used a fixed 8, and the `demux` and
+  `resquiggle` commands used all CPUs.
+
+  Three behaviour changes worth planning for:
+  - `demux` and `resquiggle` **drop from all CPUs to 16** by default. On a
+    wide allocation that is a real throughput loss — pass
+    `-j $SLURM_CPUS_PER_TASK` to keep the old behaviour.
+  - the block-copy commands rise from 8 to 16.
+  - `view`, `summary`, `repack`, and `bam-filter` have no `--threads` flag and
+    were previously unbounded; they now get the same 16-thread default.
+
+  `RAYON_NUM_THREADS` still applies when no flag is given. `-t 0` is now an
+  error rather than a silent "let rayon decide".
+- `-t` and `-j` are accepted interchangeably by every command that takes a
+  thread count; previously `merge`/`filter`/`subset`/`index` took only `-t`
+  and `demux classify` only `-j`.
+
 ## 0.6.3 (2026-07-26)
 
 ### Added

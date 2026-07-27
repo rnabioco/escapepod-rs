@@ -23,6 +23,7 @@ escpod subset --csv <FILE> -o <OUTPUT_DIR> [OPTIONS] <INPUT>
 | `--csv <FILE>` | CSV file with read_id,output columns (required) |
 | `-o, --output-dir <DIR>` | Output directory (default: current directory) |
 | `-f, --force` | Overwrite existing files |
+| `-t, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ## CSV File Format

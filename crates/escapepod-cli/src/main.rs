@@ -11,6 +11,7 @@ use tracing_subscriber::registry::LookupSpan;
 mod commands;
 mod progress;
 mod style;
+mod threads;
 mod util;
 
 /// Terse event formatter for `escpod` logs: `YYYY-MM-DD HH:MM:SS  LEVEL [target] message`.
@@ -203,8 +204,8 @@ Examples:
         #[arg(long)]
         duplicate_ok: bool,
 
-        /// Number of threads for parallel processing (default: 8)
-        #[arg(short = 't', long, value_name = "N")]
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
 
         /// Overwrite the output file if it already exists
@@ -255,8 +256,8 @@ At least one filter criterion must be specified.
         #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
 
-        /// Number of threads for parallel processing (default: 8)
-        #[arg(short = 't', long, value_name = "N")]
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
 
         /// Overwrite the output file if it already exists
@@ -369,8 +370,8 @@ Each unique 'output' value creates a separate POD5 file.
         #[arg(short, long, default_value = ".", value_name = "DIR")]
         output_dir: PathBuf,
 
-        /// Number of threads for parallel processing (default: 8)
-        #[arg(short = 't', long, value_name = "N")]
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
 
         /// Overwrite existing files
@@ -450,8 +451,8 @@ Examples:
         #[arg(short, long)]
         force: bool,
 
-        /// Number of threads for parallel processing (default: 8)
-        #[arg(short = 't', long, value_name = "N")]
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
     },
 
@@ -467,6 +468,47 @@ Examples:
         )]
         args: Vec<String>,
     },
+}
+
+/// The `-t/--threads` value the user asked for, whichever command they ran.
+///
+/// `main` sizes the rayon pool once, before dispatch (see [`threads`]), so it
+/// needs the flag before it knows which command will consume it. Reading it
+/// back out of the parsed enum keeps each subcommand's own `--threads` arg
+/// intact — a `global = true` arg on `Cli` would collide with them.
+///
+/// This match is deliberately exhaustive: a new command is a compile error
+/// until someone states whether it takes `--threads`. That is what stops #155
+/// from being reintroduced by a command that quietly sizes its own pool.
+fn requested_threads(command: &Commands) -> Option<usize> {
+    match command {
+        Commands::Merge { threads, .. }
+        | Commands::Filter { threads, .. }
+        | Commands::Subset { threads, .. } => *threads,
+
+        #[cfg(feature = "experimental")]
+        Commands::Index { threads, .. } => *threads,
+        #[cfg(not(feature = "experimental"))]
+        Commands::Index { .. } => None,
+
+        // Like `demux`, resquiggle flattens its run args under a subcommand.
+        #[cfg(feature = "experimental")]
+        Commands::Resquiggle(args) => args.run.threads,
+        #[cfg(not(feature = "experimental"))]
+        Commands::Resquiggle { .. } => None,
+
+        #[cfg(feature = "demux")]
+        Commands::Demux(args) => commands::demux::requested_threads(args),
+        #[cfg(not(feature = "demux"))]
+        Commands::Demux { .. } => None,
+
+        // No `--threads` flag; these run on the default pool.
+        Commands::View { .. }
+        | Commands::Inspect { .. }
+        | Commands::BamFilter { .. }
+        | Commands::Summary(_)
+        | Commands::Repack { .. } => None,
+    }
 }
 
 #[derive(Subcommand)]
@@ -601,6 +643,12 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Size the rayon pool before any command code runs. rayon's global pool
+    // can only be built once, and only before anything touches it — doing it
+    // here is what keeps `--threads` from being silently ignored (#155).
+    // After the subscriber, so the diagnostics in `init` are visible.
+    threads::init(requested_threads(&cli.command))?;
+
     install_signal_handler();
 
     let durability = Durability::from(cli.fsync);
@@ -626,18 +674,10 @@ fn main() -> anyhow::Result<()> {
             inputs,
             output,
             duplicate_ok,
-            threads,
+            threads: _,
             force,
             profile,
-        } => commands::merge::run(
-            inputs,
-            output,
-            duplicate_ok,
-            threads,
-            force,
-            profile,
-            durability,
-        ),
+        } => commands::merge::run(inputs, output, duplicate_ok, force, profile, durability),
 
         Commands::Filter {
             input,
@@ -647,7 +687,7 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
-            threads,
+            threads: _,
             force,
             profile,
         } => commands::filter::run(
@@ -658,7 +698,6 @@ fn main() -> anyhow::Result<()> {
             end_reason,
             exclude_end_reason,
             output,
-            threads,
             force,
             profile,
             durability,
@@ -692,10 +731,10 @@ fn main() -> anyhow::Result<()> {
             input,
             csv,
             output_dir,
-            threads,
+            threads: _,
             force,
             profile,
-        } => commands::subset::run(input, csv, output_dir, threads, force, profile, durability),
+        } => commands::subset::run(input, csv, output_dir, force, profile, durability),
 
         Commands::Summary(args) => commands::summary::run(args),
 
@@ -715,8 +754,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Index {
             inputs,
             force,
-            threads,
-        } => commands::index::run(inputs, force, threads),
+            threads: _,
+        } => commands::index::run(inputs, force),
 
         #[cfg(not(feature = "experimental"))]
         Commands::Index { .. } => feature_disabled("index", "experimental"),
@@ -780,6 +819,127 @@ mod tests {
         assert!(
             !out.contains("\\x1b"),
             "message ANSI was sanitized to literal text: {out:?}"
+        );
+    }
+
+    /// Parse a real argv and report the thread count `main` would apply.
+    fn threads_for(argv: &[&str]) -> Option<usize> {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        requested_threads(&cli.command)
+    }
+
+    /// The regression guard for #155.
+    ///
+    /// `--method cnn` used to run a full-width pool whatever `-j` said, because
+    /// its pool-sizing call landed *after* a `par_iter()` had already built the
+    /// global pool. Sizing now happens in `main` from this accessor, so the
+    /// flag reaching it is the property worth pinning — and it is identical for
+    /// both methods, which is exactly what was untrue before.
+    #[test]
+    fn detect_threads_reach_main_for_every_method() {
+        let base = ["escpod", "demux", "detect", "in.pod5", "-o", "b.csv"];
+        for method in ["llr", "cnn"] {
+            let argv = [&base[..], &["--method", method, "-j", "3"]].concat();
+            assert_eq!(threads_for(&argv), Some(3), "method {method} dropped -j");
+        }
+    }
+
+    #[test]
+    fn detect_accepts_both_t_and_j() {
+        let base = ["escpod", "demux", "detect", "in.pod5", "-o", "b.csv"];
+        for flag in ["-j", "-t", "--threads"] {
+            let argv = [&base[..], &[flag, "5"]].concat();
+            assert_eq!(threads_for(&argv), Some(5), "{flag} dropped");
+        }
+    }
+
+    #[test]
+    fn absent_flag_defers_to_the_default() {
+        assert_eq!(
+            threads_for(&["escpod", "demux", "detect", "in.pod5", "-o", "b.csv"]),
+            None
+        );
+        assert_eq!(threads_for(&["escpod", "view", "in.pod5"]), None);
+    }
+
+    /// With no subcommand, `demux` is the fused pipeline and its flags live in
+    /// the flattened `RunArgs` — a separate path through the accessor.
+    #[test]
+    fn fused_demux_pipeline_threads_are_read() {
+        assert_eq!(
+            threads_for(&[
+                "escpod", "demux", "in.pod5", "--model", "m.json", "-d", "out", "-j", "7"
+            ]),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn every_demux_subcommand_forwards_threads() {
+        let cases: [&[&str]; 4] = [
+            &[
+                "fingerprint",
+                "in.pod5",
+                "--boundaries",
+                "b.csv",
+                "-o",
+                "f.csv",
+            ],
+            &["classify", "f.csv", "--reference", "r.csv", "-o", "c.csv"],
+            &[
+                "split",
+                "in.pod5",
+                "--classifications",
+                "c.csv",
+                "-d",
+                "out",
+            ],
+            &["train", "--assignments", "a.csv", "-o", "r.json"],
+        ];
+        for case in cases {
+            let argv = [&["escpod", "demux"][..], case, &["-j", "6"]].concat();
+            assert_eq!(threads_for(&argv), Some(6), "{case:?} dropped -j");
+        }
+    }
+
+    #[test]
+    fn top_level_commands_forward_threads() {
+        let cases: [&[&str]; 3] = [
+            &["merge", "a.pod5", "-o", "out.pod5"],
+            &["filter", "in.pod5", "--min-samples", "10", "-o", "out.pod5"],
+            &["subset", "in.pod5", "--csv", "m.csv", "-o", "out"],
+        ];
+        for case in cases {
+            for flag in ["-t", "-j"] {
+                let argv = [&["escpod"][..], case, &[flag, "2"]].concat();
+                assert_eq!(threads_for(&argv), Some(2), "{case:?} dropped {flag}");
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn experimental_commands_forward_threads() {
+        assert_eq!(
+            threads_for(&["escpod", "index", "in.pod5", "-t", "4"]),
+            Some(4)
+        );
+        // resquiggle flattens its run args under a subcommand, like demux.
+        assert_eq!(
+            threads_for(&[
+                "escpod",
+                "resquiggle",
+                "in.pod5",
+                "-b",
+                "a.bam",
+                "-k",
+                "k.tsv",
+                "-o",
+                "o.bam",
+                "-j",
+                "4",
+            ]),
+            Some(4)
         );
     }
 }

@@ -11,26 +11,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     inputs: Vec<PathBuf>,
     output: PathBuf,
     duplicate_ok: bool,
-    threads: Option<usize>,
     force: bool,
     profile: bool,
     durability: Durability,
 ) -> anyhow::Result<()> {
-    // Bound the parallelism. Merge scales across input files, but like the
-    // other block-copy commands it does NOT default to all CPUs (see
-    // DEFAULT_THREADS) — that is antisocial on a shared node for a largely
-    // I/O-bound copy. Raise it with `-t` on a machine you own.
-    let num_threads = threads.unwrap_or(crate::commands::DEFAULT_THREADS);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .ok(); // Ignore error if pool already initialized
-
     check_output_writable(&output, force)?;
 
     let all_files = collect_pod5_inputs(&inputs)?;

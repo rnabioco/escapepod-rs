@@ -68,7 +68,7 @@ escpod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
 | `--dwell-weight <W>` | Dwell penalty weight (default: 0.5) |
 | `--normalize <MODE>` | Normalization mode for kmer levels (e.g., `mad`) |
 | `--rna` | RNA mode: reverse raw signal to match basecaller's 5'→3' orientation |
-| `-j, --threads <N>` | Number of threads for parallel processing |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
 ## K-mer models
