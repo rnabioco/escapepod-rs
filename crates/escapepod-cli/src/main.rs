@@ -622,11 +622,25 @@ fn main() -> anyhow::Result<()> {
     // Verbosity → log level. `RUST_LOG` always wins if set.
     // Status/progress output is emitted at INFO, so INFO is the default level
     // (status visible out of the box); `-q` drops to errors only.
-    let filter = match (cli.quiet, cli.verbose) {
+    let level = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
         (_, 0) => "info",
         (_, 1) => "debug",
         _ => "trace",
+    };
+    // Scope the level to our own crates and hold dependencies at `warn`.
+    // Verbosity flags are about escpod's own progress, but some dependencies
+    // are chatty at info through the `log` bridge — tract announces every SIMD
+    // kernel it probes on each `demux detect --method cnn` run. `RUST_LOG`
+    // remains the escape hatch for dependency logs. `-q` silences everything
+    // but errors, dependencies included, so it stays a flat global level.
+    let filter = if cli.quiet {
+        level.to_string()
+    } else {
+        format!(
+            "warn,escpod={level},escapepod_cli={level},escapepod_demux={level},\
+             escapepod_signal={level},escapepod_pod5={level}"
+        )
     };
     tracing_subscriber::fmt()
         // Our status lines carry ANSI from the `style::*` helpers (already

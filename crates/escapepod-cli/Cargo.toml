@@ -70,13 +70,20 @@ pod5 = ["dep:escapepod-pod5"]
 signal = ["dep:escapepod-signal"]
 demux = ["dep:escapepod-demux"]
 
-# The `escpod` binary and everything it links. Implies the `signal` and
-# `demux` layers. `demux` is in the default build because it pulls in **no**
-# additional third-party crates — ndarray, serde_json, rayon and uuid are all
-# already in the CLI dependency graph — so shipping it costs only compile time.
+# The `escpod` binary and everything it links. Implies the `signal`, `demux`
+# and `cnn-detect` layers. `demux` is in the default build because it pulls in
+# **no** additional third-party crates — ndarray, serde_json, rayon and uuid are
+# all already in the CLI dependency graph — so shipping it costs only compile
+# time. `cnn-detect` does add one (tract-onnx), but only to the binary: library
+# consumers reach the layers through `default-features = false` (they have to,
+# or they inherit clap/noodles/parquet), so they never pay for it. It is in the
+# default build because `--method cnn` is how the shipped barcode models reach
+# their published accuracy — without it `escpod demux` silently falls back to
+# the less accurate LLR boundary detector.
 cli = [
     "signal",
     "demux",
+    "cnn-detect",
     "dep:anyhow",
     "dep:arrow",
     "dep:bstr",
@@ -105,8 +112,11 @@ cli = [
     "dep:walkdir",
 ]
 
-# CNN-based adapter detection (requires a local ADAPTed-exported .onnx model
-# at runtime; weights are CC BY-NC 4.0 and not bundled).
+# CNN/TCN-based adapter detection through tract-onnx. Part of the `cli` feature
+# (see above); still selectable on its own for `default-features = false`
+# consumers. No weights are bundled — the caller supplies an ONNX file on the
+# `[B,1,L] -> [B,2,L]` contract at runtime, e.g. escapepod-models'
+# `adapter_rna004` (CC BY 4.0) or an ADAPTed export (CC BY-NC 4.0).
 cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
 # Batched GPU CNN/TCN adapter detection via onnxruntime CUDA (`escpod demux
 # detect --method cnn --gpu`). Implies `cnn-detect` for the shared CPU path and

@@ -113,13 +113,13 @@ match result {
 
 | Feature | Effect |
 |---------|--------|
-| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal` |
+| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal`, `demux` and `cnn-detect` |
 | `pod5` / `signal` / `demux` | Library re-exports of each layer (for `default-features = false` consumers) |
 | `experimental` | Unlocks `repack`, `resquiggle`, `index` |
 | `demux` | Unlocks the `demux` subcommand tree (detect / fingerprint / classify / split / train) |
 | `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
 | `gpu` | Implies `demux`; batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc at runtime) |
-| `cnn-detect` | Implies `demux`; ADAPTed-style CNN adapter detection (bring-your-own ONNX model; weights are CC BY-NC 4.0 and not bundled) |
+| `cnn-detect` | Part of `cli`; implies `demux`. CNN/TCN adapter detection through `tract-onnx` (bring-your-own ONNX model — no weights are bundled) |
 
 ### `escapepod-demux`
 

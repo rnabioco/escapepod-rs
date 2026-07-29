@@ -136,10 +136,14 @@ from the [KleistLab](https://github.com/KleistLab):
   from ADAPTed, and `escapepod-demux::adapter_cnn` is a runtime port of
   ADAPTed's `BoundariesCNN` through `tract-onnx`.
 
-  **Note on CNN weights:** ADAPTed's trained CNN weights are licensed
-  under **CC BY-NC 4.0** and are **not bundled** with escapepod-rs. The
-  `cnn-detect` feature ships only the inference code; users must export
-  their own ONNX file from a local ADAPTed install (see
+  **Note on CNN weights:** the `cnn-detect` code is in the default build,
+  but **no weights are bundled** — the detector is architecture-agnostic
+  and takes any ONNX graph on the `[B,1,L] -> [B,2,L]` contract at
+  runtime. escapepod-rs points users at
+  [escapepod-models](https://github.com/rnabioco/escapepod-models)'
+  `adapter_rna004` TCN (CC BY 4.0). ADAPTed's own trained weights are
+  licensed **CC BY-NC 4.0**; users who prefer those must export their own
+  ONNX file from a local ADAPTed install (see
   `scripts/export_adapter_cnn_to_onnx.py`) and accept ADAPTed's license
   terms separately.
 

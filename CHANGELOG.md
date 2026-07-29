@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- **`cnn-detect` is now part of the default `cli` feature**, so released
+  binaries can run `escpod demux detect --method cnn` (and the fused
+  `escpod demux --method cnn`) without a rebuild. The barcode models published
+  in escapepod-models are trained against the CNN/TCN boundary detector, so a
+  binary without it silently fell back to the LLR detector and produced
+  materially worse classification. Unlike the 0.6.3 `demux` promotion this does
+  add a dependency (tract-onnx: ~10 MB → ~31 MB stripped, ~3.7 MB → ~11 MB
+  compressed), but only for the binary — library consumers reach the layers
+  through `default-features = false`, which never enabled `cli`. `cnn-gpu`,
+  `gpu`, and `train` remain opt-in.
+
 ### Fixed
 
 - **`demux detect --method cnn` honours `-t/-j` again.** It ran a full-width
@@ -39,6 +52,11 @@
 - `-t` and `-j` are accepted interchangeably by every command that takes a
   thread count; previously `merge`/`filter`/`subset`/`index` took only `-t`
   and `demux classify` only `-j`.
+- **Dependency logs no longer appear at the default verbosity.** The tracing
+  filter is now scoped to escpod's own crates with dependencies held at `warn`;
+  previously `demux detect --method cnn` printed a dozen lines of tract SIMD
+  kernel-probe output before doing any work. `RUST_LOG` still overrides
+  everything, and `-q` still silences all but errors.
 
 ## 0.6.3 (2026-07-26)
 

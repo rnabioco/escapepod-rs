@@ -56,8 +56,8 @@ pub struct DetectArgs {
     /// Adapter detection method.
     ///
     /// `llr` (default) uses the built-in log-likelihood ratio detector.
-    /// `cnn` runs a boundary-CNN ONNX graph through tract-onnx (opt-in via
-    /// `--features cnn-detect`). Supply any model with the `[B,1,L] -> [B,2,L]`
+    /// `cnn` runs a boundary-CNN ONNX graph through tract-onnx (in the default
+    /// build). Supply any model with the `[B,1,L] -> [B,2,L]`
     /// contract via `--cnn-model` — e.g. escapepod-models' `adapter_rna004`
     /// (CC-BY), or an ADAPTed `BoundariesCNN` exported with
     /// `scripts/export_adapter_cnn_to_onnx.py` (those weights are CC BY-NC 4.0
