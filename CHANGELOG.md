@@ -15,6 +15,29 @@
   through `default-features = false`, which never enabled `cli`. `cnn-gpu`,
   `gpu`, and `train` remain opt-in.
 
+- **`demux detect --method cnn --emit-llr-delta`** runs the LLR detector
+  alongside the CNN and adds `llr_adapter_start`, `llr_adapter_end`, and
+  `end_delta` columns, so the two independent detectors can be compared per
+  read. Boundary quality is otherwise only checkable against EDX-derived
+  labels, which production demultiplexing does not have; detector disagreement
+  is the gate that works without them. A summary line reports the median, p95,
+  and max of `|end_delta|` — percentiles rather than a "within N samples" count,
+  since any such N would be invented here.
+
+  Opt-in because of I/O, not compute. LLR is nearly free next to CNN inference
+  (~0.25 s vs ~77 s per 20k reads), but it normalizes over the whole read, so
+  the CNN path can no longer decode only each read's leading `max_obs_trace`
+  samples — the saving that matters on long mRNA reads. Running LLR on the
+  CNN's prefix instead would have been nearly free, and was rejected: those are
+  not the boundaries `--method llr` reports, so the delta would measure the
+  truncation rather than the disagreement. For the same reason the flag is
+  refused with `--gpu`, whose producer only ever decodes a prefix.
+
+  `end_delta` is left empty unless *both* detectors found a boundary, because
+  `adapter_end == 0` is a shared sentinel for "no adapter", "too short", and
+  "inference failed" — differencing against it would report a large
+  disagreement that neither detector has.
+
 ### Fixed
 
 - **`demux detect --method cnn` honours `-t/-j` again.** It ran a full-width

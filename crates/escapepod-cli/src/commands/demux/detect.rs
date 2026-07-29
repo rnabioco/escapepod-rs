@@ -83,6 +83,22 @@ pub struct DetectArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
+    /// Also run the LLR detector and emit its boundaries alongside the CNN's
+    /// (`--method cnn` only).
+    ///
+    /// Adds `llr_adapter_start`, `llr_adapter_end`, and `end_delta` columns, so
+    /// the two independent detectors can be compared per read. This is the only
+    /// boundary quality gate that works in production, where EDX labels are not
+    /// available.
+    ///
+    /// Opt-in because of I/O, not compute: LLR itself is nearly free next to CNN
+    /// inference, but it normalizes over the whole read, so the CNN path can no
+    /// longer decode just its leading `max_obs_trace` samples. Every read is
+    /// decompressed in full while this is on.
+    #[cfg(feature = "cnn-detect")]
+    #[arg(long, help_heading = "Advanced Options")]
+    pub emit_llr_delta: bool,
+
     /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
@@ -90,6 +106,48 @@ pub struct DetectArgs {
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
     pub profile: bool,
+}
+
+/// One output row: the CNN's boundaries, plus the LLR arm's `(start, end)` when
+/// `--emit-llr-delta` is on.
+#[cfg(feature = "cnn-detect")]
+type DetectRow = (ReadBoundaries, Option<(usize, usize)>);
+
+/// LLR adapter boundaries for one read, in full-resolution coordinates.
+///
+/// Shared by `--method llr` and by the `--emit-llr-delta` arm of `--method cnn`,
+/// and shared deliberately: the delta is only meaningful if its LLR side is the
+/// same detector `--method llr` reports, so the two must not be able to drift
+/// apart. Calling one function is a stronger guarantee of that than two copies
+/// that agree today.
+fn llr_boundaries(
+    signal: &[i16],
+    (min_adapter, border_trim, downscale): (usize, usize, usize),
+) -> (usize, usize) {
+    // Per-worker scratch via a thread-local: `process_reads_par` takes an `Fn`,
+    // so there is no init hook to thread buffers through. The unfused
+    // normalize+downscale chain allocates three full-length f32 buffers per
+    // read, and the read-length tail (medians of ~8 k with maxima in the
+    // millions) makes that a real RSS spike.
+    thread_local! {
+        static PREP: std::cell::RefCell<(SignalPrepScratch, Vec<f32>)> =
+            const { std::cell::RefCell::new((SignalPrepScratch::new(), Vec::new())) };
+    }
+
+    // A 0 or 1 factor both mean "no downscaling"; folding them together here is
+    // what keeps the two callers from disagreeing on `--downscale 0`.
+    let scale_factor = downscale.max(1);
+
+    let (start, end) = PREP.with(|cell| {
+        let (prep, processed) = &mut *cell.borrow_mut();
+        downscale_normalize_into(signal, scale_factor, prep, processed);
+        detect_adapter(
+            processed,
+            (min_adapter / scale_factor).max(1),
+            (border_trim / scale_factor).max(1),
+        )
+    });
+    (start * scale_factor, end * scale_factor)
 }
 
 /// Run the detect subcommand.
@@ -163,39 +221,15 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
         Some(&progress_bar),
         None, // LLR scans the full read
         |read_id, num_samples, signal| {
-            // Per-worker scratch via a thread-local: `process_reads_par` takes
-            // an `Fn`, so there is no init hook to thread buffers through. The
-            // unfused normalize+downscale chain allocates three full-length f32
-            // buffers per read, and the read-length tail (medians of ~8 k with
-            // maxima in the millions) makes that a real RSS spike.
-            thread_local! {
-                static PREP: std::cell::RefCell<(SignalPrepScratch, Vec<f32>)> =
-                    const { std::cell::RefCell::new((SignalPrepScratch::new(), Vec::new())) };
-            }
+            let (adapter_start, adapter_end) =
+                llr_boundaries(signal, (min_adapter, border_trim, downscale_factor));
 
-            let scale_factor = if downscale_factor > 1 {
-                downscale_factor
-            } else {
-                1
-            };
-            let scaled_min_adapter = min_adapter / scale_factor;
-            let scaled_border_trim = border_trim / scale_factor;
-
-            let (adapter_start, adapter_end) = PREP.with(|cell| {
-                let (prep, processed) = &mut *cell.borrow_mut();
-                downscale_normalize_into(signal, downscale_factor, prep, processed);
-                detect_adapter(
-                    processed,
-                    scaled_min_adapter.max(1),
-                    scaled_border_trim.max(1),
-                )
-            });
-
+            // `llr_boundaries` already rescales to full-resolution coordinates.
             ReadBoundaries {
                 read_id,
                 num_samples,
-                adapter_start: adapter_start * scale_factor,
-                adapter_end: adapter_end * scale_factor,
+                adapter_start,
+                adapter_end,
             }
         },
     )?;
@@ -270,6 +304,18 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     #[cfg(not(feature = "cnn-gpu"))]
     let use_gpu = false;
 
+    // The GPU producer prepares reads through `get_signal_prefix`, so the whole
+    // signal an LLR arm would need is never decoded there. Rejecting the
+    // combination is honest; silently running LLR on the prefix would report a
+    // delta that measures truncation instead of detector disagreement.
+    if args.emit_llr_delta && use_gpu {
+        anyhow::bail!(
+            "--emit-llr-delta is not supported with --gpu: the GPU path decodes \
+             only each read's leading samples, and the LLR detector normalizes \
+             over the whole read. Drop --gpu to compare the two detectors."
+        );
+    }
+
     warn!(
         "boundary CNN runs the model you supply via --cnn-model; respect that \
          model's license (e.g. ADAPTed-derived weights are CC BY-NC 4.0).",
@@ -330,7 +376,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         }
     };
 
-    let results: Vec<ReadBoundaries> = if use_gpu {
+    let results: Vec<DetectRow> = if use_gpu {
         // GPU: a dedicated consumer thread builds the ort session — overlapping
         // the (multi-second) CUDA/cuDNN init with the producers' first decodes —
         // then runs each prepped block batched. CPU producers use the full pool
@@ -353,8 +399,8 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             let model_path = cnn_model_path.clone();
             let pb = &progress_bar;
             let bnd = &boundaries;
-            std::thread::scope(|scope| -> anyhow::Result<Vec<ReadBoundaries>> {
-                let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<ReadBoundaries>> {
+            std::thread::scope(|scope| -> anyhow::Result<Vec<DetectRow>> {
+                let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<DetectRow>> {
                     // Bound onnxruntime's intra-op pool too. Left unset it
                     // spawns `available_parallelism()` threads alongside
                     // rayon's, so `--threads` would not bound the process
@@ -369,7 +415,9 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                         let ends = gpu.detect_prepped(&prepped);
                         pb.inc(meta.len() as u64);
                         for (end, (read_id, num_samples)) in ends.into_iter().zip(meta) {
-                            out.push(bnd(read_id, num_samples, end));
+                            // `--emit-llr-delta` is rejected with `--gpu` above, so the
+                            // LLR arm is always absent here.
+                            out.push((bnd(read_id, num_samples, end), None));
                         }
                     }
                     Ok(out)
@@ -430,14 +478,29 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         // many reads is the better CPU schedule.
         let cnn = escapepod_demux::AdapterCnn::load(cnn_model_path)
             .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
-        let decode_bound = Some(cnn.config().max_obs_trace);
+        // The CNN alone needs only the leading `max_obs_trace` samples, which is
+        // what lets long mRNA reads skip most of their decompression. The LLR
+        // arm normalizes over the *whole* read, so with `--emit-llr-delta` that
+        // saving has to go: scoring LLR on the CNN's prefix would not be the
+        // detector `--method llr` runs, and the delta would measure the
+        // truncation rather than the disagreement.
+        let decode_bound = if args.emit_llr_delta {
+            None
+        } else {
+            Some(cnn.config().max_obs_trace)
+        };
+        let llr_params = (args.min_adapter, args.border_trim, args.downscale);
         process_reads_par(
             &args.input,
             Some(&progress_bar),
-            decode_bound, // CNN only needs the leading max_obs_trace samples
+            decode_bound,
             |read_id, num_samples, signal| {
                 let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
-                boundaries(read_id, num_samples, cnn.detect_adapter_end(&sig_f32))
+                let b = boundaries(read_id, num_samples, cnn.detect_adapter_end(&sig_f32));
+                let llr = args
+                    .emit_llr_delta
+                    .then(|| llr_boundaries(signal, llr_params));
+                (b, llr)
             },
         )?
     };
@@ -446,15 +509,38 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
 
     let output_file = File::create(&args.output)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
-    writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
+    if args.emit_llr_delta {
+        writeln!(
+            writer,
+            "read_id,num_samples,adapter_start,adapter_end,llr_adapter_start,llr_adapter_end,end_delta"
+        )?;
+    } else {
+        writeln!(writer, "read_id,num_samples,adapter_start,adapter_end")?;
+    }
 
     let mut detected = 0;
-    for b in &results {
-        writeln!(
+    let mut abs_deltas: Vec<u64> = Vec::new();
+    for (b, llr) in &results {
+        write!(
             writer,
             "{},{},{},{}",
             b.read_id, b.num_samples, b.adapter_start, b.adapter_end
         )?;
+        if let Some((llr_start, llr_end)) = llr {
+            // `adapter_end == 0` is the shared "no adapter / too short /
+            // inference failed" sentinel on both arms. Subtracting it would give
+            // the distance from a position to a sentinel, which reads as a huge
+            // disagreement and is not one — so `end_delta` is left empty unless
+            // both detectors actually found a boundary.
+            if b.adapter_end > 0 && *llr_end > 0 {
+                let delta = b.adapter_end as i64 - *llr_end as i64;
+                abs_deltas.push(delta.unsigned_abs());
+                write!(writer, ",{llr_start},{llr_end},{delta}")?;
+            } else {
+                write!(writer, ",{llr_start},{llr_end},")?;
+            }
+        }
+        writeln!(writer)?;
         if b.has_valid_adapter() {
             detected += 1;
         }
@@ -484,6 +570,78 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         style::count(detected)
     );
 
+    if args.emit_llr_delta {
+        if abs_deltas.is_empty() {
+            warn!(
+                "--emit-llr-delta: no read had a boundary from both detectors, \
+                 so every end_delta is empty"
+            );
+        } else {
+            // Percentiles rather than a "within N samples" count: any such N
+            // would be a threshold invented here, and the point of the gate is
+            // to let the distribution speak.
+            abs_deltas.sort_unstable();
+            let at = |q: f64| abs_deltas[((abs_deltas.len() - 1) as f64 * q) as usize];
+            info!(
+                "{} {} reads comparable; |end_delta| median {}, p95 {}, max {}",
+                style::label("LLR vs CNN:"),
+                style::count(abs_deltas.len()),
+                at(0.5),
+                at(0.95),
+                abs_deltas[abs_deltas.len() - 1],
+            );
+        }
+    }
+
     timer.report(profile);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::llr_boundaries;
+
+    /// A synthetic read shaped like what the LLR detector looks for: one level
+    /// followed by another, with a deterministic wobble so neither segment has
+    /// zero variance (which is degenerate for a log-likelihood ratio).
+    fn synthetic_read() -> Vec<i16> {
+        (0..4000)
+            .map(|i| {
+                let base: i16 = if i < 1200 { 400 } else { 900 };
+                base + ((i * 37) % 21) as i16 - 10
+            })
+            .collect()
+    }
+
+    /// `--downscale 0` and `--downscale 1` both mean "no downscaling", and the
+    /// two callers of this function must agree on that.
+    ///
+    /// Regression guard with a specific history: `--method llr` folds the 0 case
+    /// away with `args.downscale.max(1)` in its caller, so a second copy of this
+    /// logic that took the raw argument would hand a factor of 0 to
+    /// `downscale_normalize_into` and diverge from the detector it claims to
+    /// reproduce — which would surface as fictional LLR-vs-CNN disagreement in
+    /// `--emit-llr-delta`. Sharing one function is what prevents it; this pins
+    /// the behaviour.
+    #[test]
+    fn downscale_zero_and_one_agree() {
+        let sig = synthetic_read();
+        assert_eq!(
+            llr_boundaries(&sig, (200, 50, 0)),
+            llr_boundaries(&sig, (200, 50, 1)),
+        );
+    }
+
+    /// Boundaries come back in full-resolution sample coordinates, not in
+    /// downscaled units — the callers write them straight into the CSV
+    /// alongside `num_samples`.
+    #[test]
+    fn downscaled_output_is_rescaled_to_full_resolution() {
+        let sig = synthetic_read();
+        let (start, end) = llr_boundaries(&sig, (200, 50, 10));
+        assert_eq!(start % 10, 0, "start not rescaled by the downscale factor");
+        assert_eq!(end % 10, 0, "end not rescaled by the downscale factor");
+        assert!(end <= sig.len(), "boundary past the end of the read");
+        assert!(start <= end, "start after end");
+    }
 }
