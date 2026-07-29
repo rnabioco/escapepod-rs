@@ -32,11 +32,15 @@ Demux has additional sub-features layered on top:
 
 | Feature | Enables |
 |---------|---------|
+| `cnn-detect` *(no flag needed — in the default build)* | CPU CNN/TCN adapter detection through `tract-onnx` (`escpod demux detect --method cnn`); bring-your-own ONNX model, no weights bundled |
 | `--features train` | SVM model training via `linfa-svm` (`escpod demux train-svm`) |
 | `--features gpu` | Batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc required at runtime) |
-| `--features cnn-detect` | ADAPTed-style CNN adapter detection (bring-your-own ONNX model; weights are CC BY-NC 4.0 and not bundled) |
+| `--features cnn-gpu` | Implies `cnn-detect`; onnxruntime CUDA inference for `detect --method cnn --gpu` |
 
-Each implies `demux`, so `cargo build --features train` is enough.
+The `--features` rows each imply `demux`, so `cargo build --features train` is
+enough. `cnn-detect` is listed for reference only: it ships in the default build
+and needs no flag, but `cnn-gpu` builds on it and `--method cnn` is what the
+published barcode models expect.
 
 ## Stability
 

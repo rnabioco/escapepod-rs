@@ -189,8 +189,11 @@ custom `EscpodFormatter` in `main.rs` renders `timestamp LEVEL [target] message`
 Command *data* — TSV/CSV rows, `inspect`/`summary` reports, ID lists — stays on
 **stdout** via `println!`, so it can be piped/redirected independently of logs.
 
-Default level is **info** (status visible out of the box). Control via CLI flags
-or `RUST_LOG` (which always wins when set):
+Default level is **info** for escpod's own crates; dependencies are pinned at
+**warn** so third-party chatter (tract logs every SIMD kernel it probes on each
+`demux detect --method cnn` run) stays out of normal output. `-v`/`-vv` raise
+escpod's level only — `RUST_LOG` is the escape hatch for dependency logs, and
+always wins when set:
 
 ```bash
 escpod inspect summary file.pod5         # info (default): status + warnings
@@ -216,7 +219,7 @@ level); use `println!`→stdout only for the command's actual data product.
 - **escapepod-pod5**: POD5 format I/O layer — reader, writer, VBZ compression, footer parsing, block-level merge/filter/repack/subset operations.
 - **escapepod-signal**: Signal-processing algorithms (DTW, resquiggle, segmentation) layered on top of `escapepod-pod5`. Re-exports the pod5 surface so downstream consumers can depend on a single crate.
 - **escapepod-demux**: WarpDemuX-compatible barcode demultiplexing — SVM model loaders, DTW+SVM classifier, Platt scaling, optional SVM training (`train`), GPU DTW batch classify (`gpu`), boundary-CNN adapter detection (`cnn-detect`, CPU tract; optional onnxruntime CUDA via `cnn-gpu`). Depends on `escapepod-signal` for DTW and fingerprint primitives.
-- **escapepod-cli**: the `escpod` CLI binary (built by the default `cli` feature) plus an optional umbrella library (imported as `escapepod_cli`) that re-exports `pod5`/`signal`/`demux` behind feature flags for `default-features = false` consumers. Demux is part of the default `cli` feature (it adds no third-party crates — ndarray/serde_json/rayon/uuid are already in the graph); `default-features = false` consumers can still select it explicitly. Forward features `train`, `gpu`, `cnn-detect`, `cnn-gpu` propagate to the demux crate and remain opt-in because they need extra toolchains or a CUDA runtime.
+- **escapepod-cli**: the `escpod` CLI binary (built by the default `cli` feature) plus an optional umbrella library (imported as `escapepod_cli`) that re-exports `pod5`/`signal`/`demux` behind feature flags for `default-features = false` consumers. Demux is part of the default `cli` feature (it adds no third-party crates — ndarray/serde_json/rayon/uuid are already in the graph), as is `cnn-detect` (it does add tract-onnx, ~+21 MB stripped, but only to the binary — library consumers must already use `default-features = false` to avoid clap/noodles, so they never pay for it; `--method cnn` is what the published barcode models were trained against). `default-features = false` consumers can still select either explicitly. Forward features `train`, `gpu`, `cnn-gpu` propagate to the demux crate and remain opt-in because they need extra toolchains or a CUDA runtime.
 - **escapepod-python**: pyo3 bindings.
 
 ### POD5 File Format

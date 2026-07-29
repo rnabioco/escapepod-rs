@@ -37,7 +37,7 @@ features:
 | `demux` | `demux detect`, `fingerprint`, `classify`, `split`, `train` |
 | `train` | implies `demux`; adds `demux train-svm` |
 | `gpu` | implies `demux`; batched GPU DTW for `classify` / `train-svm` (CUDA driver + libnvrtc required at runtime) |
-| `cnn-detect` | implies `demux`; ADAPTed-style CNN adapter detection (bring-your-own ONNX model) |
+| `cnn-detect` | *in the default build*; CNN/TCN adapter detection, `demux detect --method cnn` (bring-your-own ONNX model) |
 
 Combine as needed:
 

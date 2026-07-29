@@ -1,14 +1,15 @@
 # escpod demux
 
-Barcode demultiplexing ships in the default `escpod` build — it pulls in no
-third-party dependencies beyond what the CLI already links, so there is no
-feature flag to enable.
+Barcode demultiplexing ships in the default `escpod` build, including CNN/TCN
+adapter detection (`--method cnn`) — the barcode models published in
+[escapepod-models](https://github.com/rnabioco/escapepod-models) are trained
+against that boundary detector, so it is what they need to reach their reported
+accuracy.
 
 !!! note "Optional accelerators are still opt-in"
     These need extra toolchains or hardware and are therefore separate builds:
 
     ```bash
-    cargo build --release --features cnn-detect   # CNN adapter detection (CPU, tract)
     cargo build --release --features cnn-gpu      # CNN adapter detection (onnxruntime CUDA)
     cargo build --release --features train        # train DTW-SVM models (linfa)
     cargo build --release --features gpu          # EXPERIMENTAL: GPU DTW classify
