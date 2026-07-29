@@ -1,0 +1,34 @@
+# Ruff configuration for the Python surface of escapepod-rs — the binding tests
+# under tests/ and the escapepod.pyi type stub. CI runs `ruff check tests/python`
+# and `ruff format --check tests/python` (pixi.toml `lint-python`); pinning the
+# settings here keeps formatting stable across ruff releases instead of riding
+# on whatever the installed ruff defaults happen to be.
+
+# Match the package's declared floor (crates/escapepod-python/pyproject.toml
+# requires-python = ">=3.9") so ruff never rewrites to newer-only syntax.
+target-version = "py39"
+line-length = 88
+
+# Keep a bare `ruff check` / `ruff format` from wandering into non-package
+# Python: the pixi env, vendored submodules, and scratch/analysis scripts are
+# not part of the linted surface.
+extend-exclude = [
+    ".pixi",
+    "ext",
+    "notes",
+    "bench_tcn_gpu",
+    "bench_wdx",
+    "scripts",
+    "target",
+    "target-gpu",
+]
+
+[lint]
+# Ruff's default rule set (pyflakes `F` + a pycodestyle `E` subset) plus import
+# sorting, which the existing test files already conform to.
+extend-select = ["I"]
+
+[lint.isort]
+# The compiled extension imports as `escapepod`; treat it as first-party so its
+# import sorts into its own group after third-party (numpy/pod5/pytest).
+known-first-party = ["escapepod"]
