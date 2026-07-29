@@ -1,0 +1,24 @@
+# ty (Astral type checker) configuration. CI runs
+# `ty check tests/python crates/escapepod-python/escapepod.pyi`
+# (pixi.toml `typecheck-python`). ty resolves `import escapepod` from the
+# maturin-built extension and third-party imports (numpy, pod5, pytest) from
+# the active pixi env, so no explicit search paths are needed here.
+
+[environment]
+# Match the package floor (crates/escapepod-python/pyproject.toml
+# requires-python = ">=3.9") so annotations are checked against the oldest
+# supported interpreter.
+python-version = "3.9"
+
+[src]
+# Keep the pixi env, vendored submodules, and scratch scripts out of any
+# directory-level check.
+exclude = [
+    ".pixi",
+    "ext",
+    "notes",
+    "bench_tcn_gpu",
+    "bench_wdx",
+    "target",
+    "target-gpu",
+]
