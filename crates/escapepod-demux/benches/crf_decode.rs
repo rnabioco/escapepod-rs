@@ -43,15 +43,9 @@ fn bench_decode(c: &mut Criterion) {
     // One element = one read, so the reported throughput is reads/s directly.
     group.throughput(Throughput::Elements(1));
 
-    let mut backends = vec![("scalar", Backend::Scalar)];
-    #[cfg(target_arch = "x86_64")]
-    if Backend::best_for(&layout) == Backend::Avx2 {
-        backends.push(("avx2", Backend::Avx2));
-    }
-
-    for (name, backend) in backends {
+    for backend in Backend::all_supported(&layout) {
         group.bench_with_input(
-            BenchmarkId::from_parameter(name),
+            BenchmarkId::from_parameter(format!("{backend:?}").to_lowercase()),
             &backend,
             |b, &backend| {
                 let mut scratch = CrfScratch::new();

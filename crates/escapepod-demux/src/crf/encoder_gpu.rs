@@ -6,21 +6,22 @@
 //!
 //! # Why the decode stays on the CPU
 //!
-//! Measured on one read of the RNA004 barcode export (rna partition, AVX2):
+//! Measured per read on the RNA004 barcode export (rna partition):
 //!
 //! ```text
 //! tract encoder        13.9 ms
-//! decode, scalar       13.53 ms
-//! decode, AVX2          2.40 ms
+//! decode, scalar       12.14 ms
+//! decode, AVX2          1.92 ms
+//! decode, AVX-512       1.19 ms
 //! ```
 //!
-//! (`cargo bench --bench crf_decode` reproduces the two decode rows.)
+//! (`cargo bench --bench crf_decode` reproduces the three decode rows.)
 //!
-//! The decode is *half* the CPU cost, so moving only the encoder to the GPU
-//! would leave it as essentially the entire remaining runtime — which is why
-//! the AVX2 kernels are a prerequisite for this path rather than a nicety. With
-//! them, the decode is small enough that overlapping it across rayon workers
-//! while the GPU runs the next batch keeps the device fed.
+//! The decode started out as *half* the CPU cost, so moving only the encoder to
+//! the GPU leaves it as essentially the entire remaining runtime — which is why
+//! the vector kernels are a prerequisite for this path rather than a nicety.
+//! With them, the decode is small enough that overlapping it across rayon
+//! workers while the GPU runs the next batch keeps the device fed.
 //!
 //! That split also mirrors what the boundary-CNN work concluded: the lattice
 //! decode is sequential in time with a 256-wide inner dimension, so it is a poor

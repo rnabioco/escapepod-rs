@@ -59,7 +59,7 @@ fn layout_from(fixture: &serde_json::Value) -> CrfLayout {
 }
 
 /// The headline check: same sequence, same per-timestep edge, same path, for
-/// both reads and every backend this CPU offers.
+/// both reads and every backend this CPU supports.
 #[test]
 fn decode_matches_bonito() {
     let fixture = golden();
@@ -89,12 +89,7 @@ fn decode_matches_bonito() {
     let path = flat("path_flat");
     let seqs = small["seqs"].as_array().unwrap();
 
-    let mut backends = vec![Backend::Scalar];
-    #[cfg(target_arch = "x86_64")]
-    if Backend::best_for(&layout) == Backend::Avx2 {
-        backends.push(Backend::Avx2);
-    }
-
+    let backends = Backend::all_supported(&layout);
     let mut scratch = CrfScratch::new();
     for backend in backends {
         for n in 0..n_reads {

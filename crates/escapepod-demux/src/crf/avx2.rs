@@ -269,6 +269,34 @@ unsafe fn deinterleave4(src: &[f32], dst: &mut [f32]) {
     }
 }
 
+/// `dst[edge * n_states + dest] = src[dest * n_edges + edge]` — the
+/// `[dest][edge]` → `[edge][dest]` transpose of one timestep.
+///
+/// See [`super::avx512::transpose_scores`]: `n_edges` is 5, which no shuffle
+/// network de-interleaves cleanly, so this gathers one edge row at a time.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn transpose_scores(
+    src: &[f32],
+    dst: &mut [f32],
+    n_states: usize,
+    n_edges: usize,
+) {
+    unsafe {
+        let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let step = _mm256_mullo_epi32(lane, _mm256_set1_epi32(n_edges as i32));
+        let bump = _mm256_set1_epi32((8 * n_edges) as i32);
+        for edge in 0..n_edges {
+            let base = src.as_ptr().add(edge);
+            let out = dst.as_mut_ptr().add(edge * n_states);
+            let mut idx = step;
+            for d in (0..n_states).step_by(8) {
+                _mm256_storeu_ps(out.add(d), _mm256_i32gather_ps::<4>(base, idx));
+                idx = _mm256_add_epi32(idx, bump);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lattice passes
 // ---------------------------------------------------------------------------
@@ -423,26 +451,28 @@ pub(super) unsafe fn log_softmax_floored(src: &[f32], dst: &mut [f32], floor: f3
         for c in (0..n).step_by(8) {
             mv = _mm256_max_ps(mv, _mm256_loadu_ps(src.as_ptr().add(c)));
         }
-        let peak = hmax(mv);
-        let m = _mm256_set1_ps(peak);
+        let m = _mm256_set1_ps(hmax(mv));
 
+        // Keep exp(x - max) in `dst` and divide by its own sum, rather than
+        // taking a second exp against the logsumexp. Same softmax — and the
+        // form torch itself uses — for one exp per element instead of two, in
+        // the decode's hottest kernel.
         let mut sv = _mm256_setzero_ps();
         for c in (0..n).step_by(8) {
-            sv = _mm256_add_ps(
-                sv,
-                exp8(_mm256_sub_ps(_mm256_loadu_ps(src.as_ptr().add(c)), m)),
-            );
+            let e = exp8(_mm256_sub_ps(_mm256_loadu_ps(src.as_ptr().add(c)), m));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(c), e);
+            sv = _mm256_add_ps(sv, e);
         }
         // The vector loop accumulates in eight independent lanes, so this sum is
         // reassociated relative to the scalar path's sequential one — a ~1 ulp
         // difference, not a bug, and the reason the SIMD contract is "same decode"
         // rather than "same bits".
-        let lse = _mm256_set1_ps(peak + hsum(sv).ln());
+        let inv = _mm256_set1_ps(1.0 / hsum(sv));
 
         let fl = _mm256_set1_ps(floor);
         for c in (0..n).step_by(8) {
-            let p = exp8(_mm256_sub_ps(_mm256_loadu_ps(src.as_ptr().add(c)), lse));
-            _mm256_storeu_ps(dst.as_mut_ptr().add(c), ln8(_mm256_add_ps(p, fl)));
+            let e = _mm256_loadu_ps(dst.as_ptr().add(c));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(c), ln8(_mm256_fmadd_ps(e, inv, fl)));
         }
     }
 }
@@ -469,17 +499,56 @@ unsafe fn hsum(v: __m256) -> f32 {
     _mm_cvtss_f32(s)
 }
 
-/// The maximum edge score in a timestep. The caller resolves which edge
-/// achieves it with a scalar scan, so ties break exactly as `torch.argmax`
-/// breaks them regardless of lane order.
+/// The `(dest, edge)` with the highest score, ties broken toward the lowest
+/// `dest * n_edges + edge` — what `torch.argmax` over that axis returns.
+///
+/// Two passes, both unit-stride: a vector max over everything, then a
+/// compare-and-`movemask` scan that stops at the first hit in each edge row.
+/// The obvious scalar form instead walks `dest` outermost, which strides the
+/// `[edge][dest]` layout by `n_states` and mispredicts on every new maximum;
+/// it measured as the bulk of an 18% profile entry.
+///
+/// Tie-breaking is exact rather than lane-order dependent: for a fixed edge the
+/// flat index increases with `dest`, so the first match in a row is that row's
+/// best candidate, and the minimum over rows is the global first.
+///
+/// Returns `None` if nothing compares equal to the maximum — unreachable for
+/// finite input, but a NaN row would otherwise fall through, so the caller
+/// keeps the scalar path as a fallback.
 #[target_feature(enable = "avx2,fma")]
-pub(super) unsafe fn max_edge_score(edges: &[f32]) -> f32 {
+pub(super) unsafe fn argmax_edge(
+    edges: &[f32],
+    n_states: usize,
+    n_edges: usize,
+) -> Option<(usize, usize)> {
     unsafe {
         let mut mv = _mm256_set1_ps(f32::NEG_INFINITY);
         for c in (0..edges.len()).step_by(8) {
             mv = _mm256_max_ps(mv, _mm256_loadu_ps(edges.as_ptr().add(c)));
         }
-        hmax(mv)
+        let peak = _mm256_set1_ps(hmax(mv));
+
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_flat = usize::MAX;
+        for edge in 0..n_edges {
+            let row = edges.as_ptr().add(edge * n_states);
+            for c in (0..n_states).step_by(8) {
+                let hits = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(
+                    _mm256_loadu_ps(row.add(c)),
+                    peak,
+                ));
+                if hits != 0 {
+                    let dest = c + hits.trailing_zeros() as usize;
+                    let flat = dest * n_edges + edge;
+                    if flat < best_flat {
+                        best_flat = flat;
+                        best = Some((dest, edge));
+                    }
+                    break;
+                }
+            }
+        }
+        best
     }
 }
 

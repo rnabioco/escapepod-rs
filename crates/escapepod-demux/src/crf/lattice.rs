@@ -220,10 +220,16 @@ impl Semiring {
 /// ~2 MB of scratch), so the decoder threads one of these through.
 #[derive(Debug, Clone, Default)]
 pub struct CrfScratch {
-    /// `[t][edge][dest]` — encoder scores, transposed.
+    /// `[t][edge][dest]` — encoder scores, transposed; then overwritten in
+    /// place by `log(posterior + 1e-8)`, which is pass 2's input.
+    ///
+    /// One buffer rather than two because the reuse is safe and it is 1 MB per
+    /// decoding thread: pass 1's forward and backward sweeps have both finished
+    /// before any posterior is written, and timestep `t`'s posterior depends
+    /// only on `scores[t]` (plus `alpha[t]` and `beta[t+1]`), so writing it back
+    /// over `scores[t]` destroys nothing still needed. It also halves the hot
+    /// working set, which matters on a 1 MB L2.
     scores: Vec<f32>,
-    /// `[t][edge][dest]` — `log(posterior + 1e-8)`, the pass-2 input.
-    posteriors: Vec<f32>,
     /// `[t][state]`, `t` in `0..=t_len`.
     alpha: Vec<f32>,
     /// `[t][state]`, `t` in `0..=t_len`.
@@ -244,24 +250,22 @@ impl CrfScratch {
         Self::default()
     }
 
+    /// Size the buffers for one read.
+    ///
+    /// Deliberately *not* `clear()` + `resize()`: every buffer here is fully
+    /// overwritten before it is read, so re-zeroing costs a ~2 MB memset per
+    /// read and buys nothing. Decoding a run of same-length reads — which is
+    /// the only thing this is ever used for, since the encoder window is fixed
+    /// — then leaves these as no-ops.
     fn reserve(&mut self, layout: &CrfLayout, t_len: usize) {
         let lattice = (t_len + 1) * layout.n_states;
         let edges = t_len * layout.n_score;
-        self.scores.clear();
         self.scores.resize(edges, 0.0);
-        self.posteriors.clear();
-        self.posteriors.resize(edges, 0.0);
-        self.alpha.clear();
         self.alpha.resize(lattice, 0.0);
-        self.beta.clear();
         self.beta.resize(lattice, 0.0);
-        self.edge.clear();
         self.edge.resize(layout.n_score, 0.0);
-        self.work.clear();
         self.work.resize(layout.n_base * layout.n_states, 0.0);
-        self.path.clear();
         self.path.resize(t_len, 0);
-        self.traceback.clear();
         self.traceback.resize(t_len, 0);
     }
 
@@ -360,17 +364,42 @@ pub enum Backend {
     /// state count that is a multiple of 32 — true of every bonito CRF model.
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    /// AVX-512F, 16 lanes wide. Same kernels as [`Backend::Avx2`]; needs a
+    /// state count that is a multiple of 64.
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
 }
 
 impl Backend {
     /// The fastest backend this CPU and layout support.
     pub fn best_for(layout: &CrfLayout) -> Self {
         #[cfg(target_arch = "x86_64")]
-        if super::avx2::supported(layout) && super::avx2::available() {
-            return Self::Avx2;
+        {
+            if super::avx512::supported(layout) && super::avx512::available() {
+                return Self::Avx512;
+            }
+            if super::avx2::supported(layout) && super::avx2::available() {
+                return Self::Avx2;
+            }
         }
         let _ = layout;
         Self::Scalar
+    }
+
+    /// Every backend this CPU and layout support, fastest last. Used by tests
+    /// and benchmarks to cover each one without hardcoding a CPU model.
+    pub fn all_supported(layout: &CrfLayout) -> Vec<Self> {
+        let mut out = vec![Self::Scalar];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if super::avx2::supported(layout) && super::avx2::available() {
+                out.push(Self::Avx2);
+            }
+            if super::avx512::supported(layout) && super::avx512::available() {
+                out.push(Self::Avx512);
+            }
+        }
+        out
     }
 }
 
@@ -390,6 +419,9 @@ fn forward_dispatch(
         // both the runtime CPU features and the layout constraints the kernels
         // assume. `work` is sized `n_base * n_states` by `CrfScratch::reserve`.
         Backend::Avx2 => unsafe { super::avx2::forward(layout, scores, t_len, s, alpha, work) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see above; `Avx512` additionally implies AVX512F.
+        Backend::Avx512 => unsafe { super::avx512::forward(layout, scores, t_len, s, alpha, work) },
     }
     let _ = work;
 }
@@ -408,6 +440,9 @@ fn backward_dispatch(
         #[cfg(target_arch = "x86_64")]
         // SAFETY: see `forward_dispatch`.
         Backend::Avx2 => unsafe { super::avx2::backward(layout, scores, t_len, s, beta, work) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see above; `Avx512` additionally implies AVX512F.
+        Backend::Avx512 => unsafe { super::avx512::backward(layout, scores, t_len, s, beta, work) },
     }
     let _ = work;
 }
@@ -428,8 +463,31 @@ fn edge_scores_dispatch(
         Backend::Avx2 => unsafe {
             super::avx2::edge_scores(layout, row, alpha_t, beta_next, out, work)
         },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see above.
+        Backend::Avx512 => unsafe {
+            super::avx512::edge_scores(layout, row, alpha_t, beta_next, out, work)
+        },
     }
     let _ = work;
+}
+
+fn transpose_dispatch(layout: &CrfLayout, src: &[f32], dst: &mut [f32], backend: Backend) {
+    match backend {
+        Backend::Scalar => transpose_scores(layout, src, dst),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see `forward_dispatch`. The gathers read
+        // `dest * n_edges + edge` for `dest < n_states`, whose maximum is
+        // `n_score - 1`, so every lane is in bounds.
+        Backend::Avx2 => unsafe {
+            super::avx2::transpose_scores(src, dst, layout.n_states, layout.n_edges)
+        },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see above.
+        Backend::Avx512 => unsafe {
+            super::avx512::transpose_scores(src, dst, layout.n_states, layout.n_edges)
+        },
+    }
 }
 
 fn log_softmax_dispatch(src: &[f32], dst: &mut [f32], backend: Backend) {
@@ -439,6 +497,9 @@ fn log_softmax_dispatch(src: &[f32], dst: &mut [f32], backend: Backend) {
         // SAFETY: see `forward_dispatch`; `n_score` is a multiple of 8 whenever
         // the AVX2 layout constraints hold.
         Backend::Avx2 => unsafe { super::avx2::log_softmax_floored(src, dst, POSTERIOR_FLOOR) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see above.
+        Backend::Avx512 => unsafe { super::avx512::log_softmax_floored(src, dst, POSTERIOR_FLOOR) },
     }
 }
 
@@ -495,7 +556,12 @@ pub fn decode_with(
 
     for t in 0..t_len {
         let (lo, hi) = (t * layout.n_score, (t + 1) * layout.n_score);
-        transpose_scores(layout, &scores[lo..hi], &mut scratch.scores[lo..hi]);
+        transpose_dispatch(
+            layout,
+            &scores[lo..hi],
+            &mut scratch.scores[lo..hi],
+            backend,
+        );
     }
 
     // Pass 1: posteriors under the log semiring.
@@ -528,13 +594,13 @@ pub fn decode_with(
             &mut scratch.work,
             backend,
         );
-        log_softmax_dispatch(&scratch.edge, &mut scratch.posteriors[lo..hi], backend);
+        log_softmax_dispatch(&scratch.edge, &mut scratch.scores[lo..hi], backend);
     }
 
     // Pass 2: Viterbi over the log-posteriors.
     forward_dispatch(
         layout,
-        &scratch.posteriors,
+        &scratch.scores,
         t_len,
         Semiring::Max,
         &mut scratch.alpha,
@@ -543,7 +609,7 @@ pub fn decode_with(
     );
     backward_dispatch(
         layout,
-        &scratch.posteriors,
+        &scratch.scores,
         t_len,
         Semiring::Max,
         &mut scratch.beta,
@@ -556,7 +622,7 @@ pub fn decode_with(
         let (lo, hi) = (t * layout.n_score, (t + 1) * layout.n_score);
         edge_scores_dispatch(
             layout,
-            &scratch.posteriors[lo..hi],
+            &scratch.scores[lo..hi],
             &scratch.alpha[t * layout.n_states..(t + 1) * layout.n_states],
             &scratch.beta[(t + 1) * layout.n_states..(t + 2) * layout.n_states],
             &mut scratch.edge,
@@ -579,9 +645,14 @@ pub fn decode_with(
 /// `log(softmax(x) + 1e-8)`, matching bonito's `posteriors(scores) + 1e-8`
 /// followed by `.log()`.
 ///
-/// Written as the same three steps in the same order rather than folded into
-/// `x - logsumexp(x)`: the floor is applied to the probability, not the log, so
-/// it is not a shift and the fold would change the result for small posteriors.
+/// The floor is applied to the probability, not the log, so it is not a shift
+/// and this cannot be folded into `x - logsumexp(x)`.
+///
+/// `exp(x - max)` is kept and divided by its own sum rather than recomputed as
+/// `exp(x - logsumexp)`. That is the same softmax — and the form `torch` itself
+/// uses — but it costs one `exp` per element instead of two. This is the
+/// hottest kernel in the decode (36% of profiled time before the change), so
+/// the saving is the single largest one available.
 fn log_softmax_floored(src: &[f32], dst: &mut [f32]) {
     let mut m = f32::NEG_INFINITY;
     for &v in src {
@@ -590,12 +661,13 @@ fn log_softmax_floored(src: &[f32], dst: &mut [f32]) {
         }
     }
     let mut sum = 0.0f32;
-    for &v in src {
-        sum += (v - m).exp();
-    }
-    let lse = m + sum.ln();
     for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = ((s - lse).exp() + POSTERIOR_FLOOR).ln();
+        *d = (s - m).exp();
+        sum += *d;
+    }
+    let inv = 1.0 / sum;
+    for d in dst.iter_mut() {
+        *d = d.mul_add(inv, POSTERIOR_FLOOR).ln();
     }
 }
 
@@ -603,17 +675,27 @@ fn log_softmax_floored(src: &[f32], dst: &mut [f32]) {
 /// flat index in bonito's `dest * n_edges + edge` order — which is what
 /// `torch.argmax` over that axis returns.
 ///
-/// The SIMD path only accelerates finding the maximum *value*; which edge
-/// achieves it is then resolved by the same scalar scan, so lane order can
-/// never change how a tie breaks.
+/// Both backends break ties by flat index rather than by traversal order, so
+/// they cannot disagree on a tie.
 fn argmax_edge(layout: &CrfLayout, edges: &[f32], backend: Backend) -> (usize, usize) {
-    let n_states = layout.n_states;
-    let target = match backend {
-        Backend::Scalar => None,
-        #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "x86_64")]
+    {
         // SAFETY: see `forward_dispatch`.
-        Backend::Avx2 => Some(unsafe { super::avx2::max_edge_score(edges) }),
-    };
+        let hit = match backend {
+            Backend::Avx2 => unsafe {
+                super::avx2::argmax_edge(edges, layout.n_states, layout.n_edges)
+            },
+            Backend::Avx512 => unsafe {
+                super::avx512::argmax_edge(edges, layout.n_states, layout.n_edges)
+            },
+            Backend::Scalar => None,
+        };
+        if let Some(hit) = hit {
+            return hit;
+        }
+    }
+    let _ = backend;
+    let n_states = layout.n_states;
     let (mut best, mut best_dest, mut best_edge) = (f32::NEG_INFINITY, 0usize, 0usize);
     for dest in 0..n_states {
         for edge in 0..layout.n_edges {
@@ -622,9 +704,6 @@ fn argmax_edge(layout: &CrfLayout, edges: &[f32], backend: Backend) -> (usize, u
                 best = v;
                 best_dest = dest;
                 best_edge = edge;
-                if Some(v) == target {
-                    return (best_dest, best_edge);
-                }
             }
         }
     }
@@ -718,6 +797,24 @@ mod tests {
         }
     }
 
+    /// The gather-based transposes must be exactly the scalar one — this is a
+    /// pure data movement, so unlike the arithmetic kernels there is no
+    /// tolerance to allow.
+    #[test]
+    fn every_backend_transposes_identically() {
+        let layout = CrfLayout::new(4, 4).unwrap();
+        let src: Vec<f32> = (0..layout.n_score)
+            .map(|i| (i as f32) * 0.5 - 3.0)
+            .collect();
+        let mut want = vec![0.0; layout.n_score];
+        transpose_scores(&layout, &src, &mut want);
+        for backend in Backend::all_supported(&layout) {
+            let mut got = vec![f32::NAN; layout.n_score];
+            transpose_dispatch(&layout, &src, &mut got, backend);
+            assert_eq!(got, want, "{backend:?}");
+        }
+    }
+
     #[test]
     fn transpose_round_trips() {
         let layout = CrfLayout::new(4, 4).unwrap();
@@ -789,13 +886,14 @@ mod tests {
 
     /// The SIMD kernels use polynomial `exp`/`ln` and reassociate one sum, so
     /// they are not bit-identical to the scalar reference. What must hold is
-    /// that they decode the same sequence and stay within a tight tolerance.
-    #[cfg(target_arch = "x86_64")]
+    /// that every backend decodes the same sequence and stays within a tight
+    /// tolerance.
     #[test]
-    fn avx2_agrees_with_scalar() {
+    fn simd_backends_agree_with_scalar() {
         let layout = CrfLayout::new(4, 4).unwrap();
-        if Backend::best_for(&layout) != Backend::Avx2 {
-            eprintln!("skipping: no AVX2+FMA on this host");
+        let backends = Backend::all_supported(&layout);
+        if backends.len() == 1 {
+            eprintln!("skipping: no SIMD backend on this host");
             return;
         }
         let t_len = 60;
@@ -805,23 +903,38 @@ mod tests {
             let want =
                 decode_with(&layout, b"NACGT", &scores, t_len, &mut sc, Backend::Scalar).unwrap();
             let want_alpha = sc.alpha.clone();
-            let want_post = sc.posteriors.clone();
+            let want_post = sc.scores.clone();
 
-            let mut sa = CrfScratch::new();
-            let got =
-                decode_with(&layout, b"NACGT", &scores, t_len, &mut sa, Backend::Avx2).unwrap();
+            for backend in backends.iter().copied().filter(|&b| b != Backend::Scalar) {
+                let mut sa = CrfScratch::new();
+                let got = decode_with(&layout, b"NACGT", &scores, t_len, &mut sa, backend).unwrap();
 
-            assert_eq!(got, want, "decoded sequence differs (seed {seed})");
-            assert_eq!(sa.path(), sc.path(), "path differs (seed {seed})");
+                assert_eq!(got, want, "{backend:?}: sequence differs (seed {seed})");
+                assert_eq!(
+                    sa.path(),
+                    sc.path(),
+                    "{backend:?}: path differs (seed {seed})"
+                );
+                assert_eq!(
+                    sa.traceback(),
+                    sc.traceback(),
+                    "{backend:?}: traceback differs (seed {seed})"
+                );
 
-            let worst_alpha = max_abs_diff(&sa.alpha, &want_alpha);
-            let worst_post = max_abs_diff(&sa.posteriors, &want_post);
-            assert!(worst_alpha < 2e-3, "alpha diverges by {worst_alpha:e}");
-            assert!(worst_post < 2e-4, "posteriors diverge by {worst_post:e}");
+                let worst_alpha = max_abs_diff(&sa.alpha, &want_alpha);
+                let worst_post = max_abs_diff(&sa.scores, &want_post);
+                assert!(
+                    worst_alpha < 2e-3,
+                    "{backend:?}: alpha diverges by {worst_alpha:e}"
+                );
+                assert!(
+                    worst_post < 2e-4,
+                    "{backend:?}: posteriors diverge by {worst_post:e}"
+                );
+            }
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
         a.iter()

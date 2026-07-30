@@ -22,6 +22,9 @@ pub mod lattice;
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 
+#[cfg(target_arch = "x86_64")]
+mod avx512;
+
 #[cfg(feature = "crf-decode")]
 pub mod encoder;
 

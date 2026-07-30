@@ -22,8 +22,8 @@
   Correctness is pinned against bonito rather than asserted. `crf_golden.rs`
   replays a score tensor defined by a closed-form expression through the real
   `CTC_CRF` on a GPU and checks the Rust decode reproduces the decoded
-  sequence, the per-timestep argmax edge, *and* the path exactly, for both
-  backends. Two details differ from what #27 recorded and are worth carrying
+  sequence, the per-timestep argmax edge, *and* the path exactly, on every
+  backend the host supports. Two details differ from what #27 recorded and are worth carrying
   forward: the score width is **1280**, not 1024 (1024 is the linear layer;
   `LinearCRFEncoder` expands blanks to one per state), and the output is
   **time-major** `[T, batch, n_score]`, so it cannot reuse the boundary CNN's
@@ -39,26 +39,33 @@
   a reference needs an edit-distance aligner, which this workspace does not have
   yet. That is a separate decision (#27 tracks lifting `fqxv-align`).
 
-- **AVX2 kernels for the CRF decode**, with runtime dispatch and a scalar
-  fallback. The decode is transcendental-bound — ~770k `exp` and ~260k `ln` per
-  200-timestep read — and measured on the rna partition it was *half* the total
-  CPU cost, not a rounding error:
+- **AVX2 and AVX-512 kernels for the CRF decode**, runtime-dispatched with a
+  scalar fallback. The decode is transcendental-bound — ~770k `exp` and ~260k
+  `ln` per 200-timestep read — and started out as *half* the total CPU cost,
+  not a rounding error:
 
-  | stage | per read |
-  |---|---|
-  | tract encoder | 13.9 ms |
-  | decode, scalar | 13.53 ms |
-  | decode, AVX2 | 2.40 ms |
+  | decode backend | per read | vs scalar |
+  |---|---|---|
+  | scalar | 12.14 ms | — |
+  | AVX2 | 1.92 ms | 6.3× |
+  | AVX-512 | 1.19 ms | 10.2× |
 
-  So this is 5.6× on the decode and 1.7× end-to-end on CPU — reproducible via
-  `cargo bench --bench crf_decode`, so the claim stays checkable. It also gates the
-  GPU path being worth anything: with the encoder on the device, a scalar decode
-  would *be* the runtime. Vectorised `exp`/`ln` are polynomial approximations
+  (tract's encoder, for scale, is 13.9 ms/read.) Reproducible via
+  `cargo bench --bench crf_decode`, so the claim stays checkable.
+
+  This gates the GPU path being worth anything: with the encoder on the device
+  the decode *is* the runtime, so a scalar decode would have capped `--gpu` at
+  roughly no gain at all. Vectorised `exp`/`ln` are polynomial approximations
   and the softmax denominator is reassociated across lanes, so the contract is
   "same decoded sequence, floats within a tight tolerance" rather than
-  bit-identity — enforced by a scalar-vs-AVX2 equivalence test, and the argmax
-  resolves ties through the same scalar scan on both paths so lane order can
-  never change a call.
+  bit-identity — enforced by an equivalence test that runs *every* backend the
+  host supports against scalar, and by the bonito parity test doing the same.
+  Both SIMD paths break argmax ties by flat index rather than lane order, so
+  they cannot disagree with scalar on a tie.
+
+  Per the repository's build policy AVX-512 is runtime-detected, not a baseline
+  bump — the pinned `target-cpu=x86-64-v3` stays portable across the Broadwell
+  login node, Cascade Lake `rna`, and Ice Lake `gpu`.
 
 - **`crf-gpu` feature** — CRF encoder inference through onnxruntime's CUDA
   execution provider (`escpod demux basecall --gpu`), sharing the exact ONNX
