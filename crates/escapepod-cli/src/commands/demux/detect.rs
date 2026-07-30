@@ -76,6 +76,14 @@ pub struct DetectArgs {
     #[arg(long, value_name = "FILE", help_heading = "Advanced Options")]
     pub cnn_model: Option<PathBuf>,
 
+    /// Named boundary model resolved from the local cache, e.g.
+    /// `adapter_rna004`. Prefetch it with `escpod demux models fetch`;
+    /// resolution never touches the network. Mutually exclusive with
+    /// `--cnn-model`.
+    #[cfg(all(feature = "cnn-detect", feature = "demux-models"))]
+    #[arg(long, value_name = "NAME", help_heading = "Advanced Options")]
+    pub cnn_model_name: Option<String>,
+
     /// Run `--method cnn` inference on the GPU via onnxruntime CUDA, instead of
     /// the batched CPU tract path. Requires a `--features cnn-gpu` build and a
     /// visible CUDA device + onnxruntime shared library at runtime.
@@ -294,6 +302,24 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
     timer.phase("Detect adapters (CNN)");
     let profile = args.profile;
 
+    #[cfg(feature = "demux-models")]
+    let resolved_model;
+    #[cfg(feature = "demux-models")]
+    let cnn_model_path = match (&args.cnn_model, &args.cnn_model_name) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass either --cnn-model or --cnn-model-name, not both")
+        }
+        (None, None) => anyhow::bail!(
+            "--method cnn requires a model: --cnn-model <FILE> or --cnn-model-name <NAME> \
+             (see 'escpod demux models list')"
+        ),
+        (Some(path), None) => path,
+        (None, Some(name)) => {
+            resolved_model = super::models::resolve(name)?;
+            &resolved_model
+        }
+    };
+    #[cfg(not(feature = "demux-models"))]
     let cnn_model_path = args
         .cnn_model
         .as_ref()

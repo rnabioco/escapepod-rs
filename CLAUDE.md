@@ -302,6 +302,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
   - `classify`: DTW-based barcode classification
   - `split`: Split reads by barcode into separate files
   - `train`: Train reference fingerprints from known samples
+  - `models`: manage demux model downloads — `list`, `path`, `fetch <bundle>`. Pinned manifest of GitHub-Release bundles with per-member sha256; cache at `$ESCAPEPOD_DEMUX_MODEL_CACHE` → `$XDG_CACHE_HOME/escapepod/demux_models` → `~/.cache/…`. **Fetch is explicit and resolution never touches the network** (compute nodes can't reach GitHub — a lazy fetch would hang a job). The fetch unit is a *bundle*, so the boundary↔barcode pair can't be split. `escapepod-models` is private today, so fetching needs `GITHUB_TOKEN`/`GH_TOKEN`; the REST endpoint used also serves public repos anonymously, so no code change is needed if it opens up. Consumed by `detect --cnn-model-name` and `classify --model-name`, alongside the existing path flags.
   - `basecall`: CTC-CRF barcode basecalling from a boundaries CSV (requires `crf-decode`, in the default build). With `--barcodes <name,sequence CSV>` it also assigns each read to its closest reference by edit distance and emits `read_id,barcode` — exactly what `demux split` reads, so `detect -> basecall -> split` runs end to end with no Python. Without it, decoded sequences only. Confidence is the edit-distance margin to the second-best reference (the definition the model's published precision-at-recovery numbers used).
   - `train-svm`: Train SVM model (requires `train` feature)
 

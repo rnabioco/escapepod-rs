@@ -58,6 +58,9 @@ tempfile = { version = "3", optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
+# Release bundles ship as zip archives; deflate is the only method they use and
+# rides on flate2, which is already in the graph.
+zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
 uuid = { workspace = true, optional = true }
 walkdir = { version = "2", optional = true }
 
@@ -85,6 +88,8 @@ cli = [
     "demux",
     "cnn-detect",
     "crf-decode",
+    "demux-models",
+    "model-fetch",
     "dep:anyhow",
     "dep:arrow",
     "dep:bstr",
@@ -135,11 +140,25 @@ crf-gpu = ["crf-decode", "escapepod-demux/crf-gpu"]
 # preprocessing. Needs a CUDA-enabled libonnxruntime + visible GPU at runtime.
 cnn-gpu = ["cnn-detect", "escapepod-demux/cnn-gpu"]
 experimental = []
+# Shared model-prefetch machinery: HTTPS (ureq/rustls), sha256 verification, and
+# zip extraction for release bundles. Split out so the demux model fetch can
+# ship by default without dragging in `experimental`, which gates the whole
+# resquiggle command.
+#
+# This is what puts a TLS stack in the default release binary. That is a
+# deliberate trade: without it `escpod demux models fetch` cannot exist, and
+# there is then no supported way to obtain the boundary/barcode models at all
+# (they are gitignored upstream and distributed via GitHub Releases).
+model-fetch = ["dep:ureq", "dep:sha2", "dep:zip"]
 # Download k-mer level models from the pinned nanoporetech/kmer_models commit
-# into the local cache (`escpod resquiggle models fetch`). Opt-in so the default
-# release binary pulls no TLS stack; implies `experimental` (the resquiggle
-# command it serves). Prefetch on a networked node; runtime never downloads.
-models-download = ["experimental", "dep:ureq", "dep:sha2"]
+# into the local cache (`escpod resquiggle models fetch`). Still opt-in, and
+# still implies `experimental` (the resquiggle command it serves).
+models-download = ["experimental", "model-fetch"]
+# Demux boundary/barcode model manifest, cache and offline resolution
+# (`escpod demux models`). Fetching additionally needs `model-fetch`; without it
+# the subcommand still lists, resolves and reports the cache, and `fetch` errors
+# with a rebuild hint.
+demux-models = ["demux"]
 # EXPERIMENTAL. GPU-accelerated DTW for demux classify and train-svm (requires
 # a CUDA driver + libnvrtc at runtime).
 #
