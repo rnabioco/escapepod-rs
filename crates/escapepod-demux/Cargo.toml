@@ -78,3 +78,11 @@ cnn-gpu = ["cnn-detect", "dep:ort", "dep:cudarc"]
 gpu = ["dep:cudarc", "dep:indicatif", "escapepod-signal/gpu"]
 # Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
 train = ["dep:linfa", "dep:linfa-svm"]
+
+# The tract probe links tract-onnx directly, which only exists under
+# `cnn-detect`. Without this, `cargo test -p escapepod-demux --features train`
+# tries to build it anyway and fails to resolve the crate — which is exactly
+# how CI caught it.
+[[example]]
+name = "tract_crf_probe"
+required-features = ["cnn-detect"]
