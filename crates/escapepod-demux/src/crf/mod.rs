@@ -26,12 +26,18 @@ mod avx2;
 mod avx512;
 
 #[cfg(feature = "crf-decode")]
+pub mod barcode;
+
+#[cfg(feature = "crf-decode")]
 pub mod encoder;
 
 #[cfg(feature = "crf-gpu")]
 pub mod encoder_gpu;
 
 pub use lattice::{Backend, CrfDecodeError, CrfLayout, CrfScratch, decode, decode_with};
+
+#[cfg(feature = "crf-decode")]
+pub use barcode::{BarcodeError, BarcodeMatch, BarcodeRefs};
 
 #[cfg(feature = "crf-decode")]
 pub use encoder::{CrfEncoder, CrfError, CrfMetadata};
