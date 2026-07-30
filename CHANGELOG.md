@@ -47,10 +47,11 @@
   | stage | per read |
   |---|---|
   | tract encoder | 13.9 ms |
-  | decode, scalar | 13.5 ms |
-  | decode, AVX2 | 2.3 ms |
+  | decode, scalar | 13.53 ms |
+  | decode, AVX2 | 2.40 ms |
 
-  So this is 5.9× on the decode and 1.7× end-to-end on CPU. It also gates the
+  So this is 5.6× on the decode and 1.7× end-to-end on CPU — reproducible via
+  `cargo bench --bench crf_decode`, so the claim stays checkable. It also gates the
   GPU path being worth anything: with the encoder on the device, a scalar decode
   would *be* the runtime. Vectorised `exp`/`ln` are polynomial approximations
   and the softmax denominator is reassociated across lanes, so the contract is
@@ -65,6 +66,15 @@
   the CPU: it is sequential in time with a 256-wide inner dimension, a poor fit
   for the device next to the encoder's dense matmuls, and it overlaps across
   rayon workers while the GPU runs the next batch.
+
+  Across 300 real reads, CPU, GPU, and the Python pipeline disagree on only two
+  reads, and the pattern says the disagreement is in the *encoder*, not the
+  decode: on one read CPU and GPU agree with each other while Python differs
+  (and Python flips that read's answer across `--batch-size` 1→256, agreeing
+  with both Rust backends at 8–128), and on the other the GPU agrees with
+  Python exactly while tract differs by one base. Both are single-base indels
+  in the model's least-confident regions, and all three assign the same barcode
+  for all 300 reads.
 
 - **`cnn-detect` is now part of the default `cli` feature**, so released
   binaries can run `escpod demux detect --method cnn` (and the fused

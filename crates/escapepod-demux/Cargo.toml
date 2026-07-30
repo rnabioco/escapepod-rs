@@ -14,6 +14,10 @@ categories = ["algorithms", "science"]
 harness = false
 name = "classify"
 
+[[bench]]
+harness = false
+name = "crf_decode"
+
 # The probe links tract-onnx directly, which only exists under the ONNX
 # features. Without this a plain `cargo test -p escapepod-demux` tries to build
 # it anyway and fails to resolve the crate — which is how CI caught it (#163).

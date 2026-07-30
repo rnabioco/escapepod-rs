@@ -10,9 +10,11 @@
 //!
 //! ```text
 //! tract encoder        13.9 ms
-//! decode, scalar       13.5 ms
-//! decode, AVX2          2.3 ms
+//! decode, scalar       13.53 ms
+//! decode, AVX2          2.40 ms
 //! ```
+//!
+//! (`cargo bench --bench crf_decode` reproduces the two decode rows.)
 //!
 //! The decode is *half* the CPU cost, so moving only the encoder to the GPU
 //! would leave it as essentially the entire remaining runtime — which is why
@@ -137,24 +139,24 @@ impl CrfEncoderGpu {
     pub fn encode_batch(&self, prepped: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, CrfError> {
         let mut out = Vec::with_capacity(prepped.len());
         for chunk in prepped.chunks(self.batch_rows) {
-            out.extend(self.run_batch(chunk, chunk.len())?);
+            out.extend(self.run_batch(chunk)?);
         }
         Ok(out)
     }
 
-    /// One onnxruntime call, halving and retrying on device OOM.
-    fn run_batch(&self, rows: &[Vec<f32>], limit: usize) -> Result<Vec<Vec<f32>>, CrfError> {
-        if rows.len() > limit {
-            let mid = rows.len().div_ceil(2);
-            let mut first = self.run_batch(&rows[..mid], limit)?;
-            first.extend(self.run_batch(&rows[mid..], limit)?);
-            return Ok(first);
-        }
+    /// One onnxruntime call, halving and retrying on device out-of-memory.
+    ///
+    /// LSTM activations scale with the model's hidden width and layer count,
+    /// which `batch_rows` cannot know, so the starting batch is a guess and
+    /// this is what adapts it to the device. Splitting is exact: every window
+    /// is the same length, nothing is padded, and the batch axis is
+    /// independent, so a split batch and a whole one give identical scores.
+    fn run_batch(&self, rows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, CrfError> {
         match self.try_run_batch(rows) {
             Err(CrfError::Run(msg)) if is_oom(&msg) && rows.len() > 1 => {
                 let half = rows.len().div_ceil(2);
-                let mut first = self.run_batch(&rows[..half], half)?;
-                first.extend(self.run_batch(&rows[half..], half)?);
+                let mut first = self.run_batch(&rows[..half])?;
+                first.extend(self.run_batch(&rows[half..])?);
                 Ok(first)
             }
             other => other,
@@ -200,17 +202,7 @@ impl CrfEncoderGpu {
             });
         }
 
-        // Time-major: read `b` is strided by `batch * n_score` across t.
-        Ok((0..batch)
-            .map(|b| {
-                let mut per_read = Vec::with_capacity(t_len * n_score);
-                for t in 0..t_len {
-                    let off = (t * batch + b) * n_score;
-                    per_read.extend_from_slice(&data[off..off + n_score]);
-                }
-                per_read
-            })
-            .collect())
+        Ok(split_time_major(data, t_len, batch, n_score))
     }
 
     /// Encode on the GPU, then decode on the CPU across rayon workers.
@@ -254,6 +246,29 @@ impl CrfEncoderGpu {
     }
 }
 
+/// Split a time-major `[t_len, batch, n_score]` buffer into one contiguous
+/// score buffer per read.
+///
+/// This is the only genuinely new index arithmetic on the GPU path — the CPU
+/// path pins batch to 1, where time-major and per-read layout coincide, so it
+/// never exercises the stride. Getting it wrong would interleave reads rather
+/// than fail, producing plausible sequences attributed to the wrong read IDs,
+/// which is why it is a free function with its own test rather than a closure
+/// buried in the onnxruntime call.
+fn split_time_major(data: &[f32], t_len: usize, batch: usize, n_score: usize) -> Vec<Vec<f32>> {
+    debug_assert_eq!(data.len(), t_len * batch * n_score);
+    (0..batch)
+        .map(|b| {
+            let mut per_read = Vec::with_capacity(t_len * n_score);
+            for t in 0..t_len {
+                let off = (t * batch + b) * n_score;
+                per_read.extend_from_slice(&data[off..off + n_score]);
+            }
+            per_read
+        })
+        .collect()
+}
+
 /// onnxruntime surfaces device OOM as a message, not a typed error.
 fn is_oom(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
@@ -269,6 +284,45 @@ mod tests {
         assert!(is_oom("CUDA failure 2: out of memory"));
         assert!(is_oom("cudaErrorMemoryAllocation"));
         assert!(!is_oom("invalid input shape"));
+    }
+
+    /// Each read must come back with exactly the values the encoder emitted
+    /// for it, in timestep order — not its neighbour's.
+    #[test]
+    fn split_time_major_recovers_each_read() {
+        let (t_len, batch, n_score) = (7, 5, 3);
+        // Encode (t, b, c) into the value so a mis-strided read is obvious.
+        let data: Vec<f32> = (0..t_len * batch * n_score)
+            .map(|i| {
+                let (t, b, c) = (i / (batch * n_score), (i / n_score) % batch, i % n_score);
+                (t * 10_000 + b * 100 + c) as f32
+            })
+            .collect();
+
+        let split = split_time_major(&data, t_len, batch, n_score);
+        assert_eq!(split.len(), batch);
+        for (b, read) in split.iter().enumerate() {
+            assert_eq!(read.len(), t_len * n_score);
+            for t in 0..t_len {
+                for c in 0..n_score {
+                    assert_eq!(
+                        read[t * n_score + c],
+                        (t * 10_000 + b * 100 + c) as f32,
+                        "read {b}, t {t}, score {c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Batch 1 is the case the CPU path takes, where time-major and per-read
+    /// layout are the same buffer. Pinning it means the two paths cannot drift.
+    #[test]
+    fn split_time_major_is_the_identity_for_batch_one() {
+        let data: Vec<f32> = (0..40).map(|i| i as f32).collect();
+        let split = split_time_major(&data, 10, 1, 4);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0], data);
     }
 
     #[test]
