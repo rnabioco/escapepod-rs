@@ -4,6 +4,68 @@
 
 ### Added
 
+- **CTC-CRF barcode basecalling — `escpod demux basecall`.** escapepod-rs can
+  now run a bonito-style CTC-CRF barcode model end to end: ONNX encoder
+  inference plus a native lattice decode. Previously the decode did not exist
+  in Rust at all, so the Stage-1 pipeline
+  (rnabioco/escapepod-models#27) had to drop into Python between
+  `escpod demux detect` and `escpod demux split`.
+
+  The split follows what ONNX can express. The encoder (convolutions → 5 stacked
+  LSTMs → `LinearCRFEncoder`) exports cleanly and runs through tract; the decode
+  is a sparse forward/backward over 256 states × 5 edges that standard ONNX ops
+  cannot express and that bonito itself only implements as hand-written CUDA
+  (`koi`). So the encoder ships as an ONNX file and `escapepod_demux::crf`
+  owns the decode — in portable Rust, with **no GPU requirement and no
+  dependencies**, which also means CI exercises it.
+
+  Correctness is pinned against bonito rather than asserted. `crf_golden.rs`
+  replays a score tensor defined by a closed-form expression through the real
+  `CTC_CRF` on a GPU and checks the Rust decode reproduces the decoded
+  sequence, the per-timestep argmax edge, *and* the path exactly, for both
+  backends. Two details differ from what #27 recorded and are worth carrying
+  forward: the score width is **1280**, not 1024 (1024 is the linear layer;
+  `LinearCRFEncoder` expands blanks to one per state), and the output is
+  **time-major** `[T, batch, n_score]`, so it cannot reuse the boundary CNN's
+  batch-major shape probe and gets its own.
+
+  Standardisation constants come from the export's `metadata.json` sidecar, not
+  from bonito's `config.toml` — that file carries SeqTagger's unrelated
+  `mean = 80.876 / stdev = 17.270`, and using it applies a ~1.8 sigma shift and
+  a 1.7× scale error that degrades the decode with nothing to indicate it. The
+  loader refuses to guess.
+
+  `basecall` emits decoded sequences, not barcode calls: assigning a sequence to
+  a reference needs an edit-distance aligner, which this workspace does not have
+  yet. That is a separate decision (#27 tracks lifting `fqxv-align`).
+
+- **AVX2 kernels for the CRF decode**, with runtime dispatch and a scalar
+  fallback. The decode is transcendental-bound — ~770k `exp` and ~260k `ln` per
+  200-timestep read — and measured on the rna partition it was *half* the total
+  CPU cost, not a rounding error:
+
+  | stage | per read |
+  |---|---|
+  | tract encoder | 13.9 ms |
+  | decode, scalar | 13.5 ms |
+  | decode, AVX2 | 2.3 ms |
+
+  So this is 5.9× on the decode and 1.7× end-to-end on CPU. It also gates the
+  GPU path being worth anything: with the encoder on the device, a scalar decode
+  would *be* the runtime. Vectorised `exp`/`ln` are polynomial approximations
+  and the softmax denominator is reassociated across lanes, so the contract is
+  "same decoded sequence, floats within a tight tolerance" rather than
+  bit-identity — enforced by a scalar-vs-AVX2 equivalence test, and the argmax
+  resolves ties through the same scalar scan on both paths so lane order can
+  never change a call.
+
+- **`crf-gpu` feature** — CRF encoder inference through onnxruntime's CUDA
+  execution provider (`escpod demux basecall --gpu`), sharing the exact ONNX
+  graph and decode with the CPU path. The lattice decode deliberately stays on
+  the CPU: it is sequential in time with a 256-wide inner dimension, a poor fit
+  for the device next to the encoder's dense matmuls, and it overlaps across
+  rayon workers while the GPU runs the next batch.
+
 - **`cnn-detect` is now part of the default `cli` feature**, so released
   binaries can run `escpod demux detect --method cnn` (and the fused
   `escpod demux --method cnn`) without a rebuild. The barcode models published

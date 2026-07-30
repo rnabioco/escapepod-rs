@@ -1,7 +1,11 @@
-//! WarpDemuX-compatible barcode demultiplexing for Oxford Nanopore POD5 data.
+//! Barcode demultiplexing for Oxford Nanopore POD5 data.
 //!
-//! This crate layers on top of [`escapepod-signal`] and packages the pieces
-//! needed to demultiplex nanopore reads against a WarpDemuX-style model:
+//! This crate layers on top of [`escapepod-signal`] and packages two
+//! independent ways to assign a read to a barcode — fingerprint-and-classify
+//! (WarpDemuX-compatible) and basecall-then-match (CTC-CRF) — plus the adapter
+//! detection both need.
+//!
+//! Fingerprint-and-classify:
 //!
 //! - [`WarpDemuxModel`] and [`DtwSvmModel`] JSON loaders.
 //! - Per-read DTW classifier ([`classify_read`]) and full SVM predictor
@@ -13,7 +17,19 @@
 //! - Optional `cnn-detect` feature: adapter-end detection by running an
 //!   exported boundary-CNN ONNX graph through tract-onnx ([`AdapterCnn`]).
 //!   This is CPU-only and architecture-agnostic (any `[B,1,L] -> [B,2,L]`
-//!   graph); there is no GPU CNN path.
+//!   graph); [`AdapterCnnGpu`] adds a CUDA path under `cnn-gpu`.
+//!
+//! Basecall-then-match ([`crf`]):
+//!
+//! - [`crf::lattice`]: the CTC-CRF decode — a port of bonito's `CTC_CRF`,
+//!   which upstream exists only as CUDA kernels. Pure `f32` with no
+//!   dependencies and no feature gate, plus runtime-dispatched AVX2 kernels.
+//! - Optional `crf-decode` feature: the ONNX encoder through tract
+//!   ([`crf::CrfEncoder`]); `crf-gpu` runs it on onnxruntime + CUDA instead.
+//!
+//! Only the decode is implemented here. Matching a decoded sequence to a
+//! barcode reference needs an edit-distance aligner, which this workspace does
+//! not have yet.
 //!
 //! # Model workflow
 //!
@@ -54,6 +70,7 @@
 //! ```
 
 mod classify;
+pub mod crf;
 mod fingerprint;
 mod gbm;
 mod model;

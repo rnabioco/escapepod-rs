@@ -84,6 +84,7 @@ cli = [
     "signal",
     "demux",
     "cnn-detect",
+    "crf-decode",
     "dep:anyhow",
     "dep:arrow",
     "dep:bstr",
@@ -118,6 +119,17 @@ cli = [
 # `[B,1,L] -> [B,2,L]` contract at runtime, e.g. escapepod-models'
 # `adapter_rna004` (CC BY 4.0) or an ADAPTed export (CC BY-NC 4.0).
 cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
+
+# CTC-CRF barcode basecalling (`escpod demux basecall`). Part of the `cli`
+# feature: it needs tract-onnx, which `cnn-detect` already links, so shipping it
+# in the default build costs compile time and nothing else. The lattice decode
+# it depends on has no third-party dependencies at all.
+crf-decode = ["demux", "escapepod-demux/crf-decode"]
+
+# CTC-CRF encoder inference on the GPU (`escpod demux basecall --gpu`).
+# Opt-in: needs a CUDA-enabled libonnxruntime on `ORT_DYLIB_PATH` and a visible
+# device at run time.
+crf-gpu = ["crf-decode", "escapepod-demux/crf-gpu"]
 # Batched GPU CNN/TCN adapter detection via onnxruntime CUDA (`escpod demux
 # detect --method cnn --gpu`). Implies `cnn-detect` for the shared CPU path and
 # preprocessing. Needs a CUDA-enabled libonnxruntime + visible GPU at runtime.
