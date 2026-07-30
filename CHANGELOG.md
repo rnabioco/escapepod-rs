@@ -35,9 +35,31 @@
   a 1.7× scale error that degrades the decode with nothing to indicate it. The
   loader refuses to guess.
 
-  `basecall` emits decoded sequences, not barcode calls: assigning a sequence to
-  a reference needs an edit-distance aligner, which this workspace does not have
-  yet. That is a separate decision (#27 tracks lifting `fqxv-align`).
+  With `--barcodes` (a `name,sequence` CSV) each read is also assigned to its
+  closest reference by edit distance, and the output carries `read_id,barcode` —
+  exactly what `escpod demux split` reads. So `detect → basecall → split` runs
+  end to end with **no Python in the middle**, which is what this was for.
+  Verified on 300 real reads: **300/300 barcode calls identical** to
+  `demux_stage1.py`, and `split` produced 14 per-barcode POD5s whose counts match
+  the classifier exactly. Without `--barcodes`, only decoded sequences are
+  emitted.
+
+  Alignment is `fqxv-align`'s wavefront implementation (a git dependency on
+  `rnabioco/fqxv`, pinned by rev — a zero-runtime-dependency leaf crate
+  extracted for exactly this in rnabioco/fqxv#252, so it brings no dependency
+  cone). WFA rather than a DP because its work scales with the edit *distance*:
+  a decode sits ~4 edits from its own reference and ~10+ from the other 95, so
+  most of the comparisons abandon almost immediately. Confidence is the
+  edit-distance margin to the second-best reference — the definition the model's
+  published precision-at-recovery numbers were computed with, kept identical so
+  a recovery threshold still means what it meant at evaluation time. Ties
+  resolve to the lowest reference index with a margin of 0, which is the honest
+  signal that a read is ambiguous rather than a silent coin flip.
+
+  Note the git dependency would block `cargo publish`. Neither crate is
+  published today, and shipping barcode assignment in the default binary is
+  worth more than keeping that door open — a `basecall` that emits sequences
+  nobody can act on repeats the mistake `cnn-detect` was promoted to fix.
 
 - **AVX2 and AVX-512 kernels for the CRF decode**, runtime-dispatched with a
   scalar fallback. The decode is transcendental-bound — ~770k `exp` and ~260k

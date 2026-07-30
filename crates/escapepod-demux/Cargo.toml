@@ -42,6 +42,16 @@ uuid = { workspace = true }
 linfa = { version = "0.8", optional = true }
 linfa-svm = { version = "0.8", optional = true }
 
+# Edit-distance alignment for barcode matching (opt-in via `crf-decode`).
+# A zero-runtime-dependency leaf crate extracted from fqxv for exactly this
+# (rnabioco/fqxv#252), so it brings no dependency cone with it. Pinned to a rev
+# rather than tracking a branch. Note a git dependency would block
+# `cargo publish`; neither this crate nor escapepod-cli is published today, and
+# shipping barcode assignment in the default binary is worth more than keeping
+# that door open (a `basecall` that emits sequences nobody can act on repeats
+# the mistake `cnn-detect` was promoted to fix).
+fqxv-align = { git = "https://github.com/rnabioco/fqxv", rev = "a3af3d891f242f15e828ab2126069aa5dd67e693", optional = true }
+
 # CNN adapter detection (opt-in via `cnn-detect`). Pure-Rust ONNX runtime;
 # user supplies the model file at runtime (weights are CC BY-NC).
 tract-onnx = { workspace = true, optional = true }
@@ -88,7 +98,7 @@ cnn-gpu = ["cnn-detect", "dep:ort", "dep:cudarc"]
 # decodes the lattice natively. Only the encoder needs this feature — the
 # lattice decode in `crf::lattice` has no dependencies and is always compiled,
 # so CI covers the Viterbi without needing a model file.
-crf-decode = ["dep:tract-onnx"]
+crf-decode = ["dep:tract-onnx", "dep:fqxv-align"]
 # CTC-CRF encoder inference on the GPU: same ONNX graph and the same native
 # lattice decode as `crf-decode`, with the LSTM stack running through
 # onnxruntime's CUDA execution provider. The decode deliberately stays on the

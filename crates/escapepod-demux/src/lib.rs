@@ -26,10 +26,9 @@
 //!   dependencies and no feature gate, plus runtime-dispatched AVX2 kernels.
 //! - Optional `crf-decode` feature: the ONNX encoder through tract
 //!   ([`crf::CrfEncoder`]); `crf-gpu` runs it on onnxruntime + CUDA instead.
-//!
-//! Only the decode is implemented here. Matching a decoded sequence to a
-//! barcode reference needs an edit-distance aligner, which this workspace does
-//! not have yet.
+//! - [`crf::BarcodeRefs`]: matching a decoded sequence to a barcode reference
+//!   by edit distance (wavefront alignment via `fqxv-align`), with the
+//!   margin-to-second-best as the confidence.
 //!
 //! # Model workflow
 //!

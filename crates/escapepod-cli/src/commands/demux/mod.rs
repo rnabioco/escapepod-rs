@@ -89,14 +89,17 @@ Examples:
     #[cfg(feature = "crf-decode")]
     #[command(after_help = "\
 Examples:
-  escpod demux basecall input.pod5 --boundaries boundaries.csv --model crf_export/ -o seqs.csv
-  escpod demux basecall *.pod5 --boundaries boundaries.csv --model crf_export/ -o seqs.csv --gpu
+  escpod demux basecall in.pod5 --boundaries bnd.csv --model crf_export/ \
+      --barcodes refs.csv -o classifications.csv
+  escpod demux basecall *.pod5 --boundaries bnd.csv --model crf_export/ -o seqs.csv --gpu
+
+With --barcodes (a `name,sequence` CSV) each read is assigned to its closest
+reference by edit distance and the output feeds `escpod demux split` directly.
+Without it, only decoded sequences are emitted. Confidence is the edit-distance
+margin to the second-best reference.
 
 --gpu needs the `crf-gpu` feature (onnxruntime + CUDA); the lattice decode stays
 on the CPU regardless.
-
-Emits the decoded sequence per read, not a barcode call: assigning a sequence to
-a reference needs an edit-distance aligner, which escapepod-rs does not have yet.
 ")]
     Basecall(BasecallArgs),
 

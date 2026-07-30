@@ -910,6 +910,7 @@ dependencies = [
  "cudarc",
  "escapepod-pod5",
  "escapepod-signal",
+ "fqxv-align",
  "indicatif",
  "linfa",
  "linfa-svm",
@@ -1053,6 +1054,11 @@ name = "foreign-types-shared"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
+
+[[package]]
+name = "fqxv-align"
+version = "0.5.2"
+source = "git+https://github.com/rnabioco/fqxv?rev=a3af3d891f242f15e828ab2126069aa5dd67e693#a3af3d891f242f15e828ab2126069aa5dd67e693"
 
 [[package]]
 name = "futures-core"
