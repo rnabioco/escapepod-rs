@@ -8,10 +8,13 @@
 //! 1. **detect**: LLR-based adapter boundary detection
 //! 2. **fingerprint**: Extract signal features from adapter regions
 //! 3. **classify**: Assign reads to barcodes using DTW distance
-//! 4. **split**: Write demultiplexed reads to separate POD5 files
-//! 5. **train**: Generate reference barcodes from known samples
-//! 6. **train-svm**: Train SVM model from fingerprints (requires `train` feature)
+//! 4. **basecall**: CTC-CRF barcode basecalling from detected boundaries
+//! 5. **split**: Write demultiplexed reads to separate POD5 files
+//! 6. **train**: Generate reference barcodes from known samples
+//! 7. **train-svm**: Train SVM model from fingerprints (requires `train` feature)
 
+#[cfg(feature = "crf-decode")]
+mod basecall;
 mod classify;
 mod detect;
 mod fingerprint;
@@ -25,6 +28,8 @@ mod utils;
 #[cfg(feature = "train")]
 mod train_svm;
 
+#[cfg(feature = "crf-decode")]
+pub use basecall::BasecallArgs;
 pub use classify::ClassifyArgs;
 pub use detect::DetectArgs;
 pub use fingerprint::FingerprintArgs;
@@ -80,6 +85,24 @@ Examples:
 ")]
     Classify(ClassifyArgs),
 
+    /// Basecall barcode regions with a CTC-CRF model
+    #[cfg(feature = "crf-decode")]
+    #[command(after_help = "\
+Examples:
+  escpod demux basecall in.pod5 --boundaries bnd.csv --model crf_export/ \
+      --barcodes refs.csv -o classifications.csv
+  escpod demux basecall *.pod5 --boundaries bnd.csv --model crf_export/ -o seqs.csv --gpu
+
+With --barcodes (a `name,sequence` CSV) each read is assigned to its closest
+reference by edit distance and the output feeds `escpod demux split` directly.
+Without it, only decoded sequences are emitted. Confidence is the edit-distance
+margin to the second-best reference.
+
+--gpu needs the `crf-gpu` feature (onnxruntime + CUDA); the lattice decode stays
+on the CPU regardless.
+")]
+    Basecall(BasecallArgs),
+
     /// Split reads into separate POD5 files by barcode
     #[command(after_help = "\
 Examples:
@@ -125,6 +148,8 @@ pub fn requested_threads(args: &DemuxArgs) -> Option<usize> {
         None => args.run.threads,
         Some(DemuxCommand::Detect(a)) => a.threads,
         Some(DemuxCommand::Fingerprint(a)) => a.threads,
+        #[cfg(feature = "crf-decode")]
+        Some(DemuxCommand::Basecall(a)) => a.threads,
         Some(DemuxCommand::Classify(a)) => a.threads,
         Some(DemuxCommand::Split(a)) => a.threads,
         Some(DemuxCommand::Train(a)) => a.threads,
@@ -143,6 +168,8 @@ pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
     match command {
         DemuxCommand::Detect(detect_args) => detect::run(detect_args),
         DemuxCommand::Fingerprint(fingerprint_args) => fingerprint::run(fingerprint_args),
+        #[cfg(feature = "crf-decode")]
+        DemuxCommand::Basecall(basecall_args) => basecall::run(basecall_args),
         DemuxCommand::Classify(classify_args) => classify::run(classify_args),
         DemuxCommand::Split(split_args) => split::run(split_args),
         DemuxCommand::Train(train_args) => train::run(train_args),

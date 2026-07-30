@@ -1,0 +1,793 @@
+{
+ "generator": "crf_golden.py",
+ "torch": "2.13.0+cu130",
+ "gpu": "NVIDIA A30",
+ "seqdist": {
+  "state_len": 4,
+  "n_base": 4,
+  "alphabet": [
+   "N",
+   "A",
+   "C",
+   "G",
+   "T"
+  ],
+  "n_states": 256,
+  "scores_per_state": 5,
+  "n_score": 1280
+ },
+ "formula": {
+  "expr": "scores[t,n,c] = sin(0.1*t + 0.01*c + 0.7*n) * 2.0 + cos(0.013*(t*C + c))",
+  "T": 40,
+  "N": 2,
+  "C": 1280,
+  "a_t": 0.1,
+  "a_c": 0.01,
+  "a_n": 0.7,
+  "amp": 2.0,
+  "b": 0.013,
+  "dtype": "computed float64, cast float32",
+  "note": "the cos term does not depend on n; t*C + c uses C = 1280"
+ },
+ "idx": {
+  "shape": [
+   256,
+   5
+  ],
+  "dtype": "int32",
+  "meaning": "idx[c,k] = SOURCE state of the edge whose DESTINATION state is c and whose score slot is k (k=0 stay/blank, k=1+j drops base j)",
+  "closed_form": "src(c,0) = c ; src(c,1+j) = j*64 + (c>>2)",
+  "closed_form_matches_everywhere": true,
+  "n_mismatch": 0,
+  "rows": {
+   "0": [
+    0,
+    0,
+    64,
+    128,
+    192
+   ],
+   "1": [
+    1,
+    0,
+    64,
+    128,
+    192
+   ],
+   "2": [
+    2,
+    0,
+    64,
+    128,
+    192
+   ],
+   "3": [
+    3,
+    0,
+    64,
+    128,
+    192
+   ],
+   "4": [
+    4,
+    1,
+    65,
+    129,
+    193
+   ],
+   "63": [
+    63,
+    15,
+    79,
+    143,
+    207
+   ],
+   "64": [
+    64,
+    16,
+    80,
+    144,
+    208
+   ],
+   "65": [
+    65,
+    16,
+    80,
+    144,
+    208
+   ],
+   "255": [
+    255,
+    63,
+    127,
+    191,
+    255
+   ]
+  },
+  "idx_T": {
+   "definition": "koi: idx.flatten().argsort() on CPU; idx_T[s*5+i] = flat (c*5+k) of the i-th OUTGOING edge of source state s",
+   "is_permutation": true,
+   "tie_break_warning": "argsort ties are broken arbitrarily and differ between the CPU and CUDA sorts; only the 5-edge SET per source is semantically defined. Summation order therefore changes float32 rounding by ~1e-6 relative.",
+   "outgoing_closed_form": "stay: dst=s, k=0 ; move: dst=(s&63)*4+m, k=1+(s>>6), m in 0..3",
+   "outgoing_closed_form_matches_everywhere": true,
+   "rows": {
+    "0": [
+     [
+      0,
+      1
+     ],
+     [
+      0,
+      0
+     ],
+     [
+      3,
+      1
+     ],
+     [
+      2,
+      1
+     ],
+     [
+      1,
+      1
+     ]
+    ],
+    "1": [
+     [
+      6,
+      1
+     ],
+     [
+      5,
+      1
+     ],
+     [
+      7,
+      1
+     ],
+     [
+      4,
+      1
+     ],
+     [
+      1,
+      0
+     ]
+    ],
+    "2": [
+     [
+      9,
+      1
+     ],
+     [
+      8,
+      1
+     ],
+     [
+      10,
+      1
+     ],
+     [
+      11,
+      1
+     ],
+     [
+      2,
+      0
+     ]
+    ],
+    "3": [
+     [
+      12,
+      1
+     ],
+     [
+      14,
+      1
+     ],
+     [
+      15,
+      1
+     ],
+     [
+      13,
+      1
+     ],
+     [
+      3,
+      0
+     ]
+    ],
+    "4": [
+     [
+      19,
+      1
+     ],
+     [
+      4,
+      0
+     ],
+     [
+      18,
+      1
+     ],
+     [
+      16,
+      1
+     ],
+     [
+      17,
+      1
+     ]
+    ],
+    "7": [
+     [
+      31,
+      1
+     ],
+     [
+      7,
+      0
+     ],
+     [
+      30,
+      1
+     ],
+     [
+      29,
+      1
+     ],
+     [
+      28,
+      1
+     ]
+    ],
+    "63": [
+     [
+      255,
+      1
+     ],
+     [
+      63,
+      0
+     ],
+     [
+      253,
+      1
+     ],
+     [
+      254,
+      1
+     ],
+     [
+      252,
+      1
+     ]
+    ],
+    "64": [
+     [
+      0,
+      2
+     ],
+     [
+      3,
+      2
+     ],
+     [
+      2,
+      2
+     ],
+     [
+      1,
+      2
+     ],
+     [
+      64,
+      0
+     ]
+    ],
+    "65": [
+     [
+      65,
+      0
+     ],
+     [
+      7,
+      2
+     ],
+     [
+      4,
+      2
+     ],
+     [
+      5,
+      2
+     ],
+     [
+      6,
+      2
+     ]
+    ],
+    "255": [
+     [
+      253,
+      4
+     ],
+     [
+      252,
+      4
+     ],
+     [
+      254,
+      4
+     ],
+     [
+      255,
+      0
+     ],
+     [
+      255,
+      4
+     ]
+    ]
+   }
+  }
+ },
+ "recursions": {
+  "layout": "Ms = scores.reshape(T, N, 256, 5); c = DESTINATION state, k = dropped base (0 = stay/blank). Confirmed against bonito's own comment in CTC_CRF.compute_transition_probs: '(new_state, dropped_base)'.",
+  "alpha": "alpha[0][s] = S.one (0.0); alpha[t+1][c] = S.sum_k( alpha[t][idx[c,k]] + Ms[t,n,c,k] )",
+  "beta": "beta[T][s] = S.one (0.0); beta[t][s] = S.sum over the 5 edges (c,k) with idx[c,k]==s of ( Ms[t,n,c,k] + beta[t+1][c] )",
+  "posteriors_Log": "softmax over the flattened 1280 (c,k) of ( alpha[t][idx[c,k]] + Ms[t,n,c,k] + beta[t+1][c] ); sums to 1 over dim 2 -- it is a probability, not a log-probability, despite the name (it is the autograd gradient of logZ).",
+  "posteriors_Max": "one-hot 1.0 at argmax over the flattened 1280 of the same expression, using the Max semiring alphas/betas.",
+  "traceback_argmax": "argmax over dim 2 of posteriors(s2, Max) == argmax of ( alpha_max[t][idx[c,k]] + s2[t,n,c,k] + beta_max[t+1][c] )",
+  "viterbi": "tb = traceback_argmax; move = (tb % 5) != 0; path = move ? 1 + ((tb // 5) % 4) : 0  (tb//5 = destination state c, its low 2 bits are the newly emitted base)",
+  "path_to_str": "concat alphabet[p] for p != 0, alphabet = NACGT",
+  "S.one": 0.0,
+  "S.zero": -1e+38,
+  "verified_max_abs_err_vs_float64_reference": {
+   "alpha_log": 1.35e-05,
+   "beta_log": 2.06e-05,
+   "posteriors_log": 6.88e-07,
+   "alpha_max": 1.96e-05,
+   "beta_max": 2.84e-05,
+   "note": "float32 kernel vs float64 numpy replay of the same recursion; traceback_argmax matched exactly (0 of 80 differ)."
+  }
+ },
+ "small_scores_checksum": {
+  "shape": [
+   40,
+   2,
+   1280
+  ],
+  "dtype": "float32",
+  "sum": 1000.0884311320663,
+  "mean": 0.009766488585274085,
+  "min": -2.9999923706054688,
+  "max": 2.9998939037323
+ },
+ "small": {
+  "checksums": {
+   "alpha_log": {
+    "shape": [
+     41,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": 1118825.854783495,
+    "mean": 53.29772555180521,
+    "min": -0.8682584166526794,
+    "max": 111.63459014892578
+   },
+   "beta_log": {
+    "shape": [
+     41,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": 1100191.486127595,
+    "mean": 52.41003649616973,
+    "min": -1.7643572092056274,
+    "max": 112.11016082763672
+   },
+   "posteriors_log": {
+    "shape": [
+     40,
+     2,
+     1280
+    ],
+    "dtype": "float32",
+    "sum": 80.00000072631133,
+    "mean": 0.000781250007092884,
+    "min": 1.3187986293294873e-11,
+    "max": 0.15114077925682068
+   },
+   "s2": {
+    "shape": [
+     40,
+     2,
+     1280
+    ],
+    "dtype": "float32",
+    "sum": -1214244.492950797,
+    "mean": -11.857856376472627,
+    "min": -18.419363021850586,
+    "max": -1.8895435333251953
+   },
+   "alpha_max": {
+    "shape": [
+     41,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": -1472981.2527532578,
+    "mean": -70.16869534838308,
+    "min": -131.14122009277344,
+    "max": 0.0
+   },
+   "beta_max": {
+    "shape": [
+     41,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": -1513767.6923604012,
+    "mean": -72.11164693027825,
+    "min": -143.47181701660156,
+    "max": 0.0
+   },
+   "traceback_argmax": {
+    "shape": [
+     40,
+     2
+    ],
+    "dtype": "int64",
+    "sum": 63717.0,
+    "mean": 796.4625,
+    "min": 39.0,
+    "max": 1279.0
+   },
+   "path": {
+    "shape": [
+     40,
+     2
+    ],
+    "dtype": "int64",
+    "sum": 149.0,
+    "mean": 1.8625,
+    "min": 0.0,
+    "max": 4.0
+   }
+  },
+  "seqs": [
+   "GAGGAGCTTTTTTCTCCTCCCCCCAGG",
+   "TTTTTTCTTCTCCTCCCCCCATAGTCA"
+  ],
+  "seq_lens": [
+   27,
+   27
+  ],
+  "files": [
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_alpha_log.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_beta_log.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_posteriors_log.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_s2.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_alpha_max.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_beta_max.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_traceback_argmax.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/small_path.npy"
+  ],
+  "decode_batch_seqs": [
+   "GAGGAGCTTTTTTCTCCTCCCCCCAGG",
+   "TTTTTTCTTCTCCTCCCCCCATAGTCA"
+  ],
+  "decode_batch_matches_manual_chain": true,
+  "posteriors_log_rowsum_min": 0.9999998807907104,
+  "posteriors_log_rowsum_max": 1.0000001192092896,
+  "traceback_argmax_flat": [
+   54,
+   39,
+   201,
+   156,
+   811,
+   636,
+   693,
+   635,
+   203,
+   635,
+   811,
+   1277,
+   688,
+   1279,
+   198,
+   1275,
+   796,
+   1279,
+   638,
+   1275,
+   1277,
+   1275,
+   1279,
+   1269,
+   1275,
+   1239,
+   1275,
+   1235,
+   1279,
+   1119,
+   1275,
+   629,
+   1275,
+   1237,
+   1269,
+   1109,
+   1239,
+   1105,
+   1235,
+   1105,
+   1235,
+   589,
+   1235,
+   1077,
+   1235,
+   469,
+   1109,
+   587,
+   1105,
+   1067,
+   589,
+   429,
+   585,
+   427,
+   1077,
+   425,
+   469,
+   425,
+   587,
+   427,
+   1067,
+   425,
+   1065,
+   425,
+   1065,
+   422,
+   429,
+   417,
+   427,
+   415,
+   427,
+   382,
+   422,
+   252,
+   420,
+   1016,
+   412,
+   229,
+   372,
+   901
+  ],
+  "path_flat": [
+   3,
+   4,
+   1,
+   4,
+   3,
+   4,
+   3,
+   0,
+   1,
+   0,
+   3,
+   4,
+   2,
+   4,
+   4,
+   0,
+   4,
+   4,
+   4,
+   0,
+   4,
+   0,
+   4,
+   2,
+   0,
+   4,
+   0,
+   0,
+   4,
+   4,
+   0,
+   2,
+   0,
+   4,
+   2,
+   2,
+   4,
+   0,
+   0,
+   0,
+   0,
+   2,
+   0,
+   4,
+   0,
+   2,
+   2,
+   2,
+   0,
+   2,
+   2,
+   2,
+   0,
+   2,
+   4,
+   0,
+   2,
+   0,
+   2,
+   2,
+   2,
+   0,
+   0,
+   0,
+   0,
+   1,
+   2,
+   4,
+   2,
+   0,
+   2,
+   1,
+   1,
+   3,
+   0,
+   4,
+   3,
+   2,
+   3,
+   1
+  ],
+  "flat_layout": "row-major (T, N) -> t*N + n, T=40 N=2"
+ },
+ "real_scores_checksum": {
+  "shape": [
+   200,
+   2,
+   1280
+  ],
+  "dtype": "float32",
+  "sum": -1294056.9670950857,
+  "mean": -2.527455013857589,
+  "min": -4.999999046325684,
+  "max": 4.999975681304932
+ },
+ "real": {
+  "checksums": {
+   "alpha_log": {
+    "shape": [
+     201,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": 24940725.21997094,
+    "mean": 242.35001962813803,
+    "min": 0.0,
+    "max": 488.1039733886719
+   },
+   "beta_log": {
+    "shape": [
+     201,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": 23590491.26307273,
+    "mean": 229.2297425283031,
+    "min": 0.0,
+    "max": 486.0415954589844
+   },
+   "posteriors_log": {
+    "shape": [
+     200,
+     2,
+     1280
+    ],
+    "dtype": "float32",
+    "sum": 400.000016860947,
+    "mean": 0.0007812500329315372,
+    "min": 3.624157437051551e-19,
+    "max": 0.999025821685791
+   },
+   "s2": {
+    "shape": [
+     200,
+     2,
+     1280
+    ],
+    "dtype": "float32",
+    "sum": -8539453.618821017,
+    "mean": -16.6786203492598,
+    "min": -18.42068099975586,
+    "max": -0.0009746531140990555
+   },
+   "alpha_max": {
+    "shape": [
+     201,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": -28841399.91328907,
+    "mean": -280.25303087384435,
+    "min": -432.82330322265625,
+    "max": 0.0
+   },
+   "beta_max": {
+    "shape": [
+     201,
+     2,
+     256
+    ],
+    "dtype": "float32",
+    "sum": -16987520.817568466,
+    "mean": -165.06841590454434,
+    "min": -418.8965759277344,
+    "max": 0.0
+   },
+   "traceback_argmax": {
+    "shape": [
+     200,
+     2
+    ],
+    "dtype": "int64",
+    "sum": 187902.0,
+    "mean": 469.755,
+    "min": 15.0,
+    "max": 1183.0
+   },
+   "path": {
+    "shape": [
+     200,
+     2
+    ],
+    "dtype": "int64",
+    "sum": 155.0,
+    "mean": 0.3875,
+    "min": 0.0,
+    "max": 4.0
+   }
+  },
+  "seqs": [
+   "AAATGATGATAGCCGAAGGTAGTAGGTTC",
+   "ATAGGCGAATAGTCCCGGTAAGGTAGTAGGTTC"
+  ],
+  "seq_lens": [
+   29,
+   33
+  ],
+  "files": [
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_alpha_log.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_beta_log.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_posteriors_log.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_s2.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_alpha_max.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_beta_max.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_traceback_argmax.npy",
+   "/beevol/home/jhessel/scratch/ldx/crf_golden/real_path.npy"
+  ],
+  "decode_batch_seqs": [
+   "AAATGATGATAGCCGAAGGTAGTAGGTTC",
+   "ATAGGCGAATAGTCCCGGTAAGGTAGTAGGTTC"
+  ],
+  "decode_batch_matches_manual_chain": true,
+  "posteriors_log_rowsum_min": 0.9999997615814209,
+  "posteriors_log_rowsum_max": 1.000000238418579,
+  "source": "/beevol/home/jhessel/scratch/ldx/crf_export/reference_io.npz"
+ }
+}

@@ -4,6 +4,107 @@
 
 ### Added
 
+- **CTC-CRF barcode basecalling — `escpod demux basecall`.** escapepod-rs can
+  now run a bonito-style CTC-CRF barcode model end to end: ONNX encoder
+  inference plus a native lattice decode. Previously the decode did not exist
+  in Rust at all, so the Stage-1 pipeline
+  (rnabioco/escapepod-models#27) had to drop into Python between
+  `escpod demux detect` and `escpod demux split`.
+
+  The split follows what ONNX can express. The encoder (convolutions → 5 stacked
+  LSTMs → `LinearCRFEncoder`) exports cleanly and runs through tract; the decode
+  is a sparse forward/backward over 256 states × 5 edges that standard ONNX ops
+  cannot express and that bonito itself only implements as hand-written CUDA
+  (`koi`). So the encoder ships as an ONNX file and `escapepod_demux::crf`
+  owns the decode — in portable Rust, with **no GPU requirement and no
+  dependencies**, which also means CI exercises it.
+
+  Correctness is pinned against bonito rather than asserted. `crf_golden.rs`
+  replays a score tensor defined by a closed-form expression through the real
+  `CTC_CRF` on a GPU and checks the Rust decode reproduces the decoded
+  sequence, the per-timestep argmax edge, *and* the path exactly, on every
+  backend the host supports. Two details differ from what #27 recorded and are worth carrying
+  forward: the score width is **1280**, not 1024 (1024 is the linear layer;
+  `LinearCRFEncoder` expands blanks to one per state), and the output is
+  **time-major** `[T, batch, n_score]`, so it cannot reuse the boundary CNN's
+  batch-major shape probe and gets its own.
+
+  Standardisation constants come from the export's `metadata.json` sidecar, not
+  from bonito's `config.toml` — that file carries SeqTagger's unrelated
+  `mean = 80.876 / stdev = 17.270`, and using it applies a ~1.8 sigma shift and
+  a 1.7× scale error that degrades the decode with nothing to indicate it. The
+  loader refuses to guess.
+
+  With `--barcodes` (a `name,sequence` CSV) each read is also assigned to its
+  closest reference by edit distance, and the output carries `read_id,barcode` —
+  exactly what `escpod demux split` reads. So `detect → basecall → split` runs
+  end to end with **no Python in the middle**, which is what this was for.
+  Verified on 300 real reads: **300/300 barcode calls identical** to
+  `demux_stage1.py`, and `split` produced 14 per-barcode POD5s whose counts match
+  the classifier exactly. Without `--barcodes`, only decoded sequences are
+  emitted.
+
+  Alignment is `fqxv-align`'s wavefront implementation (a git dependency on
+  `rnabioco/fqxv`, pinned by rev — a zero-runtime-dependency leaf crate
+  extracted for exactly this in rnabioco/fqxv#252, so it brings no dependency
+  cone). WFA rather than a DP because its work scales with the edit *distance*:
+  a decode sits ~4 edits from its own reference and ~10+ from the other 95, so
+  most of the comparisons abandon almost immediately. Confidence is the
+  edit-distance margin to the second-best reference — the definition the model's
+  published precision-at-recovery numbers were computed with, kept identical so
+  a recovery threshold still means what it meant at evaluation time. Ties
+  resolve to the lowest reference index with a margin of 0, which is the honest
+  signal that a read is ambiguous rather than a silent coin flip.
+
+  Note the git dependency would block `cargo publish`. Neither crate is
+  published today, and shipping barcode assignment in the default binary is
+  worth more than keeping that door open — a `basecall` that emits sequences
+  nobody can act on repeats the mistake `cnn-detect` was promoted to fix.
+
+- **AVX2 and AVX-512 kernels for the CRF decode**, runtime-dispatched with a
+  scalar fallback. The decode is transcendental-bound — ~770k `exp` and ~260k
+  `ln` per 200-timestep read — and started out as *half* the total CPU cost,
+  not a rounding error:
+
+  | decode backend | per read | vs scalar |
+  |---|---|---|
+  | scalar | 12.14 ms | — |
+  | AVX2 | 1.92 ms | 6.3× |
+  | AVX-512 | 1.19 ms | 10.2× |
+
+  (tract's encoder, for scale, is 13.9 ms/read.) Reproducible via
+  `cargo bench --bench crf_decode`, so the claim stays checkable.
+
+  This gates the GPU path being worth anything: with the encoder on the device
+  the decode *is* the runtime, so a scalar decode would have capped `--gpu` at
+  roughly no gain at all. Vectorised `exp`/`ln` are polynomial approximations
+  and the softmax denominator is reassociated across lanes, so the contract is
+  "same decoded sequence, floats within a tight tolerance" rather than
+  bit-identity — enforced by an equivalence test that runs *every* backend the
+  host supports against scalar, and by the bonito parity test doing the same.
+  Both SIMD paths break argmax ties by flat index rather than lane order, so
+  they cannot disagree with scalar on a tie.
+
+  Per the repository's build policy AVX-512 is runtime-detected, not a baseline
+  bump — the pinned `target-cpu=x86-64-v3` stays portable across the Broadwell
+  login node, Cascade Lake `rna`, and Ice Lake `gpu`.
+
+- **`crf-gpu` feature** — CRF encoder inference through onnxruntime's CUDA
+  execution provider (`escpod demux basecall --gpu`), sharing the exact ONNX
+  graph and decode with the CPU path. The lattice decode deliberately stays on
+  the CPU: it is sequential in time with a 256-wide inner dimension, a poor fit
+  for the device next to the encoder's dense matmuls, and it overlaps across
+  rayon workers while the GPU runs the next batch.
+
+  Across 300 real reads, CPU, GPU, and the Python pipeline disagree on only two
+  reads, and the pattern says the disagreement is in the *encoder*, not the
+  decode: on one read CPU and GPU agree with each other while Python differs
+  (and Python flips that read's answer across `--batch-size` 1→256, agreeing
+  with both Rust backends at 8–128), and on the other the GPU agrees with
+  Python exactly while tract differs by one base. Both are single-base indels
+  in the model's least-confident regions, and all three assign the same barcode
+  for all 300 reads.
+
 - **`cnn-detect` is now part of the default `cli` feature**, so released
   binaries can run `escpod demux detect --method cnn` (and the fused
   `escpod demux --method cnn`) without a rebuild. The barcode models published

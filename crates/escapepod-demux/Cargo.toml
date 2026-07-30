@@ -3,16 +3,29 @@ name = "escapepod-demux"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "WarpDemuX-compatible barcode demultiplexing for Oxford Nanopore POD5 data (DTW + SVM, optional CNN adapter detection and GPU acceleration)."
+description = "Barcode demultiplexing for Oxford Nanopore POD5 data — WarpDemuX-compatible DTW+SVM classification and CTC-CRF barcode basecalling, with optional CNN adapter detection and GPU acceleration."
 readme.workspace = true
 repository.workspace = true
 license.workspace = true
-keywords = ["barcode", "demultiplex", "nanopore", "pod5", "svm"]
+keywords = ["barcode", "basecalling", "demultiplex", "nanopore", "pod5"]
 categories = ["algorithms", "science"]
 
 [[bench]]
 harness = false
 name = "classify"
+
+[[bench]]
+harness = false
+name = "crf_decode"
+
+# The probe links tract-onnx directly, which only exists under the ONNX
+# features. Without this a plain `cargo test -p escapepod-demux` tries to build
+# it anyway and fails to resolve the crate — which is how CI caught it (#163).
+# Gated on `crf-decode` rather than `cnn-detect`: both pull tract, but the probe
+# is about the CRF encoder, and `crf-decode` did not exist when #163 landed.
+[[example]]
+name = "tract_crf_probe"
+required-features = ["crf-decode"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -28,6 +41,16 @@ uuid = { workspace = true }
 # SVM training (opt-in via `train`).
 linfa = { version = "0.8", optional = true }
 linfa-svm = { version = "0.8", optional = true }
+
+# Edit-distance alignment for barcode matching (opt-in via `crf-decode`).
+# A zero-runtime-dependency leaf crate extracted from fqxv for exactly this
+# (rnabioco/fqxv#252), so it brings no dependency cone with it. Pinned to a rev
+# rather than tracking a branch. Note a git dependency would block
+# `cargo publish`; neither this crate nor escapepod-cli is published today, and
+# shipping barcode assignment in the default binary is worth more than keeping
+# that door open (a `basecall` that emits sequences nobody can act on repeats
+# the mistake `cnn-detect` was promoted to fix).
+fqxv-align = { git = "https://github.com/rnabioco/fqxv", rev = "a3af3d891f242f15e828ab2126069aa5dd67e693", optional = true }
 
 # CNN adapter detection (opt-in via `cnn-detect`). Pure-Rust ONNX runtime;
 # user supplies the model file at runtime (weights are CC BY-NC).
@@ -70,6 +93,18 @@ cnn-detect = ["dep:tract-onnx"]
 # Builds on `cnn-detect` for the shared preprocessing/decoding. Needs a
 # CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
 cnn-gpu = ["cnn-detect", "dep:ort", "dep:cudarc"]
+# CTC-CRF barcode basecalling: runs a user-supplied CRF *encoder* ONNX graph
+# (`[B,1,chunk] -> [T,B,n_score]`, time-major) through tract-onnx on the CPU and
+# decodes the lattice natively. Only the encoder needs this feature — the
+# lattice decode in `crf::lattice` has no dependencies and is always compiled,
+# so CI covers the Viterbi without needing a model file.
+crf-decode = ["dep:tract-onnx", "dep:fqxv-align"]
+# CTC-CRF encoder inference on the GPU: same ONNX graph and the same native
+# lattice decode as `crf-decode`, with the LSTM stack running through
+# onnxruntime's CUDA execution provider. The decode deliberately stays on the
+# CPU (see `crf::encoder_gpu`), so the AVX2 kernels matter more here, not less.
+# Needs a CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
+crf-gpu = ["crf-decode", "dep:ort"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
 # time, not build time. Also pulls cudarc directly so the post-DTW SVM
@@ -79,10 +114,6 @@ gpu = ["dep:cudarc", "dep:indicatif", "escapepod-signal/gpu"]
 # Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
 train = ["dep:linfa", "dep:linfa-svm"]
 
-# The tract probe links tract-onnx directly, which only exists under
-# `cnn-detect`. Without this, `cargo test -p escapepod-demux --features train`
-# tries to build it anyway and fails to resolve the crate — which is exactly
-# how CI caught it.
 [[example]]
-name = "tract_crf_probe"
-required-features = ["cnn-detect"]
+name = "crf_basecall_check"
+required-features = ["crf-decode"]
