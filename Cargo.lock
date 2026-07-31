@@ -364,7 +364,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.9.1",
 ]
 
 [[package]]
@@ -373,6 +373,16 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
 dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5727b15fa97d4f4fee0a3b7c3d550ed0269f54329207b86388de918604e31269"
+dependencies = [
+ "borsh",
  "serde",
 ]
 
@@ -398,6 +408,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
+]
+
+[[package]]
+name = "borsh"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88b7ea17d208c4193f2c1e6de3c35fe71f98c96982d5ced308bdcc749ff6e1f"
+dependencies = [
+ "borsh-derive",
+ "bytes",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8f347189c62a579b8cd5f80714efa178f52e461dc2e6d701d264f5ff22e566c"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -884,8 +918,8 @@ dependencies = [
  "noodles-bam",
  "noodles-bgzf 0.49.0",
  "noodles-core",
- "noodles-csi",
- "noodles-sam",
+ "noodles-csi 0.57.0",
+ "noodles-sam 0.87.0",
  "owo-colors",
  "parquet",
  "rayon",
@@ -966,7 +1000,7 @@ dependencies = [
  "flate2",
  "ndarray 0.17.2",
  "noodles-bam",
- "noodles-sam",
+ "noodles-sam 0.87.0",
  "parquet",
  "rand 0.10.2",
  "rayon",
@@ -1706,8 +1740,8 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.48.0",
  "noodles-core",
- "noodles-csi",
- "noodles-sam",
+ "noodles-csi 0.57.0",
+ "noodles-sam 0.86.0",
 ]
 
 [[package]]
@@ -1749,10 +1783,23 @@ version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56d2b47cd56d466c6b39d7d2d3f19905c786d5bbcf45c782af3c206129bb39b8"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.9.1",
  "bstr",
  "indexmap",
  "noodles-bgzf 0.48.0",
+ "noodles-core",
+]
+
+[[package]]
+name = "noodles-csi"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b522467eb7ae4a226b05182069e895940beda9206a3f4da9dd9395613ec9e5a8"
+dependencies = [
+ "bit-vec 0.10.1",
+ "bstr",
+ "indexmap",
+ "noodles-bgzf 0.49.0",
  "noodles-core",
 ]
 
@@ -1769,7 +1816,23 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.48.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.57.0",
+]
+
+[[package]]
+name = "noodles-sam"
+version = "0.87.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db484fde243408e8713278e6e83dbd67765cbd33612f2383f29b6359059d023f"
+dependencies = [
+ "bitflags",
+ "bstr",
+ "indexmap",
+ "lexical-core",
+ "memchr",
+ "noodles-bgzf 0.49.0",
+ "noodles-core",
+ "noodles-csi 0.58.0",
 ]
 
 [[package]]
@@ -2130,6 +2193,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc0d895b311e3af9902528fbb8f928688abbd95872819320517cc24ca6b2bd08"
 dependencies = [
  "num-integer",
+]
+
+[[package]]
+name = "proc-macro-crate"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+dependencies = [
+ "toml_edit",
 ]
 
 [[package]]
@@ -2880,6 +2952,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "winnow",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3610,6 +3712,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"
