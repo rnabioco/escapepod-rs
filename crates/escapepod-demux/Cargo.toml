@@ -61,7 +61,7 @@ tract-onnx = { workspace = true, optional = true }
 # (nothing needed at build time); set `ORT_DYLIB_PATH` to a CUDA-enabled
 # libonnxruntime to run. Architecture-agnostic — same `[B,1,L] -> [B,2,L]`
 # contract as the tract CPU path.
-ort = { version = "=2.0.0-rc.12", optional = true, features = [
+ort = { version = "=2.0.0-rc.13", optional = true, features = [
     "cuda",
     "load-dynamic",
     "ndarray",
