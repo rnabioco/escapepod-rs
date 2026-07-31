@@ -53,6 +53,13 @@ pub struct ClassifyArgs {
     #[arg(long, value_name = "FILE")]
     pub model: Option<PathBuf>,
 
+    /// Named barcode model resolved from the local cache, e.g.
+    /// `barcode_wdx4_rna004`. Prefetch it with `escpod demux models fetch`;
+    /// resolution never touches the network. Mutually exclusive with `--model`.
+    #[cfg(feature = "demux-models")]
+    #[arg(long, value_name = "NAME")]
+    pub model_name: Option<String>,
+
     /// Deprecated alias for `--model`. Kept for compatibility with existing
     /// scripts; emits a warning when used.
     #[arg(long, value_name = "FILE", hide = true)]
@@ -166,6 +173,14 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     }
 
     // Validate that exactly one input source was provided.
+    #[cfg(feature = "demux-models")]
+    if let Some(name) = args.model_name.take() {
+        if args.model.is_some() {
+            anyhow::bail!("pass either --model or --model-name, not both");
+        }
+        args.model = Some(super::models::resolve(&name)?);
+    }
+
     match (args.model.is_some(), args.reference.is_some()) {
         (false, false) => anyhow::bail!("One of --reference or --model must be provided"),
         (true, true) => anyhow::bail!("Only one of --reference or --model can be specified"),

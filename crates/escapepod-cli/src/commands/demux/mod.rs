@@ -19,6 +19,8 @@ mod classify;
 mod detect;
 mod fingerprint;
 mod fp_io;
+#[cfg(feature = "demux-models")]
+pub mod models;
 mod run;
 mod split;
 mod train;
@@ -85,6 +87,23 @@ Examples:
 ")]
     Classify(ClassifyArgs),
 
+    /// Manage boundary/barcode model downloads and the local cache
+    #[cfg(feature = "demux-models")]
+    #[command(after_help = "\
+Examples:
+  escpod demux models list
+  escpod demux models fetch wdx4_rna004
+  escpod demux models path
+
+Models are gitignored upstream and distributed via GitHub Releases. Fetch on a
+networked node before submitting compute jobs — resolution at run time never
+touches the network, so a missing model fails fast instead of hanging.
+")]
+    Models {
+        #[command(subcommand)]
+        command: models::ModelsCommand,
+    },
+
     /// Basecall barcode regions with a CTC-CRF model
     #[cfg(feature = "crf-decode")]
     #[command(after_help = "\
@@ -148,6 +167,8 @@ pub fn requested_threads(args: &DemuxArgs) -> Option<usize> {
         None => args.run.threads,
         Some(DemuxCommand::Detect(a)) => a.threads,
         Some(DemuxCommand::Fingerprint(a)) => a.threads,
+        #[cfg(feature = "demux-models")]
+        Some(DemuxCommand::Models { .. }) => None,
         #[cfg(feature = "crf-decode")]
         Some(DemuxCommand::Basecall(a)) => a.threads,
         Some(DemuxCommand::Classify(a)) => a.threads,
@@ -168,6 +189,8 @@ pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
     match command {
         DemuxCommand::Detect(detect_args) => detect::run(detect_args),
         DemuxCommand::Fingerprint(fingerprint_args) => fingerprint::run(fingerprint_args),
+        #[cfg(feature = "demux-models")]
+        DemuxCommand::Models { command } => models::run(command),
         #[cfg(feature = "crf-decode")]
         DemuxCommand::Basecall(basecall_args) => basecall::run(basecall_args),
         DemuxCommand::Classify(classify_args) => classify::run(classify_args),

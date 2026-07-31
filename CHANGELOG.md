@@ -4,6 +4,64 @@
 
 ### Added
 
+- **`escpod demux models` — pinned manifest, verified cache, offline resolution**
+  (#158 item 1). Boundary and barcode model binaries are gitignored upstream and
+  distributed through GitHub Releases, so there was previously **no supported way
+  to obtain them from escpod at all**. Same shape as `escpod resquiggle models`
+  does for k-mer tables:
+
+  ```
+  escpod demux models fetch wdx4_rna004    # on a networked login node
+  escpod demux models list                 # what's known, what's cached
+  escpod demux detect --method cnn --cnn-model-name adapter_rna004 …
+  escpod demux classify --model-name barcode_wdx4_rna004 …
+  ```
+
+  `--cnn-model-name` / `--model-name` sit alongside the existing path flags,
+  mirroring `--kmer-table` / `--kmer-model`. **Resolution never touches the
+  network**: on this project's HPC target the compute nodes generally cannot
+  reach GitHub, so a lazy fetch would hang a job rather than fail it. A missing
+  model errors immediately and names the exact command to run.
+
+  **The fetch unit is a bundle, not a model.** The barcode GBM is trained
+  against a specific boundary model's output; using LLR boundaries instead costs
+  17.2 points of balanced recall, and even swapping between two *good* boundary
+  models costs 0.0059 (McNemar p=3.8e-08) unless the GBM is retrained. Fetching
+  the matched release as a unit makes that coupling impossible to break by
+  accident — which is most of what #158 item 2 asks for, obtained structurally
+  rather than by a check. Members stay individually addressable for resolution;
+  they just cannot be *fetched* apart.
+
+  Each member's sha256 is verified after extraction against the value pinned in
+  the manifest — the same value the release's `BUNDLE.json` and `provenance.json`
+  publish, independently re-hashed from the artifacts before being recorded. The
+  archive's own checksum is deliberately not pinned: re-packing the zip would
+  change it without changing a model byte, so it would produce false failures
+  while adding nothing.
+
+  **Requires a GitHub token today.** `escapepod-models` is currently a *private*
+  repository, so release assets 404 for anonymous requests — GitHub's advertised
+  `browser_download_url` is unusable without credentials, and a private repo
+  answers 404 rather than 401, which makes the bare failure deeply misleading.
+  Fetching goes through the REST asset endpoint and sends a bearer token from
+  `$GITHUB_TOKEN` or `$GH_TOKEN`; the anonymous 404 is rewritten to say exactly
+  this. The same endpoint serves public repositories anonymously, so if the
+  repository is opened up later this keeps working with no token and no code
+  change. escpod's own test suite never fetches, so CI needs no secret.
+
+### Changed
+
+- **The default `escpod` binary now links a TLS stack** (`ureq`/rustls) and a
+  zip reader, via the new `model-fetch` feature. Measured cost: **32.76 MB →
+  34.74 MB stripped (+1.98 MB, +6.0%)**. This was previously avoided on purpose,
+  and it is a deliberate reversal: without it `escpod demux models fetch` cannot
+  exist in a released binary, and the models it serves are the
+  difference between 0.9928 and 0.8196 balanced recall. rustls (not OpenSSL)
+  keeps the static-musl release self-contained. `model-fetch` is separate from
+  the existing `models-download` precisely so the demux fetch could ship by
+  default without dragging in `experimental`, which gates the whole resquiggle
+  command.
+
 - **CTC-CRF barcode basecalling — `escpod demux basecall`.** escapepod-rs can
   now run a bonito-style CTC-CRF barcode model end to end: ONNX encoder
   inference plus a native lattice decode. Previously the decode did not exist
