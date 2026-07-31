@@ -21,12 +21,12 @@ use std::sync::mpsc::SyncSender;
 
 use crate::progress::create_progress_bar;
 use crate::style;
+#[cfg(feature = "crf-decode")]
+use escapepod_demux::crf::{BarcodeRefs, CrfEncoder, CrfScratch};
 use escapepod_demux::{
     AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace,
     extract_fingerprint_from_signal, load_any_model,
 };
-#[cfg(feature = "crf-decode")]
-use escapepod_demux::crf::{BarcodeRefs, CrfEncoder, CrfScratch};
 use escapepod_signal::dtw::NormMethod;
 use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
 use escapepod_signal::{
@@ -37,7 +37,6 @@ use rayon::prelude::*;
 use tracing::info;
 
 const UNCLASSIFIED: &str = "unclassified";
-
 
 /// Arguments for the fused demux pipeline.
 #[derive(Debug, clap::Args)]
@@ -1180,7 +1179,9 @@ fn produce_cpu_crf(
 /// decode.
 #[cfg(feature = "crf-decode")]
 fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
-    raw.iter().map(|&v| (f32::from(v) + offset) * scale).collect()
+    raw.iter()
+        .map(|&v| (f32::from(v) + offset) * scale)
+        .collect()
 }
 
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a
@@ -1463,7 +1464,10 @@ fn spawn_class_writer(
 /// asked for by name. Explicit `--method` overrides a pin — that has to stay
 /// possible to evaluate a new boundary model — except that a bundle pinning
 /// `cnn` refuses the downgrade, which is #16's runtime guard.
-fn build_detector(args: &RunArgs, pin: Option<(&str, Option<PathBuf>)>) -> anyhow::Result<Detector> {
+fn build_detector(
+    args: &RunArgs,
+    pin: Option<(&str, Option<PathBuf>)>,
+) -> anyhow::Result<Detector> {
     let pinned_method = pin.as_ref().map(|(m, _)| *m);
     let pinned_onnx = pin.and_then(|(_, p)| p);
     let method = match (args.method.as_deref(), pinned_method) {

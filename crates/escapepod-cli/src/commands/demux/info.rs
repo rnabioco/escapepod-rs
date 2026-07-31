@@ -140,8 +140,10 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
     // `state_len` bases of its target (escapepod-models#36).
     field(
         "emits",
-        format!("target[{}:]  — the first {} target bases fix the initial state and are never emitted",
-            meta.crf.state_len, meta.crf.state_len),
+        format!(
+            "target[{}:]  — the first {} target bases fix the initial state and are never emitted",
+            meta.crf.state_len, meta.crf.state_len
+        ),
     );
 
     heading("Barcode references");
@@ -259,7 +261,10 @@ fn classifier_info(path: &Path) -> anyhow::Result<()> {
             Some(&m.label_mapper)
         }
         AnyModel::WarpDemux(_) => {
-            field("kind", "WarpDemuX reference bank (demux classify --reference)");
+            field(
+                "kind",
+                "WarpDemuX reference bank (demux classify --reference)",
+            );
             None
         }
     };
