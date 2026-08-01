@@ -40,7 +40,7 @@ pub use lattice::{Backend, CrfDecodeError, CrfLayout, CrfScratch, decode, decode
 pub use barcode::{BarcodeError, BarcodeMatch, BarcodeRefs};
 
 #[cfg(feature = "crf-decode")]
-pub use encoder::{CrfEncoder, CrfError, CrfMetadata};
+pub use encoder::{BarcodeEntry, BoundarySpec, CrfEncoder, CrfError, CrfMetadata, ModelIdent};
 
 #[cfg(feature = "crf-gpu")]
 pub use encoder_gpu::CrfEncoderGpu;

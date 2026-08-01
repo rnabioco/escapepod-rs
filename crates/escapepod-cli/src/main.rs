@@ -397,9 +397,18 @@ Examples:
     #[command(after_help = "\
 Examples:
   escpod demux input.pod5 --model model.json -d out/   Fused pipeline (recommended)
+  escpod demux input.pod5 --model crf_bundle/ --barcodes refs.csv -d out/ \\
+      --method cnn --cnn-model adapter.onnx            Fused, CTC-CRF head
   escpod demux detect input.pod5 -o boundaries.csv
   escpod demux fingerprint input.pod5 --boundaries boundaries.csv -o fingerprints.csv
   escpod demux classify fingerprints.csv --reference barcodes.csv -o classifications.csv
+  escpod demux basecall input.pod5 --boundaries boundaries.csv --model crf_bundle/ \\
+      --barcodes refs.csv -o classifications.csv
+
+The fused pipeline drives any of the three classifier heads -- DTW-SVM, GBM or
+CTC-CRF -- and decodes each read's signal once. The detect/fingerprint/classify/
+basecall subcommands are those same stages run separately, which re-reads the
+POD5 per stage; prefer the fused form unless you want the intermediate files.
 ")]
     Demux(commands::demux::DemuxArgs),
 

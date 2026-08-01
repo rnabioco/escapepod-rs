@@ -21,6 +21,8 @@ use std::sync::mpsc::SyncSender;
 
 use crate::progress::create_progress_bar;
 use crate::style;
+#[cfg(feature = "crf-decode")]
+use escapepod_demux::crf::{BarcodeRefs, CrfEncoder, CrfScratch};
 use escapepod_demux::{
     AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace,
     extract_fingerprint_from_signal, load_any_model,
@@ -44,10 +46,45 @@ pub struct RunArgs {
     #[arg(value_name = "FILES")]
     pub input: Vec<PathBuf>,
 
-    /// Trained classifier JSON — DTW-SVM (`demux train-svm` / converted
-    /// WarpDemuX) or native GBM tree ensemble. Auto-detected by JSON shape.
-    #[arg(long, value_name = "FILE")]
+    /// Trained classifier — a DTW-SVM / GBM JSON (auto-detected by JSON
+    /// shape), or a CTC-CRF encoder bundle directory (`metadata.json` + the
+    /// ONNX graph it names). A CRF bundle also needs `--barcodes`.
+    #[arg(long, value_name = "FILE|DIR")]
     pub model: Option<PathBuf>,
+
+    /// Barcode reference CSV (`name,sequence`) for the CTC-CRF head. Required
+    /// with a CRF bundle, ignored otherwise: the fingerprint heads carry their
+    /// own barcode set in the model JSON, whereas the CRF emits sequence and
+    /// has to be told what to match it against.
+    ///
+    /// These must be the sequences the model actually EMITS, which is not the
+    /// training target: `state_len` leading bases only fix the initial CRF
+    /// state and are never produced, so a 40-nt target emits 36 nt. Matching
+    /// against full-length targets still calls the same barcode, but inflates
+    /// every distance and compresses the confidence margin that `--min-margin`
+    /// gates on (escapepod-models#36).
+    #[cfg(feature = "crf-decode")]
+    #[arg(long, value_name = "FILE")]
+    pub barcodes: Option<PathBuf>,
+
+    /// Call a read `unclassified` when its edit-distance margin to the
+    /// second-best reference is below this (CRF head only). 0 keeps every
+    /// call, including outright ties.
+    #[cfg(feature = "crf-decode")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Advanced Options"
+    )]
+    pub min_margin: u32,
+
+    /// Describe the model and exit: identity, signal geometry, bundled
+    /// references, pinned boundary detector, published metrics, and the exact
+    /// command line it needs. Reads no POD5, so it is safe to run against a
+    /// model before trusting it.
+    #[arg(long)]
+    pub info: bool,
 
     /// Output directory for the per-barcode demultiplexed POD5 files
     #[arg(short = 'd', long, value_name = "DIR")]
@@ -62,14 +99,17 @@ pub struct RunArgs {
     #[arg(long, default_value = "barcode", help_heading = "Advanced Options")]
     pub prefix: String,
 
-    /// Adapter detection method: `llr` (default) or `cnn`.
-    #[arg(
-        long,
-        default_value = "llr",
-        value_name = "{llr,cnn}",
-        help_heading = "Advanced Options"
-    )]
-    pub method: String,
+    /// Adapter detection method: `cnn` or `llr`. **No default** — LLR is
+    /// opt-in, never inferred.
+    ///
+    /// LLR boundaries cost 17.2 points of barcode recall against the same
+    /// classifier (0.9928 -> 0.8196, escapepod-models#16) and the failure is
+    /// silent: it runs and produces plausible output. So a model bundle that
+    /// pins its detector supplies this, and otherwise you have to say which
+    /// you want. Passing it explicitly overrides a bundle's choice, except
+    /// that a bundle pinning `cnn` refuses to be downgraded to `llr`.
+    #[arg(long, value_name = "{cnn,llr}", help_heading = "Advanced Options")]
+    pub method: Option<String>,
 
     /// Path to the ADAPTed CNN ONNX model (only with `--method cnn`).
     #[cfg(feature = "cnn-detect")]
@@ -332,23 +372,86 @@ fn route(
     });
 }
 
-/// Either classifier head the fused pipeline can drive. Detect + fingerprint are
-/// model-agnostic; only the per-read classify differs — DTW-SVM (with an optional
-/// GPU DTW path) or the CPU-only GBM tree walk.
+/// Which classifier head the fused pipeline drives.
+///
+/// The two fingerprint heads (DTW-SVM, with an optional GPU DTW path, and the
+/// CPU-only GBM tree walk) share everything up to classify: detect, then a
+/// fingerprint of the adapter region, then a model that maps features to a
+/// class index.
+///
+/// The CRF head is a different shape. It does not fingerprint at all — it
+/// basecalls the barcode out of the raw pA window `[adapter_end - chunk,
+/// adapter_end]` and matches the decoded sequence to a reference set by edit
+/// distance. So its barcode set comes from the reference CSV rather than a
+/// `label_mapper`, and its confidence is an edit-distance margin rather than a
+/// probability.
 enum ClassifyModel {
     Svm(DtwSvmModel),
     Gbm(GbmModel),
+    #[cfg(feature = "crf-decode")]
+    Crf(Box<CrfHead>),
+}
+
+/// The CTC-CRF head: encoder bundle plus the references its decodes are matched
+/// against.
+#[cfg(feature = "crf-decode")]
+struct CrfHead {
+    encoder: CrfEncoder,
+    refs: BarcodeRefs,
+    min_margin: u32,
 }
 
 impl ClassifyModel {
-    /// Class-index → barcode-id map (same shape on both heads), for the output
-    /// barcode set.
-    fn label_mapper(&self) -> &HashMap<usize, i32> {
+    /// The set of output barcode labels, before `unclassified` is added.
+    ///
+    /// The fingerprint heads name barcodes positionally from the model's
+    /// `label_mapper` (`BC00`, `BC01`, ...); the CRF head uses the reference
+    /// names, so its output files are `barcode_nbc01.pod5` rather than
+    /// `barcode_BC00.pod5`.
+    fn barcode_names(&self) -> Vec<String> {
         match self {
-            ClassifyModel::Svm(m) => &m.label_mapper,
-            ClassifyModel::Gbm(m) => &m.label_mapper,
+            ClassifyModel::Svm(m) => barcode_set(&m.label_mapper),
+            ClassifyModel::Gbm(m) => barcode_set(&m.label_mapper),
+            #[cfg(feature = "crf-decode")]
+            ClassifyModel::Crf(h) => {
+                // Reference order is the CSV's, but every label here becomes a
+                // router key and an output file, so a duplicate name (or one
+                // literally called `unclassified`) would leave a writer thread
+                // with no sender. Dedup rather than trusting the CSV.
+                let mut v: Vec<String> = Vec::with_capacity(h.refs.len() + 1);
+                for n in h.refs.names() {
+                    if n != UNCLASSIFIED && !v.iter().any(|s| s == n) {
+                        v.push(n.clone());
+                    }
+                }
+                v.push(UNCLASSIFIED.to_string());
+                v
+            }
         }
     }
+}
+
+/// Is this `--model` a CTC-CRF encoder bundle rather than a classifier JSON?
+///
+/// A bundle is a directory holding `metadata.json`, or that `metadata.json`
+/// itself. Sniff the `format` key rather than trusting the extension, so a
+/// stray `.json` cannot be mistaken for either kind: the CRF sidecar declares
+/// `"format": "escapepod-crf-encoder/N"`, which no classifier JSON carries.
+#[cfg(feature = "crf-decode")]
+pub(super) fn crf_bundle_dir(path: &Path) -> Option<PathBuf> {
+    let (dir, meta) = if path.is_dir() {
+        (path.to_path_buf(), path.join("metadata.json"))
+    } else if path.file_name().is_some_and(|n| n == "metadata.json") {
+        (path.parent()?.to_path_buf(), path.to_path_buf())
+    } else {
+        return None;
+    };
+    let text = std::fs::read_to_string(&meta).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("format")?
+        .as_str()?
+        .starts_with("escapepod-crf-encoder/")
+        .then_some(dir)
 }
 
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -359,30 +462,115 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // Validate the fused-pipeline args here (not via clap `required`) so the
     // advanced subcommands aren't forced to supply them.
-    if args.input.is_empty() {
-        anyhow::bail!("no input POD5 file(s) given");
-    }
     let model_path = args
         .model
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("--model <FILE> is required"))?;
+        .ok_or_else(|| anyhow::anyhow!("--model <FILE|DIR> is required"))?;
+    // `--info` describes the model and exits: no input, no output dir, no POD5
+    // touched. Checked before the input/output validation below so you can
+    // interrogate a model without inventing arguments for a run you are not
+    // making.
+    if args.info {
+        return super::info::run(&model_path);
+    }
+    if args.input.is_empty() {
+        anyhow::bail!("no input POD5 file(s) given");
+    }
     let output_dir = args
         .output_dir
         .clone()
         .ok_or_else(|| anyhow::anyhow!("-d/--output-dir <DIR> is required"))?;
 
-    // The fused pipeline supports both classifier heads: DTW-SVM (with an
-    // optional GPU DTW path) and the native GBM tree ensemble (CPU-only). Only
-    // the legacy reference-bank WarpDemux JSON is rejected here.
-    let model = match load_any_model(&model_path)? {
-        AnyModel::Svm(m) => ClassifyModel::Svm(m),
-        AnyModel::Gbm(m) => ClassifyModel::Gbm(m),
-        AnyModel::WarpDemux(_) => anyhow::bail!(
-            "`demux` needs an SVM or GBM model (DtwSvmModel / converted WarpDemuX \
-             / native GBM). The reference-CSV path is only on `demux classify --reference`."
-        ),
+    // Three heads: DTW-SVM (with an optional GPU DTW path), the native GBM tree
+    // ensemble (CPU-only), and the CTC-CRF basecaller. A CRF bundle is a
+    // directory, so check for that before trying to parse `--model` as JSON.
+    // Only the legacy reference-bank WarpDemux JSON is rejected here.
+    #[cfg(feature = "crf-decode")]
+    let crf_dir = crf_bundle_dir(&model_path);
+    #[cfg(not(feature = "crf-decode"))]
+    let crf_dir: Option<PathBuf> = None;
+    // Kept because a pinned boundary model's ONNX path is relative to the
+    // bundle directory, and `crf_dir` is consumed building the head below.
+    #[cfg(feature = "crf-decode")]
+    let crf_dir_for_pin = crf_dir.clone();
+
+    let model = match crf_dir {
+        #[cfg(feature = "crf-decode")]
+        Some(dir) => {
+            let encoder = CrfEncoder::load_bundle(&dir)?;
+            // References come from the bundle unless the caller overrides them.
+            // Carrying them in the bundle is what makes the plain
+            // `--model <bundle> -d out/` form work, and it fixes the
+            // emitted-vs-target trimming once at export instead of at every
+            // call site (escapepod-models#36).
+            let refs = match (&args.barcodes, &encoder.metadata().barcodes) {
+                (Some(csv), _) => {
+                    let r = BarcodeRefs::from_csv(csv)?;
+                    if encoder.metadata().barcodes.is_some() {
+                        info!(
+                            "{} overriding the {} references in the bundle",
+                            style::label("Barcodes:"),
+                            style::count(encoder.metadata().barcodes.as_ref().unwrap().len())
+                        );
+                    }
+                    r
+                }
+                (None, Some(entries)) => BarcodeRefs::from_pairs(
+                    entries.iter().map(|e| (e.name.clone(), e.sequence.clone())),
+                )?,
+                (None, None) => anyhow::bail!(
+                    "this CTC-CRF bundle carries no barcode references, so --barcodes \
+                     <FILE> is required. The CRF emits sequence rather than a class \
+                     index and has to be told what to match it against — and those must \
+                     be the sequences the model EMITS (target[state_len:]), not the \
+                     full-length training targets."
+                ),
+            };
+            info!(
+                "{} {} references, minimum pairwise edit distance {}",
+                style::label("Barcodes:"),
+                style::count(refs.len()),
+                refs.min_pairwise_distance()
+                    .map_or_else(|| "n/a".to_string(), |d| d.to_string()),
+            );
+            ClassifyModel::Crf(Box::new(CrfHead {
+                encoder,
+                refs,
+                min_margin: args.min_margin,
+            }))
+        }
+        #[cfg(not(feature = "crf-decode"))]
+        Some(_) => unreachable!("crf_dir is always None without the crf-decode feature"),
+        None => match load_any_model(&model_path)? {
+            AnyModel::Svm(m) => ClassifyModel::Svm(m),
+            AnyModel::Gbm(m) => ClassifyModel::Gbm(m),
+            AnyModel::WarpDemux(_) => anyhow::bail!(
+                "`demux` needs an SVM, GBM or CTC-CRF model (DtwSvmModel / converted \
+                 WarpDemuX / native GBM / CRF bundle directory). The reference-bank path \
+                 is only on `demux classify --reference`."
+            ),
+        },
     };
-    let detector = build_detector(&args)?;
+    // A CRF bundle may pin the boundary detector it was trained against; the
+    // ONNX path in the sidecar is relative to the bundle directory.
+    #[cfg(feature = "crf-decode")]
+    let boundary_pin = match (&model, &crf_dir_for_pin) {
+        (ClassifyModel::Crf(h), Some(dir)) => h.encoder.metadata().boundary.as_ref().map(|b| {
+            if let Some(id) = &b.model_id {
+                info!(
+                    "{} {} (pinned by the model bundle)",
+                    style::label("Boundary model:"),
+                    style::value(id)
+                );
+            }
+            (b.method.as_str(), b.onnx.as_ref().map(|o| dir.join(o)))
+        }),
+        _ => None,
+    };
+    #[cfg(not(feature = "crf-decode"))]
+    let boundary_pin: Option<(&str, Option<PathBuf>)> = None;
+
+    let detector = build_detector(&args, boundary_pin)?;
     let fp = FpParams::default();
 
     std::fs::create_dir_all(&output_dir)?;
@@ -428,7 +616,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // and when a channel fills, rayon workers block inside `for_each` on
     // `send` — and blocked rayon workers cannot be stolen from, so one
     // saturated writer stalls the whole pool.
-    let barcodes = barcode_set(model.label_mapper());
+    let barcodes = model.barcode_names();
     let router_depth = (ROUTER_TOTAL_SLOTS / barcodes.len().max(1)).clamp(256, 4096);
 
     let mut routers: Routers = HashMap::new();
@@ -468,15 +656,32 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             // accelerates adapter detection, so only warn when `--gpu` can do
             // nothing (CPU classify + CPU detect).
             #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-            if args.gpu && args.method != "cnn" {
+            if args.gpu && args.method.as_deref() != Some("cnn") {
                 tracing::warn!(
                     "--gpu has no effect here: GBM classify is CPU-only and \
                      `--method {}` detection is CPU-only (use `--method cnn` for \
                      GPU adapter detection).",
-                    args.method
+                    args.method.as_deref().unwrap_or("<from model>")
                 );
             }
             produce_cpu_gbm(&args, &detector, gbm, fp, &routers, class_tx.as_ref(), &pb)
+        }
+        #[cfg(feature = "crf-decode")]
+        ClassifyModel::Crf(head) => {
+            // Encoder inference here is tract on the CPU, one read per rayon
+            // worker. `demux basecall --gpu` has an onnxruntime path; it is not
+            // wired through the fused pipeline, so say so rather than silently
+            // ignoring the flag.
+            #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
+            if args.gpu && args.method.as_deref() != Some("cnn") {
+                tracing::warn!(
+                    "--gpu has no effect here: fused CRF basecalling is CPU-only and \
+                     `--method {}` detection is CPU-only (use `--method cnn` for GPU \
+                     adapter detection, or `demux basecall --gpu` for a GPU encoder).",
+                    args.method.as_deref().unwrap_or("<from model>")
+                );
+            }
+            produce_cpu_crf(&args, &detector, head, &routers, class_tx.as_ref(), &pb)
         }
     };
 
@@ -880,6 +1085,105 @@ fn produce_cpu_gbm(
     )
 }
 
+/// CRF producer: detect → prep the raw-pA window → CTC-CRF basecall → match the
+/// decoded sequence to the references by edit distance.
+///
+/// Unlike the fingerprint heads this needs **calibrated pA**, not ADC counts,
+/// and it needs the window `[adapter_end - chunk, adapter_end]` to lie inside
+/// the decoded prefix. It always does: the detector bounds its decode by
+/// `max_obs_trace` and can only report an `adapter_end` inside what it saw, so
+/// any read whose adapter was detected at all has its window available.
+/// `meta.prep` still returns `None` when `adapter_end < chunk` (the adapter sits
+/// too close to the read start), and those route as unclassified.
+///
+/// Batching mirrors `produce_cpu_gbm`: detect the whole block at once, then
+/// chunk so each rayon task preps, encodes and matches a run of reads. The
+/// encode is the dominant cost and tract has no batched LSTM, so parallelism is
+/// per read within the chunk.
+#[cfg(feature = "crf-decode")]
+fn produce_cpu_crf(
+    args: &RunArgs,
+    detector: &Detector,
+    head: &CrfHead,
+    routers: &Routers,
+    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    pb: &indicatif::ProgressBar,
+) -> anyhow::Result<()> {
+    let meta = head.encoder.metadata();
+    drive_blocks(
+        &args.input,
+        detector.signal_decode_bound(),
+        |sigs, items| {
+            const CRF_CHUNK: usize = 256;
+            let bounds = detector.detect_batch(&sigs);
+            let rows: Vec<_> = sigs
+                .into_iter()
+                .zip(bounds)
+                .zip(items)
+                .map(|((sig, b), item)| (sig, b, item))
+                .collect();
+
+            rows.into_par_iter().chunks(CRF_CHUNK).for_each(|chunk| {
+                let n = chunk.len();
+                let mut scratch = CrfScratch::new();
+                for (signal, (_s, adapter_end), (read, chunks, run_infos)) in chunk {
+                    let (barcode, conf) = (|| {
+                        let adc = signal.as_ref()?;
+                        // The detector reports `adapter_end` as an index into
+                        // the decoded prefix, which is what `prep` wants.
+                        let pa = adc_to_pa(adc, read.calibration_offset, read.calibration_scale);
+                        let window = meta.prep(&pa, adapter_end)?;
+                        let seq = head
+                            .encoder
+                            .basecall_prepped(&window, &mut scratch)
+                            .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                            .ok()?;
+                        let m = head.refs.match_sequence(seq.as_bytes())?;
+                        // Same gate as `demux basecall --min-margin`, including
+                        // its treatment of a single reference: with no runner-up
+                        // there is no margin to test, so the call stands.
+                        if !m.margin.is_none_or(|v| v >= head.min_margin) {
+                            return None;
+                        }
+                        // Confidence is the margin, matching `demux basecall`
+                        // and `eval_recovery.py`. A lone reference reports 0
+                        // rather than a fabricated distance.
+                        Some((
+                            head.refs.name(m.index).to_string(),
+                            f64::from(m.margin.unwrap_or(0)),
+                        ))
+                    })()
+                    .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0));
+
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        barcode,
+                        chunks,
+                        run_infos,
+                        conf,
+                    );
+                }
+                pb.inc(n as u64);
+            });
+        },
+    )
+}
+
+/// ADC counts to picoamps, fused so there is one rounding step.
+///
+/// Matches `escapepod_python::adc_to_pa` and `demux basecall`'s own conversion;
+/// the reference `pod5` package computes it unfused, which differs by ~1 ulp —
+/// thousands of times below the standardisation scale and irrelevant to the
+/// decode.
+#[cfg(feature = "crf-decode")]
+fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
+    raw.iter()
+        .map(|&v| (f32::from(v) + offset) * scale)
+        .collect()
+}
+
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a
 /// decoded signal and precomputed boundaries. Returns `(barcode, confidence)`;
 /// unfingerprintable reads route to `unclassified` (matching the SVM path).
@@ -1147,8 +1451,43 @@ fn spawn_class_writer(
     Ok((Some(tx), Some(handle)))
 }
 
-fn build_detector(args: &RunArgs) -> anyhow::Result<Detector> {
-    match args.method.as_str() {
+/// Build the adapter detector: the model bundle's pinned choice, or an explicit
+/// `--method`, and an error rather than a silent guess when neither says.
+///
+/// `pin` is the detector a CRF bundle declares itself calibrated against
+/// (`(method, Some(onnx_path))`). The training window is defined relative to
+/// that detector's `adapter_end`, so a pin is a hard requirement rather than a
+/// preference.
+///
+/// LLR is never inferred. It costs 17.2 points of barcode recall against the
+/// same classifier and fails silently (escapepod-models#16), so it has to be
+/// asked for by name. Explicit `--method` overrides a pin — that has to stay
+/// possible to evaluate a new boundary model — except that a bundle pinning
+/// `cnn` refuses the downgrade, which is #16's runtime guard.
+fn build_detector(
+    args: &RunArgs,
+    pin: Option<(&str, Option<PathBuf>)>,
+) -> anyhow::Result<Detector> {
+    let pinned_method = pin.as_ref().map(|(m, _)| *m);
+    let pinned_onnx = pin.and_then(|(_, p)| p);
+    let method = match (args.method.as_deref(), pinned_method) {
+        (Some("llr"), Some("cnn")) => anyhow::bail!(
+            "this model is calibrated against CNN adapter boundaries and refuses \
+             `--method llr`: LLR costs 17.2 points of barcode recall on the same \
+             classifier (0.9928 -> 0.8196) and fails silently. Drop `--method llr`, \
+             or use a model that does not pin a detector."
+        ),
+        (Some(m), _) => m,
+        (None, Some(m)) => m,
+        (None, None) => anyhow::bail!(
+            "--method {{cnn,llr}} is required: this model does not pin a boundary \
+             detector, and LLR is never chosen for you. Use `--method cnn --cnn-model \
+             <FILE>` for the accuracy the shipped barcode models were measured at, or \
+             `--method llr` to opt into the classical detector (17.2 points worse on \
+             barcode recall — escapepod-models#16)."
+        ),
+    };
+    match method {
         "llr" => Ok(Detector::Llr {
             min_adapter: args.min_adapter,
             border_trim: args.border_trim,
@@ -1160,7 +1499,13 @@ fn build_detector(args: &RunArgs) -> anyhow::Result<Detector> {
                 let path = args
                     .cnn_model
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
+                    .or(pinned_onnx.as_ref())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--method cnn requires --cnn-model <FILE> (this model bundle \
+                             does not ship a boundary model)"
+                        )
+                    })?;
                 // `--gpu` with `--method cnn` runs detection on the GPU (one
                 // batched onnxruntime call per block) when built with cnn-gpu.
                 #[cfg(feature = "cnn-gpu")]
@@ -1180,6 +1525,7 @@ fn build_detector(args: &RunArgs) -> anyhow::Result<Detector> {
             }
             #[cfg(not(feature = "cnn-detect"))]
             {
+                let _ = pinned_onnx;
                 anyhow::bail!("--method cnn requires a build with `--features cnn-detect`")
             }
         }
@@ -1206,5 +1552,45 @@ fn print_summary(summary: &DemuxSummary) {
             style::count(total),
             summary.per_barcode.len()
         );
+    }
+}
+
+#[cfg(all(test, feature = "crf-decode"))]
+mod tests {
+    use super::crf_bundle_dir;
+
+    /// `--model` sniffing must not depend on the extension or the file name
+    /// alone: a CRF bundle is identified by its sidecar's `format` key, so a
+    /// classifier JSON living next to one, or a directory without a sidecar,
+    /// still routes to `load_any_model`.
+    #[test]
+    fn crf_bundle_detected_by_format_key_not_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Not a bundle: no metadata.json at all.
+        assert!(crf_bundle_dir(root).is_none());
+
+        // Not a bundle: metadata.json exists but declares something else.
+        let meta = root.join("metadata.json");
+        std::fs::write(&meta, r#"{"format":"something-else/1"}"#).unwrap();
+        assert!(crf_bundle_dir(root).is_none());
+        assert!(crf_bundle_dir(&meta).is_none());
+
+        // A bundle: recognised via the directory and via the sidecar itself,
+        // and both resolve to the directory the ONNX is loaded from.
+        std::fs::write(&meta, r#"{"format":"escapepod-crf-encoder/1"}"#).unwrap();
+        assert_eq!(crf_bundle_dir(root).as_deref(), Some(root));
+        assert_eq!(crf_bundle_dir(&meta).as_deref(), Some(root));
+
+        // A classifier JSON is never mistaken for a bundle, even beside one.
+        let svm = root.join("model.json");
+        std::fs::write(&svm, r#"{"label_mapper":{}}"#).unwrap();
+        assert!(crf_bundle_dir(&svm).is_none());
+
+        // Malformed sidecar: fall through to the JSON loader rather than
+        // failing here, so the error the user sees comes from the real parse.
+        std::fs::write(&meta, "not json").unwrap();
+        assert!(crf_bundle_dir(root).is_none());
     }
 }

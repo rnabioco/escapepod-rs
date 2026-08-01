@@ -88,6 +88,78 @@ pub struct CrfMetadata {
     pub standardisation: Standardisation,
     pub signal: SignalSpec,
     pub crf: CrfSpec,
+    /// References the decoded sequence is matched against, if the bundle
+    /// carries them.
+    ///
+    /// A CRF emits sequence, not a class index, so it is useless without a
+    /// reference set — but unlike the fingerprint heads it has nowhere natural
+    /// to keep one, so callers were passing it separately every time. Shipping
+    /// it here also fixes the trimming at export rather than at each call site:
+    /// the model emits `target[state_len:]`, so anyone writing their own CSV
+    /// can silently supply full-length targets, which inflates every distance
+    /// and compresses the confidence margin (escapepod-models#36). A
+    /// caller-supplied list still overrides this.
+    #[serde(default)]
+    pub barcodes: Option<Vec<BarcodeEntry>>,
+    /// The boundary detector this model is calibrated against, if the bundle
+    /// pins one.
+    ///
+    /// The training window is defined relative to that detector's
+    /// `adapter_end`, so pairing the model with a different detector silently
+    /// degrades it. That coupling is a property of the model and belongs with
+    /// it, not in the user's shell history.
+    #[serde(default)]
+    pub boundary: Option<BoundarySpec>,
+    /// Registry identity, for `--info` and for logging what actually ran.
+    #[serde(default)]
+    pub model: Option<ModelIdent>,
+    /// Published performance, carried verbatim from the model's provenance.
+    ///
+    /// Deliberately untyped: metric names differ per model kind and per
+    /// evaluation, and a schema here would either lag the provenance or force
+    /// every producer through this crate. `--info` pretty-prints whatever is
+    /// present rather than interpreting it.
+    #[serde(default)]
+    pub metrics: Option<serde_json::Value>,
+}
+
+/// Who this model is, for provenance in logs and `--info`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelIdent {
+    pub id: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub chemistry: Option<String>,
+    /// What the model does and anything a user needs to know before trusting
+    /// its output.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Caveats worth surfacing every time, e.g. a confounded pilot.
+    #[serde(default)]
+    pub caveats: Vec<String>,
+}
+
+/// One reference a decoded sequence can be matched to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BarcodeEntry {
+    pub name: String,
+    /// The sequence the model EMITS, not the training target.
+    pub sequence: String,
+}
+
+/// The boundary detector a CRF bundle is calibrated against.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BoundarySpec {
+    /// Detection method the model expects (`cnn` or `llr`).
+    pub method: String,
+    /// ONNX graph for `cnn`, relative to the sidecar. Absent means the bundle
+    /// names a method but does not ship the weights.
+    #[serde(default)]
+    pub onnx: Option<String>,
+    /// Registry id of that model, for provenance in logs.
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 fn default_onnx_name() -> String {

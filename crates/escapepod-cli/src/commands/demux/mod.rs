@@ -19,6 +19,7 @@ mod classify;
 mod detect;
 mod fingerprint;
 mod fp_io;
+mod info;
 #[cfg(feature = "demux-models")]
 pub mod models;
 mod run;

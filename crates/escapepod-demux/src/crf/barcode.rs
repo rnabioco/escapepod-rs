@@ -153,6 +153,41 @@ impl BarcodeRefs {
         Ok(out)
     }
 
+    /// Build a reference set from `(name, sequence)` pairs.
+    ///
+    /// For references that travel inside the model bundle rather than in a
+    /// separate CSV. Applies the same validation as [`Self::from_csv`] —
+    /// non-empty, ACGT-only, no duplicate names — because a bundle is no more
+    /// trustworthy than a file the user pointed at.
+    pub fn from_pairs<N, S>(pairs: impl IntoIterator<Item = (N, S)>) -> Result<Self, BarcodeError>
+    where
+        N: Into<String>,
+        S: AsRef<str>,
+    {
+        let path = || std::path::PathBuf::from("<bundle metadata.json>");
+        let mut out = Self::default();
+        for (i, (name, seq)) in pairs.into_iter().enumerate() {
+            let seq = seq.as_ref().to_ascii_uppercase();
+            if seq.is_empty() || !seq.bytes().all(|b| b"ACGT".contains(&b)) {
+                return Err(BarcodeError::BadSequence {
+                    path: path(),
+                    line: i + 1,
+                    seq,
+                });
+            }
+            let name = name.into();
+            if out.names.contains(&name) {
+                return Err(BarcodeError::DuplicateName { path: path(), name });
+            }
+            out.names.push(name);
+            out.seqs.push(seq.into_bytes());
+        }
+        if out.names.is_empty() {
+            return Err(BarcodeError::Empty { path: path() });
+        }
+        Ok(out)
+    }
+
     pub fn len(&self) -> usize {
         self.names.len()
     }

@@ -63,13 +63,13 @@ pub struct DetectArgs {
     /// `scripts/export_adapter_cnn_to_onnx.py` (those weights are CC BY-NC 4.0
     /// and not bundled). Runs batched on the CPU by default; pass `--gpu` (with
     /// a `--features cnn-gpu` build) for onnxruntime CUDA inference.
-    #[arg(
-        long,
-        default_value = "llr",
-        value_name = "{llr,cnn}",
-        help_heading = "Advanced Options"
-    )]
-    pub method: String,
+    ///
+    /// **No default** — LLR is opt-in, never inferred. It costs 17.2 points of
+    /// downstream barcode recall against the same classifier (0.9928 -> 0.8196,
+    /// escapepod-models#16) and the failure is silent: it runs and produces
+    /// plausible-looking boundaries.
+    #[arg(long, value_name = "{cnn,llr}", help_heading = "Advanced Options")]
+    pub method: Option<String>,
 
     /// Path to the boundary-CNN ONNX model (only used with `--method cnn`).
     #[cfg(feature = "cnn-detect")]
@@ -160,7 +160,16 @@ fn llr_boundaries(
 
 /// Run the detect subcommand.
 pub fn run(args: DetectArgs) -> anyhow::Result<()> {
-    match args.method.as_str() {
+    let Some(method) = args.method.clone() else {
+        anyhow::bail!(
+            "--method {{cnn,llr}} is required: LLR is never chosen for you. Use \
+             `--method cnn --cnn-model <FILE>` for the accuracy the shipped barcode \
+             models were measured at, or `--method llr` to opt into the classical \
+             detector (17.2 points worse on downstream barcode recall — \
+             escapepod-models#16)."
+        );
+    };
+    match method.as_str() {
         "llr" => run_llr(args),
         "cnn" => {
             #[cfg(feature = "cnn-detect")]
