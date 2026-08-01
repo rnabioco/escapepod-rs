@@ -208,12 +208,12 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(m) = &meta.model {
-        if !m.caveats.is_empty() {
-            heading("Caveats");
-            for c in &m.caveats {
-                println!("  {} {}", style::label("!"), c);
-            }
+    if let Some(m) = &meta.model
+        && !m.caveats.is_empty()
+    {
+        heading("Caveats");
+        for c in &m.caveats {
+            println!("  {} {}", style::label("!"), c);
         }
     }
 
