@@ -11,6 +11,8 @@ use tracing_subscriber::registry::LookupSpan;
 mod commands;
 mod progress;
 mod style;
+#[cfg(test)]
+mod test_env;
 mod threads;
 mod util;
 

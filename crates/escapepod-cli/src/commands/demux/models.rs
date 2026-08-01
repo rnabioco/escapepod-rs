@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn resolve_is_offline_and_explains_how_to_prefetch() {
         let tmp = tempfile::tempdir().unwrap();
-        temp_env(
+        crate::test_env::temp_env(
             &[(
                 "ESCAPEPOD_DEMUX_MODEL_CACHE",
                 Some(tmp.path().to_str().unwrap()),
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn cache_dir_precedence() {
-        temp_env(
+        crate::test_env::temp_env(
             &[
                 ("ESCAPEPOD_DEMUX_MODEL_CACHE", Some("/x/cache")),
                 ("XDG_CACHE_HOME", Some("/x/xdg")),
@@ -639,7 +639,7 @@ mod tests {
             ],
             || assert_eq!(cache_dir().unwrap(), PathBuf::from("/x/cache")),
         );
-        temp_env(
+        crate::test_env::temp_env(
             &[
                 ("ESCAPEPOD_DEMUX_MODEL_CACHE", None),
                 ("XDG_CACHE_HOME", Some("/x/xdg")),
@@ -653,7 +653,7 @@ mod tests {
             },
         );
         // Empty XDG is treated as unset, per the spec.
-        temp_env(
+        crate::test_env::temp_env(
             &[
                 ("ESCAPEPOD_DEMUX_MODEL_CACHE", None),
                 ("XDG_CACHE_HOME", Some("")),
@@ -684,27 +684,5 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    /// Set env vars for the duration of a closure, restoring them afterwards.
-    fn temp_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let saved: Vec<_> = vars
-            .iter()
-            .map(|(k, _)| (*k, std::env::var_os(k)))
-            .collect();
-        for (k, v) in vars {
-            match v {
-                // SAFETY: single-threaded test bodies; restored below.
-                Some(v) => unsafe { std::env::set_var(k, v) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => unsafe { std::env::set_var(k, v) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-        }
     }
 }

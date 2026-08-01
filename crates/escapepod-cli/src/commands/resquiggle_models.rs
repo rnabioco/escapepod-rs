@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn cache_dir_precedence() {
         // ESCAPEPOD_KMER_CACHE wins outright.
-        temp_env(
+        crate::test_env::temp_env(
             &[
                 ("ESCAPEPOD_KMER_CACHE", Some("/x/cache")),
                 ("XDG_CACHE_HOME", Some("/x/xdg")),
@@ -319,7 +319,7 @@ mod tests {
             || assert_eq!(cache_dir().unwrap(), PathBuf::from("/x/cache")),
         );
         // Falls back to XDG when the explicit var is unset/empty.
-        temp_env(
+        crate::test_env::temp_env(
             &[
                 ("ESCAPEPOD_KMER_CACHE", None),
                 ("XDG_CACHE_HOME", Some("/x/xdg")),
@@ -333,7 +333,7 @@ mod tests {
             },
         );
         // Empty XDG is treated as unset → HOME.
-        temp_env(
+        crate::test_env::temp_env(
             &[
                 ("ESCAPEPOD_KMER_CACHE", None),
                 ("XDG_CACHE_HOME", Some("")),
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn resolve_uncached_model_hints_prefetch() {
-        temp_env(
+        crate::test_env::temp_env(
             &[("ESCAPEPOD_KMER_CACHE", Some("/nonexistent/escpod-cache"))],
             || {
                 let err = resolve("rna004").unwrap_err().to_string();
@@ -364,30 +364,5 @@ mod tests {
                 assert!(err.contains("models fetch rna004"), "{err}");
             },
         );
-    }
-
-    /// Set env vars for the duration of `f`, restoring prior values after.
-    /// Serialized via a mutex since env is process-global.
-    fn temp_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
-            .iter()
-            .map(|(k, _)| ((*k).to_string(), std::env::var_os(k)))
-            .collect();
-        for (k, v) in vars {
-            match v {
-                Some(val) => unsafe { std::env::set_var(k, val) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(val) => unsafe { std::env::set_var(&k, val) },
-                None => unsafe { std::env::remove_var(&k) },
-            }
-        }
     }
 }
