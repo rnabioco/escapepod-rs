@@ -70,9 +70,12 @@
 
 mod classify;
 pub mod crf;
+
 mod fingerprint;
 mod gbm;
 mod model;
+#[cfg(any(feature = "cnn-gpu", feature = "crf-gpu"))]
+mod ort_ep;
 mod probability;
 mod svm;
 
