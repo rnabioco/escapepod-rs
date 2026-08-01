@@ -35,7 +35,6 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use ort::execution_providers::CUDAExecutionProvider;
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
@@ -106,7 +105,7 @@ impl CrfEncoderGpu {
                 .map_err(|e| CrfError::Load(e.to_string()))?;
         }
         let session = builder
-            .with_execution_providers([CUDAExecutionProvider::default().build()])
+            .with_execution_providers(crate::ort_ep::cuda_providers())
             .map_err(|e| CrfError::Load(e.to_string()))?
             .commit_from_file(onnx)
             .map_err(|e| CrfError::Load(e.to_string()))?;
