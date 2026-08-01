@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use fqxv_align::wfa_align;
+use fqxv_align::{wfa_align, wfa_align_opt};
 
 /// A barcode reference set: names and their target sequences.
 #[derive(Debug, Clone, Default)]
@@ -237,7 +237,19 @@ impl BarcodeRefs {
         let (mut best, mut best_at) = (u32::MAX, 0usize);
         let mut second = u32::MAX;
         for (i, refseq) in self.seqs.iter().enumerate() {
-            let d = edit_distance(refseq, query);
+            // Cap each comparison at the current runner-up. Both branches below
+            // discard any `d >= second`, so a reference that cannot beat it does
+            // not need its exact distance — only the fact that it lost. WFA's
+            // work scales with the distance it is allowed to reach, so this is
+            // what actually buys the early abandonment this module was written
+            // around: without a cap the `max_score` guard can never fire and
+            // every reference runs to its true optimum plus a full traceback.
+            //
+            // `best <= second` holds throughout (the swap below preserves it),
+            // so capping at `second` cannot hide a new best either.
+            let Some(d) = edit_distance_within(refseq, query, second) else {
+                continue;
+            };
             if d < best {
                 second = best;
                 best = d;
@@ -269,6 +281,26 @@ fn edit_distance(a: &[u8], b: &[u8]) -> u32 {
     wfa_align(a, b, cap).dist
 }
 
+/// Levenshtein distance, but only when it is strictly below `limit`.
+///
+/// `Some(d)` iff `d < limit`; `None` means "at least `limit`", with no exact
+/// value computed. WFA abandons as soon as its wavefront passes `max_score`, so
+/// a reference far from the query stops early instead of running to its true
+/// optimum — and `wfa_align_opt` returns before the traceback, which is where
+/// the per-comparison allocations live.
+///
+/// `limit` is clamped to the longest possible optimal score so that the
+/// unbounded case (`u32::MAX`, the first comparison) stays exact rather than
+/// asking WFA for a score it can never reach.
+fn edit_distance_within(a: &[u8], b: &[u8], limit: u32) -> Option<u32> {
+    if limit == 0 {
+        return None;
+    }
+    let max_possible = (a.len() + b.len()) as u32;
+    let cap = (limit - 1).min(max_possible);
+    wfa_align_opt(a, b, cap).map(|al| al.dist)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +320,115 @@ mod tests {
             std::mem::swap(&mut prev, &mut cur);
         }
         prev[b.len()]
+    }
+
+    /// `match_sequence` as it read before the runner-up cap: every reference
+    /// compared to its true optimum, nothing abandoned.
+    fn match_uncapped(refs: &BarcodeRefs, query: &[u8]) -> Option<BarcodeMatch> {
+        if refs.seqs.is_empty() {
+            return None;
+        }
+        let (mut best, mut best_at) = (u32::MAX, 0usize);
+        let mut second = u32::MAX;
+        for (i, refseq) in refs.seqs.iter().enumerate() {
+            let d = edit_distance(refseq, query);
+            if d < best {
+                second = best;
+                best = d;
+                best_at = i;
+            } else if d < second {
+                second = d;
+            }
+        }
+        let second_best_dist = (refs.seqs.len() > 1).then_some(second);
+        Some(BarcodeMatch {
+            index: best_at,
+            best_dist: best,
+            second_best_dist,
+            margin: second_best_dist.map(|s| s.saturating_sub(best)),
+        })
+    }
+
+    /// Capping each comparison at the running runner-up must not change a single
+    /// field of the result — including the tie-to-lowest-index rule and the
+    /// runner-up distance the margin is computed from. This is the whole
+    /// correctness argument for the cap, so it is checked against the previous
+    /// implementation rather than against hand-picked expectations.
+    #[test]
+    fn capped_matching_is_identical_to_uncapped() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for trial in 0..400 {
+            // Reference banks from 1 to 12 codes, so the single-reference and
+            // ties-everywhere cases are both covered.
+            let n_refs = 1 + (trial % 12);
+            let len = 20 + (trial % 21);
+            let pairs: Vec<(String, String)> = (0..n_refs)
+                .map(|k| {
+                    let s: String = (0..len)
+                        .map(|_| b"ACGT"[(next() % 4) as usize] as char)
+                        .collect();
+                    (format!("bc{k}"), s)
+                })
+                .collect();
+            let refs = BarcodeRefs::from_pairs(pairs.clone()).unwrap();
+
+            for q in 0..6 {
+                // Queries: mutated copies of a reference, plus pure noise.
+                let query: Vec<u8> = if q < 4 {
+                    let mut s = pairs[(next() as usize) % n_refs].1.clone().into_bytes();
+                    for _ in 0..(q * 3) {
+                        let p = (next() as usize) % s.len();
+                        s[p] = b"ACGT"[(next() % 4) as usize];
+                    }
+                    s.truncate(s.len() - (next() as usize % 4));
+                    s
+                } else {
+                    (0..len).map(|_| b"ACGT"[(next() % 4) as usize]).collect()
+                };
+
+                let got = refs.match_sequence(&query);
+                let want = match_uncapped(&refs, &query);
+                assert_eq!(got, want, "trial {trial}, query {q}: {query:?}");
+            }
+        }
+    }
+
+    /// The cap must never turn a genuine best hit into a miss, however tight the
+    /// runner-up gets: an exact match is distance 0 and has to survive.
+    #[test]
+    fn exact_match_survives_the_tightest_cap() {
+        let refs = BarcodeRefs::from_pairs([
+            ("a", "ACGTACGTACGTACGTACGT"),
+            ("b", "ACGTACGTACGTACGTACGA"),
+            ("c", "TTTTTTTTTTTTTTTTTTTT"),
+        ])
+        .unwrap();
+        // "b" is 1 away from "a", so by the time "c" is reached the cap is 1.
+        let m = refs.match_sequence(b"ACGTACGTACGTACGTACGT").unwrap();
+        assert_eq!((m.index, m.best_dist), (0, 0));
+        assert_eq!(m.second_best_dist, Some(1));
+        assert_eq!(m.margin, Some(1));
+    }
+
+    #[test]
+    fn edit_distance_within_reports_only_below_the_limit() {
+        // "abcde" vs "abXde" is distance 1.
+        let (a, b) = (b"ACGTA".as_slice(), b"ACTTA".as_slice());
+        assert_eq!(edit_distance(a, b), 1);
+        assert_eq!(edit_distance_within(a, b, 2), Some(1));
+        // limit == the true distance means "cannot beat it" — no value.
+        assert_eq!(edit_distance_within(a, b, 1), None);
+        assert_eq!(edit_distance_within(a, b, 0), None);
+        // An unbounded limit stays exact rather than overflowing the cap.
+        assert_eq!(edit_distance_within(a, b, u32::MAX), Some(1));
+        // Identical sequences are reachable at any non-zero limit.
+        assert_eq!(edit_distance_within(a, a, 1), Some(0));
     }
 
     fn write_csv(body: &str) -> tempfile::NamedTempFile {

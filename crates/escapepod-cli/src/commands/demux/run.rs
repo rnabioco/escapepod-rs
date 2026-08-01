@@ -616,8 +616,27 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // and when a channel fills, rayon workers block inside `for_each` on
     // `send` — and blocked rayon workers cannot be stolen from, so one
     // saturated writer stalls the whole pool.
+    //
+    // The floor is what makes the budget approximate rather than absolute: at
+    // more than `ROUTER_TOTAL_SLOTS / MIN_ROUTER_DEPTH` barcodes the per-barcode
+    // share falls below it and total slots start scaling with the barcode count
+    // again. That is deliberate — a channel too shallow to absorb a burst stalls
+    // the pool, which costs more than the memory — but it is why the floor is
+    // 64 and not the 256 it started as. The CRF head takes its barcode set from
+    // a user-supplied reference CSV, so the count is unbounded, and a 256 floor
+    // put a 384-plex set at ~1 GB, twice the budget this is supposed to enforce.
+    // No shipping design is affected: the floor does not bind until 768
+    // barcodes, so 4-, 5-, 12-, 16- and 96-code models all get the same depth
+    // they got before.
     let barcodes = model.barcode_names();
-    let router_depth = (ROUTER_TOTAL_SLOTS / barcodes.len().max(1)).clamp(256, 4096);
+    let n_barcodes = barcodes.len().max(1);
+    let router_depth = (ROUTER_TOTAL_SLOTS / n_barcodes).clamp(MIN_ROUTER_DEPTH, 4096);
+    if ROUTER_TOTAL_SLOTS / n_barcodes < MIN_ROUTER_DEPTH {
+        tracing::debug!(
+            "{n_barcodes} barcodes x depth {router_depth} exceeds the {ROUTER_TOTAL_SLOTS}-slot \
+             router budget; peak router memory will scale with the barcode count"
+        );
+    }
 
     let mut routers: Routers = HashMap::new();
     let mut writer_handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<usize>>)> =
@@ -722,6 +741,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
 /// Split evenly per barcode and clamped — see the router setup in `run`.
 const ROUTER_TOTAL_SLOTS: usize = 49_152;
 
+/// Shallowest per-barcode writer channel the router will hand out.
+///
+/// Below this a burst on one barcode blocks a rayon worker inside `send`, and
+/// blocked workers cannot be stolen from. This floor is what makes
+/// [`ROUTER_TOTAL_SLOTS`] a target rather than a hard cap: past
+/// `ROUTER_TOTAL_SLOTS / MIN_ROUTER_DEPTH` = 768 barcodes the budget is
+/// knowingly exceeded, and `run` logs when that happens.
+const MIN_ROUTER_DEPTH: usize = 64;
+
 /// Upper bound on reads accumulated into one detect+classify block. POD5 Arrow
 /// read-batches are small (~1000 reads), so detecting per batch makes GPU CNN
 /// fire many tiny calls; accumulating across batches into a large block groups
@@ -742,6 +770,14 @@ const DETECT_WINDOW: usize = 65_536;
 ///
 /// 128 MB measured best on 1.22 M reads; larger is worse on both wall time and
 /// RSS (512 MB: 74.4 s / 13.07 GB vs 128 MB: 63.8 s / 12.68 GB).
+///
+/// This bounds **one block**, not the process. [`fill_shard`] enforces it per
+/// filler thread, so blocks in flight are roughly
+/// `filler_threads() * (BLOCK_QUEUE_DEPTH + 1) + 1` — about 640 MB at the
+/// defaults and ~1.4 GB at `ESCAPEPOD_DEMUX_FILLERS=8`. That is already what the
+/// peak-RSS column in [`filler_threads`]' table is measuring, so the 128 MB
+/// figure is tuned *with* the multiplier, not against it; scale the filler count
+/// to trade throughput for footprint rather than shrinking this.
 const BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Blocks queued between the reader threads and the processing loop.
@@ -1120,17 +1156,26 @@ fn produce_cpu_crf(
         |sigs, items| {
             let bounds = detector.detect_batch(&sigs);
             sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
-                CrfScratch::new,
-                |scratch, ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
+                || (CrfScratch::new(), Vec::<f32>::new()),
+                |(scratch, window), ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
                     let (barcode, conf) = (|| {
                         let adc = signal.as_ref()?;
                         // The detector reports `adapter_end` as an index into
-                        // the decoded prefix, which is what `prep` wants.
-                        let pa = adc_to_pa(adc, read.calibration_offset, read.calibration_scale);
-                        let window = meta.prep(&pa, adapter_end)?;
+                        // the decoded prefix, which is what `prep` wants. Only
+                        // the `chunk` samples ending there are converted — the
+                        // prefix itself can be the whole read under LLR.
+                        if !meta.prep_adc_into(
+                            adc,
+                            adapter_end,
+                            read.calibration_offset,
+                            read.calibration_scale,
+                            window,
+                        ) {
+                            return None;
+                        }
                         let seq = head
                             .encoder
-                            .basecall_prepped(&window, scratch)
+                            .basecall_prepped(window, scratch)
                             .inspect_err(|e| tracing::warn!("encoder: {e}"))
                             .ok()?;
                         let m = head.refs.match_sequence(seq.as_bytes())?;
@@ -1164,19 +1209,6 @@ fn produce_cpu_crf(
             );
         },
     )
-}
-
-/// ADC counts to picoamps, fused so there is one rounding step.
-///
-/// Matches `escapepod_python::adc_to_pa` and `demux basecall`'s own conversion;
-/// the reference `pod5` package computes it unfused, which differs by ~1 ulp —
-/// thousands of times below the standardisation scale and irrelevant to the
-/// decode.
-#[cfg(feature = "crf-decode")]
-fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
-    raw.iter()
-        .map(|&v| (f32::from(v) + offset) * scale)
-        .collect()
 }
 
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a

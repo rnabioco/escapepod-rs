@@ -199,6 +199,22 @@
 
 ### Fixed
 
+- **The two CRF entry points computed picoamps differently.** `demux basecall`
+  and `escapepod_python::adc_to_pa` use a fused `adc.mul_add(scale, offset *
+  scale)`; the fused `demux` pipeline used an unfused `(adc + offset) * scale`
+  despite a comment claiming it matched the reference — two roundings instead of
+  one, ~1 ulp apart. Both now use the reference form. `demux basecall` is
+  unaffected; the fused pipeline's encoder input shifts by ~1 ulp, which moved
+  the reported confidence on 1 of 992 and 7 of 9943 reads in a parity run and
+  changed **no** barcode call.
+- **The router's memory budget is honoured up to 768 barcodes, not 192.**
+  `ROUTER_TOTAL_SLOTS` is meant to cap queued-read memory regardless of barcode
+  count, but the per-barcode depth was clamped to a floor of 256, so past 192
+  barcodes the total scaled with the barcode count again — the exact behaviour
+  the budget replaced. The CRF head takes its references from a user-supplied
+  CSV, so the count is unbounded, and a 384-plex set sat at roughly twice the
+  budget. The floor is now 64 and any overshoot is logged. No shipping design
+  changes: the floor does not bind until 768 barcodes.
 - **`demux detect --method cnn` honours `-t/-j` again.** It ran a full-width
   rayon pool for every value of the flag — 18 threads and ~1550% CPU at `-j 1`
   just as at `-j 16` — so a Slurm job could not be held to its allocation.
@@ -281,6 +297,32 @@
   map is a `BTreeMap`; three consecutive runs are byte-identical (#152).
 
 ### Performance
+
+- **Barcode matching abandons early, as it was always meant to.** `edit_distance`
+  passed WFA a cap of `a.len() + b.len()` — the largest score any alignment can
+  reach — so the `max_score` guard could never fire and every reference ran to
+  its true optimum plus a full traceback. The module was written around WFA
+  precisely because its work scales with edit *distance*, so the cap was
+  defeating the reason for the algorithm choice. Each comparison is now capped at
+  the running runner-up, which both branches of the selection loop already treat
+  as a discard threshold, so the result is unchanged field for field: per
+  comparison 7.74 µs → 5.65 µs at 16 references and → 2.47 µs at 96 (the cap
+  tightens faster with more references, so a 96-plex read goes ~743 µs → 237 µs,
+  3.1×). Pinned by a 2400-case test against the previous implementation.
+- **The CRF encoder no longer copies its scores out.** `basecall_prepped`
+  decoded from an owned `Vec` that `encode` filled element by element —
+  `t_len * n_score` floats, 1 MB per read for RNA004 — which the decode's first
+  loop then immediately transposed into `CrfScratch` and dropped. It now decodes
+  straight out of tract's output tensor. `encode` still exists for callers that
+  want to own the scores. The decode backend is also resolved once at load
+  instead of re-probed per read.
+- **Only the model's window is calibrated, not the whole decoded prefix.**
+  `prep` needs `chunk` samples of pA ending at `adapter_end`, but callers
+  converted every decoded sample to pA first — `max_obs_trace` (16 000, 8× the
+  window) under the CNN detector, and the *entire read* under LLR, which sets no
+  decode bound at all. `prep_adc_into` fuses calibration and standardisation into
+  one pass over exactly the 2000 samples the encoder sees, writing into a
+  per-worker buffer.
 
 - **Fused `demux` CRF head is 1.36–2.25× faster** (10k reads 23.3 s → 17.0 s;
   1k reads 4.91 s → 2.19 s, 32 cores), bit-identically: per-read barcode calls
