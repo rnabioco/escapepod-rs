@@ -35,8 +35,8 @@ thiserror = { workspace = true, optional = true }
 [dev-dependencies]
 arrow = { workspace = true }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-noodles-bam = "0.91"
-noodles-sam = "0.86"
+noodles-bam = "0.92"
+noodles-sam = "0.87"
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 tempfile = "3"
 
