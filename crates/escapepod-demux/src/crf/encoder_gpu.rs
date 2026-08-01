@@ -137,10 +137,17 @@ impl CrfEncoderGpu {
     /// Returns one `t_len * n_score` score buffer per input, already
     /// de-interleaved out of the time-major `[T, batch, n_score]` output into
     /// the per-read `[t][dest][edge]` layout the decode wants.
+    ///
+    /// Every read's scores are held at once — `t_len * n_score` floats is 1 MB
+    /// for the RNA004 geometry, so this is 1 MB *per input*. Prefer
+    /// [`basecall_batch`](Self::basecall_batch), which decodes each device batch
+    /// before encoding the next and so never holds more than `batch_rows` of
+    /// them.
     pub fn encode_batch(&self, prepped: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, CrfError> {
         let mut out = Vec::with_capacity(prepped.len());
         for chunk in prepped.chunks(self.batch_rows) {
-            out.extend(self.run_batch(chunk)?);
+            let rows: Vec<&[f32]> = chunk.iter().map(Vec::as_slice).collect();
+            out.extend(self.run_batch(&rows)?);
         }
         Ok(out)
     }
@@ -152,7 +159,7 @@ impl CrfEncoderGpu {
     /// this is what adapts it to the device. Splitting is exact: every window
     /// is the same length, nothing is padded, and the batch axis is
     /// independent, so a split batch and a whole one give identical scores.
-    fn run_batch(&self, rows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, CrfError> {
+    fn run_batch(&self, rows: &[&[f32]]) -> Result<Vec<Vec<f32>>, CrfError> {
         match self.try_run_batch(rows) {
             Err(CrfError::Run(msg)) if is_oom(&msg) && rows.len() > 1 => {
                 let half = rows.len().div_ceil(2);
@@ -164,7 +171,7 @@ impl CrfEncoderGpu {
         }
     }
 
-    fn try_run_batch(&self, rows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, CrfError> {
+    fn try_run_batch(&self, rows: &[&[f32]]) -> Result<Vec<Vec<f32>>, CrfError> {
         let chunk = self.meta.signal.chunk;
         let batch = rows.len();
         let mut flat = Vec::with_capacity(batch * chunk);
@@ -210,6 +217,13 @@ impl CrfEncoderGpu {
     ///
     /// `prepped[i] == None` (a read with no usable window) yields `None` and
     /// never reaches the device.
+    ///
+    /// Encode and decode alternate one device batch at a time rather than
+    /// encoding everything first. `batch_rows` bounds only the *device*-side
+    /// activations; the scores coming back are 1 MB per read, so holding a
+    /// whole caller batch would retain gigabytes of host memory for an Arrow
+    /// batch of a few thousand reads. Interleaving caps that at `batch_rows`
+    /// reads' worth regardless of how many reads are handed in.
     pub fn basecall_batch(
         &self,
         prepped: &[Option<Vec<f32>>],
@@ -217,31 +231,37 @@ impl CrfEncoderGpu {
         let valid: Vec<usize> = (0..prepped.len())
             .filter(|&i| prepped[i].is_some())
             .collect();
-        let windows: Vec<Vec<f32>> = valid
-            .iter()
-            .map(|&i| prepped[i].as_ref().unwrap().clone())
-            .collect();
-        let scores = self.encode_batch(&windows)?;
 
         let backend = Backend::best_for(&self.layout);
-        let decoded: Result<Vec<String>, CrfError> = scores
-            .par_iter()
-            .map_init(CrfScratch::new, |scratch, s| {
-                decode_with(
-                    &self.layout,
-                    &self.alphabet,
-                    s,
-                    self.meta.t_len(),
-                    scratch,
-                    backend,
-                )
-                .map_err(|e| CrfError::Decode(e.to_string()))
-            })
-            .collect();
-
         let mut out = vec![None; prepped.len()];
-        for (&i, seq) in valid.iter().zip(decoded?) {
-            out[i] = Some(seq);
+
+        for idx in valid.chunks(self.batch_rows) {
+            // Borrowed, not cloned: `prepped` outlives the call, and these
+            // windows are `chunk` floats each on the way to a device copy.
+            let rows: Vec<&[f32]> = idx
+                .iter()
+                .map(|&i| prepped[i].as_deref().unwrap())
+                .collect();
+            let scores = self.run_batch(&rows)?;
+
+            let decoded: Result<Vec<String>, CrfError> = scores
+                .par_iter()
+                .map_init(CrfScratch::new, |scratch, s| {
+                    decode_with(
+                        &self.layout,
+                        &self.alphabet,
+                        s,
+                        self.meta.t_len(),
+                        scratch,
+                        backend,
+                    )
+                    .map_err(|e| CrfError::Decode(e.to_string()))
+                })
+                .collect();
+
+            for (&i, seq) in idx.iter().zip(decoded?) {
+                out[i] = Some(seq);
+            }
         }
         Ok(out)
     }

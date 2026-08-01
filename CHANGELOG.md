@@ -282,6 +282,27 @@
 
 ### Performance
 
+- **Fused `demux` CRF head is 1.36–2.25× faster** (10k reads 23.3 s → 17.0 s;
+  1k reads 4.91 s → 2.19 s, 32 cores), bit-identically: per-read barcode calls
+  and every per-barcode POD5 are unchanged. `produce_cpu_crf` fanned out with
+  `.chunks(256)` and then ran the chunk *serially*, mirroring `produce_cpu_gbm`
+  — but that head chunks because `predict_many` is a genuinely batched kernel,
+  whereas tract has no batched LSTM, so the CRF chunk only ever serialized its
+  reads. At ~14 ms per read (13 ms encode + 1.2 ms decode, measured on rna) one
+  chunk is ~3.6 s of work no starved worker can steal, and a block with fewer
+  than `256 × threads` reads cannot fill the machine at all — 1000 reads made
+  just 4 tasks for 32 cores. Now `for_each_init`, which also moves `CrfScratch`
+  from per-chunk to per-worker.
+- **`CrfEncoderGpu::basecall_batch` no longer retains every read's scores.**
+  Encode and decode now alternate one device batch at a time instead of
+  encoding the whole caller batch first. `ESCAPEPOD_CRF_GPU_BATCH_ROWS` bounds
+  only the *device*-side activations; the scores coming back are `t_len *
+  n_score` floats — 1 MB per read for the RNA004 geometry — so a several-
+  thousand-read Arrow batch held gigabytes of host memory regardless of that
+  setting. Host high-water is now `batch_rows` reads' worth. The prepped
+  windows are also borrowed rather than cloned on the way to the device,
+  dropping one 8 KB copy and one allocation per read.
+
 - **Fused `demux` pipeline is 2.3× faster on GBM models** (151.0 s → 65.1 s on
   1.22M reads / 10.4 GB, 48 cores; CPU utilization 511% → 1273%), and 1.27×
   on DTW-SVM. The pipeline was neither compute- nor I/O-bound — it ran faster
