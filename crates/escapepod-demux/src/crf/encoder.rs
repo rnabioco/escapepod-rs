@@ -258,6 +258,52 @@ impl CrfMetadata {
         Some(out)
     }
 
+    /// [`Self::prep`], but straight from ADC counts and converting only the
+    /// window the model actually sees.
+    ///
+    /// The model reads `chunk` samples of calibrated pA ending at
+    /// `adapter_end`, but callers hold ADC counts for the whole *decoded
+    /// prefix* — `max_obs_trace` samples under the CNN detector (16 000 by
+    /// default, 8× the window) and the entire read under LLR, which has no
+    /// decode bound at all and routinely runs to millions of samples.
+    /// Calibrating all of that to read the last 2000 samples is the waste this
+    /// avoids: calibration and standardisation fuse into one pass over exactly
+    /// the window.
+    ///
+    /// Calibration is the **fused** `adc.mul_add(scale, offset * scale)` that
+    /// `escapepod_python::adc_to_pa` and `demux basecall` use, then
+    /// `(pa - mean) / stdev` — the same three operations in the same order, so
+    /// this is bit-identical to those two paths rather than merely equivalent.
+    ///
+    /// The fused pipeline previously used an unfused `(adc + offset) * scale`
+    /// here, which its own doc comment claimed matched the reference but did
+    /// not: two roundings instead of one, differing by ~1 ulp. Both CRF entry
+    /// points now agree with the reference.
+    ///
+    /// Writes into `out` so a per-worker buffer survives across reads. Returns
+    /// `false`, leaving `out` empty, exactly where [`Self::prep`] returns `None`.
+    pub fn prep_adc_into(
+        &self,
+        adc: &[i16],
+        adapter_end: usize,
+        offset: f32,
+        scale: f32,
+        out: &mut Vec<f32>,
+    ) -> bool {
+        out.clear();
+        if adapter_end < self.min_adapter_end() || adapter_end > adc.len() {
+            return false;
+        }
+        let (mean, stdev) = (self.standardisation.mean, self.standardisation.stdev);
+        let bias = offset * scale;
+        out.extend(
+            adc[adapter_end - self.signal.chunk..adapter_end]
+                .iter()
+                .map(|&v| (f32::from(v).mul_add(scale, bias) - mean) / stdev),
+        );
+        true
+    }
+
     /// Smallest `adapter_end` that yields a usable window.
     ///
     /// `extract_chunks.py` required `adapter_end > chunk + 200` when building
@@ -291,6 +337,9 @@ pub struct CrfEncoder {
     meta: CrfMetadata,
     layout: CrfLayout,
     alphabet: Vec<u8>,
+    /// Fastest decode kernels for this layout, resolved once at load rather
+    /// than re-probed on every read.
+    backend: Backend,
 }
 
 impl CrfEncoder {
@@ -325,9 +374,15 @@ impl CrfEncoder {
             meta,
             layout,
             alphabet,
+            backend: Backend::best_for(&layout),
         };
         encoder.probe_output_contract()?;
         Ok(encoder)
+    }
+
+    /// Decode backend chosen for this layout.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// One dummy forward pass asserting the time-major `[T, 1, n_score]`
@@ -370,24 +425,32 @@ impl CrfEncoder {
         .map_err(|e| CrfError::Decode(e.to_string()))
     }
 
-    /// Run the encoder on one standardised `chunk`-sample window, returning
-    /// `t_len * n_score` scores in the decoder's expected `[t][dest][edge]`
-    /// order.
-    pub fn encode(&self, prepped: &[f32]) -> Result<Vec<f32>, CrfError> {
+    /// One forward pass over a standardised `chunk`-sample window.
+    ///
+    /// Kept separate from the score extraction so callers that only want to read
+    /// the output can borrow it rather than own it — the outputs must stay alive
+    /// for as long as the borrow, which the return type makes explicit.
+    fn run_encoder(&self, prepped: &[f32]) -> Result<TVec<TValue>, CrfError> {
         let chunk = self.meta.signal.chunk;
         let input = Tensor::from_shape(&[1, 1, chunk], prepped)
             .map_err(|e| CrfError::Run(e.to_string()))?;
-        let outputs = self
-            .plan
+        self.plan
             .run(tvec!(input.into()))
-            .map_err(|e| CrfError::Run(e.to_string()))?;
+            .map_err(|e| CrfError::Run(e.to_string()))
+    }
+
+    /// Borrow one forward pass's scores as a flat `t_len * n_score` slice,
+    /// checking the time-major `[T, 1, n_score]` contract on the way.
+    ///
+    /// Batch is 1, so time-major already lays this read out contiguously and no
+    /// de-interleave is needed — the GPU path's `split_time_major` exists
+    /// precisely because that stops being true above batch 1.
+    fn scores_of<'a>(&self, outputs: &'a TVec<TValue>) -> Result<&'a [f32], CrfError> {
         let view = outputs[0]
             .to_plain_array_view::<f32>()
             .map_err(|e| CrfError::Run(e.to_string()))?;
-
         let t_len = self.meta.t_len();
-        let want = [t_len, 1, self.layout.n_score];
-        if view.shape() != want {
+        if view.shape() != [t_len, 1, self.layout.n_score] {
             return Err(CrfError::BadShape {
                 got: view.shape().to_vec(),
                 t: t_len,
@@ -395,18 +458,37 @@ impl CrfEncoder {
                 n_score: self.layout.n_score,
             });
         }
-        // Batch is 1, so time-major already lays this read out contiguously.
-        Ok(view.iter().copied().collect())
+        view.to_slice()
+            .ok_or_else(|| CrfError::Run("encoder output is not contiguous".into()))
+    }
+
+    /// Run the encoder on one standardised `chunk`-sample window, returning
+    /// `t_len * n_score` scores in the decoder's expected `[t][dest][edge]`
+    /// order.
+    ///
+    /// This allocates and copies the whole score buffer — 1 MB for the RNA004
+    /// geometry. [`Self::basecall_prepped`] decodes out of tract's own output
+    /// instead and does not pay it; prefer that unless you genuinely need to own
+    /// the scores.
+    pub fn encode(&self, prepped: &[f32]) -> Result<Vec<f32>, CrfError> {
+        let outputs = self.run_encoder(prepped)?;
+        Ok(self.scores_of(&outputs)?.to_vec())
     }
 
     /// Basecall one already-prepped read.
+    ///
+    /// The scores are decoded straight out of tract's output tensor. The decode
+    /// immediately transposes them into `scratch`, so materialising an owned
+    /// copy first would be a 1 MB allocation and memcpy per read that nothing
+    /// ever reads twice.
     pub fn basecall_prepped(
         &self,
         prepped: &[f32],
         scratch: &mut CrfScratch,
     ) -> Result<String, CrfError> {
-        let scores = self.encode(prepped)?;
-        self.decode_scores(&scores, scratch, Backend::best_for(&self.layout))
+        let outputs = self.run_encoder(prepped)?;
+        let scores = self.scores_of(&outputs)?;
+        self.decode_scores(scores, scratch, self.backend)
     }
 
     /// Basecall one read from raw calibrated pA and a detected adapter end.
@@ -475,6 +557,46 @@ mod tests {
         assert!(m.prep(&signal, 2199).is_none(), "below the training margin");
         assert!(m.prep(&signal, 2200).is_some(), "exactly at the margin");
         assert!(m.prep(&signal, 6000).is_none(), "past the end of the read");
+    }
+
+    /// `prep_adc_into` must be bit-identical to calibrating the whole prefix
+    /// and calling `prep` on it — that equality is the only reason it is safe to
+    /// convert just the window. Checked against the *fused* reference
+    /// (`escapepod_python::adc_to_pa`), which is what `demux basecall` used.
+    #[test]
+    fn prep_adc_into_matches_calibrate_then_prep() {
+        let m = meta();
+        let (offset, scale) = (7.5f32, 0.1875f32);
+        let adc: Vec<i16> = (0..5000).map(|i| ((i * 37) % 4096 - 2048) as i16).collect();
+
+        let bias = offset * scale;
+        let pa: Vec<f32> = adc
+            .iter()
+            .map(|&v| f32::from(v).mul_add(scale, bias))
+            .collect();
+
+        for end in [2200usize, 3000, 4000, 5000] {
+            let want = m.prep(&pa, end).expect("usable window");
+            let mut got = Vec::new();
+            assert!(m.prep_adc_into(&adc, end, offset, scale, &mut got));
+            assert_eq!(got, want, "adapter_end {end}");
+        }
+    }
+
+    /// The rejection cases must line up exactly with `prep`, including the
+    /// `adapter_end == 0` sentinel, and must leave the buffer empty so a reused
+    /// per-worker `Vec` cannot leak the previous read's window.
+    #[test]
+    fn prep_adc_into_rejects_where_prep_does() {
+        let m = meta();
+        let adc = vec![100i16; 5000];
+        let mut buf = vec![1.0f32; 8];
+        for end in [0usize, 2199, 6000] {
+            assert!(!m.prep_adc_into(&adc, end, 0.0, 1.0, &mut buf), "end {end}");
+            assert!(buf.is_empty(), "end {end}: buffer not cleared");
+        }
+        assert!(m.prep_adc_into(&adc, 2200, 0.0, 1.0, &mut buf));
+        assert_eq!(buf.len(), 2000);
     }
 
     #[test]

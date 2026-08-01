@@ -78,7 +78,7 @@ pub struct BasecallArgs {
 /// Where encoder inference runs. The lattice decode is on the CPU in both
 /// cases — see `escapepod_demux::crf::encoder_gpu` for why.
 enum Basecaller {
-    Cpu(CrfEncoder),
+    Cpu(Box<CrfEncoder>),
     #[cfg(feature = "crf-gpu")]
     Gpu(Box<escapepod_demux::crf::CrfEncoderGpu>),
 }
@@ -212,10 +212,10 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             args.threads,
         )?))
     } else {
-        Basecaller::Cpu(CrfEncoder::load_bundle(&args.model)?)
+        Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?))
     };
     #[cfg(not(feature = "crf-gpu"))]
-    let encoder = Basecaller::Cpu(CrfEncoder::load_bundle(&args.model)?);
+    let encoder = Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?));
 
     let meta = encoder.metadata();
     info!(
@@ -326,11 +326,18 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
                         .unwrap_or(0);
                     let window = (|| {
                         // Only the window ending at the adapter is ever read,
-                        // so decode that prefix rather than a whole transcript.
+                        // so decode that prefix rather than a whole transcript
+                        // — and calibrate only the window, not the prefix.
                         let adc = decode_chunks_to(chunks, Some(adapter_end))?;
-                        let signal =
-                            adc_to_pa(&adc, read.calibration_offset, read.calibration_scale);
-                        meta.prep(&signal, adapter_end)
+                        let mut w = Vec::new();
+                        meta.prep_adc_into(
+                            &adc,
+                            adapter_end,
+                            read.calibration_offset,
+                            read.calibration_scale,
+                            &mut w,
+                        )
+                        .then_some(w)
                     })();
                     (read.read_id, adapter_end, window)
                 })
@@ -393,16 +400,4 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// ADC counts to picoamps, fused so there is one rounding step.
-///
-/// Matches `escapepod_python::adc_to_pa`; the reference `pod5` package computes
-/// it unfused, which differs by ~1 ulp — thousands of times below the
-/// standardisation scale and irrelevant to the decode.
-fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
-    let bias = offset * scale;
-    raw.iter()
-        .map(|&adc| f32::from(adc).mul_add(scale, bias))
-        .collect()
 }
