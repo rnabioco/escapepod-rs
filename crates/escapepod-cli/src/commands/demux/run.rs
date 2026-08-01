@@ -1096,10 +1096,14 @@ fn produce_cpu_gbm(
 /// `meta.prep` still returns `None` when `adapter_end < chunk` (the adapter sits
 /// too close to the read start), and those route as unclassified.
 ///
-/// Batching mirrors `produce_cpu_gbm`: detect the whole block at once, then
-/// chunk so each rayon task preps, encodes and matches a run of reads. The
-/// encode is the dominant cost and tract has no batched LSTM, so parallelism is
-/// per read within the chunk.
+/// Detection is batched over the whole block, but the per-read work is *not*
+/// chunked the way `produce_cpu_gbm` chunks: that head batches because
+/// `predict_many` is a genuinely batched kernel, whereas tract has no batched
+/// LSTM, so a chunk here would only ever run its reads serially. At ~14 ms per
+/// read (13 ms encode + 1.2 ms decode) even a modest chunk is seconds of work a
+/// starved worker cannot steal, so this fans out per read and keeps one
+/// `CrfScratch` per *worker* via `for_each_init` — the same shape as
+/// `produce_cpu`.
 #[cfg(feature = "crf-decode")]
 fn produce_cpu_crf(
     args: &RunArgs,
@@ -1114,19 +1118,10 @@ fn produce_cpu_crf(
         &args.input,
         detector.signal_decode_bound(),
         |sigs, items| {
-            const CRF_CHUNK: usize = 256;
             let bounds = detector.detect_batch(&sigs);
-            let rows: Vec<_> = sigs
-                .into_iter()
-                .zip(bounds)
-                .zip(items)
-                .map(|((sig, b), item)| (sig, b, item))
-                .collect();
-
-            rows.into_par_iter().chunks(CRF_CHUNK).for_each(|chunk| {
-                let n = chunk.len();
-                let mut scratch = CrfScratch::new();
-                for (signal, (_s, adapter_end), (read, chunks, run_infos)) in chunk {
+            sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
+                CrfScratch::new,
+                |scratch, ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
                     let (barcode, conf) = (|| {
                         let adc = signal.as_ref()?;
                         // The detector reports `adapter_end` as an index into
@@ -1135,7 +1130,7 @@ fn produce_cpu_crf(
                         let window = meta.prep(&pa, adapter_end)?;
                         let seq = head
                             .encoder
-                            .basecall_prepped(&window, &mut scratch)
+                            .basecall_prepped(&window, scratch)
                             .inspect_err(|e| tracing::warn!("encoder: {e}"))
                             .ok()?;
                         let m = head.refs.match_sequence(seq.as_bytes())?;
@@ -1164,9 +1159,9 @@ fn produce_cpu_crf(
                         run_infos,
                         conf,
                     );
-                }
-                pb.inc(n as u64);
-            });
+                    pb.inc(1);
+                },
+            );
         },
     )
 }
