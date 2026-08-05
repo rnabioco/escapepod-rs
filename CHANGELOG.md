@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.0 (2026-08-04)
+
 ### Added
 
 - **`escpod demux models` — pinned manifest, verified cache, offline resolution**
@@ -48,19 +50,6 @@
   this. The same endpoint serves public repositories anonymously, so if the
   repository is opened up later this keeps working with no token and no code
   change. escpod's own test suite never fetches, so CI needs no secret.
-
-### Changed
-
-- **The default `escpod` binary now links a TLS stack** (`ureq`/rustls) and a
-  zip reader, via the new `model-fetch` feature. Measured cost: **32.76 MB →
-  34.74 MB stripped (+1.98 MB, +6.0%)**. This was previously avoided on purpose,
-  and it is a deliberate reversal: without it `escpod demux models fetch` cannot
-  exist in a released binary, and the models it serves are the
-  difference between 0.9928 and 0.8196 balanced recall. rustls (not OpenSSL)
-  keeps the static-musl release self-contained. `model-fetch` is separate from
-  the existing `models-download` precisely so the demux fetch could ship by
-  default without dragging in `experimental`, which gates the whole resquiggle
-  command.
 
 - **CTC-CRF barcode basecalling — `escpod demux basecall`.** escapepod-rs can
   now run a bonito-style CTC-CRF barcode model end to end: ONNX encoder
@@ -197,6 +186,40 @@
   "inference failed" — differencing against it would report a large
   disagreement that neither detector has.
 
+- **The fused `escpod demux` pipeline drives the CRF head**, so
+  `escpod demux in.pod5 --model <bundle> -d out/` produces barcoded POD5s with
+  nothing else on the command line. Previously the CRF was reachable only as
+  `demux basecall`, which takes boundaries as input, so using it meant
+  `detect → basecall → split`: two intermediate files and three passes over the
+  POD5. `--model` now accepts a CRF bundle directory — sniffed by the sidecar's
+  `format` key rather than the path — and runs detect → prep → basecall → match
+  → route, decoding each read once.
+
+  Verified against the 3-step path on 4,000 reads with the same detector,
+  encoder, and references: all **3,993 shared reads get an identical call** and
+  every barcode bin matches exactly. The fused path emits **4,000 rows to the
+  3-step path's 3,993** — `basecall` drops reads with no usable window so
+  `split` never sees them, whereas the fused path routes them `unclassified`
+  like the other heads. Output now reconciles with input.
+
+- **CRF bundles describe themselves, and `--info` interrogates one.**
+  `metadata.json` gains optional `barcodes`, `boundary`, `model`, and `metrics`
+  keys, so a bundle carries its own references and pinned detector instead of
+  needing `--barcodes`, `--method`, and `--cnn-model` on every invocation.
+
+  Carrying references in the bundle is not just ergonomics. The CRF has
+  `state_len=4` and emits `target[4:]`, so a hand-written CSV of full-length
+  targets still calls the same barcode but inflates every edit distance by 4 and
+  **compresses the confidence margin** that `--min-margin` and `--recovery` rank
+  on. Measured on 20,000 reads with the shipped weights: median `best_dist` 4 →
+  0, margin median 10 → 12/13, distinct margin values 12/11 → 15/14. Deriving
+  them at bundle-build time from the encoder's own `state_len` removes the
+  failure mode rather than documenting it; `--barcodes` remains as an override.
+
+  `--info` prints identity, geometry, references with their minimum pairwise
+  distance, the pinned detector, published metrics, and caveats, then exits
+  without touching a POD5.
+
 ### Fixed
 
 - **The two CRF entry points computed picoamps differently.** `demux basecall`
@@ -228,7 +251,82 @@
   at onnxruntime's default width and spawned alongside rayon's, so `--threads`
   did not bound the process even once the rayon half was fixed (#155).
 
+### Performance
+
+- **The CRF producer fans out per read, not per 256-read chunk.**
+  `produce_cpu_crf` chunked and then walked each chunk with a serial loop — a
+  shape copied from `produce_cpu_gbm`, where it is correct because
+  `predict_many` is a genuinely batched kernel. tract has no batched LSTM, so
+  the CRF chunk only serialized its reads. At ~14 ms per read one chunk is
+  ~3.6 s of work a starved worker cannot steal, and a block with fewer than
+  `256 × threads` reads could not fill the machine at all (1,000 reads produced
+  four tasks for 32 cores). `for_each_init(CrfScratch::new, …)` gives per-read
+  work stealing and moves the scratch from per-chunk to per-worker: **2.25× at
+  1k reads** (4.91 s → 2.19 s) and **1.36× at 10k** (23.3 s → 17.0 s) on 32
+  cores. The gap narrows as chunk count catches up to core count, which is the
+  predicted shape.
+
+- **Barcode matching abandons early, as it was always documented to.**
+  `edit_distance` passed WFA `cap = a.len() + b.len()` — the largest score any
+  alignment can reach — so the `max_score` guard could never fire and every
+  reference ran to its true optimum *and* did a full traceback, defeating the
+  reason WFA was chosen over a DP. Each comparison is now capped at the running
+  runner-up: both branches of the selection loop already discard any
+  `d >= second`, and `second` is monotonically non-increasing, so a reference
+  that cannot beat it never needs its exact distance. Per comparison, 7.74 µs →
+  5.65 µs at 16 references and 7.74 µs → 2.47 µs at 96 (**3.1× per read**,
+  ~743 → 237 µs) — the cap tightens faster with more references, so this scales
+  *with* the barcode design rather than against it. Output is unchanged field
+  for field, pinned by a 2,400-case test against the previous implementation.
+
+- **The encoder no longer copies 1 MB per read for nothing.**
+  `basecall_prepped` decoded from an owned `Vec` that `encode` filled element by
+  element (`t_len * n_score` floats, 1 MB for RNA004), which `decode_with`
+  immediately transposed into `CrfScratch` and dropped. It now decodes straight
+  out of tract's output tensor, and the decode backend is resolved once at load
+  instead of re-probed per read.
+
+- **Only the encoder's window is calibrated.** `prep` needs `chunk` samples of
+  pA ending at `adapter_end`, but callers converted the entire decoded prefix
+  first — 16,000 samples under the CNN detector (8× the window) and the whole
+  read under LLR, which sets no decode bound. `prep_adc_into` fuses calibration
+  and standardisation into one pass over exactly the 2,000 samples the encoder
+  sees, into a per-worker buffer.
+
+- **`basecall_batch` no longer retains every read's scores.**
+  `CrfEncoderGpu::basecall_batch` encoded the whole caller batch before decoding
+  any of it. `ESCAPEPOD_CRF_GPU_BATCH_ROWS` bounds *device*-side activations,
+  not the host, and the scores coming back are 1 MB per read for RNA004 — so an
+  Arrow batch of a few thousand reads retained gigabytes of host RAM regardless
+  of that knob. Encode and decode now alternate one device batch at a time,
+  capping host high-water at `batch_rows` reads' worth. Chunk boundaries are
+  unchanged, so the scores are identical. This is a memory fix, not an overlap
+  of encode with decode.
+
 ### Changed
+
+- **Breaking: `escpod demux` and `escpod demux detect` require `--method`**
+  when the model does not pin one. `--method` previously defaulted to `llr`,
+  and LLR boundaries cost **17.2 points** of barcode recall against the same
+  classifier (0.9928 → 0.8196) while failing silently — the run succeeds and
+  the output looks plausible. A bundle may now pin its detector, supplying both
+  method and weights; an explicit `--method` overrides that pin, except that a
+  bundle pinned to `cnn` **refuses** `--method llr`; with neither, the command
+  errors out naming the tradeoff instead of quietly picking the worse detector.
+  Scripts relying on the implicit default must add `--method llr` to keep their
+  current behaviour — which is the point, since that default was silently
+  costing 17.2 points.
+
+- **The default `escpod` binary now links a TLS stack** (`ureq`/rustls) and a
+  zip reader, via the new `model-fetch` feature. Measured cost: **32.76 MB →
+  34.74 MB stripped (+1.98 MB, +6.0%)**. This was previously avoided on purpose,
+  and it is a deliberate reversal: without it `escpod demux models fetch` cannot
+  exist in a released binary, and the models it serves are the
+  difference between 0.9928 and 0.8196 balanced recall. rustls (not OpenSSL)
+  keeps the static-musl release self-contained. `model-fetch` is separate from
+  the existing `models-download` precisely so the demux fetch could ship by
+  default without dragging in `experimental`, which gates the whole resquiggle
+  command.
 
 - **`-t/--threads` now defaults to 16 everywhere, capped at the CPUs actually
   available** (`available_parallelism()`, which respects cgroup quota and CPU
@@ -255,6 +353,17 @@
   previously `demux detect --method cnn` printed a dozen lines of tract SIMD
   kernel-probe output before doing any work. `RUST_LOG` still overrides
   everything, and `-q` still silences all but errors.
+
+### Build / Tooling
+
+- `ort` moves to `2.0.0-rc.13` and the CUDA execution provider is configured in
+  one place, shared by the `cnn-gpu` and `crf-gpu` paths instead of being set up
+  independently in each.
+- noodles bumps: `noodles-bam` 0.92, `noodles-sam` 0.87, `noodles-csi` 0.58
+  (together, since their APIs move as a set), and `noodles-bgzf` 0.49.
+- CI clippies the opt-in feature builds (`train`, `gpu`, `cnn-gpu`, `crf-gpu`)
+  and the CLI, which previously went unlinted — `crf-gpu` in particular did not
+  compile under `-D warnings` on `main`.
 
 ## 0.6.3 (2026-07-26)
 
