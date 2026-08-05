@@ -78,7 +78,11 @@ pub struct CrfLayout {
 impl CrfLayout {
     /// `n_states / n_base` — the block of destination states that share a
     /// source under a move edge.
+    ///
+    /// Only the AVX2/AVX-512 kernels need this; the scalar path derives the
+    /// source with [`CrfLayout::source_state`] instead.
     #[inline]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(super) fn group(&self) -> usize {
         self.group
     }
@@ -389,6 +393,7 @@ impl Backend {
     /// Every backend this CPU and layout support, fastest last. Used by tests
     /// and benchmarks to cover each one without hardcoding a CPU model.
     pub fn all_supported(layout: &CrfLayout) -> Vec<Self> {
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut out = vec![Self::Scalar];
         #[cfg(target_arch = "x86_64")]
         {
@@ -399,6 +404,7 @@ impl Backend {
                 out.push(Self::Avx512);
             }
         }
+        let _ = layout;
         out
     }
 }
