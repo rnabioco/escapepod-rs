@@ -20,54 +20,9 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::adapter_cnn::{
-    decode_adapter_end, group_by_len_bucketed, pack_batch, prep_adapter_signal, scatter_group,
+    decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
 };
 use crate::{AdapterCnnConfig, AdapterCnnError};
-
-/// Length bucket for batching (`ESCAPEPOD_CNN_GPU_LEN_BUCKET`).
-///
-/// **Defaults to 1 — exact-length grouping — because padding is not
-/// output-preserving here.** The knob exists so the trade can be re-measured,
-/// not because it should be turned on.
-///
-/// The motivation was real: [`prep_adapter_signal`] clamps its window to the
-/// read end, so every read shorter than `max_obs_trace` gets its own length.
-/// Over a production run's 527k reads, 68.6% reach the 806 cap and share one
-/// shape while the other 31.4% spread across **680 distinct lengths**, so a
-/// 65,536-read block issues one call of ~45,000 rows plus ~679 of ~30 rows. Each
-/// new shape pays fresh cuDNN plan selection: detection measured 401 s of device
-/// time in a 425 s wall, against ~0.01 ms/read for the same kernel at a steady
-/// shape (`examples/cnn_gpu_floor`).
-///
-/// Padding does not fix it, because **this graph is globally length-dependent**.
-/// `examples/cnn_pad_probe` runs one read at its exact length and again zero-padded
-/// to the cap, and compares raw scores position by position:
-///
-/// ```text
-/// prepped=38   max|Δ| = 4.50   first divergence at k=0    argmax 32 -> 37
-/// prepped=120  max|Δ| = 1.99   first divergence at k=0    argmax 42 -> 92
-/// prepped=250  max|Δ| = 3.47   first divergence at k=0
-/// ```
-///
-/// The divergence starts at **position 0**, nowhere near where the padding
-/// begins. That rules out a local receptive-field effect — which would appear
-/// near `valid_len`, and which a `valid_len` clamp could contain — and points at
-/// a normalisation over the length axis: appending zeros moves the statistics and
-/// every output shifts with them. No clamp can recover that.
-///
-/// It also means a read already at the 806 cap is unaffected only because
-/// bucketing appends *nothing* to it, not because padding is safe there.
-///
-/// So the fragmentation has to be addressed on the runtime side (per-shape plan
-/// selection) rather than by reshaping the input.
-fn resolve_len_bucket() -> usize {
-    const DEFAULT_BUCKET: usize = 1;
-    std::env::var("ESCAPEPOD_CNN_GPU_LEN_BUCKET")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_BUCKET)
-}
 
 /// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
 /// call, scaled to the device's memory. The largest length-group (every read
@@ -271,7 +226,7 @@ impl AdapterCnnGpu {
         valid_idx: &[usize],
         out: &mut [Result<usize, AdapterCnnError>],
     ) {
-        for (len, group) in group_by_len_bucketed(prepped, valid_idx, resolve_len_bucket()) {
+        for (len, group) in group_by_len(prepped, valid_idx) {
             let start_rows = (self.batch_elems / len.max(1)).max(1);
             // Work stack of `[lo, hi)` index ranges into `group`. On OOM a range
             // is split in half and pushed back, shrinking until it fits.

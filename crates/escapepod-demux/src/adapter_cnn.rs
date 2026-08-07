@@ -55,9 +55,22 @@ impl Default for AdapterCnnConfig {
 }
 
 impl AdapterCnnConfig {
+    /// The model's fixed input length, in downscaled samples.
+    ///
+    /// Mirrors escapepod-models `DataConfig.input_len`
+    /// (`(max_obs_trace - min_obs_adapter) // downscale_factor` = 1500), which is
+    /// the length every training example was padded to. Derived rather than
+    /// stored so it cannot drift from the three fields it depends on — though
+    /// none of this is declared in the model manifest today, which is the
+    /// underlying problem (#187).
+    pub fn input_len(&self) -> usize {
+        self.max_obs_trace.saturating_sub(self.min_obs_adapter) / self.downscale_factor.max(1)
+    }
+
     /// Preprocess a raw signal into the model input (slice + mean-pool +
-    /// median/MAD-normalize + truncate to the receptive-field-bounded cap), or
-    /// `None` if the read is too short. Exposed so callers can prep many reads
+    /// median/MAD-normalize + pad to [`input_len`](Self::input_len) with
+    /// `SCORE_EXCL`), or `None` if the read is too short. Exposed so callers can
+    /// prep many reads
     /// in parallel and then hand the prepped vectors to a batched detector
     /// (e.g. [`AdapterCnnGpu::detect_prepped`](crate::adapter_cnn_gpu::AdapterCnnGpu::detect_prepped)).
     pub fn prep(&self, signal_pa: &[f32]) -> Option<Vec<f32>> {
@@ -317,39 +330,49 @@ pub(crate) fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Downscaled positions past the adapter search window that can still reach it
-/// through the CNN's receptive field. The graph is local (`Conv`/`Add`/`Relu`),
-/// so any model input beyond `search_window + this margin` cannot affect a
-/// score *inside* the search window — feeding only that prefix is
-/// output-preserving. Truncating to it also bounds conv work/memory for very
-/// long reads AND collapses every read longer than the cap onto one common
-/// length, which is what lets the GPU path batch them together. Default 256 is
-/// comfortably above the `tcn_l4` receptive field (kernel 7 × dilations ≤ 8 ⇒
-/// half-width ~90); override via `ESCAPEPOD_CNN_MARGIN` for a model with a
-/// larger field (a too-small value silently shifts boundaries — validate with
-/// the batch-parity test against a larger margin).
-fn search_receptive_margin() -> usize {
-    use std::sync::OnceLock;
-    static MARGIN: OnceLock<usize> = OnceLock::new();
-    *MARGIN.get_or_init(|| {
-        std::env::var("ESCAPEPOD_CNN_MARGIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256)
-    })
-}
+/// Value the training pipeline pads short windows with, and the same value it
+/// substitutes for NaN (`adapted.detect.cnn.SCORE_EXCL`, escapepod-models
+/// `config.py:17`). Padding with anything else — zero included — feeds the model
+/// a pattern it never saw.
+pub(crate) const SCORE_EXCL: f32 = -5.0;
 
-/// Slice `[min_obs_adapter:]`, mean-pool by `downscale_factor`, then
-/// median/MAD-normalize — the exact input the boundary CNN expects. Returns
-/// `None` when the signal is too short to contain an adapter. Shared by the
-/// CPU (tract) and GPU (onnxruntime) backends so their preprocessing is
-/// bit-identical.
+/// Slice `[min_obs_adapter:max_obs_trace]`, mean-pool by `downscale_factor`,
+/// median/MAD-normalize, then pad to the model's fixed input length with
+/// [`SCORE_EXCL`] — the exact input the boundary CNN was trained on. Returns
+/// `None` when the signal is too short to contain an adapter. Shared by the CPU
+/// (tract) and GPU (onnxruntime) backends so their preprocessing is identical.
 ///
-/// Normalization statistics are computed over the **full** tail (matching the
-/// per-read reference exactly), then the model input is truncated to a prefix
-/// covering the search window plus receptive-field margin — see
-/// [`search_receptive_margin`]. This keeps results identical to feeding the
-/// whole read while keeping batched conv tensors bounded.
+/// # Why fixed-length, and why this pad value (#187)
+///
+/// escapepod-models builds *every* training example through
+/// `dataset.py::prepare_signal`, which ends:
+///
+/// ```python
+/// out = np.full(cfg.input_len, cfg.score_excl, dtype=np.float32)
+/// out[:min(len(norm), cfg.input_len)] = norm[:...]
+/// ```
+///
+/// — a fixed `input_len = (max_obs_trace - min_obs_adapter) / downscale` = 1500,
+/// right-padded with `score_excl = -5.0`. Its own inference path
+/// (`barcode.py`) prepares inputs the same way.
+///
+/// This used to truncate to `search_window + ESCAPEPOD_CNN_MARGIN` (550 + 256 =
+/// 806) instead, on the argument that a local graph cannot reach past it. Two
+/// things were wrong with that. The receptive field is larger than the margin
+/// assumed — `Conv k=7 s=5` then `k=7` at dilations 1,1,2,2,4,4,8,8 gives
+/// `((1 + 6+6+12+12+24+24+48+48) - 1) * 5 + 7 = 907`, so half-width ~453, and an
+/// output at the far edge of the search window depended on input the truncation
+/// removed. And the model had never seen a 806-long input at all.
+///
+/// It was also expensive. Because the window clamps to the read end, every read
+/// shorter than `max_obs_trace` got its own length: over a production run's 527k
+/// reads, 680 distinct lengths, so a 65,536-read block issued one large call plus
+/// ~679 of ~30 rows, each a new shape paying fresh cuDNN plan selection.
+/// Detection measured 401 s of device time in a 425 s wall — 94% — against
+/// 0.009 ms/read for the same kernel at a steady shape.
+///
+/// One fixed length fixes both: it is what the model was trained on, and it is
+/// one shape for every read.
 pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> Option<Vec<f32>> {
     if signal_pa.len() <= cfg.min_obs_adapter + cfg.downscale_factor {
         return None;
@@ -365,12 +388,9 @@ pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> 
         .min(signal_pa.len());
     let tail = &signal_pa[cfg.min_obs_adapter..end];
     let mut normalized = median_mad_normalize(&mean_pool(tail, cfg.downscale_factor));
-    let search_window =
-        cfg.max_obs_adapter.saturating_sub(cfg.min_obs_adapter) / cfg.downscale_factor;
-    let cap = search_window + search_receptive_margin();
-    if normalized.len() > cap {
-        normalized.truncate(cap);
-    }
+    // Normalisation statistics come from the true window above; only the tensor
+    // handed to the graph is padded, which is the order training uses too.
+    normalized.resize(cfg.input_len(), SCORE_EXCL);
     Some(normalized)
 }
 
@@ -450,49 +470,6 @@ pub(crate) fn pack_batch(prepped: &[Option<Vec<f32>>], indices: &[usize], len: u
         data[row * len..row * len + n].copy_from_slice(&src[..n]);
     }
     data
-}
-
-/// Round `len` up to the next multiple of `bucket` (no-op when `bucket <= 1`).
-#[cfg(feature = "cnn-gpu")]
-pub(crate) fn bucket_len(len: usize, bucket: usize) -> usize {
-    if bucket <= 1 {
-        len
-    } else {
-        len.div_ceil(bucket) * bucket
-    }
-}
-
-/// Group reads by *bucketed* length: every read whose true length rounds up to
-/// the same multiple of `bucket` shares one padded batch.
-///
-/// `bucket <= 1` reproduces [`group_by_len`] exactly.
-///
-/// This exists because exact-length grouping fragments catastrophically on real
-/// data. [`prep_adapter_signal`] clamps its window to the read end, so any read
-/// shorter than `max_obs_trace` gets its own length: over a production run's 527k
-/// reads, 68.6% reach the cap and share one shape while the other 31.4% spread
-/// across **680 distinct lengths**. A 65,536-read block therefore issues one call
-/// of ~45,000 rows plus ~679 calls of ~30 rows, and each new shape pays fresh
-/// cuDNN plan selection — measured at 401 s of device time in a 425 s run against
-/// ~0.01 ms/read for the same kernel called at a steady shape.
-///
-/// The returned length is the padded one; callers pad with [`pack_batch`] and
-/// must pass each read's own length to [`decode_adapter_end`] as `valid_len`.
-#[cfg(feature = "cnn-gpu")]
-pub(crate) fn group_by_len_bucketed(
-    prepped: &[Option<Vec<f32>>],
-    valid_idx: &[usize],
-    bucket: usize,
-) -> Vec<(usize, Vec<usize>)> {
-    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    for &i in valid_idx {
-        let len = prepped[i]
-            .as_ref()
-            .expect("valid_idx points at a prepped signal")
-            .len();
-        groups.entry(bucket_len(len, bucket)).or_default().push(i);
-    }
-    groups.into_iter().collect()
 }
 
 /// Scatter a group/sub-batch's inference `result` into `out` at each read's
