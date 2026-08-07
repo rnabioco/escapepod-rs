@@ -872,6 +872,43 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     pb.finish_with_message("complete");
     print_summary(&summary);
     timer.report(profile);
+
+    // Keep the onnxruntime sessions alive past the end of `main`.
+    //
+    // onnxruntime's CUDA provider reads freed memory during onnxruntime's *own*
+    // at-exit teardown. valgrind, on a run whose output was complete and correct:
+    //
+    // ```text
+    // Invalid read of size 8
+    //    at  libonnxruntime_providers_cuda.so
+    //    by  libonnxruntime.so.1.27.1
+    //    by  <Arc<ort::environment::Environment>>::drop_slow
+    //    by  ort::environment::release_env_on_exit
+    //    by  _dl_fini
+    // Address .. is 1,258,744 bytes inside an unallocated block of size 1,360,656
+    // ```
+    //
+    // Ten errors, five contexts, every one of them at teardown; nothing in the
+    // processing loop. glibc notices the damage at the last `free` and aborts
+    // with "corrupted double-linked list" — measured 5 runs in 10, always *after*
+    // every read was written, so it corrupted no output but did make a successful
+    // run exit non-zero, which a workflow engine reads as failure.
+    //
+    // `release_env_on_exit` (ort puts it in `.fini_array`) calls `ReleaseEnv`
+    // only when the *last* `Arc<Environment>` drops, and every live `Session`
+    // holds one (`SharedSessionInner::_environment`). Leaking the objects that
+    // own our sessions keeps that count above zero, so the faulty path never
+    // runs. The process is exiting; the memory is reclaimed by the kernel either
+    // way.
+    //
+    // This is deliberately narrow: it does not skip our own destructors, and
+    // every writer thread has already been joined and every output renamed into
+    // place above. Only reached when a GPU path actually created ORT sessions.
+    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+    if args.gpu {
+        std::mem::forget(model);
+        std::mem::forget(detector);
+    }
     Ok(())
 }
 

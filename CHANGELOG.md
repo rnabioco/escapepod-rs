@@ -166,6 +166,38 @@
 
 ### Fixed
 
+- **`escpod demux --gpu` aborted at exit roughly half the time**, after writing
+  every read correctly. onnxruntime's CUDA provider reads freed memory during
+  onnxruntime's *own* at-exit teardown; valgrind, on a run whose output was
+  complete:
+
+  ```text
+  Invalid read of size 8
+     at  libonnxruntime_providers_cuda.so
+     by  libonnxruntime.so.1.27.1
+     by  <Arc<ort::environment::Environment>>::drop_slow
+     by  ort::environment::release_env_on_exit
+     by  _dl_fini
+  Address .. is 1,258,744 bytes inside an unallocated block of size 1,360,656
+  ```
+
+  Ten errors, five contexts, all at teardown; **none in the processing loop**.
+  glibc notices at the last `free` and aborts with `corrupted double-linked
+  list`. Measured 5 runs in 10 against 0/10 for 0.7.0 — which never hit it
+  because it ran the CRF encoder on CPU tract and only gave the CUDA EP the
+  small adapter CNN, so there was far less provider state to unwind.
+
+  Output was never affected (every trial wrote all reads), but the process
+  exited non-zero, which a workflow engine reads as a failed job.
+
+  `release_env_on_exit` calls `ReleaseEnv` only when the last
+  `Arc<Environment>` drops, and every live `Session` holds one, so the fix is to
+  keep our sessions alive past `main`: the faulty path never runs. Verified back
+  to **0/10**. Narrow by construction — our own destructors still run, writers
+  are already joined and outputs renamed before that point, and it only applies
+  when a GPU path created ORT sessions. Worth revisiting after an `ort` or
+  onnxruntime bump; the code comment carries the trace needed to re-test.
+
 - **The zero-copy binding named device 0 regardless of which device its session
   was on.** Harmless while there was only ever one device; with a worker pool it
   failed the run outright — onnxruntime resolves a bound output's allocator
