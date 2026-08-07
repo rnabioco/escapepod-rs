@@ -125,3 +125,7 @@ required-features = ["crf-gpu"]
 [[example]]
 name = "cnn_gpu_floor"
 required-features = ["cnn-gpu"]
+
+[[example]]
+name = "cnn_pad_probe"
+required-features = ["cnn-gpu"]

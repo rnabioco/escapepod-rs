@@ -24,20 +24,6 @@ use crate::adapter_cnn::{
 };
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
-/// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
-/// call, scaled to the device's memory. The largest length-group (every read
-/// longer than the prep cap collapses onto one length — up to hundreds of
-/// thousands of reads) is split into chunks of this size; a chunk that still
-/// OOMs is halved and retried (`run_grouped`), so this is a *starting* guess,
-/// not a hard limit.
-///
-/// Resolution order: `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` env override → scaled from
-/// total VRAM (`total_bytes / BYTES_PER_ELEM`) → a fixed fallback. Conv
-/// activations scale with `rows × len × channels`, so on a 24 GB device ~5k
-/// rows at the 806 cap length (~4.2M elems) fit but ~10k OOM (measured) — i.e.
-/// ~24 GB / 5500 bytes-per-element. Using total VRAM means an 80 GB A100/H100
-/// gets ~3× larger batches automatically, while the halve-retry covers any
-/// over-estimate (e.g. a model with more channels).
 /// Length bucket for batching (`ESCAPEPOD_CNN_GPU_LEN_BUCKET`).
 ///
 /// **Defaults to 1 — exact-length grouping — because padding is not
@@ -53,15 +39,24 @@ use crate::{AdapterCnnConfig, AdapterCnnError};
 /// time in a 425 s wall, against ~0.01 ms/read for the same kernel at a steady
 /// shape (`examples/cnn_gpu_floor`).
 ///
-/// Padding does not fix it, for a structural reason. An output at downscaled
-/// position `k` depends on input within the receptive margin `R` (256) either
-/// side, and [`decode_adapter_end`] searches `k` up to `min(search_window, valid_len)`.
-/// Padding beyond `valid_len` therefore leaves the searched region alone only if
-/// `min(550, valid_len) <= valid_len - 256`, i.e. only if `valid_len >= 806` —
-/// which is exactly the cap, where reads already share one shape. For anything
-/// shorter the padding is inside the receptive field of positions the decode
-/// actually reads, and `tests/adapter_cnn_bucket_parity.rs` confirms it: 11 of 62
-/// synthetic reads changed their call at bucket 16, some by hundreds of samples.
+/// Padding does not fix it, because **this graph is globally length-dependent**.
+/// `examples/cnn_pad_probe` runs one read at its exact length and again zero-padded
+/// to the cap, and compares raw scores position by position:
+///
+/// ```text
+/// prepped=38   max|Δ| = 4.50   first divergence at k=0    argmax 32 -> 37
+/// prepped=120  max|Δ| = 1.99   first divergence at k=0    argmax 42 -> 92
+/// prepped=250  max|Δ| = 3.47   first divergence at k=0
+/// ```
+///
+/// The divergence starts at **position 0**, nowhere near where the padding
+/// begins. That rules out a local receptive-field effect — which would appear
+/// near `valid_len`, and which a `valid_len` clamp could contain — and points at
+/// a normalisation over the length axis: appending zeros moves the statistics and
+/// every output shifts with them. No clamp can recover that.
+///
+/// It also means a read already at the 806 cap is unaffected only because
+/// bucketing appends *nothing* to it, not because padding is safe there.
 ///
 /// So the fragmentation has to be addressed on the runtime side (per-shape plan
 /// selection) rather than by reshaping the input.
@@ -74,6 +69,20 @@ fn resolve_len_bucket() -> usize {
         .unwrap_or(DEFAULT_BUCKET)
 }
 
+/// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
+/// call, scaled to the device's memory. The largest length-group (every read
+/// longer than the prep cap collapses onto one length — up to hundreds of
+/// thousands of reads) is split into chunks of this size; a chunk that still
+/// OOMs is halved and retried (`run_grouped`), so this is a *starting* guess,
+/// not a hard limit.
+///
+/// Resolution order: `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` env override → scaled from
+/// total VRAM (`total_bytes / BYTES_PER_ELEM`) → a fixed fallback. Conv
+/// activations scale with `rows × len × channels`, so on a 24 GB device ~5k
+/// rows at the 806 cap length (~4.2M elems) fit but ~10k OOM (measured) — i.e.
+/// ~24 GB / 5500 bytes-per-element. Using total VRAM means an 80 GB A100/H100
+/// gets ~3× larger batches automatically, while the halve-retry covers any
+/// over-estimate (e.g. a model with more channels).
 fn resolve_batch_elems() -> usize {
     /// Empirical peak device bytes per input element (`rows × len`) at the OOM
     /// boundary for the rna004 TCN — folds in channel count and the number of
@@ -286,6 +295,39 @@ impl AdapterCnnGpu {
                 }
             }
         }
+    }
+
+    /// Raw channel-0 (adapter-end) scores for one prepped signal, run at tensor
+    /// length `len` and zero-padded if the signal is shorter.
+    ///
+    /// Diagnostic. It exists to answer whether padding changes the model's output
+    /// *before* the padding starts — which decides whether length bucketing is a
+    /// wiring problem or a property of the graph, and no decoded `adapter_end`
+    /// can distinguish those.
+    pub fn scores_for_probe(
+        &self,
+        prepped: &[f32],
+        len: usize,
+    ) -> Result<Vec<f32>, AdapterCnnError> {
+        let mut data = vec![0f32; len];
+        let n = prepped.len().min(len);
+        data[..n].copy_from_slice(&prepped[..n]);
+        let input = Tensor::from_array(([1usize, 1, len], data))
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        let mut session = self.session.lock().expect("ort session mutex poisoned");
+        let outputs = session
+            .run(ort::inputs![input])
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        let (shape, scores) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        if shape.len() != 3 || shape[1] != 2 {
+            return Err(AdapterCnnError::BadShape {
+                got: shape.iter().map(|&d| d as usize).collect(),
+            });
+        }
+        let length_out = shape[2] as usize;
+        Ok(scores[..length_out].to_vec())
     }
 
     /// One onnxruntime call over `sub` reads (all of prepped length `len`),

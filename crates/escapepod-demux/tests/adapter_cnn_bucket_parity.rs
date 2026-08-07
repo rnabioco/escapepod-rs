@@ -11,10 +11,12 @@
 //! **Padding is not free of consequence, and this test is the check.** The head
 //! is fixed (the window always starts at `min_obs_adapter`, and the decode
 //! searches forward from index 0), so a tail pad never shifts a boundary index,
-//! and `valid_len` keeps the argmax out of the padding. But a read whose prepped
-//! length falls *below* the search window has searched positions within the
-//! model's receptive field of where the padding begins, so its call can move.
-//! This measures that directly rather than assuming either way.
+//! and `valid_len` keeps the argmax out of the padding. None of that helps: the
+//! graph is **globally length-dependent**. `examples/cnn_pad_probe` shows raw
+//! scores diverging from position 0 — nowhere near the padding — by up to 4.5,
+//! which is the signature of a normalisation over the length axis rather than a
+//! local receptive-field effect. Appending zeros moves the statistics, and every
+//! output moves with them.
 //!
 //! Requires a real boundary-CNN ONNX model and a GPU:
 //! ```text
@@ -74,14 +76,12 @@ fn detect_all(detector: &AdapterCnnGpu, signals: &[Vec<f32>]) -> Vec<Option<usiz
         .collect()
 }
 
-/// Prepped length at or above which zero-padding the tail provably cannot move a
-/// call: `search_window + receptive margin` = 550 + 256.
+/// The prepped-length cap, at which bucketing appends **nothing**.
 ///
-/// An output at downscaled position `k` depends on input within `R` either side,
-/// and the decode searches `k` up to `min(search_window, valid_len)`. Padding
-/// past `valid_len` leaves every searched position alone only when
-/// `min(550, valid_len) <= valid_len - R`, which for `valid_len < 550` is
-/// impossible and otherwise requires `valid_len >= 806`.
+/// Reads here are unaffected by construction, not because padding is safe for
+/// them: `prep_adapter_signal` truncates to this, so a bucket at or above it adds
+/// no zeros at all. That is the only regime where bucketed and exact agree, and
+/// it is exactly the regime where bucketing does no work.
 const SAFE_PREPPED_LEN: usize = 806;
 
 /// A read's prepped length, mirroring `prep_adapter_signal`:
@@ -94,13 +94,17 @@ fn prepped_len(raw_len: usize) -> usize {
     ((end - 1_000) / 10).min(SAFE_PREPPED_LEN)
 }
 
-/// The load-bearing check: **reads long enough for padding to be provably
-/// harmless must be bit-identical under any bucket size.**
+/// The load-bearing check: **reads that receive no padding must be bit-identical
+/// under any bucket size.**
 ///
-/// Reads below [`SAFE_PREPPED_LEN`] are counted and reported but not asserted —
-/// they are expected to move, and pinning them to today's values would be
-/// pinning an artefact of where the signal happens to stop. The count is the
-/// point: it is what says bucketing cannot be turned on globally.
+/// A genuine invariant — those reads are already at the cap, so bucketing changes
+/// their tensor not at all, and any difference would be a wiring bug in
+/// `pack_batch` or the `valid_len` clamp rather than a model effect.
+///
+/// Reads below the cap do receive padding and are counted, not asserted: the
+/// graph is globally length-dependent (see the module docs), so they are expected
+/// to move, and pinning today's values would pin an artefact. The count is the
+/// point — it is what says bucketing cannot be turned on.
 #[test]
 fn bucketing_is_exact_where_padding_cannot_reach() {
     let Ok(model_path) = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX") else {
