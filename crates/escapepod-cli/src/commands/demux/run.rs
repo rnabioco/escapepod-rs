@@ -1386,6 +1386,76 @@ fn crf_gpu_workers(devices: usize) -> usize {
 /// device or an unlucky block cannot leave one worker holding the tail. Blocks
 /// are independent and output row order is already nondeterministic here (the
 /// per-barcode writers interleave), so which worker takes which does not matter.
+/// Where the fused GPU CRF pipeline's wall time goes, in milliseconds summed
+/// across threads (`ESCAPEPOD_CRF_GPU_TRACE=1`).
+///
+/// Blocked-vs-working is the whole point: a stage that is mostly *blocked* is
+/// being starved by its neighbour, and a stage that is mostly *working* is the
+/// constraint. Six plausible fixes for this pipeline's idle GPU were tried and
+/// measured negative before this existed, which is the argument for having it.
+#[cfg(feature = "crf-gpu")]
+#[derive(Default)]
+struct GpuTrace {
+    /// Producer: batched adapter-CNN detect over a whole block.
+    detect_ms: std::sync::atomic::AtomicU64,
+    /// Producer: window standardisation across rayon.
+    prep_ms: std::sync::atomic::AtomicU64,
+    /// Producer blocked handing a sub-block over — the encoders are behind.
+    send_blocked_ms: std::sync::atomic::AtomicU64,
+    /// Worker blocked waiting for a sub-block — the producer is behind.
+    recv_blocked_ms: std::sync::atomic::AtomicU64,
+    /// Worker: onnxruntime encode plus the lattice decode.
+    encode_decode_ms: std::sync::atomic::AtomicU64,
+    /// Worker: barcode match across rayon.
+    match_ms: std::sync::atomic::AtomicU64,
+    /// Worker blocked in `route` — a per-barcode writer channel is full.
+    route_ms: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "crf-gpu")]
+impl GpuTrace {
+    fn enabled() -> bool {
+        std::env::var("ESCAPEPOD_CRF_GPU_TRACE").as_deref() == Ok("1")
+    }
+
+    /// Add `t`'s elapsed millis to `field`, but only when tracing is on — the
+    /// `Instant::now()` calls are cheap next to a block but not free.
+    fn add(field: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
+        field.fetch_add(
+            t.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn report(&self, wall: std::time::Duration, workers: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1000.0;
+        info!("{}", style::label("GPU CRF stage trace (thread-seconds):"));
+        info!(
+            "  producer   detect {:>7.1}s  prep {:>7.1}s  BLOCKED on send {:>7.1}s",
+            g(&self.detect_ms),
+            g(&self.prep_ms),
+            g(&self.send_blocked_ms)
+        );
+        info!(
+            "  {} worker(s)  encode+decode {:>7.1}s  match {:>6.1}s  route {:>6.1}s  BLOCKED on recv {:>7.1}s",
+            workers,
+            g(&self.encode_decode_ms),
+            g(&self.match_ms),
+            g(&self.route_ms),
+            g(&self.recv_blocked_ms)
+        );
+        let wall_s = wall.as_secs_f64();
+        info!(
+            "  wall {:.1}s — worker busy {:.0}% of its wall, producer busy {:.0}%",
+            wall_s,
+            100.0 * (g(&self.encode_decode_ms) + g(&self.match_ms) + g(&self.route_ms))
+                / (wall_s * workers as f64).max(1e-9),
+            100.0 * (g(&self.detect_ms) + g(&self.prep_ms)) / wall_s.max(1e-9),
+        );
+    }
+}
+
 // One over clippy's limit: the sibling producers take the same seven, and this
 // one additionally needs the bundle directory to load its extra workers.
 #[allow(clippy::too_many_arguments)]
@@ -1431,6 +1501,11 @@ fn produce_gpu_crf(
     let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Block>(2 * workers);
     let block_rx = Arc::new(std::sync::Mutex::new(block_rx));
 
+    let trace = GpuTrace::default();
+    let trace = &trace;
+    let tracing_on = GpuTrace::enabled();
+    let t_wall = std::time::Instant::now();
+
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let mut gpus = Vec::with_capacity(workers);
         for w in 0..workers {
@@ -1439,21 +1514,30 @@ fn produce_gpu_crf(
             gpus.push(scope.spawn(move || -> anyhow::Result<()> {
                 loop {
                     // Held only across `recv`, never across the encode.
+                    let t_wait = std::time::Instant::now();
                     let next = {
                         let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
                         guard.recv()
                     };
+                    if tracing_on {
+                        GpuTrace::add(&trace.recv_blocked_ms, t_wait);
+                    }
                     let Ok((windows, items)) = next else { break };
 
                     // Encodes on the device, then fans the lattice decode back
                     // out across rayon. `None` windows never reach the device
                     // and come back `None`, so this stays aligned with `items`.
+                    let t_enc = std::time::Instant::now();
                     let seqs = enc
                         .basecall_batch(&windows)
                         .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?;
+                    if tracing_on {
+                        GpuTrace::add(&trace.encode_decode_ms, t_enc);
+                    }
                     // 96 references x one wavefront alignment each is small next
                     // to the decode, but it is still per-read work worth fanning
                     // out.
+                    let t_match = std::time::Instant::now();
                     let calls: Vec<(String, f64)> = seqs
                         .par_iter()
                         .map(|seq| {
@@ -1462,7 +1546,11 @@ fn produce_gpu_crf(
                                 .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0))
                         })
                         .collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.match_ms, t_match);
+                    }
                     let n = items.len() as u64;
+                    let t_route = std::time::Instant::now();
                     for ((read, chunks, run_infos), (barcode, conf)) in items.into_iter().zip(calls)
                     {
                         route(
@@ -1474,6 +1562,9 @@ fn produce_gpu_crf(
                             run_infos,
                             conf,
                         );
+                    }
+                    if tracing_on {
+                        GpuTrace::add(&trace.route_ms, t_route);
                     }
                     pb.inc(n);
                 }
@@ -1494,13 +1585,18 @@ fn produce_gpu_crf(
                 }
                 // Detect over the whole block (one batched GPU CNN call), then
                 // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
+                let t_det = std::time::Instant::now();
                 let bounds = detector.detect_batch(&sigs);
+                if tracing_on {
+                    GpuTrace::add(&trace.detect_ms, t_det);
+                }
                 let mut rows = sigs.into_iter().zip(bounds).zip(items);
                 loop {
                     let chunk: Vec<_> = rows.by_ref().take(gpu_block).collect();
                     if chunk.is_empty() {
                         break;
                     }
+                    let t_prep = std::time::Instant::now();
                     let windows: Vec<Option<Vec<f32>>> = chunk
                         .par_iter()
                         .map(|((signal, (_s, adapter_end)), (read, _, _))| {
@@ -1519,7 +1615,15 @@ fn produce_gpu_crf(
                         })
                         .collect();
                     let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
-                    if block_tx.send((windows, items)).is_err() {
+                    if tracing_on {
+                        GpuTrace::add(&trace.prep_ms, t_prep);
+                    }
+                    let t_send = std::time::Instant::now();
+                    let sent = block_tx.send((windows, items));
+                    if tracing_on {
+                        GpuTrace::add(&trace.send_blocked_ms, t_send);
+                    }
+                    if sent.is_err() {
                         hung_up = true;
                         return;
                     }
@@ -1533,6 +1637,9 @@ fn produce_gpu_crf(
         for (w, g) in gpus.into_iter().enumerate() {
             g.join()
                 .map_err(|e| anyhow::anyhow!("GPU encoder worker {w} panicked: {e:?}"))??;
+        }
+        if tracing_on {
+            trace.report(t_wall.elapsed(), workers);
         }
         drive
     })

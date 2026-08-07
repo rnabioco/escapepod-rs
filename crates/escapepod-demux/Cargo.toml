@@ -117,3 +117,7 @@ train = ["dep:linfa", "dep:linfa-svm"]
 [[example]]
 name = "crf_basecall_check"
 required-features = ["crf-decode"]
+
+[[example]]
+name = "crf_gpu_floor"
+required-features = ["crf-gpu"]
