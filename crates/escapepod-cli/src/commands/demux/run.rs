@@ -538,11 +538,23 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             // spawned `available_parallelism()` wide on top of rayon's.
             #[cfg(feature = "crf-gpu")]
             let encoder = if args.gpu {
-                info!(
-                    "{} GPU (onnxruntime CUDA); lattice decode stays on the CPU",
-                    style::label("CRF encoder:")
-                );
-                CrfEncoderAny::Gpu(Box::new(CrfEncoderGpu::load_bundle(&dir, args.threads)?))
+                let enc = CrfEncoderGpu::load_bundle(&dir, args.threads)?;
+                if enc.gpu_decode_active() {
+                    info!(
+                        "{} GPU (onnxruntime CUDA), lattice decode GPU (batched)",
+                        style::label("CRF encoder:")
+                    );
+                } else {
+                    // The decode is the larger half of this path's host cost, so
+                    // running it on the CPU is a ~3x end-to-end difference. Say
+                    // so rather than letting the run look fully accelerated.
+                    tracing::warn!(
+                        "CRF lattice decode fell back to the CPU ({}); the encoder is \
+                         still on the GPU, but expect roughly 3x the wall time.",
+                        enc.decode_fallback_reason().unwrap_or("reason unavailable")
+                    );
+                }
+                CrfEncoderAny::Gpu(Box::new(enc))
             } else {
                 CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
             };

@@ -4,7 +4,7 @@
 //! the scores to the *same* [`lattice`](super::lattice) decode, so the only
 //! thing that changes is where the LSTM stack executes.
 //!
-//! # Why the decode stays on the CPU
+//! # Where the decode runs
 //!
 //! Measured per read on the RNA004 barcode export (rna partition):
 //!
@@ -20,12 +20,24 @@
 //! The decode started out as *half* the CPU cost, so moving only the encoder to
 //! the GPU leaves it as essentially the entire remaining runtime — which is why
 //! the vector kernels are a prerequisite for this path rather than a nicety.
-//! With them, the decode is small enough that overlapping it across rayon
-//! workers while the GPU runs the next batch keeps the device fed.
 //!
-//! That split also mirrors what the boundary-CNN work concluded: the lattice
-//! decode is sequential in time with a 256-wide inner dimension, so it is a poor
-//! fit for the device compared to the encoder's dense matmuls.
+//! It now goes to the device too, via [`lattice_gpu`](super::lattice_gpu), and
+//! that is the default whenever the kernels load. **This reverses an earlier
+//! note here**, which read: "the lattice decode is sequential in time with a
+//! 256-wide inner dimension, so it is a poor fit for the device compared to the
+//! encoder's dense matmuls."
+//!
+//! That was right about decoding *one read* and wrong about this pipeline. A
+//! device batch holds hundreds of independent reads, so a timestep is
+//! `batch * n_states` lanes, not 256; only the `t_len` sweep is sequential, and
+//! it is sequential on the CPU too. Profiling the encoder-only GPU path settled
+//! it: with the encoder on the device the AVX-512 decode was **66% of all
+//! remaining CPU cycles**, and the pipeline stopped scaling with cores entirely.
+//! bonito reaches the same conclusion — its own forward/backward scores come
+//! from koi's `ctc.{fwd,bwd}_scores_cu_sparse` CUDA kernels.
+//!
+//! The CPU decode remains the reference implementation, the only always-compiled
+//! one, and the automatic fallback; `ESCAPEPOD_CRF_GPU_DECODE=0` forces it.
 //!
 //! `load-dynamic`: onnxruntime is dlopened at runtime, not linked at build
 //! time. Point `ORT_DYLIB_PATH` at a CUDA-enabled `libonnxruntime.so` with a
@@ -68,6 +80,13 @@ pub struct CrfEncoderGpu {
     layout: CrfLayout,
     alphabet: Vec<u8>,
     batch_rows: usize,
+    /// Batched lattice decode on the device. `None` falls back to the rayon CPU
+    /// decode — correct either way, but the CPU decode is ~66% of this path's
+    /// host cost, so which one is running is worth reporting rather than
+    /// discovering from a benchmark.
+    lattice: Option<super::lattice_gpu::CrfLatticeGpu>,
+    /// Why [`Self::lattice`] is `None`, when it is.
+    decode_fallback: Option<String>,
 }
 
 impl CrfEncoderGpu {
@@ -110,12 +129,31 @@ impl CrfEncoderGpu {
             .commit_from_file(onnx)
             .map_err(|e| CrfError::Load(e.to_string()))?;
 
+        // The lattice decode is the larger half of this path's host cost, so it
+        // goes to the device too unless it cannot. `ESCAPEPOD_CRF_GPU_DECODE=0`
+        // forces the CPU decode, which is what A/B measurements and any future
+        // bisect want.
+        let (lattice, decode_fallback) =
+            if std::env::var("ESCAPEPOD_CRF_GPU_DECODE").as_deref() == Ok("0") {
+                (
+                    None,
+                    Some("disabled by ESCAPEPOD_CRF_GPU_DECODE=0".to_string()),
+                )
+            } else {
+                match super::lattice_gpu::CrfLatticeGpu::new(layout) {
+                    Ok(l) => (Some(l), None),
+                    Err(e) => (None, Some(e.to_string())),
+                }
+            };
+
         let encoder = Self {
             session: Mutex::new(session),
             meta,
             layout,
             alphabet,
             batch_rows: resolve_batch_rows(),
+            lattice,
+            decode_fallback,
         };
         // Same reasoning as the CPU loader: catch a batch-major (boundary-CNN)
         // export here rather than after decoding noise for every read.
@@ -129,6 +167,18 @@ impl CrfEncoderGpu {
 
     pub fn layout(&self) -> &CrfLayout {
         &self.layout
+    }
+
+    /// Whether the lattice decode runs on the device.
+    pub fn gpu_decode_active(&self) -> bool {
+        self.lattice.is_some()
+    }
+
+    /// Why the decode fell back to the CPU, when it did. The caller is expected
+    /// to surface this: a CPU decode is correct but roughly three times slower
+    /// end to end, and that is not something a run should discover silently.
+    pub fn decode_fallback_reason(&self) -> Option<&str> {
+        self.decode_fallback.as_deref()
     }
 
     /// Run the encoder over a batch of standardised windows.
@@ -242,6 +292,14 @@ impl CrfEncoderGpu {
         rows: &[&[f32]],
         backend: Backend,
     ) -> Result<Vec<String>, CrfError> {
+        // The device decode reads onnxruntime's time-major output as it stands,
+        // so nothing is de-interleaved on the host at all — neither the batch
+        // axis nor the per-timestep [dest][edge] order.
+        if let Some(lattice) = &self.lattice {
+            return self.run_raw(rows, |data, t_len, _batch, _n_score| {
+                lattice.decode_time_major(data, t_len, &self.alphabet)
+            });
+        }
         self.run_raw(rows, |data, t_len, batch, n_score| {
             (0..batch)
                 .into_par_iter()
@@ -279,7 +337,10 @@ impl CrfEncoderGpu {
     /// same sequences as a whole one.
     fn run_and_decode(&self, rows: &[&[f32]], backend: Backend) -> Result<Vec<String>, CrfError> {
         match self.try_run_and_decode(rows, backend) {
-            Err(CrfError::Run(msg)) if is_oom(&msg) && rows.len() > 1 => {
+            // `Run` is an encode OOM, `Decode` a device-decode OOM — the GPU
+            // decode cannot split a time-major batch itself, so halving here is
+            // what handles it, and it shrinks the encode at the same time.
+            Err(CrfError::Run(msg) | CrfError::Decode(msg)) if is_oom(&msg) && rows.len() > 1 => {
                 let half = rows.len().div_ceil(2);
                 let mut first = self.run_and_decode(&rows[..half], backend)?;
                 first.extend(self.run_and_decode(&rows[half..], backend)?);

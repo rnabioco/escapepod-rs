@@ -56,7 +56,7 @@ use std::fmt;
 /// Natural log of the blank floor bonito adds before taking logs
 /// (`posteriors(x) + 1e-8`). Kept as the literal so the port reads like the
 /// Python.
-const POSTERIOR_FLOOR: f32 = 1e-8;
+pub(super) const POSTERIOR_FLOOR: f32 = 1e-8;
 
 /// Geometry of a bonito-style CTC-CRF lattice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

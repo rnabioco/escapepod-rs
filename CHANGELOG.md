@@ -4,6 +4,64 @@
 
 ### Added
 
+- **Batched CTC-CRF lattice decode on the GPU** (`crf::lattice_gpu`, `crf-gpu`).
+  The same two passes as `crf::lattice`, the same edge indexing and the same
+  tie-breaking, with the batch axis mapped onto the device. On by default
+  wherever the kernels load; `ESCAPEPOD_CRF_GPU_DECODE=0` forces the CPU decode.
+
+  **This reverses a documented decision.** `encoder_gpu` said the lattice decode
+  was "sequential in time with a 256-wide inner dimension, a poor fit for the
+  device". That is true of decoding *one read* and wrong for this pipeline: a
+  device batch holds hundreds of independent reads, so a timestep is
+  `batch * n_states` lanes (131 072 at batch 512) and only the `t_len` sweep is
+  sequential — as it is on the CPU too. Profiling settled it: with the encoder on
+  the device the AVX-512 decode was 66% of all remaining CPU cycles and the
+  pipeline had stopped scaling with cores. bonito agrees; its own forward/backward
+  scores come from koi's `ctc.{fwd,bwd}_scores_cu_sparse` CUDA kernels.
+
+  **What it actually buys is cores, not wall time.** 40 k real RNA004 reads, one
+  A30, same binary both ways:
+
+  ```text
+  threads     CPU decode   GPU decode
+     2          51.8 s       30.5 s
+     4          36.8 s       30.2 s
+     8          29.5 s       29.8 s
+    16          30.6 s       28.7 s
+  ```
+
+  Flat from 2 to 16 threads: the run now reaches full speed on **2 cores where it
+  previously needed 8**, so the demux rule can hand a dozen cores back to the
+  cluster. At 16 cores it is only 2.4% faster, because the bottleneck has moved
+  off the CPU entirely (see the known limitation below).
+
+  Correctness is exact: **40 001/40 001 identical barcode calls** against the CPU
+  decode on the same binary — not merely the same sequences, the same calls.
+  `tests/gpu_crf_lattice.rs` checks the kernels against `crf_golden.json`, the
+  fixture produced by running real `bonito.crf.model.CTC_CRF` through koi's CUDA
+  kernels, plus batch-invariance, an all-tied lattice (which exercises the argmax
+  tie-break end to end), a `-inf` column, and time-major/batch-major equivalence.
+
+  Fusions worth noting, since they shape the kernel layout:
+  - **No transpose pass.** The CPU decode transposes each timestep into
+    `[edge][dest]` for unit-stride SIMD; the GPU wants the opposite, so the
+    kernels read the encoder's native `[dest][edge]` directly. That drops a
+    kernel, a second `t_len * n_score` device buffer, and its round trip through
+    memory — and makes the Viterbi tie-break key the flat index itself, because
+    native order *is* bonito's `dest * n_edges + edge`.
+  - **Forward and backward share one launch** (`blockIdx.y` picks the direction).
+    They only read `scores`, so fusing them doubles the blocks in flight.
+  - **onnxruntime's time-major output is decoded as it stands.** Rows are
+    addressed by stride, so `[T][batch][n_score]` needs no host de-interleave —
+    removing 1.5 MB per read of pure memory movement that previously had to
+    complete before the decode could start.
+
+  Known limitation: the score buffer still round-trips through host memory
+  (onnxruntime copies it out, the decode uploads it back) — about 122 GB of PCIe
+  traffic across this workload. That is now the binding constraint, and removing
+  it needs onnxruntime's output bound to device memory
+  (`IoBinding::bind_output_to_device`) so the decode can read it in place.
+
 - **`escpod demux --gpu` now runs the CTC-CRF encoder on the GPU.** The fused
   pipeline previously always took `produce_cpu_crf`, so a CRF bundle got tract on
   the CPU no matter what `--gpu` said; the `crf-gpu` encoder existed but was only
