@@ -117,6 +117,22 @@ impl AdapterCnnGpu {
         config: AdapterCnnConfig,
         intra_threads: Option<usize>,
     ) -> Result<Self, AdapterCnnError> {
+        Self::load_with_config_on_device(path, config, intra_threads, 0)
+    }
+
+    /// [`load_with_config`](Self::load_with_config) pinned to a CUDA ordinal.
+    ///
+    /// Detection and the CRF encoder are comparable in device cost (measured 5.4 s
+    /// vs 6.4 s over 40 k reads), so on one GPU they contend and the pipeline is
+    /// bound by their sum. Given more than one device they can be given separate
+    /// roles instead, making the ceiling the *larger* of the two rather than the
+    /// total. This is what lets the caller place them.
+    pub fn load_with_config_on_device(
+        path: impl AsRef<Path>,
+        config: AdapterCnnConfig,
+        intra_threads: Option<usize>,
+        device: i32,
+    ) -> Result<Self, AdapterCnnError> {
         let mut builder = Session::builder().map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         if let Some(n) = intra_threads {
             builder = builder
@@ -128,7 +144,7 @@ impl AdapterCnnGpu {
                 .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         }
         let session = builder
-            .with_execution_providers(crate::ort_ep::cuda_providers())
+            .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?
             .commit_from_file(path)
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?;

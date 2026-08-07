@@ -274,9 +274,30 @@ impl Detector {
     /// batched onnxruntime call (length-grouped); LLR and CPU CNN run per read
     /// in parallel. Bit-identical to calling [`Self::detect_with`] on each signal.
     fn detect_batch(&self, signals: &[Option<Vec<i16>>]) -> Vec<(usize, usize)> {
+        self.detect_batch_traced(signals, None)
+    }
+
+    /// [`detect_batch`](Self::detect_batch), splitting the GPU-CNN path's cost
+    /// into its host and device halves.
+    ///
+    /// Worth separating because they call for opposite fixes: host-side prep
+    /// scales with threads and pipelines against the device, while the batched
+    /// onnxruntime call serialises on one session mutex and contends with the
+    /// encoder for the same GPU. Detect is this pipeline's bottleneck, and
+    /// without this split there is no way to tell which half to attack.
+    // `split` is only read by the GPU-CNN branch, so it is unused whenever that
+    // branch is compiled out. Plain atomics rather than a `&GpuTrace` so this
+    // signature needs no feature gate of its own.
+    #[cfg_attr(not(feature = "cnn-gpu"), allow(unused_variables))]
+    fn detect_batch_traced(
+        &self,
+        signals: &[Option<Vec<i16>>],
+        split: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)>,
+    ) -> Vec<(usize, usize)> {
         #[cfg(feature = "cnn-gpu")]
         if let Detector::CnnGpu(gpu) = self {
             let cfg = gpu.config();
+            let t_prep = std::time::Instant::now();
             let prepped: Vec<Option<Vec<f32>>> = signals
                 .par_iter()
                 .map(|s| {
@@ -286,11 +307,25 @@ impl Detector {
                     })
                 })
                 .collect();
-            return gpu
+            if let Some((prep_ms, _)) = split {
+                prep_ms.fetch_add(
+                    t_prep.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let t_infer = std::time::Instant::now();
+            let out: Vec<(usize, usize)> = gpu
                 .detect_prepped(&prepped)
                 .into_iter()
                 .map(|r| (0usize, r.unwrap_or(0)))
                 .collect();
+            if let Some((_, infer_ms)) = split {
+                infer_ms.fetch_add(
+                    t_infer.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            return out;
         }
         signals
             .par_iter()
@@ -538,7 +573,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             // spawned `available_parallelism()` wide on top of rayon's.
             #[cfg(feature = "crf-gpu")]
             let encoder = if args.gpu {
-                let enc = CrfEncoderGpu::load_bundle(&dir, args.threads)?;
+                // Must match `produce_gpu_crf`'s placement: this instance becomes
+                // worker 0, so it has to land on the first *encoder* device — GPU 1
+                // when detection has GPU 0 to itself.
+                let enc_device = crf_encoder_devices(
+                    escapepod_demux::crf::lattice_gpu::visible_device_count()
+                        .unwrap_or(1)
+                        .max(1),
+                )[0];
+                let enc = CrfEncoderGpu::load_bundle_on_device(&dir, args.threads, enc_device)?;
                 if enc.gpu_decode_active() {
                     info!(
                         "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
@@ -1350,6 +1393,28 @@ fn crf_gpu_block() -> usize {
     })
 }
 
+/// The CUDA ordinals the CRF encoder pool may use.
+///
+/// With one visible device everything shares it. With more, **device 0 is
+/// reserved for adapter detection** and the encoders take the rest.
+///
+/// The split is worth the asymmetry: detect and the encoder cost almost the same
+/// in device time (5.4 s vs 6.4 s over 40 k reads), so sharing one GPU makes the
+/// pipeline's ceiling their *sum* — ~0.25 ms/read, and measurement puts the
+/// device near saturated at that. Giving them separate devices makes the ceiling
+/// the larger of the two instead, roughly halving it. Round-robining both roles
+/// over all devices, which is what this used to do, leaves device 0 carrying
+/// detect *plus* a share of the encoding while the others carry only encoding —
+/// which is why two GPUs returned 1.14x rather than anything like 2x.
+#[cfg(feature = "crf-gpu")]
+fn crf_encoder_devices(visible: usize) -> Vec<i32> {
+    if visible > 1 {
+        (1..visible as i32).collect()
+    } else {
+        vec![0]
+    }
+}
+
 /// Encoder workers, and how they are spread over the visible devices
 /// (`ESCAPEPOD_CRF_GPU_WORKERS`).
 ///
@@ -1396,8 +1461,12 @@ fn crf_gpu_workers(devices: usize) -> usize {
 #[cfg(feature = "crf-gpu")]
 #[derive(Default)]
 struct GpuTrace {
-    /// Producer: batched adapter-CNN detect over a whole block.
+    /// Producer: batched adapter-CNN detect over a whole block (prep + infer).
     detect_ms: std::sync::atomic::AtomicU64,
+    /// Detect, host half: i16 -> f32, normalise, median, across rayon.
+    detect_prep_ms: std::sync::atomic::AtomicU64,
+    /// Detect, device half: the batched onnxruntime call.
+    detect_infer_ms: std::sync::atomic::AtomicU64,
     /// Producer: window standardisation across rayon.
     prep_ms: std::sync::atomic::AtomicU64,
     /// Producer blocked handing a sub-block over — the encoders are behind.
@@ -1432,8 +1501,11 @@ impl GpuTrace {
         let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1000.0;
         info!("{}", style::label("GPU CRF stage trace (thread-seconds):"));
         info!(
-            "  producer   detect {:>7.1}s  prep {:>7.1}s  BLOCKED on send {:>7.1}s",
+            "  producer   detect {:>7.1}s (host {:>6.1}s + device {:>6.1}s)  \
+             prep {:>5.1}s  BLOCKED on send {:>6.1}s",
             g(&self.detect_ms),
+            g(&self.detect_prep_ms),
+            g(&self.detect_infer_ms),
             g(&self.prep_ms),
             g(&self.send_blocked_ms)
         );
@@ -1481,18 +1553,31 @@ fn produce_gpu_crf(
     let devices = escapepod_demux::crf::lattice_gpu::visible_device_count()
         .unwrap_or(1)
         .max(1);
-    let workers = crf_gpu_workers(devices);
-    // Worker 0 reuses the encoder already loaded for its metadata (device 0);
-    // the rest get their own session, round-robin across devices.
+    let enc_devices = crf_encoder_devices(devices);
+    let workers = crf_gpu_workers(enc_devices.len());
+    // Worker 0 reuses the encoder already loaded for its metadata, which `run`
+    // placed on `enc_devices[0]`; the rest get their own session, round-robin
+    // over the encoder devices.
     let extra: Vec<CrfEncoderGpu> = (1..workers)
-        .map(|w| CrfEncoderGpu::load_bundle_on_device(bundle, args.threads, (w % devices) as i32))
+        .map(|w| {
+            CrfEncoderGpu::load_bundle_on_device(
+                bundle,
+                args.threads,
+                enc_devices[w % enc_devices.len()],
+            )
+        })
         .collect::<Result<_, _>>()?;
     if workers > 1 || devices > 1 {
         info!(
-            "{} {} encoder worker(s) across {} visible GPU(s)",
+            "{} {} worker(s) on GPU {:?}{}",
             style::label("CRF encoder:"),
             style::count(workers),
-            style::count(devices)
+            enc_devices,
+            if devices > 1 {
+                "; adapter detection has GPU 0 to itself"
+            } else {
+                ""
+            }
         );
     }
 
@@ -1586,7 +1671,10 @@ fn produce_gpu_crf(
                 // Detect over the whole block (one batched GPU CNN call), then
                 // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
                 let t_det = std::time::Instant::now();
-                let bounds = detector.detect_batch(&sigs);
+                let bounds = detector.detect_batch_traced(
+                    &sigs,
+                    tracing_on.then_some((&trace.detect_prep_ms, &trace.detect_infer_ms)),
+                );
                 if tracing_on {
                     GpuTrace::add(&trace.detect_ms, t_det);
                 }

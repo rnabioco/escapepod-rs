@@ -119,6 +119,33 @@
   that — and measuring 1024/4096/16384 showed under 5% between them, so it is a
   memory knob rather than a throughput one.
 
+- **Adapter detection gets GPU 0 to itself when more than one is visible**, and
+  the encoder pool takes the rest. Previously both roles round-robined over all
+  devices, so device 0 carried detection *plus* a share of the encoding while the
+  others carried only encoding. On 1 M reads across two A30s: 447.6 s -> 431.2 s,
+  and 510.6 s -> 431.2 s against a single GPU (1.18x). Collapses to shared
+  placement on a single-GPU host, so nothing changes there.
+
+- **`ESCAPEPOD_CRF_GPU_TRACE=1` now splits adapter detection into its host and
+  device halves**, which is what finally located this pipeline's bottleneck.
+  On 1 M reads:
+
+  ```text
+  producer   detect 406.1s (host 4.8s + device 401.0s)  prep 0.9s  BLOCKED on send 0.0s
+  2 workers  encode+decode 153.8s  match 11.0s  route 0.7s  BLOCKED on recv 683.8s
+  wall 425.4s — worker busy 19% of its wall, producer busy 96%
+  ```
+
+  **Detect is 401 s of device time in a 425 s run — 94% of the wall**, and 99% of
+  detect is on the device rather than in host prep. The encoder workers idle 82%.
+  Every previous attempt to explain the idle GPU as a scheduling problem was
+  aimed at a stage that was already idle; this is the measurement that says so.
+
+  For scale: CPU detection through tract is 0.915 ms/read on 16 threads against
+  the GPU's 0.240, so moving detection to the host is not an option either — it
+  is 3.8x slower already, and there is only 0.2 s of host-side prep to
+  parallelise.
+
 - **A pool of CRF encoder workers, spread over every visible GPU**
   (`ESCAPEPOD_CRF_GPU_WORKERS`, default two per device, capped at 8). Each worker
   holds its own onnxruntime session and lattice context pinned to one ordinal,
