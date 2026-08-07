@@ -87,6 +87,13 @@ pub struct CrfEncoderGpu {
     lattice: Option<super::lattice_gpu::CrfLatticeGpu>,
     /// Why [`Self::lattice`] is `None`, when it is.
     decode_fallback: Option<String>,
+    /// The graph's output name, resolved once so the IoBinding does not have to
+    /// re-read session metadata per batch.
+    output_name: String,
+    /// Bind the encoder's output to CUDA memory and decode it in place, instead
+    /// of letting onnxruntime copy it to the host for us to upload again.
+    /// Requires [`Self::lattice`]; `ESCAPEPOD_CRF_GPU_ZEROCOPY=0` disables it.
+    zero_copy: bool,
 }
 
 impl CrfEncoderGpu {
@@ -146,6 +153,16 @@ impl CrfEncoderGpu {
                 }
             };
 
+        let output_name = session
+            .outputs()
+            .first()
+            .map(|o| o.name().to_string())
+            .ok_or_else(|| CrfError::Load("encoder graph declares no outputs".to_string()))?;
+        // Only meaningful with the device decode: with the CPU decode the scores
+        // have to reach the host anyway.
+        let zero_copy =
+            lattice.is_some() && std::env::var("ESCAPEPOD_CRF_GPU_ZEROCOPY").as_deref() != Ok("0");
+
         let encoder = Self {
             session: Mutex::new(session),
             meta,
@@ -154,6 +171,8 @@ impl CrfEncoderGpu {
             batch_rows: resolve_batch_rows(),
             lattice,
             decode_fallback,
+            output_name,
+            zero_copy,
         };
         // Same reasoning as the CPU loader: catch a batch-major (boundary-CNN)
         // export here rather than after decoding noise for every read.
@@ -172,6 +191,12 @@ impl CrfEncoderGpu {
     /// Whether the lattice decode runs on the device.
     pub fn gpu_decode_active(&self) -> bool {
         self.lattice.is_some()
+    }
+
+    /// Whether the encoder's scores are decoded in place in device memory,
+    /// rather than copied to the host and uploaded again.
+    pub fn zero_copy_active(&self) -> bool {
+        self.zero_copy
     }
 
     /// Why the decode fell back to the CPU, when it did. The caller is expected
@@ -296,6 +321,9 @@ impl CrfEncoderGpu {
         // so nothing is de-interleaved on the host at all — neither the batch
         // axis nor the per-timestep [dest][edge] order.
         if let Some(lattice) = &self.lattice {
+            if self.zero_copy {
+                return self.run_zero_copy(rows, lattice);
+            }
             return self.run_raw(rows, |data, t_len, _batch, _n_score| {
                 lattice.decode_time_major(data, t_len, &self.alphabet)
             });
@@ -329,6 +357,115 @@ impl CrfEncoderGpu {
                 )
                 .collect()
         })
+    }
+
+    /// Encode with the output bound to CUDA memory and decode it where it lies.
+    ///
+    /// The scores are the pipeline's largest object by far — `t_len * n_score`
+    /// floats, 1.5 MB per read at the RNA004 geometry. Letting onnxruntime copy
+    /// them to the host so the decode can upload them again costs two PCIe
+    /// crossings per read and nothing else; once both the encoder and the decode
+    /// were on the device that was the binding constraint. Binding the output to
+    /// device memory removes both crossings, and only `t_len` bytes of decoded
+    /// path per read ever come back.
+    ///
+    /// The input still crosses host→device, but it is `chunk` floats per read
+    /// (12 KB), two orders of magnitude smaller than the scores.
+    fn run_zero_copy(
+        &self,
+        rows: &[&[f32]],
+        lattice: &super::lattice_gpu::CrfLatticeGpu,
+    ) -> Result<Vec<String>, CrfError> {
+        use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+        use ort::value::{DynTensorValueType, ValueType};
+
+        let chunk = self.meta.signal.chunk;
+        let batch = rows.len();
+        let mut flat = Vec::with_capacity(batch * chunk);
+        for r in rows {
+            if r.len() != chunk {
+                return Err(CrfError::Run(format!(
+                    "prepped window has {} samples, expected {chunk}",
+                    r.len()
+                )));
+            }
+            flat.extend_from_slice(r);
+        }
+        let input = Tensor::from_array(([batch, 1, chunk], flat))
+            .map_err(|e| CrfError::Run(e.to_string()))?;
+        let run = |e: ort::Error| CrfError::Run(e.to_string());
+
+        // Device 0 for both sides: under SLURM `--gres=gpu:1`, CUDA_VISIBLE_DEVICES
+        // renumbers the allocated GPU to 0, which is also the ordinal
+        // `CrfLatticeGpu::new` binds. The residency check below is what actually
+        // enforces the pairing.
+        let mem = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(run)?;
+
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut binding = session.create_binding().map_err(run)?;
+        binding.bind_input("signal", &input).map_err(run)?;
+        binding
+            .bind_output_to_device(self.output_name.as_str(), &mem)
+            .map_err(run)?;
+        let outputs = session.run_binding(&binding).map_err(run)?;
+        // onnxruntime's execution provider has its own stream; the decode runs on
+        // the lattice context's. Without this the kernels could read the buffer
+        // while the encoder is still filling it.
+        binding.synchronize_outputs().map_err(run)?;
+
+        let tensor = outputs[0]
+            .downcast_ref::<DynTensorValueType>()
+            .map_err(|e| CrfError::Run(format!("encoder output is not a tensor: {e}")))?;
+
+        // If the EP declined the binding and produced a host tensor, `data_ptr`
+        // is a host pointer and handing it to a kernel would read garbage — or
+        // fault. Refuse rather than produce silent nonsense.
+        let device = tensor.memory_info().allocation_device();
+        if device != AllocationDevice::CUDA {
+            return Err(CrfError::Run(format!(
+                "encoder output landed on {device:?}, not CUDA, so it cannot be decoded \
+                 in place. Set ESCAPEPOD_CRF_GPU_ZEROCOPY=0 to fall back to the copying path."
+            )));
+        }
+
+        let t_len = self.meta.t_len();
+        let n_score = self.layout.n_score;
+        let dims: Vec<usize> = match tensor.dtype() {
+            ValueType::Tensor { shape, .. } => shape.iter().map(|&d| d as usize).collect(),
+            other => {
+                return Err(CrfError::Run(format!(
+                    "encoder output has non-tensor type {other:?}"
+                )));
+            }
+        };
+        if dims != [t_len, batch, n_score] {
+            return Err(CrfError::BadShape {
+                got: dims,
+                t: t_len,
+                batch,
+                n_score,
+            });
+        }
+
+        let ptr = tensor.data_ptr() as u64;
+        // SAFETY: `ptr` is onnxruntime's own CUDA allocation for this output —
+        // residency and shape are both checked immediately above, so it is
+        // `t_len * batch * n_score` f32 on device 0, the device the lattice
+        // context binds. `synchronize_outputs` has retired the producing stream.
+        // `outputs` owns the allocation and is alive across the call, and nothing
+        // else aliases it while the session lock is held. The decode overwrites
+        // it in place with the log-posteriors, which is sound because we are its
+        // only reader and onnxruntime fully rewrites the buffer on the next run.
+        unsafe { lattice.decode_device_time_major(ptr, batch, t_len, &self.alphabet) }
     }
 
     /// Encode one batch on the device and decode it on the CPU, halving and

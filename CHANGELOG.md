@@ -56,11 +56,35 @@
     removing 1.5 MB per read of pure memory movement that previously had to
     complete before the decode could start.
 
-  Known limitation: the score buffer still round-trips through host memory
-  (onnxruntime copies it out, the decode uploads it back) — about 122 GB of PCIe
-  traffic across this workload. That is now the binding constraint, and removing
-  it needs onnxruntime's output bound to device memory
-  (`IoBinding::bind_output_to_device`) so the decode can read it in place.
+- **The encoder's scores are decoded in place in device memory.** onnxruntime's
+  output is bound to CUDA through `IoBinding::bind_output_to_device` and the
+  decode kernels read it where it lies, so the largest object in the pipeline —
+  `t_len * n_score` floats, 1.5 MB per read — never crosses PCIe in either
+  direction. Previously onnxruntime copied it to the host and the decode uploaded
+  it straight back: ~122 GB of round-trip traffic across 40 k reads, and the
+  binding constraint once both the encoder and the decode were on the device.
+
+  ```text
+  40k reads, one A30, --method cnn --gpu
+                         16 threads    4 threads    2 threads
+  scores via host           27.3 s       29.8 s          —
+  scores decoded in place   16.5 s       17.3 s       18.0 s
+  ```
+
+  1.65x on top of the GPU decode, and **4.3x against 0.7.0** (70.7 s -> 16.5 s).
+  Peak RSS drops 4.4 GB -> 3.6 GB with the host score buffer gone. Two cores now
+  beat what 0.7.0 did with sixteen, by 3.9x.
+
+  Bit-identical: **40 001/40 001 identical rows** against the copying path on the
+  same binary — full rows, not just the barcode calls. `ESCAPEPOD_CRF_GPU_ZEROCOPY=0`
+  restores the copying path.
+
+  The device pointer is only used after checking that the output actually landed
+  on CUDA (`MemoryInfo::allocation_device`) and has the expected shape; if an
+  execution provider declines the binding and returns a host tensor, this errors
+  and names the escape hatch rather than handing a host pointer to a kernel.
+  `IoBinding::synchronize_outputs` retires onnxruntime's stream before the decode
+  kernels run on the lattice context's own stream.
 
 - **`escpod demux --gpu` now runs the CTC-CRF encoder on the GPU.** The fused
   pipeline previously always took `produce_cpu_crf`, so a CRF bundle got tract on

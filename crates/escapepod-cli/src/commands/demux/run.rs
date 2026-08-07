@@ -541,8 +541,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                 let enc = CrfEncoderGpu::load_bundle(&dir, args.threads)?;
                 if enc.gpu_decode_active() {
                     info!(
-                        "{} GPU (onnxruntime CUDA), lattice decode GPU (batched)",
-                        style::label("CRF encoder:")
+                        "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
+                         scores {}",
+                        style::label("CRF encoder:"),
+                        if enc.zero_copy_active() {
+                            "decoded in place on the device"
+                        } else {
+                            "round-tripped through host memory"
+                        }
                     );
                 } else {
                     // The decode is the larger half of this path's host cost, so

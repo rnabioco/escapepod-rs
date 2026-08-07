@@ -220,11 +220,74 @@ impl CrfLatticeGpu {
         }
     }
 
-    /// One batch, one device residency. Every intermediate stays on the device;
-    /// only `batch * t_len` bytes of path come back.
+    /// Decode scores that are **already on the device**, in onnxruntime's
+    /// time-major `[t_len][batch][n_score]` order.
+    ///
+    /// This is the zero-copy path: onnxruntime's output is bound to CUDA memory
+    /// and decoded where it lies, so the encoder's `t_len * n_score` floats per
+    /// read never cross PCIe in either direction. That is ~1.5 MB per read each
+    /// way at the RNA004 geometry, and it was the binding constraint once both
+    /// the encoder and the decode were on the device.
+    ///
+    /// # Safety
+    ///
+    /// `scores_dev` must be
+    /// - a CUDA device pointer on the **same device** this context was built on,
+    /// - valid and unaliased for `batch * t_len * n_score` `f32`,
+    /// - **writable** — pass 1 overwrites it in place with the log-posteriors,
+    /// - and complete: any producing stream must have been synchronised, since
+    ///   these kernels run on this context's own stream.
+    ///
+    /// The caller must keep the allocation alive until this returns.
+    pub unsafe fn decode_device_time_major(
+        &self,
+        scores_dev: u64,
+        batch: usize,
+        t_len: usize,
+        alphabet: &[u8],
+    ) -> Result<Vec<String>, CrfError> {
+        if alphabet.len() != self.layout.n_edges {
+            return Err(CrfError::Decode(format!(
+                "alphabet has {} symbols, expected {}",
+                alphabet.len(),
+                self.layout.n_edges
+            )));
+        }
+        if batch == 0 || t_len == 0 {
+            return Ok(Vec::new());
+        }
+        self.launch(
+            Scores::Device(scores_dev),
+            batch,
+            t_len,
+            alphabet,
+            ScoreOrder::TimeMajor,
+        )
+    }
+
+    /// Upload a host buffer, then run the same launch sequence.
     fn decode_one(
         &self,
         scores: &[f32],
+        batch: usize,
+        t_len: usize,
+        alphabet: &[u8],
+        order: ScoreOrder,
+    ) -> Result<Vec<String>, CrfError> {
+        // The encoder's own [dest][edge] order is what every kernel reads, so
+        // this is uploaded once and worked on in place — no transpose pass and
+        // no second score buffer.
+        let mut work = self
+            .stream
+            .clone_htod(scores)
+            .map_err(|e| CrfError::Decode(e.to_string()))?;
+        self.launch(Scores::Owned(&mut work), batch, t_len, alphabet, order)
+    }
+
+    /// The kernel sequence, over scores that are on the device either way.
+    fn launch(
+        &self,
+        scores: Scores<'_>,
         batch: usize,
         t_len: usize,
         alphabet: &[u8],
@@ -242,11 +305,6 @@ impl CrfLatticeGpu {
 
         let dev = |e: cudarc::driver::DriverError| CrfError::Decode(e.to_string());
 
-        // The encoder's own [dest][edge] order is what every kernel reads, so
-        // this is uploaded once and then worked on in place — no transpose pass
-        // and no second score buffer. The posterior kernel overwrites it with
-        // the log-posteriors that pass 2 consumes.
-        let mut work = self.stream.clone_htod(scores).map_err(dev)?;
         let mut alpha = self.stream.alloc_zeros::<f32>(lattice).map_err(dev)?;
         let mut beta = self.stream.alloc_zeros::<f32>(lattice).map_err(dev)?;
         let mut path = self.stream.alloc_zeros::<u8>(batch * t_len).map_err(dev)?;
@@ -275,7 +333,7 @@ impl CrfLatticeGpu {
 
         // ---- Pass 1: posteriors under the log semiring ----
         self.sweep(
-            &work,
+            &scores,
             &mut alpha,
             &mut beta,
             &sweep_cfg,
@@ -292,8 +350,8 @@ impl CrfLatticeGpu {
             let floor = super::lattice::POSTERIOR_FLOOR;
             let f = self.func(k::POSTERIOR_KERNEL_NAME)?;
             let mut b = self.stream.launch_builder(&f);
-            b.arg(&mut work)
-                .arg(&alpha)
+            push_scores(&mut b, &scores);
+            b.arg(&alpha)
                 .arg(&beta)
                 .arg(&t_i)
                 .arg(&ns_i)
@@ -308,7 +366,7 @@ impl CrfLatticeGpu {
 
         // ---- Pass 2: Viterbi over the log-posteriors ----
         self.sweep(
-            &work,
+            &scores,
             &mut alpha,
             &mut beta,
             &sweep_cfg,
@@ -324,8 +382,8 @@ impl CrfLatticeGpu {
         {
             let f = self.func(k::VITERBI_KERNEL_NAME)?;
             let mut b = self.stream.launch_builder(&f);
-            b.arg(&work)
-                .arg(&alpha)
+            push_scores(&mut b, &scores);
+            b.arg(&alpha)
                 .arg(&beta)
                 .arg(&mut path)
                 .arg(&t_i)
@@ -360,7 +418,7 @@ impl CrfLatticeGpu {
     #[allow(clippy::too_many_arguments)]
     fn sweep(
         &self,
-        scores: &cudarc::driver::CudaSlice<f32>,
+        scores: &Scores<'_>,
         alpha: &mut cudarc::driver::CudaSlice<f32>,
         beta: &mut cudarc::driver::CudaSlice<f32>,
         cfg: &LaunchConfig,
@@ -375,8 +433,8 @@ impl CrfLatticeGpu {
     ) -> Result<(), CrfError> {
         let f = self.func(k::SWEEP_KERNEL_NAME)?;
         let mut b = self.stream.launch_builder(&f);
-        b.arg(scores)
-            .arg(alpha)
+        push_scores(&mut b, scores);
+        b.arg(alpha)
             .arg(beta)
             .arg(&t)
             .arg(&ns)
@@ -390,6 +448,27 @@ impl CrfLatticeGpu {
             .map(|_| ())
             .map_err(|e| CrfError::Decode(e.to_string()))
     }
+}
+
+/// Where a launch's score buffer lives.
+///
+/// Both variants reach the kernel as the same 8-byte device address — a
+/// `CudaSlice` pushes its own pointer, a raw `u64` pushes itself — so one kernel
+/// serves the uploaded and the zero-copy paths without a second signature.
+enum Scores<'a> {
+    /// Uploaded and owned by this decode.
+    Owned(&'a mut cudarc::driver::CudaSlice<f32>),
+    /// Device memory owned by someone else, e.g. onnxruntime's bound output.
+    /// Validity is the caller's obligation — see
+    /// [`CrfLatticeGpu::decode_device_time_major`].
+    Device(u64),
+}
+
+fn push_scores<'b>(args: &mut cudarc::driver::LaunchArgs<'b>, scores: &'b Scores<'_>) {
+    match scores {
+        Scores::Owned(s) => args.arg(&**s),
+        Scores::Device(p) => args.arg(p),
+    };
 }
 
 /// CUDA reports device OOM as a message, like onnxruntime does.
