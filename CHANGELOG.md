@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+### Added
+
+- **`escpod demux --gpu` now runs the CTC-CRF encoder on the GPU.** The fused
+  pipeline previously always took `produce_cpu_crf`, so a CRF bundle got tract on
+  the CPU no matter what `--gpu` said; the `crf-gpu` encoder existed but was only
+  reachable from `demux basecall --gpu`. Since the encoder is ~91% of that head's
+  cost, `--gpu --method cnn` left the device essentially idle — measured on a real
+  1M-read run, 0–6% GPU utilisation while 11.6 of 16 cores were pinned.
+
+  The new `produce_gpu_crf` mirrors the DTW-SVM `produce_gpu`: parallel CPU prep
+  (decode, batched detect, window standardisation) feeds a dedicated encoder
+  thread over a bounded channel, so prep for the next block overlaps inference on
+  the current one instead of the two alternating.
+
+  Measured on 40 k real RNA004 reads, one A30, 16 cores (the allocation the
+  production rule requests), against 0.7.0 with the same model, same input and
+  the same `--method cnn --gpu`:
+
+  ```text
+                        wall     reads/s   GPU util (mean / median / p90)
+  0.7.0 (CPU encoder)   70.7 s      566     1.0% /  0% /  0%
+  this change           29.5 s     1355    22.1% / 25% / 40%
+  ```
+
+  2.4x end-to-end, and the device goes from idle in 91% of samples to busy in
+  82% of them. Barcode calls agree with the CPU encoder on 99.97% of reads
+  (39,989/40,001); the residue is tract-vs-onnxruntime numerics in the encoder,
+  the same single-base-indel disagreement already documented for
+  `demux basecall --gpu`, and confidence margins differ on 0.4% of rows.
+
+  `ESCAPEPOD_CRF_GPU_BLOCK` (default 4096 reads) sizes the host-side handoff.
+  It is deliberately not the device batch — `ESCAPEPOD_CRF_GPU_BATCH_ROWS` is
+  that — and measuring 1024/4096/16384 showed under 5% between them, so it is a
+  memory knob rather than a throughput one.
+
+### Fixed
+
+- **The GPU CRF decode's time-major transpose was serial, and it — not the
+  device — was the bottleneck.** `split_time_major` de-interleaves onnxruntime's
+  `[T, batch, n_score]` output into per-read buffers: 786 MB in and 786 MB out
+  per 512-read batch at the RNA004 geometry, single-threaded. It capped the fused
+  GPU path at ~700 reads/s on *any* thread count (16/32/48 all within 5%) while
+  the CPU-encoder path kept scaling to 1150. Parallelising it over the batch axis
+  (order-preserving, so read alignment is unaffected) took the same workload from
+  57.2 s to 27.9 s — 2x, on top of the win above. `demux basecall --gpu` uses the
+  same code and gets the same speedup.
+
+- The fused CRF path no longer materialises the whole transpose before decoding:
+  it gathers each read straight into the decode's input buffer, one buffer per
+  rayon worker rather than one 1.5 MB allocation per read. Wall time is unchanged
+  — the parallel transpose above is what mattered — but peak RSS no longer
+  carries a second full copy of the score batch, which is what made raising
+  `ESCAPEPOD_CRF_GPU_BATCH_ROWS` expensive (that knob still scales onnxruntime's
+  own output tensor: 4.33 GB peak at 512 rows, 7.06 GB at 2048).
+
+### Changed
+
+- `escpod demux --gpu`'s "no effect here" warning for a CRF model no longer
+  requires `--method` to be something other than `cnn`. The old gate silenced the
+  warning for exactly the combination that looks most accelerated and is not —
+  `--gpu --method cnn` against a CPU-only encoder — which is how a production run
+  spent its time CPU-bound on a GPU node without a word of warning. Binaries
+  built with `crf-gpu` no longer warn at all, because the flag now does something.
+
+- `--gpu` is available on `demux` whenever any of `gpu`, `cnn-gpu` **or**
+  `crf-gpu` is compiled in; previously a `crf-gpu`-only build had no such flag.
+
 ## 0.7.0 (2026-08-04)
 
 ### Added

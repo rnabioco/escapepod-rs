@@ -21,6 +21,8 @@ use std::sync::mpsc::SyncSender;
 
 use crate::progress::create_progress_bar;
 use crate::style;
+#[cfg(feature = "crf-gpu")]
+use escapepod_demux::crf::CrfEncoderGpu;
 #[cfg(feature = "crf-decode")]
 use escapepod_demux::crf::{BarcodeRefs, CrfEncoder, CrfScratch};
 use escapepod_demux::{
@@ -146,17 +148,23 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// [experimental] Use the GPU where this pipeline supports it: batched
-    /// DTW-SVM classify (`--features gpu`) and/or batched CNN adapter detection
-    /// with `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and
-    /// feeds the GPU; CPU falls back automatically for stages without a GPU
-    /// path (e.g. GBM classify).
+    /// [experimental] Use the GPU where this pipeline supports it: CTC-CRF
+    /// encoder inference (`--features crf-gpu`), batched DTW-SVM classify
+    /// (`--features gpu`), and/or batched CNN adapter detection with
+    /// `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and feeds
+    /// the GPU; CPU falls back automatically for stages without a GPU path
+    /// (e.g. GBM classify).
+    ///
+    /// With a CRF bundle this is the case that pays off most: the encoder is
+    /// ~91% of that head's CPU cost (13.9 ms/read against a 1.19 ms AVX-512
+    /// lattice decode), so leaving it on the CPU leaves the device idle even
+    /// with `--method cnn` doing detection there.
     ///
     /// GPU DTW classify is NOT recommended on a full node — the CPU DTW is
     /// faster there (measured 113 s CPU on 64 cores vs 132 s with `--gpu` on an
     /// A30, plus ~2.2 GB more RSS). It may help when cores are scarce. GPU CNN
     /// detection (`--method cnn --gpu`) is the case that does pay off.
-    #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
+    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
@@ -396,9 +404,36 @@ enum ClassifyModel {
 /// against.
 #[cfg(feature = "crf-decode")]
 struct CrfHead {
-    encoder: CrfEncoder,
+    encoder: CrfEncoderAny,
     refs: BarcodeRefs,
     min_margin: u32,
+}
+
+/// Where CRF encoder inference runs. The lattice decode is on the CPU either
+/// way — see `escapepod_demux::crf::encoder_gpu` for why.
+///
+/// The two variants drive genuinely different producers rather than hiding
+/// behind one `basecall` method: tract has no efficient batched LSTM, so the CPU
+/// path interleaves prep/encode/match per read inside one rayon pass, while the
+/// GPU path has to accumulate a batch before it can submit anything. Collapsing
+/// them into a common batched interface would force the CPU path to materialise
+/// a whole block of 3000-sample windows it has no use for.
+#[cfg(feature = "crf-decode")]
+enum CrfEncoderAny {
+    Cpu(Box<CrfEncoder>),
+    #[cfg(feature = "crf-gpu")]
+    Gpu(Box<CrfEncoderGpu>),
+}
+
+#[cfg(feature = "crf-decode")]
+impl CrfEncoderAny {
+    fn metadata(&self) -> &escapepod_demux::crf::CrfMetadata {
+        match self {
+            Self::Cpu(e) => e.metadata(),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.metadata(),
+        }
+    }
 }
 
 impl ClassifyModel {
@@ -497,7 +532,22 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let model = match crf_dir {
         #[cfg(feature = "crf-decode")]
         Some(dir) => {
-            let encoder = CrfEncoder::load_bundle(&dir)?;
+            // The encoder is ~91% of this head's CPU cost, so `--gpu` moves it
+            // to the device; the lattice decode stays on the CPU regardless.
+            // `--threads` bounds onnxruntime's intra-op pool, which is otherwise
+            // spawned `available_parallelism()` wide on top of rayon's.
+            #[cfg(feature = "crf-gpu")]
+            let encoder = if args.gpu {
+                info!(
+                    "{} GPU (onnxruntime CUDA); lattice decode stays on the CPU",
+                    style::label("CRF encoder:")
+                );
+                CrfEncoderAny::Gpu(Box::new(CrfEncoderGpu::load_bundle(&dir, args.threads)?))
+            } else {
+                CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
+            };
+            #[cfg(not(feature = "crf-gpu"))]
+            let encoder = CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?));
             // References come from the bundle unless the caller overrides them.
             // Carrying them in the bundle is what makes the plain
             // `--model <bundle> -d out/` form work, and it fixes the
@@ -687,20 +737,41 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         }
         #[cfg(feature = "crf-decode")]
         ClassifyModel::Crf(head) => {
-            // Encoder inference here is tract on the CPU, one read per rayon
-            // worker. `demux basecall --gpu` has an onnxruntime path; it is not
-            // wired through the fused pipeline, so say so rather than silently
-            // ignoring the flag.
-            #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-            if args.gpu && args.method.as_deref() != Some("cnn") {
+            // Without `crf-gpu` the encoder is tract on the CPU, one read per
+            // rayon worker, and it is ~91% of this head's cost. `--method cnn`
+            // moving detection to the device does NOT make up for that, so warn
+            // regardless of the method — the previous `!= Some("cnn")` gate
+            // silenced exactly the combination that looks most accelerated and
+            // is not.
+            #[cfg(all(not(feature = "crf-gpu"), any(feature = "gpu", feature = "cnn-gpu")))]
+            if args.gpu {
                 tracing::warn!(
-                    "--gpu has no effect here: fused CRF basecalling is CPU-only and \
-                     `--method {}` detection is CPU-only (use `--method cnn` for GPU \
-                     adapter detection, or `demux basecall --gpu` for a GPU encoder).",
-                    args.method.as_deref().unwrap_or("<from model>")
+                    "--gpu leaves the CRF encoder on the CPU: this binary was built \
+                     without `crf-gpu`, and the encoder is ~91% of this head's cost. \
+                     Rebuild with `--features crf-gpu` for a GPU encoder."
                 );
             }
-            produce_cpu_crf(&args, &detector, head, &routers, class_tx.as_ref(), &pb)
+            match &head.encoder {
+                #[cfg(feature = "crf-gpu")]
+                CrfEncoderAny::Gpu(enc) => produce_gpu_crf(
+                    &args,
+                    &detector,
+                    head,
+                    enc,
+                    &routers,
+                    class_tx.as_ref(),
+                    &pb,
+                ),
+                CrfEncoderAny::Cpu(enc) => produce_cpu_crf(
+                    &args,
+                    &detector,
+                    head,
+                    enc,
+                    &routers,
+                    class_tx.as_ref(),
+                    &pb,
+                ),
+            }
         }
     };
 
@@ -1145,11 +1216,12 @@ fn produce_cpu_crf(
     args: &RunArgs,
     detector: &Detector,
     head: &CrfHead,
+    encoder: &CrfEncoder,
     routers: &Routers,
     class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
-    let meta = head.encoder.metadata();
+    let meta = encoder.metadata();
     drive_blocks(
         &args.input,
         detector.signal_decode_bound(),
@@ -1173,25 +1245,11 @@ fn produce_cpu_crf(
                         ) {
                             return None;
                         }
-                        let seq = head
-                            .encoder
+                        let seq = encoder
                             .basecall_prepped(window, scratch)
                             .inspect_err(|e| tracing::warn!("encoder: {e}"))
                             .ok()?;
-                        let m = head.refs.match_sequence(seq.as_bytes())?;
-                        // Same gate as `demux basecall --min-margin`, including
-                        // its treatment of a single reference: with no runner-up
-                        // there is no margin to test, so the call stands.
-                        if !m.margin.is_none_or(|v| v >= head.min_margin) {
-                            return None;
-                        }
-                        // Confidence is the margin, matching `demux basecall`
-                        // and `eval_recovery.py`. A lone reference reports 0
-                        // rather than a fabricated distance.
-                        Some((
-                            head.refs.name(m.index).to_string(),
-                            f64::from(m.margin.unwrap_or(0)),
-                        ))
+                        call_barcode(head, &seq)
                     })()
                     .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0));
 
@@ -1209,6 +1267,179 @@ fn produce_cpu_crf(
             );
         },
     )
+}
+
+/// Match one decoded sequence to a reference, applying `--min-margin`.
+///
+/// `None` means "no call" — either nothing matched, or the runner-up was too
+/// close — and the caller routes those to `unclassified`. Shared by the CPU and
+/// GPU CRF producers so the two cannot drift on the gate or on what confidence
+/// means.
+///
+/// Same gate as `demux basecall --min-margin`, including its treatment of a
+/// single reference: with no runner-up there is no margin to test, so the call
+/// stands. Confidence is the margin, matching `demux basecall` and
+/// `eval_recovery.py`; a lone reference reports 0 rather than a fabricated
+/// distance.
+#[cfg(feature = "crf-decode")]
+fn call_barcode(head: &CrfHead, seq: &str) -> Option<(String, f64)> {
+    let m = head.refs.match_sequence(seq.as_bytes())?;
+    if !m.margin.is_none_or(|v| v >= head.min_margin) {
+        return None;
+    }
+    Some((
+        head.refs.name(m.index).to_string(),
+        f64::from(m.margin.unwrap_or(0)),
+    ))
+}
+
+/// Reads whose prepped windows are handed to the GPU encoder in one go
+/// (`ESCAPEPOD_CRF_GPU_BLOCK`).
+///
+/// This is a *host* memory bound, not a device one — `CrfEncoderGpu` splits each
+/// call into `ESCAPEPOD_CRF_GPU_BATCH_ROWS` (512) rows for the device and
+/// decodes each of those before encoding the next, so device activations and the
+/// 1.5 MB/read score buffers are already capped underneath this. Raising this
+/// does not enlarge the device batch; raise `ESCAPEPOD_CRF_GPU_BATCH_ROWS` for
+/// that.
+///
+/// What this sizes is the prepped windows in flight: `chunk` f32 per read, so
+/// 48 MB per block at the RNA004 geometry (3000 samples), and the channel holds
+/// two. A whole [`DETECT_WINDOW`] block would be 786 MB.
+///
+/// 4096 is 8 device batches, which measured enough on an A30: the encoder thread
+/// is the bottleneck there, so the producer is always ahead and deeper buffering
+/// buys nothing. Worth raising only if prep becomes the slower side (many cores
+/// starved of I/O, or a much faster device).
+#[cfg(feature = "crf-gpu")]
+fn crf_gpu_block() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ESCAPEPOD_CRF_GPU_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4096)
+    })
+}
+
+/// GPU producer for the CRF head: parallel CPU prep (decode + detect + window
+/// standardisation) feeds a dedicated encoder thread through a bounded channel,
+/// so the device is kept fed while the next block is prepped.
+///
+/// The overlap is the point. Running the encoder inline in the block loop the
+/// way [`produce_cpu_crf`] does would alternate device and host phases with
+/// neither saturated: the GPU would idle through prep and the rayon pool would
+/// idle through inference. `drive_blocks` already hands blocks over from its own
+/// reader threads, so this adds the second half of the pipeline.
+#[cfg(feature = "crf-gpu")]
+fn produce_gpu_crf(
+    args: &RunArgs,
+    detector: &Detector,
+    head: &CrfHead,
+    encoder: &CrfEncoderGpu,
+    routers: &Routers,
+    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    pb: &indicatif::ProgressBar,
+) -> anyhow::Result<()> {
+    /// Prepped windows (`None` = no usable window) aligned with their reads.
+    type Block = (Vec<Option<Vec<f32>>>, Vec<BlockItem>);
+
+    let meta = encoder.metadata();
+    let gpu_block = crf_gpu_block();
+    // Depth 2 double-buffers: prep can run ~2 blocks ahead of the encoder.
+    let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Block>(2);
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let gpu = scope.spawn(move || -> anyhow::Result<()> {
+            for (windows, items) in block_rx.iter() {
+                // Encodes on the device, then fans the lattice decode back out
+                // across rayon. `None` windows never reach the device and come
+                // back `None`, so this stays aligned with `items`.
+                let seqs = encoder
+                    .basecall_batch(&windows)
+                    .map_err(|e| anyhow::anyhow!("GPU encoder: {e}"))?;
+                // 96 references x one wavefront alignment each is small next to
+                // the decode, but it is still per-read work worth fanning out.
+                let calls: Vec<(String, f64)> = seqs
+                    .par_iter()
+                    .map(|seq| {
+                        seq.as_deref()
+                            .and_then(|s| call_barcode(head, s))
+                            .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0))
+                    })
+                    .collect();
+                let n = items.len() as u64;
+                for ((read, chunks, run_infos), (barcode, conf)) in items.into_iter().zip(calls) {
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        barcode,
+                        chunks,
+                        run_infos,
+                        conf,
+                    );
+                }
+                pb.inc(n);
+            }
+            Ok(())
+        });
+
+        // CPU prep. A send failure means the encoder thread is gone; stop
+        // feeding and let the join below report why rather than masking it with
+        // a channel error.
+        let mut hung_up = false;
+        let drive = drive_blocks(
+            &args.input,
+            detector.signal_decode_bound(),
+            |sigs, items| {
+                if hung_up {
+                    return;
+                }
+                // Detect over the whole block (one batched GPU CNN call), then
+                // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
+                let bounds = detector.detect_batch(&sigs);
+                let mut rows = sigs.into_iter().zip(bounds).zip(items);
+                loop {
+                    let chunk: Vec<_> = rows.by_ref().take(gpu_block).collect();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let windows: Vec<Option<Vec<f32>>> = chunk
+                        .par_iter()
+                        .map(|((signal, (_s, adapter_end)), (read, _, _))| {
+                            let adc = signal.as_ref()?;
+                            let mut w = Vec::new();
+                            // Same conversion as the CPU path: only the `chunk`
+                            // samples ending at `adapter_end` are calibrated.
+                            meta.prep_adc_into(
+                                adc,
+                                *adapter_end,
+                                read.calibration_offset,
+                                read.calibration_scale,
+                                &mut w,
+                            )
+                            .then_some(w)
+                        })
+                        .collect();
+                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
+                    if block_tx.send((windows, items)).is_err() {
+                        hung_up = true;
+                        return;
+                    }
+                }
+            },
+        );
+
+        drop(block_tx);
+        // The encoder's error is the root cause when the channel hung up, so
+        // report it ahead of whatever `drive_blocks` returned.
+        gpu.join()
+            .map_err(|e| anyhow::anyhow!("GPU encoder thread panicked: {e:?}"))??;
+        drive
+    })
 }
 
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a

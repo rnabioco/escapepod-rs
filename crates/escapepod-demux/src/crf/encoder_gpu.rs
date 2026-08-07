@@ -171,6 +171,23 @@ impl CrfEncoderGpu {
     }
 
     fn try_run_batch(&self, rows: &[&[f32]]) -> Result<Vec<Vec<f32>>, CrfError> {
+        self.run_raw(rows, |data, t_len, batch, n_score| {
+            Ok(split_time_major(data, t_len, batch, n_score))
+        })
+    }
+
+    /// Build the `[batch, 1, chunk]` input, run one onnxruntime call, check the
+    /// output shape, and hand the raw time-major buffer to `consume`.
+    ///
+    /// The session lock is held across `consume` because the output tensor
+    /// borrows the session's run context. Both callers drive the encoder from a
+    /// single thread — the fused pipeline's GPU thread and `demux basecall`'s
+    /// batch loop — so nothing contends on it.
+    fn run_raw<R>(
+        &self,
+        rows: &[&[f32]],
+        consume: impl FnOnce(&[f32], usize, usize, usize) -> Result<R, CrfError>,
+    ) -> Result<R, CrfError> {
         let chunk = self.meta.signal.chunk;
         let batch = rows.len();
         let mut flat = Vec::with_capacity(batch * chunk);
@@ -209,7 +226,67 @@ impl CrfEncoderGpu {
             });
         }
 
-        Ok(split_time_major(data, t_len, batch, n_score))
+        consume(data, t_len, batch, n_score)
+    }
+
+    /// [`run_and_decode`](Self::run_and_decode) for one call, no OOM retry.
+    ///
+    /// Gathers each read out of the time-major buffer and decodes it in the
+    /// *same* parallel pass, into a buffer the worker reuses across reads.
+    /// Materialising the transpose first (as [`split_time_major`] does) costs a
+    /// 1.5 MB allocation per read and pushes the whole 786 MB batch out to DRAM
+    /// and back; gathering straight into the decode's input keeps it in cache
+    /// and leaves one buffer per rayon worker instead of one per read.
+    fn try_run_and_decode(
+        &self,
+        rows: &[&[f32]],
+        backend: Backend,
+    ) -> Result<Vec<String>, CrfError> {
+        self.run_raw(rows, |data, t_len, batch, n_score| {
+            (0..batch)
+                .into_par_iter()
+                .map_init(
+                    || {
+                        (
+                            CrfScratch::new(),
+                            Vec::<f32>::with_capacity(t_len * n_score),
+                        )
+                    },
+                    |(scratch, buf), b| {
+                        buf.clear();
+                        for t in 0..t_len {
+                            let off = (t * batch + b) * n_score;
+                            buf.extend_from_slice(&data[off..off + n_score]);
+                        }
+                        decode_with(
+                            &self.layout,
+                            &self.alphabet,
+                            buf.as_slice(),
+                            t_len,
+                            scratch,
+                            backend,
+                        )
+                        .map_err(|e| CrfError::Decode(e.to_string()))
+                    },
+                )
+                .collect()
+        })
+    }
+
+    /// Encode one batch on the device and decode it on the CPU, halving and
+    /// retrying on device out-of-memory exactly as [`run_batch`](Self::run_batch)
+    /// does — the batch axis is independent, so a split batch decodes to the
+    /// same sequences as a whole one.
+    fn run_and_decode(&self, rows: &[&[f32]], backend: Backend) -> Result<Vec<String>, CrfError> {
+        match self.try_run_and_decode(rows, backend) {
+            Err(CrfError::Run(msg)) if is_oom(&msg) && rows.len() > 1 => {
+                let half = rows.len().div_ceil(2);
+                let mut first = self.run_and_decode(&rows[..half], backend)?;
+                first.extend(self.run_and_decode(&rows[half..], backend)?);
+                Ok(first)
+            }
+            other => other,
+        }
     }
 
     /// Encode on the GPU, then decode on the CPU across rayon workers.
@@ -241,24 +318,7 @@ impl CrfEncoderGpu {
                 .iter()
                 .map(|&i| prepped[i].as_deref().unwrap())
                 .collect();
-            let scores = self.run_batch(&rows)?;
-
-            let decoded: Result<Vec<String>, CrfError> = scores
-                .par_iter()
-                .map_init(CrfScratch::new, |scratch, s| {
-                    decode_with(
-                        &self.layout,
-                        &self.alphabet,
-                        s,
-                        self.meta.t_len(),
-                        scratch,
-                        backend,
-                    )
-                    .map_err(|e| CrfError::Decode(e.to_string()))
-                })
-                .collect();
-
-            for (&i, seq) in idx.iter().zip(decoded?) {
+            for (&i, seq) in idx.iter().zip(self.run_and_decode(&rows, backend)?) {
                 out[i] = Some(seq);
             }
         }
@@ -275,9 +335,18 @@ impl CrfEncoderGpu {
 /// than fail, producing plausible sequences attributed to the wrong read IDs,
 /// which is why it is a free function with its own test rather than a closure
 /// buried in the onnxruntime call.
+///
+/// Parallel because this transpose is *large*, not because it is clever: at the
+/// RNA004 geometry one 512-read device batch is 786 MB in and 786 MB out, plus
+/// one 1.5 MB allocation per read. Serially that made the encoder thread, not
+/// the device, the pipeline's bottleneck — the fused GPU producer refused to
+/// scale past ~700 reads/s on any thread count while the CPU-encoder path kept
+/// scaling to 1150. `into_par_iter()` over the batch axis is order-preserving,
+/// so the caller's `idx` alignment is unaffected.
 fn split_time_major(data: &[f32], t_len: usize, batch: usize, n_score: usize) -> Vec<Vec<f32>> {
     debug_assert_eq!(data.len(), t_len * batch * n_score);
     (0..batch)
+        .into_par_iter()
         .map(|b| {
             let mut per_read = Vec::with_capacity(t_len * n_score);
             for t in 0..t_len {
