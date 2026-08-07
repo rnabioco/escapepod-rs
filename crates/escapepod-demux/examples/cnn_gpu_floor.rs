@@ -2,9 +2,16 @@
 //!
 //! Tracing the fused pipeline over 1 M reads put detection at **401 s of device
 //! time in a 425 s wall** — 94% of the run, and ~0.40 ms/read. That is hard to
-//! believe for a small 1-D TCN over 806 samples when the LSTM encoder next to it
-//! costs 0.105 ms/read, so this prices the same call in isolation across batch
-//! sizes.
+//! believe for a small 1-D CNN over ~800 samples when the LSTM encoder next to
+//! it costs 0.105 ms/read, so this prices the same call in isolation across
+//! batch sizes.
+//!
+//! **It answered ~0.009 ms/read at a steady shape — 44× below the pipeline's
+//! rate, and flat.** So the 0.40 ms was per-call overhead, not compute, and the
+//! cause was the ~680 distinct input shapes prep was emitting; see #187 and
+//! `prep_adapter_signal`. Keep the example: it is the measurement that
+//! distinguishes "the model is slow" from "we are calling it badly", and that
+//! question recurs.
 //!
 //! Read it as a shape, not a number:
 //!
@@ -15,7 +22,7 @@
 //!   levers are a cheaper model, fp16, or a shorter input window.
 //!
 //! Note `detect_prepped` splits internally at `ESCAPEPOD_CNN_GPU_BATCH_ELEMS`
-//! (default ≈ VRAM/5500 elements, so ~5200 rows at the 806-sample cap). Batches
+//! (default ≈ VRAM/5500 elements, so ~2800 rows at today's 1500-sample prep). Batches
 //! above that become several device calls, which is itself part of the answer —
 //! set it explicitly to hold the split fixed while sweeping.
 //!
@@ -40,8 +47,9 @@ fn main() -> anyhow::Result<()> {
     let detector = AdapterCnnGpu::load_with_threads(&onnx, 16)
         .map_err(|e| anyhow::anyhow!("loading {onnx}: {e}"))?;
 
-    // Derive the prepped length from the real preprocessing rather than assuming
-    // the 806 cap — if the config or the margin ever changes, this follows.
+    // Derive the prepped length from the real preprocessing rather than
+    // hardcoding it — if the config's window or downscale ever changes, this
+    // follows, and the benchmark keeps measuring what the pipeline runs.
     let raw: Vec<f32> = (0..cfg.max_obs_trace)
         .map(|i| 90.0 + ((i as f32) * 0.01).sin() * 8.0)
         .collect();

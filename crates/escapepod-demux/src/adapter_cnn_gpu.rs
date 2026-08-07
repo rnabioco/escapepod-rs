@@ -25,17 +25,18 @@ use crate::adapter_cnn::{
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
 /// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
-/// call, scaled to the device's memory. The largest length-group (every read
-/// longer than the prep cap collapses onto one length — up to hundreds of
-/// thousands of reads) is split into chunks of this size; a chunk that still
-/// OOMs is halved and retried (`run_grouped`), so this is a *starting* guess,
-/// not a hard limit.
+/// call, scaled to the device's memory. Since #187 prep emits one fixed length
+/// for every read, so this splits the single group — which is every valid read
+/// in the block — into chunks of this size; a chunk that still OOMs is halved
+/// and retried (`run_grouped`), so this is a *starting* guess, not a hard limit.
 ///
 /// Resolution order: `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` env override → scaled from
 /// total VRAM (`total_bytes / BYTES_PER_ELEM`) → a fixed fallback. Conv
 /// activations scale with `rows × len × channels`, so on a 24 GB device ~5k
-/// rows at the 806 cap length (~4.2M elems) fit but ~10k OOM (measured) — i.e.
-/// ~24 GB / 5500 bytes-per-element. Using total VRAM means an 80 GB A100/H100
+/// rows at the then-806 prep length (~4.2M elems) fit but ~10k OOM (measured)
+/// — i.e. ~24 GB / 5500 bytes-per-element. The elements-not-rows unit is what
+/// makes that measurement still apply at today's 1500: the same element budget
+/// simply yields proportionally fewer rows. Using total VRAM means an 80 GB A100/H100
 /// gets ~3× larger batches automatically, while the halve-retry covers any
 /// over-estimate (e.g. a model with more channels).
 fn resolve_batch_elems() -> usize {

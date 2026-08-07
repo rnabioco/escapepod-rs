@@ -1,12 +1,12 @@
 //! Does zero-padding a short input actually change the model's output at
 //! positions before the padding starts?
 //!
-//! The bucketing parity test showed short reads changing their call when padded,
-//! and I attributed that to the padding landing inside the receptive field. That
-//! reasoning is suspect: a `Conv1d` with zero-padding already reads zeros past
-//! the tensor edge, so for positions before `valid_len` explicit zeros and the
-//! implicit edge ought to agree exactly. If they do, the divergence is a bug in
-//! the padding/`valid_len` wiring, not a property of the model.
+//! A length-bucketing experiment showed short reads changing their call when
+//! padded, and I first attributed that to the padding landing inside the
+//! receptive field. That reasoning is suspect: a `Conv1d` with zero-padding
+//! already reads zeros past the tensor edge, so for positions before the pad,
+//! explicit zeros and the implicit edge ought to agree exactly. If they do, the
+//! divergence is a wiring bug, not a property of the model.
 //!
 //! This compares raw channel-0 scores position by position, which distinguishes
 //! the two:
@@ -16,6 +16,16 @@
 //! * divergent → the model genuinely depends on total input length (a
 //!   length-dependent normalisation, or transposed-conv alignment), and no
 //!   `valid_len` clamp can recover it.
+//!
+//! **It answered: divergent, from k=0.** Which is why batching must never
+//! introduce padding of its own, and why the fix was to make prep emit the
+//! model's own fixed length with the model's own pad value (#187) rather than
+//! to bucket ragged ones.
+//!
+//! Since that fix `prep` always returns `input_len`, so there is no naturally
+//! short input to probe with; the short case is synthesised here by truncating
+//! a prepped window, which is exactly the tensor a read ending early used to
+//! produce.
 //!
 //! ```text
 //! cargo run --release --features cnn-gpu --example cnn_pad_probe -- <adapter.onnx>
@@ -44,7 +54,10 @@ fn main() -> anyhow::Result<()> {
     let det =
         AdapterCnnGpu::load_with_threads(&onnx, 4).map_err(|e| anyhow::anyhow!("load: {e}"))?;
 
-    // A few short reads, whose prepped length is well below the 806 cap.
+    let full_len = cfg.input_len();
+    // A few short reads. `prep` pads every read to `input_len` now, so truncate
+    // to recover the ragged tensor the old prep produced — the input whose
+    // batching behaviour is in question.
     for raw_len in [1374usize, 2196, 3500, 6000] {
         let sig = synth(raw_len as u64, raw_len);
         let prepped = match cfg.prep(&sig) {
@@ -54,17 +67,25 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
-        let valid = prepped.len();
+        // Downscaled length this read would have occupied before padding.
+        let valid = ((raw_len.saturating_sub(cfg.min_obs_adapter)).div_ceil(cfg.downscale_factor))
+            .min(full_len);
+        if valid == 0 {
+            println!("raw_len={raw_len}: no window");
+            continue;
+        }
 
         // Exact: the tensor is exactly `valid` long — the conv sees the edge.
         let exact = det
-            .scores_for_probe(&prepped, valid)
+            .scores_for_probe(&prepped[..valid], valid)
             .map_err(|e| anyhow::anyhow!("exact: {e}"))?;
-        // Padded: same data, zeros appended to a longer tensor.
-        let mut padded_in = prepped.clone();
-        padded_in.resize(806, 0.0);
+        // Padded: the same leading `valid` samples in a full-length tensor.
+        // Zeros, deliberately: the question is what *batch* padding would do,
+        // and `pack_batch` zero-fills. (Prep itself pads with SCORE_EXCL.)
+        let mut padded_in = vec![0f32; full_len];
+        padded_in[..valid].copy_from_slice(&prepped[..valid]);
         let padded = det
-            .scores_for_probe(&padded_in, 806)
+            .scores_for_probe(&padded_in, full_len)
             .map_err(|e| anyhow::anyhow!("padded: {e}"))?;
 
         // Compare only where both are defined and the decode would actually look.

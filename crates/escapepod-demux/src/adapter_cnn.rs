@@ -8,11 +8,17 @@
 //!
 //! Port of `adapted.detect.cnn.{prepare_data, cnn_predict, cnn_detect}`:
 //!
-//! * Slice raw calibrated signal from `[min_obs_adapter:]` (default 1000).
+//! * Slice raw calibrated signal to `[min_obs_adapter:max_obs_trace]`
+//!   (defaults 1000 and 16000).
 //! * Mean-pool by `downscale_factor` (default 10) — `efficient_average_pooling`
 //!   with zero-padding when length isn't a multiple.
 //! * Subtract median, divide by MAD. Replace any NaN with `-5.0`.
-//! * Feed through the ONNX `BoundariesCNN` (3× Conv1d + 1× ConvTranspose1d).
+//! * Right-pad to the fixed `input_len` (1500) with `SCORE_EXCL` = `-5.0`, the
+//!   convention every training example was built with (#187). Normalisation
+//!   statistics come from the real window, before padding — training's order.
+//! * Feed through the ONNX graph (`[B,1,L] -> [B,2,L]`; ADAPTed's
+//!   `BoundariesCNN` is 3× Conv1d + 1× ConvTranspose1d, escapepod-models'
+//!   `adapter_rna004` is a 1-D U-Net — this module is agnostic to which).
 //! * `adapter_end_pos = argmax(scores[0, 0, :search_len])` where
 //!   `search_len = (max_obs_adapter - min_obs_adapter) / downscale_factor`.
 //! * Return `adapter_end = adapter_end_pos * downscale_factor + min_obs_adapter`
@@ -245,12 +251,13 @@ impl AdapterCnn {
         }
 
         // 2. Group by exact prepped length and run each group as an *unpadded*
-        //    `[group, 1, len]` batch. Cross-read zero-padding is NOT safe for
-        //    this model (its conv boundary handling makes a padded short read
-        //    score differently than when run alone), so we never pad: every
-        //    read is fed at exactly its own length, making batched results
-        //    bit-identical to the per-read path. Downscaling collapses ranges
-        //    of sample counts onto the same length, so groups stay sizable.
+        //    `[group, 1, len]` batch, so batched results are bit-identical to
+        //    the per-read path. Since #187 prep emits one fixed length, so this
+        //    is a single group covering the whole block — but the grouping is
+        //    what makes that a property rather than an assumption. Batching
+        //    must never introduce its own padding: `cnn_pad_probe` measured
+        //    this graph's scores changing *before* the pad begins, so a row
+        //    padded here would score differently than run alone.
         let mut out: Vec<Result<usize, AdapterCnnError>> =
             (0..signals.len()).map(|i| Err(short_err(i))).collect();
 
@@ -397,11 +404,26 @@ pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> 
 /// Decode one read's adapter-end channel into a sample index in the original
 /// (un-downscaled) signal frame. `score_at(k)` returns the channel-0 score at
 /// downscaled position `k`; `length_out` is the model output length and
-/// `valid_len` the read's own un-padded downscaled length (they're equal for
-/// the single-read path; for a padded batch `valid_len <= length_out`, so the
-/// clamp keeps the argmax out of the zero-padded tail). Argmax over the
+/// `valid_len` the read's own un-padded downscaled length. Argmax over the
 /// expected adapter window; 0 when the peak is slot 0 ("no adapter"), matching
 /// ADAPTed. Shared by both backends so decoding is bit-identical.
+///
+/// # Two deliberate departures from escapepod-models' own decode
+///
+/// `predict.py::decode_scores` argmaxes the model's full output and has no
+/// "slot 0 means no adapter" rule; both extras here are ADAPTed's rna004
+/// conventions, inherited because this decode is architecture-agnostic.
+///
+/// The search cap is the one with a measurable cost: `max_obs_adapter` = 6500
+/// makes `search_end` 550 of the 1500 positions the model emits, so any adapter
+/// the model would place past raw sample 6500 is unreachable. On
+/// escapepod-models' move-table gold set that is **84 of 20,303 reads (0.41%)**
+/// — p99 is 5706, so the prior holds for the bulk of the distribution, but it is
+/// a real ceiling and not an artefact of the model.
+///
+/// `valid_len` is now always equal to the padded length (prep emits one fixed
+/// length), so the clamp is inert; it is kept for the same reason
+/// [`group_by_len`] is.
 pub(crate) fn decode_adapter_end(
     cfg: &AdapterCnnConfig,
     length_out: usize,
@@ -431,6 +453,14 @@ pub(crate) fn decode_adapter_end(
 /// Group valid (non-`None`) prepped signals by their exact length, so each
 /// group can be run as an unpadded batch. Returns `(len, original-indices)`.
 /// Shared by the CPU (tract) and GPU (onnxruntime) batch paths.
+///
+/// Since #187 [`prep_adapter_signal`] emits exactly `cfg.input_len()` for every
+/// read, so in practice this always returns one group. It is kept rather than
+/// replaced by "one batch of everything" because the alternative fails
+/// *silently* if that invariant ever breaks: [`pack_batch`] would truncate or
+/// zero-pad the mismatched rows and the reads would come back with plausible,
+/// wrong boundaries. The cost is one `HashMap` pass per block, far below the
+/// inference it guards.
 pub(crate) fn group_by_len(
     prepped: &[Option<Vec<f32>>],
     valid_idx: &[usize],
@@ -449,17 +479,20 @@ pub(crate) fn group_by_len(
 /// Pack prepped signals into a row-major `[g, 1, len]` f32 batch buffer,
 /// gathered from `prepped` at `indices`.
 ///
-/// Rows shorter than `len` are written at the head and the remainder left zero,
-/// which is what lets a bucketed group hold reads of differing true lengths. The
-/// head is the fixed end: [`prep_adapter_signal`]'s window always starts at
-/// `min_obs_adapter` and [`decode_adapter_end`] searches forward from index 0, so
-/// padding the *tail* leaves every boundary index where it was. Callers must
-/// still pass each row's true length to `decode_adapter_end` as `valid_len` so
-/// the argmax cannot wander into the padding.
+/// Every row is `cfg.input_len()` long since #187, so the `min` below is not
+/// reached and no row is zero-filled. It stays defensive rather than asserting
+/// because a short row zero-filled at the tail is at least positionally sound —
+/// [`prep_adapter_signal`]'s window always starts at `min_obs_adapter` and
+/// [`decode_adapter_end`] searches forward from index 0, so padding the tail
+/// leaves every boundary index where it was.
 ///
-/// Exact-length callers are unaffected — with every row equal to `len` this is
-/// the same buffer it always produced. Shared by the CPU (tract) and GPU
-/// (onnxruntime) batch paths so the layout stays byte-identical between backends.
+/// Note that zero is *not* the model's pad value ([`SCORE_EXCL`] is), which is
+/// exactly why this must not become the padding path: `cnn_pad_probe` measured
+/// this graph's output changing well before the padding starts. Prep pads to the
+/// full length itself, with the right value.
+///
+/// Shared by the CPU (tract) and GPU (onnxruntime) batch paths so the layout
+/// stays byte-identical between backends.
 pub(crate) fn pack_batch(prepped: &[Option<Vec<f32>>], indices: &[usize], len: usize) -> Vec<f32> {
     let mut data = vec![0f32; indices.len() * len];
     for (row, &i) in indices.iter().enumerate() {
