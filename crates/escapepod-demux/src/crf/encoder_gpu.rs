@@ -556,10 +556,21 @@ fn split_time_major(data: &[f32], t_len: usize, batch: usize, n_score: usize) ->
         .collect()
 }
 
-/// onnxruntime surfaces device OOM as a message, not a typed error.
+/// onnxruntime and the CUDA driver both surface device OOM as a message rather
+/// than a typed error, and they word it differently.
+///
+/// The BFC-arena wording is the one that matters in practice and was missing:
+/// onnxruntime reports its own allocator failures as
+/// `"Failed to allocate memory for requested buffer of size N"`, with no
+/// "out of memory" anywhere in it. Because this returned `false` for that, the
+/// halve-and-retry above never fired and a batch that merely needed splitting
+/// killed the run instead — reproduced at `ESCAPEPOD_CRF_GPU_BATCH_ROWS=2048`
+/// on an A30, where the zero-copy path keeps the scores resident and so reaches
+/// the arena limit sooner than the copying path does.
 fn is_oom(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("out of memory") || m.contains("cudaerrormemoryallocation") || m.contains("oom")
+    // Shared with the lattice decode so the two cannot drift; `_` is folded to
+    // ` ` there so the driver's CUDA_ERROR_OUT_OF_MEMORY matches too.
+    super::lattice_gpu::is_oom(msg)
 }
 
 #[cfg(test)]
@@ -570,7 +581,17 @@ mod tests {
     fn oom_detection_covers_the_shapes_ort_reports() {
         assert!(is_oom("CUDA failure 2: out of memory"));
         assert!(is_oom("cudaErrorMemoryAllocation"));
+        // The BFC-arena wording, verbatim from a real failure at
+        // ESCAPEPOD_CRF_GPU_BATCH_ROWS=2048. Note it never says "out of memory":
+        // missing this turned a batch that only needed halving into a dead run.
+        assert!(is_oom(
+            "Non-zero status code returned while running Pad node. Name:'/9/Pad' \
+             Status Message: bfc_arena.cc:358 void* \
+             onnxruntime::BFCArena::AllocateRawInternal(size_t, bool, onnxruntime::Stream*) \
+             Failed to allocate memory for requested buffer of size 5551104000"
+        ));
         assert!(!is_oom("invalid input shape"));
+        assert!(!is_oom("unexpected output shape: expected time-major"));
     }
 
     /// Each read must come back with exactly the values the encoder emitted

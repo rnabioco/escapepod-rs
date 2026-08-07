@@ -471,10 +471,22 @@ fn push_scores<'b>(args: &mut cudarc::driver::LaunchArgs<'b>, scores: &'b Scores
     };
 }
 
-/// CUDA reports device OOM as a message, like onnxruntime does.
-fn is_oom(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("out of memory") || m.contains("outofmemory") || m.contains("oom")
+/// CUDA reports device OOM as a message, not a typed error, and every layer
+/// words it differently. Kept in step with `encoder_gpu::is_oom`.
+///
+/// Underscores are folded to spaces first so the driver's `CUDA_ERROR_OUT_OF_MEMORY`
+/// and a prose "out of memory" are one pattern rather than two — matching the
+/// driver form on the nose is easy to get wrong, and getting it wrong turns a
+/// batch that only needed halving into a dead run.
+pub(super) fn is_oom(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase().replace('_', " ");
+    m.contains("out of memory")
+        || m.contains("outofmemory")
+        || m.contains("oom")
+        // The runtime API's spelling, via onnxruntime.
+        || m.contains("cudaerrormemoryallocation")
+        // onnxruntime's BFC arena, which never says "out of memory" at all.
+        || m.contains("failed to allocate")
 }
 
 #[cfg(test)]
