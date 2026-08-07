@@ -1468,14 +1468,36 @@ fn crf_gpu_block() -> usize {
 /// With one visible device everything shares it. With more, **device 0 is
 /// reserved for adapter detection** and the encoders take the rest.
 ///
-/// The split is worth the asymmetry: detect and the encoder cost almost the same
-/// in device time (5.4 s vs 6.4 s over 40 k reads), so sharing one GPU makes the
-/// pipeline's ceiling their *sum* — ~0.25 ms/read, and measurement puts the
-/// device near saturated at that. Giving them separate devices makes the ceiling
-/// the larger of the two instead, roughly halving it. Round-robining both roles
-/// over all devices, which is what this used to do, leaves device 0 carrying
-/// detect *plus* a share of the encoding while the others carry only encoding —
-/// which is why two GPUs returned 1.14x rather than anything like 2x.
+/// # This reservation is now mis-tuned — measured, unfixed
+///
+/// It was justified by detect and the encoder costing about the same device time
+/// (5.4 s vs 6.4 s over 40 k reads): if two roles are comparable, sharing a card
+/// makes the pipeline's ceiling their sum and separating them makes it the
+/// larger of the two. #187 destroyed that premise. Matching the model's training
+/// convention cut detect's device time ~20x (401 s -> 20.2 s over 1 M reads)
+/// while the encoder stayed put, so the roles now cost ~19 s against ~170 s —
+/// and reserving a whole card for 10% of the work costs more than the contention
+/// it avoids. At exactly two devices it is pathological: the encoder pool does
+/// not grow at all, so the second GPU only offloads detection. Measured on 1 M
+/// reads, interleaved, 2 reps each:
+///
+/// ```text
+/// GPUs   encoder pool          wall     vs 1 GPU
+///   1    2 workers on [0]     107.5 s     --
+///   2    2 workers on [1]      96.5 s    1.11x    <- barely worth the card
+///   4    6 workers on [1,2,3]  43.7 s    2.46x
+/// ```
+///
+/// The likely fix is to encode on *every* visible device and let detection share
+/// device 0 — workers pull from one channel rather than being handed a
+/// partition, so whichever device is slowed by carrying detection simply takes
+/// fewer blocks, with nothing to balance explicitly. It is **not** applied here
+/// because it is unmeasured, and the four-device column is the reason for
+/// caution: at 4 GPUs the producer is already the constraint (busy 71%, workers
+/// blocked on `recv` 38.6 s), and that producer *is* detection. Adding encoder
+/// work to device 0 could slow the stage that is already the ceiling and regress
+/// the case that currently scales, to fix the case that does not. Measure both
+/// columns before changing it.
 #[cfg(feature = "crf-gpu")]
 fn crf_encoder_devices(visible: usize) -> Vec<i32> {
     if visible > 1 {
@@ -2187,6 +2209,47 @@ fn print_summary(summary: &DemuxSummary) {
             style::count(total),
             summary.per_barcode.len()
         );
+    }
+}
+
+#[cfg(all(test, feature = "crf-gpu"))]
+mod gpu_placement_tests {
+    use super::{crf_encoder_devices, crf_gpu_workers};
+
+    /// Pins today's placement, including the part that is known mis-tuned: at
+    /// two devices the encoder pool is `[1]` alone, which is why the second GPU
+    /// measures 1.11x rather than ~2x. Written so that changing the policy has
+    /// to change this test deliberately rather than silently.
+    #[test]
+    fn device_zero_is_reserved_for_detection_above_one_device() {
+        assert_eq!(crf_encoder_devices(1), vec![0]);
+        assert_eq!(crf_encoder_devices(2), vec![1]);
+        assert_eq!(crf_encoder_devices(4), vec![1, 2, 3]);
+        // A zero count can only come from a failed probe; never hand back an
+        // empty pool, since the caller indexes into it.
+        assert_eq!(crf_encoder_devices(0), vec![0]);
+    }
+
+    /// The pool must divide evenly over the devices it is spread across, or the
+    /// per-device row budget is computed against the wrong denominator.
+    #[test]
+    fn workers_spread_evenly_over_the_encoder_devices() {
+        if std::env::var("ESCAPEPOD_CRF_GPU_WORKERS").is_ok() {
+            return;
+        }
+        for visible in [1usize, 2, 4] {
+            let devices = crf_encoder_devices(visible);
+            let workers = crf_gpu_workers(devices.len());
+            assert_eq!(
+                workers % devices.len(),
+                0,
+                "{workers} workers do not divide over {} devices",
+                devices.len()
+            );
+            // Two per device is what overlaps one worker's per-call setup with
+            // another's device work; the row budget is sized for it.
+            assert_eq!(workers / devices.len(), 2);
+        }
     }
 }
 
