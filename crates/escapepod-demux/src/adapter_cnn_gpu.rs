@@ -20,7 +20,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::adapter_cnn::{
-    decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
+    decode_adapter_end, group_by_len_bucketed, pack_batch, prep_adapter_signal, scatter_group,
 };
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
@@ -38,6 +38,42 @@ use crate::{AdapterCnnConfig, AdapterCnnError};
 /// ~24 GB / 5500 bytes-per-element. Using total VRAM means an 80 GB A100/H100
 /// gets ~3× larger batches automatically, while the halve-retry covers any
 /// over-estimate (e.g. a model with more channels).
+/// Length bucket for batching (`ESCAPEPOD_CNN_GPU_LEN_BUCKET`).
+///
+/// **Defaults to 1 — exact-length grouping — because padding is not
+/// output-preserving here.** The knob exists so the trade can be re-measured,
+/// not because it should be turned on.
+///
+/// The motivation was real: [`prep_adapter_signal`] clamps its window to the
+/// read end, so every read shorter than `max_obs_trace` gets its own length.
+/// Over a production run's 527k reads, 68.6% reach the 806 cap and share one
+/// shape while the other 31.4% spread across **680 distinct lengths**, so a
+/// 65,536-read block issues one call of ~45,000 rows plus ~679 of ~30 rows. Each
+/// new shape pays fresh cuDNN plan selection: detection measured 401 s of device
+/// time in a 425 s wall, against ~0.01 ms/read for the same kernel at a steady
+/// shape (`examples/cnn_gpu_floor`).
+///
+/// Padding does not fix it, for a structural reason. An output at downscaled
+/// position `k` depends on input within the receptive margin `R` (256) either
+/// side, and [`decode_adapter_end`] searches `k` up to `min(search_window, valid_len)`.
+/// Padding beyond `valid_len` therefore leaves the searched region alone only if
+/// `min(550, valid_len) <= valid_len - 256`, i.e. only if `valid_len >= 806` —
+/// which is exactly the cap, where reads already share one shape. For anything
+/// shorter the padding is inside the receptive field of positions the decode
+/// actually reads, and `tests/adapter_cnn_bucket_parity.rs` confirms it: 11 of 62
+/// synthetic reads changed their call at bucket 16, some by hundreds of samples.
+///
+/// So the fragmentation has to be addressed on the runtime side (per-shape plan
+/// selection) rather than by reshaping the input.
+fn resolve_len_bucket() -> usize {
+    const DEFAULT_BUCKET: usize = 1;
+    std::env::var("ESCAPEPOD_CNN_GPU_LEN_BUCKET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BUCKET)
+}
+
 fn resolve_batch_elems() -> usize {
     /// Empirical peak device bytes per input element (`rows × len`) at the OOM
     /// boundary for the rna004 TCN — folds in channel count and the number of
@@ -226,7 +262,7 @@ impl AdapterCnnGpu {
         valid_idx: &[usize],
         out: &mut [Result<usize, AdapterCnnError>],
     ) {
-        for (len, group) in group_by_len(prepped, valid_idx) {
+        for (len, group) in group_by_len_bucketed(prepped, valid_idx, resolve_len_bucket()) {
             let start_rows = (self.batch_elems / len.max(1)).max(1);
             // Work stack of `[lo, hi)` index ranges into `group`. On OOM a range
             // is split in half and pushed back, shrinking until it fits.
@@ -281,9 +317,15 @@ impl AdapterCnnGpu {
         let length_out = shape[2] as usize;
         Ok((0..g)
             .map(|row| {
-                // Channel-0 (adapter_end) of row `row`.
+                // Channel-0 (adapter_end) of row `row`. `valid_len` is this
+                // read's own prepped length, which in a bucketed group is <=
+                // `len` — that clamp is what keeps the argmax out of the padding.
+                let valid_len = prepped[sub[row]]
+                    .as_ref()
+                    .expect("sub points at prepped signals")
+                    .len();
                 let base = row * 2 * length_out;
-                decode_adapter_end(&cfg, length_out, len, |k| scores[base + k])
+                decode_adapter_end(&cfg, length_out, valid_len, |k| scores[base + k])
             })
             .collect())
     }

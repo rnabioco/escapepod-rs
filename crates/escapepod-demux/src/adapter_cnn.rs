@@ -426,16 +426,73 @@ pub(crate) fn group_by_len(
     groups.into_iter().collect()
 }
 
-/// Pack a set of same-length prepped signals into a row-major `[g, 1, len]` f32
-/// batch buffer, gathered from `prepped` at `indices`. No padding — every row is
-/// exactly `len`. Shared by the CPU (tract) and GPU (onnxruntime) batch paths so
-/// the batch layout stays byte-identical between backends.
+/// Pack prepped signals into a row-major `[g, 1, len]` f32 batch buffer,
+/// gathered from `prepped` at `indices`.
+///
+/// Rows shorter than `len` are written at the head and the remainder left zero,
+/// which is what lets a bucketed group hold reads of differing true lengths. The
+/// head is the fixed end: [`prep_adapter_signal`]'s window always starts at
+/// `min_obs_adapter` and [`decode_adapter_end`] searches forward from index 0, so
+/// padding the *tail* leaves every boundary index where it was. Callers must
+/// still pass each row's true length to `decode_adapter_end` as `valid_len` so
+/// the argmax cannot wander into the padding.
+///
+/// Exact-length callers are unaffected — with every row equal to `len` this is
+/// the same buffer it always produced. Shared by the CPU (tract) and GPU
+/// (onnxruntime) batch paths so the layout stays byte-identical between backends.
 pub(crate) fn pack_batch(prepped: &[Option<Vec<f32>>], indices: &[usize], len: usize) -> Vec<f32> {
     let mut data = vec![0f32; indices.len() * len];
     for (row, &i) in indices.iter().enumerate() {
-        data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
+        let src = prepped[i]
+            .as_ref()
+            .expect("indices point at prepped signals");
+        let n = src.len().min(len);
+        data[row * len..row * len + n].copy_from_slice(&src[..n]);
     }
     data
+}
+
+/// Round `len` up to the next multiple of `bucket` (no-op when `bucket <= 1`).
+#[cfg(feature = "cnn-gpu")]
+pub(crate) fn bucket_len(len: usize, bucket: usize) -> usize {
+    if bucket <= 1 {
+        len
+    } else {
+        len.div_ceil(bucket) * bucket
+    }
+}
+
+/// Group reads by *bucketed* length: every read whose true length rounds up to
+/// the same multiple of `bucket` shares one padded batch.
+///
+/// `bucket <= 1` reproduces [`group_by_len`] exactly.
+///
+/// This exists because exact-length grouping fragments catastrophically on real
+/// data. [`prep_adapter_signal`] clamps its window to the read end, so any read
+/// shorter than `max_obs_trace` gets its own length: over a production run's 527k
+/// reads, 68.6% reach the cap and share one shape while the other 31.4% spread
+/// across **680 distinct lengths**. A 65,536-read block therefore issues one call
+/// of ~45,000 rows plus ~679 calls of ~30 rows, and each new shape pays fresh
+/// cuDNN plan selection — measured at 401 s of device time in a 425 s run against
+/// ~0.01 ms/read for the same kernel called at a steady shape.
+///
+/// The returned length is the padded one; callers pad with [`pack_batch`] and
+/// must pass each read's own length to [`decode_adapter_end`] as `valid_len`.
+#[cfg(feature = "cnn-gpu")]
+pub(crate) fn group_by_len_bucketed(
+    prepped: &[Option<Vec<f32>>],
+    valid_idx: &[usize],
+    bucket: usize,
+) -> Vec<(usize, Vec<usize>)> {
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for &i in valid_idx {
+        let len = prepped[i]
+            .as_ref()
+            .expect("valid_idx points at a prepped signal")
+            .len();
+        groups.entry(bucket_len(len, bucket)).or_default().push(i);
+    }
+    groups.into_iter().collect()
 }
 
 /// Scatter a group/sub-batch's inference `result` into `out` at each read's
