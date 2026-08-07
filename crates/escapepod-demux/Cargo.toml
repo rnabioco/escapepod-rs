@@ -121,3 +121,7 @@ required-features = ["crf-decode"]
 [[example]]
 name = "crf_gpu_floor"
 required-features = ["crf-gpu"]
+
+[[example]]
+name = "cnn_gpu_floor"
+required-features = ["cnn-gpu"]
