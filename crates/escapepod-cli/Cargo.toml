@@ -44,7 +44,7 @@ libc = { version = "0.2", optional = true }
 noodles-bam = { version = "0.92", optional = true }
 noodles-bgzf = { version = "0.49", optional = true }
 noodles-core = { version = "0.20", optional = true }
-noodles-csi = { version = "0.58", optional = true }
+noodles-csi = { version = "0.60", optional = true }
 noodles-sam = { version = "0.87", optional = true }
 owo-colors = { version = "4", optional = true }
 parquet = { workspace = true, optional = true }
