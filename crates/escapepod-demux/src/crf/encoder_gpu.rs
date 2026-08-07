@@ -90,6 +90,12 @@ pub struct CrfEncoderGpu {
     /// The graph's output name, resolved once so the IoBinding does not have to
     /// re-read session metadata per batch.
     output_name: String,
+    /// The CUDA ordinal this session and its lattice context live on. The
+    /// zero-copy binding's `MemoryInfo` must name this device and not device 0:
+    /// onnxruntime matches the bound output's allocator against the session's
+    /// own, and a mismatch fails the run outright with "Failed to find allocator
+    /// for device".
+    device: i32,
     /// Bind the encoder's output to CUDA memory and decode it in place, instead
     /// of letting onnxruntime copy it to the host for us to upload again.
     /// Requires [`Self::lattice`]; `ESCAPEPOD_CRF_GPU_ZEROCOPY=0` disables it.
@@ -107,10 +113,25 @@ impl CrfEncoderGpu {
         dir: impl AsRef<Path>,
         intra_threads: Option<usize>,
     ) -> Result<Self, CrfError> {
+        Self::load_bundle_on_device(dir, intra_threads, 0)
+    }
+
+    /// [`load_bundle`](Self::load_bundle) pinned to a CUDA device ordinal.
+    ///
+    /// One of these per encoder worker is what lets the pipeline run several
+    /// encoders at once — on one device, so each worker's per-call setup
+    /// overlaps another's device work, or spread across several. The session and
+    /// its lattice context both land on `device`, so a worker never moves scores
+    /// between devices.
+    pub fn load_bundle_on_device(
+        dir: impl AsRef<Path>,
+        intra_threads: Option<usize>,
+        device: i32,
+    ) -> Result<Self, CrfError> {
         let dir = dir.as_ref();
         let meta = CrfMetadata::load(dir.join("metadata.json"))?;
         let onnx = dir.join(&meta.onnx);
-        Self::load(onnx, meta, intra_threads)
+        Self::load_on_device(onnx, meta, intra_threads, device)
     }
 
     /// Load an ONNX graph with an already-parsed sidecar.
@@ -118,6 +139,16 @@ impl CrfEncoderGpu {
         onnx: impl AsRef<Path>,
         meta: CrfMetadata,
         intra_threads: Option<usize>,
+    ) -> Result<Self, CrfError> {
+        Self::load_on_device(onnx, meta, intra_threads, 0)
+    }
+
+    /// [`load`](Self::load) pinned to a CUDA device ordinal.
+    pub fn load_on_device(
+        onnx: impl AsRef<Path>,
+        meta: CrfMetadata,
+        intra_threads: Option<usize>,
+        device: i32,
     ) -> Result<Self, CrfError> {
         let layout = meta.layout()?;
         let alphabet = meta.alphabet_bytes();
@@ -131,7 +162,7 @@ impl CrfEncoderGpu {
                 .map_err(|e| CrfError::Load(e.to_string()))?;
         }
         let session = builder
-            .with_execution_providers(crate::ort_ep::cuda_providers())
+            .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
             .map_err(|e| CrfError::Load(e.to_string()))?
             .commit_from_file(onnx)
             .map_err(|e| CrfError::Load(e.to_string()))?;
@@ -147,7 +178,7 @@ impl CrfEncoderGpu {
                     Some("disabled by ESCAPEPOD_CRF_GPU_DECODE=0".to_string()),
                 )
             } else {
-                match super::lattice_gpu::CrfLatticeGpu::new(layout) {
+                match super::lattice_gpu::CrfLatticeGpu::new_on_device(layout, device as usize) {
                     Ok(l) => (Some(l), None),
                     Err(e) => (None, Some(e.to_string())),
                 }
@@ -172,6 +203,7 @@ impl CrfEncoderGpu {
             lattice,
             decode_fallback,
             output_name,
+            device,
             zero_copy,
         };
         // Same reasoning as the CPU loader: catch a batch-major (boundary-CNN)
@@ -395,13 +427,15 @@ impl CrfEncoderGpu {
             .map_err(|e| CrfError::Run(e.to_string()))?;
         let run = |e: ort::Error| CrfError::Run(e.to_string());
 
-        // Device 0 for both sides: under SLURM `--gres=gpu:1`, CUDA_VISIBLE_DEVICES
-        // renumbers the allocated GPU to 0, which is also the ordinal
-        // `CrfLatticeGpu::new` binds. The residency check below is what actually
-        // enforces the pairing.
+        // This worker's own ordinal, not 0. onnxruntime resolves the bound
+        // output's allocator against the session's device, so naming the wrong
+        // one fails the run outright with "Failed to find allocator for device"
+        // — which is what a second worker placed on device 1 hit while this said
+        // 0. The lattice context is on the same ordinal, so the decode reads the
+        // scores from the device that produced them.
         let mem = MemoryInfo::new(
             AllocationDevice::CUDA,
-            0,
+            self.device,
             AllocatorType::Device,
             MemoryType::Default,
         )

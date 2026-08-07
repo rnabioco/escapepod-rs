@@ -119,7 +119,42 @@
   that — and measuring 1024/4096/16384 showed under 5% between them, so it is a
   memory knob rather than a throughput one.
 
+- **A pool of CRF encoder workers, spread over every visible GPU**
+  (`ESCAPEPOD_CRF_GPU_WORKERS`, default two per device, capped at 8). Each worker
+  holds its own onnxruntime session and lattice context pinned to one ordinal,
+  and they pull from a single shared channel rather than a partition, so a slow
+  device cannot leave one worker holding the tail.
+
+  Device placement is dynamic and needs no flag: the count comes from the
+  *visible* devices, so `CUDA_VISIBLE_DEVICES` and SLURM `--gres=gpu:1` collapse
+  it to a same-device pool automatically. Nothing changes for single-GPU users.
+
+  **Measured gain is small today, and the reason is worth stating**: 17.6 s → 15.7 s
+  on 40 k reads with two A30s (1.12x), not the ~2x the device count suggests. The
+  pipeline is not device-bound — the GPU idles ~75% of the time — so a second GPU
+  mostly adds idle capacity. This lands as capability plus the placement fix
+  below; the starvation it exposes is unresolved (see *Known limitations*).
+
+  Output is unaffected: 40 001/40 001 identical rows at one, two and four workers.
+
 ### Fixed
+
+- **The zero-copy binding named device 0 regardless of which device its session
+  was on.** Harmless while there was only ever one device; with a worker pool it
+  failed the run outright — onnxruntime resolves a bound output's allocator
+  against the session's device and reports `Failed to find allocator for device`.
+  Each encoder now carries its ordinal and binds against it.
+
+- **`is_oom` missed two of the three wordings a device out-of-memory arrives in**,
+  so the halve-and-retry both GPU paths depend on never fired and a batch that
+  only needed splitting killed the run. onnxruntime's BFC arena says "Failed to
+  allocate memory for requested buffer" and never "out of memory"; the driver
+  says `CUDA_ERROR_OUT_OF_MEMORY`, whose underscores the old substring missed.
+  Reproduced at `ESCAPEPOD_CRF_GPU_BATCH_ROWS=2048`, which now halves and
+  completes. The `lattice_gpu` unit test covering the driver spelling had never
+  run — `crf-gpu` is not in the workspace default features, so it was compiled
+  out of every suite invocation, and its assertion had been wrong since it was
+  written.
 
 - **The GPU CRF decode's time-major transpose was serial, and it — not the
   device — was the bottleneck.** `split_time_major` de-interleaves onnxruntime's

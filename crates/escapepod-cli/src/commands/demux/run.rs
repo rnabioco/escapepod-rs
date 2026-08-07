@@ -771,15 +771,23 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             }
             match &head.encoder {
                 #[cfg(feature = "crf-gpu")]
-                CrfEncoderAny::Gpu(enc) => produce_gpu_crf(
-                    &args,
-                    &detector,
-                    head,
-                    enc,
-                    &routers,
-                    class_tx.as_ref(),
-                    &pb,
-                ),
+                CrfEncoderAny::Gpu(enc) => {
+                    // Extra encoder workers load their own session from the same
+                    // bundle, so the pool needs the directory the head came from.
+                    let bundle = crf_dir_for_pin
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("CRF head without a bundle directory"))?;
+                    produce_gpu_crf(
+                        &args,
+                        &detector,
+                        head,
+                        enc,
+                        bundle,
+                        &routers,
+                        class_tx.as_ref(),
+                        &pb,
+                    )
+                }
                 CrfEncoderAny::Cpu(enc) => produce_cpu_crf(
                     &args,
                     &detector,
@@ -1342,8 +1350,30 @@ fn crf_gpu_block() -> usize {
     })
 }
 
+/// Encoder workers, and how they are spread over the visible devices
+/// (`ESCAPEPOD_CRF_GPU_WORKERS`).
+///
+/// Default is two per visible device. One worker leaves the device idle through
+/// its own per-call overhead — an onnxruntime `Run` is bracketed by cuDNN plan
+/// setup, two stream syncs, the barcode match and the routing, and profiling put
+/// 34% of wall time in cuDNN's engine/graph setup rather than in convolution. A
+/// second worker on the *same* device overlaps that setup with the first's
+/// device work; further workers across devices add real parallelism.
+///
+/// Capped so a many-GPU node does not spawn an encoder session per device
+/// unbounded — each one holds its own ONNX graph and scores buffer.
+#[cfg(feature = "crf-gpu")]
+fn crf_gpu_workers(devices: usize) -> usize {
+    std::env::var("ESCAPEPOD_CRF_GPU_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (2 * devices).min(8))
+        .max(1)
+}
+
 /// GPU producer for the CRF head: parallel CPU prep (decode + detect + window
-/// standardisation) feeds a dedicated encoder thread through a bounded channel,
+/// standardisation) feeds a pool of encoder workers through a bounded channel,
 /// so the device is kept fed while the next block is prepped.
 ///
 /// The overlap is the point. Running the encoder inline in the block loop the
@@ -1351,12 +1381,21 @@ fn crf_gpu_block() -> usize {
 /// neither saturated: the GPU would idle through prep and the rayon pool would
 /// idle through inference. `drive_blocks` already hands blocks over from its own
 /// reader threads, so this adds the second half of the pipeline.
+///
+/// Workers pull from one channel rather than being handed a partition, so a slow
+/// device or an unlucky block cannot leave one worker holding the tail. Blocks
+/// are independent and output row order is already nondeterministic here (the
+/// per-barcode writers interleave), so which worker takes which does not matter.
+// One over clippy's limit: the sibling producers take the same seven, and this
+// one additionally needs the bundle directory to load its extra workers.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "crf-gpu")]
 fn produce_gpu_crf(
     args: &RunArgs,
     detector: &Detector,
     head: &CrfHead,
     encoder: &CrfEncoderGpu,
+    bundle: &Path,
     routers: &Routers,
     class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
     pb: &indicatif::ProgressBar,
@@ -1366,44 +1405,81 @@ fn produce_gpu_crf(
 
     let meta = encoder.metadata();
     let gpu_block = crf_gpu_block();
-    // Depth 2 double-buffers: prep can run ~2 blocks ahead of the encoder.
-    let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Block>(2);
+
+    // Visible, so `CUDA_VISIBLE_DEVICES` already applies: under SLURM
+    // `--gres=gpu:1` this is 1 and the pool collapses to same-device workers.
+    let devices = escapepod_demux::crf::lattice_gpu::visible_device_count()
+        .unwrap_or(1)
+        .max(1);
+    let workers = crf_gpu_workers(devices);
+    // Worker 0 reuses the encoder already loaded for its metadata (device 0);
+    // the rest get their own session, round-robin across devices.
+    let extra: Vec<CrfEncoderGpu> = (1..workers)
+        .map(|w| CrfEncoderGpu::load_bundle_on_device(bundle, args.threads, (w % devices) as i32))
+        .collect::<Result<_, _>>()?;
+    if workers > 1 || devices > 1 {
+        info!(
+            "{} {} encoder worker(s) across {} visible GPU(s)",
+            style::label("CRF encoder:"),
+            style::count(workers),
+            style::count(devices)
+        );
+    }
+
+    // Depth scales with the pool so every worker can hold one block and still
+    // find another queued behind it.
+    let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Block>(2 * workers);
+    let block_rx = Arc::new(std::sync::Mutex::new(block_rx));
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
-        let gpu = scope.spawn(move || -> anyhow::Result<()> {
-            for (windows, items) in block_rx.iter() {
-                // Encodes on the device, then fans the lattice decode back out
-                // across rayon. `None` windows never reach the device and come
-                // back `None`, so this stays aligned with `items`.
-                let seqs = encoder
-                    .basecall_batch(&windows)
-                    .map_err(|e| anyhow::anyhow!("GPU encoder: {e}"))?;
-                // 96 references x one wavefront alignment each is small next to
-                // the decode, but it is still per-read work worth fanning out.
-                let calls: Vec<(String, f64)> = seqs
-                    .par_iter()
-                    .map(|seq| {
-                        seq.as_deref()
-                            .and_then(|s| call_barcode(head, s))
-                            .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0))
-                    })
-                    .collect();
-                let n = items.len() as u64;
-                for ((read, chunks, run_infos), (barcode, conf)) in items.into_iter().zip(calls) {
-                    route(
-                        routers,
-                        class_tx,
-                        read.for_writing(read.run_info_index),
-                        barcode,
-                        chunks,
-                        run_infos,
-                        conf,
-                    );
+        let mut gpus = Vec::with_capacity(workers);
+        for w in 0..workers {
+            let enc: &CrfEncoderGpu = if w == 0 { encoder } else { &extra[w - 1] };
+            let rx = Arc::clone(&block_rx);
+            gpus.push(scope.spawn(move || -> anyhow::Result<()> {
+                loop {
+                    // Held only across `recv`, never across the encode.
+                    let next = {
+                        let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.recv()
+                    };
+                    let Ok((windows, items)) = next else { break };
+
+                    // Encodes on the device, then fans the lattice decode back
+                    // out across rayon. `None` windows never reach the device
+                    // and come back `None`, so this stays aligned with `items`.
+                    let seqs = enc
+                        .basecall_batch(&windows)
+                        .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?;
+                    // 96 references x one wavefront alignment each is small next
+                    // to the decode, but it is still per-read work worth fanning
+                    // out.
+                    let calls: Vec<(String, f64)> = seqs
+                        .par_iter()
+                        .map(|seq| {
+                            seq.as_deref()
+                                .and_then(|s| call_barcode(head, s))
+                                .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0))
+                        })
+                        .collect();
+                    let n = items.len() as u64;
+                    for ((read, chunks, run_infos), (barcode, conf)) in items.into_iter().zip(calls)
+                    {
+                        route(
+                            routers,
+                            class_tx,
+                            read.for_writing(read.run_info_index),
+                            barcode,
+                            chunks,
+                            run_infos,
+                            conf,
+                        );
+                    }
+                    pb.inc(n);
                 }
-                pb.inc(n);
-            }
-            Ok(())
-        });
+                Ok(())
+            }));
+        }
 
         // CPU prep. A send failure means the encoder thread is gone; stop
         // feeding and let the join below report why rather than masking it with
@@ -1452,10 +1528,12 @@ fn produce_gpu_crf(
         );
 
         drop(block_tx);
-        // The encoder's error is the root cause when the channel hung up, so
+        // An encoder's error is the root cause when the channel hung up, so
         // report it ahead of whatever `drive_blocks` returned.
-        gpu.join()
-            .map_err(|e| anyhow::anyhow!("GPU encoder thread panicked: {e:?}"))??;
+        for (w, g) in gpus.into_iter().enumerate() {
+            g.join()
+                .map_err(|e| anyhow::anyhow!("GPU encoder worker {w} panicked: {e:?}"))??;
+        }
         drive
     })
 }

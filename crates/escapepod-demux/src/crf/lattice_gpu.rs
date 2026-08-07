@@ -62,6 +62,17 @@ impl ScoreOrder {
     }
 }
 
+/// How many CUDA devices this process can see, or `None` if the driver cannot
+/// be reached at all.
+///
+/// This is the *visible* count, so it already honours `CUDA_VISIBLE_DEVICES`:
+/// under SLURM `--gres=gpu:1` it is 1 no matter how many cards the node holds,
+/// which is what makes multi-device placement safe to enable by default. Ordinals
+/// `0..count` index the same devices onnxruntime's `device_id` does.
+pub fn visible_device_count() -> Option<usize> {
+    CudaContext::device_count().ok().map(|n| n.max(0) as usize)
+}
+
 /// A CUDA device with the lattice kernels loaded.
 ///
 /// Build once and reuse: NVRTC compilation and module load are amortised across
