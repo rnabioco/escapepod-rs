@@ -54,19 +54,38 @@ use rayon::prelude::*;
 use super::encoder::{CrfError, CrfMetadata};
 use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with};
 
-/// Reads per onnxruntime call before splitting.
+/// Rows one device may have in flight across *all* encoders sharing it.
 ///
-/// LSTM activations scale with `rows * t_len * features * layers`, which the
-/// caller cannot see from here, so this is a starting guess: a batch that hits
-/// a device out-of-memory error is halved and retried, exactly as the
-/// boundary-CNN GPU path does. Override with `ESCAPEPOD_CRF_GPU_BATCH_ROWS`.
-fn resolve_batch_rows() -> usize {
-    const DEFAULT_ROWS: usize = 512;
+/// 1024 is two 512-row batches, the configuration the pipeline was tuned at on a
+/// 24 GB A30. It is a budget rather than a per-worker constant because every
+/// worker on a device allocates its LSTM activations from the same VRAM: a
+/// sweep at `ESCAPEPOD_CRF_GPU_WORKERS=4` on one A30 asked for 4x512 rows, hit
+/// 49 allocation failures, and then died with a generic `CudaCall` error on a
+/// `Reshape` — the halve-and-retry recognised every one of those 49 but could
+/// not save the run, because by then the context was wedged. Prevention is the
+/// only fix available; retry is the backstop for what prevention cannot size.
+pub const DEVICE_ROW_BUDGET: usize = 1024;
+
+/// Reads per onnxruntime call before splitting, for one encoder that shares its
+/// device with `workers_on_device - 1` others.
+///
+/// LSTM activations scale with `rows * t_len * features * layers`, which this
+/// cannot see, so the result is still a starting guess: a batch that hits a
+/// device out-of-memory error is halved and retried, exactly as the boundary-CNN
+/// GPU path does.
+///
+/// `ESCAPEPOD_CRF_GPU_BATCH_ROWS` overrides it and is **per worker, not per
+/// device** — raising it with several workers per device is how you reproduce
+/// the failure above.
+fn resolve_batch_rows(workers_on_device: usize) -> usize {
+    /// Below this, splitting costs more in per-call overhead than the memory is
+    /// worth; a device that cannot host this many rows needs fewer workers.
+    const MIN_ROWS: usize = 64;
     std::env::var("ESCAPEPOD_CRF_GPU_BATCH_ROWS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_ROWS)
+        .unwrap_or_else(|| (DEVICE_ROW_BUDGET / workers_on_device.max(1)).max(MIN_ROWS))
 }
 
 /// Batched CTC-CRF basecaller backed by onnxruntime + CUDA.
@@ -79,7 +98,11 @@ pub struct CrfEncoderGpu {
     meta: CrfMetadata,
     layout: CrfLayout,
     alphabet: Vec<u8>,
-    batch_rows: usize,
+    /// Rows per device call. Atomic because the encoder is shared behind `&` by
+    /// the time the pipeline knows how many workers will contend for its device
+    /// — see [`Self::share_device_with`]. Written once at start-up, read per
+    /// batch, so `Relaxed` is all the ordering this needs.
+    batch_rows: std::sync::atomic::AtomicUsize,
     /// Batched lattice decode on the device. `None` falls back to the rayon CPU
     /// decode — correct either way, but the CPU decode is ~66% of this path's
     /// host cost, so which one is running is worth reporting rather than
@@ -199,7 +222,9 @@ impl CrfEncoderGpu {
             meta,
             layout,
             alphabet,
-            batch_rows: resolve_batch_rows(),
+            // Assume sole use of the device; the fused pipeline corrects this
+            // via `share_device_with` once its worker layout is decided.
+            batch_rows: std::sync::atomic::AtomicUsize::new(resolve_batch_rows(1)),
             lattice,
             decode_fallback,
             output_name,
@@ -223,6 +248,27 @@ impl CrfEncoderGpu {
     /// Whether the lattice decode runs on the device.
     pub fn gpu_decode_active(&self) -> bool {
         self.lattice.is_some()
+    }
+
+    /// Rows this encoder sends to the device per call.
+    pub fn batch_rows(&self) -> usize {
+        self.batch_rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Tell this encoder that `workers` encoders (including itself) share its
+    /// device, so it takes only its slice of [`DEVICE_ROW_BUDGET`].
+    ///
+    /// Call before the first batch. Workers do not allocate from a common pool —
+    /// each holds its own LSTM activations in the same VRAM — so without this,
+    /// asking for more workers multiplies device memory rather than dividing the
+    /// work, and the run dies once that exceeds the card. An explicit
+    /// `ESCAPEPOD_CRF_GPU_BATCH_ROWS` still wins: it is stated per worker, and
+    /// overriding it is how you deliberately trade one against the other.
+    pub fn share_device_with(&self, workers: usize) {
+        self.batch_rows.store(
+            resolve_batch_rows(workers),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Whether the encoder's scores are decoded in place in device memory,
@@ -251,7 +297,7 @@ impl CrfEncoderGpu {
     /// them.
     pub fn encode_batch(&self, prepped: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, CrfError> {
         let mut out = Vec::with_capacity(prepped.len());
-        for chunk in prepped.chunks(self.batch_rows) {
+        for chunk in prepped.chunks(self.batch_rows()) {
             let rows: Vec<&[f32]> = chunk.iter().map(Vec::as_slice).collect();
             out.extend(self.run_batch(&rows)?);
         }
@@ -543,7 +589,7 @@ impl CrfEncoderGpu {
         let backend = Backend::best_for(&self.layout);
         let mut out = vec![None; prepped.len()];
 
-        for idx in valid.chunks(self.batch_rows) {
+        for idx in valid.chunks(self.batch_rows()) {
             // Borrowed, not cloned: `prepped` outlives the call, and these
             // windows are `chunk` floats each on the way to a device copy.
             let rows: Vec<&[f32]> = idx
@@ -671,6 +717,29 @@ mod tests {
     fn batch_rows_honours_the_env_override() {
         // Default when unset/garbage; the env var is process-global so this
         // only asserts the parse rules, not a specific ambient value.
-        assert!(resolve_batch_rows() > 0);
+        assert!(resolve_batch_rows(1) > 0);
+    }
+
+    /// The whole point of the budget: N workers on one device must not ask it
+    /// for N times the memory. Skipped when the env override is set, since that
+    /// is defined to win.
+    #[test]
+    fn workers_on_a_device_divide_its_row_budget() {
+        if std::env::var("ESCAPEPOD_CRF_GPU_BATCH_ROWS").is_ok() {
+            return;
+        }
+        let one = resolve_batch_rows(1);
+        assert_eq!(one, DEVICE_ROW_BUDGET);
+        assert_eq!(resolve_batch_rows(2), one / 2);
+        assert_eq!(resolve_batch_rows(4), one / 4);
+        // Total in flight stays within the budget as workers scale.
+        for w in [1usize, 2, 3, 4, 8] {
+            assert!(
+                resolve_batch_rows(w) * w <= DEVICE_ROW_BUDGET.max(64 * w),
+                "{w} workers exceed the device budget"
+            );
+        }
+        // ...but never split so far that per-call overhead dominates.
+        assert_eq!(resolve_batch_rows(1024), 64);
     }
 }

@@ -156,15 +156,82 @@
   *visible* devices, so `CUDA_VISIBLE_DEVICES` and SLURM `--gres=gpu:1` collapse
   it to a same-device pool automatically. Nothing changes for single-GPU users.
 
-  **Measured gain is small today, and the reason is worth stating**: 17.6 s → 15.7 s
-  on 40 k reads with two A30s (1.12x), not the ~2x the device count suggests. The
-  pipeline is not device-bound — the GPU idles ~75% of the time — so a second GPU
-  mostly adds idle capacity. This lands as capability plus the placement fix
-  below; the starvation it exposes is unresolved (see *Known limitations*).
+  **Measured gain was small when this landed, and the reason is worth keeping**:
+  17.6 s → 15.7 s on 40 k reads with two A30s (1.12x), not the ~2x the device
+  count suggests. The pipeline was not device-bound — the GPU idled ~75% of the
+  time — so a second GPU mostly added idle capacity. Both causes of that idling
+  have since been fixed (the boundary-prep shape churn, and reader threads
+  starving the pool; see *Fixed* and *Performance*), and the device now runs at
+  90%+ for three quarters of a 1 M-read run on one A30. The two-GPU numbers
+  predate those fixes and have not been re-measured.
+
+  Note the pool must be sized against device memory, not just device count — see
+  the `DEVICE_ROW_BUDGET` entry under *Fixed*.
 
   Output is unaffected: 40 001/40 001 identical rows at one, two and four workers.
 
 ### Fixed
+
+- **The boundary CNN was never prepped the way it was trained** (#187).
+  escapepod-models builds every training example through
+  `dataset.py::prepare_signal`, which pads to a fixed
+  `input_len = (max_obs_trace - min_obs_adapter) / downscale` = 1500 with
+  `score_excl = -5.0`; its own inference path does the same. escpod instead
+  truncated to `search_window + ESCAPEPOD_CNN_MARGIN` (550 + 256 = 806) and
+  padded with nothing, so the model has been running off-distribution since the
+  CNN detector shipped. The truncation's premise did not hold either — the
+  graph's receptive field is wider than the margin assumed, so an output at the
+  far edge of the search window depended on input the truncation removed.
+
+  Scored against escapepod-models' move-table gold labels (20,303 reads, the
+  same yardstick used to rank boundary architectures), matching the training
+  convention is an improvement on every metric:
+
+  ```text
+  prep    MAE    median   +/-200   +/-500
+  old    111.8    30.0    0.9146   0.9654
+  new    111.1    30.0    0.9149   0.9658
+  ```
+
+  Of the 38 labelled reads where the two preps disagree, 24 are closer to gold
+  under the new prep and 14 under the old.
+
+  It was also the fused GPU pipeline's bottleneck. The window clamps to the read
+  end, so every read shorter than `max_obs_trace` got its own length — 680
+  distinct shapes over one production run's 527 k reads, so a block issued one
+  large onnxruntime call plus ~679 tiny ones, each paying fresh cuDNN plan
+  selection. Detection measured **401 s of device time in a 425 s wall (94%)**
+  against 0.009 ms/read for the same kernel at a steady shape. One fixed length
+  fixes both: **401 s -> 20.2 s**.
+
+  Expect adapter positions to move on a minority of reads. That is the point of
+  the change, and the gold comparison above is the evidence for its direction.
+
+- **`ESCAPEPOD_CRF_GPU_WORKERS` could kill or hang a run.** Every encoder worker
+  sharing a device allocates its LSTM activations from that device's VRAM, but
+  each took a full `ESCAPEPOD_CRF_GPU_BATCH_ROWS` batch, so asking for more
+  workers multiplied device memory instead of dividing the work. Four workers on
+  one 24 GB A30 hit 49 allocation failures and then died with a generic
+  `CudaCall` error on a `Reshape`, followed by `corrupted double-linked list` —
+  the halve-and-retry recognised all 49 but could not save the run, because by
+  then the CUDA context was wedged.
+
+  Both failure modes are bad in different ways. One run aborted with exit 134
+  after writing **997,211 of 1,001,307 reads**, so a caller that checked only the
+  output and not the exit code would have lost a block of reads silently. Another
+  did not abort at all: it hung holding the full 24 GB for as long as it was left
+  running, pinning the device against every other job on the node.
+
+  Rows are now a **per-device budget** (`DEVICE_ROW_BUDGET`, 1024) split across
+  the workers on that device, so total in-flight rows stay flat as the pool
+  grows. The default two-workers-per-device configuration is unchanged at 512
+  rows each; an explicit `ESCAPEPOD_CRF_GPU_BATCH_ROWS` still wins and is still
+  stated per worker. The pipeline logs the resolved rows/call alongside the
+  worker count.
+
+  The configuration that previously aborted now completes: four workers on one
+  A30, 1 M reads, 256 rows/call, 112.0 s, zero allocation failures, all
+  1,001,307 reads written.
 
 - **`escpod demux --gpu` aborted at exit roughly half the time**, after writing
   every read correctly. onnxruntime's CUDA provider reads freed memory during

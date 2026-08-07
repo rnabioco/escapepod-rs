@@ -929,9 +929,14 @@ const MIN_ROUTER_DEPTH: usize = 64;
 
 /// Upper bound on reads accumulated into one detect+classify block. POD5 Arrow
 /// read-batches are small (~1000 reads), so detecting per batch makes GPU CNN
-/// fire many tiny calls; accumulating across batches into a large block groups
-/// far more same-length reads per onnxruntime call. The on-device batch is
-/// separately capped by `gpu_batch_elems`.
+/// fire many tiny calls; accumulating across batches amortises the per-call
+/// overhead over more rows. The on-device batch is separately capped by
+/// `gpu_batch_elems`, and on the CNN path [`BLOCK_TARGET_BYTES`] usually binds
+/// first.
+///
+/// This used to also be how same-length reads found each other, back when prep
+/// gave every read its own length; #187 made the model input one fixed shape,
+/// so grouping is no longer a reason to accumulate.
 const DETECT_WINDOW: usize = 65_536;
 
 /// Upper bound on the *decoded signal bytes* held in one block.
@@ -941,20 +946,26 @@ const DETECT_WINDOW: usize = 65_536;
 /// reads that is ~1.8 GB on a short-read RNA library and ~9.5 GB on a long-read
 /// one — measured 13.5 GB peak RSS on a 1.22 M-read file, of which ~2.4 GB was
 /// this block (the rest is mmap'd input pages). Capping by bytes keeps the
-/// footprint flat across libraries with wildly different read lengths, while
-/// the read cap above still lets the GPU-CNN path (which decodes only ~806
-/// samples per read) fill a full 65,536-read block before this binds.
+/// footprint flat across libraries with wildly different read lengths.
+///
+/// Note which cap actually binds: the CNN path decodes up to `max_obs_trace`
+/// (16,000 samples = 32 KB) per read, so on a long-read library this cap binds
+/// at a few thousand reads and [`DETECT_WINDOW`] is never reached. That is
+/// fine — since #187 fixed the model input to one shape, batching quality no
+/// longer depends on accumulating many reads to find same-length peers, and
+/// smaller blocks pipeline better against the encoder pool.
 ///
 /// 128 MB measured best on 1.22 M reads; larger is worse on both wall time and
 /// RSS (512 MB: 74.4 s / 13.07 GB vs 128 MB: 63.8 s / 12.68 GB).
 ///
 /// This bounds **one block**, not the process. [`fill_shard`] enforces it per
 /// filler thread, so blocks in flight are roughly
-/// `filler_threads() * (BLOCK_QUEUE_DEPTH + 1) + 1` — about 640 MB at the
-/// defaults and ~1.4 GB at `ESCAPEPOD_DEMUX_FILLERS=8`. That is already what the
-/// peak-RSS column in [`filler_threads`]' table is measuring, so the 128 MB
-/// figure is tuned *with* the multiplier, not against it; scale the filler count
-/// to trade throughput for footprint rather than shrinking this.
+/// `fillers * (BLOCK_QUEUE_DEPTH + 1) + 1` — about 0.9 GB at [`CPU_FILLERS`] and
+/// 3.2 GB at [`GPU_CRF_FILLERS`], which is the whole of the measured ~4 GB gap
+/// between those two settings. That is already what the peak-RSS columns in
+/// both tables are measuring, so the 128 MB figure is tuned *with* the
+/// multiplier, not against it; scale the filler count to trade throughput for
+/// footprint rather than shrinking this.
 const BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Blocks queued between the reader threads and the processing loop.
@@ -981,6 +992,28 @@ const BLOCK_QUEUE_DEPTH: usize = 2;
 /// second covers that stall. Past two it is flat, and the extra blocks in
 /// flight cost real memory. Set `ESCAPEPOD_DEMUX_FILLERS=1` on a cold network
 /// filesystem where concurrent streams are known to hurt.
+///
+/// # This is also flat for the GPU CRF pipeline — do not re-litigate it
+///
+/// Once the encoder ran on the device, its workers traced as 47% blocked on
+/// `recv`, which reads like reader starvation, and a sweep at 2/4/8 fillers on
+/// 1 M reads returned a clean monotone 179.6 s → 136.4 s → 119.6 s with GPU
+/// utilisation climbing 49% → 65% → 75% alongside. Every column agreed.
+///
+/// It was an artefact. The arms ran in ascending order against a cold page
+/// cache, so each one re-read less of the 12 GB input than the last. Re-run
+/// **interleaved** on the same node — 2, 8, 2, 8 — the effect vanishes:
+///
+/// ```text
+/// fillers=2  114.6 s      fillers=8  112.2 s
+/// fillers=2  109.8 s      fillers=8  109.1 s
+/// ```
+///
+/// A second node confirmed it (116.2 s at 8 vs 114.2 s at 2). Eight fillers cost
+/// ~4 GB of resident memory for nothing. Interleave the arms before believing
+/// any I/O-adjacent sweep here.
+const DEFAULT_FILLERS: usize = 2;
+
 fn filler_threads() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -989,7 +1022,7 @@ fn filler_threads() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(2)
+            .unwrap_or(DEFAULT_FILLERS)
             .min(32)
     })
 }
@@ -1464,6 +1497,12 @@ fn crf_encoder_devices(visible: usize) -> Vec<i32> {
 ///
 /// Capped so a many-GPU node does not spawn an encoder session per device
 /// unbounded — each one holds its own ONNX graph and scores buffer.
+///
+/// Raising this does **not** give the device more memory to work with: workers
+/// on one device split its row budget (`CrfEncoderGpu::share_device_with`), so
+/// past a point each does proportionally smaller calls and the per-call overhead
+/// this exists to hide grows back. Before that fix, four workers on one 24 GB
+/// A30 simply exhausted the card and killed the run.
 #[cfg(feature = "crf-gpu")]
 fn crf_gpu_workers(devices: usize) -> usize {
     std::env::var("ESCAPEPOD_CRF_GPU_WORKERS")
@@ -1604,12 +1643,22 @@ fn produce_gpu_crf(
             )
         })
         .collect::<Result<_, _>>()?;
+    // Every worker sharing a device allocates its LSTM activations from that
+    // device's VRAM, so they must split its row budget rather than each take a
+    // full one. Without this, `ESCAPEPOD_CRF_GPU_WORKERS=4` on a single 24 GB
+    // A30 exhausted the card and killed the run.
+    let per_device = workers.div_ceil(enc_devices.len());
+    encoder.share_device_with(per_device);
+    for e in &extra {
+        e.share_device_with(per_device);
+    }
     if workers > 1 || devices > 1 {
         info!(
-            "{} {} worker(s) on GPU {:?}{}",
+            "{} {} worker(s) on GPU {:?}, {} reads/call{}",
             style::label("CRF encoder:"),
             style::count(workers),
             enc_devices,
+            style::count(encoder.batch_rows()),
             if devices > 1 {
                 "; adapter detection has GPU 0 to itself"
             } else {
