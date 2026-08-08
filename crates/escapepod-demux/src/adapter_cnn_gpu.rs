@@ -20,7 +20,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::adapter_cnn::{
-    decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
+    PreppedWindow, decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
 };
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
@@ -169,7 +169,7 @@ impl AdapterCnnGpu {
         signals: &[&[f32]],
     ) -> Vec<Result<usize, AdapterCnnError>> {
         let cfg = self.config;
-        let prepped: Vec<Option<Vec<f32>>> = signals
+        let prepped: Vec<Option<PreppedWindow>> = signals
             .iter()
             .map(|&s| prep_adapter_signal(s, &cfg))
             .collect();
@@ -194,7 +194,7 @@ impl AdapterCnnGpu {
     /// length is one unpadded `[group, 1, len]` onnxruntime batch.
     pub fn detect_prepped(
         &self,
-        prepped: &[Option<Vec<f32>>],
+        prepped: &[Option<PreppedWindow>],
     ) -> Vec<Result<usize, AdapterCnnError>> {
         let valid_idx: Vec<usize> = (0..prepped.len())
             .filter(|&i| prepped[i].is_some())
@@ -223,7 +223,7 @@ impl AdapterCnnGpu {
     /// bit-identical: same length, no padding, the batch axis is independent.
     fn run_grouped(
         &self,
-        prepped: &[Option<Vec<f32>>],
+        prepped: &[Option<PreppedWindow>],
         valid_idx: &[usize],
         out: &mut [Result<usize, AdapterCnnError>],
     ) {
@@ -290,7 +290,7 @@ impl AdapterCnnGpu {
     /// returning each read's adapter_end. Unpadded `[sub.len(), 1, len]`.
     fn run_one(
         &self,
-        prepped: &[Option<Vec<f32>>],
+        prepped: &[Option<PreppedWindow>],
         sub: &[usize],
         len: usize,
     ) -> Result<Vec<usize>, AdapterCnnError> {
@@ -316,12 +316,14 @@ impl AdapterCnnGpu {
         Ok((0..g)
             .map(|row| {
                 // Channel-0 (adapter_end) of row `row`. `valid_len` is this
-                // read's own prepped length, which in a bucketed group is <=
-                // `len` — that clamp is what keeps the argmax out of the padding.
+                // read's own PRE-PADDING length, not the tensor width — see
+                // `PreppedWindow`. Passing the padded length here is what let a
+                // short read's argmax wander into 540 positions of SCORE_EXCL
+                // and return a boundary past the end of the read.
                 let valid_len = prepped[sub[row]]
                     .as_ref()
                     .expect("sub points at prepped signals")
-                    .len();
+                    .valid_len;
                 let base = row * 2 * length_out;
                 decode_adapter_end(&cfg, length_out, valid_len, |k| scores[base + k])
             })

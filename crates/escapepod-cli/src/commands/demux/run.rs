@@ -177,6 +177,57 @@ pub struct RunArgs {
     pub profile: bool,
 }
 
+/// Owns `T` and, when `leak` is set, forgets it at scope exit instead of
+/// dropping it.
+///
+/// Exists for one upstream bug: onnxruntime's CUDA provider reads freed memory
+/// during onnxruntime's *own* at-exit teardown (pykeio/ort#609), and glibc
+/// aborts on it with "corrupted double-linked list" — measured 5 runs in 10,
+/// always after every read had already been written. `release_env_on_exit` calls
+/// `ReleaseEnv` only once the last `Arc<Environment>` drops and every live
+/// `Session` holds one, so keeping our sessions alive past `main` means the
+/// faulty path never runs.
+///
+/// The reason this is a guard and not a `mem::forget` at the end of the happy
+/// path: `run` is full of `?`, so a trailing forget is skipped on precisely the
+/// error paths — where an ordinary, reportable failure would then be masked by
+/// an exit-134 abort. `Drop` runs on every path.
+///
+/// Narrow by construction: `leak` is false unless a GPU path actually created
+/// ORT sessions, our own destructors elsewhere still run, and the process is
+/// exiting anyway, so the kernel reclaims the memory. Drop it once `ort` /
+/// onnxruntime ship a fix.
+pub(super) struct LeakIf<T> {
+    inner: Option<T>,
+    leak: bool,
+}
+
+impl<T> LeakIf<T> {
+    pub(super) fn new(inner: T, leak: bool) -> Self {
+        Self {
+            inner: Some(inner),
+            leak,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for LeakIf<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner.as_ref().expect("present until drop")
+    }
+}
+
+impl<T> Drop for LeakIf<T> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take()
+            && self.leak
+        {
+            std::mem::forget(inner);
+        }
+    }
+}
+
 /// A classified read handed to its barcode's writer thread (block-copy).
 struct Routed {
     read: ReadData,
@@ -298,7 +349,7 @@ impl Detector {
         if let Detector::CnnGpu(gpu) = self {
             let cfg = gpu.config();
             let t_prep = std::time::Instant::now();
-            let prepped: Vec<Option<Vec<f32>>> = signals
+            let prepped: Vec<Option<escapepod_demux::PreppedWindow>> = signals
                 .par_iter()
                 .map(|s| {
                     s.as_ref().and_then(|v| {
@@ -593,6 +644,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                             "round-tripped through host memory"
                         }
                     );
+                    // Zero-copy is *requested* from a cudarc probe, which proves
+                    // only that the CUDA driver works — not that onnxruntime
+                    // registered its CUDA EP. When the load-time probe finds the
+                    // encoder output on the host, the run stays correct but the
+                    // line above overstates it, so say what happened. Most often
+                    // this means ORT_DYLIB_PATH points at a CPU-only build.
+                    if let Some(why) = enc.zero_copy_fallback_reason() {
+                        tracing::warn!(
+                            "Zero-copy scores unavailable, using the copying path \
+                             (same results, slower): {why}"
+                        );
+                    }
                 } else {
                     // The decode is the larger half of this path's host cost, so
                     // running it on the CPU is a ~3x end-to-end difference. Say
@@ -682,6 +745,33 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let boundary_pin: Option<(&str, Option<PathBuf>)> = None;
 
     let detector = build_detector(&args, boundary_pin)?;
+
+    // Neutralise onnxruntime's at-exit CUDA teardown *here*, at construction,
+    // rather than at the end of a successful run.
+    //
+    // The bug this dodges is upstream (pykeio/ort#609): onnxruntime's CUDA
+    // provider reads freed memory inside onnxruntime's own `.fini_array`
+    // teardown, and glibc aborts on it with "corrupted double-linked list" —
+    // measured 5 runs in 10, always *after* every read was written. The
+    // mechanism is that `release_env_on_exit` calls `ReleaseEnv` only when the
+    // last `Arc<Environment>` drops, and every live `Session` holds one, so
+    // keeping ours alive means the faulty path never runs.
+    //
+    // A drop guard rather than a `mem::forget` at the end of `run`, because this
+    // function is full of `?`. A trailing forget is skipped on exactly the error
+    // paths — a bad POD5 batch, ENOSPC on an output shard, a writer panic — so a
+    // run that failed for an ordinary, reportable reason would abort at exit
+    // with 134 and bury its own diagnosis under a glibc message. That is the
+    // case that most needs a readable error, and it was the one case the
+    // mitigation missed. `LeakIf` fires on every path, and only when a GPU path
+    // actually built ORT sessions.
+    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+    let leak_ort = args.gpu;
+    #[cfg(not(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu")))]
+    let leak_ort = false;
+    let model = LeakIf::new(model, leak_ort);
+    let detector = LeakIf::new(detector, leak_ort);
+
     let fp = FpParams::default();
 
     std::fs::create_dir_all(&output_dir)?;
@@ -766,8 +856,22 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let (class_tx, class_handle) = spawn_class_writer(args.classifications.as_deref())?;
 
     // ---- Stages A/B: produce classified reads ----
-    let produce_result = match &model {
+    let produce_result = match &*model {
         ClassifyModel::Svm(svm) => {
+            // `--gpu` exists whenever any GPU feature is compiled in, but DTW-SVM
+            // classify is only accelerated by `gpu`. On a `crf-gpu`-only build the
+            // flag is accepted and does nothing for this model, so warn — unless
+            // `--method cnn` on a `cnn-gpu` build means detection still uses the
+            // device. Without this the flag is a silent no-op, which is the exact
+            // failure this PR removed for the CRF head.
+            #[cfg(all(not(feature = "gpu"), any(feature = "cnn-gpu", feature = "crf-gpu")))]
+            if args.gpu && !(cfg!(feature = "cnn-gpu") && args.method.as_deref() == Some("cnn")) {
+                tracing::warn!(
+                    "--gpu has no effect here: this build has no `gpu` feature, so \
+                     DTW-SVM classify is CPU-only (rebuild with `--features gpu`, or \
+                     use `--method cnn` on a `cnn-gpu` build for GPU adapter detection)."
+                );
+            }
             #[cfg(feature = "gpu")]
             {
                 if args.gpu {
@@ -785,12 +889,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             // GBM classify is CPU-only; with `--method cnn` the GPU still
             // accelerates adapter detection, so only warn when `--gpu` can do
             // nothing (CPU classify + CPU detect).
-            #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-            if args.gpu && args.method.as_deref() != Some("cnn") {
+            // Widened to every GPU feature: `--gpu` is accepted on a
+            // `crf-gpu`-only build too, and there it does nothing at all for GBM.
+            #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+            if args.gpu && !(cfg!(feature = "cnn-gpu") && args.method.as_deref() == Some("cnn")) {
                 tracing::warn!(
                     "--gpu has no effect here: GBM classify is CPU-only and \
-                     `--method {}` detection is CPU-only (use `--method cnn` for \
-                     GPU adapter detection).",
+                     `--method {}` detection is not running on the GPU (use \
+                     `--method cnn` on a `cnn-gpu` build for GPU adapter detection).",
                     args.method.as_deref().unwrap_or("<from model>")
                 );
             }
@@ -873,42 +979,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     print_summary(&summary);
     timer.report(profile);
 
-    // Keep the onnxruntime sessions alive past the end of `main`.
-    //
-    // onnxruntime's CUDA provider reads freed memory during onnxruntime's *own*
-    // at-exit teardown. valgrind, on a run whose output was complete and correct:
-    //
-    // ```text
-    // Invalid read of size 8
-    //    at  libonnxruntime_providers_cuda.so
-    //    by  libonnxruntime.so.1.27.1
-    //    by  <Arc<ort::environment::Environment>>::drop_slow
-    //    by  ort::environment::release_env_on_exit
-    //    by  _dl_fini
-    // Address .. is 1,258,744 bytes inside an unallocated block of size 1,360,656
-    // ```
-    //
-    // Ten errors, five contexts, every one of them at teardown; nothing in the
-    // processing loop. glibc notices the damage at the last `free` and aborts
-    // with "corrupted double-linked list" — measured 5 runs in 10, always *after*
-    // every read was written, so it corrupted no output but did make a successful
-    // run exit non-zero, which a workflow engine reads as failure.
-    //
-    // `release_env_on_exit` (ort puts it in `.fini_array`) calls `ReleaseEnv`
-    // only when the *last* `Arc<Environment>` drops, and every live `Session`
-    // holds one (`SharedSessionInner::_environment`). Leaking the objects that
-    // own our sessions keeps that count above zero, so the faulty path never
-    // runs. The process is exiting; the memory is reclaimed by the kernel either
-    // way.
-    //
-    // This is deliberately narrow: it does not skip our own destructors, and
-    // every writer thread has already been joined and every output renamed into
-    // place above. Only reached when a GPU path actually created ORT sessions.
-    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
-    if args.gpu {
-        std::mem::forget(model);
-        std::mem::forget(detector);
-    }
+    // The onnxruntime sessions are kept alive past the end of `main` by the
+    // `LeakIf` guards wrapping `model` and `detector` — see that type, and
+    // pykeio/ort#609. Nothing to do here: the guards fire on this path and on
+    // every `?` above, which is the point.
     Ok(())
 }
 

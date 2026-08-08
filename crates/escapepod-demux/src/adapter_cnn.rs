@@ -79,8 +79,39 @@ impl AdapterCnnConfig {
     /// prep many reads
     /// in parallel and then hand the prepped vectors to a batched detector
     /// (e.g. [`AdapterCnnGpu::detect_prepped`](crate::adapter_cnn_gpu::AdapterCnnGpu::detect_prepped)).
-    pub fn prep(&self, signal_pa: &[f32]) -> Option<Vec<f32>> {
+    pub fn prep(&self, signal_pa: &[f32]) -> Option<PreppedWindow> {
         prep_adapter_signal(signal_pa, self)
+    }
+}
+
+/// One read's model input: the fixed-length tensor row, and how much of it is
+/// real.
+///
+/// The two travel together because keeping them apart is what broke: #187 padded
+/// every read to `input_len`, and the decode's clamp — which took a separate
+/// `valid_len` argument — was then handed the *padded* length by all three call
+/// sites. That silently widened the argmax over up to 540 positions of pure
+/// `SCORE_EXCL` padding, and on 503 k real reads it put `adapter_end` past the
+/// end of the read for **272 of them** (0.054%, all reads under 6500 samples;
+/// 0.7.0 produced none). Making the length a field of the data removes the
+/// opportunity to pass the wrong one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreppedWindow {
+    /// Model input row, always [`AdapterCnnConfig::input_len`] long.
+    pub data: Vec<f32>,
+    /// Leading positions of `data` that came from real signal, before padding.
+    /// Never greater than `data.len()`.
+    pub valid_len: usize,
+}
+
+impl PreppedWindow {
+    /// Length of the tensor row handed to the graph.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 
@@ -184,7 +215,7 @@ impl AdapterCnn {
             })?;
 
         // Feed through the ONNX plan.
-        let input = Tensor::from_shape(&[1, 1, normalized.len()], &normalized)
+        let input = Tensor::from_shape(&[1, 1, normalized.len()], &normalized.data)
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let outputs = self
             .plan
@@ -204,7 +235,7 @@ impl AdapterCnn {
         Ok(decode_adapter_end(
             &cfg,
             length_out,
-            normalized.len(),
+            normalized.valid_len,
             |k| scores[[0, 0, k]],
         ))
     }
@@ -232,7 +263,7 @@ impl AdapterCnn {
         let min_len = cfg.min_obs_adapter + cfg.downscale_factor;
 
         // 1. Prep each signal independently; record which are usable.
-        let prepped: Vec<Option<Vec<f32>>> = signals
+        let prepped: Vec<Option<PreppedWindow>> = signals
             .iter()
             .map(|&sig| prep_adapter_signal(sig, &cfg))
             .collect();
@@ -282,7 +313,15 @@ impl AdapterCnn {
                 }
                 let length_out = shape[2];
                 Ok((0..g)
-                    .map(|row| decode_adapter_end(&cfg, length_out, len, |k| scores[[row, 0, k]]))
+                    .map(|row| {
+                        // Each read's own pre-padding length, never the group's
+                        // tensor width — see `PreppedWindow`.
+                        let valid_len = prepped[group[row]]
+                            .as_ref()
+                            .expect("group points at prepped signals")
+                            .valid_len;
+                        decode_adapter_end(&cfg, length_out, valid_len, |k| scores[[row, 0, k]])
+                    })
                     .collect())
             })();
             scatter_group(&mut out, &group, run);
@@ -380,7 +419,10 @@ pub(crate) const SCORE_EXCL: f32 = -5.0;
 ///
 /// One fixed length fixes both: it is what the model was trained on, and it is
 /// one shape for every read.
-pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> Option<Vec<f32>> {
+pub(crate) fn prep_adapter_signal(
+    signal_pa: &[f32],
+    cfg: &AdapterCnnConfig,
+) -> Option<PreppedWindow> {
     if signal_pa.len() <= cfg.min_obs_adapter + cfg.downscale_factor {
         return None;
     }
@@ -395,10 +437,17 @@ pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> 
         .min(signal_pa.len());
     let tail = &signal_pa[cfg.min_obs_adapter..end];
     let mut normalized = median_mad_normalize(&mean_pool(tail, cfg.downscale_factor));
+    // How much of the row is real, captured *before* padding. Training pads the
+    // same way, so the model is in-distribution either way — but the decode must
+    // not argmax into the pad, or a short read gets a boundary past its own end.
+    let valid_len = normalized.len().min(cfg.input_len());
     // Normalisation statistics come from the true window above; only the tensor
     // handed to the graph is padded, which is the order training uses too.
     normalized.resize(cfg.input_len(), SCORE_EXCL);
-    Some(normalized)
+    Some(PreppedWindow {
+        data: normalized,
+        valid_len,
+    })
 }
 
 /// Decode one read's adapter-end channel into a sample index in the original
@@ -462,7 +511,7 @@ pub(crate) fn decode_adapter_end(
 /// wrong boundaries. The cost is one `HashMap` pass per block, far below the
 /// inference it guards.
 pub(crate) fn group_by_len(
-    prepped: &[Option<Vec<f32>>],
+    prepped: &[Option<PreppedWindow>],
     valid_idx: &[usize],
 ) -> Vec<(usize, Vec<usize>)> {
     let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
@@ -493,12 +542,17 @@ pub(crate) fn group_by_len(
 ///
 /// Shared by the CPU (tract) and GPU (onnxruntime) batch paths so the layout
 /// stays byte-identical between backends.
-pub(crate) fn pack_batch(prepped: &[Option<Vec<f32>>], indices: &[usize], len: usize) -> Vec<f32> {
+pub(crate) fn pack_batch(
+    prepped: &[Option<PreppedWindow>],
+    indices: &[usize],
+    len: usize,
+) -> Vec<f32> {
     let mut data = vec![0f32; indices.len() * len];
     for (row, &i) in indices.iter().enumerate() {
-        let src = prepped[i]
+        let src = &prepped[i]
             .as_ref()
-            .expect("indices point at prepped signals");
+            .expect("indices point at prepped signals")
+            .data;
         let n = src.len().min(len);
         data[row * len..row * len + n].copy_from_slice(&src[..n]);
     }
@@ -579,5 +633,56 @@ mod tests {
         assert!(out.iter().all(|x| x.is_finite()));
         // NaN position got replaced with -5.0.
         assert_eq!(out[3], -5.0);
+    }
+
+    /// A short read pads to `input_len`, but its real content does not, and the
+    /// two lengths must not be confused.
+    #[test]
+    fn prep_reports_the_pre_padding_length() {
+        let cfg = AdapterCnnConfig::default();
+        let sig = vec![100.0f32; 2120];
+        let w = prep_adapter_signal(&sig, &cfg).expect("2120 samples is long enough");
+
+        // The tensor is always the model's fixed width...
+        assert_eq!(w.data.len(), cfg.input_len());
+        assert_eq!(w.data.len(), 1500);
+        // ...but only (2120 - 1000) / 10 = 112 positions came from signal.
+        assert_eq!(w.valid_len, 112);
+        // Everything past that is the training pad value, not zero.
+        assert!(w.data[w.valid_len..].iter().all(|&v| v == SCORE_EXCL));
+    }
+
+    /// The regression this guards is a shipped one, not a hypothetical.
+    ///
+    /// #187 padded every read to `input_len`, and all three `decode_adapter_end`
+    /// call sites then passed the *padded* length as `valid_len`. `search_end`
+    /// widened from the read's own 112 positions to the full 550, so the argmax
+    /// could land in `SCORE_EXCL` padding and return a boundary past the end of
+    /// the read. On 503,076 production reads that produced `adapter_end >
+    /// num_samples` for **272** of them; 0.7.0 produced none.
+    #[test]
+    fn decode_never_returns_a_boundary_past_the_read() {
+        let cfg = AdapterCnnConfig::default();
+        let raw_len = 2120usize;
+        let sig = vec![100.0f32; raw_len];
+        let w = prep_adapter_signal(&sig, &cfg).expect("long enough");
+
+        // Worst case: the model's strongest response is out in the padding,
+        // exactly where the old code was free to follow it.
+        let end = decode_adapter_end(&cfg, cfg.input_len(), w.valid_len, |k| {
+            if k == 400 { 100.0 } else { 0.0 }
+        });
+        assert!(
+            end <= raw_len,
+            "adapter_end {end} is past the {raw_len}-sample read"
+        );
+
+        // And a peak inside the real region is still found, so the clamp did not
+        // simply disable detection.
+        let end = decode_adapter_end(&cfg, cfg.input_len(), w.valid_len, |k| {
+            if k == 50 { 100.0 } else { 0.0 }
+        });
+        assert_eq!(end, 50 * cfg.downscale_factor + cfg.min_obs_adapter);
+        assert!(end <= raw_len);
     }
 }

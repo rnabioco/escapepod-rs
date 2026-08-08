@@ -428,7 +428,10 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             // onnxruntime calls. Bounded at 2 in flight to cap memory.
             const GPU_BLOCK: usize = 16_384;
             let cfg = AdapterCnnConfig::default();
-            type Block = (Vec<(Uuid, u64)>, Vec<Option<Vec<f32>>>);
+            type Block = (
+                Vec<(Uuid, u64)>,
+                Vec<Option<escapepod_demux::PreppedWindow>>,
+            );
             let (tx, rx) = sync_channel::<Block>(2);
 
             let model_path = cnn_model_path.clone();
@@ -503,22 +506,23 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                     reads.sort_by_key(|r| r.num_samples);
                     let extractor = reader.signal_extractor()?;
                     for window in reads.chunks(GPU_BLOCK) {
-                        let prepped: Vec<(Uuid, u64, Option<Vec<f32>>)> = window
-                            .par_iter()
-                            .map(|r| {
-                                // Only the leading `max_obs_trace` samples feed the
-                                // CNN; skip decompressing the rest (matters for long
-                                // mRNA reads).
-                                let p = extractor
-                                    .get_signal_prefix(&r.signal_rows, cfg.max_obs_trace)
-                                    .ok()
-                                    .and_then(|s| {
-                                        let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
-                                        cfg.prep(&f)
-                                    });
-                                (r.read_id, r.num_samples, p)
-                            })
-                            .collect();
+                        let prepped: Vec<(Uuid, u64, Option<escapepod_demux::PreppedWindow>)> =
+                            window
+                                .par_iter()
+                                .map(|r| {
+                                    // Only the leading `max_obs_trace` samples feed the
+                                    // CNN; skip decompressing the rest (matters for long
+                                    // mRNA reads).
+                                    let p = extractor
+                                        .get_signal_prefix(&r.signal_rows, cfg.max_obs_trace)
+                                        .ok()
+                                        .and_then(|s| {
+                                            let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
+                                            cfg.prep(&f)
+                                        });
+                                    (r.read_id, r.num_samples, p)
+                                })
+                                .collect();
                         let mut meta = Vec::with_capacity(prepped.len());
                         let mut preps = Vec::with_capacity(prepped.len());
                         for (id, ns, p) in prepped {

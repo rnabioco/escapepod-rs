@@ -114,6 +114,12 @@ use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with};
 /// only fix available; retry is the backstop for what prevention cannot size.
 pub const DEVICE_ROW_BUDGET: usize = 1024;
 
+/// Workers per device assumed before [`CrfEncoderGpu::share_device_with`] says
+/// otherwise. Two is what the fused pipeline runs, and assuming it keeps the
+/// out-of-the-box batch at the 512 rows every caller used before the budget
+/// existed.
+pub const DEFAULT_WORKERS_PER_DEVICE: usize = 2;
+
 /// Reads per onnxruntime call before splitting, for one encoder that shares its
 /// device with `workers_on_device - 1` others.
 ///
@@ -171,6 +177,10 @@ pub struct CrfEncoderGpu {
     /// of letting onnxruntime copy it to the host for us to upload again.
     /// Requires [`Self::lattice`]; `ESCAPEPOD_CRF_GPU_ZEROCOPY=0` disables it.
     zero_copy: bool,
+    /// Why zero-copy stood down at load, when it did. Surfaced like
+    /// [`Self::decode_fallback`] rather than logged: this crate has no `tracing`
+    /// dependency, and the CLI is the layer that decides how loud to be.
+    zero_copy_fallback: Option<String>,
 }
 
 impl CrfEncoderGpu {
@@ -261,27 +271,42 @@ impl CrfEncoderGpu {
             .map(|o| o.name().to_string())
             .ok_or_else(|| CrfError::Load("encoder graph declares no outputs".to_string()))?;
         // Only meaningful with the device decode: with the CPU decode the scores
-        // have to reach the host anyway.
+        // have to reach the host anyway. Note this is a *request*: `lattice` only
+        // proves the CUDA driver and NVRTC work, which says nothing about whether
+        // onnxruntime registered its CUDA EP. The probe below settles that.
         let zero_copy =
             lattice.is_some() && std::env::var("ESCAPEPOD_CRF_GPU_ZEROCOPY").as_deref() != Ok("0");
 
-        let encoder = Self {
+        let mut encoder = Self {
             session: Mutex::new(session),
             meta,
             layout,
             alphabet,
-            // Assume sole use of the device; the fused pipeline corrects this
-            // via `share_device_with` once its worker layout is decided.
-            batch_rows: std::sync::atomic::AtomicUsize::new(resolve_batch_rows(1)),
+            // Assume the device is shared the way the fused pipeline shares it
+            // (two workers), which `share_device_with` then confirms or corrects
+            // once the worker layout is known.
+            //
+            // NOT `resolve_batch_rows(1)`. A lone encoder really could take the
+            // whole budget, but callers that never call `share_device_with` —
+            // `demux basecall --gpu`, the examples — would then silently jump
+            // from the 512 rows they used before this became a budget to 1024,
+            // doubling per-call device memory on hardware that had not changed.
+            // A default that only holds for the caller that overrides it anyway
+            // is the wrong default.
+            batch_rows: std::sync::atomic::AtomicUsize::new(resolve_batch_rows(
+                DEFAULT_WORKERS_PER_DEVICE,
+            )),
             lattice,
             decode_fallback,
             output_name,
             device,
             zero_copy,
+            zero_copy_fallback: None,
         };
         // Same reasoning as the CPU loader: catch a batch-major (boundary-CNN)
         // export here rather than after decoding noise for every read.
         encoder.encode_batch(&[vec![0f32; encoder.meta.signal.chunk]])?;
+        encoder.probe_zero_copy();
         Ok(encoder)
     }
 
@@ -323,6 +348,45 @@ impl CrfEncoderGpu {
     /// rather than copied to the host and uploaded again.
     pub fn zero_copy_active(&self) -> bool {
         self.zero_copy
+    }
+
+    /// Why zero-copy stood down at load, when it did. The caller should surface
+    /// this: the run is still correct, but slower than the log line above it
+    /// would otherwise imply.
+    pub fn zero_copy_fallback_reason(&self) -> Option<&str> {
+        self.zero_copy_fallback.as_deref()
+    }
+
+    /// Settle at load time whether the encoder's output really lands in device
+    /// memory, and quietly stand down if it does not.
+    ///
+    /// `zero_copy` is requested from `lattice.is_some()`, which proves only that
+    /// the CUDA *driver* and libnvrtc are usable. Whether **onnxruntime**
+    /// registered its CUDA EP is a separate question, and the module header
+    /// documents the answer being "no" as a survivable outcome: "If the CUDA EP
+    /// cannot initialise, onnxruntime silently falls back to CPU — slow, but
+    /// correct." Without this probe that stopped being true. A CUDA-capable node
+    /// with a CPU-only `libonnxruntime` on `ORT_DYLIB_PATH` — the dangling-path
+    /// and missing-libcudnn traps this repo has already been bitten by — would
+    /// load cleanly, announce "decoded in place on the device", then fail on the
+    /// first real batch. That is not an OOM, so the halve-and-retry does not
+    /// catch it, and it lands after the per-barcode POD5 files are part-written.
+    ///
+    /// One batch-1 run through the binding, at load, converts that into the
+    /// documented slow-but-correct degradation plus a warning.
+    fn probe_zero_copy(&mut self) {
+        if !self.zero_copy {
+            return;
+        }
+        let Some(lattice) = self.lattice.as_ref() else {
+            return;
+        };
+        let probe = vec![0f32; self.meta.signal.chunk];
+        let rows: Vec<&[f32]> = vec![probe.as_slice()];
+        if let Err(e) = self.run_zero_copy(&rows, lattice) {
+            self.zero_copy = false;
+            self.zero_copy_fallback = Some(e.to_string());
+        }
     }
 
     /// Why the decode fell back to the CPU, when it did. The caller is expected
@@ -778,6 +842,10 @@ mod tests {
         }
         let one = resolve_batch_rows(1);
         assert_eq!(one, DEVICE_ROW_BUDGET);
+        // The out-of-the-box default assumes the fused layout, so a caller that
+        // never calls `share_device_with` keeps the 512 rows it had before this
+        // was a budget rather than silently doubling.
+        assert_eq!(resolve_batch_rows(DEFAULT_WORKERS_PER_DEVICE), 512);
         assert_eq!(resolve_batch_rows(2), one / 2);
         assert_eq!(resolve_batch_rows(4), one / 4);
         // Total in flight stays within the budget as workers scale.

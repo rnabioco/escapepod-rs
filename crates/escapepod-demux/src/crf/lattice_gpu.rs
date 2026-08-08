@@ -295,8 +295,38 @@ impl CrfLatticeGpu {
         self.launch(Scores::Owned(&mut work), batch, t_len, alphabet, order)
     }
 
-    /// The kernel sequence, over scores that are on the device either way.
+    /// The kernel sequence, plus the guarantee that nothing is still running
+    /// over `scores` when this returns — including when it returns an error.
+    ///
+    /// The success path synchronises at the end anyway. The error path is the
+    /// one that matters, and only on the zero-copy route: `scores` there is
+    /// onnxruntime's own output allocation, borrowed. If a launch fails midway,
+    /// earlier kernels are still enqueued and reading it, and returning
+    /// immediately lets `run_zero_copy` drop the binding and hand that block
+    /// back to ORT's BFC arena. `run_and_decode` then retries with half the
+    /// rows, ORT hands the *same* block out for the retry's encoder output, and
+    /// the orphaned kernels are still writing to it — corrupted scores decoded
+    /// into confident, wrong barcode calls, or an illegal-access abort.
+    ///
+    /// A failed sync is discarded: the launch error is the useful one, and a
+    /// sticky device error would only mask it.
     fn launch(
+        &self,
+        scores: Scores<'_>,
+        batch: usize,
+        t_len: usize,
+        alphabet: &[u8],
+        order: ScoreOrder,
+    ) -> Result<Vec<String>, CrfError> {
+        let out = self.launch_kernels(scores, batch, t_len, alphabet, order);
+        if out.is_err() {
+            let _ = self.stream.synchronize();
+        }
+        out
+    }
+
+    /// The kernel sequence, over scores that are on the device either way.
+    fn launch_kernels(
         &self,
         scores: Scores<'_>,
         batch: usize,

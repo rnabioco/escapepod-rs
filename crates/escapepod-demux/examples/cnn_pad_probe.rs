@@ -77,13 +77,13 @@ fn main() -> anyhow::Result<()> {
 
         // Exact: the tensor is exactly `valid` long — the conv sees the edge.
         let exact = det
-            .scores_for_probe(&prepped[..valid], valid)
+            .scores_for_probe(&prepped.data[..valid], valid)
             .map_err(|e| anyhow::anyhow!("exact: {e}"))?;
         // Padded: the same leading `valid` samples in a full-length tensor.
         // Zeros, deliberately: the question is what *batch* padding would do,
         // and `pack_batch` zero-fills. (Prep itself pads with SCORE_EXCL.)
         let mut padded_in = vec![0f32; full_len];
-        padded_in[..valid].copy_from_slice(&prepped[..valid]);
+        padded_in[..valid].copy_from_slice(&prepped.data[..valid]);
         let padded = det
             .scores_for_probe(&padded_in, full_len)
             .map_err(|e| anyhow::anyhow!("padded: {e}"))?;

@@ -217,6 +217,18 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     #[cfg(not(feature = "crf-gpu"))]
     let encoder = Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?));
 
+    // Keep the ORT session alive past process exit when there is one, for the
+    // reason spelled out on `run::LeakIf` (pykeio/ort#609). Applied here, at
+    // construction, rather than after the last write: the rest of this function
+    // is full of `?`, and a trailing `mem::forget` is skipped on exactly the
+    // error paths — where an ordinary failure would then be masked by an
+    // exit-134 glibc abort instead of reporting itself.
+    #[cfg(feature = "crf-gpu")]
+    let leak_ort = matches!(encoder, Basecaller::Gpu(_));
+    #[cfg(not(feature = "crf-gpu"))]
+    let leak_ort = false;
+    let encoder = super::run::LeakIf::new(encoder, leak_ort);
+
     let meta = encoder.metadata();
     info!(
         "{} chunk={} stride={} t_len={} states={}",
@@ -398,16 +410,6 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             style::count(skipped),
             style::value(encoder.metadata().signal.chunk),
         );
-    }
-    // Keep the ORT session alive past process exit when one was created, for the
-    // same reason `demux --gpu` does: onnxruntime's CUDA provider reads freed
-    // memory during onnxruntime's own at-exit teardown and glibc aborts on it,
-    // *after* every output is written. See the long comment in `run.rs` and
-    // pykeio/ort#609. Everything above is already flushed by this point, and the
-    // CPU (tract) basecaller is left to drop normally.
-    #[cfg(feature = "crf-gpu")]
-    if matches!(encoder, Basecaller::Gpu(_)) {
-        std::mem::forget(encoder);
     }
     Ok(())
 }

@@ -67,10 +67,13 @@ fn main() -> anyhow::Result<()> {
         "batch", "ms/call", "reads/s", "ms/read", "vs 0.40"
     );
     for &batch in &[32usize, 128, 512, 1024, 2048, 4096, 8192] {
-        let prepped: Vec<Option<Vec<f32>>> = (0..batch)
+        let prepped: Vec<Option<escapepod_demux::PreppedWindow>> = (0..batch)
             .map(|b| {
                 // Vary per row so nothing can be cached across the batch axis.
-                Some(one.iter().map(|v| v + (b as f32) * 1e-4).collect())
+                Some(escapepod_demux::PreppedWindow {
+                    data: one.data.iter().map(|v| v + (b as f32) * 1e-4).collect(),
+                    valid_len: one.valid_len,
+                })
             })
             .collect();
 
