@@ -11,13 +11,15 @@ accuracy.
 
     ```bash
     cargo build --release --features cnn-gpu      # CNN adapter detection (onnxruntime CUDA)
+    cargo build --release --features crf-gpu      # CTC-CRF basecall encoder (onnxruntime CUDA)
     cargo build --release --features train        # train DTW-SVM models (linfa)
     cargo build --release --features gpu          # EXPERIMENTAL: GPU DTW classify
     ```
 
-    The GPU features require a CUDA driver and `libnvrtc` **at run time** (not
+    The GPU features need a CUDA runtime **at run time only** (nothing at
     build time), so GPU-enabled binaries are distributed separately from the
-    static release artifacts.
+    static release artifacts. The repository's pixi `gpu` environment
+    provides every required library — see [GPU setup](gpu-setup.md).
 
 !!! warning "`--gpu` DTW classify is experimental and usually slower"
     On a full node the CPU DTW beats the GPU: 113 s on 64 CPU cores vs 132 s
