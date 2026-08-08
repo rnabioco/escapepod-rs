@@ -121,6 +121,11 @@ pub struct CrfMetadata {
     /// present rather than interpreting it.
     #[serde(default)]
     pub metrics: Option<serde_json::Value>,
+    /// Per-run override of the bundle's declared `boundary.margin`, set by
+    /// `demux --boundary-margin`. Never read from the sidecar — the bundle
+    /// states the contract, this is the operator overruling it.
+    #[serde(skip)]
+    margin_override: Option<usize>,
 }
 
 /// Who this model is, for provenance in logs and `--info`.
@@ -174,6 +179,17 @@ pub struct BoundarySpec {
     /// it in builds without `crf-decode`.
     #[serde(default)]
     pub input: Option<crate::crf::BoundaryInputSpec>,
+    /// Samples of `adapter_end` beyond `signal.chunk` a read needs before it is
+    /// decoded. Absent uses [`BOUNDARY_MARGIN`].
+    ///
+    /// This belongs to the bundle for the same reason `input` does: it is a
+    /// property of how the corpus was framed, not of the caller. The exporter
+    /// knows the filter its `extract_chunks` applied (rna004 nbc16 used
+    /// `adapter_end > chunk + 200`) and is the only party that can state it
+    /// without guessing. A bundle that declares 0 is asserting its model was
+    /// trained to tolerate a window reaching the read's opening samples.
+    #[serde(default)]
+    pub margin: Option<usize>,
 }
 
 fn default_onnx_name() -> String {
@@ -325,7 +341,28 @@ impl CrfMetadata {
     /// margin is kept here rather than accepting any read with `chunk` samples
     /// of history.
     pub fn min_adapter_end(&self) -> usize {
-        self.signal.chunk + BOUNDARY_MARGIN
+        self.signal.chunk + self.boundary_margin()
+    }
+
+    /// The margin in effect: the operator's override, else the bundle's
+    /// declared `boundary.margin`, else [`BOUNDARY_MARGIN`].
+    pub fn boundary_margin(&self) -> usize {
+        self.margin_override
+            .or_else(|| self.boundary.as_ref().and_then(|b| b.margin))
+            .unwrap_or(BOUNDARY_MARGIN)
+    }
+
+    /// Overrule the bundle's declared margin for this run
+    /// (`demux --boundary-margin`).
+    ///
+    /// The margin describes how the training corpus was *filtered*, not what
+    /// the encoder needs: any read with `adapter_end >= chunk` has a full
+    /// window. Lowering it trades a window that reaches into the read's opening
+    /// samples for reads that would otherwise be dropped undecoded. Prefer
+    /// fixing the bundle's declaration; this exists for evaluating a change
+    /// before it is baked into an export.
+    pub fn set_boundary_margin(&mut self, margin: usize) {
+        self.margin_override = Some(margin);
     }
 }
 
@@ -410,6 +447,12 @@ impl CrfEncoder {
     /// Metadata sidecar in effect.
     pub fn metadata(&self) -> &CrfMetadata {
         &self.meta
+    }
+
+    /// Override the decode's boundary margin. See
+    /// [`CrfMetadata::set_boundary_margin`].
+    pub fn set_boundary_margin(&mut self, margin: usize) {
+        self.meta.set_boundary_margin(margin);
     }
 
     /// Lattice geometry implied by the sidecar.
@@ -546,6 +589,52 @@ mod tests {
         assert_eq!(m.t_len(), 200);
         assert_eq!(m.layout().unwrap().n_score, 1280);
         assert_eq!(m.min_adapter_end(), 2200);
+    }
+
+    /// Precedence: operator override > bundle's declared `boundary.margin` >
+    /// [`BOUNDARY_MARGIN`]. A bundle stating 0 asserts its model tolerates a
+    /// window reaching the read's opening samples.
+    #[test]
+    fn boundary_margin_precedence() {
+        // No boundary block at all: the legacy default.
+        let mut m = meta();
+        assert_eq!(m.boundary_margin(), BOUNDARY_MARGIN);
+        assert_eq!(m.min_adapter_end(), m.signal.chunk + BOUNDARY_MARGIN);
+
+        m.set_boundary_margin(0);
+        assert_eq!(m.min_adapter_end(), m.signal.chunk, "override wins");
+
+        // Declared by the bundle, no override.
+        let declared: CrfMetadata = serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 2000, "stride": 10},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]},
+              "boundary": {"method": "cnn", "margin": 0}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(declared.boundary_margin(), 0);
+        assert_eq!(declared.min_adapter_end(), 2000);
+
+        // A boundary block that omits it still falls back.
+        let silent: CrfMetadata = serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 2000, "stride": 10},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]},
+              "boundary": {"method": "cnn"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(silent.min_adapter_end(), 2000 + BOUNDARY_MARGIN);
+
+        // Override beats a declaration too.
+        let mut both = declared;
+        both.set_boundary_margin(300);
+        assert_eq!(both.min_adapter_end(), 2300);
     }
 
     /// The boundary block's `input` contract and `sha256` are optional
