@@ -20,22 +20,23 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::adapter_cnn::{
-    decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
+    PreppedWindow, decode_adapter_end, group_by_len, pack_batch, prep_adapter_signal, scatter_group,
 };
 use crate::{AdapterCnnConfig, AdapterCnnError};
 
 /// Resolve the starting cap on input elements (`rows × len`) per onnxruntime
-/// call, scaled to the device's memory. The largest length-group (every read
-/// longer than the prep cap collapses onto one length — up to hundreds of
-/// thousands of reads) is split into chunks of this size; a chunk that still
-/// OOMs is halved and retried (`run_grouped`), so this is a *starting* guess,
-/// not a hard limit.
+/// call, scaled to the device's memory. Since #187 prep emits one fixed length
+/// for every read, so this splits the single group — which is every valid read
+/// in the block — into chunks of this size; a chunk that still OOMs is halved
+/// and retried (`run_grouped`), so this is a *starting* guess, not a hard limit.
 ///
 /// Resolution order: `ESCAPEPOD_CNN_GPU_BATCH_ELEMS` env override → scaled from
 /// total VRAM (`total_bytes / BYTES_PER_ELEM`) → a fixed fallback. Conv
 /// activations scale with `rows × len × channels`, so on a 24 GB device ~5k
-/// rows at the 806 cap length (~4.2M elems) fit but ~10k OOM (measured) — i.e.
-/// ~24 GB / 5500 bytes-per-element. Using total VRAM means an 80 GB A100/H100
+/// rows at the then-806 prep length (~4.2M elems) fit but ~10k OOM (measured)
+/// — i.e. ~24 GB / 5500 bytes-per-element. The elements-not-rows unit is what
+/// makes that measurement still apply at today's 1500: the same element budget
+/// simply yields proportionally fewer rows. Using total VRAM means an 80 GB A100/H100
 /// gets ~3× larger batches automatically, while the halve-retry covers any
 /// over-estimate (e.g. a model with more channels).
 fn resolve_batch_elems() -> usize {
@@ -117,6 +118,22 @@ impl AdapterCnnGpu {
         config: AdapterCnnConfig,
         intra_threads: Option<usize>,
     ) -> Result<Self, AdapterCnnError> {
+        Self::load_with_config_on_device(path, config, intra_threads, 0)
+    }
+
+    /// [`load_with_config`](Self::load_with_config) pinned to a CUDA ordinal.
+    ///
+    /// Detection and the CRF encoder are comparable in device cost (measured 5.4 s
+    /// vs 6.4 s over 40 k reads), so on one GPU they contend and the pipeline is
+    /// bound by their sum. Given more than one device they can be given separate
+    /// roles instead, making the ceiling the *larger* of the two rather than the
+    /// total. This is what lets the caller place them.
+    pub fn load_with_config_on_device(
+        path: impl AsRef<Path>,
+        config: AdapterCnnConfig,
+        intra_threads: Option<usize>,
+        device: i32,
+    ) -> Result<Self, AdapterCnnError> {
         let mut builder = Session::builder().map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         if let Some(n) = intra_threads {
             builder = builder
@@ -128,7 +145,7 @@ impl AdapterCnnGpu {
                 .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         }
         let session = builder
-            .with_execution_providers(crate::ort_ep::cuda_providers())
+            .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?
             .commit_from_file(path)
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
@@ -152,7 +169,7 @@ impl AdapterCnnGpu {
         signals: &[&[f32]],
     ) -> Vec<Result<usize, AdapterCnnError>> {
         let cfg = self.config;
-        let prepped: Vec<Option<Vec<f32>>> = signals
+        let prepped: Vec<Option<PreppedWindow>> = signals
             .iter()
             .map(|&s| prep_adapter_signal(s, &cfg))
             .collect();
@@ -177,7 +194,7 @@ impl AdapterCnnGpu {
     /// length is one unpadded `[group, 1, len]` onnxruntime batch.
     pub fn detect_prepped(
         &self,
-        prepped: &[Option<Vec<f32>>],
+        prepped: &[Option<PreppedWindow>],
     ) -> Vec<Result<usize, AdapterCnnError>> {
         let valid_idx: Vec<usize> = (0..prepped.len())
             .filter(|&i| prepped[i].is_some())
@@ -206,7 +223,7 @@ impl AdapterCnnGpu {
     /// bit-identical: same length, no padding, the batch axis is independent.
     fn run_grouped(
         &self,
-        prepped: &[Option<Vec<f32>>],
+        prepped: &[Option<PreppedWindow>],
         valid_idx: &[usize],
         out: &mut [Result<usize, AdapterCnnError>],
     ) {
@@ -236,11 +253,44 @@ impl AdapterCnnGpu {
         }
     }
 
+    /// Raw channel-0 (adapter-end) scores for one prepped signal, run at tensor
+    /// length `len` and zero-padded if the signal is shorter.
+    ///
+    /// Diagnostic. It exists to answer whether padding changes the model's output
+    /// *before* the padding starts — which decides whether length bucketing is a
+    /// wiring problem or a property of the graph, and no decoded `adapter_end`
+    /// can distinguish those.
+    pub fn scores_for_probe(
+        &self,
+        prepped: &[f32],
+        len: usize,
+    ) -> Result<Vec<f32>, AdapterCnnError> {
+        let mut data = vec![0f32; len];
+        let n = prepped.len().min(len);
+        data[..n].copy_from_slice(&prepped[..n]);
+        let input = Tensor::from_array(([1usize, 1, len], data))
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        let mut session = self.session.lock().expect("ort session mutex poisoned");
+        let outputs = session
+            .run(ort::inputs![input])
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        let (shape, scores) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
+        if shape.len() != 3 || shape[1] != 2 {
+            return Err(AdapterCnnError::BadShape {
+                got: shape.iter().map(|&d| d as usize).collect(),
+            });
+        }
+        let length_out = shape[2] as usize;
+        Ok(scores[..length_out].to_vec())
+    }
+
     /// One onnxruntime call over `sub` reads (all of prepped length `len`),
     /// returning each read's adapter_end. Unpadded `[sub.len(), 1, len]`.
     fn run_one(
         &self,
-        prepped: &[Option<Vec<f32>>],
+        prepped: &[Option<PreppedWindow>],
         sub: &[usize],
         len: usize,
     ) -> Result<Vec<usize>, AdapterCnnError> {
@@ -265,9 +315,17 @@ impl AdapterCnnGpu {
         let length_out = shape[2] as usize;
         Ok((0..g)
             .map(|row| {
-                // Channel-0 (adapter_end) of row `row`.
+                // Channel-0 (adapter_end) of row `row`. `valid_len` is this
+                // read's own PRE-PADDING length, not the tensor width — see
+                // `PreppedWindow`. Passing the padded length here is what let a
+                // short read's argmax wander into 540 positions of SCORE_EXCL
+                // and return a boundary past the end of the read.
+                let valid_len = prepped[sub[row]]
+                    .as_ref()
+                    .expect("sub points at prepped signals")
+                    .valid_len;
                 let base = row * 2 * length_out;
-                decode_adapter_end(&cfg, length_out, len, |k| scores[base + k])
+                decode_adapter_end(&cfg, length_out, valid_len, |k| scores[base + k])
             })
             .collect())
     }

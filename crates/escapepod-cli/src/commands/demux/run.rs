@@ -21,6 +21,8 @@ use std::sync::mpsc::SyncSender;
 
 use crate::progress::create_progress_bar;
 use crate::style;
+#[cfg(feature = "crf-gpu")]
+use escapepod_demux::crf::CrfEncoderGpu;
 #[cfg(feature = "crf-decode")]
 use escapepod_demux::crf::{BarcodeRefs, CrfEncoder, CrfScratch};
 use escapepod_demux::{
@@ -146,17 +148,23 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// [experimental] Use the GPU where this pipeline supports it: batched
-    /// DTW-SVM classify (`--features gpu`) and/or batched CNN adapter detection
-    /// with `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and
-    /// feeds the GPU; CPU falls back automatically for stages without a GPU
-    /// path (e.g. GBM classify).
+    /// [experimental] Use the GPU where this pipeline supports it: CTC-CRF
+    /// encoder inference (`--features crf-gpu`), batched DTW-SVM classify
+    /// (`--features gpu`), and/or batched CNN adapter detection with
+    /// `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and feeds
+    /// the GPU; CPU falls back automatically for stages without a GPU path
+    /// (e.g. GBM classify).
+    ///
+    /// With a CRF bundle this is the case that pays off most: the encoder is
+    /// ~91% of that head's CPU cost (13.9 ms/read against a 1.19 ms AVX-512
+    /// lattice decode), so leaving it on the CPU leaves the device idle even
+    /// with `--method cnn` doing detection there.
     ///
     /// GPU DTW classify is NOT recommended on a full node — the CPU DTW is
     /// faster there (measured 113 s CPU on 64 cores vs 132 s with `--gpu` on an
     /// A30, plus ~2.2 GB more RSS). It may help when cores are scarce. GPU CNN
     /// detection (`--method cnn --gpu`) is the case that does pay off.
-    #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
+    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
@@ -167,6 +175,57 @@ pub struct RunArgs {
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
     pub profile: bool,
+}
+
+/// Owns `T` and, when `leak` is set, forgets it at scope exit instead of
+/// dropping it.
+///
+/// Exists for one upstream bug: onnxruntime's CUDA provider reads freed memory
+/// during onnxruntime's *own* at-exit teardown (pykeio/ort#609), and glibc
+/// aborts on it with "corrupted double-linked list" — measured 5 runs in 10,
+/// always after every read had already been written. `release_env_on_exit` calls
+/// `ReleaseEnv` only once the last `Arc<Environment>` drops and every live
+/// `Session` holds one, so keeping our sessions alive past `main` means the
+/// faulty path never runs.
+///
+/// The reason this is a guard and not a `mem::forget` at the end of the happy
+/// path: `run` is full of `?`, so a trailing forget is skipped on precisely the
+/// error paths — where an ordinary, reportable failure would then be masked by
+/// an exit-134 abort. `Drop` runs on every path.
+///
+/// Narrow by construction: `leak` is false unless a GPU path actually created
+/// ORT sessions, our own destructors elsewhere still run, and the process is
+/// exiting anyway, so the kernel reclaims the memory. Drop it once `ort` /
+/// onnxruntime ship a fix.
+pub(super) struct LeakIf<T> {
+    inner: Option<T>,
+    leak: bool,
+}
+
+impl<T> LeakIf<T> {
+    pub(super) fn new(inner: T, leak: bool) -> Self {
+        Self {
+            inner: Some(inner),
+            leak,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for LeakIf<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner.as_ref().expect("present until drop")
+    }
+}
+
+impl<T> Drop for LeakIf<T> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take()
+            && self.leak
+        {
+            std::mem::forget(inner);
+        }
+    }
 }
 
 /// A classified read handed to its barcode's writer thread (block-copy).
@@ -266,10 +325,31 @@ impl Detector {
     /// batched onnxruntime call (length-grouped); LLR and CPU CNN run per read
     /// in parallel. Bit-identical to calling [`Self::detect_with`] on each signal.
     fn detect_batch(&self, signals: &[Option<Vec<i16>>]) -> Vec<(usize, usize)> {
+        self.detect_batch_traced(signals, None)
+    }
+
+    /// [`detect_batch`](Self::detect_batch), splitting the GPU-CNN path's cost
+    /// into its host and device halves.
+    ///
+    /// Worth separating because they call for opposite fixes: host-side prep
+    /// scales with threads and pipelines against the device, while the batched
+    /// onnxruntime call serialises on one session mutex and contends with the
+    /// encoder for the same GPU. Detect is this pipeline's bottleneck, and
+    /// without this split there is no way to tell which half to attack.
+    // `split` is only read by the GPU-CNN branch, so it is unused whenever that
+    // branch is compiled out. Plain atomics rather than a `&GpuTrace` so this
+    // signature needs no feature gate of its own.
+    #[cfg_attr(not(feature = "cnn-gpu"), allow(unused_variables))]
+    fn detect_batch_traced(
+        &self,
+        signals: &[Option<Vec<i16>>],
+        split: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)>,
+    ) -> Vec<(usize, usize)> {
         #[cfg(feature = "cnn-gpu")]
         if let Detector::CnnGpu(gpu) = self {
             let cfg = gpu.config();
-            let prepped: Vec<Option<Vec<f32>>> = signals
+            let t_prep = std::time::Instant::now();
+            let prepped: Vec<Option<escapepod_demux::PreppedWindow>> = signals
                 .par_iter()
                 .map(|s| {
                     s.as_ref().and_then(|v| {
@@ -278,11 +358,25 @@ impl Detector {
                     })
                 })
                 .collect();
-            return gpu
+            if let Some((prep_ms, _)) = split {
+                prep_ms.fetch_add(
+                    t_prep.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let t_infer = std::time::Instant::now();
+            let out: Vec<(usize, usize)> = gpu
                 .detect_prepped(&prepped)
                 .into_iter()
                 .map(|r| (0usize, r.unwrap_or(0)))
                 .collect();
+            if let Some((_, infer_ms)) = split {
+                infer_ms.fetch_add(
+                    t_infer.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            return out;
         }
         signals
             .par_iter()
@@ -396,9 +490,36 @@ enum ClassifyModel {
 /// against.
 #[cfg(feature = "crf-decode")]
 struct CrfHead {
-    encoder: CrfEncoder,
+    encoder: CrfEncoderAny,
     refs: BarcodeRefs,
     min_margin: u32,
+}
+
+/// Where CRF encoder inference runs. The lattice decode is on the CPU either
+/// way — see `escapepod_demux::crf::encoder_gpu` for why.
+///
+/// The two variants drive genuinely different producers rather than hiding
+/// behind one `basecall` method: tract has no efficient batched LSTM, so the CPU
+/// path interleaves prep/encode/match per read inside one rayon pass, while the
+/// GPU path has to accumulate a batch before it can submit anything. Collapsing
+/// them into a common batched interface would force the CPU path to materialise
+/// a whole block of 3000-sample windows it has no use for.
+#[cfg(feature = "crf-decode")]
+enum CrfEncoderAny {
+    Cpu(Box<CrfEncoder>),
+    #[cfg(feature = "crf-gpu")]
+    Gpu(Box<CrfEncoderGpu>),
+}
+
+#[cfg(feature = "crf-decode")]
+impl CrfEncoderAny {
+    fn metadata(&self) -> &escapepod_demux::crf::CrfMetadata {
+        match self {
+            Self::Cpu(e) => e.metadata(),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.metadata(),
+        }
+    }
 }
 
 impl ClassifyModel {
@@ -497,7 +618,60 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let model = match crf_dir {
         #[cfg(feature = "crf-decode")]
         Some(dir) => {
-            let encoder = CrfEncoder::load_bundle(&dir)?;
+            // The encoder is ~91% of this head's CPU cost, so `--gpu` moves it
+            // to the device; the lattice decode stays on the CPU regardless.
+            // `--threads` bounds onnxruntime's intra-op pool, which is otherwise
+            // spawned `available_parallelism()` wide on top of rayon's.
+            #[cfg(feature = "crf-gpu")]
+            let encoder = if args.gpu {
+                // Must match `produce_gpu_crf`'s placement: this instance becomes
+                // worker 0, so it has to land on the first *encoder* device — GPU 1
+                // when detection has GPU 0 to itself.
+                let enc_device = crf_encoder_devices(
+                    escapepod_demux::crf::lattice_gpu::visible_device_count()
+                        .unwrap_or(1)
+                        .max(1),
+                )[0];
+                let enc = CrfEncoderGpu::load_bundle_on_device(&dir, args.threads, enc_device)?;
+                if enc.gpu_decode_active() {
+                    info!(
+                        "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
+                         scores {}",
+                        style::label("CRF encoder:"),
+                        if enc.zero_copy_active() {
+                            "decoded in place on the device"
+                        } else {
+                            "round-tripped through host memory"
+                        }
+                    );
+                    // Zero-copy is *requested* from a cudarc probe, which proves
+                    // only that the CUDA driver works — not that onnxruntime
+                    // registered its CUDA EP. When the load-time probe finds the
+                    // encoder output on the host, the run stays correct but the
+                    // line above overstates it, so say what happened. Most often
+                    // this means ORT_DYLIB_PATH points at a CPU-only build.
+                    if let Some(why) = enc.zero_copy_fallback_reason() {
+                        tracing::warn!(
+                            "Zero-copy scores unavailable, using the copying path \
+                             (same results, slower): {why}"
+                        );
+                    }
+                } else {
+                    // The decode is the larger half of this path's host cost, so
+                    // running it on the CPU is a ~3x end-to-end difference. Say
+                    // so rather than letting the run look fully accelerated.
+                    tracing::warn!(
+                        "CRF lattice decode fell back to the CPU ({}); the encoder is \
+                         still on the GPU, but expect roughly 3x the wall time.",
+                        enc.decode_fallback_reason().unwrap_or("reason unavailable")
+                    );
+                }
+                CrfEncoderAny::Gpu(Box::new(enc))
+            } else {
+                CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
+            };
+            #[cfg(not(feature = "crf-gpu"))]
+            let encoder = CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?));
             // References come from the bundle unless the caller overrides them.
             // Carrying them in the bundle is what makes the plain
             // `--model <bundle> -d out/` form work, and it fixes the
@@ -571,6 +745,33 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let boundary_pin: Option<(&str, Option<PathBuf>)> = None;
 
     let detector = build_detector(&args, boundary_pin)?;
+
+    // Neutralise onnxruntime's at-exit CUDA teardown *here*, at construction,
+    // rather than at the end of a successful run.
+    //
+    // The bug this dodges is upstream (pykeio/ort#609): onnxruntime's CUDA
+    // provider reads freed memory inside onnxruntime's own `.fini_array`
+    // teardown, and glibc aborts on it with "corrupted double-linked list" —
+    // measured 5 runs in 10, always *after* every read was written. The
+    // mechanism is that `release_env_on_exit` calls `ReleaseEnv` only when the
+    // last `Arc<Environment>` drops, and every live `Session` holds one, so
+    // keeping ours alive means the faulty path never runs.
+    //
+    // A drop guard rather than a `mem::forget` at the end of `run`, because this
+    // function is full of `?`. A trailing forget is skipped on exactly the error
+    // paths — a bad POD5 batch, ENOSPC on an output shard, a writer panic — so a
+    // run that failed for an ordinary, reportable reason would abort at exit
+    // with 134 and bury its own diagnosis under a glibc message. That is the
+    // case that most needs a readable error, and it was the one case the
+    // mitigation missed. `LeakIf` fires on every path, and only when a GPU path
+    // actually built ORT sessions.
+    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+    let leak_ort = args.gpu;
+    #[cfg(not(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu")))]
+    let leak_ort = false;
+    let model = LeakIf::new(model, leak_ort);
+    let detector = LeakIf::new(detector, leak_ort);
+
     let fp = FpParams::default();
 
     std::fs::create_dir_all(&output_dir)?;
@@ -655,8 +856,22 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let (class_tx, class_handle) = spawn_class_writer(args.classifications.as_deref())?;
 
     // ---- Stages A/B: produce classified reads ----
-    let produce_result = match &model {
+    let produce_result = match &*model {
         ClassifyModel::Svm(svm) => {
+            // `--gpu` exists whenever any GPU feature is compiled in, but DTW-SVM
+            // classify is only accelerated by `gpu`. On a `crf-gpu`-only build the
+            // flag is accepted and does nothing for this model, so warn — unless
+            // `--method cnn` on a `cnn-gpu` build means detection still uses the
+            // device. Without this the flag is a silent no-op, which is the exact
+            // failure this PR removed for the CRF head.
+            #[cfg(all(not(feature = "gpu"), any(feature = "cnn-gpu", feature = "crf-gpu")))]
+            if args.gpu && !(cfg!(feature = "cnn-gpu") && args.method.as_deref() == Some("cnn")) {
+                tracing::warn!(
+                    "--gpu has no effect here: this build has no `gpu` feature, so \
+                     DTW-SVM classify is CPU-only (rebuild with `--features gpu`, or \
+                     use `--method cnn` on a `cnn-gpu` build for GPU adapter detection)."
+                );
+            }
             #[cfg(feature = "gpu")]
             {
                 if args.gpu {
@@ -674,12 +889,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             // GBM classify is CPU-only; with `--method cnn` the GPU still
             // accelerates adapter detection, so only warn when `--gpu` can do
             // nothing (CPU classify + CPU detect).
-            #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-            if args.gpu && args.method.as_deref() != Some("cnn") {
+            // Widened to every GPU feature: `--gpu` is accepted on a
+            // `crf-gpu`-only build too, and there it does nothing at all for GBM.
+            #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+            if args.gpu && !(cfg!(feature = "cnn-gpu") && args.method.as_deref() == Some("cnn")) {
                 tracing::warn!(
                     "--gpu has no effect here: GBM classify is CPU-only and \
-                     `--method {}` detection is CPU-only (use `--method cnn` for \
-                     GPU adapter detection).",
+                     `--method {}` detection is not running on the GPU (use \
+                     `--method cnn` on a `cnn-gpu` build for GPU adapter detection).",
                     args.method.as_deref().unwrap_or("<from model>")
                 );
             }
@@ -687,20 +904,49 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         }
         #[cfg(feature = "crf-decode")]
         ClassifyModel::Crf(head) => {
-            // Encoder inference here is tract on the CPU, one read per rayon
-            // worker. `demux basecall --gpu` has an onnxruntime path; it is not
-            // wired through the fused pipeline, so say so rather than silently
-            // ignoring the flag.
-            #[cfg(any(feature = "gpu", feature = "cnn-gpu"))]
-            if args.gpu && args.method.as_deref() != Some("cnn") {
+            // Without `crf-gpu` the encoder is tract on the CPU, one read per
+            // rayon worker, and it is ~91% of this head's cost. `--method cnn`
+            // moving detection to the device does NOT make up for that, so warn
+            // regardless of the method — the previous `!= Some("cnn")` gate
+            // silenced exactly the combination that looks most accelerated and
+            // is not.
+            #[cfg(all(not(feature = "crf-gpu"), any(feature = "gpu", feature = "cnn-gpu")))]
+            if args.gpu {
                 tracing::warn!(
-                    "--gpu has no effect here: fused CRF basecalling is CPU-only and \
-                     `--method {}` detection is CPU-only (use `--method cnn` for GPU \
-                     adapter detection, or `demux basecall --gpu` for a GPU encoder).",
-                    args.method.as_deref().unwrap_or("<from model>")
+                    "--gpu leaves the CRF encoder on the CPU: this binary was built \
+                     without `crf-gpu`, and the encoder is ~91% of this head's cost. \
+                     Rebuild with `--features crf-gpu` for a GPU encoder."
                 );
             }
-            produce_cpu_crf(&args, &detector, head, &routers, class_tx.as_ref(), &pb)
+            match &head.encoder {
+                #[cfg(feature = "crf-gpu")]
+                CrfEncoderAny::Gpu(enc) => {
+                    // Extra encoder workers load their own session from the same
+                    // bundle, so the pool needs the directory the head came from.
+                    let bundle = crf_dir_for_pin
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("CRF head without a bundle directory"))?;
+                    produce_gpu_crf(
+                        &args,
+                        &detector,
+                        head,
+                        enc,
+                        bundle,
+                        &routers,
+                        class_tx.as_ref(),
+                        &pb,
+                    )
+                }
+                CrfEncoderAny::Cpu(enc) => produce_cpu_crf(
+                    &args,
+                    &detector,
+                    head,
+                    enc,
+                    &routers,
+                    class_tx.as_ref(),
+                    &pb,
+                ),
+            }
         }
     };
 
@@ -732,6 +978,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     pb.finish_with_message("complete");
     print_summary(&summary);
     timer.report(profile);
+
+    // The onnxruntime sessions are kept alive past the end of `main` by the
+    // `LeakIf` guards wrapping `model` and `detector` — see that type, and
+    // pykeio/ort#609. Nothing to do here: the guards fire on this path and on
+    // every `?` above, which is the point.
     Ok(())
 }
 
@@ -752,9 +1003,14 @@ const MIN_ROUTER_DEPTH: usize = 64;
 
 /// Upper bound on reads accumulated into one detect+classify block. POD5 Arrow
 /// read-batches are small (~1000 reads), so detecting per batch makes GPU CNN
-/// fire many tiny calls; accumulating across batches into a large block groups
-/// far more same-length reads per onnxruntime call. The on-device batch is
-/// separately capped by `gpu_batch_elems`.
+/// fire many tiny calls; accumulating across batches amortises the per-call
+/// overhead over more rows. The on-device batch is separately capped by
+/// `gpu_batch_elems`, and on the CNN path [`BLOCK_TARGET_BYTES`] usually binds
+/// first.
+///
+/// This used to also be how same-length reads found each other, back when prep
+/// gave every read its own length; #187 made the model input one fixed shape,
+/// so grouping is no longer a reason to accumulate.
 const DETECT_WINDOW: usize = 65_536;
 
 /// Upper bound on the *decoded signal bytes* held in one block.
@@ -764,20 +1020,26 @@ const DETECT_WINDOW: usize = 65_536;
 /// reads that is ~1.8 GB on a short-read RNA library and ~9.5 GB on a long-read
 /// one — measured 13.5 GB peak RSS on a 1.22 M-read file, of which ~2.4 GB was
 /// this block (the rest is mmap'd input pages). Capping by bytes keeps the
-/// footprint flat across libraries with wildly different read lengths, while
-/// the read cap above still lets the GPU-CNN path (which decodes only ~806
-/// samples per read) fill a full 65,536-read block before this binds.
+/// footprint flat across libraries with wildly different read lengths.
+///
+/// Note which cap actually binds: the CNN path decodes up to `max_obs_trace`
+/// (16,000 samples = 32 KB) per read, so on a long-read library this cap binds
+/// at a few thousand reads and [`DETECT_WINDOW`] is never reached. That is
+/// fine — since #187 fixed the model input to one shape, batching quality no
+/// longer depends on accumulating many reads to find same-length peers, and
+/// smaller blocks pipeline better against the encoder pool.
 ///
 /// 128 MB measured best on 1.22 M reads; larger is worse on both wall time and
 /// RSS (512 MB: 74.4 s / 13.07 GB vs 128 MB: 63.8 s / 12.68 GB).
 ///
 /// This bounds **one block**, not the process. [`fill_shard`] enforces it per
 /// filler thread, so blocks in flight are roughly
-/// `filler_threads() * (BLOCK_QUEUE_DEPTH + 1) + 1` — about 640 MB at the
-/// defaults and ~1.4 GB at `ESCAPEPOD_DEMUX_FILLERS=8`. That is already what the
-/// peak-RSS column in [`filler_threads`]' table is measuring, so the 128 MB
-/// figure is tuned *with* the multiplier, not against it; scale the filler count
-/// to trade throughput for footprint rather than shrinking this.
+/// `fillers * (BLOCK_QUEUE_DEPTH + 1) + 1` — about 0.9 GB at [`CPU_FILLERS`] and
+/// 3.2 GB at [`GPU_CRF_FILLERS`], which is the whole of the measured ~4 GB gap
+/// between those two settings. That is already what the peak-RSS columns in
+/// both tables are measuring, so the 128 MB figure is tuned *with* the
+/// multiplier, not against it; scale the filler count to trade throughput for
+/// footprint rather than shrinking this.
 const BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Blocks queued between the reader threads and the processing loop.
@@ -804,6 +1066,28 @@ const BLOCK_QUEUE_DEPTH: usize = 2;
 /// second covers that stall. Past two it is flat, and the extra blocks in
 /// flight cost real memory. Set `ESCAPEPOD_DEMUX_FILLERS=1` on a cold network
 /// filesystem where concurrent streams are known to hurt.
+///
+/// # This is also flat for the GPU CRF pipeline — do not re-litigate it
+///
+/// Once the encoder ran on the device, its workers traced as 47% blocked on
+/// `recv`, which reads like reader starvation, and a sweep at 2/4/8 fillers on
+/// 1 M reads returned a clean monotone 179.6 s → 136.4 s → 119.6 s with GPU
+/// utilisation climbing 49% → 65% → 75% alongside. Every column agreed.
+///
+/// It was an artefact. The arms ran in ascending order against a cold page
+/// cache, so each one re-read less of the 12 GB input than the last. Re-run
+/// **interleaved** on the same node — 2, 8, 2, 8 — the effect vanishes:
+///
+/// ```text
+/// fillers=2  114.6 s      fillers=8  112.2 s
+/// fillers=2  109.8 s      fillers=8  109.1 s
+/// ```
+///
+/// A second node confirmed it (116.2 s at 8 vs 114.2 s at 2). Eight fillers cost
+/// ~4 GB of resident memory for nothing. Interleave the arms before believing
+/// any I/O-adjacent sweep here.
+const DEFAULT_FILLERS: usize = 2;
+
 fn filler_threads() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -812,7 +1096,7 @@ fn filler_threads() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(2)
+            .unwrap_or(DEFAULT_FILLERS)
             .min(32)
     })
 }
@@ -1145,11 +1429,12 @@ fn produce_cpu_crf(
     args: &RunArgs,
     detector: &Detector,
     head: &CrfHead,
+    encoder: &CrfEncoder,
     routers: &Routers,
     class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
-    let meta = head.encoder.metadata();
+    let meta = encoder.metadata();
     drive_blocks(
         &args.input,
         detector.signal_decode_bound(),
@@ -1173,25 +1458,11 @@ fn produce_cpu_crf(
                         ) {
                             return None;
                         }
-                        let seq = head
-                            .encoder
+                        let seq = encoder
                             .basecall_prepped(window, scratch)
                             .inspect_err(|e| tracing::warn!("encoder: {e}"))
                             .ok()?;
-                        let m = head.refs.match_sequence(seq.as_bytes())?;
-                        // Same gate as `demux basecall --min-margin`, including
-                        // its treatment of a single reference: with no runner-up
-                        // there is no margin to test, so the call stands.
-                        if !m.margin.is_none_or(|v| v >= head.min_margin) {
-                            return None;
-                        }
-                        // Confidence is the margin, matching `demux basecall`
-                        // and `eval_recovery.py`. A lone reference reports 0
-                        // rather than a fabricated distance.
-                        Some((
-                            head.refs.name(m.index).to_string(),
-                            f64::from(m.margin.unwrap_or(0)),
-                        ))
+                        call_barcode(head, &seq)
                     })()
                     .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0));
 
@@ -1209,6 +1480,439 @@ fn produce_cpu_crf(
             );
         },
     )
+}
+
+/// Match one decoded sequence to a reference, applying `--min-margin`.
+///
+/// `None` means "no call" — either nothing matched, or the runner-up was too
+/// close — and the caller routes those to `unclassified`. Shared by the CPU and
+/// GPU CRF producers so the two cannot drift on the gate or on what confidence
+/// means.
+///
+/// Same gate as `demux basecall --min-margin`, including its treatment of a
+/// single reference: with no runner-up there is no margin to test, so the call
+/// stands. Confidence is the margin, matching `demux basecall` and
+/// `eval_recovery.py`; a lone reference reports 0 rather than a fabricated
+/// distance.
+#[cfg(feature = "crf-decode")]
+fn call_barcode(head: &CrfHead, seq: &str) -> Option<(String, f64)> {
+    let m = head.refs.match_sequence(seq.as_bytes())?;
+    if !m.margin.is_none_or(|v| v >= head.min_margin) {
+        return None;
+    }
+    Some((
+        head.refs.name(m.index).to_string(),
+        f64::from(m.margin.unwrap_or(0)),
+    ))
+}
+
+/// Reads whose prepped windows are handed to the GPU encoder in one go
+/// (`ESCAPEPOD_CRF_GPU_BLOCK`).
+///
+/// This is a *host* memory bound, not a device one — `CrfEncoderGpu` splits each
+/// call into `ESCAPEPOD_CRF_GPU_BATCH_ROWS` (512) rows for the device and
+/// decodes each of those before encoding the next, so device activations and the
+/// 1.5 MB/read score buffers are already capped underneath this. Raising this
+/// does not enlarge the device batch; raise `ESCAPEPOD_CRF_GPU_BATCH_ROWS` for
+/// that.
+///
+/// What this sizes is the prepped windows in flight: `chunk` f32 per read, so
+/// 48 MB per block at the RNA004 geometry (3000 samples), and the channel holds
+/// two. A whole [`DETECT_WINDOW`] block would be 786 MB.
+///
+/// 4096 is 8 device batches, which measured enough on an A30: the encoder thread
+/// is the bottleneck there, so the producer is always ahead and deeper buffering
+/// buys nothing. Worth raising only if prep becomes the slower side (many cores
+/// starved of I/O, or a much faster device).
+#[cfg(feature = "crf-gpu")]
+fn crf_gpu_block() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ESCAPEPOD_CRF_GPU_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4096)
+    })
+}
+
+/// The CUDA ordinals the CRF encoder pool may use.
+///
+/// With one visible device everything shares it. With more, **device 0 is
+/// reserved for adapter detection** and the encoders take the rest.
+///
+/// # This reservation is now mis-tuned — measured, unfixed
+///
+/// It was justified by detect and the encoder costing about the same device time
+/// (5.4 s vs 6.4 s over 40 k reads): if two roles are comparable, sharing a card
+/// makes the pipeline's ceiling their sum and separating them makes it the
+/// larger of the two. #187 destroyed that premise. Matching the model's training
+/// convention cut detect's device time ~20x (401 s -> 20.2 s over 1 M reads)
+/// while the encoder stayed put, so the roles now cost ~19 s against ~170 s —
+/// and reserving a whole card for 10% of the work costs more than the contention
+/// it avoids. At exactly two devices it is pathological: the encoder pool does
+/// not grow at all, so the second GPU only offloads detection. Measured on 1 M
+/// reads, interleaved, 2 reps each:
+///
+/// ```text
+/// GPUs   encoder pool          wall     vs 1 GPU
+///   1    2 workers on [0]     107.5 s     --
+///   2    2 workers on [1]      96.5 s    1.11x    <- barely worth the card
+///   4    6 workers on [1,2,3]  43.7 s    2.46x
+/// ```
+///
+/// The likely fix is to encode on *every* visible device and let detection share
+/// device 0 — workers pull from one channel rather than being handed a
+/// partition, so whichever device is slowed by carrying detection simply takes
+/// fewer blocks, with nothing to balance explicitly. It is **not** applied here
+/// because it is unmeasured, and the four-device column is the reason for
+/// caution: at 4 GPUs the producer is already the constraint (busy 71%, workers
+/// blocked on `recv` 38.6 s), and that producer *is* detection. Adding encoder
+/// work to device 0 could slow the stage that is already the ceiling and regress
+/// the case that currently scales, to fix the case that does not. Measure both
+/// columns before changing it.
+#[cfg(feature = "crf-gpu")]
+fn crf_encoder_devices(visible: usize) -> Vec<i32> {
+    if visible > 1 {
+        (1..visible as i32).collect()
+    } else {
+        vec![0]
+    }
+}
+
+/// Encoder workers, and how they are spread over the visible devices
+/// (`ESCAPEPOD_CRF_GPU_WORKERS`).
+///
+/// Default is two per visible device. One worker leaves the device idle through
+/// its own per-call overhead — an onnxruntime `Run` is bracketed by cuDNN plan
+/// setup, two stream syncs, the barcode match and the routing, and profiling put
+/// 34% of wall time in cuDNN's engine/graph setup rather than in convolution. A
+/// second worker on the *same* device overlaps that setup with the first's
+/// device work; further workers across devices add real parallelism.
+///
+/// Capped so a many-GPU node does not spawn an encoder session per device
+/// unbounded — each one holds its own ONNX graph and scores buffer.
+///
+/// Raising this does **not** give the device more memory to work with: workers
+/// on one device split its row budget (`CrfEncoderGpu::share_device_with`), so
+/// past a point each does proportionally smaller calls and the per-call overhead
+/// this exists to hide grows back. Before that fix, four workers on one 24 GB
+/// A30 simply exhausted the card and killed the run.
+#[cfg(feature = "crf-gpu")]
+fn crf_gpu_workers(devices: usize) -> usize {
+    std::env::var("ESCAPEPOD_CRF_GPU_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (2 * devices).min(8))
+        .max(1)
+}
+
+/// GPU producer for the CRF head: parallel CPU prep (decode + detect + window
+/// standardisation) feeds a pool of encoder workers through a bounded channel,
+/// so the device is kept fed while the next block is prepped.
+///
+/// The overlap is the point. Running the encoder inline in the block loop the
+/// way [`produce_cpu_crf`] does would alternate device and host phases with
+/// neither saturated: the GPU would idle through prep and the rayon pool would
+/// idle through inference. `drive_blocks` already hands blocks over from its own
+/// reader threads, so this adds the second half of the pipeline.
+///
+/// Workers pull from one channel rather than being handed a partition, so a slow
+/// device or an unlucky block cannot leave one worker holding the tail. Blocks
+/// are independent and output row order is already nondeterministic here (the
+/// per-barcode writers interleave), so which worker takes which does not matter.
+/// Where the fused GPU CRF pipeline's wall time goes, in milliseconds summed
+/// across threads (`ESCAPEPOD_CRF_GPU_TRACE=1`).
+///
+/// Blocked-vs-working is the whole point: a stage that is mostly *blocked* is
+/// being starved by its neighbour, and a stage that is mostly *working* is the
+/// constraint. Six plausible fixes for this pipeline's idle GPU were tried and
+/// measured negative before this existed, which is the argument for having it.
+#[cfg(feature = "crf-gpu")]
+#[derive(Default)]
+struct GpuTrace {
+    /// Producer: batched adapter-CNN detect over a whole block (prep + infer).
+    detect_ms: std::sync::atomic::AtomicU64,
+    /// Detect, host half: i16 -> f32, normalise, median, across rayon.
+    detect_prep_ms: std::sync::atomic::AtomicU64,
+    /// Detect, device half: the batched onnxruntime call.
+    detect_infer_ms: std::sync::atomic::AtomicU64,
+    /// Producer: window standardisation across rayon.
+    prep_ms: std::sync::atomic::AtomicU64,
+    /// Producer blocked handing a sub-block over — the encoders are behind.
+    send_blocked_ms: std::sync::atomic::AtomicU64,
+    /// Worker blocked waiting for a sub-block — the producer is behind.
+    recv_blocked_ms: std::sync::atomic::AtomicU64,
+    /// Worker: onnxruntime encode plus the lattice decode.
+    encode_decode_ms: std::sync::atomic::AtomicU64,
+    /// Worker: barcode match across rayon.
+    match_ms: std::sync::atomic::AtomicU64,
+    /// Worker blocked in `route` — a per-barcode writer channel is full.
+    route_ms: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "crf-gpu")]
+impl GpuTrace {
+    fn enabled() -> bool {
+        std::env::var("ESCAPEPOD_CRF_GPU_TRACE").as_deref() == Ok("1")
+    }
+
+    /// Add `t`'s elapsed millis to `field`, but only when tracing is on — the
+    /// `Instant::now()` calls are cheap next to a block but not free.
+    fn add(field: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
+        field.fetch_add(
+            t.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn report(&self, wall: std::time::Duration, workers: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1000.0;
+        info!("{}", style::label("GPU CRF stage trace (thread-seconds):"));
+        info!(
+            "  producer   detect {:>7.1}s (host {:>6.1}s + device {:>6.1}s)  \
+             prep {:>5.1}s  BLOCKED on send {:>6.1}s",
+            g(&self.detect_ms),
+            g(&self.detect_prep_ms),
+            g(&self.detect_infer_ms),
+            g(&self.prep_ms),
+            g(&self.send_blocked_ms)
+        );
+        info!(
+            "  {} worker(s)  encode+decode {:>7.1}s  match {:>6.1}s  route {:>6.1}s  BLOCKED on recv {:>7.1}s",
+            workers,
+            g(&self.encode_decode_ms),
+            g(&self.match_ms),
+            g(&self.route_ms),
+            g(&self.recv_blocked_ms)
+        );
+        let wall_s = wall.as_secs_f64();
+        info!(
+            "  wall {:.1}s — worker busy {:.0}% of its wall, producer busy {:.0}%",
+            wall_s,
+            100.0 * (g(&self.encode_decode_ms) + g(&self.match_ms) + g(&self.route_ms))
+                / (wall_s * workers as f64).max(1e-9),
+            100.0 * (g(&self.detect_ms) + g(&self.prep_ms)) / wall_s.max(1e-9),
+        );
+    }
+}
+
+// One over clippy's limit: the sibling producers take the same seven, and this
+// one additionally needs the bundle directory to load its extra workers.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "crf-gpu")]
+fn produce_gpu_crf(
+    args: &RunArgs,
+    detector: &Detector,
+    head: &CrfHead,
+    encoder: &CrfEncoderGpu,
+    bundle: &Path,
+    routers: &Routers,
+    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    pb: &indicatif::ProgressBar,
+) -> anyhow::Result<()> {
+    /// Prepped windows (`None` = no usable window) aligned with their reads.
+    type Block = (Vec<Option<Vec<f32>>>, Vec<BlockItem>);
+
+    let meta = encoder.metadata();
+    let gpu_block = crf_gpu_block();
+
+    // Visible, so `CUDA_VISIBLE_DEVICES` already applies: under SLURM
+    // `--gres=gpu:1` this is 1 and the pool collapses to same-device workers.
+    let devices = escapepod_demux::crf::lattice_gpu::visible_device_count()
+        .unwrap_or(1)
+        .max(1);
+    let enc_devices = crf_encoder_devices(devices);
+    let workers = crf_gpu_workers(enc_devices.len());
+    // Worker 0 reuses the encoder already loaded for its metadata, which `run`
+    // placed on `enc_devices[0]`; the rest get their own session, round-robin
+    // over the encoder devices.
+    let extra: Vec<CrfEncoderGpu> = (1..workers)
+        .map(|w| {
+            CrfEncoderGpu::load_bundle_on_device(
+                bundle,
+                args.threads,
+                enc_devices[w % enc_devices.len()],
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    // Every worker sharing a device allocates its LSTM activations from that
+    // device's VRAM, so they must split its row budget rather than each take a
+    // full one. Without this, `ESCAPEPOD_CRF_GPU_WORKERS=4` on a single 24 GB
+    // A30 exhausted the card and killed the run.
+    let per_device = workers.div_ceil(enc_devices.len());
+    encoder.share_device_with(per_device);
+    for e in &extra {
+        e.share_device_with(per_device);
+    }
+    if workers > 1 || devices > 1 {
+        info!(
+            "{} {} worker(s) on GPU {:?}, {} reads/call{}",
+            style::label("CRF encoder:"),
+            style::count(workers),
+            enc_devices,
+            style::count(encoder.batch_rows()),
+            if devices > 1 {
+                "; adapter detection has GPU 0 to itself"
+            } else {
+                ""
+            }
+        );
+    }
+
+    // Depth scales with the pool so every worker can hold one block and still
+    // find another queued behind it.
+    let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Block>(2 * workers);
+    let block_rx = Arc::new(std::sync::Mutex::new(block_rx));
+
+    let trace = GpuTrace::default();
+    let trace = &trace;
+    let tracing_on = GpuTrace::enabled();
+    let t_wall = std::time::Instant::now();
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut gpus = Vec::with_capacity(workers);
+        for w in 0..workers {
+            let enc: &CrfEncoderGpu = if w == 0 { encoder } else { &extra[w - 1] };
+            let rx = Arc::clone(&block_rx);
+            gpus.push(scope.spawn(move || -> anyhow::Result<()> {
+                loop {
+                    // Held only across `recv`, never across the encode.
+                    let t_wait = std::time::Instant::now();
+                    let next = {
+                        let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.recv()
+                    };
+                    if tracing_on {
+                        GpuTrace::add(&trace.recv_blocked_ms, t_wait);
+                    }
+                    let Ok((windows, items)) = next else { break };
+
+                    // Encodes on the device, then fans the lattice decode back
+                    // out across rayon. `None` windows never reach the device
+                    // and come back `None`, so this stays aligned with `items`.
+                    let t_enc = std::time::Instant::now();
+                    let seqs = enc
+                        .basecall_batch(&windows)
+                        .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?;
+                    if tracing_on {
+                        GpuTrace::add(&trace.encode_decode_ms, t_enc);
+                    }
+                    // 96 references x one wavefront alignment each is small next
+                    // to the decode, but it is still per-read work worth fanning
+                    // out.
+                    let t_match = std::time::Instant::now();
+                    let calls: Vec<(String, f64)> = seqs
+                        .par_iter()
+                        .map(|seq| {
+                            seq.as_deref()
+                                .and_then(|s| call_barcode(head, s))
+                                .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0))
+                        })
+                        .collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.match_ms, t_match);
+                    }
+                    let n = items.len() as u64;
+                    let t_route = std::time::Instant::now();
+                    for ((read, chunks, run_infos), (barcode, conf)) in items.into_iter().zip(calls)
+                    {
+                        route(
+                            routers,
+                            class_tx,
+                            read.for_writing(read.run_info_index),
+                            barcode,
+                            chunks,
+                            run_infos,
+                            conf,
+                        );
+                    }
+                    if tracing_on {
+                        GpuTrace::add(&trace.route_ms, t_route);
+                    }
+                    pb.inc(n);
+                }
+                Ok(())
+            }));
+        }
+
+        // CPU prep. A send failure means the encoder thread is gone; stop
+        // feeding and let the join below report why rather than masking it with
+        // a channel error.
+        let mut hung_up = false;
+        let drive = drive_blocks(
+            &args.input,
+            detector.signal_decode_bound(),
+            |sigs, items| {
+                if hung_up {
+                    return;
+                }
+                // Detect over the whole block (one batched GPU CNN call), then
+                // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
+                let t_det = std::time::Instant::now();
+                let bounds = detector.detect_batch_traced(
+                    &sigs,
+                    tracing_on.then_some((&trace.detect_prep_ms, &trace.detect_infer_ms)),
+                );
+                if tracing_on {
+                    GpuTrace::add(&trace.detect_ms, t_det);
+                }
+                let mut rows = sigs.into_iter().zip(bounds).zip(items);
+                loop {
+                    let chunk: Vec<_> = rows.by_ref().take(gpu_block).collect();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let t_prep = std::time::Instant::now();
+                    let windows: Vec<Option<Vec<f32>>> = chunk
+                        .par_iter()
+                        .map(|((signal, (_s, adapter_end)), (read, _, _))| {
+                            let adc = signal.as_ref()?;
+                            let mut w = Vec::new();
+                            // Same conversion as the CPU path: only the `chunk`
+                            // samples ending at `adapter_end` are calibrated.
+                            meta.prep_adc_into(
+                                adc,
+                                *adapter_end,
+                                read.calibration_offset,
+                                read.calibration_scale,
+                                &mut w,
+                            )
+                            .then_some(w)
+                        })
+                        .collect();
+                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.prep_ms, t_prep);
+                    }
+                    let t_send = std::time::Instant::now();
+                    let sent = block_tx.send((windows, items));
+                    if tracing_on {
+                        GpuTrace::add(&trace.send_blocked_ms, t_send);
+                    }
+                    if sent.is_err() {
+                        hung_up = true;
+                        return;
+                    }
+                }
+            },
+        );
+
+        drop(block_tx);
+        // An encoder's error is the root cause when the channel hung up, so
+        // report it ahead of whatever `drive_blocks` returned.
+        for (w, g) in gpus.into_iter().enumerate() {
+            g.join()
+                .map_err(|e| anyhow::anyhow!("GPU encoder worker {w} panicked: {e:?}"))??;
+        }
+        if tracing_on {
+            trace.report(t_wall.elapsed(), workers);
+        }
+        drive
+    })
 }
 
 /// GBM counterpart to [`classify_one_cpu`]: fingerprint → GBM tree walk from a
@@ -1579,6 +2283,47 @@ fn print_summary(summary: &DemuxSummary) {
             style::count(total),
             summary.per_barcode.len()
         );
+    }
+}
+
+#[cfg(all(test, feature = "crf-gpu"))]
+mod gpu_placement_tests {
+    use super::{crf_encoder_devices, crf_gpu_workers};
+
+    /// Pins today's placement, including the part that is known mis-tuned: at
+    /// two devices the encoder pool is `[1]` alone, which is why the second GPU
+    /// measures 1.11x rather than ~2x. Written so that changing the policy has
+    /// to change this test deliberately rather than silently.
+    #[test]
+    fn device_zero_is_reserved_for_detection_above_one_device() {
+        assert_eq!(crf_encoder_devices(1), vec![0]);
+        assert_eq!(crf_encoder_devices(2), vec![1]);
+        assert_eq!(crf_encoder_devices(4), vec![1, 2, 3]);
+        // A zero count can only come from a failed probe; never hand back an
+        // empty pool, since the caller indexes into it.
+        assert_eq!(crf_encoder_devices(0), vec![0]);
+    }
+
+    /// The pool must divide evenly over the devices it is spread across, or the
+    /// per-device row budget is computed against the wrong denominator.
+    #[test]
+    fn workers_spread_evenly_over_the_encoder_devices() {
+        if std::env::var("ESCAPEPOD_CRF_GPU_WORKERS").is_ok() {
+            return;
+        }
+        for visible in [1usize, 2, 4] {
+            let devices = crf_encoder_devices(visible);
+            let workers = crf_gpu_workers(devices.len());
+            assert_eq!(
+                workers % devices.len(),
+                0,
+                "{workers} workers do not divide over {} devices",
+                devices.len()
+            );
+            // Two per device is what overlaps one worker's per-call setup with
+            // another's device work; the row budget is sized for it.
+            assert_eq!(workers / devices.len(), 2);
+        }
     }
 }
 

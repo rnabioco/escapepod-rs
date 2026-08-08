@@ -120,7 +120,7 @@ pub use svm::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx}
 pub use train::*;
 
 #[cfg(feature = "cnn-detect")]
-pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError};
+pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError, PreppedWindow};
 
 #[cfg(feature = "cnn-gpu")]
 pub use adapter_cnn_gpu::AdapterCnnGpu;

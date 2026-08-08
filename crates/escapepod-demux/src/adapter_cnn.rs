@@ -8,11 +8,17 @@
 //!
 //! Port of `adapted.detect.cnn.{prepare_data, cnn_predict, cnn_detect}`:
 //!
-//! * Slice raw calibrated signal from `[min_obs_adapter:]` (default 1000).
+//! * Slice raw calibrated signal to `[min_obs_adapter:max_obs_trace]`
+//!   (defaults 1000 and 16000).
 //! * Mean-pool by `downscale_factor` (default 10) — `efficient_average_pooling`
 //!   with zero-padding when length isn't a multiple.
 //! * Subtract median, divide by MAD. Replace any NaN with `-5.0`.
-//! * Feed through the ONNX `BoundariesCNN` (3× Conv1d + 1× ConvTranspose1d).
+//! * Right-pad to the fixed `input_len` (1500) with `SCORE_EXCL` = `-5.0`, the
+//!   convention every training example was built with (#187). Normalisation
+//!   statistics come from the real window, before padding — training's order.
+//! * Feed through the ONNX graph (`[B,1,L] -> [B,2,L]`; ADAPTed's
+//!   `BoundariesCNN` is 3× Conv1d + 1× ConvTranspose1d, escapepod-models'
+//!   `adapter_rna004` is a 1-D U-Net — this module is agnostic to which).
 //! * `adapter_end_pos = argmax(scores[0, 0, :search_len])` where
 //!   `search_len = (max_obs_adapter - min_obs_adapter) / downscale_factor`.
 //! * Return `adapter_end = adapter_end_pos * downscale_factor + min_obs_adapter`
@@ -55,13 +61,57 @@ impl Default for AdapterCnnConfig {
 }
 
 impl AdapterCnnConfig {
+    /// The model's fixed input length, in downscaled samples.
+    ///
+    /// Mirrors escapepod-models `DataConfig.input_len`
+    /// (`(max_obs_trace - min_obs_adapter) // downscale_factor` = 1500), which is
+    /// the length every training example was padded to. Derived rather than
+    /// stored so it cannot drift from the three fields it depends on — though
+    /// none of this is declared in the model manifest today, which is the
+    /// underlying problem (#187).
+    pub fn input_len(&self) -> usize {
+        self.max_obs_trace.saturating_sub(self.min_obs_adapter) / self.downscale_factor.max(1)
+    }
+
     /// Preprocess a raw signal into the model input (slice + mean-pool +
-    /// median/MAD-normalize + truncate to the receptive-field-bounded cap), or
-    /// `None` if the read is too short. Exposed so callers can prep many reads
+    /// median/MAD-normalize + pad to [`input_len`](Self::input_len) with
+    /// `SCORE_EXCL`), or `None` if the read is too short. Exposed so callers can
+    /// prep many reads
     /// in parallel and then hand the prepped vectors to a batched detector
     /// (e.g. [`AdapterCnnGpu::detect_prepped`](crate::adapter_cnn_gpu::AdapterCnnGpu::detect_prepped)).
-    pub fn prep(&self, signal_pa: &[f32]) -> Option<Vec<f32>> {
+    pub fn prep(&self, signal_pa: &[f32]) -> Option<PreppedWindow> {
         prep_adapter_signal(signal_pa, self)
+    }
+}
+
+/// One read's model input: the fixed-length tensor row, and how much of it is
+/// real.
+///
+/// The two travel together because keeping them apart is what broke: #187 padded
+/// every read to `input_len`, and the decode's clamp — which took a separate
+/// `valid_len` argument — was then handed the *padded* length by all three call
+/// sites. That silently widened the argmax over up to 540 positions of pure
+/// `SCORE_EXCL` padding, and on 503 k real reads it put `adapter_end` past the
+/// end of the read for **272 of them** (0.054%, all reads under 6500 samples;
+/// 0.7.0 produced none). Making the length a field of the data removes the
+/// opportunity to pass the wrong one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreppedWindow {
+    /// Model input row, always [`AdapterCnnConfig::input_len`] long.
+    pub data: Vec<f32>,
+    /// Leading positions of `data` that came from real signal, before padding.
+    /// Never greater than `data.len()`.
+    pub valid_len: usize,
+}
+
+impl PreppedWindow {
+    /// Length of the tensor row handed to the graph.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 
@@ -165,7 +215,7 @@ impl AdapterCnn {
             })?;
 
         // Feed through the ONNX plan.
-        let input = Tensor::from_shape(&[1, 1, normalized.len()], &normalized)
+        let input = Tensor::from_shape(&[1, 1, normalized.len()], &normalized.data)
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let outputs = self
             .plan
@@ -185,7 +235,7 @@ impl AdapterCnn {
         Ok(decode_adapter_end(
             &cfg,
             length_out,
-            normalized.len(),
+            normalized.valid_len,
             |k| scores[[0, 0, k]],
         ))
     }
@@ -213,7 +263,7 @@ impl AdapterCnn {
         let min_len = cfg.min_obs_adapter + cfg.downscale_factor;
 
         // 1. Prep each signal independently; record which are usable.
-        let prepped: Vec<Option<Vec<f32>>> = signals
+        let prepped: Vec<Option<PreppedWindow>> = signals
             .iter()
             .map(|&sig| prep_adapter_signal(sig, &cfg))
             .collect();
@@ -232,12 +282,13 @@ impl AdapterCnn {
         }
 
         // 2. Group by exact prepped length and run each group as an *unpadded*
-        //    `[group, 1, len]` batch. Cross-read zero-padding is NOT safe for
-        //    this model (its conv boundary handling makes a padded short read
-        //    score differently than when run alone), so we never pad: every
-        //    read is fed at exactly its own length, making batched results
-        //    bit-identical to the per-read path. Downscaling collapses ranges
-        //    of sample counts onto the same length, so groups stay sizable.
+        //    `[group, 1, len]` batch, so batched results are bit-identical to
+        //    the per-read path. Since #187 prep emits one fixed length, so this
+        //    is a single group covering the whole block — but the grouping is
+        //    what makes that a property rather than an assumption. Batching
+        //    must never introduce its own padding: `cnn_pad_probe` measured
+        //    this graph's scores changing *before* the pad begins, so a row
+        //    padded here would score differently than run alone.
         let mut out: Vec<Result<usize, AdapterCnnError>> =
             (0..signals.len()).map(|i| Err(short_err(i))).collect();
 
@@ -262,7 +313,15 @@ impl AdapterCnn {
                 }
                 let length_out = shape[2];
                 Ok((0..g)
-                    .map(|row| decode_adapter_end(&cfg, length_out, len, |k| scores[[row, 0, k]]))
+                    .map(|row| {
+                        // Each read's own pre-padding length, never the group's
+                        // tensor width — see `PreppedWindow`.
+                        let valid_len = prepped[group[row]]
+                            .as_ref()
+                            .expect("group points at prepped signals")
+                            .valid_len;
+                        decode_adapter_end(&cfg, length_out, valid_len, |k| scores[[row, 0, k]])
+                    })
                     .collect())
             })();
             scatter_group(&mut out, &group, run);
@@ -317,40 +376,53 @@ pub(crate) fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Downscaled positions past the adapter search window that can still reach it
-/// through the CNN's receptive field. The graph is local (`Conv`/`Add`/`Relu`),
-/// so any model input beyond `search_window + this margin` cannot affect a
-/// score *inside* the search window — feeding only that prefix is
-/// output-preserving. Truncating to it also bounds conv work/memory for very
-/// long reads AND collapses every read longer than the cap onto one common
-/// length, which is what lets the GPU path batch them together. Default 256 is
-/// comfortably above the `tcn_l4` receptive field (kernel 7 × dilations ≤ 8 ⇒
-/// half-width ~90); override via `ESCAPEPOD_CNN_MARGIN` for a model with a
-/// larger field (a too-small value silently shifts boundaries — validate with
-/// the batch-parity test against a larger margin).
-fn search_receptive_margin() -> usize {
-    use std::sync::OnceLock;
-    static MARGIN: OnceLock<usize> = OnceLock::new();
-    *MARGIN.get_or_init(|| {
-        std::env::var("ESCAPEPOD_CNN_MARGIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256)
-    })
-}
+/// Value the training pipeline pads short windows with, and the same value it
+/// substitutes for NaN (`adapted.detect.cnn.SCORE_EXCL`, escapepod-models
+/// `config.py:17`). Padding with anything else — zero included — feeds the model
+/// a pattern it never saw.
+pub(crate) const SCORE_EXCL: f32 = -5.0;
 
-/// Slice `[min_obs_adapter:]`, mean-pool by `downscale_factor`, then
-/// median/MAD-normalize — the exact input the boundary CNN expects. Returns
-/// `None` when the signal is too short to contain an adapter. Shared by the
-/// CPU (tract) and GPU (onnxruntime) backends so their preprocessing is
-/// bit-identical.
+/// Slice `[min_obs_adapter:max_obs_trace]`, mean-pool by `downscale_factor`,
+/// median/MAD-normalize, then pad to the model's fixed input length with
+/// [`SCORE_EXCL`] — the exact input the boundary CNN was trained on. Returns
+/// `None` when the signal is too short to contain an adapter. Shared by the CPU
+/// (tract) and GPU (onnxruntime) backends so their preprocessing is identical.
 ///
-/// Normalization statistics are computed over the **full** tail (matching the
-/// per-read reference exactly), then the model input is truncated to a prefix
-/// covering the search window plus receptive-field margin — see
-/// [`search_receptive_margin`]. This keeps results identical to feeding the
-/// whole read while keeping batched conv tensors bounded.
-pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> Option<Vec<f32>> {
+/// # Why fixed-length, and why this pad value (#187)
+///
+/// escapepod-models builds *every* training example through
+/// `dataset.py::prepare_signal`, which ends:
+///
+/// ```python
+/// out = np.full(cfg.input_len, cfg.score_excl, dtype=np.float32)
+/// out[:min(len(norm), cfg.input_len)] = norm[:...]
+/// ```
+///
+/// — a fixed `input_len = (max_obs_trace - min_obs_adapter) / downscale` = 1500,
+/// right-padded with `score_excl = -5.0`. Its own inference path
+/// (`barcode.py`) prepares inputs the same way.
+///
+/// This used to truncate to `search_window + ESCAPEPOD_CNN_MARGIN` (550 + 256 =
+/// 806) instead, on the argument that a local graph cannot reach past it. Two
+/// things were wrong with that. The receptive field is larger than the margin
+/// assumed — `Conv k=7 s=5` then `k=7` at dilations 1,1,2,2,4,4,8,8 gives
+/// `((1 + 6+6+12+12+24+24+48+48) - 1) * 5 + 7 = 907`, so half-width ~453, and an
+/// output at the far edge of the search window depended on input the truncation
+/// removed. And the model had never seen a 806-long input at all.
+///
+/// It was also expensive. Because the window clamps to the read end, every read
+/// shorter than `max_obs_trace` got its own length: over a production run's 527k
+/// reads, 680 distinct lengths, so a 65,536-read block issued one large call plus
+/// ~679 of ~30 rows, each a new shape paying fresh cuDNN plan selection.
+/// Detection measured 401 s of device time in a 425 s wall — 94% — against
+/// 0.009 ms/read for the same kernel at a steady shape.
+///
+/// One fixed length fixes both: it is what the model was trained on, and it is
+/// one shape for every read.
+pub(crate) fn prep_adapter_signal(
+    signal_pa: &[f32],
+    cfg: &AdapterCnnConfig,
+) -> Option<PreppedWindow> {
     if signal_pa.len() <= cfg.min_obs_adapter + cfg.downscale_factor {
         return None;
     }
@@ -365,23 +437,42 @@ pub(crate) fn prep_adapter_signal(signal_pa: &[f32], cfg: &AdapterCnnConfig) -> 
         .min(signal_pa.len());
     let tail = &signal_pa[cfg.min_obs_adapter..end];
     let mut normalized = median_mad_normalize(&mean_pool(tail, cfg.downscale_factor));
-    let search_window =
-        cfg.max_obs_adapter.saturating_sub(cfg.min_obs_adapter) / cfg.downscale_factor;
-    let cap = search_window + search_receptive_margin();
-    if normalized.len() > cap {
-        normalized.truncate(cap);
-    }
-    Some(normalized)
+    // How much of the row is real, captured *before* padding. Training pads the
+    // same way, so the model is in-distribution either way — but the decode must
+    // not argmax into the pad, or a short read gets a boundary past its own end.
+    let valid_len = normalized.len().min(cfg.input_len());
+    // Normalisation statistics come from the true window above; only the tensor
+    // handed to the graph is padded, which is the order training uses too.
+    normalized.resize(cfg.input_len(), SCORE_EXCL);
+    Some(PreppedWindow {
+        data: normalized,
+        valid_len,
+    })
 }
 
 /// Decode one read's adapter-end channel into a sample index in the original
 /// (un-downscaled) signal frame. `score_at(k)` returns the channel-0 score at
 /// downscaled position `k`; `length_out` is the model output length and
-/// `valid_len` the read's own un-padded downscaled length (they're equal for
-/// the single-read path; for a padded batch `valid_len <= length_out`, so the
-/// clamp keeps the argmax out of the zero-padded tail). Argmax over the
+/// `valid_len` the read's own un-padded downscaled length. Argmax over the
 /// expected adapter window; 0 when the peak is slot 0 ("no adapter"), matching
 /// ADAPTed. Shared by both backends so decoding is bit-identical.
+///
+/// # Two deliberate departures from escapepod-models' own decode
+///
+/// `predict.py::decode_scores` argmaxes the model's full output and has no
+/// "slot 0 means no adapter" rule; both extras here are ADAPTed's rna004
+/// conventions, inherited because this decode is architecture-agnostic.
+///
+/// The search cap is the one with a measurable cost: `max_obs_adapter` = 6500
+/// makes `search_end` 550 of the 1500 positions the model emits, so any adapter
+/// the model would place past raw sample 6500 is unreachable. On
+/// escapepod-models' move-table gold set that is **84 of 20,303 reads (0.41%)**
+/// — p99 is 5706, so the prior holds for the bulk of the distribution, but it is
+/// a real ceiling and not an artefact of the model.
+///
+/// `valid_len` is now always equal to the padded length (prep emits one fixed
+/// length), so the clamp is inert; it is kept for the same reason
+/// [`group_by_len`] is.
 pub(crate) fn decode_adapter_end(
     cfg: &AdapterCnnConfig,
     length_out: usize,
@@ -411,8 +502,16 @@ pub(crate) fn decode_adapter_end(
 /// Group valid (non-`None`) prepped signals by their exact length, so each
 /// group can be run as an unpadded batch. Returns `(len, original-indices)`.
 /// Shared by the CPU (tract) and GPU (onnxruntime) batch paths.
+///
+/// Since #187 [`prep_adapter_signal`] emits exactly `cfg.input_len()` for every
+/// read, so in practice this always returns one group. It is kept rather than
+/// replaced by "one batch of everything" because the alternative fails
+/// *silently* if that invariant ever breaks: [`pack_batch`] would truncate or
+/// zero-pad the mismatched rows and the reads would come back with plausible,
+/// wrong boundaries. The cost is one `HashMap` pass per block, far below the
+/// inference it guards.
 pub(crate) fn group_by_len(
-    prepped: &[Option<Vec<f32>>],
+    prepped: &[Option<PreppedWindow>],
     valid_idx: &[usize],
 ) -> Vec<(usize, Vec<usize>)> {
     let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
@@ -426,14 +525,36 @@ pub(crate) fn group_by_len(
     groups.into_iter().collect()
 }
 
-/// Pack a set of same-length prepped signals into a row-major `[g, 1, len]` f32
-/// batch buffer, gathered from `prepped` at `indices`. No padding — every row is
-/// exactly `len`. Shared by the CPU (tract) and GPU (onnxruntime) batch paths so
-/// the batch layout stays byte-identical between backends.
-pub(crate) fn pack_batch(prepped: &[Option<Vec<f32>>], indices: &[usize], len: usize) -> Vec<f32> {
+/// Pack prepped signals into a row-major `[g, 1, len]` f32 batch buffer,
+/// gathered from `prepped` at `indices`.
+///
+/// Every row is `cfg.input_len()` long since #187, so the `min` below is not
+/// reached and no row is zero-filled. It stays defensive rather than asserting
+/// because a short row zero-filled at the tail is at least positionally sound —
+/// [`prep_adapter_signal`]'s window always starts at `min_obs_adapter` and
+/// [`decode_adapter_end`] searches forward from index 0, so padding the tail
+/// leaves every boundary index where it was.
+///
+/// Note that zero is *not* the model's pad value ([`SCORE_EXCL`] is), which is
+/// exactly why this must not become the padding path: `cnn_pad_probe` measured
+/// this graph's output changing well before the padding starts. Prep pads to the
+/// full length itself, with the right value.
+///
+/// Shared by the CPU (tract) and GPU (onnxruntime) batch paths so the layout
+/// stays byte-identical between backends.
+pub(crate) fn pack_batch(
+    prepped: &[Option<PreppedWindow>],
+    indices: &[usize],
+    len: usize,
+) -> Vec<f32> {
     let mut data = vec![0f32; indices.len() * len];
     for (row, &i) in indices.iter().enumerate() {
-        data[row * len..(row + 1) * len].copy_from_slice(prepped[i].as_ref().unwrap());
+        let src = &prepped[i]
+            .as_ref()
+            .expect("indices point at prepped signals")
+            .data;
+        let n = src.len().min(len);
+        data[row * len..row * len + n].copy_from_slice(&src[..n]);
     }
     data
 }
@@ -512,5 +633,56 @@ mod tests {
         assert!(out.iter().all(|x| x.is_finite()));
         // NaN position got replaced with -5.0.
         assert_eq!(out[3], -5.0);
+    }
+
+    /// A short read pads to `input_len`, but its real content does not, and the
+    /// two lengths must not be confused.
+    #[test]
+    fn prep_reports_the_pre_padding_length() {
+        let cfg = AdapterCnnConfig::default();
+        let sig = vec![100.0f32; 2120];
+        let w = prep_adapter_signal(&sig, &cfg).expect("2120 samples is long enough");
+
+        // The tensor is always the model's fixed width...
+        assert_eq!(w.data.len(), cfg.input_len());
+        assert_eq!(w.data.len(), 1500);
+        // ...but only (2120 - 1000) / 10 = 112 positions came from signal.
+        assert_eq!(w.valid_len, 112);
+        // Everything past that is the training pad value, not zero.
+        assert!(w.data[w.valid_len..].iter().all(|&v| v == SCORE_EXCL));
+    }
+
+    /// The regression this guards is a shipped one, not a hypothetical.
+    ///
+    /// #187 padded every read to `input_len`, and all three `decode_adapter_end`
+    /// call sites then passed the *padded* length as `valid_len`. `search_end`
+    /// widened from the read's own 112 positions to the full 550, so the argmax
+    /// could land in `SCORE_EXCL` padding and return a boundary past the end of
+    /// the read. On 503,076 production reads that produced `adapter_end >
+    /// num_samples` for **272** of them; 0.7.0 produced none.
+    #[test]
+    fn decode_never_returns_a_boundary_past_the_read() {
+        let cfg = AdapterCnnConfig::default();
+        let raw_len = 2120usize;
+        let sig = vec![100.0f32; raw_len];
+        let w = prep_adapter_signal(&sig, &cfg).expect("long enough");
+
+        // Worst case: the model's strongest response is out in the padding,
+        // exactly where the old code was free to follow it.
+        let end = decode_adapter_end(&cfg, cfg.input_len(), w.valid_len, |k| {
+            if k == 400 { 100.0 } else { 0.0 }
+        });
+        assert!(
+            end <= raw_len,
+            "adapter_end {end} is past the {raw_len}-sample read"
+        );
+
+        // And a peak inside the real region is still found, so the clamp did not
+        // simply disable detection.
+        let end = decode_adapter_end(&cfg, cfg.input_len(), w.valid_len, |k| {
+            if k == 50 { 100.0 } else { 0.0 }
+        });
+        assert_eq!(end, 50 * cfg.downscale_factor + cfg.min_obs_adapter);
+        assert!(end <= raw_len);
     }
 }

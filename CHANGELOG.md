@@ -2,6 +2,316 @@
 
 ## Unreleased
 
+### Added
+
+- **Batched CTC-CRF lattice decode on the GPU** (`crf::lattice_gpu`, `crf-gpu`).
+  The same two passes as `crf::lattice`, the same edge indexing and the same
+  tie-breaking, with the batch axis mapped onto the device. On by default
+  wherever the kernels load; `ESCAPEPOD_CRF_GPU_DECODE=0` forces the CPU decode.
+
+  **This reverses a documented decision.** `encoder_gpu` said the lattice decode
+  was "sequential in time with a 256-wide inner dimension, a poor fit for the
+  device". That is true of decoding *one read* and wrong for this pipeline: a
+  device batch holds hundreds of independent reads, so a timestep is
+  `batch * n_states` lanes (131 072 at batch 512) and only the `t_len` sweep is
+  sequential — as it is on the CPU too. Profiling settled it: with the encoder on
+  the device the AVX-512 decode was 66% of all remaining CPU cycles and the
+  pipeline had stopped scaling with cores. bonito agrees; its own forward/backward
+  scores come from koi's `ctc.{fwd,bwd}_scores_cu_sparse` CUDA kernels.
+
+  **What it actually buys is cores, not wall time.** 40 k real RNA004 reads, one
+  A30, same binary both ways:
+
+  ```text
+  threads     CPU decode   GPU decode
+     2          51.8 s       30.5 s
+     4          36.8 s       30.2 s
+     8          29.5 s       29.8 s
+    16          30.6 s       28.7 s
+  ```
+
+  Flat from 2 to 16 threads: the run now reaches full speed on **2 cores where it
+  previously needed 8**, so the demux rule can hand a dozen cores back to the
+  cluster. At 16 cores it is only 2.4% faster, because the bottleneck has moved
+  off the CPU entirely (see the known limitation below).
+
+  Correctness is exact: **40 001/40 001 identical barcode calls** against the CPU
+  decode on the same binary — not merely the same sequences, the same calls.
+  `tests/gpu_crf_lattice.rs` checks the kernels against `crf_golden.json`, the
+  fixture produced by running real `bonito.crf.model.CTC_CRF` through koi's CUDA
+  kernels, plus batch-invariance, an all-tied lattice (which exercises the argmax
+  tie-break end to end), a `-inf` column, and time-major/batch-major equivalence.
+
+  Fusions worth noting, since they shape the kernel layout:
+  - **No transpose pass.** The CPU decode transposes each timestep into
+    `[edge][dest]` for unit-stride SIMD; the GPU wants the opposite, so the
+    kernels read the encoder's native `[dest][edge]` directly. That drops a
+    kernel, a second `t_len * n_score` device buffer, and its round trip through
+    memory — and makes the Viterbi tie-break key the flat index itself, because
+    native order *is* bonito's `dest * n_edges + edge`.
+  - **Forward and backward share one launch** (`blockIdx.y` picks the direction).
+    They only read `scores`, so fusing them doubles the blocks in flight.
+  - **onnxruntime's time-major output is decoded as it stands.** Rows are
+    addressed by stride, so `[T][batch][n_score]` needs no host de-interleave —
+    removing 1.5 MB per read of pure memory movement that previously had to
+    complete before the decode could start.
+
+- **The encoder's scores are decoded in place in device memory.** onnxruntime's
+  output is bound to CUDA through `IoBinding::bind_output_to_device` and the
+  decode kernels read it where it lies, so the largest object in the pipeline —
+  `t_len * n_score` floats, 1.5 MB per read — never crosses PCIe in either
+  direction. Previously onnxruntime copied it to the host and the decode uploaded
+  it straight back: ~122 GB of round-trip traffic across 40 k reads, and the
+  binding constraint once both the encoder and the decode were on the device.
+
+  ```text
+  40k reads, one A30, --method cnn --gpu
+                         16 threads    4 threads    2 threads
+  scores via host           27.3 s       29.8 s          —
+  scores decoded in place   16.5 s       17.3 s       18.0 s
+  ```
+
+  1.65x on top of the GPU decode, and **4.3x against 0.7.0** (70.7 s -> 16.5 s).
+  Peak RSS drops 4.4 GB -> 3.6 GB with the host score buffer gone. Two cores now
+  beat what 0.7.0 did with sixteen, by 3.9x.
+
+  Bit-identical: **40 001/40 001 identical rows** against the copying path on the
+  same binary — full rows, not just the barcode calls. `ESCAPEPOD_CRF_GPU_ZEROCOPY=0`
+  restores the copying path.
+
+  The device pointer is only used after checking that the output actually landed
+  on CUDA (`MemoryInfo::allocation_device`) and has the expected shape; if an
+  execution provider declines the binding and returns a host tensor, this errors
+  and names the escape hatch rather than handing a host pointer to a kernel.
+  `IoBinding::synchronize_outputs` retires onnxruntime's stream before the decode
+  kernels run on the lattice context's own stream.
+
+- **`escpod demux --gpu` now runs the CTC-CRF encoder on the GPU.** The fused
+  pipeline previously always took `produce_cpu_crf`, so a CRF bundle got tract on
+  the CPU no matter what `--gpu` said; the `crf-gpu` encoder existed but was only
+  reachable from `demux basecall --gpu`. Since the encoder is ~91% of that head's
+  cost, `--gpu --method cnn` left the device essentially idle — measured on a real
+  1M-read run, 0–6% GPU utilisation while 11.6 of 16 cores were pinned.
+
+  The new `produce_gpu_crf` mirrors the DTW-SVM `produce_gpu`: parallel CPU prep
+  (decode, batched detect, window standardisation) feeds a dedicated encoder
+  thread over a bounded channel, so prep for the next block overlaps inference on
+  the current one instead of the two alternating.
+
+  Measured on 40 k real RNA004 reads, one A30, 16 cores (the allocation the
+  production rule requests), against 0.7.0 with the same model, same input and
+  the same `--method cnn --gpu`:
+
+  ```text
+                        wall     reads/s   GPU util (mean / median / p90)
+  0.7.0 (CPU encoder)   70.7 s      566     1.0% /  0% /  0%
+  this change           29.5 s     1355    22.1% / 25% / 40%
+  ```
+
+  2.4x end-to-end, and the device goes from idle in 91% of samples to busy in
+  82% of them. Barcode calls agree with the CPU encoder on 99.97% of reads
+  (39,989/40,001); the residue is tract-vs-onnxruntime numerics in the encoder,
+  the same single-base-indel disagreement already documented for
+  `demux basecall --gpu`, and confidence margins differ on 0.4% of rows.
+
+  `ESCAPEPOD_CRF_GPU_BLOCK` (default 4096 reads) sizes the host-side handoff.
+  It is deliberately not the device batch — `ESCAPEPOD_CRF_GPU_BATCH_ROWS` is
+  that — and measuring 1024/4096/16384 showed under 5% between them, so it is a
+  memory knob rather than a throughput one.
+
+- **Adapter detection gets GPU 0 to itself when more than one is visible**, and
+  the encoder pool takes the rest. Previously both roles round-robined over all
+  devices, so device 0 carried detection *plus* a share of the encoding while the
+  others carried only encoding. On 1 M reads across two A30s: 447.6 s -> 431.2 s,
+  and 510.6 s -> 431.2 s against a single GPU (1.18x). Collapses to shared
+  placement on a single-GPU host, so nothing changes there.
+
+- **`ESCAPEPOD_CRF_GPU_TRACE=1` now splits adapter detection into its host and
+  device halves**, which is what finally located this pipeline's bottleneck.
+  On 1 M reads:
+
+  ```text
+  producer   detect 406.1s (host 4.8s + device 401.0s)  prep 0.9s  BLOCKED on send 0.0s
+  2 workers  encode+decode 153.8s  match 11.0s  route 0.7s  BLOCKED on recv 683.8s
+  wall 425.4s — worker busy 19% of its wall, producer busy 96%
+  ```
+
+  **Detect is 401 s of device time in a 425 s run — 94% of the wall**, and 99% of
+  detect is on the device rather than in host prep. The encoder workers idle 82%.
+  Every previous attempt to explain the idle GPU as a scheduling problem was
+  aimed at a stage that was already idle; this is the measurement that says so.
+
+  For scale: CPU detection through tract is 0.915 ms/read on 16 threads against
+  the GPU's 0.240, so moving detection to the host is not an option either — it
+  is 3.8x slower already, and there is only 0.2 s of host-side prep to
+  parallelise.
+
+- **A pool of CRF encoder workers, spread over every visible GPU**
+  (`ESCAPEPOD_CRF_GPU_WORKERS`, default two per device, capped at 8). Each worker
+  holds its own onnxruntime session and lattice context pinned to one ordinal,
+  and they pull from a single shared channel rather than a partition, so a slow
+  device cannot leave one worker holding the tail.
+
+  Device placement is dynamic and needs no flag: the count comes from the
+  *visible* devices, so `CUDA_VISIBLE_DEVICES` and SLURM `--gres=gpu:1` collapse
+  it to a same-device pool automatically. Nothing changes for single-GPU users.
+
+  **Measured gain was small when this landed, and the reason is worth keeping**:
+  17.6 s → 15.7 s on 40 k reads with two A30s (1.12x), not the ~2x the device
+  count suggests. The pipeline was not device-bound — the GPU idled ~75% of the
+  time — so a second GPU mostly added idle capacity. Both causes of that idling
+  have since been fixed (the boundary-prep shape churn, and reader threads
+  starving the pool; see *Fixed* and *Performance*), and the device now runs at
+  90%+ for three quarters of a 1 M-read run on one A30. The two-GPU numbers
+  predate those fixes and have not been re-measured.
+
+  Note the pool must be sized against device memory, not just device count — see
+  the `DEVICE_ROW_BUDGET` entry under *Fixed*.
+
+  Output is unaffected: 40 001/40 001 identical rows at one, two and four workers.
+
+### Fixed
+
+- **The boundary CNN was never prepped the way it was trained** (#187).
+  escapepod-models builds every training example through
+  `dataset.py::prepare_signal`, which pads to a fixed
+  `input_len = (max_obs_trace - min_obs_adapter) / downscale` = 1500 with
+  `score_excl = -5.0`; its own inference path does the same. escpod instead
+  truncated to `search_window + ESCAPEPOD_CNN_MARGIN` (550 + 256 = 806) and
+  padded with nothing, so the model has been running off-distribution since the
+  CNN detector shipped. The truncation's premise did not hold either — the
+  graph's receptive field is wider than the margin assumed, so an output at the
+  far edge of the search window depended on input the truncation removed.
+
+  Scored against escapepod-models' move-table gold labels (20,303 reads, the
+  same yardstick used to rank boundary architectures), matching the training
+  convention is an improvement on every metric:
+
+  ```text
+  prep    MAE    median   +/-200   +/-500
+  old    111.8    30.0    0.9146   0.9654
+  new    111.1    30.0    0.9149   0.9658
+  ```
+
+  Of the 38 labelled reads where the two preps disagree, 24 are closer to gold
+  under the new prep and 14 under the old.
+
+  It was also the fused GPU pipeline's bottleneck. The window clamps to the read
+  end, so every read shorter than `max_obs_trace` got its own length — 680
+  distinct shapes over one production run's 527 k reads, so a block issued one
+  large onnxruntime call plus ~679 tiny ones, each paying fresh cuDNN plan
+  selection. Detection measured **401 s of device time in a 425 s wall (94%)**
+  against 0.009 ms/read for the same kernel at a steady shape. One fixed length
+  fixes both: **401 s -> 20.2 s**.
+
+  Expect adapter positions to move on a minority of reads. That is the point of
+  the change, and the gold comparison above is the evidence for its direction.
+
+- **`ESCAPEPOD_CRF_GPU_WORKERS` could kill or hang a run.** Every encoder worker
+  sharing a device allocates its LSTM activations from that device's VRAM, but
+  each took a full `ESCAPEPOD_CRF_GPU_BATCH_ROWS` batch, so asking for more
+  workers multiplied device memory instead of dividing the work. Four workers on
+  one 24 GB A30 hit 49 allocation failures and then died with a generic
+  `CudaCall` error on a `Reshape`, followed by `corrupted double-linked list` —
+  the halve-and-retry recognised all 49 but could not save the run, because by
+  then the CUDA context was wedged.
+
+  Both failure modes are bad in different ways. One run aborted with exit 134
+  after writing **997,211 of 1,001,307 reads**, so a caller that checked only the
+  output and not the exit code would have lost a block of reads silently. Another
+  did not abort at all: it hung holding the full 24 GB for as long as it was left
+  running, pinning the device against every other job on the node.
+
+  Rows are now a **per-device budget** (`DEVICE_ROW_BUDGET`, 1024) split across
+  the workers on that device, so total in-flight rows stay flat as the pool
+  grows. The default two-workers-per-device configuration is unchanged at 512
+  rows each; an explicit `ESCAPEPOD_CRF_GPU_BATCH_ROWS` still wins and is still
+  stated per worker. The pipeline logs the resolved rows/call alongside the
+  worker count.
+
+  The configuration that previously aborted now completes: four workers on one
+  A30, 1 M reads, 256 rows/call, 112.0 s, zero allocation failures, all
+  1,001,307 reads written.
+
+- **`escpod demux --gpu` aborted at exit roughly half the time**, after writing
+  every read correctly. onnxruntime's CUDA provider reads freed memory during
+  onnxruntime's *own* at-exit teardown; valgrind, on a run whose output was
+  complete:
+
+  ```text
+  Invalid read of size 8
+     at  libonnxruntime_providers_cuda.so
+     by  libonnxruntime.so.1.27.1
+     by  <Arc<ort::environment::Environment>>::drop_slow
+     by  ort::environment::release_env_on_exit
+     by  _dl_fini
+  Address .. is 1,258,744 bytes inside an unallocated block of size 1,360,656
+  ```
+
+  Ten errors, five contexts, all at teardown; **none in the processing loop**.
+  glibc notices at the last `free` and aborts with `corrupted double-linked
+  list`. Measured 5 runs in 10 against 0/10 for 0.7.0 — which never hit it
+  because it ran the CRF encoder on CPU tract and only gave the CUDA EP the
+  small adapter CNN, so there was far less provider state to unwind.
+
+  Output was never affected (every trial wrote all reads), but the process
+  exited non-zero, which a workflow engine reads as a failed job.
+
+  `release_env_on_exit` calls `ReleaseEnv` only when the last
+  `Arc<Environment>` drops, and every live `Session` holds one, so the fix is to
+  keep our sessions alive past `main`: the faulty path never runs. Verified back
+  to **0/10**. Narrow by construction — our own destructors still run, writers
+  are already joined and outputs renamed before that point, and it only applies
+  when a GPU path created ORT sessions. Worth revisiting after an `ort` or
+  onnxruntime bump; the code comment carries the trace needed to re-test.
+
+- **The zero-copy binding named device 0 regardless of which device its session
+  was on.** Harmless while there was only ever one device; with a worker pool it
+  failed the run outright — onnxruntime resolves a bound output's allocator
+  against the session's device and reports `Failed to find allocator for device`.
+  Each encoder now carries its ordinal and binds against it.
+
+- **`is_oom` missed two of the three wordings a device out-of-memory arrives in**,
+  so the halve-and-retry both GPU paths depend on never fired and a batch that
+  only needed splitting killed the run. onnxruntime's BFC arena says "Failed to
+  allocate memory for requested buffer" and never "out of memory"; the driver
+  says `CUDA_ERROR_OUT_OF_MEMORY`, whose underscores the old substring missed.
+  Reproduced at `ESCAPEPOD_CRF_GPU_BATCH_ROWS=2048`, which now halves and
+  completes. The `lattice_gpu` unit test covering the driver spelling had never
+  run — `crf-gpu` is not in the workspace default features, so it was compiled
+  out of every suite invocation, and its assertion had been wrong since it was
+  written.
+
+- **The GPU CRF decode's time-major transpose was serial, and it — not the
+  device — was the bottleneck.** `split_time_major` de-interleaves onnxruntime's
+  `[T, batch, n_score]` output into per-read buffers: 786 MB in and 786 MB out
+  per 512-read batch at the RNA004 geometry, single-threaded. It capped the fused
+  GPU path at ~700 reads/s on *any* thread count (16/32/48 all within 5%) while
+  the CPU-encoder path kept scaling to 1150. Parallelising it over the batch axis
+  (order-preserving, so read alignment is unaffected) took the same workload from
+  57.2 s to 27.9 s — 2x, on top of the win above. `demux basecall --gpu` uses the
+  same code and gets the same speedup.
+
+- The fused CRF path no longer materialises the whole transpose before decoding:
+  it gathers each read straight into the decode's input buffer, one buffer per
+  rayon worker rather than one 1.5 MB allocation per read. Wall time is unchanged
+  — the parallel transpose above is what mattered — but peak RSS no longer
+  carries a second full copy of the score batch, which is what made raising
+  `ESCAPEPOD_CRF_GPU_BATCH_ROWS` expensive (that knob still scales onnxruntime's
+  own output tensor: 4.33 GB peak at 512 rows, 7.06 GB at 2048).
+
+### Changed
+
+- `escpod demux --gpu`'s "no effect here" warning for a CRF model no longer
+  requires `--method` to be something other than `cnn`. The old gate silenced the
+  warning for exactly the combination that looks most accelerated and is not —
+  `--gpu --method cnn` against a CPU-only encoder — which is how a production run
+  spent its time CPU-bound on a GPU node without a word of warning. Binaries
+  built with `crf-gpu` no longer warn at all, because the flag now does something.
+
+- `--gpu` is available on `demux` whenever any of `gpu`, `cnn-gpu` **or**
+  `crf-gpu` is compiled in; previously a `crf-gpu`-only build had no such flag.
+
 ## 0.7.0 (2026-08-04)
 
 ### Added

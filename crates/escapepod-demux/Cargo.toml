@@ -104,7 +104,7 @@ crf-decode = ["dep:tract-onnx", "dep:fqxv-align"]
 # onnxruntime's CUDA execution provider. The decode deliberately stays on the
 # CPU (see `crf::encoder_gpu`), so the AVX2 kernels matter more here, not less.
 # Needs a CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
-crf-gpu = ["crf-decode", "dep:ort"]
+crf-gpu = ["crf-decode", "dep:ort", "dep:cudarc"]
 # Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
 # from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
 # time, not build time. Also pulls cudarc directly so the post-DTW SVM
@@ -117,3 +117,15 @@ train = ["dep:linfa", "dep:linfa-svm"]
 [[example]]
 name = "crf_basecall_check"
 required-features = ["crf-decode"]
+
+[[example]]
+name = "crf_gpu_floor"
+required-features = ["crf-gpu"]
+
+[[example]]
+name = "cnn_gpu_floor"
+required-features = ["cnn-gpu"]
+
+[[example]]
+name = "cnn_pad_probe"
+required-features = ["cnn-gpu"]
