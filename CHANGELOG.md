@@ -2,7 +2,36 @@
 
 ## Unreleased
 
+## 0.8.0 (2026-08-08)
+
 ### Added
+
+- **The bundle's boundary input contract is read, not assumed** (#190,
+  escapepod-models#56, closing #187's root cause). A CRF bundle's sidecar can
+  now declare the input tensor its pinned boundary CNN consumes
+  (`boundary.input`: window, downscale, fixed `input_len`, pad value —
+  written by escapepod-models from the same `DataConfig` that framed every
+  training example), and the detector preps from that declaration instead of
+  hardcoded constants. `input_len` is declared redundantly and cross-checked:
+  a self-inconsistent block is a load error, not a silent preference. Bundles
+  without the block keep the legacy rna004 defaults, which is what their
+  models trained with. `--info` prints the declared geometry.
+
+- **The pinned boundary model's sha256 is verified at load** (#190,
+  escapepod-models#56). The pinned adapter copy is the one bundle file the
+  registry manifest does not hash, so the sidecar now declares it
+  (`boundary.sha256`) and `demux` refuses to run pinned weights that do not
+  match, naming both hashes. Applies only when the pinned file is what loads —
+  an explicit `--cnn-model` already chose different weights deliberately.
+
+- **The CTC-CRF runtime bundle is fetchable**: `escpod demux models fetch
+  crf_nbc16_rna004` (#191), pinned at `barcode_crf_nbc16_rna004@v0.3.1` — the
+  release whose metadata carries the input contract and sha declaration above.
+  A CRF bundle is a directory, not a file, so the manifest grows `extras`:
+  non-model files (metadata sidecar, pinned adapter copy, provenance)
+  downloaded and sha256-verified exactly like members, into the member's cache
+  directory. The cached directory is a complete `escpod demux --model <dir>`
+  argument, and `models list` prints the exact command.
 
 - **Batched CTC-CRF lattice decode on the GPU** (`crf::lattice_gpu`, `crf-gpu`).
   The same two passes as `crf::lattice`, the same edge indexing and the same
