@@ -455,13 +455,44 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                             out.push((bnd(read_id, num_samples, end), None));
                         }
                     }
+                    // Keep the ORT session alive past process exit, for the same
+                    // reason `demux --gpu` does — onnxruntime's CUDA provider
+                    // reads freed memory during onnxruntime's own at-exit
+                    // teardown, and glibc aborts on it. See the long comment in
+                    // `run.rs` and pykeio/ort#609. `release_env_on_exit` only
+                    // fires when the last `Arc<Environment>` drops and every live
+                    // `Session` holds one, so leaking this keeps the count above
+                    // zero. All output is produced from `out`, not from `gpu`.
+                    std::mem::forget(gpu);
                     Ok(out)
                 });
 
-                // Producers: per file, sort reads by length (so each block's reads
-                // share lengths ⇒ big exact-length groups), then decode + i16→f32 +
-                // prep in parallel and push blocks. MAD-norm is scale-invariant, so
-                // raw i16 → f32 matches the pA path bit-for-bit post-normalization.
+                // Producers: per file, sort reads by length, then decode +
+                // i16→f32 + prep in parallel and push blocks. MAD-norm is
+                // scale-invariant, so raw i16 → f32 matches the pA path
+                // bit-for-bit post-normalization.
+                //
+                // The sort's original purpose is gone: it grouped reads so each
+                // block shared a prepped length and formed big exact-length GPU
+                // groups, and #187 made prep emit one fixed length for every
+                // read, so that grouping is now automatic. It is kept anyway,
+                // because removing it was measured and is not an improvement.
+                //
+                // Dropping it looks like it should help — sorting scatters the
+                // per-read `get_signal_prefix` across the file, which is the
+                // access pattern #72 measured at 0.3 MB/s against 288 MB/s for
+                // one ascending sweep. It does not: over 503 k reads, warmed and
+                // interleaved, unsorted ran 18.0/15.9/16.7 s against sorted
+                // 18.3/17.3/16.6 s — within-arm spread larger than the
+                // difference. (An earlier cold-cache run showed 185.7 s -> 21.6 s
+                // and meant nothing; see `DEFAULT_FILLERS` for the same trap.)
+                //
+                // And it is not free to change: read order decides which reads
+                // share a device batch, and that changes results. Same binary
+                // twice is bit-identical, but sorted vs unsorted disagreed on
+                // **7 of 503,076** boundaries — cuDNN's batch-shape-dependent
+                // kernel choice, not a bug here. No gain is worth perturbing
+                // output for.
                 for path in &args.input {
                     let reader = Reader::open(path)?;
                     let mut reads: Vec<_> = reader

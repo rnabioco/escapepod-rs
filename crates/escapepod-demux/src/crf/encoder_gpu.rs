@@ -43,6 +43,54 @@
 //! time. Point `ORT_DYLIB_PATH` at a CUDA-enabled `libonnxruntime.so` with a
 //! visible CUDA device. If the CUDA EP cannot initialise, onnxruntime silently
 //! falls back to CPU — slow, but correct.
+//!
+//! # What this graph is, and why the obvious accelerations do not apply
+//!
+//! 519,880 parameters, opset 17: three 1-D convolutions with SiLU (the last
+//! `k=31, stride=10`), then **five unidirectional LSTM layers of `hidden_size`
+//! 96** (direction alternated by a negative-step `Slice`, bonito's reverse
+//! trick), then `MatMul(96->1024)`, `tanh`, `*5.0`, and a `Pad` with 2.0 that
+//! expands 1024 to the 1280 blank-per-state width. Scores are therefore
+//! `5*tanh(...)`, **bounded to [-5, 5]** — no dynamic range problem anywhere.
+//!
+//! Per-op device time at batch 512 says where the money is:
+//!
+//! ```text
+//! LSTM    389.2 ms   89.8%
+//! Reshape/Pad 15.1    3.5%
+//! Conv      9.6       2.2%
+//! MatMul    8.0       1.8%
+//! ```
+//!
+//! **~90% of the work is an LSTM stack at `hidden = 96` over 300 timesteps x 5
+//! layers = 1500 *sequential* steps.** Each recurrent GEMM is a thin
+//! `[rows,96] x [96,384]`, so the stack is launch-latency and bandwidth bound,
+//! not FLOP bound. That single fact decides the two accelerations people reach
+//! for first:
+//!
+//! * **fp16 — measured and rejected.** ORT's CUDA EP cannot convert an fp32
+//!   graph at runtime, so this means shipping a converted model. Done and
+//!   benchmarked: only **1.18x** at batch 512 end-to-end, because the LSTM is
+//!   89.8% of the work and gets just 1.23x. The cost is not worth arguing about:
+//!   over 40 k real reads it changed **38 barcode calls (0.095%)**, and they are
+//!   *unfilterable* — 32 of the 38 had margin > 5 on both sides and several were
+//!   exact (`dist = 0`) matches to a **different** barcode, so no `--min-margin`
+//!   removes them. The mechanism is chaotic amplification of 1-ulp gate
+//!   decisions through 1500 sequential steps (max |delta| grows 0.0095 -> 2.30
+//!   layer by layer while the *mean* stays at fp16 eps), not saturation — so
+//!   loss scaling cannot fix it and bf16 would be worse. Keeping the LSTMs in
+//!   fp32 caps the whole exercise at 1.03x.
+//! * **TF32 is already on** via `CUDA::default()` and is worth 1.35x. See
+//!   `crate::ort_ep` — do not turn it off.
+//!
+//! TensorRT is the one that attacks the actual bottleneck: it absorbs the whole
+//! graph (all five LSTMs, no CUDA-EP fallback) and preserves the zero-copy
+//! output binding, measuring 1.50x at batch 1024. But it decays with batch size
+//! — 1.28x at 512, **1.01x at 256** — and the pipeline runs 512 or less, while
+//! `libnvinfer` is ~860 MB and installed nowhere on this cluster. Left unbuilt
+//! deliberately; `ort::ep::TensorRT` behind a feature is the seam if that
+//! changes, and it needs an explicit optimization profile or every new batch
+//! size triggers a ~15 s engine rebuild.
 
 use std::path::Path;
 use std::sync::Mutex;

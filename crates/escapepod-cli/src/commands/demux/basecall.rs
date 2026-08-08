@@ -399,5 +399,15 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             style::value(encoder.metadata().signal.chunk),
         );
     }
+    // Keep the ORT session alive past process exit when one was created, for the
+    // same reason `demux --gpu` does: onnxruntime's CUDA provider reads freed
+    // memory during onnxruntime's own at-exit teardown and glibc aborts on it,
+    // *after* every output is written. See the long comment in `run.rs` and
+    // pykeio/ort#609. Everything above is already flushed by this point, and the
+    // CPU (tract) basecaller is left to drop normally.
+    #[cfg(feature = "crf-gpu")]
+    if matches!(encoder, Basecaller::Gpu(_)) {
+        std::mem::forget(encoder);
+    }
     Ok(())
 }
