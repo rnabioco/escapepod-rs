@@ -36,11 +36,15 @@ Demux has additional sub-features layered on top:
 | `--features train` | SVM model training via `linfa-svm` (`escpod demux train-svm`) |
 | `--features gpu` | Batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc required at runtime) |
 | `--features cnn-gpu` | Implies `cnn-detect`; onnxruntime CUDA inference for `detect --method cnn --gpu` |
+| `--features crf-gpu` | onnxruntime CUDA inference for the CTC-CRF basecall encoder (`basecall --gpu`) |
 
 The `--features` rows each imply `demux`, so `cargo build --features train` is
 enough. `cnn-detect` is listed for reference only: it ships in the default build
 and needs no flag, but `cnn-gpu` builds on it and `--method cnn` is what the
 published barcode models expect.
+
+The GPU features need runtime CUDA libraries; the repository's pixi `gpu`
+environment provides all of them — see [GPU setup](gpu-setup.md).
 
 ## Stability
 

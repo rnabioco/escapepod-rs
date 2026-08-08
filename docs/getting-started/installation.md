@@ -38,6 +38,12 @@ features:
 | `train` | implies `demux`; adds `demux train-svm` |
 | `gpu` | implies `demux`; batched GPU DTW for `classify` / `train-svm` (CUDA driver + libnvrtc required at runtime) |
 | `cnn-detect` | *in the default build*; CNN/TCN adapter detection, `demux detect --method cnn` (bring-your-own ONNX model) |
+| `cnn-gpu` | implies `cnn-detect`; onnxruntime CUDA inference for `demux detect --method cnn --gpu` |
+| `crf-gpu` | onnxruntime CUDA inference for the CTC-CRF basecall encoder (`demux basecall --gpu`) |
+
+The GPU features need CUDA libraries at run time only; the repository's pixi
+`gpu` environment provides all of them — see
+[GPU setup](../experimental/gpu-setup.md).
 
 Combine as needed:
 

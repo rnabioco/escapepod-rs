@@ -55,33 +55,52 @@ typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escape
   "build-python",
 ] }
 
-# GPU (CUDA) feature. Covers two runtime paths, both `load-dynamic`/dlopen
-# (nothing needed at build time):
+# GPU (CUDA) feature. Covers the runtime needs of all three GPU cargo
+# features, all `load-dynamic`/dlopen (nothing needed at build time):
 #   * `--features gpu`      — cudarc dlopens libnvrtc for the GPU DTW kernels.
-#   * `--features cnn-gpu`  — the `ort` CUDA execution provider for batched CNN
-#     adapter detection. ORT 1.24's CUDA EP dlopens cublas/cublasLt/cudart/cufft
-#     AND cuDNN 9; without them it fails with
-#     `libcublasLt.so.12: cannot open shared object file` and silently falls back
-#     to CPU. We pull the whole CUDA 12 runtime from conda-forge so `pixi -e gpu`
-#     is self-contained (no cross-repo env on LD_LIBRARY_PATH). See the memory
-#     `reference-cnn-gpu-ort-runtime-setup` for the full story.
-# Activate with `pixi shell -e gpu` or `pixi run -e gpu …` on a GPU node.
+#   * `--features cnn-gpu`  — onnxruntime CUDA execution provider for batched
+#     CNN adapter detection (`demux detect --method cnn --gpu`).
+#   * `--features crf-gpu`  — the same onnxruntime CUDA EP for the CTC-CRF
+#     encoder (`demux basecall --gpu`, fused `demux --gpu`).
+# The CUDA 12 runtime libs come from conda-forge; the ort CUDA EP dlopens
+# cublas/cublasLt/cudart/cufft AND cuDNN 9, and without them it fails with
+# `libcublasLt.so.12: cannot open shared object file` and silently falls back
+# to CPU. The one piece conda cannot supply without a workspace-wide
+# `__cuda` platform re-key is the CUDA-enabled libonnxruntime itself: run
+# `pixi run -e gpu install-ort` ONCE on a networked (login) node to fetch it
+# from the onnxruntime-gpu wheel into `.pixi/ort/` — the activation script
+# then finds it there. Setup, in full:
+#   pixi run -e gpu install-ort      # once, networked node; compute nodes can't
+#   pixi run -e gpu <escpod … --gpu> # any GPU node, no env vars needed
 [feature.gpu.dependencies]
 cuda-nvrtc = ">=12"        # GPU DTW (cudarc)
 cuda-version = "12.*"
 libcublas = "*"            # ort CUDA EP: libcublas.so.12 + libcublasLt.so.12
 cuda-cudart = "*"          # ort CUDA EP: libcudart.so.12
 libcufft = "*"             # ort CUDA EP: libcufft.so.11
-cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9 (ORT 1.24 needs cuDNN 9)
+cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9
 
-# Make `$CONDA_PREFIX/lib` visible to the dlopen paths above (cudarc's libnvrtc
-# and ort's CUDA EP deps) — the conda-forge CUDA packages ship no activation
-# hook that sets this. `ORT_DYLIB_PATH` points `ort` (load-dynamic) at a
-# CUDA-enabled libonnxruntime 1.24.x; the manual onnxruntime-gpu download lives
-# under ~/ortgpu (not on PyPI/conda for this exact build). Override it if yours
-# is elsewhere.
+[feature.gpu.tasks]
+# Fetch the CUDA-enabled libonnxruntime that `ort` (load-dynamic) dlopens at
+# run time. Pinned: 1.28.0 is verified against the workspace's ort
+# 2.0.0-rc.13 pin (see crates/escapepod-demux/Cargo.toml) — bump the two
+# together, deliberately. The wheel is only a container for the .so; nothing
+# is pip-*installed*.
+install-ort = """
+python -m pip download onnxruntime-gpu==1.28.0 --no-deps -d .pixi/ort && \
+python scripts/unpack_ort_gpu.py .pixi/ort
+"""
+
+# LD_LIBRARY_PATH makes `$CONDA_PREFIX/lib` visible to the dlopen paths above
+# (cudarc's libnvrtc and ort's CUDA EP deps) — the conda-forge CUDA packages
+# ship no activation hook that sets this. The script exports ORT_DYLIB_PATH
+# only when `.pixi/ort/` actually holds the library (see install-ort above):
+# a dangling ORT_DYLIB_PATH makes the ort features hang silently at startup,
+# whereas unset fails fast with a clear error. An ORT_DYLIB_PATH you export
+# yourself wins over the script.
 [feature.gpu.activation]
-env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH", ORT_DYLIB_PATH = "$HOME/ortgpu/onnxruntime/capi/libonnxruntime.so.1.24.4" }
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+scripts = ["scripts/gpu_env_activation.sh"]
 
 # WarpDemuX benchmark feature. Neither `warpdemux` nor `adapted` is on
 # PyPI, so we pip-install them editable from the cloned repos under

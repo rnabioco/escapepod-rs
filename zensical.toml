@@ -28,6 +28,7 @@ nav = [
     { "repack" = "experimental/repack.md" },
     { "resquiggle" = "experimental/resquiggle.md" },
     { "demux" = "experimental/demux.md" },
+    { "GPU setup" = "experimental/gpu-setup.md" },
   ] },
   { "Python API" = [
     { "Overview" = "python/index.md" },

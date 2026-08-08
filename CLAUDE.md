@@ -25,6 +25,14 @@ cargo build --release --features train
 # and sets LD_LIBRARY_PATH automatically:
 pixi run -e gpu cargo build --release --features gpu -p escapepod-cli
 
+# The onnxruntime-CUDA features (cnn-gpu, crf-gpu) additionally need a
+# CUDA-enabled libonnxruntime at RUN time. One-time setup on a networked
+# (login) node — fetches it into .pixi/ort/, after which the gpu env's
+# activation script sets ORT_DYLIB_PATH automatically (only when the file
+# exists; a dangling ORT_DYLIB_PATH hangs silently at startup):
+pixi run -e gpu install-ort
+# Full runtime story + verification: docs/experimental/gpu-setup.md
+
 # Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`):
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     pixi run -e gpu cargo nextest run --features gpu -p escapepod-signal --test gpu_dtw
