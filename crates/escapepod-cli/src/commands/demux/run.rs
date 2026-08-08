@@ -81,6 +81,29 @@ pub struct RunArgs {
     )]
     pub min_margin: u32,
 
+    /// Overrule the bundle's declared `boundary.margin` — the samples of
+    /// `adapter_end` a read needs beyond the model's `chunk` before it decodes
+    /// (CRF head only). Unset uses the bundle, which falls back to 200.
+    ///
+    /// The margin records how the training corpus was FILTERED, not what the
+    /// encoder needs: `adapter_end >= chunk` already yields a full window, and
+    /// the extra samples exist only because `extract_chunks.py` demanded them.
+    /// Reads in `[chunk, chunk + margin)` are therefore dropped undecoded even
+    /// though they are decodable. Lowering it recovers them at the cost of a
+    /// window reaching into the read's opening samples, which the model never
+    /// saw in training. Measured on a 1.0M-read RNA004 nbc16 run: 0 recovered
+    /// 36,921 reads (demux yield 85.44% -> 89.13%), all decoding at median edit
+    /// distance 0 with 98.3% within 2 edits — cleaner than the reads that
+    /// already passed.
+    ///
+    /// This is an escape hatch for evaluating a change before baking it into an
+    /// export. The bundle should state the margin its corpus was built with;
+    /// once measured, set `boundary.margin` there rather than passing this on
+    /// every run.
+    #[cfg(feature = "crf-decode")]
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
+    pub boundary_margin: Option<usize>,
+
     /// Describe the model and exit: identity, signal geometry, bundled
     /// references, pinned boundary detector, published metrics, and the exact
     /// command line it needs. Reads no POD5, so it is safe to run against a
@@ -520,6 +543,14 @@ impl CrfEncoderAny {
             Self::Gpu(e) => e.metadata(),
         }
     }
+
+    fn set_boundary_margin(&mut self, margin: usize) {
+        match self {
+            Self::Cpu(e) => e.set_boundary_margin(margin),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.set_boundary_margin(margin),
+        }
+    }
 }
 
 impl ClassifyModel {
@@ -672,6 +703,19 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             };
             #[cfg(not(feature = "crf-gpu"))]
             let encoder = CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?));
+            #[allow(unused_mut)]
+            let mut encoder = encoder;
+            if let Some(margin) = args.boundary_margin {
+                let was = encoder.metadata().min_adapter_end();
+                encoder.set_boundary_margin(margin);
+                info!(
+                    "{} adapter_end >= {} (was {}); reads between the two decode instead \
+                     of routing to unclassified",
+                    style::label("Boundary margin:"),
+                    style::count(encoder.metadata().min_adapter_end()),
+                    style::count(was),
+                );
+            }
             // References come from the bundle unless the caller overrides them.
             // Carrying them in the bundle is what makes the plain
             // `--model <bundle> -d out/` form work, and it fixes the

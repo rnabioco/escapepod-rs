@@ -314,6 +314,12 @@ impl CrfEncoderGpu {
         &self.meta
     }
 
+    /// Override the decode's boundary margin. See
+    /// [`CrfMetadata::set_boundary_margin`].
+    pub fn set_boundary_margin(&mut self, margin: usize) {
+        self.meta.set_boundary_margin(margin);
+    }
+
     pub fn layout(&self) -> &CrfLayout {
         &self.layout
     }

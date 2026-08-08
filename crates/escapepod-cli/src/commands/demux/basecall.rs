@@ -64,6 +64,14 @@ pub struct BasecallArgs {
     #[arg(long, default_value = "0", value_name = "N", requires = "barcodes")]
     pub min_margin: u32,
 
+    /// Overrule the bundle's declared `boundary.margin` for this run.
+    ///
+    /// Reads below the threshold emit an empty sequence rather than a poor one,
+    /// so a run full of `decoded_len=0` means the gate, not the decode. See
+    /// `escpod demux --help`; prefer fixing the bundle's declaration.
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
+    pub boundary_margin: Option<usize>,
+
     /// Run encoder inference on the GPU (onnxruntime CUDA execution provider).
     /// The lattice decode stays on the CPU either way.
     #[cfg(feature = "crf-gpu")]
@@ -89,6 +97,14 @@ impl Basecaller {
             Self::Cpu(e) => e.metadata(),
             #[cfg(feature = "crf-gpu")]
             Self::Gpu(e) => e.metadata(),
+        }
+    }
+
+    fn set_boundary_margin(&mut self, margin: usize) {
+        match self {
+            Self::Cpu(e) => e.set_boundary_margin(margin),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.set_boundary_margin(margin),
         }
     }
 
@@ -216,6 +232,18 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "crf-gpu"))]
     let encoder = Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?));
+    #[allow(unused_mut)]
+    let mut encoder = encoder;
+    if let Some(margin) = args.boundary_margin {
+        let was = encoder.metadata().min_adapter_end();
+        encoder.set_boundary_margin(margin);
+        info!(
+            "{} adapter_end >= {} (was {})",
+            style::label("Boundary margin:"),
+            style::count(encoder.metadata().min_adapter_end()),
+            style::count(was),
+        );
+    }
 
     // Keep the ORT session alive past process exit when there is one, for the
     // reason spelled out on `run::LeakIf` (pykeio/ort#609). Applied here, at
