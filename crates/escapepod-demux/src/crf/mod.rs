@@ -51,6 +51,37 @@ pub use barcode::{BarcodeError, BarcodeMatch, BarcodeRefs};
 #[cfg(feature = "crf-decode")]
 pub use encoder::{BarcodeEntry, BoundarySpec, CrfEncoder, CrfError, CrfMetadata, ModelIdent};
 
+/// The input tensor a bundle's pinned boundary CNN consumes
+/// (`boundary.input` in the sidecar; escapepod-models writes it from the same
+/// `DataConfig` that framed every training example).
+///
+/// This block exists because nothing declared it before: the geometry lived as
+/// hardcoded constants on both sides of the repo boundary, they drifted, and
+/// escpod fed the model variable-length truncated tensors it was never trained
+/// on (#187). `AdapterCnnConfig::from_bundle_input` is the one consumer.
+///
+/// Defined here, outside the `crf-decode` gate, because the detector pin
+/// plumbing has to name the type in every feature combination — the sidecar
+/// parsing (`crf-decode`) and the CNN it configures (`cnn-detect`) are
+/// independently selectable.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct BoundaryInputSpec {
+    /// Raw-signal window start, in samples.
+    pub min_obs_adapter: usize,
+    /// Raw-signal window end, in samples. Normalisation statistics and the
+    /// model input both come from `signal[min_obs_adapter:max_obs_trace]`.
+    pub max_obs_trace: usize,
+    /// Mean-pool factor from raw samples to model positions.
+    pub downscale_factor: usize,
+    /// Fixed tensor length the model consumes, in downscaled positions.
+    /// Derivable from the three fields above and declared anyway, so producer
+    /// and consumer computing different lengths is a load error rather than a
+    /// silent preference for one of them.
+    pub input_len: usize,
+    /// Value training right-pads short windows with (and substitutes for NaN).
+    pub pad_value: f32,
+}
+
 #[cfg(feature = "crf-gpu")]
 pub use encoder_gpu::CrfEncoderGpu;
 

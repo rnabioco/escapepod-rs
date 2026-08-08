@@ -726,7 +726,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         },
     };
     // A CRF bundle may pin the boundary detector it was trained against; the
-    // ONNX path in the sidecar is relative to the bundle directory.
+    // ONNX path in the sidecar is relative to the bundle directory, and the
+    // sidecar may declare the input tensor that detector consumes (#187).
     #[cfg(feature = "crf-decode")]
     let boundary_pin = match (&model, &crf_dir_for_pin) {
         (ClassifyModel::Crf(h), Some(dir)) => h.encoder.metadata().boundary.as_ref().map(|b| {
@@ -737,12 +738,20 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                     style::value(id)
                 );
             }
-            (b.method.as_str(), b.onnx.as_ref().map(|o| dir.join(o)))
+            (
+                b.method.as_str(),
+                b.onnx.as_ref().map(|o| dir.join(o)),
+                b.input,
+            )
         }),
         _ => None,
     };
     #[cfg(not(feature = "crf-decode"))]
-    let boundary_pin: Option<(&str, Option<PathBuf>)> = None;
+    let boundary_pin: Option<(
+        &str,
+        Option<PathBuf>,
+        Option<escapepod_demux::crf::BoundaryInputSpec>,
+    )> = None;
 
     let detector = build_detector(&args, boundary_pin)?;
 
@@ -2197,10 +2206,16 @@ fn spawn_class_writer(
 /// `cnn` refuses the downgrade, which is #16's runtime guard.
 fn build_detector(
     args: &RunArgs,
-    pin: Option<(&str, Option<PathBuf>)>,
+    pin: Option<(
+        &str,
+        Option<PathBuf>,
+        Option<escapepod_demux::crf::BoundaryInputSpec>,
+    )>,
 ) -> anyhow::Result<Detector> {
-    let pinned_method = pin.as_ref().map(|(m, _)| *m);
-    let pinned_onnx = pin.and_then(|(_, p)| p);
+    let (pinned_method, pinned_onnx, pinned_input) = match pin {
+        Some((m, p, i)) => (Some(m), p, i),
+        None => (None, None, None),
+    };
     let method = match (args.method.as_deref(), pinned_method) {
         (Some("llr"), Some("cnn")) => anyhow::bail!(
             "this model is calibrated against CNN adapter boundaries and refuses \
@@ -2237,26 +2252,40 @@ fn build_detector(
                              does not ship a boundary model)"
                         )
                     })?;
+                // Prep with the geometry the bundle declares for its pinned
+                // model (#187) — but only when that model is what's running.
+                // An explicit --cnn-model is a different set of weights, whose
+                // geometry the bundle cannot speak for; those get the legacy
+                // defaults, as does a bundle from before the contract existed
+                // (the defaults are what its model trained with).
+                let config = match (&args.cnn_model, pinned_input) {
+                    (None, Some(spec)) => {
+                        escapepod_demux::AdapterCnnConfig::from_bundle_input(&spec)
+                            .map_err(|e| anyhow::anyhow!("bundle boundary.input: {e}"))?
+                    }
+                    _ => escapepod_demux::AdapterCnnConfig::default(),
+                };
                 // `--gpu` with `--method cnn` runs detection on the GPU (one
                 // batched onnxruntime call per block) when built with cnn-gpu.
                 #[cfg(feature = "cnn-gpu")]
                 if args.gpu {
                     return Ok(Detector::CnnGpu(Box::new(
-                        escapepod_demux::AdapterCnnGpu::load_with_threads(
+                        escapepod_demux::AdapterCnnGpu::load_with_config(
                             path,
-                            crate::threads::width(),
+                            config,
+                            Some(crate::threads::width()),
                         )
                         .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
                     )));
                 }
                 Ok(Detector::Cnn(Box::new(
-                    escapepod_demux::AdapterCnn::load(path)
+                    escapepod_demux::AdapterCnn::load_with_config(path, config)
                         .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?,
                 )))
             }
             #[cfg(not(feature = "cnn-detect"))]
             {
-                let _ = pinned_onnx;
+                let _ = (pinned_onnx, pinned_input);
                 anyhow::bail!("--method cnn requires a build with `--features cnn-detect`")
             }
         }

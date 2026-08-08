@@ -193,6 +193,20 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
                 Some(o) => field("weights", format!("{o} (bundled)")),
                 None => field("weights", "not bundled — supply --cnn-model"),
             }
+            match &b.input {
+                Some(i) => field(
+                    "input",
+                    format!(
+                        "raw [{}..{}] /{} -> {} positions, pad {}",
+                        i.min_obs_adapter,
+                        i.max_obs_trace,
+                        i.downscale_factor,
+                        i.input_len,
+                        i.pad_value
+                    ),
+                ),
+                None => field("input", "not declared — assuming legacy rna004 geometry"),
+            }
             field("pinned", "yes — this model was calibrated against it");
         }
         None => field("pinned", "no — you must pass --method"),

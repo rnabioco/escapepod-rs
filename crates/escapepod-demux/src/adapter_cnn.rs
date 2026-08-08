@@ -47,6 +47,11 @@ pub struct AdapterCnnConfig {
     /// shorter than this (tRNA) the window clamps to the read end, so bounding
     /// is a no-op. Matches escapepod-models `DataConfig.max_obs_trace`.
     pub max_obs_trace: usize,
+    /// Value the window is right-padded to [`input_len`](Self::input_len) with,
+    /// and the NaN substitute during normalisation ([`SCORE_EXCL`] unless a
+    /// bundle declares otherwise). Padding with anything else — zero included —
+    /// feeds the model a pattern it never saw.
+    pub pad_value: f32,
 }
 
 impl Default for AdapterCnnConfig {
@@ -56,6 +61,7 @@ impl Default for AdapterCnnConfig {
             max_obs_adapter: 6500,
             downscale_factor: 10,
             max_obs_trace: 16000,
+            pad_value: SCORE_EXCL,
         }
     }
 }
@@ -81,6 +87,32 @@ impl AdapterCnnConfig {
     /// (e.g. [`AdapterCnnGpu::detect_prepped`](crate::adapter_cnn_gpu::AdapterCnnGpu::detect_prepped)).
     pub fn prep(&self, signal_pa: &[f32]) -> Option<PreppedWindow> {
         prep_adapter_signal(signal_pa, self)
+    }
+
+    /// Build from the contract a bundle declares (`boundary.input`), keeping
+    /// the decode-policy fields the contract deliberately omits
+    /// (`max_obs_adapter`, the argmax cap) at their defaults.
+    ///
+    /// Refuses a self-inconsistent block: the sidecar declares `input_len`
+    /// redundantly so that producer and consumer computing different lengths is
+    /// a load error here, not a silent preference for one of them.
+    pub fn from_bundle_input(
+        spec: &crate::crf::BoundaryInputSpec,
+    ) -> Result<Self, AdapterCnnError> {
+        let cfg = Self {
+            min_obs_adapter: spec.min_obs_adapter,
+            max_obs_trace: spec.max_obs_trace,
+            downscale_factor: spec.downscale_factor.max(1),
+            pad_value: spec.pad_value,
+            ..Self::default()
+        };
+        if cfg.input_len() != spec.input_len {
+            return Err(AdapterCnnError::ContractMismatch {
+                declared: spec.input_len,
+                derived: cfg.input_len(),
+            });
+        }
+        Ok(cfg)
     }
 }
 
@@ -126,6 +158,12 @@ pub enum AdapterCnnError {
     BadShape { got: Vec<usize> },
     #[error("signal too short ({len} samples, need at least {required})")]
     SignalTooShort { len: usize, required: usize },
+    #[error(
+        "boundary input contract is self-inconsistent: declares input_len {declared} but \
+         (max_obs_trace - min_obs_adapter) / downscale_factor = {derived}; refusing to guess \
+         which one the model was trained with"
+    )]
+    ContractMismatch { declared: usize, derived: usize },
 }
 
 // tract 0.23 renamed the 3-parameter `SimplePlan<F, O, M>` to the 2-parameter
@@ -354,9 +392,10 @@ pub(crate) fn mean_pool(signal: &[f32], factor: usize) -> Vec<f32> {
 }
 
 /// In-place `(x - median) / MAD` where `MAD = median(|x - median|)`. Returns
-/// a fresh vector. NaN-safe — any non-finite input is replaced with `-5.0`
-/// (ADAPTed's `SCORE_EXCL`) after the transform.
-pub(crate) fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
+/// a fresh vector. NaN-safe — any non-finite input is replaced with `excl`
+/// (the config's pad value; training's `np.nan_to_num(..., nan=cfg.score_excl)`)
+/// after the transform.
+pub(crate) fn median_mad_normalize(signal: &[f32], excl: f32) -> Vec<f32> {
     if signal.is_empty() {
         return Vec::new();
     }
@@ -371,7 +410,7 @@ pub(crate) fn median_mad_normalize(signal: &[f32]) -> Vec<f32> {
         .iter()
         .map(|&x| {
             let v = (x - med) / scale;
-            if v.is_finite() { v } else { -5.0 }
+            if v.is_finite() { v } else { excl }
         })
         .collect()
 }
@@ -436,14 +475,15 @@ pub(crate) fn prep_adapter_signal(
         .max(cfg.min_obs_adapter)
         .min(signal_pa.len());
     let tail = &signal_pa[cfg.min_obs_adapter..end];
-    let mut normalized = median_mad_normalize(&mean_pool(tail, cfg.downscale_factor));
+    let mut normalized =
+        median_mad_normalize(&mean_pool(tail, cfg.downscale_factor), cfg.pad_value);
     // How much of the row is real, captured *before* padding. Training pads the
     // same way, so the model is in-distribution either way — but the decode must
     // not argmax into the pad, or a short read gets a boundary past its own end.
     let valid_len = normalized.len().min(cfg.input_len());
     // Normalisation statistics come from the true window above; only the tensor
     // handed to the graph is padded, which is the order training uses too.
-    normalized.resize(cfg.input_len(), SCORE_EXCL);
+    normalized.resize(cfg.input_len(), cfg.pad_value);
     Some(PreppedWindow {
         data: normalized,
         valid_len,
@@ -621,7 +661,7 @@ mod tests {
     #[test]
     fn normalize_constant_signal() {
         // Constant signal: median = 1.0, MAD = 0 (guarded to 1.0). Output = 0.
-        let out = median_mad_normalize(&[1.0; 10]);
+        let out = median_mad_normalize(&[1.0; 10], SCORE_EXCL);
         for x in &out {
             assert!(x.abs() < 1e-6);
         }
@@ -629,7 +669,7 @@ mod tests {
 
     #[test]
     fn normalize_nan_replaced() {
-        let out = median_mad_normalize(&[1.0, 2.0, 3.0, f32::NAN, 5.0]);
+        let out = median_mad_normalize(&[1.0, 2.0, 3.0, f32::NAN, 5.0], SCORE_EXCL);
         assert!(out.iter().all(|x| x.is_finite()));
         // NaN position got replaced with -5.0.
         assert_eq!(out[3], -5.0);
@@ -684,5 +724,73 @@ mod tests {
         });
         assert_eq!(end, 50 * cfg.downscale_factor + cfg.min_obs_adapter);
         assert!(end <= raw_len);
+    }
+
+    mod bundle_contract {
+        use super::*;
+        use crate::crf::BoundaryInputSpec;
+
+        /// What escapepod-models ships for adapter_rna004 (its
+        /// `DataConfig().input_contract()`).
+        fn rna004_spec() -> BoundaryInputSpec {
+            BoundaryInputSpec {
+                min_obs_adapter: 1000,
+                max_obs_trace: 16000,
+                downscale_factor: 10,
+                input_len: 1500,
+                pad_value: -5.0,
+            }
+        }
+
+        /// The shipped contract must reproduce the config the runtime assumed
+        /// all along — if this breaks, either the fallback defaults or the
+        /// producer changed, and the two sides no longer agree on the model.
+        #[test]
+        fn shipped_contract_reproduces_the_legacy_defaults() {
+            let cfg = AdapterCnnConfig::from_bundle_input(&rna004_spec()).expect("consistent");
+            let dflt = AdapterCnnConfig::default();
+            assert_eq!(cfg.min_obs_adapter, dflt.min_obs_adapter);
+            assert_eq!(cfg.max_obs_trace, dflt.max_obs_trace);
+            assert_eq!(cfg.downscale_factor, dflt.downscale_factor);
+            assert_eq!(cfg.pad_value, dflt.pad_value);
+            assert_eq!(cfg.input_len(), 1500);
+            // Decode policy is not the contract's to set.
+            assert_eq!(cfg.max_obs_adapter, dflt.max_obs_adapter);
+        }
+
+        #[test]
+        fn inconsistent_input_len_is_refused() {
+            // 806 is the truncated length #187's bug fed the model.
+            let spec = BoundaryInputSpec {
+                input_len: 806,
+                ..rna004_spec()
+            };
+            match AdapterCnnConfig::from_bundle_input(&spec) {
+                Err(AdapterCnnError::ContractMismatch { declared, derived }) => {
+                    assert_eq!(declared, 806);
+                    assert_eq!(derived, 1500);
+                }
+                other => panic!("expected ContractMismatch, got {other:?}"),
+            }
+        }
+
+        /// A declared pad value must reach both the padding and the NaN
+        /// substitution — a contract that only half-applies is worse than none.
+        #[test]
+        fn declared_pad_value_reaches_the_tensor() {
+            let spec = BoundaryInputSpec {
+                pad_value: -7.0,
+                ..rna004_spec()
+            };
+            let cfg = AdapterCnnConfig::from_bundle_input(&spec).expect("consistent");
+            let mut sig = vec![100.0f32; 2120];
+            sig[1500] = f32::NAN;
+            let w = prep_adapter_signal(&sig, &cfg).expect("long enough");
+            assert!(w.data[w.valid_len..].iter().all(|&v| v == -7.0));
+            assert_eq!(
+                w.data[(1500 - cfg.min_obs_adapter) / cfg.downscale_factor],
+                -7.0
+            );
+        }
     }
 }
