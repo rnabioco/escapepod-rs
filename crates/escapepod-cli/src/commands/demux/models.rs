@@ -67,6 +67,9 @@ pub enum ModelKind {
     Boundary,
     /// Barcode classifier for `demux classify`.
     Barcode,
+    /// Not a model: a file a runtime-bundle directory needs to function
+    /// (metadata sidecar, provenance). Only ever appears on [`Extra`]s.
+    Sidecar,
 }
 
 impl ModelKind {
@@ -74,6 +77,7 @@ impl ModelKind {
         match self {
             Self::Boundary => "boundary",
             Self::Barcode => "barcode",
+            Self::Sidecar => "sidecar",
         }
     }
 }
@@ -105,6 +109,28 @@ impl Member {
     }
 }
 
+/// A file a runtime-bundle directory needs beyond its member models: the
+/// sidecar naming everything, the pinned detector copy, provenance. Fetched
+/// and sha256-verified exactly like a member, into `<cache>/<into>/<file>`,
+/// so the cached directory is complete and `escpod demux --model <dir>` works
+/// offline as-is.
+pub struct Extra {
+    /// Cache subdirectory the file lands in — a member's `full_id`, so every
+    /// extra rides inside a directory a member anchors.
+    pub into: &'static str,
+    /// Path of the file within the release archive.
+    #[cfg_attr(not(any(feature = "model-fetch", test)), allow(dead_code))]
+    pub archive_path: &'static str,
+    /// Basename the file is cached under.
+    pub file: &'static str,
+    /// What the file is. A pinned detector copy is [`ModelKind::Boundary`];
+    /// metadata/provenance are [`ModelKind::Sidecar`].
+    pub kind: ModelKind,
+    /// Expected sha256 of the file contents (lowercase hex).
+    #[cfg_attr(not(any(feature = "model-fetch", test)), allow(dead_code))]
+    pub sha256: &'static str,
+}
+
 /// A release that ships one or more coupled models.
 pub struct Bundle {
     /// Name used with `escpod demux models fetch <name>`.
@@ -118,38 +144,88 @@ pub struct Bundle {
     /// One-line description for `models list`.
     pub description: &'static str,
     pub members: &'static [Member],
+    /// Non-model files the bundle directory needs (empty for bundles whose
+    /// members are used as standalone files).
+    pub extras: &'static [Extra],
 }
 
 /// The pinned manifest.
 ///
 /// sha256 values are taken from the release's `BUNDLE.json` and independently
 /// re-hashed from the downloaded artifacts before being recorded here.
-pub const BUNDLES: &[Bundle] = &[Bundle {
-    name: "wdx4_rna004",
-    tag: "wdx4_rna004_bundle@v1.1.0",
-    asset: "wdx4_rna004_bundle@v1.1.0.zip",
-    description: "RNA004 boundary CNN + WDX4 barcode GBM (matched pair)",
-    members: &[
-        Member {
-            id: "adapter_rna004",
-            version: "1.1.0",
-            kind: ModelKind::Boundary,
-            chemistry: "rna004",
-            archive_path: "adapter_rna004@v1.1.0/adapter_rna004.onnx",
-            file: "adapter_rna004.onnx",
-            sha256: "b59f8667187ef9fa7e940cd37b108f8d5f3c6d6213ca841cda6eced0e33d26b5",
-        },
-        Member {
-            id: "barcode_wdx4_rna004",
-            version: "1.1.0",
+pub const BUNDLES: &[Bundle] = &[
+    Bundle {
+        name: "wdx4_rna004",
+        tag: "wdx4_rna004_bundle@v1.1.0",
+        asset: "wdx4_rna004_bundle@v1.1.0.zip",
+        description: "RNA004 boundary CNN + WDX4 barcode GBM (matched pair)",
+        members: &[
+            Member {
+                id: "adapter_rna004",
+                version: "1.1.0",
+                kind: ModelKind::Boundary,
+                chemistry: "rna004",
+                archive_path: "adapter_rna004@v1.1.0/adapter_rna004.onnx",
+                file: "adapter_rna004.onnx",
+                sha256: "b59f8667187ef9fa7e940cd37b108f8d5f3c6d6213ca841cda6eced0e33d26b5",
+            },
+            Member {
+                id: "barcode_wdx4_rna004",
+                version: "1.1.0",
+                kind: ModelKind::Barcode,
+                chemistry: "rna004",
+                archive_path: "barcode_wdx4_rna004@v1.1.0/barcode_wdx4_rna004.gbm.json",
+                file: "barcode_wdx4_rna004.gbm.json",
+                sha256: "75b74a92a9996bba250b5936c536221f3e156a3dcd1947cb8a046daded4fec1d",
+            },
+        ],
+        extras: &[],
+    },
+    // The CTC-CRF runtime bundle is a *directory*: the encoder is the member,
+    // and the sidecar (which declares the boundary input contract and the
+    // pinned adapter's sha256, #187), the pinned adapter copy and provenance
+    // ride as extras into the same cache directory. That directory is what
+    // `escpod demux --model <dir>` takes, verbatim. v0.3.1 is the sidecar-only
+    // reissue of v0.3.0 that added those declarations; weights identical.
+    Bundle {
+        name: "crf_nbc16_rna004",
+        tag: "barcode_crf_nbc16_rna004@v0.3.1",
+        asset: "barcode_crf_nbc16_rna004@v0.3.1.zip",
+        description: "RNA004 CTC-CRF 16-plex runtime bundle (encoder + pinned boundary CNN)",
+        members: &[Member {
+            id: "barcode_crf_nbc16_rna004",
+            version: "0.3.1",
             kind: ModelKind::Barcode,
             chemistry: "rna004",
-            archive_path: "barcode_wdx4_rna004@v1.1.0/barcode_wdx4_rna004.gbm.json",
-            file: "barcode_wdx4_rna004.gbm.json",
-            sha256: "75b74a92a9996bba250b5936c536221f3e156a3dcd1947cb8a046daded4fec1d",
-        },
-    ],
-}];
+            archive_path: "barcode_crf_nbc16_rna004@v0.3.1/barcode_crf_nbc16_rna004.onnx",
+            file: "barcode_crf_nbc16_rna004.onnx",
+            sha256: "412cc501190266126e3084694e0986b9b45dfc50aba413ca1fba2ef1dd8591cd",
+        }],
+        extras: &[
+            Extra {
+                into: "barcode_crf_nbc16_rna004@v0.3.1",
+                archive_path: "barcode_crf_nbc16_rna004@v0.3.1/metadata.json",
+                file: "metadata.json",
+                kind: ModelKind::Sidecar,
+                sha256: "67e332b4ba001f32205a605391f6f1d8d30cff0900739ecf0c6fdd4f441ca109",
+            },
+            Extra {
+                into: "barcode_crf_nbc16_rna004@v0.3.1",
+                archive_path: "barcode_crf_nbc16_rna004@v0.3.1/adapter_rna004.onnx",
+                file: "adapter_rna004.onnx",
+                kind: ModelKind::Boundary,
+                sha256: "b59f8667187ef9fa7e940cd37b108f8d5f3c6d6213ca841cda6eced0e33d26b5",
+            },
+            Extra {
+                into: "barcode_crf_nbc16_rna004@v0.3.1",
+                archive_path: "barcode_crf_nbc16_rna004@v0.3.1/provenance.json",
+                file: "provenance.json",
+                kind: ModelKind::Sidecar,
+                sha256: "f23d0acaa9366e66e639dc45336fe94cf004b8d9f1d63afc9a7771f2c087681f",
+            },
+        ],
+    },
+];
 
 /// Every member across every bundle.
 pub fn members() -> impl Iterator<Item = (&'static Bundle, &'static Member)> {
@@ -246,11 +322,13 @@ pub enum ModelsCommand {
     #[command(after_help = "\
 Examples:
   escpod demux models fetch wdx4_rna004
+  escpod demux models fetch crf_nbc16_rna004
   escpod demux models fetch --all
 
 Fetches a matched bundle, not individual models: the barcode classifier is
 trained against a specific boundary model's output, and mixing them silently
-loses accuracy.
+loses accuracy. The CRF bundle caches a complete runtime directory — pass it
+to `escpod demux --model <dir>` as-is ('models list' prints the path).
 ")]
     Fetch {
         /// Bundle name to download (omit and pass --all for every bundle)
@@ -293,6 +371,28 @@ fn list() -> Result<()> {
                 m.kind.as_str(),
                 m.chemistry,
                 status
+            );
+        }
+        for x in b.extras {
+            let status = if dir.join(x.into).join(x.file).exists() {
+                "cached"
+            } else {
+                "not cached"
+            };
+            println!(
+                "  {:<28} {:<9} {:<8} {}",
+                format!("{}/{}", x.into, x.file),
+                x.kind.as_str(),
+                "-",
+                status
+            );
+        }
+        if !b.extras.is_empty() {
+            // The directory, not any single file, is the unit this bundle is
+            // used as.
+            println!(
+                "  use: escpod demux <in.pod5> --model {} -d out/",
+                dir.join(b.extras[0].into).display()
             );
         }
     }
@@ -339,11 +439,49 @@ fn fetch(_name: Option<String>, _all: bool) -> Result<()> {
     );
 }
 
-/// Download one bundle, verify every member's sha256, and write them into the
-/// cache. Members already present with a matching hash are left alone, so a
-/// re-run is cheap and a partially-populated cache self-heals.
+/// Uniform view of one file a bundle materialises into the cache. Members and
+/// extras differ in what they *are*, not in how they are downloaded, verified
+/// or published, so the fetch path sees only this.
 #[cfg(feature = "model-fetch")]
-fn fetch_bundle(bundle: &Bundle) -> Result<()> {
+struct Fetchable {
+    /// Human label for logs (`id@vX.Y.Z` or `id@vX.Y.Z/file`).
+    label: String,
+    /// Cache subdirectory the file lands in (a member's `full_id`, or an
+    /// extra's `into` — which points at a member's `full_id` by construction).
+    subdir: String,
+    file: &'static str,
+    archive_path: &'static str,
+    sha256: &'static str,
+}
+
+#[cfg(feature = "model-fetch")]
+fn fetchables(bundle: &'static Bundle) -> Vec<Fetchable> {
+    bundle
+        .members
+        .iter()
+        .map(|m| Fetchable {
+            label: m.full_id(),
+            subdir: m.full_id(),
+            file: m.file,
+            archive_path: m.archive_path,
+            sha256: m.sha256,
+        })
+        .chain(bundle.extras.iter().map(|x| Fetchable {
+            label: format!("{}/{}", x.into, x.file),
+            subdir: x.into.to_string(),
+            file: x.file,
+            archive_path: x.archive_path,
+            sha256: x.sha256,
+        }))
+        .collect()
+}
+
+/// Download one bundle, verify every file's sha256 (members and extras alike),
+/// and write them into the cache. Files already present with a matching hash
+/// are left alone, so a re-run is cheap and a partially-populated cache
+/// self-heals.
+#[cfg(feature = "model-fetch")]
+fn fetch_bundle(bundle: &'static Bundle) -> Result<()> {
     use anyhow::Context;
     use std::io::Read;
     use tracing::{info, warn};
@@ -352,22 +490,19 @@ fn fetch_bundle(bundle: &Bundle) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating cache directory {}", dir.display()))?;
 
-    // Skip the download entirely when every member is already good.
+    // Skip the download entirely when every file is already good.
     let mut missing = Vec::new();
-    for m in bundle.members {
-        let dest = dir.join(m.full_id()).join(m.file);
+    for f in fetchables(bundle) {
+        let dest = dir.join(&f.subdir).join(f.file);
         match std::fs::read(&dest) {
-            Ok(bytes) if sha256_hex(&bytes) == m.sha256 => {
-                info!("{} already cached ({})", m.full_id(), dest.display());
+            Ok(bytes) if sha256_hex(&bytes) == f.sha256 => {
+                info!("{} already cached ({})", f.label, dest.display());
             }
             Ok(_) => {
-                warn!(
-                    "{} cached copy failed checksum; re-downloading",
-                    m.full_id()
-                );
-                missing.push(m);
+                warn!("{} cached copy failed checksum; re-downloading", f.label);
+                missing.push(f);
             }
-            Err(_) => missing.push(m),
+            Err(_) => missing.push(f),
         }
     }
     if missing.is_empty() {
@@ -379,42 +514,42 @@ fn fetch_bundle(bundle: &Bundle) -> Result<()> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&body))
         .with_context(|| format!("opening {} as a zip archive", bundle.asset))?;
 
-    for m in missing {
-        let mut entry = archive.by_name(m.archive_path).with_context(|| {
+    for f in missing {
+        let mut entry = archive.by_name(f.archive_path).with_context(|| {
             format!(
                 "{} does not contain {} (release layout changed?)",
-                bundle.asset, m.archive_path
+                bundle.asset, f.archive_path
             )
         })?;
         let mut bytes = Vec::with_capacity(entry.size() as usize);
         entry
             .read_to_end(&mut bytes)
-            .with_context(|| format!("extracting {}", m.archive_path))?;
+            .with_context(|| format!("extracting {}", f.archive_path))?;
 
         let got = sha256_hex(&bytes);
-        if got != m.sha256 {
+        if got != f.sha256 {
             bail!(
                 "checksum mismatch for {}: expected {}, got {} \
                  (release re-published or download corrupted)",
-                m.full_id(),
-                m.sha256,
+                f.label,
+                f.sha256,
                 got
             );
         }
 
-        let subdir = dir.join(m.full_id());
+        let subdir = dir.join(&f.subdir);
         std::fs::create_dir_all(&subdir)
             .with_context(|| format!("creating {}", subdir.display()))?;
-        let dest = subdir.join(m.file);
+        let dest = subdir.join(f.file);
         // Atomic publish: write beside the target, then rename, so a killed
         // fetch never leaves a half-written model that `resolve` would accept.
-        let tmp = subdir.join(format!(".{}.tmp", m.file));
+        let tmp = subdir.join(format!(".{}.tmp", f.file));
         std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &dest)
             .with_context(|| format!("moving {} into place", dest.display()))?;
         info!(
             "cached {} ({} bytes) -> {}",
-            m.full_id(),
+            f.label,
             bytes.len(),
             dest.display()
         );
@@ -574,6 +709,33 @@ mod tests {
                     "{} archive_path should be namespaced by full_id",
                     m.id
                 );
+                assert_ne!(
+                    m.kind,
+                    ModelKind::Sidecar,
+                    "{} members are models; Sidecar is for extras",
+                    m.id
+                );
+            }
+            for x in b.extras {
+                assert_eq!(x.sha256.len(), 64, "{} sha256 must be 64 hex chars", x.file);
+                assert!(
+                    x.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{} sha256 must be hex",
+                    x.file
+                );
+                assert_eq!(
+                    x.archive_path,
+                    format!("{}/{}", x.into, x.file),
+                    "extras live beside their bundle's files in the archive"
+                );
+                // An extra must ride inside a directory a member anchors, or
+                // the cached directory has no model and nothing resolves it.
+                assert!(
+                    b.members.iter().any(|m| m.full_id() == x.into),
+                    "{}/{} lands in a directory no member anchors",
+                    x.into,
+                    x.file
+                );
             }
         }
     }
@@ -589,18 +751,42 @@ mod tests {
     }
 
     /// The coupling this whole design exists to protect: a bundle that ships a
-    /// barcode model must also ship the boundary model it was trained against.
+    /// barcode model must also ship the boundary model it was trained against —
+    /// as a member, or pinned inside the runtime directory as an extra.
     #[test]
     fn barcode_models_travel_with_a_boundary_model() {
         for b in BUNDLES {
             if b.members.iter().any(|m| m.kind == ModelKind::Barcode) {
                 assert!(
-                    b.members.iter().any(|m| m.kind == ModelKind::Boundary),
+                    b.members.iter().any(|m| m.kind == ModelKind::Boundary)
+                        || b.extras.iter().any(|x| x.kind == ModelKind::Boundary),
                     "{} ships a barcode model without its boundary model",
                     b.name
                 );
             }
         }
+    }
+
+    /// The CRF runtime bundle must cache a *complete* `--model` directory:
+    /// the sidecar that names everything, and the pinned boundary weights the
+    /// sidecar's sha256 declaration covers (#187). Without either, the cached
+    /// directory looks fetchable but cannot run.
+    #[test]
+    fn crf_bundle_caches_a_runnable_directory() {
+        let b = find_bundle("crf_nbc16_rna004").expect("crf bundle in manifest");
+        let dir = &b.members[0].full_id();
+        assert!(
+            b.extras
+                .iter()
+                .any(|x| x.file == "metadata.json" && x.into == *dir),
+            "no metadata sidecar in the runtime directory"
+        );
+        assert!(
+            b.extras
+                .iter()
+                .any(|x| x.kind == ModelKind::Boundary && x.into == *dir),
+            "no pinned boundary weights in the runtime directory"
+        );
     }
 
     #[test]
