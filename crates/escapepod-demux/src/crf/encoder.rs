@@ -160,6 +160,20 @@ pub struct BoundarySpec {
     /// Registry id of that model, for provenance in logs.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Lowercase-hex sha256 of the pinned ONNX, as built into the bundle.
+    /// The pinned copy is the one bundle file the registry manifest does not
+    /// hash, so this declaration is what makes it verifiable; the runtime
+    /// checks it before trusting the pin.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// The input tensor the pinned model consumes. Absent in bundles built
+    /// before escapepod-models shipped the contract; the runtime then assumes
+    /// the legacy rna004 geometry, which is what those models trained with.
+    ///
+    /// Lives in [`crate::crf`] rather than here so the pin plumbing can name
+    /// it in builds without `crf-decode`.
+    #[serde(default)]
+    pub input: Option<crate::crf::BoundaryInputSpec>,
 }
 
 fn default_onnx_name() -> String {
@@ -532,6 +546,47 @@ mod tests {
         assert_eq!(m.t_len(), 200);
         assert_eq!(m.layout().unwrap().n_score, 1280);
         assert_eq!(m.min_adapter_end(), 2200);
+    }
+
+    /// The boundary block's `input` contract and `sha256` are optional
+    /// (bundles from before escapepod-models shipped them), and parse when
+    /// present (#187).
+    #[test]
+    fn boundary_input_contract_is_optional_and_parses() {
+        let bare: BoundarySpec = serde_json::from_str(
+            r#"{"method": "cnn", "onnx": "adapter.onnx", "model_id": "adapter_rna004@v1.1.0"}"#,
+        )
+        .unwrap();
+        assert!(bare.input.is_none());
+        assert!(bare.sha256.is_none());
+
+        let declared: BoundarySpec = serde_json::from_str(
+            r#"{
+              "method": "cnn",
+              "onnx": "adapter.onnx",
+              "model_id": "adapter_rna004@v1.1.0",
+              "sha256": "b59f8667187ef9fa7e940cd37b108f8d5f3c6d6213ca841cda6eced0e33d26b5",
+              "input": {
+                "min_obs_adapter": 1000,
+                "max_obs_trace": 16000,
+                "downscale_factor": 10,
+                "input_len": 1500,
+                "pad_value": -5.0,
+                "source": "escapepod_models.config.DataConfig"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            declared.sha256.as_deref(),
+            Some("b59f8667187ef9fa7e940cd37b108f8d5f3c6d6213ca841cda6eced0e33d26b5")
+        );
+        let input = declared.input.expect("input block present");
+        assert_eq!(input.min_obs_adapter, 1000);
+        assert_eq!(input.max_obs_trace, 16000);
+        assert_eq!(input.downscale_factor, 10);
+        assert_eq!(input.input_len, 1500);
+        assert_eq!(input.pad_value, -5.0);
     }
 
     #[test]

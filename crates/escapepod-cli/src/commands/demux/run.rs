@@ -726,7 +726,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         },
     };
     // A CRF bundle may pin the boundary detector it was trained against; the
-    // ONNX path in the sidecar is relative to the bundle directory.
+    // ONNX path in the sidecar is relative to the bundle directory, and the
+    // sidecar may declare the input tensor that detector consumes and the
+    // sha256 of the weights it shipped (#187).
     #[cfg(feature = "crf-decode")]
     let boundary_pin = match (&model, &crf_dir_for_pin) {
         (ClassifyModel::Crf(h), Some(dir)) => h.encoder.metadata().boundary.as_ref().map(|b| {
@@ -737,12 +739,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                     style::value(id)
                 );
             }
-            (b.method.as_str(), b.onnx.as_ref().map(|o| dir.join(o)))
+            BoundaryPin {
+                method: b.method.clone(),
+                onnx: b.onnx.as_ref().map(|o| dir.join(o)),
+                input: b.input,
+                sha256: b.sha256.clone(),
+            }
         }),
         _ => None,
     };
     #[cfg(not(feature = "crf-decode"))]
-    let boundary_pin: Option<(&str, Option<PathBuf>)> = None;
+    let boundary_pin: Option<BoundaryPin> = None;
 
     let detector = build_detector(&args, boundary_pin)?;
 
@@ -2195,12 +2202,21 @@ fn spawn_class_writer(
 /// asked for by name. Explicit `--method` overrides a pin — that has to stay
 /// possible to evaluate a new boundary model — except that a bundle pinning
 /// `cnn` refuses the downgrade, which is #16's runtime guard.
-fn build_detector(
-    args: &RunArgs,
-    pin: Option<(&str, Option<PathBuf>)>,
-) -> anyhow::Result<Detector> {
-    let pinned_method = pin.as_ref().map(|(m, _)| *m);
-    let pinned_onnx = pin.and_then(|(_, p)| p);
+/// What a CRF bundle pins for boundary detection, lifted out of the sidecar
+/// with the ONNX path resolved against the bundle directory.
+struct BoundaryPin {
+    method: String,
+    onnx: Option<PathBuf>,
+    input: Option<escapepod_demux::crf::BoundaryInputSpec>,
+    sha256: Option<String>,
+}
+
+fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<Detector> {
+    let (pinned_method, pinned_onnx, pinned_input, pinned_sha) = match pin {
+        Some(p) => (Some(p.method), p.onnx, p.input, p.sha256),
+        None => (None, None, None, None),
+    };
+    let pinned_method = pinned_method.as_deref();
     let method = match (args.method.as_deref(), pinned_method) {
         (Some("llr"), Some("cnn")) => anyhow::bail!(
             "this model is calibrated against CNN adapter boundaries and refuses \
@@ -2237,30 +2253,117 @@ fn build_detector(
                              does not ship a boundary model)"
                         )
                     })?;
+                // The bundle names the exact bytes it pinned; refuse to run
+                // different ones (a truncated fetch, a hand-edited bundle).
+                // Only when the pinned file is what loads — an explicit
+                // --cnn-model already chose different weights deliberately.
+                #[cfg(feature = "model-fetch")]
+                if args.cnn_model.is_none()
+                    && let (Some(expect), Some(p)) = (pinned_sha.as_deref(), pinned_onnx.as_ref())
+                {
+                    verify_pinned_sha256(p, expect)?;
+                }
+                #[cfg(not(feature = "model-fetch"))]
+                if pinned_sha.is_some() && args.cnn_model.is_none() {
+                    tracing::warn!(
+                        "the bundle declares its pinned boundary model's sha256, but this \
+                         build lacks `model-fetch` and cannot verify it"
+                    );
+                }
+                // Prep with the geometry the bundle declares for its pinned
+                // model (#187) — but only when that model is what's running.
+                // An explicit --cnn-model is a different set of weights, whose
+                // geometry the bundle cannot speak for; those get the legacy
+                // defaults, as does a bundle from before the contract existed
+                // (the defaults are what its model trained with).
+                let config = match (&args.cnn_model, pinned_input) {
+                    (None, Some(spec)) => {
+                        escapepod_demux::AdapterCnnConfig::from_bundle_input(&spec)
+                            .map_err(|e| anyhow::anyhow!("bundle boundary.input: {e}"))?
+                    }
+                    _ => escapepod_demux::AdapterCnnConfig::default(),
+                };
                 // `--gpu` with `--method cnn` runs detection on the GPU (one
                 // batched onnxruntime call per block) when built with cnn-gpu.
                 #[cfg(feature = "cnn-gpu")]
                 if args.gpu {
                     return Ok(Detector::CnnGpu(Box::new(
-                        escapepod_demux::AdapterCnnGpu::load_with_threads(
+                        escapepod_demux::AdapterCnnGpu::load_with_config(
                             path,
-                            crate::threads::width(),
+                            config,
+                            Some(crate::threads::width()),
                         )
                         .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
                     )));
                 }
                 Ok(Detector::Cnn(Box::new(
-                    escapepod_demux::AdapterCnn::load(path)
+                    escapepod_demux::AdapterCnn::load_with_config(path, config)
                         .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?,
                 )))
             }
             #[cfg(not(feature = "cnn-detect"))]
             {
-                let _ = pinned_onnx;
+                let _ = (pinned_onnx, pinned_input, pinned_sha);
                 anyhow::bail!("--method cnn requires a build with `--features cnn-detect`")
             }
         }
         other => anyhow::bail!("unknown --method `{other}`; expected `llr` or `cnn`"),
+    }
+}
+
+/// Refuse to run pinned boundary weights whose bytes are not the ones the
+/// bundle was built with. The pinned copy is the one bundle file the registry
+/// manifest does not hash, which is why the sidecar declares it
+/// (escapepod-models#56); a mismatch means a corrupt or edited bundle, and
+/// running it anyway would silently degrade every downstream barcode call.
+#[cfg(all(feature = "cnn-detect", feature = "model-fetch"))]
+fn verify_pinned_sha256(path: &Path, expect: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("reading pinned boundary model {}: {e}", path.display()))?;
+    // Same formatting as models.rs::sha256_hex, not a call to it: that helper
+    // sits behind `demux-models`, a feature this path does not otherwise need.
+    let digest = Sha256::digest(&bytes);
+    let mut got = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(got, "{b:02x}");
+    }
+    if !got.eq_ignore_ascii_case(expect) {
+        anyhow::bail!(
+            "pinned boundary model {} hashes {got} but the bundle declares {expect}: the \
+             bundle is corrupt or was edited after it was built; re-fetch it (`escpod demux \
+             models fetch`)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "cnn-detect", feature = "model-fetch"))]
+mod pinned_sha_tests {
+    use super::*;
+
+    #[test]
+    fn verify_accepts_the_built_bytes_and_refuses_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("adapter.onnx");
+        std::fs::write(&p, b"weights").unwrap();
+
+        // sha256("weights"), computed independently of the code under test.
+        let expect = "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c";
+        verify_pinned_sha256(&p, expect).expect("matching bytes verify");
+        verify_pinned_sha256(&p, &expect.to_uppercase()).expect("hex case is not a mismatch");
+
+        let err = verify_pinned_sha256(&p, "deadbeef")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("declares deadbeef"), "unhelpful error: {err}");
+
+        let err = verify_pinned_sha256(&dir.path().join("missing.onnx"), expect)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading pinned boundary model"), "{err}");
     }
 }
 
