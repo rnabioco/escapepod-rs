@@ -193,6 +193,9 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
                 Some(o) => field("weights", format!("{o} (bundled)")),
                 None => field("weights", "not bundled — supply --cnn-model"),
             }
+            if let Some(sha) = &b.sha256 {
+                field("sha256", format!("{sha} (checked at run)"));
+            }
             match &b.input {
                 Some(i) => field(
                     "input",
