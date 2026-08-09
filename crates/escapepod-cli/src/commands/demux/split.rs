@@ -2,7 +2,9 @@
 
 use crate::style;
 use escapepod_signal::Durability;
-use escapepod_signal::operations::{FilterOptions, parse_barcode_mapping, subset_files};
+use escapepod_signal::operations::{
+    FilterOptions, parse_barcode_mapping, read_annotation, subset_files,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -18,8 +20,22 @@ pub struct SplitArgs {
     pub input: Vec<PathBuf>,
 
     /// Classifications CSV file (from classify command)
-    #[arg(long, required = true, value_name = "FILE")]
-    pub classifications: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "sidecar",
+        conflicts_with = "sidecar",
+        value_name = "FILE"
+    )]
+    pub classifications: Option<PathBuf>,
+
+    /// Read assignments from each input's .p5s sidecar (written by
+    /// `escpod annotate`) instead of a classifications CSV
+    #[arg(long)]
+    pub sidecar: bool,
+
+    /// Annotation name to read from the sidecar (with --sidecar)
+    #[arg(long, default_value = "barcode", value_name = "NAME")]
+    pub annotation: String,
 
     /// Output directory for demultiplexed files
     #[arg(short = 'd', long, required = true, value_name = "DIR")]
@@ -69,11 +85,18 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
         style::label("Input:"),
         style::count(args.input.len())
     );
-    info!(
-        "{} {}",
-        style::label("Classifications:"),
-        style::path(args.classifications.display())
-    );
+    match &args.classifications {
+        Some(csv) => info!(
+            "{} {}",
+            style::label("Classifications:"),
+            style::path(csv.display())
+        ),
+        None => info!(
+            "{} .p5s sidecar, annotation '{}'",
+            style::label("Classifications:"),
+            args.annotation
+        ),
+    }
     info!(
         "{} {}",
         style::label("Output dir:"),
@@ -85,9 +108,21 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     // Create output directory if it doesn't exist
     fs::create_dir_all(&args.output_dir)?;
 
-    // Parse the classifications CSV
+    // Load assignments: from the classifications CSV, or from each input's
+    // .p5s sidecar (merged — sidecars are per-file).
     info!("{} classifications...", style::action("Loading"));
-    let barcode_mapping = parse_barcode_mapping(&args.classifications)?;
+    let barcode_mapping = match &args.classifications {
+        Some(csv) => parse_barcode_mapping(csv)?,
+        None => {
+            let mut merged: HashMap<Uuid, String> = HashMap::new();
+            for input in &args.input {
+                let annotation = read_annotation(input, Some(&args.annotation))
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", input.display()))?;
+                merged.extend(annotation.to_map());
+            }
+            merged
+        }
+    };
     info!(
         "{} {} classified reads",
         style::label("Loaded:"),

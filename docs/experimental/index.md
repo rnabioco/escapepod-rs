@@ -10,11 +10,64 @@ with Cargo features.
 |---------|-------------|---------|
 | [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
 | [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
-| `index` | `--features experimental` | Build `.p5i` sidecar indexes for O(1) read-ID lookup |
+| `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(1) read-ID lookup |
+| `annotate` | `--features experimental` | Record per-read annotations (demux barcodes) in the `.p5s` sidecar |
 
-The `index` command is intentionally undocumented in depth — it builds a read-ID
-sidecar but the speedup vs. a direct scan is marginal for typical file sizes,
-and the format is subject to change.
+## The `.p5s` sidecar
+
+`reads.pod5` gets one companion file, `reads.pod5.p5s`, holding any
+combination of a read index (`escpod index`) and named per-read annotations
+(`escpod annotate`). The POD5 itself is **never modified** — raw sequencer
+output stays byte-identical and checksummable; deleting an annotation is
+editing or deleting the sidecar.
+
+The sidecar is a plain Arrow IPC (Feather v2) table — one row per read,
+`read_id | batch_idx | row_idx` plus one dictionary-encoded column per
+annotation — so it is directly readable without escapepod:
+
+```python
+import pyarrow.ipc as ipc
+table = ipc.open_file("reads.pod5.p5s").read_all()
+```
+
+The sidecar is bound to its POD5 by file-identifier UUID and byte size
+(stored in the Arrow schema metadata, checked before any data is decoded);
+a stale sidecar or one copied next to the wrong file fails loudly. Writes
+are atomic and section-preserving: `index` keeps annotations, `annotate`
+keeps the index and other annotations.
+
+Typical demux flow, with no intermediate per-barcode POD5s kept around:
+
+```bash
+escpod demux detect … | escpod demux basecall --barcodes … -o demux.csv
+escpod annotate -a demux.csv reads.pod5      # record assignments in reads.pod5.p5s
+escpod demux split reads.pod5 --sidecar -d out/   # materialize per-barcode files on demand
+```
+
+The sidecar can also carry the **experimental design** — a samplesheet
+mapping barcode labels (or combinations of annotations, e.g. `ldx,edx`) to
+experimental variables:
+
+```bash
+cat samplesheet.csv
+# barcode,condition,replicate
+# nbc01,fresh_edx01,r1
+# …
+escpod annotate --design samplesheet.csv reads.pod5
+escpod demux split reads.pod5 --sidecar --annotation condition -d by_condition/
+```
+
+The design table is stored as JSON in the sidecar's schema metadata
+(`escapepod:design`), and each of its variables is materialized as a derived
+per-read column by joining across the key annotations — so `split`, pyarrow
+filtering, and `reader.annotation("condition")` all work with no join logic.
+Key columns are auto-detected (CSV columns that name an existing annotation;
+override with `--keys`). Rewriting a key annotation (say, re-demuxing
+`barcode`) automatically re-derives the dependent columns, and writing a
+derived column directly is refused — update the design instead.
+
+This format replaces the earlier `.p5i` index sidecar; delete any `.p5i`
+files and rerun `escpod index`.
 
 ## Building
 

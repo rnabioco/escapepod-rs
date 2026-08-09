@@ -1,11 +1,9 @@
 //! Read UUID index for fast lookup by read ID.
+//!
+//! Persisted as the `batch_idx`/`row_idx` columns of the `.p5s` sidecar
+//! (see [`crate::sidecar`]); this type is the in-memory, UUID-sorted form.
 
 use crate::types::Uuid;
-
-/// Magic bytes for the `.p5i` sidecar index file.
-pub(super) const P5I_MAGIC: &[u8; 4] = b"P5IX";
-/// Current `.p5i` format version.
-pub(super) const P5I_VERSION: u8 = 1;
 
 pub struct ReadIndex {
     /// (uuid_bytes, batch_idx, row_idx) sorted by UUID for binary search.
@@ -33,5 +31,17 @@ impl ReadIndex {
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The `(uuid bytes, batch, row)` entries, sorted by UUID.
+    pub fn entries(&self) -> &[([u8; 16], u32, u32)] {
+        &self.entries
+    }
+
+    /// Iterate over all read UUIDs, in UUID order.
+    pub fn uuids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.entries
+            .iter()
+            .map(|&(bytes, _, _)| Uuid::from_bytes(bytes))
     }
 }

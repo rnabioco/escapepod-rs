@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run --release --example bench_reads_by_ids -- <pod5_file> [num_target_ids]
 //!
-//! Temporarily hides the .p5i sidecar to measure the scan path separately.
+//! Temporarily hides the .p5s sidecar to measure the scan path separately.
 
 use escapepod_signal::Reader;
 use std::collections::HashSet;
@@ -19,12 +19,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pod5_path = &args[1];
     let num_targets: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
 
-    let p5i_path = PathBuf::from(format!("{}.p5i", pod5_path));
-    let p5i_hidden = PathBuf::from(format!("{}.p5i.bench_hidden", pod5_path));
+    let p5i_path = PathBuf::from(format!("{}.p5s", pod5_path));
+    let p5i_hidden = PathBuf::from(format!("{}.p5s.bench_hidden", pod5_path));
     let has_index = p5i_path.exists();
 
     println!("Opening: {}", pod5_path);
-    println!("Index:   {}", if has_index { "yes (.p5i)" } else { "no" });
+    println!("Index:   {}", if has_index { "yes (.p5s)" } else { "no" });
 
     let reader = Reader::open(pod5_path)?;
 
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             elapsed,
         );
 
-        // --- Benchmark 2: reads_by_ids() without index (hide .p5i) ---
+        // --- Benchmark 2: reads_by_ids() without index (hide .p5s) ---
         println!("\n=== reads_by_ids() [scan, no index] ===");
         std::fs::rename(&p5i_path, &p5i_hidden)?;
         let reader = Reader::open(pod5_path)?;

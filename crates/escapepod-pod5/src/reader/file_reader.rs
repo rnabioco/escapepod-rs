@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use super::read_index::{P5I_MAGIC, P5I_VERSION, ReadIndex};
+use super::read_index::ReadIndex;
 use super::read_iter::{ReadIterator, extract_read_from_batch};
 use super::signal_extractor::SignalExtractor;
 
@@ -87,9 +87,9 @@ pub struct Reader {
     /// footer can't be parsed (callers fall back to the Arrow reader path).
     signal_ipc_footer: OnceLock<Option<ArrowIpcFooter>>,
     /// Cached read UUID index: UUID → (batch_idx, row_within_batch).
-    /// Lazily built on first lookup via `.p5i` sidecar or column-projected scan.
+    /// Lazily built on first lookup via `.p5s` sidecar or column-projected scan.
     read_index: OnceLock<ReadIndex>,
-    /// Path to the POD5 file (for locating `.p5i` sidecar).
+    /// Path to the POD5 file (for locating `.p5s` sidecar).
     file_path: Option<PathBuf>,
 }
 
@@ -1001,22 +1001,25 @@ impl Reader {
     // Read index: cached UUID → (batch_idx, row) mapping
     // ------------------------------------------------------------------
 
-    /// Get the path to the `.p5i` sidecar index file for this POD5.
-    ///
-    /// Appends `.p5i` to the full filename (e.g. `foo.pod5` → `foo.pod5.p5i`),
-    /// mirroring the `samtools index` convention (`foo.bam` → `foo.bam.bai`).
-    fn p5i_path(&self) -> Option<PathBuf> {
-        self.file_path.as_ref().map(|p| {
-            let mut s = p.as_os_str().to_owned();
-            s.push(".p5i");
-            PathBuf::from(s)
+    /// Get the path to the `.p5s` sidecar file for this POD5.
+    fn p5s_path(&self) -> Option<PathBuf> {
+        self.file_path.as_ref().map(crate::sidecar::sidecar_path)
+    }
+
+    /// The identity a `.p5s` sidecar for this file must be bound to.
+    pub fn sidecar_identity(&self) -> Result<crate::sidecar::Pod5Identity> {
+        let file_id = Uuid::parse_str(self.file_identifier())
+            .map_err(|e| Error::InvalidUuid(e.to_string()))?;
+        Ok(crate::sidecar::Pod5Identity {
+            file_id,
+            size: self.mmap.len() as u64,
         })
     }
 
     /// Build the read index from a column-projected scan of the reads table.
     ///
     /// Projects only column 0 (read_id) to avoid parsing all 22 columns.
-    fn build_read_index_from_scan(&self) -> Result<ReadIndex> {
+    pub(crate) fn build_read_index_from_scan(&self) -> Result<ReadIndex> {
         use arrow::array::{Array, AsArray};
 
         let embedded = self
@@ -1050,83 +1053,29 @@ impl Reader {
         Ok(ReadIndex { entries })
     }
 
-    /// Try to load the read index from a `.p5i` sidecar file.
+    /// Try to load the read index from the `.p5s` sidecar.
     ///
-    /// Returns `Ok(None)` if the sidecar doesn't exist.
-    /// Returns `Err` if the sidecar exists but is invalid or stale.
-    fn load_p5i_index(&self) -> Result<Option<ReadIndex>> {
-        use std::io::Read as _;
-
-        let p5i_path = match self.p5i_path() {
+    /// Returns `Ok(None)` if no sidecar exists.
+    /// Returns `Err` if one exists but is invalid or stale.
+    fn load_sidecar_index(&self) -> Result<Option<ReadIndex>> {
+        let p5s_path = match self.p5s_path() {
             Some(p) => p,
             None => return Ok(None),
         };
-        let mut file = match File::open(&p5i_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::from(e)),
+        let sidecar = match crate::sidecar::read_sidecar_file(&p5s_path, &self.sidecar_identity()?)?
+        {
+            Some(s) => s,
+            None => return Ok(None),
         };
-
-        // Header: magic (4) + version (1) + file_id (16) + file_size (8) + count (4) = 33
-        let mut header = [0u8; 33];
-        file.read_exact(&mut header)
-            .map_err(|_| Error::InvalidFooter("truncated .p5i header".to_string()))?;
-
-        if &header[0..4] != P5I_MAGIC {
-            return Err(Error::InvalidFooter("invalid .p5i magic bytes".to_string()));
-        }
-        if header[4] != P5I_VERSION {
-            return Err(Error::InvalidFooter(format!(
-                ".p5i version {} unsupported (expected {}); rebuild with `escpod index`",
-                header[4], P5I_VERSION
-            )));
-        }
-
-        // Validate file identifier matches
-        let stored_file_id =
-            Uuid::from_slice(&header[5..21]).map_err(|e| Error::InvalidUuid(e.to_string()))?;
-        let our_file_id = Uuid::parse_str(self.file_identifier())
-            .map_err(|e| Error::InvalidUuid(e.to_string()))?;
-        let stored_size = u64::from_le_bytes(header[21..29].try_into().unwrap());
-        let actual_size = self.mmap.len() as u64;
-        if stored_file_id != our_file_id || stored_size != actual_size {
-            return Err(Error::InvalidFooter(
-                ".p5i does not match POD5 file; rebuild with `escpod index`".to_string(),
-            ));
-        }
-
-        let count = u32::from_le_bytes(header[29..33].try_into().unwrap()) as usize;
-
-        // Read remaining bytes and zstd-decompress to get the entries
-        let mut compressed = Vec::new();
-        file.read_to_end(&mut compressed)?;
-        let buf = zstd::decode_all(compressed.as_slice())
-            .map_err(|e| Error::Compression(format!(".p5i decompression failed: {e}")))?;
-
-        if buf.len() != count * 24 {
-            return Err(Error::InvalidFooter(format!(
-                ".p5i entry block corrupt: expected {} bytes, got {}",
-                count * 24,
-                buf.len()
-            )));
-        }
-
-        let mut entries = Vec::with_capacity(count);
-        for i in 0..count {
-            let offset = i * 24;
-            let uuid_bytes: [u8; 16] = buf[offset..offset + 16].try_into().unwrap();
-            let batch_idx = u32::from_le_bytes(buf[offset + 16..offset + 20].try_into().unwrap());
-            let row_idx = u32::from_le_bytes(buf[offset + 20..offset + 24].try_into().unwrap());
-            entries.push((uuid_bytes, batch_idx, row_idx));
-        }
-        entries.sort_unstable_by_key(|e| e.0);
-
-        Ok(Some(ReadIndex { entries }))
+        // Sidecar entries are already UUID-sorted.
+        Ok(Some(ReadIndex {
+            entries: sidecar.entries().to_vec(),
+        }))
     }
 
     /// Get or lazily build the read UUID index.
     ///
-    /// Checks for a `.p5i` sidecar file first; falls back to a
+    /// Checks for a `.p5s` sidecar file first; falls back to a
     /// column-projected scan of the reads table.
     pub fn read_index(&self) -> Result<&ReadIndex> {
         if let Some(idx) = self.read_index.get() {
@@ -1134,50 +1083,30 @@ impl Reader {
         }
         // Build outside the lock — may race with another thread, but
         // get_or_init will discard the extra copy.
-        let index = match self.load_p5i_index()? {
+        let index = match self.load_sidecar_index()? {
             Some(index) => index,
             None => self.build_read_index_from_scan()?,
         };
         Ok(self.read_index.get_or_init(|| index))
     }
 
-    /// Build the read index and write it to a `.p5i` sidecar file.
+    /// Build the read index and write it to the `.p5s` sidecar.
     ///
-    /// This is called by the `escpod index` CLI command.
+    /// Annotations in a valid existing sidecar are preserved; a stale or
+    /// unreadable sidecar is replaced outright (its contents were bound to
+    /// a different file and unusable anyway). This is called by the
+    /// `escpod index` CLI command.
     pub fn build_and_write_index<P: AsRef<Path>>(&self, output: P) -> Result<usize> {
-        use std::io::Write as _;
-
         let index = self.build_read_index_from_scan()?;
         let count = index.len();
+        let identity = self.sidecar_identity()?;
 
-        let mut file = File::create(output.as_ref())?;
-
-        // Header (uncompressed — allows validation before decompressing)
-        file.write_all(P5I_MAGIC)?;
-        file.write_all(&[P5I_VERSION])?;
-        let file_id = Uuid::parse_str(self.file_identifier())
-            .map_err(|e| Error::InvalidUuid(e.to_string()))?;
-        file.write_all(file_id.as_bytes())?;
-        file.write_all(&(self.mmap.len() as u64).to_le_bytes())?;
-        file.write_all(&(count as u32).to_le_bytes())?;
-
-        // Entries — sorted by (batch_idx, row_idx) for compression locality
-        let mut disk_entries = index.entries.clone();
-        disk_entries.sort_unstable_by_key(|e| (e.1, e.2));
-
-        let mut raw = Vec::with_capacity(count * 24);
-        for (uuid_bytes, batch_idx, row_idx) in &disk_entries {
-            raw.extend_from_slice(uuid_bytes);
-            raw.extend_from_slice(&batch_idx.to_le_bytes());
-            raw.extend_from_slice(&row_idx.to_le_bytes());
-        }
-
-        // Zstd-compress the entry block
-        let compressed = zstd::encode_all(raw.as_slice(), 3)
-            .map_err(|e| Error::Compression(format!("zstd compress failed: {e}")))?;
-        file.write_all(&compressed)?;
-
-        file.flush()?;
+        let mut sidecar = match crate::sidecar::read_sidecar_file(output.as_ref(), &identity) {
+            Ok(Some(existing)) => existing,
+            Ok(None) | Err(_) => crate::sidecar::Sidecar::default(),
+        };
+        sidecar.set_entries(index.entries.clone());
+        crate::sidecar::write_sidecar_file(output.as_ref(), &identity, &sidecar)?;
         Ok(count)
     }
 
@@ -1185,19 +1114,19 @@ impl Reader {
     // Targeted batch access — indexed or single-pass
     // ------------------------------------------------------------------
 
-    /// Check whether a read index is already available (`.p5i` sidecar
+    /// Check whether a read index is already available (`.p5s` sidecar
     /// or previously built in-memory) without triggering a build.
     fn has_index(&self) -> bool {
         if self.read_index.get().is_some() {
             return true;
         }
         // Peek for sidecar without loading it yet
-        self.p5i_path().is_some_and(|p| p.exists())
+        self.p5s_path().is_some_and(|p| p.exists())
     }
 
     /// Look up signal rows for a set of target UUIDs.
     ///
-    /// If a `.p5i` index (or in-memory index) exists, uses indexed
+    /// If a `.p5s` index (or in-memory index) exists, uses indexed
     /// batch access (skips non-target batches). Otherwise does a
     /// **single-pass** column-projected scan with inline UUID filtering
     /// — no index is built.
@@ -1230,7 +1159,7 @@ impl Reader {
 
     /// Retrieve full `ReadData` for a set of target UUIDs.
     ///
-    /// **Indexed path** (when `.p5i` sidecar or in-memory index exists):
+    /// **Indexed path** (when `.p5s` sidecar or in-memory index exists):
     /// groups targets by batch, opens a full-column reader, and seeks
     /// directly to each target batch — only the batches that contain
     /// target UUIDs are deserialized.

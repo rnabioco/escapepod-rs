@@ -176,7 +176,7 @@ impl PyReader {
 
     /// Look up a single read by UUID string.
     ///
-    /// Uses the ReadIndex for O(log n) lookup when a .p5i sidecar exists.
+    /// Uses the ReadIndex for O(log n) lookup when a .p5s sidecar exists.
     fn get_read(&self, read_id: &str) -> PyResult<PyReadData> {
         let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
             .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
@@ -194,7 +194,7 @@ impl PyReader {
 
     /// Look up multiple reads by UUID strings.
     ///
-    /// Uses indexed batch-skipping when a .p5i sidecar exists,
+    /// Uses indexed batch-skipping when a .p5s sidecar exists,
     /// otherwise falls back to a single-pass scan with early exit.
     ///
     /// If `missing_ok` is False (default), raises KeyError when any requested
@@ -309,25 +309,107 @@ impl PyReader {
         })
     }
 
-    // -- Index management --------------------------------------------------
+    // -- Sidecar management ------------------------------------------------
 
-    /// Check if a .p5i sidecar index exists for this file.
+    /// Check if a .p5s sidecar exists for this file.
     #[getter]
     fn has_index(&self) -> bool {
-        let mut p5i = self.path.as_os_str().to_owned();
-        p5i.push(".p5i");
-        PathBuf::from(p5i).exists()
+        escapepod_signal::pod5::sidecar::sidecar_path(&self.path).exists()
     }
 
-    /// Build and write a .p5i sidecar index for fast UUID lookups.
+    /// Build and write the .p5s sidecar read index for fast UUID lookups.
     ///
+    /// Annotations already in the sidecar are preserved.
     /// Returns the number of reads indexed.
     fn build_index(&self) -> PyResult<usize> {
-        let mut p5i = self.path.as_os_str().to_owned();
-        p5i.push(".p5i");
         self.inner
-            .build_and_write_index(PathBuf::from(p5i))
+            .build_and_write_index(escapepod_signal::pod5::sidecar::sidecar_path(&self.path))
             .map_err(to_py_err)
+    }
+
+    /// The annotation names available in the .p5s sidecar, in name order.
+    ///
+    /// Empty when no sidecar exists. A sidecar that does not match this
+    /// POD5 (stale or copied from another file) raises instead.
+    fn annotation_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let path = self.path.clone();
+        py.detach(|| {
+            let identity = self.inner.sidecar_identity().map_err(to_py_err)?;
+            let p5s = escapepod_signal::pod5::sidecar::sidecar_path(&path);
+            let sidecar = escapepod_signal::pod5::sidecar::read_sidecar_file(&p5s, &identity)
+                .map_err(to_py_err)?;
+            Ok(sidecar
+                .map(|s| {
+                    s.annotation_names()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
+    }
+
+    /// The experimental design recorded in the .p5s sidecar, or None.
+    ///
+    /// Returns a dict with ``key_columns`` (annotation names forming the
+    /// lookup key), ``value_columns`` (experimental variables, each also
+    /// materialized as a derived annotation), and ``rows`` (list of dicts,
+    /// one per design row).
+    fn design<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let path = self.path.clone();
+        let design = py.detach(|| -> PyResult<_> {
+            let identity = self.inner.sidecar_identity().map_err(to_py_err)?;
+            let p5s = escapepod_signal::pod5::sidecar::sidecar_path(&path);
+            let sidecar = escapepod_signal::pod5::sidecar::read_sidecar_file(&p5s, &identity)
+                .map_err(to_py_err)?;
+            Ok(sidecar.and_then(|s| s.design().cloned()))
+        })?;
+        let Some(design) = design else {
+            return Ok(None);
+        };
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("key_columns", design.key_columns.clone())?;
+        dict.set_item("value_columns", design.value_columns.clone())?;
+        let rows: Vec<std::collections::HashMap<String, String>> = design
+            .rows
+            .iter()
+            .map(|row| {
+                design
+                    .key_columns
+                    .iter()
+                    .chain(&design.value_columns)
+                    .cloned()
+                    .zip(row.iter().cloned())
+                    .collect()
+            })
+            .collect();
+        dict.set_item("rows", rows)?;
+        Ok(Some(dict))
+    }
+
+    /// Read an annotation from the .p5s sidecar as a dict of
+    /// ``read_id -> label`` (read IDs as standard UUID strings).
+    ///
+    /// With ``name=None`` the sidecar must contain exactly one annotation.
+    /// Unassigned reads are absent from the dict. Raises if no sidecar
+    /// exists, if it does not match this POD5, or if the annotation is
+    /// missing.
+    #[pyo3(signature = (name=None))]
+    fn annotation(
+        &self,
+        py: Python<'_>,
+        name: Option<&str>,
+    ) -> PyResult<std::collections::HashMap<String, String>> {
+        let path = self.path.clone();
+        py.detach(|| {
+            let annotation =
+                escapepod_signal::operations::read_annotation(&path, name).map_err(to_py_err)?;
+            Ok(annotation
+                .iter()
+                .map(|(uuid, label)| (uuid.to_string(), label.to_string()))
+                .collect())
+        })
     }
 
     /// Advise the OS to prefetch signal data into memory.
