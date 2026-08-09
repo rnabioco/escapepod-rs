@@ -93,6 +93,40 @@ let all_ids = reader.read_ids()?;
 println!("File contains {} reads", all_ids.len());
 ```
 
+For repeated by-ID lookups, persist the read index in the
+[`.p5s` sidecar](../format/sidecar.md) — subsequent opens load it instead of
+scanning:
+
+```rust linenums="1"
+use escapepod_signal::pod5::sidecar::sidecar_path;
+
+reader.build_and_write_index(sidecar_path(&path))?;
+```
+
+## Sidecar Annotations
+
+Per-read annotations written by `escpod annotate` / `escpod demux
+--annotate` (barcode assignments, design-derived conditions) live in the
+`.p5s` sidecar and are read through `escapepod_signal::operations`:
+
+```rust linenums="1"
+use escapepod_signal::operations::{read_annotation, read_design};
+
+let barcodes = read_annotation(&path, Some("barcode"))?;
+for (read_id, label) in barcodes.iter() {
+    println!("{read_id}\t{label}");
+}
+// Or as the map shape split/subset consume:
+let map = barcodes.to_map();
+
+let design = read_design(&path)?; // key/value columns + samplesheet rows
+```
+
+A sidecar is validated against the POD5's identity on every read — a stale
+or misplaced sidecar returns an error rather than wrong answers. Lower-level
+access (listing annotations, the `Sidecar` type itself) lives in
+`escapepod_signal::pod5::sidecar`.
+
 ## Batch Access
 
 For advanced use cases, access raw Arrow batches:

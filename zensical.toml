@@ -25,6 +25,7 @@ nav = [
   ] },
   { "Experimental" = [
     { "Overview" = "experimental/index.md" },
+    { "annotate" = "experimental/annotate.md" },
     { "repack" = "experimental/repack.md" },
     { "resquiggle" = "experimental/resquiggle.md" },
     { "demux" = "experimental/demux.md" },
@@ -47,6 +48,8 @@ nav = [
     { "Overview" = "format/index.md" },
     { "Container Structure" = "format/container.md" },
     { "Signal Compression" = "format/compression.md" },
+    { "The .p5s Sidecar" = "format/sidecar.md" },
+    { "Segmentation Algorithms" = "format/segmentation.md" },
   ] },
 ]
 

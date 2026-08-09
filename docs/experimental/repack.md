@@ -29,6 +29,7 @@ escpod repack -o <OUTPUT_DIR> [OPTIONS] <FILES>...
 |--------|-------------|
 | `-o, --output-dir <DIR>` | Output directory (required) |
 | `-f, --force` | Overwrite existing files |
+| `--profile` | Print per-phase timing breakdown |
 | `-h, --help` | Print help |
 
 ## Examples
@@ -53,7 +54,7 @@ escpod repack *.pod5 -o repacked/ --force
 
 ### In-Place Repacking
 
-You can safely repack files in place (output to the same directory as input). The command uses temporary files to prevent data corruption:
+You can safely repack files in place (output to the same directory as input); an interrupted run never leaves a damaged file:
 
 ```bash
 escpod repack data/*.pod5 -o data/ --force
@@ -74,4 +75,4 @@ Repacked 50000 reads across 5 file(s)
 - Output files retain the same names as input files
 - Signal data is decompressed and re-compressed during repacking
 - Run info and all metadata is preserved
-- Safe for in-place repacking (uses temporary files)
+- Safe for in-place repacking

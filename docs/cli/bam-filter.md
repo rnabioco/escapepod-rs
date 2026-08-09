@@ -25,6 +25,8 @@ escpod bam-filter -b <BAM> -o <OUTPUT> [OPTIONS] <INPUT>
 | `--mapped` | Keep only mapped reads |
 | `--region <REGION>` | Filter by genomic region (chr or chr:start-end) |
 | `--quality <MAPQ>` | Minimum mapping quality |
+| `-f, --force` | Overwrite the output file if it exists |
+| `--profile` | Print per-phase timing breakdown |
 | `-h, --help` | Print help |
 
 ## Examples

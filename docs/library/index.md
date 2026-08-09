@@ -23,6 +23,8 @@ pulling in signal-processing code.
 - **Write POD5 files** - Create new POD5 files with automatic compression
 - **Signal compression** - VBZ codec (SVB16 + ZSTD) for signal data
 - **Full metadata support** - Read/write run info, calibration, and pore data
+- **Sidecar annotations** - `.p5s` read index plus per-read annotations
+  (demux barcodes, experimental designs), without touching the POD5
 
 ## Quick Example
 

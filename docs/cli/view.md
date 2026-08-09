@@ -20,7 +20,7 @@ escpod view [OPTIONS] <INPUT>
 
 | Option | Description |
 |--------|-------------|
-| `--include <FIELDS>` | Comma-separated list of fields to include |
+| `--include <FIELDS>` | Comma-separated fields to include; names that aren't built-in read fields are read from the [`.p5s` sidecar](../format/sidecar.md) as annotation columns |
 | `--exclude <FIELDS>` | Comma-separated list of fields to exclude |
 | `--ids` | Only show read IDs |
 | `--separator <SEP>` | Field separator (default: tab) |
@@ -84,6 +84,20 @@ escpod view experiment.pod5 -o reads.tsv
 ```bash
 escpod view --include read_id,channel,num_samples experiment.pod5
 ```
+
+### Join Sidecar Annotations
+
+Names that aren't built-in fields resolve as sidecar annotation columns
+(demux barcodes, design-derived conditions) and are appended after the
+built-in columns — unassigned reads get an empty cell:
+
+```bash
+escpod view reads.pod5 --include read_id,num_samples,barcode,condition
+```
+
+A name that matches neither a built-in field nor an annotation is a hard
+error listing what's available. Naming only annotations still emits the
+default built-in columns so rows stay keyed by `read_id`.
 
 ### CSV Output
 
