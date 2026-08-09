@@ -48,6 +48,10 @@ escpod view experiment.pod5
 # Merge multiple files, then filter by read ID
 escpod merge -o combined.pod5 run1.pod5 run2.pod5
 escpod filter -i interesting_reads.txt -o subset.pod5 combined.pod5
+
+# Demux into the .p5s sidecar (POD5 untouched), pull groups on demand
+escpod demux combined.pod5 --model <bundle> --annotate
+escpod filter combined.pod5 --annotation barcode=nbc05 -o nbc05.pod5
 ```
 
 See the [CLI Reference](cli/index.md) for every command.
@@ -94,6 +98,7 @@ See the [Rust Library](library/index.md) for the full crate API.
 ## Documentation
 
 - [CLI Reference](cli/index.md) — every `escpod` command
+- [Experimental](experimental/index.md) — demux, annotations, the `.p5s` sidecar
 - [Python API](python/index.md) — reading and writing POD5 from Python
 - [Rust Library](library/index.md) — using escapepod in your Rust projects
-- [File Format](format/index.md) — technical details of the POD5 container
+- [File Format](format/index.md) — technical details of the POD5 container and sidecar

@@ -31,7 +31,51 @@ accuracy.
     GPU **CNN adapter detection** (`--method cnn --gpu`, `cnn-gpu`) is the GPU
     path that does pay off — that stage is genuinely inference-bound.
 
-Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode.
+Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode — or records the assignments in the [`.p5s` sidecar](../format/sidecar.md) so nothing needs splitting at all.
+
+## Fused pipeline (recommended)
+
+Running `escpod demux` with no subcommand streams the whole pipeline —
+adapter detection, classification, and output — in one pass over the input:
+
+```bash
+# Fetch a model bundle once (networked node; compute nodes can't reach GitHub)
+escpod demux models fetch crf_nbc16_rna004
+
+# Demux into per-barcode POD5 files
+escpod demux reads.pod5 --model ~/.cache/escapepod/demux_models/barcode_crf_nbc16_rna004@v0.3.1 -d out/
+
+# Or demux into the sidecar only — no split files, no CSV
+escpod demux reads.pod5 --model <bundle> --annotate
+```
+
+Key options (see `escpod demux --help` for the full set):
+
+| Option | Description |
+|--------|-------------|
+| `--model <PATH>` | Model: DTW-SVM / GBM JSON, or a CTC-CRF bundle directory |
+| `-d, --output-dir <DIR>` | Write per-barcode POD5 files (optional with `--annotate`) |
+| `--annotate` | Record assignments in each input's `.p5s` sidecar |
+| `--classifications <FILE>` | Also write a `read_id,barcode,confidence` CSV |
+| `--prefix <STR>` | Split-file prefix (default: `barcode`) |
+| `--method <cnn\|llr>` | Adapter detector (CRF bundles pin their own) |
+| `--gpu` | GPU inference where a GPU feature is compiled in |
+| `--info` | Describe the model and exit |
+
+### Sidecar output
+
+`--annotate` composes with the other outputs: alone it is *sidecar-only*
+demux (the POD5 is never duplicated), with `-d` it writes split files *and*
+the sidecar, and `--classifications` can keep the CSV too. Materialize
+subsets later, on demand:
+
+```bash
+escpod demux split reads.pod5 --sidecar -d out/                    # all barcodes
+escpod filter reads.pod5 --annotation barcode=nbc05 -o nbc05.pod5  # one group
+```
+
+The stepwise subcommands below remain available for running stages
+individually or inspecting intermediates.
 
 ## Comparison with WarpDemuX
 
@@ -41,13 +85,14 @@ Escapepod demux is a pure Rust reimplementation of the signal-level barcode demu
 |---------|-----------|-------------------|
 | Language | Pure Rust | Python + C |
 | Dependencies | None (statically linked) | PyTorch, dtaidistance, pod5 |
-| Adapter detection | LLR only | LLR + CNN + fallback |
+| Adapter detection | LLR + CNN | LLR + CNN + fallback |
 | Classification | DTW (Rust) | DTW (dtaidistance) |
 | Model format | JSON (native or WarpDemuX) | Scikit-learn pickle |
 
 ### Performance Benchmarks
 
-Tested on RNA004 data with 5 barcodes (1000 reads total), 4 threads:
+Early numbers (LLR + DTW path, before the CNN/CRF heads landed) on RNA004
+data with 5 barcodes (1000 reads total), 4 threads:
 
 | Metric | Escapepod | WarpDemuX |
 |--------|-----------|-----------|
@@ -55,7 +100,10 @@ Tested on RNA004 data with 5 barcodes (1000 reads total), 4 threads:
 | **Full pipeline** | ~0.5s | ~2.4s |
 | **Throughput** | ~2000 reads/sec | ~400 reads/sec |
 
-**Note:** For best classification accuracy, use WarpDemuX pre-trained models via the `classify --model` option. The escpod training workflow is experimental and may not generalize well to new samples.
+**Note:** For best classification accuracy, use a published model bundle
+(`escpod demux models list` / `fetch`) or a WarpDemuX-exported model via
+`--model`. The escpod training workflow is experimental and may not
+generalize well to new samples.
 
 ## Overview
 
@@ -63,28 +111,31 @@ The demux workflow analyzes the raw nanopore signal to detect adapter regions, e
 
 ```mermaid
 flowchart LR
-    pod5([POD5 Files]) --> detect
-    detect["<b>detect</b><br/><i>LLR-based</i>"] --> fingerprint["<b>fingerprint</b><br/><i>t-test seg</i>"]
-    fingerprint --> classify["<b>classify</b><br/><i>DTW distance</i>"]
-    classify --> split["<b>split</b><br/><i>by barcode</i>"]
-    split --> demuxed([Demuxed POD5s])
+    pod5([POD5 Files]) --> fused
+    fused["<b>demux</b> (fused)<br/><i>detect + classify</i>"] --> demuxed([Per-barcode POD5s])
+    fused -. "--annotate" .-> sidecar[reads.pod5.p5s]
+    sidecar -. "split --sidecar<br/>filter --annotation" .-> demuxed
 
-    detect -.-> boundaries[boundaries.csv]
-    fingerprint -.-> fingerprints[fingerprints.csv]
+    pod5 -.-> detect
+    detect["<b>detect</b><br/><i>LLR / CNN</i>"] -.-> boundaries[boundaries.csv]
+    boundaries -.-> fingerprint["<b>fingerprint</b><br/><i>t-test seg</i>"]
+    boundaries -.-> basecall["<b>basecall</b><br/><i>CTC-CRF</i>"]
+    fingerprint -.-> classify["<b>classify</b><br/><i>DTW / GBM</i>"]
     classify -.-> classifications[classifications.csv]
-
-    train["<b>train</b><br/><i>from known</i>"] -.-> reference[reference.json]
-    reference -. "--reference" .-> classify
+    basecall -.-> classifications
+    classifications -.-> split["<b>split</b><br/><i>by barcode</i>"]
 ```
 
 ## Subcommands
 
 | Subcommand | Description |
 |------------|-------------|
-| [detect](#detect) | Detect adapter boundaries using LLR algorithm |
+| [detect](#detect) | Detect adapter boundaries (LLR or CNN) |
 | [fingerprint](#fingerprint) | Extract signal fingerprints from adapter regions |
 | [classify](#classify) | Classify reads by barcode using DTW distance |
-| [split](#split) | Split reads into separate POD5 files by barcode |
+| `basecall` | CTC-CRF barcode basecalling from a boundaries CSV; `--barcodes` assigns reads by edit distance |
+| [split](#split) | Split reads into separate POD5 files by barcode (CSV or `--sidecar`) |
+| `models` | List / fetch published model bundles (`list`, `path`, `fetch`) |
 | [train](#train) | Train reference fingerprints from known samples |
 | [train-svm](#train-svm) | Train SVM model from fingerprints (requires `train` feature) |
 
@@ -153,7 +204,10 @@ escpod demux detect <FILES>... -o <OUTPUT>
 | `-o, --output <FILE>` | Output boundaries CSV file (required) |
 | `--min-adapter <N>` | Minimum adapter observations (default: 200) |
 | `--border-trim <N>` | Border trim size (default: 50) |
-| `--downscale <N>` | Downscale factor for signal processing (default: 1, use 10 for WarpDemuX compatibility) |
+| `--downscale <N>` | Downscale factor for signal processing (default: 10, WarpDemuX-native; set 1 for full resolution) |
+| `--method <cnn\|llr>` | Boundary detector; `cnn` is what the published models were trained against |
+| `--cnn-model <FILE>` / `--cnn-model-name <NAME>` | Boundary-CNN ONNX (explicit path, or a fetched bundle by name) |
+| `--gpu` | Run CNN detection on the GPU (`cnn-gpu` build) |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -403,7 +457,10 @@ escpod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
 | `--model <FILE>` | WarpDemuX model JSON file |
 | `-o, --output <FILE>` | Output classifications CSV (required) |
 | `--window <N>` | DTW window size (Sakoe-Chiba band, optional) |
-| `--threshold <F>` | Confidence threshold for classification (default: 0.8) |
+| `--min-ratio <RATIO>` | Top-2 distance-ratio threshold below which a read is confident (default: 0.8) |
+| `--model-name <NAME>` | Use a fetched model bundle by name instead of `--model` |
+| `--probabilities` | Emit per-class probabilities (SVM models) |
+| `--gpu` | GPU DTW batch classify (`gpu` build) |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -433,8 +490,8 @@ escpod demux classify fingerprints.csv --reference reference.csv -o classificati
 # Using WarpDemuX model
 escpod demux classify fingerprints.csv --model warpdemux.json -o classifications.csv --window 10
 
-# With custom threshold
-escpod demux classify fingerprints.csv --reference reference.csv -o out.csv --threshold 0.7
+# With a custom confidence ratio
+escpod demux classify fingerprints.csv --reference reference.csv -o out.csv --min-ratio 0.7
 ```
 
 ---
@@ -459,10 +516,13 @@ escpod demux split <FILES>... --classifications <CSV> --output-dir <DIR>
 
 | Option | Description |
 |--------|-------------|
-| `--classifications <FILE>` | Classifications CSV from classify command (required) |
+| `--classifications <FILE>` | Classifications CSV from classify/basecall (or use `--sidecar`) |
+| `--sidecar` | Read assignments from each input's `.p5s` sidecar instead of a CSV |
+| `--annotation <NAME>` | Sidecar annotation to split by (default: `barcode`) — e.g. a design-derived `condition` |
 | `-d, --output-dir <DIR>` | Output directory for demuxed files (required) |
-| `--prefix <STR>` | Output file prefix (default: none) |
-| `--unclassified` | Include unclassified reads in separate file |
+| `--prefix <STR>` | Output file prefix (default: `barcode`) |
+| `--classified-only` | Drop unclassified reads instead of writing them to their own file |
+| `-f, --force` | Overwrite existing per-barcode output files |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -470,18 +530,18 @@ escpod demux split <FILES>... --classifications <CSV> --output-dir <DIR>
 
 ```
 output_dir/
-├── barcode_01.pod5
-├── barcode_02.pod5
-├── barcode_03.pod5
-├── barcode_04.pod5
-└── unclassified.pod5  (if --unclassified)
+├── barcode_nbc01.pod5
+├── barcode_nbc02.pod5
+├── barcode_nbc03.pod5
+└── barcode_unclassified.pod5   (omitted with --classified-only)
 ```
 
 ### Example
 
 ```bash
 escpod demux split *.pod5 --classifications classifications.csv -d demuxed/
-escpod demux split experiment.pod5 --classifications class.csv -d out/ --prefix exp1_ --unclassified
+escpod demux split reads.pod5 --sidecar -d demuxed/                        # from .p5s
+escpod demux split reads.pod5 --sidecar --annotation condition -d by_cond/ # by design variable
 ```
 
 ---
@@ -643,8 +703,8 @@ escpod demux train-svm -f fingerprints.csv -o model.json
 # Train with custom hyperparameters
 escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --c 10.0 --window 10
 
-# Use trained SVM model for classification (with classify --model-svm)
-escpod demux classify fingerprints.csv --model-svm model.json -o classifications.csv
+# Use the trained SVM model for classification (--model auto-detects the JSON shape)
+escpod demux classify fingerprints.csv --model model.json -o classifications.csv
 ```
 
 ### Building with train feature
@@ -657,7 +717,18 @@ cargo build --release --features train
 
 ## Complete Workflow Example
 
-### Basic Workflow (with pre-trained model)
+### Fused pipeline (recommended)
+
+```bash
+# One pass: detect + classify + output. --annotate keeps everything in the
+# sidecar; add -d out/ to also write per-barcode files.
+escpod demux reads.pod5 --model <bundle-or-model.json> --annotate
+
+escpod inspect summary reads.pod5                 # barcode counts, sidecar state
+escpod demux split reads.pod5 --sidecar -d out/   # materialize when needed
+```
+
+### Stepwise (inspectable intermediates)
 
 ```bash
 # 1. Detect adapter boundaries in all POD5 files
@@ -669,8 +740,8 @@ escpod demux fingerprint *.pod5 --boundaries boundaries.csv -o fingerprints.csv
 # 3. Classify reads using a pre-trained model
 escpod demux classify fingerprints.csv --model warpdemux_model.json -o classifications.csv
 
-# 4. Split into separate files
-escpod demux split *.pod5 --classifications classifications.csv -d demuxed/ --unclassified
+# 4. Split into separate files (unclassified reads get their own file by default)
+escpod demux split *.pod5 --classifications classifications.csv -d demuxed/
 
 # View classification summary
 cut -d, -f2 classifications.csv | sort | uniq -c | sort -rn

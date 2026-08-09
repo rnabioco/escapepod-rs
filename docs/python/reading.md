@@ -33,7 +33,7 @@ reader.file_identifier   # file UUID
 reader.software          # writer software string
 reader.pod5_version      # POD5 format version
 reader.run_infos         # list[RunInfo]
-reader.has_index         # whether a .p5s sidecar exists
+reader.has_index         # whether a .p5s read index is available
 len(reader)              # same as reader.read_count
 ```
 

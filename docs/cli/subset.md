@@ -23,6 +23,7 @@ escpod subset --csv <FILE> -o <OUTPUT_DIR> [OPTIONS] <INPUT>
 | `--csv <FILE>` | CSV file with read_id,output columns (required) |
 | `-o, --output-dir <DIR>` | Output directory (default: current directory) |
 | `-f, --force` | Overwrite existing files |
+| `--profile` | Print per-phase timing breakdown |
 | `-t, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -78,6 +79,12 @@ If you have demultiplexing results from basecalling:
 # Assuming you have a CSV from your demultiplexing pipeline
 escpod subset multiplexed.pod5 --csv barcode_assignments.csv -o demux/
 ```
+
+For escpod's own demux output, the sidecar-native routes avoid the CSV
+entirely: `escpod demux split reads.pod5 --sidecar -d out/` splits every
+barcode, and `escpod filter reads.pod5 --annotation barcode=nbc05 -o …`
+pulls one group — see [filter](filter.md) and
+[demux](../experimental/demux.md#sidecar-output).
 
 ### Splitting by Sample
 

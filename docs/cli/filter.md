@@ -1,27 +1,36 @@
 # escpod filter
 
-Extract specific reads from a POD5 file based on read IDs.
+Extract reads by ID list, sample count, end reason, or sidecar annotation.
 
 ![escpod filter](../images/filter.gif)
 
 ## Usage
 
 ```bash
-escpod filter -i <IDS_FILE> -o <OUTPUT> <INPUT>
+escpod filter [OPTIONS] -o <OUTPUT> <INPUT>...
 ```
+
+At least one filter criterion is required.
 
 ## Arguments
 
 | Argument | Description |
 |----------|-------------|
-| `<INPUT>` | Input POD5 file to filter |
+| `<INPUT>...` | Input POD5 files and/or directories (searched recursively, de-duplicated) |
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `-i, --ids <FILE>` | File containing read IDs to extract (required) |
+| `-i, --ids <FILE>` | File of read IDs to keep (one per line; `-` or `stdin` reads from stdin) |
+| `--min-samples <N>` | Keep reads with at least N samples |
+| `--max-samples <N>` | Keep reads with at most N samples |
+| `--end-reason <REASONS>` | Keep only these end reasons (comma-separated) |
+| `--exclude-end-reason <REASONS>` | Drop these end reasons (comma-separated) |
+| `--annotation <NAME=LABEL>` | Keep reads whose [`.p5s` sidecar](../format/sidecar.md) annotation matches (repeatable) |
 | `-o, --output <FILE>` | Output file path (required) |
+| `-f, --force` | Overwrite the output file if it exists |
+| `--profile` | Print per-phase timing breakdown |
 | `-t, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -82,6 +91,27 @@ escpod inspect reads reference.pod5 > reference_ids.txt
 escpod filter -i reference_ids.txt -o matching.pod5 experiment.pod5
 ```
 
+### Filter by Sidecar Annotation
+
+With demux assignments recorded in the `.p5s` sidecar (`escpod annotate` or
+`escpod demux --annotate`), materialize one group on demand — no ID lists,
+no full split:
+
+```bash
+escpod filter reads.pod5 --annotation barcode=nbc05 -o nbc05.pod5
+escpod filter reads.pod5 --annotation condition=fresh -o fresh.pod5   # design-derived column
+```
+
+`--annotation` is repeatable: pairs with the **same** name are any-of, pairs
+with **different** names are all-of, and `--ids` intersects on top:
+
+```bash
+# (nbc05 OR nbc06) AND replicate r1
+escpod filter reads.pod5 \
+    --annotation barcode=nbc05 --annotation barcode=nbc06 \
+    --annotation replicate=r1 -o subset.pod5
+```
+
 ## Output
 
 The command prints filtering statistics:
@@ -96,7 +126,8 @@ Warning: 5 requested IDs were not found in the input file
 
 ## Notes
 
-- Only reads with matching IDs are included in output
+- Only reads matching **all** active criteria are included in the output
 - Run info is preserved for all matching reads
-- Signal data is re-compressed in the output
 - A warning is shown if some requested IDs are not found
+- `--annotation` requires a `.p5s` sidecar next to each input; a label that
+  occurs nowhere in the annotation warns rather than errors

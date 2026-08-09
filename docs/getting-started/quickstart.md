@@ -25,9 +25,19 @@ escpod inspect summary experiment.pod5
 Output:
 ```
 File: experiment.pod5
+File ID: 3c490d31-0385-4a49-a61e-d717e49c34ac
+POD5 version: 0.3.44
+Software: MinKNOW 24.x
+
 Reads: 10,000
+Read batches: 10
+
 Run info entries: 1
-File size: 1.2 GB
+  [0] acquisition_id: abc123def456
+      sample_rate: 4000 Hz
+      flow_cell_id: FAK12345
+
+Sidecar: none
 ```
 
 List all reads:
@@ -58,6 +68,29 @@ Then filter:
 ```bash
 escpod filter -i read_ids.txt -o filtered.pod5 experiment.pod5
 ```
+
+Filtering also works by read length (`--min-samples`/`--max-samples`), end
+reason, or — once reads are demultiplexed — by sidecar annotation:
+
+```bash
+escpod filter experiment.pod5 --annotation barcode=nbc05 -o nbc05.pod5
+```
+
+### Demultiplexing
+
+Demux straight into the [`.p5s` sidecar](../format/sidecar.md) — no
+per-barcode file duplication, no CSV:
+
+```bash
+escpod demux models fetch crf_nbc16_rna004        # once, on a networked node
+escpod demux experiment.pod5 --model <bundle> --annotate
+
+escpod inspect summary experiment.pod5            # barcode counts, sidecar state
+escpod demux split experiment.pod5 --sidecar -d demuxed/   # materialize when needed
+```
+
+See [demux](../experimental/demux.md) for models, GPU acceleration, and the
+stepwise pipeline.
 
 ## Python Quick Start
 
@@ -147,4 +180,5 @@ Prefer Rust? The same operations are available in the
 
 - [Python API](../python/index.md) - Full Python reading/writing/signal reference
 - [CLI Reference](../cli/index.md) - Full documentation of all commands
+- [Experimental](../experimental/index.md) - Demux, the `.p5s` sidecar, resquiggle
 - [File Format](../format/index.md) - Understanding the POD5 format

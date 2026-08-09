@@ -21,6 +21,11 @@ A POD5 file contains:
 
 See [Container Structure](container.md) for detailed layout.
 
+escapepod additionally defines one companion artifact: the
+[`.p5s` sidecar](sidecar.md), an Arrow file beside the POD5 holding a read
+index and per-read annotations (demux barcodes, experimental designs). The
+POD5 itself is never modified.
+
 ## Data Tables
 
 ### Reads Table

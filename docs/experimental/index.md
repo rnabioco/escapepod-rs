@@ -1,17 +1,19 @@
 # Experimental
 
-Tools in this section live outside the default build. They work, but their
-APIs, flags, and output formats are not stable yet, and you opt in per build
-with Cargo features.
+Tools in this section are functional but not yet stable — APIs, flags, and
+output formats may change between releases. Most live behind the
+`experimental` Cargo feature; `demux` is the exception, shipping in the
+default build with output formats that are still stabilizing.
 
 ## Commands
 
 | Command | Feature flag | Purpose |
 |---------|-------------|---------|
+| [demux](demux.md) | *(default build)* | Barcode demultiplexing — fused pipeline, stepwise subcommands, sidecar output |
 | [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
 | [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
 | `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(log n) read-ID lookup |
-| `annotate` | `--features experimental` | Record per-read annotations (demux barcodes) in the `.p5s` sidecar |
+| [annotate](annotate.md) | `--features experimental` | Record per-read annotations (demux barcodes, designs) in the `.p5s` sidecar |
 
 ## The `.p5s` sidecar
 
@@ -21,20 +23,18 @@ combination of a read index (`escpod index`) and named per-read annotations
 output stays byte-identical and checksummable; deleting an annotation is
 editing or deleting the sidecar.
 
-The sidecar is a plain Arrow IPC (Feather v2) table — one row per read,
-`read_id | batch_idx | row_idx` plus one dictionary-encoded column per
-annotation — so it is directly readable without escapepod:
+The sidecar is a plain Arrow table, directly readable without escapepod:
 
 ```python
 import pyarrow.ipc as ipc
 table = ipc.open_file("reads.pod5.p5s").read_all()
 ```
 
-The sidecar is bound to its POD5 by file-identifier UUID and byte size
-(stored in the Arrow schema metadata, checked before any data is decoded);
-a stale sidecar or one copied next to the wrong file fails loudly. Writes
-are atomic and section-preserving: `index` keeps annotations, `annotate`
-keeps the index and other annotations.
+It is bound to its POD5 by file identifier and size, so a stale sidecar or
+one copied next to the wrong file fails loudly. `index` preserves
+annotations, and `annotate` preserves the index and other annotations —
+each command touches only its own columns. Format details:
+[The `.p5s` Sidecar](../format/sidecar.md).
 
 Typical demux flow, with no intermediate per-barcode POD5s (or even a CSV)
 kept around:
@@ -80,14 +80,19 @@ escpod annotate --design samplesheet.csv reads.pod5
 escpod demux split reads.pod5 --sidecar --annotation condition -d by_condition/
 ```
 
-The design table is stored as JSON in the sidecar's schema metadata
-(`escapepod:design`), and each of its variables is materialized as a derived
-per-read column by joining across the key annotations — so `split`, pyarrow
-filtering, and `reader.annotation("condition")` all work with no join logic.
-Key columns are auto-detected (CSV columns that name an existing annotation;
-override with `--keys`). Rewriting a key annotation (say, re-demuxing
-`barcode`) automatically re-derives the dependent columns, and writing a
-derived column directly is refused — update the design instead.
+Each design variable becomes an ordinary per-read column (`condition`,
+`replicate`), so `split`, `filter`, pyarrow, and
+`reader.annotation("condition")` all work with no join logic. Rewriting a
+key annotation (say, re-demuxing `barcode`) automatically re-derives the
+dependent columns, and writing a derived column directly is refused — the
+design stays the source of truth. See [annotate](annotate.md) for the full
+command reference.
+
+Note the split in feature gates: *writing* sidecars with `escpod index` /
+`escpod annotate` needs `--features experimental`, while everything that
+*consumes* them — `demux --annotate`, `demux split --sidecar`,
+`filter --annotation`, `view`, `inspect summary` — works in the default
+build.
 
 This format replaces the earlier `.p5i` index sidecar; delete any `.p5i`
 files and rerun `escpod index`.
@@ -97,10 +102,7 @@ files and rerun `escpod index`.
 Enable one or more features at build time:
 
 ```bash
-# Repack, resquiggle, and index
-cargo build --release --features experimental
-
-# Everything
+# repack, resquiggle, index, annotate
 cargo build --release --features experimental
 ```
 

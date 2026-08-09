@@ -21,6 +21,8 @@ escpod merge -o <OUTPUT> <INPUT>...
 | Option | Description |
 |--------|-------------|
 | `-o, --output <FILE>` | Output file path (required) |
+| `--duplicate-ok` | Allow duplicate read IDs (skip duplicate checking) |
+| `-f, --force` | Overwrite the output file if it exists |
 | `-t, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `--profile` | Enable profiling output with timing and throughput |
 | `-h, --help` | Print help |
@@ -37,8 +39,9 @@ The merge command combines multiple POD5 files into a single file. This is usefu
 
 - All reads from input files are copied to the output
 - Run info entries are deduplicated by acquisition ID
-- Signal data is re-compressed in the output file
-- The output file uses default compression settings
+- Compressed signal blocks are copied as-is (no recompression)
+- [`.p5s` sidecars](../format/sidecar.md) are per-file and are **not**
+  merged — rerun `escpod index` / `escpod annotate` on the output
 
 ## Examples
 

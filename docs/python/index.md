@@ -63,6 +63,7 @@ print(escapepod.__version__)
 | [`ReadData`](reading.md#the-readdata-object) | A single read's metadata |
 | [`RunInfo`](writing.md#run-info) / `create_run_info` | Acquisition/run metadata |
 | [Signal processing](signal.md) | `normalize_signal`, `mad_normalize`, `refine_signal_map`, `KmerTable` |
+| [Sidecar annotations](reading.md#sidecar-annotations) | `Reader.annotation()` / `annotation_names()` / `design()` — demux barcodes and experimental designs from the `.p5s` sidecar |
 | `Pod5Error` | Raised on malformed/invalid POD5 data |
 
 ## Coming from `pod5`
@@ -77,6 +78,7 @@ The API is intentionally close to the official package. The main differences:
 | Raw signal | `read.signal` | `reader.get_signal(read)` |
 | Signal in pA | `read.signal_pa` | `reader.get_signal_pa(read)` |
 | Reads → DataFrame | *(manual)* | `reader.to_pandas()` / `reader.to_polars()` |
+| Barcode assignments | *(n/a)* | `reader.annotation("barcode")` (from the `.p5s` sidecar) |
 
 The most important structural difference: signal is **not** attached to the
 `ReadData` object. You request it from the reader with `get_signal(read)` (raw

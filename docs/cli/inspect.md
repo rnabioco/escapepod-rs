@@ -37,17 +37,33 @@ escpod inspect summary experiment.pod5
 Output:
 ```
 File: experiment.pod5
-Size: 1.2 GB
-Reads: 10,543
-Batches: 11
-Run info entries: 1
+File ID: 3c490d31-0385-4a49-a61e-d717e49c34ac
+POD5 version: 0.3.44
+Software: MinKNOW 24.x
 
-Run: abc123-def456
-  Flow cell: FAK12345
-  Protocol: sequencing_MIN106_DNA
-  Sample rate: 4000 Hz
-  Started: 2024-01-15 10:30:00
+Reads: 10,543
+Read batches: 11
+
+Run info entries: 1
+  [0] acquisition_id: abc123def456
+      sample_rate: 4000 Hz
+      flow_cell_id: FAK12345
+
+Sidecar: experiment.pod5.p5s
+  index: 10,543 reads
+  annotations: barcode (17 labels, 10,543 reads), condition (16 labels, 9,867 reads)
+  design: [barcode] → [condition,replicate], 16 rows
 ```
+
+The **Sidecar** block reports the [`.p5s` companion file](../format/sidecar.md)
+when one exists: the read-index size, each annotation with its label and
+assigned-read counts, and the experimental design. Files without a sidecar
+print `Sidecar: none`; a sidecar that doesn't match the POD5 (stale, or
+copied from another file) is reported inline rather than failing the
+command.
+
+`inspect summary` also accepts a directory, printing per-file lines plus
+`Total reads:` / `Total batches:`.
 
 ## escpod inspect reads
 

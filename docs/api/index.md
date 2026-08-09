@@ -29,7 +29,7 @@ Format I/O.
 
 **Main types:** `Reader`, `Writer`, `WriterOptions`, `ReadData`, `RunInfoData`, `EndReason`, `Error`.
 
-**Modules:** `reader`, `writer`, `compression` (VBZ / SVB16 / ZSTD), `footer` (FlatBuffer), `schema` (Arrow schemas), `types`, `merge`, `operations::{filter, repack, subset}`.
+**Modules:** `reader`, `writer`, `compression` (VBZ / SVB16 / ZSTD), `footer` (FlatBuffer), `schema` (Arrow schemas), `types`, `merge`, `sidecar` (the `.p5s` companion file), `operations::{filter, repack, subset, annotate}` (including `read_annotation` / `write_annotation` / `read_design`).
 
 ### escapepod-signal
 
@@ -41,11 +41,11 @@ Signal-processing algorithms, layered on top of `escapepod-pod5` (which it re-ex
 
 Barcode demultiplexing. Separate crate; included in the default CLI build (it adds no third-party dependencies), and available to library consumers via `--features demux`.
 
-**Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `train` (feature `train`), `adapter_cnn` (feature `cnn-detect`).
+**Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `crf` (CTC-CRF lattice decode; `encoder`/`barcode` behind `crf-decode`), `train` (feature `train`), `adapter_cnn` (feature `cnn-detect`).
 
 ### escapepod
 
-The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Stable commands (built with `cli`): `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`. Experimental commands live behind Cargo features — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, and the `demux` tree (output formats still stabilizing). `repack`, `resquiggle`, `index`, and `annotate` live behind the `experimental` feature — see below.
 
 ## Quick Reference
 
@@ -113,13 +113,18 @@ match result {
 
 | Feature | Effect |
 |---------|--------|
-| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal`, `demux` and `cnn-detect` |
+| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal`, `demux`, `cnn-detect`, `crf-decode`, `demux-models`, `model-fetch` |
 | `pod5` / `signal` / `demux` | Library re-exports of each layer (for `default-features = false` consumers) |
-| `experimental` | Unlocks `repack`, `resquiggle`, `index` |
-| `demux` | Unlocks the `demux` subcommand tree (detect / fingerprint / classify / split / train) |
+| `experimental` | Unlocks `repack`, `resquiggle`, `index`, `annotate` |
+| `demux` | The `demux` subcommand tree (fused pipeline, detect / fingerprint / classify / basecall / split / models / train) — *implied by `cli`* |
+| `crf-decode` | CTC-CRF barcode basecalling (`demux basecall`) — *implied by `cli`* |
+| `demux-models` / `model-fetch` | Model-bundle registry and `demux models fetch` — *implied by `cli`* |
 | `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
 | `gpu` | Implies `demux`; batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc at runtime) |
 | `cnn-detect` | Part of `cli`; implies `demux`. CNN/TCN adapter detection through `tract-onnx` (bring-your-own ONNX model — no weights are bundled) |
+| `cnn-gpu` | Implies `cnn-detect`; onnxruntime CUDA inference for `detect --method cnn --gpu` |
+| `crf-gpu` | Implies `crf-decode`; onnxruntime CUDA inference for the CRF encoder (`basecall --gpu`) |
+| `models-download` | Implies `experimental`; `resquiggle models fetch` (k-mer tables) |
 
 ### `escapepod-demux`
 

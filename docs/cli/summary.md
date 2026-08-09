@@ -1,6 +1,6 @@
 # escpod summary
 
-Generate a comprehensive summary of POD5 file(s) including read statistics, QC metrics, and run metadata.
+Generate a comprehensive summary of POD5 file(s) including read statistics, QC metrics, and run metadata. For sidecar contents (barcode annotations, experimental design), see [`escpod inspect summary`](inspect.md).
 
 ![escpod summary](../images/summary.gif)
 

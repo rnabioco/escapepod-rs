@@ -20,38 +20,20 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **Memory efficient** - Memory-mapped I/O for large files
 - **Full featured** - View, inspect, merge, filter, subset
 - **BAM integration** - Filter reads by alignment status
+- **Barcode demultiplexing** - `escpod demux` runs DTW-SVM, GBM, or CTC-CRF
+  classification end to end, in the default build
+- **`.p5s` sidecar** - Barcode assignments, experimental designs, and a read
+  index live in a small Arrow file *beside* the POD5 — raw sequencer output is
+  never modified, and per-barcode subsets are materialized on demand instead
+  of stored
 - **Crash-safe writes** - Output is staged and renamed into place, so an
   interrupted run never leaves a corrupt archive or damages an existing one
 
-### Output durability
-
-Every POD5 archive is written to a temporary file beside its destination and
-renamed into place only once it is complete and valid. An error, a panic, or a
-Ctrl-C therefore leaves the destination either untouched (if a file was already
-there) or absent — never truncated. `escpod` also traps SIGINT and SIGTERM
-(the latter is what SLURM sends on `scancel` and at walltime expiry) to remove
-staging files on the way out.
-
-Renaming does not by itself make the bytes durable against a machine crash.
-Use `--fsync file` to sync each output before it is renamed, or `--fsync full`
-to also sync the directory. The default is `--fsync none`, which is the right
-trade on scratch filesystems where output is cheap to regenerate.
-
-If a run is killed outright (`kill -9`, node failure), staging files may be
-left behind. They are identifiable by prefix:
-
-```bash
-find <output-dir> -name '.escpod-tmp-*'
-```
-
-Experimental features — `repack`, `resquiggle`, `index`, and barcode
-demultiplexing (`demux`) — live behind Cargo feature flags. See the
-[docs](https://rnabioco.github.io/escapepod-rs/experimental/) for status
-and build instructions.
-
-GPU-accelerated DTW for demux classify is available via `--features gpu`
-(opt-in, experimental). Uses NVRTC to compile a CUDA kernel at runtime —
-no `nvcc` needed at build time, only the CUDA driver + libnvrtc at run.
+Some commands — `repack`, `resquiggle`, `index`, `annotate` — are
+experimental and live behind the `experimental` Cargo feature; GPU
+acceleration for demux is opt-in (`gpu`, `cnn-gpu`, `crf-gpu`). See the
+[docs](https://rnabioco.github.io/escapepod-rs/experimental/) for status,
+build instructions, and the details behind the highlights above.
 
 ## Performance
 
@@ -81,7 +63,7 @@ cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
 Opt into experimental commands:
 
 ```bash
-# repack, resquiggle, index
+# repack, resquiggle, index, annotate
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features experimental
 ```
 

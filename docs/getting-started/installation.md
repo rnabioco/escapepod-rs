@@ -28,18 +28,25 @@ sudo cp target/release/escpod /usr/local/bin/
 ### Optional features
 
 The default build ships the stable CLI surface (summary, view, inspect,
-merge, filter, bam-filter, subset). Extra commands live behind Cargo
+merge, filter, bam-filter, subset) **plus the full demux tree** — fused
+`demux`, `detect`, `fingerprint`, `classify`, `basecall`, `split`,
+`models`, `train` — with CNN adapter detection, CRF basecalling, and model
+fetching included. Extra commands and accelerators live behind Cargo
 features:
 
 | Feature | Commands unlocked |
 |---------|-------------------|
-| `experimental` | `repack`, `resquiggle`, `index` |
-| `demux` | `demux detect`, `fingerprint`, `classify`, `split`, `train` |
-| `train` | implies `demux`; adds `demux train-svm` |
-| `gpu` | implies `demux`; batched GPU DTW for `classify` / `train-svm` (CUDA driver + libnvrtc required at runtime) |
-| `cnn-detect` | *in the default build*; CNN/TCN adapter detection, `demux detect --method cnn` (bring-your-own ONNX model) |
-| `cnn-gpu` | implies `cnn-detect`; onnxruntime CUDA inference for `demux detect --method cnn --gpu` |
+| `experimental` | `repack`, `resquiggle`, `index`, `annotate` |
+| `train` | adds `demux train-svm` (SVM training via linfa) |
+| `gpu` | batched GPU DTW for `classify` / `train-svm` (CUDA driver + libnvrtc required at runtime) |
+| `cnn-gpu` | onnxruntime CUDA inference for `demux detect --method cnn --gpu` |
 | `crf-gpu` | onnxruntime CUDA inference for the CTC-CRF basecall encoder (`demux basecall --gpu`) |
+| `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
+
+Note the sidecar asymmetry: *writing* `.p5s` sidecars (`index`, `annotate`)
+needs `--features experimental`, but consuming them (`demux --annotate`,
+`demux split --sidecar`, `filter --annotation`, `view`, `inspect`) works in
+the default build.
 
 The GPU features need CUDA libraries at run time only; the repository's pixi
 `gpu` environment provides all of them — see
@@ -48,7 +55,7 @@ The GPU features need CUDA libraries at run time only; the repository's pixi
 Combine as needed:
 
 ```bash
-cargo build --release --features experimental,demux
+cargo build --release --features experimental
 cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
 ```
 
@@ -103,8 +110,8 @@ If you only need POD5 file I/O without the signal algorithms:
 escapepod-pod5 = { git = "https://github.com/rnabioco/escapepod-rs.git" }
 ```
 
-Barcode demultiplexing lives in its own crate, `escapepod-demux`, which
-mirrors the CLI's `demux` feature gate.
+Barcode demultiplexing lives in its own crate, `escapepod-demux`, which the
+CLI links by default; library consumers opt in with `--features demux`.
 
 ## Building Documentation
 
