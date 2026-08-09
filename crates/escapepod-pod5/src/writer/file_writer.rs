@@ -1641,7 +1641,10 @@ mod tests {
         };
         let mut w = Writer::create(tmp.path(), opts).unwrap();
         w.add_run_info(create_test_run_info("acq_uniform")).unwrap();
-        for i in 0..25 {
+        // 1-based: `create_test_read` derives `start_sample` as
+        // `(read_number - 1) * num_samples`, which underflows at 0 (silently
+        // under release's wrapping arithmetic, loudly in a debug build).
+        for i in 1..=25 {
             let read = create_test_read(0, i, 400);
             w.add_read(read, &vec![42i16; 400]).unwrap();
         }
