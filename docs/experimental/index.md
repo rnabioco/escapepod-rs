@@ -10,10 +10,10 @@ default build with output formats that are still stabilizing.
 | Command | Feature flag | Purpose |
 |---------|-------------|---------|
 | [demux](demux.md) | *(default build)* | Barcode demultiplexing — fused pipeline, stepwise subcommands, sidecar output |
-| [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
-| [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
-| `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(log n) read-ID lookup |
 | [annotate](annotate.md) | `--features experimental` | Record per-read annotations (demux barcodes, designs) in the `.p5s` sidecar |
+| `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(log n) read-ID lookup |
+| [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
+| [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
 
 ## The `.p5s` sidecar
 
@@ -106,23 +106,16 @@ Enable one or more features at build time:
 cargo build --release --features experimental
 ```
 
-Demux has additional sub-features layered on top:
+Demux has two opt-in features layered on top:
 
 | Feature | Enables |
 |---------|---------|
-| `cnn-detect` *(no flag needed — in the default build)* | CPU CNN/TCN adapter detection through `tract-onnx` (`escpod demux detect --method cnn`); bring-your-own ONNX model, no weights bundled |
+| `--features gpu` | Every `--gpu` path: CNN adapter detection, the CTC-CRF encoder, and DTW classify. CUDA libraries at run time only — see [GPU acceleration](demux.md#gpu-acceleration) |
 | `--features train` | SVM model training via `linfa-svm` (`escpod demux train-svm`) |
-| `--features gpu` | Batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc required at runtime) |
-| `--features cnn-gpu` | Implies `cnn-detect`; onnxruntime CUDA inference for `detect --method cnn --gpu` |
-| `--features crf-gpu` | onnxruntime CUDA inference for the CTC-CRF basecall encoder (`basecall --gpu`) |
 
-The `--features` rows each imply `demux`, so `cargo build --features train` is
-enough. `cnn-detect` is listed for reference only: it ships in the default build
-and needs no flag, but `cnn-gpu` builds on it and `--method cnn` is what the
-published barcode models expect.
-
-The GPU features need runtime CUDA libraries; the repository's pixi `gpu`
-environment provides all of them — see [GPU setup](gpu-setup.md).
+Both imply `demux`, so `cargo build --features gpu` is enough. CPU CNN/TCN
+adapter detection (`--method cnn`, what the published barcode models expect)
+needs no flag — it ships in the default build.
 
 ## Stability
 

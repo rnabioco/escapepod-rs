@@ -31,7 +31,7 @@ pixi run -e gpu cargo build --release --features gpu -p escapepod-cli
 # activation script sets ORT_DYLIB_PATH automatically (only when the file
 # exists; a dangling ORT_DYLIB_PATH hangs silently at startup):
 pixi run -e gpu install-ort
-# Full runtime story + verification: docs/experimental/gpu-setup.md
+# Full runtime story + verification: docs/experimental/demux.md ("GPU acceleration")
 
 # Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`):
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \

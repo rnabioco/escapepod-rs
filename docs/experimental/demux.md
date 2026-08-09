@@ -1,37 +1,15 @@
 # escpod demux
 
-Barcode demultiplexing ships in the default `escpod` build, including CNN/TCN
-adapter detection (`--method cnn`) — the barcode models published in
-[escapepod-models](https://github.com/rnabioco/escapepod-models) are trained
-against that boundary detector, so it is what they need to reach their reported
-accuracy.
+Barcode demultiplexing for Oxford Nanopore sequencing data, in the default
+`escpod` build — including CNN/TCN adapter detection (`--method cnn`, what
+the published [escapepod-models](https://github.com/rnabioco/escapepod-models)
+barcodes were trained against) and CTC-CRF basecalling. Reads are classified
+from the raw signal and either split into per-barcode POD5 files or recorded
+in the [`.p5s` sidecar](../format/sidecar.md) so nothing needs splitting at
+all.
 
-!!! note "Optional accelerators are still opt-in"
-    These need extra toolchains or hardware and are therefore separate builds:
-
-    ```bash
-    cargo build --release --features cnn-gpu      # CNN adapter detection (onnxruntime CUDA)
-    cargo build --release --features crf-gpu      # CTC-CRF basecall encoder (onnxruntime CUDA)
-    cargo build --release --features train        # train DTW-SVM models (linfa)
-    cargo build --release --features gpu          # EXPERIMENTAL: GPU DTW classify
-    ```
-
-    The GPU features need a CUDA runtime **at run time only** (nothing at
-    build time), so GPU-enabled binaries are distributed separately from the
-    static release artifacts. The repository's pixi `gpu` environment
-    provides every required library — see [GPU setup](gpu-setup.md).
-
-!!! warning "`--gpu` DTW classify is experimental and usually slower"
-    On a full node the CPU DTW beats the GPU: 113 s on 64 CPU cores vs 132 s
-    with `--gpu` on an A30 (0.85x), plus ~2.2 GB more RSS, on a 1.22M-read
-    DTW-SVM run. An apparent 1.67x speedup vanishes once the CPU is given the
-    whole node instead of 16 of 64 cores. It may still help where cores are
-    scarce relative to the DTW workload, and it does nothing for GBM models.
-
-    GPU **CNN adapter detection** (`--method cnn --gpu`, `cnn-gpu`) is the GPU
-    path that does pay off — that stage is genuinely inference-bound.
-
-Barcode demultiplexing for Oxford Nanopore sequencing data. This command identifies barcodes in reads using signal-level analysis and splits reads into separate POD5 files by barcode — or records the assignments in the [`.p5s` sidecar](../format/sidecar.md) so nothing needs splitting at all.
+GPU acceleration and model training are opt-in builds — see
+[GPU acceleration](#gpu-acceleration) below.
 
 ## Fused pipeline (recommended)
 
@@ -207,7 +185,7 @@ escpod demux detect <FILES>... -o <OUTPUT>
 | `--downscale <N>` | Downscale factor for signal processing (default: 10, WarpDemuX-native; set 1 for full resolution) |
 | `--method <cnn\|llr>` | Boundary detector; `cnn` is what the published models were trained against |
 | `--cnn-model <FILE>` / `--cnn-model-name <NAME>` | Boundary-CNN ONNX (explicit path, or a fetched bundle by name) |
-| `--gpu` | Run CNN detection on the GPU (`cnn-gpu` build) |
+| `--gpu` | Run CNN detection on the GPU (`gpu` build) |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -463,6 +441,15 @@ escpod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
 | `--gpu` | GPU DTW batch classify (`gpu` build) |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
+
+!!! warning "`--gpu` DTW classify is experimental and usually slower"
+    On a full node the CPU DTW beats the GPU: 113 s on 64 CPU cores vs 132 s
+    with `--gpu` on an A30 (0.85x), plus ~2.2 GB more RSS, on a 1.22M-read
+    DTW-SVM run. An apparent 1.67x speedup vanishes once the CPU is given the
+    whole node instead of 16 of 64 cores. It may still help where cores are
+    scarce relative to the DTW workload, and it does nothing for GBM models.
+    The GPU paths that *do* pay off are CNN adapter detection and the CRF
+    encoder — see [GPU acceleration](#gpu-acceleration).
 
 ### Output Format
 
@@ -782,6 +769,113 @@ python scripts/export_warpdemux_model.py path/to/warpdemux_model.pkl -o model.js
 # Use the exported model
 escpod demux classify fingerprints.csv --model model.json -o classifications.csv
 ```
+
+## GPU acceleration
+
+One opt-in Cargo feature, `gpu`, enables every GPU path; the `--gpu` runtime
+flag then uses whichever fits the model and stage:
+
+| Stage | Commands | What runs on the GPU |
+|-------|----------|----------------------|
+| CNN adapter detection | `demux detect --method cnn --gpu`, fused `demux --method cnn --gpu` | CNN/TCN inference through onnxruntime CUDA. The GPU path that pays off most — detection is inference-bound, ~7× faster end-to-end on an A30. |
+| CTC-CRF encoder | `demux basecall --gpu`, fused `demux --gpu` with a CRF model | The basecall encoder through onnxruntime CUDA, ~4× end-to-end. |
+| DTW classification | `demux classify --gpu`, `demux train-svm --gpu` | Batched DTW distance. **Experimental and usually slower** than a full CPU node — see the warning in [classify](#classify). |
+
+(The granular `cnn-gpu` / `crf-gpu` flags still exist for library consumers
+of `escapepod-demux`; CLI users only need `gpu`.)
+
+### Building
+
+Nothing CUDA-related is needed at **build** time — the GPU runtimes load
+with `dlopen` at **run** time, so you can build on any machine, and a
+gpu-built binary still runs fine on CPU-only nodes as long as `--gpu` isn't
+requested:
+
+```bash
+cargo build --release --features gpu -p escapepod-cli
+```
+
+### Runtime libraries: the pixi environment (easiest)
+
+At run time `--gpu` needs two things, and the repository's
+[pixi](https://pixi.sh) `gpu` environment supplies both:
+
+1. **The CUDA 12 runtime libraries** — `libcublas`/`libcublasLt`,
+   `libcudart`, `libcufft`, cuDNN 9 (for the onnxruntime CUDA execution
+   provider) and `libnvrtc` (for the DTW kernels), from conda-forge.
+2. **A CUDA-enabled `libonnxruntime`** for the CNN/CRF paths — fetched once
+   by the `install-ort` task into `.pixi/ort/` (extracted from the
+   `onnxruntime-gpu` wheel; nothing is pip-installed), version-pinned to
+   match the `ort` crate the binary was built with.
+
+```bash
+# once, on a machine with network access (on clusters: the login node —
+# this also creates the environment on first use)
+pixi run -e gpu install-ort
+
+# then, on a node with a visible NVIDIA GPU — no env vars needed
+pixi run -e gpu ./target/release/escpod demux reads.pod5 --model <bundle> --gpu --annotate
+```
+
+Activating the environment (`pixi run -e gpu …` or `pixi shell -e gpu`) sets
+`LD_LIBRARY_PATH` and `ORT_DYLIB_PATH` automatically. The only system
+requirement on the node itself is an NVIDIA driver new enough for CUDA 12.
+
+### Verifying the GPU is actually in use
+
+At the default log level, escpod announces which device each stage runs on:
+
+```
+INFO Detecting adapter boundaries using boundary CNN (GPU)
+INFO Encoder runs on: GPU (onnxruntime CUDA)
+```
+
+Those lines say what was *requested*; onnxruntime failures that demote the
+work to CPU surface as **warnings** (visible by default), so a warning-free
+run on a GPU node is a healthy one. For positive confirmation that the CUDA
+execution provider loaded, raise the dependency log level — escpod pins
+third-party logs at `warn` unless `RUST_LOG` overrides it:
+
+```bash
+RUST_LOG=ort=info escpod demux basecall --gpu … 2>&1 | grep CUDAExecutionProvider
+# INFO [ort::ep] Successfully registered `CUDAExecutionProvider`
+```
+
+| Symptom | Cause |
+|---------|-------|
+| Warning that the execution provider *"may fall back to CPU"*, run is slow | A CUDA runtime library is missing (typically `libcublasLt.so.12` or `libcudnn.so.9`). Run inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them. |
+| Clear startup error: could not load onnxruntime | `ORT_DYLIB_PATH` is unset (e.g. `install-ort` was never run) or points at a CPU-only build of onnxruntime. |
+| Process hangs at startup and prints **nothing**, not even a status line | `ORT_DYLIB_PATH` is set but points at a file that does not exist. The pixi activation only sets it when the library is present, so this normally means a stale manual override. |
+
+!!! tip "On a cluster, redirect output to a file"
+    When running under a scheduler, don't pipe the job's output through
+    `tail` or similar — those buffer until EOF, so a healthy job looks
+    identical to a hung one. Redirect to a log file and follow that instead.
+
+### Manual setup (without pixi)
+
+Reproduce what the environment provides:
+
+- Put the CUDA 12 runtime on `LD_LIBRARY_PATH`: `libcublas.so.12`,
+  `libcublasLt.so.12`, `libcudart.so.12`, `libcufft.so.11`,
+  `libcudnn.so.9`, and `libnvrtc.so.12` for the DTW kernels.
+- For the CNN/CRF paths, set `ORT_DYLIB_PATH` to a **CUDA-enabled**
+  `libonnxruntime`, e.g. extracted from the `onnxruntime-gpu` wheel
+  (`onnxruntime/capi/libonnxruntime.so.<version>`). The onnxruntime version
+  must be compatible with the `ort` crate the binary was built with —
+  current pins: onnxruntime 1.28.0 with `ort` 2.0.0-rc.13.
+
+### HPC notes
+
+- Anything that downloads (`pixi run -e gpu install-ort`, and the pixi
+  environment creation it triggers) must run on a **networked** node —
+  compute nodes typically cannot reach the internet. Neither step needs a
+  GPU, so the login node is fine.
+- Both the environment (`.pixi/envs/gpu`) and the onnxruntime download
+  (`.pixi/ort`) live inside the project directory. On a shared filesystem
+  the GPU nodes see them with no further staging.
+- Model files are also fetched explicitly, never at run time — see
+  `escpod demux models fetch` above.
 
 ## Algorithm References
 
