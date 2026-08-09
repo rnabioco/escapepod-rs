@@ -339,6 +339,8 @@ impl Writer {
                 samples: chunk.len() as u32,
                 data,
             });
+            // Per chunk, not per read — see `flush_signal_if_full`.
+            self.flush_signal_if_full()?;
         }
 
         // Track dictionary entries (may fail in predefined mode)
@@ -349,15 +351,34 @@ impl Writer {
             signal_row_indices,
         });
 
-        // Flush batches if needed
-        if self.pending_signal.len() >= self.options.signal_batch_size as usize {
-            self.flush_signal_batch()?;
-        }
-
         if self.pending_reads.len() >= self.options.read_batch_size as usize {
             self.flush_read_batch()?;
         }
 
+        Ok(())
+    }
+
+    /// Flush the signal batch the moment it reaches `signal_batch_size`, so
+    /// every batch but the last holds *exactly* that many rows.
+    ///
+    /// Uniformity is load-bearing, not tidiness. A read's `signal` column holds
+    /// GLOBAL row indices, and readers resolve one to a position by assuming a
+    /// constant batch stride — so a single oversized batch silently shifts every
+    /// index after it. Checking the threshold once per read instead of once per
+    /// chunk let a multi-chunk read overshoot: one 1003-row batch, and from
+    /// there the file reads back misaligned. It fails as
+    /// `Queried signal row N is outside the available rows (M in batch)` near
+    /// EOF, or — worse, and only because this file's last batch was short
+    /// enough to catch it — returns another read's signal without complaint.
+    ///
+    /// Found in production: `escpod demux` wrote 16 per-barcode POD5s, 6 of them
+    /// with an oversized batch. dorado skipped the unreadable reads *silently*,
+    /// losing 10.6% of a 1M-read run, and the loss looked like biology until the
+    /// batch sizes were dumped.
+    fn flush_signal_if_full(&mut self) -> Result<()> {
+        if self.pending_signal.len() >= self.options.signal_batch_size as usize {
+            self.flush_signal_batch()?;
+        }
         Ok(())
     }
 
@@ -383,6 +404,8 @@ impl Writer {
                 samples: chunk.samples,
                 data: chunk.data.clone(), // Arc clone is cheap
             });
+            // Per chunk, not per read — see `flush_signal_if_full`.
+            self.flush_signal_if_full()?;
         }
 
         // Track dictionary entries (may fail in predefined mode)
@@ -392,11 +415,6 @@ impl Writer {
             data: read,
             signal_row_indices,
         });
-
-        // Flush batches if needed
-        if self.pending_signal.len() >= self.options.signal_batch_size as usize {
-            self.flush_signal_batch()?;
-        }
 
         if self.pending_reads.len() >= self.options.read_batch_size as usize {
             self.flush_read_batch()?;
@@ -1599,5 +1617,59 @@ mod tests {
         assert_eq!(reads[0].num_samples, 0);
 
         Ok(())
+    }
+
+    /// Every signal batch but the last must hold exactly `signal_batch_size`
+    /// rows. Readers resolve a read's GLOBAL signal index by assuming that
+    /// stride, so one oversized batch silently shifts every index after it.
+    ///
+    /// The regression this pins: the flush threshold used to be checked once
+    /// per read, after appending all of that read's chunks, so a read whose
+    /// chunks straddled the boundary emitted an oversized batch. Reproduced
+    /// here with `max_signal_chunk_size` small enough that reads are
+    /// multi-chunk and the batch size not a multiple of chunks-per-read.
+    #[test]
+    fn signal_batches_are_uniform_with_multi_chunk_reads() {
+        let tmp = NamedTempFile::new().unwrap();
+        let opts = WriterOptions {
+            // 4 chunks per 400-sample read; 10 rows per batch is NOT a multiple
+            // of 4, so a per-read check overshoots to 12.
+            max_signal_chunk_size: 100,
+            signal_batch_size: 10,
+            read_batch_size: 1000,
+            ..Default::default()
+        };
+        let mut w = Writer::create(tmp.path(), opts).unwrap();
+        w.add_run_info(create_test_run_info("acq_uniform")).unwrap();
+        // 1-based: `create_test_read` derives `start_sample` as
+        // `(read_number - 1) * num_samples`, which underflows at 0 (silently
+        // under release's wrapping arithmetic, loudly in a debug build).
+        for i in 1..=25 {
+            let read = create_test_read(0, i, 400);
+            w.add_read(read, &vec![42i16; 400]).unwrap();
+        }
+        w.finish().unwrap();
+
+        let reader = Reader::open(tmp.path()).unwrap();
+        let sizes: Vec<usize> = reader
+            .signal_batches()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .collect();
+        assert!(sizes.len() > 1, "need several batches to test the stride");
+        let (last, head) = sizes.split_last().unwrap();
+        for (i, n) in head.iter().enumerate() {
+            assert_eq!(
+                *n, 10,
+                "batch {i} has {n} rows, expected exactly 10 — an oversized \
+                 batch shifts every signal index after it (sizes: {sizes:?})"
+            );
+        }
+        assert!(*last <= 10, "final batch may be short, not long: {last}");
+
+        // The indices must also still resolve: 25 reads x 4 chunks.
+        let total: usize = sizes.iter().sum();
+        assert_eq!(total, 100, "25 reads x 4 chunks");
     }
 }
