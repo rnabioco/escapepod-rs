@@ -72,6 +72,15 @@ pub struct BasecallArgs {
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub boundary_margin: Option<usize>,
 
+    /// Overrule the bundle's declared `boundary.clamp_max_shift`: decode a read
+    /// whose adapter ends before the model's `chunk` from `[0, chunk]`, provided
+    /// `chunk - adapter_end` is at most N. 0 disables it.
+    ///
+    /// Reaches reads `--boundary-margin` cannot: their window would start before
+    /// sample 0. See `escpod demux --help` for the recovery/quality tradeoff.
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
+    pub clamp_max_shift: Option<usize>,
+
     /// Run encoder inference on the GPU (onnxruntime CUDA execution provider).
     /// The lattice decode stays on the CPU either way.
     #[cfg(feature = "crf-gpu")]
@@ -105,6 +114,14 @@ impl Basecaller {
             Self::Cpu(e) => e.set_boundary_margin(margin),
             #[cfg(feature = "crf-gpu")]
             Self::Gpu(e) => e.set_boundary_margin(margin),
+        }
+    }
+
+    fn set_clamp_max_shift(&mut self, shift: usize) {
+        match self {
+            Self::Cpu(e) => e.set_clamp_max_shift(shift),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.set_clamp_max_shift(shift),
         }
     }
 
@@ -244,6 +261,18 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             style::count(was),
         );
     }
+    if let Some(shift) = args.clamp_max_shift {
+        encoder.set_clamp_max_shift(shift);
+    }
+    let clamp = encoder.metadata().clamp_max_shift();
+    if clamp > 0 {
+        info!(
+            "{} adapter_end down to {} decodes from [0, {}]",
+            style::label("Window clamp:"),
+            style::count(encoder.metadata().signal.chunk.saturating_sub(clamp)),
+            style::count(encoder.metadata().signal.chunk),
+        );
+    }
 
     // Keep the ORT session alive past process exit when there is one, for the
     // reason spelled out on `run::LeakIf` (pykeio/ort#609). Applied here, at
@@ -368,7 +397,17 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
                         // Only the window ending at the adapter is ever read,
                         // so decode that prefix rather than a whole transcript
                         // — and calibrate only the window, not the prefix.
-                        let adc = decode_chunks_to(chunks, Some(adapter_end))?;
+                        //
+                        // Under clamping the window can extend PAST the adapter,
+                        // to `[0, chunk]`, so the prefix has to reach `chunk` or
+                        // the read arrives one sample short of its own window and
+                        // is refused for a reason that looks like geometry.
+                        let need = if meta.clamp_max_shift() > 0 {
+                            adapter_end.max(meta.signal.chunk)
+                        } else {
+                            adapter_end
+                        };
+                        let adc = decode_chunks_to(chunks, Some(need))?;
                         let mut w = Vec::new();
                         meta.prep_adc_into(
                             &adc,
