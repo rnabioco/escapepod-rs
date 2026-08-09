@@ -10,7 +10,7 @@ with Cargo features.
 |---------|-------------|---------|
 | [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
 | [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
-| `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(1) read-ID lookup |
+| `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(log n) read-ID lookup |
 | `annotate` | `--features experimental` | Record per-read annotations (demux barcodes) in the `.p5s` sidecar |
 
 ## The `.p5s` sidecar

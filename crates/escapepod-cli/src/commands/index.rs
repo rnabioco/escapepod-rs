@@ -15,7 +15,8 @@ use escapepod_signal::pod5::sidecar::sidecar_path;
 /// Build the `.p5s` read index for one or more POD5 files.
 ///
 /// The index maps each read UUID to its location in the reads table,
-/// enabling O(1) lookup instead of a full-table scan. The sidecar is
+/// enabling O(log n) binary-search lookup instead of a full-table scan.
+/// The sidecar is
 /// written next to the POD5 file by appending `.p5s` to the full
 /// filename (e.g. `reads.pod5` → `reads.pod5.p5s`); annotations already
 /// in the sidecar are preserved.
