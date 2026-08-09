@@ -731,7 +731,11 @@ mod tests {
         m.set_clamp_max_shift(500);
         // Inside the bound: same width, anchored at the read start.
         assert_eq!(m.window(1_900, 9_000), Some((0, chunk)), "shift 100");
-        assert_eq!(m.window(1_500, 9_000), Some((0, chunk)), "shift 500, the edge");
+        assert_eq!(
+            m.window(1_500, 9_000),
+            Some((0, chunk)),
+            "shift 500, the edge"
+        );
         // Past it.
         assert_eq!(m.window(1_499, 9_000), None, "shift 501");
         // A normal read is untouched by clamping.
