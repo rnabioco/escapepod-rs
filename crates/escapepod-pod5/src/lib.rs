@@ -36,6 +36,7 @@ pub mod merge;
 pub mod operations;
 pub mod progress;
 pub mod reader;
+pub mod sidecar;
 pub mod types;
 pub mod writer;
 

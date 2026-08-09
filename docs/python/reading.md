@@ -33,7 +33,7 @@ reader.file_identifier   # file UUID
 reader.software          # writer software string
 reader.pod5_version      # POD5 format version
 reader.run_infos         # list[RunInfo]
-reader.has_index         # whether a read-id index is built
+reader.has_index         # whether a .p5s sidecar exists
 len(reader)              # same as reader.read_count
 ```
 
@@ -71,7 +71,27 @@ reads = reader.get_reads(ids, missing_ok=True)      # skip absent IDs
 
 Repeated lookups build and reuse an in-memory index. Call
 `reader.build_index()` up front to pay that cost once (it returns the number of
-reads indexed); `reader.has_index` reports whether it's built.
+reads indexed and persists the index in the `.p5s` sidecar); `reader.has_index`
+reports whether a sidecar exists.
+
+## Sidecar annotations
+
+Per-read annotations recorded with `escpod annotate` (e.g. demux barcode
+assignments) live in the `.p5s` sidecar next to the POD5 and are exposed as
+plain dicts:
+
+```python
+reader.annotation_names()          # e.g. ["barcode", "condition"]
+barcodes = reader.annotation()     # dict[read_id, label]; name= if several
+conditions = reader.annotation("condition")  # derived from the design
+reader.design()                    # {"key_columns": …, "value_columns": …,
+                                   #  "rows": [...]} or None
+```
+
+Unassigned reads are absent from the dict. A sidecar that does not match the
+POD5 (stale, or copied from another file) raises instead of returning wrong
+answers. The sidecar itself is a plain Arrow IPC table, so
+`pyarrow.ipc.open_file("reads.pod5.p5s").read_all()` works too.
 
 ## Accessing signal data
 

@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Added
+
+- **`.p5s` sidecar: per-read annotations without touching the POD5.**
+  `escpod annotate -a demux.csv reads.pod5` (experimental) records a read →
+  barcode mapping in `reads.pod5.p5s`; the POD5 itself is never modified, so
+  raw sequencer output stays byte-identical and checksummable. The sidecar is
+  a plain Arrow IPC table (`read_id`, `batch_idx`, `row_idx`, plus one
+  dictionary-encoded column per named annotation — `--name` for more than
+  one), readable directly with pyarrow/polars, and is bound to its POD5 by
+  file-identifier UUID + byte size (checked before any data is decoded), so a
+  stale or misplaced sidecar fails loudly instead of describing the wrong
+  reads. Writes are atomic and column-preserving in both directions:
+  `escpod index` rebuilds the locator columns without dropping annotations,
+  `escpod annotate` adds a column without dropping the index. `demux split
+  --sidecar` splits from the sidecar instead of a classifications CSV
+  (verified read-for-read identical to `--classifications` on a 50k-read
+  production subset), so per-barcode POD5s become something you materialize
+  on demand rather than store. Python: `Reader.annotation()` /
+  `Reader.annotation_names()`.
+
+- **Experimental-design tables in the `.p5s` sidecar.** `escpod annotate
+  --design samplesheet.csv` records a mapping from annotation labels — or
+  combinations of them (`ldx,edx`) — to experimental variables
+  (`condition`, `replicate`, …). The table itself lives as JSON in the
+  sidecar's Arrow schema metadata (`escapepod:design`), and each variable is
+  materialized as a derived per-read dictionary column by joining across the
+  key annotations, so `demux split --sidecar --annotation condition`,
+  pyarrow filtering, and `Reader.annotation("condition")` need no join
+  logic. Key columns are auto-detected (CSV columns naming an existing
+  annotation; `--keys` to override). Rewriting a key annotation re-derives
+  its dependent columns automatically; writing a derived column directly is
+  refused, keeping the design the single source of truth. Python:
+  `Reader.design()`.
+
+### Changed
+
+- **The `.p5i` read-index sidecar is retired in favor of `.p5s`** — same
+  locator data, now one combined companion file whose read index and
+  annotations coexist. `.p5i` files are no longer read; delete them and rerun
+  `escpod index` (the index is a rebuildable cache, nothing is lost).
+  `Reader.has_index` / `build_index()` now target `.p5s`.
+
 ## 0.8.1 (2026-08-09)
 
 ### Fixed

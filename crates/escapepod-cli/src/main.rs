@@ -445,7 +445,7 @@ POD5 per stage; prefer the fused form unless you want the intermediate files.
         args: Vec<String>,
     },
 
-    /// Build .p5i read index for fast UUID lookup (experimental; requires `--features experimental`)
+    /// Build .p5s read index for fast UUID lookup (experimental; requires `--features experimental`)
     #[cfg(feature = "experimental")]
     #[command(after_help = "\
 Examples:
@@ -459,7 +459,7 @@ Examples:
         #[arg(required = true, value_name = "FILES")]
         inputs: Vec<PathBuf>,
 
-        /// Overwrite existing .p5i files
+        /// Rebuild existing .p5s indexes (annotations are preserved)
         #[arg(short, long)]
         force: bool,
 
@@ -468,11 +468,83 @@ Examples:
         threads: Option<usize>,
     },
 
-    /// Build .p5i read index for fast UUID lookup (rebuild with `--features experimental` to enable)
+    /// Build .p5s read index for fast UUID lookup (rebuild with `--features experimental` to enable)
     #[cfg(not(feature = "experimental"))]
     #[command(hide = true)]
     Index {
         /// Index arguments (ignored; feature not enabled)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+
+    /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar (experimental; requires `--features experimental`)
+    #[cfg(feature = "experimental")]
+    #[command(after_help = "\
+Writes a read → label mapping into the .p5s sidecar next to each POD5 file.
+The POD5 itself is never modified. The sidecar is a plain Arrow IPC table
+(read_id, batch_idx, row_idx, plus one dictionary column per annotation) —
+readable directly with pyarrow/polars — and is bound to its POD5 by file
+identifier + size, so a stale or misplaced sidecar fails loudly. Existing
+sidecar contents (the read index, other annotations) are preserved.
+
+Examples:
+  escpod annotate -a demux.csv input.pod5        Annotate with demux assignments
+  escpod annotate -a demux.csv data_dir/         Annotate a directory recursively
+  escpod annotate -a samples.csv --name sample input.pod5
+  escpod annotate --design samplesheet.csv input.pod5
+                                                 Map barcode (combinations) to
+                                                 experimental conditions
+")]
+    Annotate {
+        /// Input POD5 file(s) or directory
+        #[arg(required = true, value_name = "FILES")]
+        inputs: Vec<PathBuf>,
+
+        /// CSV mapping reads to labels (read_id + barcode/predicted_barcode
+        /// columns — the output of `demux classify` or `demux basecall --barcodes`)
+        #[arg(
+            short = 'a',
+            long,
+            value_name = "CSV",
+            required_unless_present = "design",
+            conflicts_with = "design"
+        )]
+        assignments: Option<PathBuf>,
+
+        /// Experimental-design CSV: one column per key annotation (e.g.
+        /// `barcode`, or `ldx,edx` for combinations) plus one column per
+        /// experimental variable (e.g. `condition`). Stored in the sidecar
+        /// and materialized as derived per-read columns
+        #[arg(long, value_name = "CSV")]
+        design: Option<PathBuf>,
+
+        /// With --design: which CSV columns are the keys (default: every
+        /// column whose name matches an existing annotation)
+        #[arg(long, value_name = "COLS", requires = "design", value_delimiter = ',')]
+        keys: Option<Vec<String>>,
+
+        /// Annotation name (the sidecar column to write, with -a)
+        #[arg(long, default_value = escapepod_signal::pod5::sidecar::DEFAULT_ANNOTATION_NAME)]
+        name: String,
+
+        /// Replace a stale or unreadable sidecar instead of erroring
+        #[arg(long)]
+        force: bool,
+
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+        threads: Option<usize>,
+    },
+
+    /// Record per-read annotations in the .p5s sidecar (rebuild with `--features experimental` to enable)
+    #[cfg(not(feature = "experimental"))]
+    #[command(hide = true)]
+    Annotate {
+        /// Annotate arguments (ignored; feature not enabled)
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
@@ -502,6 +574,11 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         Commands::Index { threads, .. } => *threads,
         #[cfg(not(feature = "experimental"))]
         Commands::Index { .. } => None,
+
+        #[cfg(feature = "experimental")]
+        Commands::Annotate { threads, .. } => *threads,
+        #[cfg(not(feature = "experimental"))]
+        Commands::Annotate { .. } => None,
 
         // Like `demux`, resquiggle flattens its run args under a subcommand.
         #[cfg(feature = "experimental")]
@@ -785,6 +862,20 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(not(feature = "experimental"))]
         Commands::Index { .. } => feature_disabled("index", "experimental"),
+
+        #[cfg(feature = "experimental")]
+        Commands::Annotate {
+            inputs,
+            assignments,
+            design,
+            keys,
+            name,
+            force,
+            threads: _,
+        } => commands::annotate::run(inputs, assignments, design, keys, name, force),
+
+        #[cfg(not(feature = "experimental"))]
+        Commands::Annotate { .. } => feature_disabled("annotate", "experimental"),
     }
 }
 

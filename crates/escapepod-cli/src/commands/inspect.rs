@@ -211,8 +211,9 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         };
 
-        // Use the indexed by-id lookup so this is O(1) per file when a
-        // .p5i sidecar exists, instead of scanning every batch.
+        // Use the indexed by-id lookup — an O(log n) binary search that
+        // touches one batch when a .p5s sidecar exists — instead of
+        // scanning every batch.
         let mut targets = std::collections::HashSet::new();
         targets.insert(target_id);
         let matches = match reader.reads_by_ids(&targets) {

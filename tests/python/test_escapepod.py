@@ -768,6 +768,65 @@ class TestIndex:
             assert reader.has_index
 
 
+class TestSidecarAnnotations:
+    """Reading .p5s sidecar annotations (written by `escpod annotate`).
+
+    Python only reads annotations, so without an escpod-written sidecar these
+    exercise the no-sidecar / index-only behavior: empty listings, clear
+    errors, and design() returning None.
+    """
+
+    def test_annotation_names_empty_without_sidecar(self):
+        if not TEST_POD5.exists():
+            pytest.skip("Test POD5 not found")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil
+
+            tmp_pod5 = Path(tmpdir) / "test.pod5"
+            shutil.copy2(TEST_POD5, tmp_pod5)
+
+            reader = escapepod.Reader(str(tmp_pod5))
+            assert reader.annotation_names() == []
+
+            # An index-only sidecar has no annotations either.
+            reader.build_index()
+            assert reader.annotation_names() == []
+
+    def test_annotation_raises_without_annotations(self):
+        if not TEST_POD5.exists():
+            pytest.skip("Test POD5 not found")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil
+
+            tmp_pod5 = Path(tmpdir) / "test.pod5"
+            shutil.copy2(TEST_POD5, tmp_pod5)
+
+            reader = escapepod.Reader(str(tmp_pod5))
+            with pytest.raises(Exception, match="sidecar"):
+                reader.annotation()
+            with pytest.raises(Exception, match="sidecar"):
+                reader.annotation("barcode")
+
+    def test_design_none_without_sidecar(self):
+        if not TEST_POD5.exists():
+            pytest.skip("Test POD5 not found")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil
+
+            tmp_pod5 = Path(tmpdir) / "test.pod5"
+            shutil.copy2(TEST_POD5, tmp_pod5)
+
+            reader = escapepod.Reader(str(tmp_pod5))
+            assert reader.design() is None
+
+            # Index-only sidecar: still no design.
+            reader.build_index()
+            assert reader.design() is None
+
+
 # ---------------------------------------------------------------------------
 # Helpers for tests that need synthetic multi-file datasets
 # ---------------------------------------------------------------------------
