@@ -320,6 +320,12 @@ impl CrfEncoderGpu {
         self.meta.set_boundary_margin(margin);
     }
 
+    /// Override how far the window may be clamped. See
+    /// [`CrfMetadata::clamp_max_shift`].
+    pub fn set_clamp_max_shift(&mut self, shift: usize) {
+        self.meta.set_clamp_max_shift(shift);
+    }
+
     pub fn layout(&self) -> &CrfLayout {
         &self.layout
     }

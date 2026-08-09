@@ -120,6 +120,29 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
     );
     field("stride", meta.signal.stride);
     field("timesteps", meta.signal.chunk / meta.signal.stride);
+    // Both of these decide whether a read is decoded at all, so a bundle that
+    // sets them is materially different to run and `--info` is where you look
+    // before trusting a model.
+    field(
+        "min adapter_end",
+        format!(
+            "{}  (chunk + margin {})",
+            meta.min_adapter_end(),
+            meta.boundary_margin()
+        ),
+    );
+    field(
+        "window clamp",
+        match meta.clamp_max_shift() {
+            0 => "off — a read whose adapter ends before chunk is refused".to_string(),
+            n => format!(
+                "adapter_end down to {} decodes from [0, {}] (max shift {})",
+                meta.signal.chunk.saturating_sub(n),
+                meta.signal.chunk,
+                n
+            ),
+        },
+    );
     field(
         "standardisation",
         format!(

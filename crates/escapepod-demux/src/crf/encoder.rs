@@ -126,6 +126,10 @@ pub struct CrfMetadata {
     /// states the contract, this is the operator overruling it.
     #[serde(skip)]
     margin_override: Option<usize>,
+    /// Per-run override of the bundle's declared `boundary.clamp_max_shift`,
+    /// set by `demux --clamp-max-shift`. Never read from the sidecar.
+    #[serde(skip)]
+    clamp_override: Option<usize>,
 }
 
 /// Who this model is, for provenance in logs and `--info`.
@@ -190,6 +194,16 @@ pub struct BoundarySpec {
     /// trained to tolerate a window reaching the read's opening samples.
     #[serde(default)]
     pub margin: Option<usize>,
+    /// Largest `chunk - adapter_end` for which a read whose adapter ends before
+    /// `chunk` is decoded from `[0, chunk]` rather than refused. Absent or 0
+    /// disables clamping.
+    ///
+    /// Belongs to the bundle for the same reason `margin` does: how far the
+    /// window can slide before the decode stops meaning anything is a property
+    /// of the trained model, measurable once at export against held-out reads,
+    /// and not something an operator can derive per run.
+    #[serde(default)]
+    pub clamp_max_shift: Option<usize>,
 }
 
 fn default_onnx_name() -> String {
@@ -279,13 +293,47 @@ impl CrfMetadata {
     /// overloaded "no adapter" / "too short" / "inference failed" sentinel)
     /// ends up unclassified rather than guessed at.
     pub fn prep(&self, signal_pa: &[f32], adapter_end: usize) -> Option<Vec<f32>> {
+        let (lo, hi) = self.window(adapter_end, signal_pa.len())?;
+        let mut out = Vec::with_capacity(self.signal.chunk);
+        self.standardise(&signal_pa[lo..hi], &mut out);
+        Some(out)
+    }
+
+    /// The `chunk`-sample window to decode, or `None` if the read cannot supply
+    /// one.
+    ///
+    /// Normally `[adapter_end - chunk, adapter_end]`. When `adapter_end < chunk`
+    /// no such window exists — the read starts mid-adapter, so the signal simply
+    /// runs out — and the read is refused, unless clamping is enabled. Clamping
+    /// substitutes `[0, chunk]`: the same width, anchored at the read start,
+    /// sliding `chunk - adapter_end` samples of downstream signal into the tail.
+    ///
+    /// The CRF tolerates that slide better than it looks: measured on RNA004
+    /// nbc16 with known-good reads deliberately slid forward, the same barcode
+    /// is still called for 98.6% at shift 0 and 93.5% at shift 500. Quality does
+    /// decay with the shift, which is why the allowance is a bound and not a
+    /// bool — see [`CrfMetadata::clamp_max_shift`].
+    fn window(&self, adapter_end: usize, len: usize) -> Option<(usize, usize)> {
         let chunk = self.signal.chunk;
-        if adapter_end < self.min_adapter_end() || adapter_end > signal_pa.len() {
+        if adapter_end > len {
             return None;
         }
-        let mut out = Vec::with_capacity(chunk);
-        self.standardise(&signal_pa[adapter_end - chunk..adapter_end], &mut out);
-        Some(out)
+        if adapter_end >= self.min_adapter_end() {
+            return Some((adapter_end - chunk, adapter_end));
+        }
+        // `adapter_end` in `[chunk, chunk + margin)` has a real window and is
+        // refused by the margin, not by geometry; clamping is not that lever.
+        if adapter_end >= chunk {
+            return None;
+        }
+        // 0 is the detector's overloaded "no adapter" / "too short" / "inference
+        // failed" sentinel. Clamping it would decode a window with no adapter in
+        // it at all and hand back a confident-looking call.
+        if adapter_end == 0 || len < chunk {
+            return None;
+        }
+        let shift = chunk - adapter_end;
+        (shift <= self.clamp_max_shift()).then_some((0, chunk))
     }
 
     /// [`Self::prep`], but straight from ADC counts and converting only the
@@ -321,13 +369,13 @@ impl CrfMetadata {
         out: &mut Vec<f32>,
     ) -> bool {
         out.clear();
-        if adapter_end < self.min_adapter_end() || adapter_end > adc.len() {
+        let Some((lo, hi)) = self.window(adapter_end, adc.len()) else {
             return false;
-        }
+        };
         let (mean, stdev) = (self.standardisation.mean, self.standardisation.stdev);
         let bias = offset * scale;
         out.extend(
-            adc[adapter_end - self.signal.chunk..adapter_end]
+            adc[lo..hi]
                 .iter()
                 .map(|&v| (f32::from(v).mul_add(scale, bias) - mean) / stdev),
         );
@@ -350,6 +398,30 @@ impl CrfMetadata {
         self.margin_override
             .or_else(|| self.boundary.as_ref().and_then(|b| b.margin))
             .unwrap_or(BOUNDARY_MARGIN)
+    }
+
+    /// Largest `chunk - adapter_end` for which the window is clamped to
+    /// `[0, chunk]` instead of the read being refused. 0 (the default) disables
+    /// clamping entirely.
+    ///
+    /// A bound rather than a bool because recovery quality decays with the
+    /// shift, so the useful question is how far to go, not whether. On the
+    /// RNA004 nbc16 run, decoding the whole `adapter_end` 2,500-2,999 band this
+    /// way returned 42,404 reads at median edit distance 0 — but agreement fell
+    /// from 97.4% within 2 edits at shift 0-99 to 92.9% at 400-499, and the
+    /// fraction that still align to a tRNA fell from 78.5% to 50.0%, because a
+    /// larger shift means more of the adapter was truncated in the first place.
+    /// Pick the bound from how much of that tail is worth having.
+    pub fn clamp_max_shift(&self) -> usize {
+        self.clamp_override
+            .or_else(|| self.boundary.as_ref().and_then(|b| b.clamp_max_shift))
+            .unwrap_or(0)
+    }
+
+    /// Overrule the bundle's declared `boundary.clamp_max_shift` for this run
+    /// (`demux --clamp-max-shift`).
+    pub fn set_clamp_max_shift(&mut self, shift: usize) {
+        self.clamp_override = Some(shift);
     }
 
     /// Overrule the bundle's declared margin for this run
@@ -453,6 +525,12 @@ impl CrfEncoder {
     /// [`CrfMetadata::set_boundary_margin`].
     pub fn set_boundary_margin(&mut self, margin: usize) {
         self.meta.set_boundary_margin(margin);
+    }
+
+    /// Override how far the window may be clamped. See
+    /// [`CrfMetadata::clamp_max_shift`].
+    pub fn set_clamp_max_shift(&mut self, shift: usize) {
+        self.meta.set_clamp_max_shift(shift);
     }
 
     /// Lattice geometry implied by the sidecar.
@@ -635,6 +713,65 @@ mod tests {
         let mut both = declared;
         both.set_boundary_margin(300);
         assert_eq!(both.min_adapter_end(), 2300);
+    }
+
+    /// Clamping substitutes `[0, chunk]` for reads whose adapter ends before
+    /// `chunk`, bounded by how far the window may slide. Off by default.
+    #[test]
+    fn window_clamps_only_within_the_declared_shift() {
+        let chunk = 2000;
+        let mut m = meta();
+        m.set_boundary_margin(0);
+        assert_eq!(m.clamp_max_shift(), 0, "off unless asked for");
+
+        // Disabled: anything short of a full window is refused.
+        assert_eq!(m.window(chunk, 9_000), Some((0, chunk)), "exactly a window");
+        assert_eq!(m.window(1_900, 9_000), None);
+
+        m.set_clamp_max_shift(500);
+        // Inside the bound: same width, anchored at the read start.
+        assert_eq!(m.window(1_900, 9_000), Some((0, chunk)), "shift 100");
+        assert_eq!(m.window(1_500, 9_000), Some((0, chunk)), "shift 500, the edge");
+        // Past it.
+        assert_eq!(m.window(1_499, 9_000), None, "shift 501");
+        // A normal read is untouched by clamping.
+        assert_eq!(m.window(3_000, 9_000), Some((1_000, 3_000)));
+
+        // The detector's "no adapter" sentinel must never be clamped, however
+        // generous the bound — the window would hold no adapter at all.
+        m.set_clamp_max_shift(chunk + 1_000);
+        assert_eq!(m.window(0, 9_000), None, "adapter_end == 0 stays refused");
+        // Nor may a clamp invent signal the read does not have.
+        assert_eq!(m.window(1_900, chunk - 1), None, "read shorter than chunk");
+
+        // Clamping does not rescue a read the MARGIN refuses: that window
+        // exists, so it is a different decision.
+        let mut margin_gated = meta();
+        margin_gated.set_clamp_max_shift(500);
+        assert_eq!(margin_gated.min_adapter_end(), chunk + BOUNDARY_MARGIN);
+        assert_eq!(margin_gated.window(chunk + 50, 9_000), None);
+    }
+
+    /// The bundle can declare the clamp, and an override beats it.
+    #[test]
+    fn clamp_max_shift_precedence() {
+        let declared: CrfMetadata = serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 2000, "stride": 10},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]},
+              "boundary": {"method": "cnn", "margin": 0, "clamp_max_shift": 400}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(declared.clamp_max_shift(), 400);
+        assert_eq!(declared.window(1_600, 9_000), Some((0, 2_000)));
+        assert_eq!(declared.window(1_599, 9_000), None);
+
+        let mut overridden = declared;
+        overridden.set_clamp_max_shift(0);
+        assert_eq!(overridden.window(1_600, 9_000), None, "override disables");
     }
 
     /// The boundary block's `input` contract and `sha256` are optional

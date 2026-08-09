@@ -104,6 +104,27 @@ pub struct RunArgs {
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub boundary_margin: Option<usize>,
 
+    /// Overrule the bundle's declared `boundary.clamp_max_shift`: decode a read
+    /// whose adapter ends before the model's `chunk` from the window `[0,
+    /// chunk]`, provided `chunk - adapter_end` is at most N. 0 disables it.
+    ///
+    /// `--boundary-margin` cannot reach these reads. Their window would start
+    /// before sample 0, so there is nothing to relax — the signal genuinely runs
+    /// out. Clamping keeps the window width and anchors it at the read start
+    /// instead, sliding `chunk - adapter_end` samples of downstream signal into
+    /// the tail. Such reads are truncated mid-adapter, so part of the barcode is
+    /// already gone; the bound is how much of that you accept.
+    ///
+    /// Measured on the RNA004 nbc16 run: known-good reads deliberately slid
+    /// forward still call the same barcode 98.6% of the time at shift 0 and
+    /// 93.5% at 500. Applying it to the real `adapter_end` 2,500-2,999 band
+    /// recovered 42,404 reads, all decoding, median edit distance 0, but with
+    /// agreement falling 97.4% -> 92.9% within 2 edits across that range and the
+    /// share still aligning to a tRNA falling 78.5% -> 50.0%.
+    #[cfg(feature = "crf-decode")]
+    #[arg(long, value_name = "N", help_heading = "Advanced Options")]
+    pub clamp_max_shift: Option<usize>,
+
     /// Describe the model and exit: identity, signal geometry, bundled
     /// references, pinned boundary detector, published metrics, and the exact
     /// command line it needs. Reads no POD5, so it is safe to run against a
@@ -551,6 +572,14 @@ impl CrfEncoderAny {
             Self::Gpu(e) => e.set_boundary_margin(margin),
         }
     }
+
+    fn set_clamp_max_shift(&mut self, shift: usize) {
+        match self {
+            Self::Cpu(e) => e.set_clamp_max_shift(shift),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.set_clamp_max_shift(shift),
+        }
+    }
 }
 
 impl ClassifyModel {
@@ -714,6 +743,20 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                     style::label("Boundary margin:"),
                     style::count(encoder.metadata().min_adapter_end()),
                     style::count(was),
+                );
+            }
+            if let Some(shift) = args.clamp_max_shift {
+                encoder.set_clamp_max_shift(shift);
+            }
+            let shift = encoder.metadata().clamp_max_shift();
+            if shift > 0 {
+                info!(
+                    "{} reads with adapter_end down to {} decode from [0, {}], sliding up \
+                     to {} samples past the adapter",
+                    style::label("Window clamp:"),
+                    style::count(encoder.metadata().signal.chunk.saturating_sub(shift)),
+                    style::count(encoder.metadata().signal.chunk),
+                    style::count(shift),
                 );
             }
             // References come from the bundle unless the caller overrides them.
