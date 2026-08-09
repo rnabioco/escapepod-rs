@@ -1,6 +1,6 @@
 //! Shared progress bar utilities.
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{HumanCount, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 /// Whether interactive progress indicators should be drawn.
 ///
@@ -12,7 +12,8 @@ fn progress_enabled() -> bool {
     tracing::enabled!(tracing::Level::INFO)
 }
 
-/// Create a progress bar with the standard style including ETA.
+/// Create a progress bar with the standard style: live throughput
+/// (items/s over the whole run), elapsed, and ETA.
 pub fn create_progress_bar(total: u64, prefix: &str) -> anyhow::Result<ProgressBar> {
     if !progress_enabled() {
         return Ok(ProgressBar::hidden());
@@ -20,7 +21,12 @@ pub fn create_progress_bar(total: u64, prefix: &str) -> anyhow::Result<ProgressB
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg} [{elapsed_precise}] ETA: {eta}")?
+            .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} ({rate}) {msg} [{elapsed_precise}] ETA: {eta}")?
+            // indicatif's stock {per_sec} prints four decimals; render the
+            // rate as a rounded human count instead ("12,847/s").
+            .with_key("rate", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}/s", HumanCount(state.per_sec().round() as u64));
+            })
             .progress_chars("━━─"),
     );
     pb.set_prefix(prefix.to_string());
