@@ -82,6 +82,21 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
         } else {
             println!("{} {}", style::key("Reads:"), style::count(read_count));
             println!("{} {}", style::key("Read batches:"), batch_count);
+            // Say it here too, not only as the open-time warning: `inspect` is
+            // where someone looks to decide whether a file is sound, and this
+            // is the one fault escapepod reads straight through.
+            if let Some(bad) = reader.nonuniform_signal_batch() {
+                println!(
+                    "{} signal batch {} has {} rows, expected {} — reads \
+                     correctly here, but the official pod5 library and dorado \
+                     assume a constant stride and will mis-resolve every signal \
+                     index after it. Rewrite with `escpod repack`.",
+                    style::warning("Signal batches: NOT PORTABLE —"),
+                    bad.index,
+                    bad.rows,
+                    bad.expected,
+                );
+            }
             println!();
 
             println!(

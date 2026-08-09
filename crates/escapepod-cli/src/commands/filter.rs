@@ -7,7 +7,9 @@
 use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
-use crate::util::{check_output_not_input, check_output_writable, resolve_pod5_inputs};
+use crate::util::{
+    check_output_not_input, check_output_writable, resolve_pod5_inputs_many, warn_if_not_portable,
+};
 use escapepod_signal::Durability;
 use escapepod_signal::operations::{
     FilterCriteria, FilterOptions, filter_files_with_criteria, read_ids_from_file,
@@ -19,7 +21,7 @@ use tracing::{info, warn};
 
 #[allow(clippy::too_many_arguments)] // args mirror the CLI subcommand surface
 pub fn run(
-    input: PathBuf,
+    input: Vec<PathBuf>,
     ids_file: Option<PathBuf>,
     min_samples: Option<u64>,
     max_samples: Option<u64>,
@@ -35,8 +37,13 @@ pub fn run(
     let mut timer = PhaseTimer::new();
     timer.phase("Resolve inputs");
 
-    // Resolve input to list of POD5 files (supports directories)
-    let files = resolve_pod5_inputs(&input)?;
+    // Resolve inputs to a list of POD5 files (files and/or directories). Taking
+    // several is what makes this a drop-in for `pod5 filter`, which accepts a
+    // list — a pipeline splitting one logical run across per-flowcell
+    // directories has to name them all in one call or the read-ID list is
+    // filtered against only part of the run.
+    let files = resolve_pod5_inputs_many(&input)?;
+    warn_if_not_portable(&files);
     check_output_not_input(&output, &files)?;
     let is_directory = files.len() > 1;
 
@@ -87,13 +94,20 @@ pub fn run(
         "{} {}",
         style::action("Filtering"),
         if is_directory {
+            // Name what the user typed, not the expansion — one directory can
+            // stand for hundreds of files, and several inputs are now possible.
+            let named = input
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
                 "{} ({} files)",
-                style::path(input.display()),
+                style::path(named),
                 style::value(files.len())
             )
         } else {
-            style::path(input.display()).to_string()
+            style::path(files[0].display()).to_string()
         }
     );
 

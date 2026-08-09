@@ -17,6 +17,56 @@ use crate::style;
 ///
 /// - If path is a file, return it as a single-element vector
 /// - If path is a directory, find all *.pod5 files recursively
+/// Resolve several inputs (files and/or directories) to one sorted file list.
+///
+/// Duplicates are dropped so overlapping arguments (`dir/` plus a file inside
+/// it) cannot feed the same read twice.
+pub fn resolve_pod5_inputs_many(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for p in paths {
+        files.extend(resolve_pod5_inputs(p)?);
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        anyhow::bail!("No POD5 files found in the given inputs");
+    }
+    Ok(files)
+}
+
+/// Warn about inputs that only escapepod can read correctly.
+///
+/// A POD5 whose signal batches break stride resolves fine here — this crate
+/// walks cumulative per-batch row counts — and mis-resolves in the official
+/// `pod5` library and dorado, which assume a constant stride. That asymmetry is
+/// why such a file passes every escpod check and then silently loses reads in
+/// the basecaller (escapepod-rs#195), so it has to be said out loud at the
+/// point the file is used, not only when someone runs `inspect`.
+///
+/// Costs one Arrow IPC footer parse per file (a few KB, no signal decode), and
+/// never fails the run: the data is readable here, it is the downstream tool
+/// that will suffer.
+pub fn warn_if_not_portable(files: &[PathBuf]) {
+    for f in files {
+        let Ok(reader) = escapepod_signal::pod5::Reader::open(f) else {
+            continue; // a real open failure is reported by the caller
+        };
+        if let Some(bad) = reader.nonuniform_signal_batch() {
+            tracing::warn!(
+                "{}: signal batch {} has {} rows, expected {} — this file reads \
+                 correctly here, but the official pod5 library and dorado assume \
+                 a constant batch stride and will mis-resolve every signal index \
+                 after it (silently, in dorado's case). Rewrite it with \
+                 `escpod repack` before basecalling.",
+                f.display(),
+                bad.index,
+                bad.rows,
+                bad.expected,
+            );
+        }
+    }
+}
+
 pub fn resolve_pod5_inputs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);

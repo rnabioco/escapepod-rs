@@ -34,6 +34,43 @@ pub(crate) struct SignalCalibration {
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
 
+/// A signal batch whose row count breaks the file's stride.
+///
+/// See [`Reader::nonuniform_signal_batch`] — a portability fault, not a read
+/// error: escapepod resolves such a file correctly, other readers do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonUniformSignalBatch {
+    /// Index of the offending batch.
+    pub index: usize,
+    /// Rows it actually holds.
+    pub rows: u64,
+    /// Rows the stride implies (the first batch's count).
+    pub expected: u64,
+}
+
+/// First non-final batch whose row count differs from the first batch's.
+///
+/// Split out from [`Reader::nonuniform_signal_batch`] so the rule is testable
+/// without a malformed file — which the writer can no longer produce
+/// (escapepod-rs#195), leaving no way to build one through the public API.
+fn first_nonuniform_batch(counts: &[u64]) -> Option<NonUniformSignalBatch> {
+    // Under 3 batches there is at most one non-final batch, and that one
+    // defines the stride, so it cannot disagree with it.
+    if counts.len() < 3 {
+        return None;
+    }
+    let expected = counts[0];
+    counts[..counts.len() - 1]
+        .iter()
+        .enumerate()
+        .find(|(_, n)| **n != expected)
+        .map(|(index, rows)| NonUniformSignalBatch {
+            index,
+            rows: *rows,
+            expected,
+        })
+}
+
 /// A reader for POD5 files.
 pub struct Reader {
     /// Memory-mapped file data.
@@ -165,14 +202,15 @@ impl Reader {
         // Load run info eagerly (it's usually small)
         let run_info_cache = Self::load_run_info(&mmap, &footer)?;
 
-        Ok(Self {
+        let reader = Self {
             mmap,
             footer,
             run_info_cache,
             signal_ipc_footer: OnceLock::new(),
             read_index: OnceLock::new(),
             file_path: Some(file_path),
-        })
+        };
+        Ok(reader)
     }
 
     /// Lazily parse and cache the signal table's Arrow IPC footer.
@@ -491,6 +529,32 @@ impl Reader {
 
     /// Get signal batches as Arrow RecordBatches for direct batch-level copying.
     /// This is the fastest method for merge operations - copies batches without unpacking.
+    /// Row count of every signal batch, straight from the Arrow IPC footer.
+    ///
+    /// O(number of batches) and no signal decode — the footer already carries
+    /// the descriptors. Empty when the file has no signal table.
+    pub fn signal_batch_row_counts(&self) -> Vec<u64> {
+        self.signal_ipc_footer()
+            .map(|f| f.record_batches.iter().map(|b| b.row_count).collect())
+            .unwrap_or_default()
+    }
+
+    /// The first non-final signal batch whose row count differs from the
+    /// first batch's, if the file has one.
+    ///
+    /// This crate reads signal by walking cumulative per-batch row counts, so a
+    /// file like this reads back correctly HERE. Other readers — including the
+    /// official `pod5` library and dorado — resolve a read's global signal
+    /// index by assuming a constant batch stride, and for them one oversized
+    /// batch shifts every index after it. So this is a **portability** fault,
+    /// not a corruption we cannot handle, and the distinction matters: such a
+    /// file looks perfect to `escpod` and silently loses reads in dorado.
+    ///
+    /// The final batch is exempt — it is legitimately short.
+    pub fn nonuniform_signal_batch(&self) -> Option<NonUniformSignalBatch> {
+        first_nonuniform_batch(&self.signal_batch_row_counts())
+    }
+
     pub fn signal_batches(&self) -> Result<Vec<RecordBatch>> {
         let embedded = self
             .footer
@@ -1637,5 +1701,51 @@ impl Reader {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod uniformity_tests {
+    use super::*;
+
+    #[test]
+    fn uniform_and_short_files_are_clean() {
+        // The last batch is legitimately short.
+        assert_eq!(first_nonuniform_batch(&[1000, 1000, 1000, 373]), None);
+        assert_eq!(first_nonuniform_batch(&[1000, 1000, 1000, 1000]), None);
+        // Too few batches for a stride to be contradicted.
+        assert_eq!(first_nonuniform_batch(&[]), None);
+        assert_eq!(first_nonuniform_batch(&[7]), None);
+        assert_eq!(first_nonuniform_batch(&[1000, 42]), None);
+    }
+
+    #[test]
+    fn oversized_batch_is_reported_with_its_position() {
+        // The shape of the real production failure: 57x1000, one 1003, short
+        // last (barcode_nbc15.pod5, escapepod-rs#195).
+        let mut counts = vec![1000u64; 58];
+        counts[1] = 1003;
+        counts.push(410);
+        let bad = first_nonuniform_batch(&counts).expect("must be flagged");
+        assert_eq!(bad.index, 1);
+        assert_eq!(bad.rows, 1003);
+        assert_eq!(bad.expected, 1000);
+    }
+
+    #[test]
+    fn an_undersized_middle_batch_counts_too() {
+        // Short is just as index-shifting as long; only the FINAL batch is
+        // allowed to be short.
+        let bad = first_nonuniform_batch(&[100, 100, 99, 100, 50]).expect("must be flagged");
+        assert_eq!((bad.index, bad.rows, bad.expected), (2, 99, 100));
+    }
+
+    #[test]
+    fn the_first_offender_is_the_one_reported() {
+        let bad = first_nonuniform_batch(&[10, 12, 10, 15, 3]).expect("must be flagged");
+        assert_eq!(
+            bad.index, 1,
+            "report the earliest divergence, not the worst"
+        );
     }
 }
