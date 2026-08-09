@@ -8,7 +8,7 @@ use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::{
-    check_output_not_input, check_output_writable, resolve_pod5_inputs_many, warn_if_not_portable,
+    check_output_not_input, check_output_writable, collect_pod5_inputs, warn_if_not_portable,
 };
 use escapepod_signal::Durability;
 use escapepod_signal::operations::{
@@ -42,7 +42,7 @@ pub fn run(
     // list — a pipeline splitting one logical run across per-flowcell
     // directories has to name them all in one call or the read-ID list is
     // filtered against only part of the run.
-    let files = resolve_pod5_inputs_many(&input)?;
+    let files = collect_pod5_inputs(&input)?;
     warn_if_not_portable(&files);
     check_output_not_input(&output, &files)?;
     let is_directory = files.len() > 1;
