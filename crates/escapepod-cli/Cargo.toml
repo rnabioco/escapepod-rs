@@ -159,16 +159,20 @@ models-download = ["experimental", "model-fetch"]
 # the subcommand still lists, resolves and reports the cache, and `fetch` errors
 # with a rebuild hint.
 demux-models = ["demux"]
-# EXPERIMENTAL. GPU-accelerated DTW for demux classify and train-svm (requires
-# a CUDA driver + libnvrtc at runtime).
+# The one user-facing GPU switch: every GPU path in one flag — CUDA DTW
+# (cudarc/NVRTC), GPU CNN adapter detection, and the GPU CTC-CRF encoder
+# (both onnxruntime CUDA). `--gpu` at runtime then uses whichever path fits
+# the model and stage. Nothing is needed at build time; at run time the DTW
+# path needs the CUDA driver + libnvrtc, and the onnxruntime paths need a
+# CUDA-enabled libonnxruntime on ORT_DYLIB_PATH (ort is `load-dynamic`, so a
+# gpu-built binary runs fine on CPU-only boxes as long as --gpu isn't asked
+# for). The granular `cnn-gpu` / `crf-gpu` flags below remain for library
+# consumers and CI isolation builds; CLI users should just use `gpu`.
 #
-# Not recommended for production use as of 0.6.x: on a full node the CPU DTW is
-# *faster*. Measured on 1.22M reads with a DTW-SVM model against an A30 —
-# 113.0 s on 64 CPU cores vs 132.4 s with `--gpu` (0.85×), plus ~2.2 GB more
-# RSS. An apparent 1.67× win disappears once the CPU is given the whole node
-# rather than 16 of 64 cores. It may still help where cores are scarce relative
-# to the DTW workload. See benchmarks/README.md.
-gpu = ["demux", "escapepod-demux/gpu"]
+# Caveat for the DTW leg specifically: on a full node the CPU DTW is *faster*
+# (113.0 s on 64 cores vs 132.4 s on an A30 for 1.22M reads, +~2.2 GB RSS) —
+# the wins are CNN detection and the CRF encoder. See benchmarks/README.md.
+gpu = ["demux", "escapepod-demux/gpu", "cnn-gpu", "crf-gpu"]
 # Training support for demux SVM models (implies `demux`).
 train = ["demux", "escapepod-demux/train"]
 

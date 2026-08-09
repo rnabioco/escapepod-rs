@@ -120,10 +120,8 @@ match result {
 | `crf-decode` | CTC-CRF barcode basecalling (`demux basecall`) — *implied by `cli`* |
 | `demux-models` / `model-fetch` | Model-bundle registry and `demux models fetch` — *implied by `cli`* |
 | `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
-| `gpu` | Implies `demux`; batched GPU DTW for classify / train-svm (CUDA driver + libnvrtc at runtime) |
+| `gpu` | Every `--gpu` path: CNN adapter detection + CRF encoder (onnxruntime CUDA) and DTW classify (cudarc). Implies `cnn-gpu` + `crf-gpu`, which remain individually selectable for library consumers |
 | `cnn-detect` | Part of `cli`; implies `demux`. CNN/TCN adapter detection through `tract-onnx` (bring-your-own ONNX model — no weights are bundled) |
-| `cnn-gpu` | Implies `cnn-detect`; onnxruntime CUDA inference for `detect --method cnn --gpu` |
-| `crf-gpu` | Implies `crf-decode`; onnxruntime CUDA inference for the CRF encoder (`basecall --gpu`) |
 | `models-download` | Implies `experimental`; `resquiggle models fetch` (k-mer tables) |
 
 ### `escapepod-demux`

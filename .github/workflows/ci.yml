@@ -225,5 +225,7 @@ jobs:
         run: cargo clippy -p escapepod-demux --features crf-gpu
       - name: crf-gpu — CLI wiring (escapepod-cli)
         run: cargo clippy -p escapepod-cli --features crf-gpu
+      - name: gpu — CLI union (what `--features gpu` users build)
+        run: cargo clippy -p escapepod-cli --features gpu
       - name: models-download — k-mer model prefetch (ureq rustls + sha2)
         run: cargo clippy -p escapepod-cli --features models-download

@@ -25,11 +25,10 @@ nav = [
   ] },
   { "Experimental" = [
     { "Overview" = "experimental/index.md" },
-    { "annotate" = "experimental/annotate.md" },
-    { "repack" = "experimental/repack.md" },
-    { "resquiggle" = "experimental/resquiggle.md" },
     { "demux" = "experimental/demux.md" },
-    { "GPU setup" = "experimental/gpu-setup.md" },
+    { "annotate" = "experimental/annotate.md" },
+    { "resquiggle" = "experimental/resquiggle.md" },
+    { "repack" = "experimental/repack.md" },
   ] },
   { "Python API" = [
     { "Overview" = "python/index.md" },

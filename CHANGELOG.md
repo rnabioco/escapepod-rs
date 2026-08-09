@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- **One GPU flag.** The CLI's `gpu` Cargo feature now enables every GPU
+  path — CNN adapter detection and the CTC-CRF encoder (onnxruntime CUDA)
+  as well as GPU DTW classify (cudarc) — so `cargo build --features gpu`
+  is the whole story and `--gpu` at runtime uses whichever path fits the
+  model and stage. Nothing is needed at build time, and a gpu-built binary
+  still runs on CPU-only nodes. The granular `cnn-gpu` / `crf-gpu` flags
+  remain for library consumers of `escapepod-demux` and still work on the
+  CLI for backward compatibility.
+
 ### Added
 
 - **`.p5s` sidecar: per-read annotations without touching the POD5.**

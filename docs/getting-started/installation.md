@@ -38,9 +38,7 @@ features:
 |---------|-------------------|
 | `experimental` | `repack`, `resquiggle`, `index`, `annotate` |
 | `train` | adds `demux train-svm` (SVM training via linfa) |
-| `gpu` | batched GPU DTW for `classify` / `train-svm` (CUDA driver + libnvrtc required at runtime) |
-| `cnn-gpu` | onnxruntime CUDA inference for `demux detect --method cnn --gpu` |
-| `crf-gpu` | onnxruntime CUDA inference for the CTC-CRF basecall encoder (`demux basecall --gpu`) |
+| `gpu` | every `--gpu` path — CNN adapter detection, the CTC-CRF encoder, DTW classify (CUDA libraries at run time only) |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 
 Note the sidecar asymmetry: *writing* `.p5s` sidecars (`index`, `annotate`)
@@ -50,7 +48,7 @@ the default build.
 
 The GPU features need CUDA libraries at run time only; the repository's pixi
 `gpu` environment provides all of them — see
-[GPU setup](../experimental/gpu-setup.md).
+[GPU acceleration](../experimental/demux.md#gpu-acceleration).
 
 Combine as needed:
 

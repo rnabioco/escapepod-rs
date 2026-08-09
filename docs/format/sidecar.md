@@ -85,10 +85,3 @@ products that exist nowhere else once the CSV that produced them is deleted
 
 Column names `read_id`, `batch_idx`, and `row_idx` are reserved; everything
 else in the schema is treated as an annotation.
-
-## Relationship to `.p5i`
-
-`.p5s` replaces the earlier `.p5i` index sidecar (a custom binary format
-holding only the read index). `.p5i` files are no longer read; delete them
-and rerun `escpod index`. The index is a rebuildable cache — nothing is
-lost in migration.

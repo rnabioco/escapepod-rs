@@ -31,7 +31,7 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 Some commands — `repack`, `resquiggle`, `index`, `annotate` — are
 experimental and live behind the `experimental` Cargo feature; GPU
-acceleration for demux is opt-in (`gpu`, `cnn-gpu`, `crf-gpu`). See the
+acceleration for demux is a single opt-in flag (`--features gpu`). See the
 [docs](https://rnabioco.github.io/escapepod-rs/experimental/) for status,
 build instructions, and the details behind the highlights above.
 

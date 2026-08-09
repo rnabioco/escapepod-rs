@@ -12,6 +12,15 @@
 
 Refine signal-to-base mapping using banded dynamic programming. Takes an input POD5 file (raw signal) and a BAM file with basecaller move tables, then produces a new BAM file with refined signal boundaries stored in auxiliary tags.
 
+## Usage
+
+```bash
+escpod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
+
+# e.g., with a named k-mer model from the local cache:
+escpod resquiggle reads.pod5 -b basecalls.bam --kmer-model rna004 --rna -o refined.bam
+```
+
 ## Overview
 
 Nanopore basecallers produce a **move table** that maps signal blocks to bases, but
@@ -38,12 +47,6 @@ kmer levels using banded dynamic programming.
   └──────────────────────────────────────────────────────┘
        ▲           ▲          ▲          ▲
   Refined       (sample-level boundaries from DP)
-```
-
-## Usage
-
-```bash
-escpod resquiggle <INPUT> -b <BAM> -k <KMER_TABLE> -o <OUTPUT> [OPTIONS]
 ```
 
 ## Arguments
