@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+## 0.8.1 (2026-08-09)
+
+### Fixed
+
+- **Signal batches are uniform again — they encode a stride** (#195). A read's
+  `signal` column holds GLOBAL row indices, and readers resolve one to a
+  position by assuming a constant batch stride. `add_read` and
+  `add_read_with_compressed_signal` appended all of a read's signal chunks and
+  only then tested the flush threshold, so a read whose chunks straddled the
+  boundary emitted an oversized batch — and every index after it then pointed
+  somewhere else.
+
+  Found in production: `escpod demux` wrote 16 per-barcode POD5s, 6 with an
+  oversized batch (57x1000, one 1003, last 410). **dorado silently skipped the
+  reads it could not resolve** — no error, no non-zero exit — dropping 97,790
+  reads, 10.6% of a 1.0M-read run, and it presented as a biological result until
+  the batch row counts were dumped.
+
+  The loud failure is the lucky one: `Queried signal row N is outside the
+  available rows (M in batch)` only fires when the shifted index runs past the
+  END of a batch. An index that lands inside a batch returns another read's
+  signal, silently. **Any POD5 written by escpod before this release should be
+  treated as suspect, not just ones that error** — the fault is data-dependent
+  (it needs a read whose chunks straddle a boundary), so it moves between runs
+  rather than tracking a version.
+
+### Added
+
+- **Non-portable signal batches are detected and reported** (#196).
+  `Reader::signal_batch_row_counts` and `Reader::nonuniform_signal_batch` (one
+  Arrow IPC footer parse, no signal decode), surfaced by `escpod inspect` and
+  warned wherever the CLI resolves inputs.
+
+  This crate resolves such a file correctly — `get_signal` walks cumulative
+  per-batch row counts rather than assuming a stride — which is exactly why #195
+  hid for so long: the corrupt files passed every escpod check and failed only
+  in dorado. Reported as NOT PORTABLE rather than corrupt, because that is the
+  true statement and it says what to do about it (`escpod repack`).
+
+- **`escpod filter` takes multiple files and/or directories** (#196), matching
+  `pod5 filter`. Inputs are resolved and de-duplicated, preserving the order
+  given, so overlapping arguments cannot feed the same read twice. A caller
+  whose run is split across per-flowcell directories must pass them in one
+  invocation or filter against only part of the run.
+
 ## 0.8.0 (2026-08-08)
 
 ### Added
