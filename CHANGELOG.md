@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0 (2026-08-09)
+
 ### Changed
 
 - **One GPU flag.** The CLI's `gpu` Cargo feature now enables every GPU
@@ -12,6 +14,12 @@
   still runs on CPU-only nodes. The granular `cnn-gpu` / `crf-gpu` flags
   remain for library consumers of `escapepod-demux` and still work on the
   CLI for backward compatibility.
+
+- **The `.p5i` read-index sidecar is retired in favor of `.p5s`** — same
+  locator data, now one combined companion file whose read index and
+  annotations coexist. `.p5i` files are no longer read; delete them and rerun
+  `escpod index` (the index is a rebuildable cache, nothing is lost).
+  `Reader.has_index` / `build_index()` now target `.p5s`.
 
 ### Added
 
@@ -60,13 +68,9 @@
   rebuilds a *stale* sidecar without `--force` instead of "skipping" a file
   the reader refuses to load.
 
-### Changed
-
-- **The `.p5i` read-index sidecar is retired in favor of `.p5s`** — same
-  locator data, now one combined companion file whose read index and
-  annotations coexist. `.p5i` files are no longer read; delete them and rerun
-  `escpod index` (the index is a rebuildable cache, nothing is lost).
-  `Reader.has_index` / `build_index()` now target `.p5s`.
+- **Progress bars show live throughput** — a `12,847/s` figure between the
+  position and the ETA. `demux` ticks per read, so that is live reads/s;
+  `merge`/`filter`/`repack` show their own tick unit per second.
 
 ## 0.8.1 (2026-08-09)
 
