@@ -81,9 +81,7 @@ for usage and building from source.
 
 ## License
 
-MIT. The `resquiggle` module is an independent implementation of algorithms
-inspired by fishnet (see Acknowledgments), not a derivative of its source, and
-is MIT-licensed like the rest of the workspace.
+MIT.
 
 ## Acknowledgments
 
