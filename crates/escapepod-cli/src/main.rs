@@ -231,8 +231,9 @@ Examples:
 At least one filter criterion must be specified.
 ")]
     Filter {
-        /// Input POD5 file or directory
-        input: PathBuf,
+        /// Input POD5 files and/or directories
+        #[arg(required = true, num_args = 1..)]
+        input: Vec<PathBuf>,
 
         /// File containing read IDs (one per line), or '-'/'stdin' to read from stdin
         #[arg(short, long, value_name = "FILE")]
