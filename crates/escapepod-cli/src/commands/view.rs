@@ -22,6 +22,33 @@ pub fn run(
     // Resolve input to list of POD5 files (supports directories)
     let files = resolve_pod5_inputs(&input)?;
 
+    // `--include` names that aren't built-in read fields are sidecar
+    // annotation columns (e.g. barcode, condition), joined per read from
+    // each file's .p5s and appended after the built-in fields.
+    let (include, annotation_fields): (Option<String>, Vec<String>) = match include {
+        Some(list) if !ids_only => {
+            let names: Vec<&str> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let (builtin, annotations): (Vec<&str>, Vec<&str>) = names
+                .into_iter()
+                .partition(|n| escapepod_signal::pod5::ALL_FIELDS.contains(n));
+            let builtin = if builtin.is_empty() && !annotations.is_empty() {
+                // Annotation-only selection still needs a key column.
+                "read_id".to_string()
+            } else {
+                builtin.join(",")
+            };
+            (
+                Some(builtin),
+                annotations.into_iter().map(str::to_string).collect(),
+            )
+        }
+        other => (other, Vec::new()),
+    };
+
     // Determine which fields to output (using core library)
     let fields = determine_fields(include.as_deref(), exclude.as_deref(), ids_only)?;
 
@@ -33,7 +60,12 @@ pub fn run(
 
     // Write header (only once for all files)
     if !no_header && !ids_only {
-        writeln!(writer, "{}", fields.join(&separator))?;
+        let mut header = fields.join(&separator);
+        for name in &annotation_fields {
+            header.push_str(&separator);
+            header.push_str(name);
+        }
+        writeln!(writer, "{header}")?;
     }
 
     // Process all files
@@ -44,6 +76,18 @@ pub fn run(
             OpenResult::Skip => continue,
             OpenResult::Err(e) => return Err(e),
         };
+
+        // Load this file's requested annotation columns up front; a missing
+        // sidecar or column is a hard error (it lists what is available)
+        // rather than a silently empty column.
+        let annotations: Vec<escapepod_signal::pod5::sidecar::AnnotationSection> =
+            annotation_fields
+                .iter()
+                .map(|name| {
+                    escapepod_signal::operations::read_annotation(file_path, Some(name))
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))
+                })
+                .collect::<anyhow::Result<_>>()?;
 
         // Write reads
         let reads_iter = match get_reads_iter_with_warning(&reader, file_path, is_directory) {
@@ -72,6 +116,10 @@ pub fn run(
                     }
                     write_field_value(&mut writer, &read, f)?;
                     first = false;
+                }
+                for annotation in &annotations {
+                    writer.write_all(sep_bytes)?;
+                    writer.write_all(annotation.get(&read.read_id).unwrap_or("").as_bytes())?;
                 }
                 writer.write_all(b"\n")?;
             }

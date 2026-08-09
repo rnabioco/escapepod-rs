@@ -8,7 +8,8 @@ mod common;
 use std::collections::HashMap;
 
 use escapepod_pod5::operations::{
-    AnnotateOptions, DesignOptions, read_annotation, read_design, write_annotation, write_design,
+    AnnotateOptions, DesignOptions, read_annotation, read_design, remove_annotation, remove_design,
+    write_annotation, write_design,
 };
 use escapepod_pod5::sidecar::{AnnotationSection, sidecar_path};
 use escapepod_pod5::{Reader, Uuid};
@@ -523,6 +524,54 @@ fn design_survives_index_rebuild() {
 
     assert_eq!(read_design(&path).unwrap().rows.len(), 2);
     assert_eq!(read_annotation(&path, Some("condition")).unwrap().len(), 10);
+}
+
+#[test]
+fn remove_annotation_and_design_guards() {
+    let (tmp, path, ids, _original) = fixture();
+    let csv = setup_with_design(&path, &tmp, &ids, 10);
+    write_design(&path, &csv, &DesignOptions::default()).unwrap();
+    write_annotation(
+        &path,
+        &ids.iter()
+            .map(|id| (*id, "sampleA".to_string()))
+            .collect::<HashMap<_, _>>(),
+        &AnnotateOptions {
+            name: "sample".to_string(),
+            ..AnnotateOptions::default()
+        },
+    )
+    .unwrap();
+
+    // Design key and value columns are protected.
+    let err = remove_annotation(&path, "barcode").unwrap_err().to_string();
+    assert!(err.contains("design key column"), "got: {err}");
+    let err = remove_annotation(&path, "condition")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("derived from the experimental design"),
+        "got: {err}"
+    );
+
+    // A free-standing annotation removes fine; absent names return false.
+    assert!(remove_annotation(&path, "sample").unwrap());
+    assert!(!remove_annotation(&path, "sample").unwrap());
+    assert!(read_annotation(&path, Some("sample")).is_err());
+
+    // Removing the design drops it AND its derived columns, then frees the
+    // key column for removal too.
+    assert!(remove_design(&path).unwrap());
+    assert!(!remove_design(&path).unwrap());
+    assert!(read_design(&path).is_err());
+    assert!(read_annotation(&path, Some("condition")).is_err());
+    assert!(remove_annotation(&path, "barcode").unwrap());
+    assert!(
+        read_annotation(&path, None)
+            .unwrap_err()
+            .to_string()
+            .contains("no annotations")
+    );
 }
 
 #[test]

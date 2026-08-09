@@ -196,6 +196,54 @@ pub fn write_design(
     })
 }
 
+/// Remove an annotation from the `.p5s` sidecar. Returns whether it was
+/// present. Design key and value columns are refused — remove or update the
+/// design instead, which keeps it the single source of truth.
+pub fn remove_annotation(pod5_path: impl AsRef<Path>, name: &str) -> Result<bool> {
+    let pod5_path = pod5_path.as_ref();
+    let reader = Reader::open(pod5_path)?;
+    let identity = reader.sidecar_identity()?;
+    let p5s_path = sidecar_path(pod5_path);
+
+    let mut sc = sidecar::read_sidecar_file(&p5s_path, &identity)?
+        .ok_or_else(|| Error::Parse(format!("no sidecar at {}", p5s_path.display())))?;
+    if let Some(design) = sc.design() {
+        if design.key_columns.contains(&name.to_string()) {
+            return Err(Error::Parse(format!(
+                "'{name}' is a design key column; remove the design first"
+            )));
+        }
+        if design.value_columns.contains(&name.to_string()) {
+            return Err(Error::Parse(format!(
+                "'{name}' is derived from the experimental design; \
+                 remove or update the design instead"
+            )));
+        }
+    }
+    let removed = sc.remove_annotation(name);
+    if removed {
+        sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
+    }
+    Ok(removed)
+}
+
+/// Remove the experimental design (and its derived columns) from the
+/// `.p5s` sidecar. Returns whether one was present.
+pub fn remove_design(pod5_path: impl AsRef<Path>) -> Result<bool> {
+    let pod5_path = pod5_path.as_ref();
+    let reader = Reader::open(pod5_path)?;
+    let identity = reader.sidecar_identity()?;
+    let p5s_path = sidecar_path(pod5_path);
+
+    let mut sc = sidecar::read_sidecar_file(&p5s_path, &identity)?
+        .ok_or_else(|| Error::Parse(format!("no sidecar at {}", p5s_path.display())))?;
+    let removed = sc.remove_design();
+    if removed {
+        sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
+    }
+    Ok(removed)
+}
+
 /// Read the experimental design recorded in the `.p5s` sidecar.
 pub fn read_design(pod5_path: impl AsRef<Path>) -> Result<Design> {
     let pod5_path = pod5_path.as_ref();
