@@ -122,6 +122,9 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
                     style::value(&run_info.flow_cell_id)
                 );
             }
+
+            println!();
+            print_sidecar_summary(&reader, file_path);
         }
     }
 
@@ -136,6 +139,79 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// One-look summary of the `.p5s` sidecar: index, annotations, design.
+fn print_sidecar_summary(reader: &Reader, pod5_path: &std::path::Path) {
+    use escapepod_signal::pod5::sidecar::{read_sidecar_file, sidecar_path};
+
+    let p5s_path = sidecar_path(pod5_path);
+    if !p5s_path.exists() {
+        println!("{} none", style::key("Sidecar:"));
+        return;
+    }
+
+    let sidecar = reader
+        .sidecar_identity()
+        .map_err(anyhow::Error::from)
+        .and_then(|identity| read_sidecar_file(&p5s_path, &identity).map_err(Into::into));
+    let sidecar = match sidecar {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("{} none", style::key("Sidecar:"));
+            return;
+        }
+        Err(e) => {
+            println!(
+                "{} {} — {}",
+                style::key("Sidecar:"),
+                style::path(p5s_path.display()),
+                e
+            );
+            return;
+        }
+    };
+
+    println!(
+        "{} {}",
+        style::key("Sidecar:"),
+        style::path(p5s_path.display())
+    );
+    println!(
+        "  {}: {} reads",
+        style::key("index"),
+        style::count(sidecar.len())
+    );
+    if sidecar.annotations().is_empty() {
+        println!("  {}: none", style::key("annotations"));
+    } else {
+        let described: Vec<String> = sidecar
+            .annotations()
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} ({} labels, {} reads)",
+                    a.name(),
+                    a.labels().len(),
+                    a.len()
+                )
+            })
+            .collect();
+        println!(
+            "  {}: {}",
+            style::key("annotations"),
+            style::value(described.join(", "))
+        );
+    }
+    if let Some(design) = sidecar.design() {
+        println!(
+            "  {}: [{}] → [{}], {} rows",
+            style::key("design"),
+            design.key_columns.join(","),
+            design.value_columns.join(","),
+            style::count(design.rows.len())
+        );
+    }
 }
 
 pub fn reads(input: PathBuf) -> anyhow::Result<()> {

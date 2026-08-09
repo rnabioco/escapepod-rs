@@ -10,29 +10,136 @@ use rayon::prelude::*;
 use tracing::info;
 
 use escapepod_signal::operations::{
-    AnnotateOptions, DesignOptions, parse_barcode_mapping, write_annotation, write_design,
+    AnnotateOptions, DesignOptions, parse_barcode_mapping, remove_annotation, remove_design,
+    write_annotation, write_design,
 };
 
 use crate::style;
 use crate::util::collect_pod5_inputs;
 
-/// Annotate one or more POD5 files: either a read → barcode mapping (`-a`,
+/// Parsed `escpod annotate` arguments (one action per invocation).
+pub struct AnnotateCmd {
+    pub inputs: Vec<PathBuf>,
+    pub assignments: Option<PathBuf>,
+    pub design: Option<PathBuf>,
+    pub keys: Option<Vec<String>>,
+    pub name: String,
+    pub list: bool,
+    pub remove: Option<String>,
+    pub remove_design: bool,
+    pub force: bool,
+}
+
+/// Annotate one or more POD5 files: write a read → barcode mapping (`-a`,
 /// the CSV format `demux split` consumes) or an experimental-design table
-/// (`--design`, mapping barcode combinations to conditions).
-pub fn run(
-    inputs: Vec<PathBuf>,
-    assignments: Option<PathBuf>,
-    design: Option<PathBuf>,
-    keys: Option<Vec<String>>,
-    name: String,
-    force: bool,
-) -> anyhow::Result<()> {
-    let files = collect_pod5_inputs(&inputs)?;
-    match (assignments, design) {
-        (Some(assignments), None) => run_assignments(&files, assignments, name, force),
-        (None, Some(design)) => run_design(&files, design, keys, force),
-        _ => unreachable!("clap enforces exactly one of -a/--design"),
+/// (`--design`), or inspect/prune the sidecar (`--list`, `--remove`,
+/// `--remove-design`).
+pub fn run(cmd: AnnotateCmd) -> anyhow::Result<()> {
+    let files = collect_pod5_inputs(&cmd.inputs)?;
+    if cmd.list {
+        return run_list(&files);
     }
+    if let Some(name) = cmd.remove {
+        return run_remove(&files, &name);
+    }
+    if cmd.remove_design {
+        return run_remove_design(&files);
+    }
+    match (cmd.assignments, cmd.design) {
+        (Some(assignments), None) => run_assignments(&files, assignments, cmd.name, cmd.force),
+        (None, Some(design)) => run_design(&files, design, cmd.keys, cmd.force),
+        _ => unreachable!("clap enforces exactly one action"),
+    }
+}
+
+/// Print each file's sidecar contents (stdout — this is the command's data).
+fn run_list(files: &[PathBuf]) -> anyhow::Result<()> {
+    use escapepod_signal::pod5::sidecar::{read_sidecar_file, sidecar_path};
+
+    for pod5_path in files {
+        let p5s_path = sidecar_path(pod5_path);
+        let reader = escapepod_signal::Reader::open(pod5_path)?;
+        let sidecar = match read_sidecar_file(&p5s_path, &reader.sidecar_identity()?) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                println!("{}: no sidecar", pod5_path.display());
+                continue;
+            }
+            Err(e) => {
+                println!("{}: {e}", p5s_path.display());
+                continue;
+            }
+        };
+        println!("{}: {} reads indexed", p5s_path.display(), sidecar.len());
+        let derived: Vec<&String> = sidecar
+            .design()
+            .map(|d| d.value_columns.iter().collect())
+            .unwrap_or_default();
+        for annotation in sidecar.annotations() {
+            println!(
+                "  {}: {} labels, {} reads{}",
+                annotation.name(),
+                annotation.labels().len(),
+                annotation.len(),
+                if derived.iter().any(|d| *d == annotation.name()) {
+                    " (derived)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if let Some(design) = sidecar.design() {
+            println!(
+                "  design: [{}] -> [{}], {} rows",
+                design.key_columns.join(","),
+                design.value_columns.join(","),
+                design.rows.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_remove(files: &[PathBuf], name: &str) -> anyhow::Result<()> {
+    for pod5_path in files {
+        let removed = remove_annotation(pod5_path, name)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", pod5_path.display()))?;
+        if removed {
+            info!(
+                "{} annotation '{}' from {}",
+                style::action("removed"),
+                name,
+                style::path(pod5_path.display())
+            );
+        } else {
+            info!(
+                "no annotation '{}' in {} — nothing removed",
+                name,
+                style::path(pod5_path.display())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_remove_design(files: &[PathBuf]) -> anyhow::Result<()> {
+    for pod5_path in files {
+        let removed = remove_design(pod5_path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", pod5_path.display()))?;
+        if removed {
+            info!(
+                "{} design (and derived columns) from {}",
+                style::action("removed"),
+                style::path(pod5_path.display())
+            );
+        } else {
+            info!(
+                "no design in {} — nothing removed",
+                style::path(pod5_path.display())
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_assignments(

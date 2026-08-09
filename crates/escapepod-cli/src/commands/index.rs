@@ -34,20 +34,39 @@ pub fn run(inputs: Vec<PathBuf>, force: bool) -> anyhow::Result<()> {
         .filter_map(|pod5_path| {
             let p5s_path = sidecar_path(pod5_path);
 
-            if p5s_path.exists() && !force {
-                warn!(
-                    "skipping {} (already exists, use --force to rebuild)",
-                    style::path(p5s_path.display()),
-                );
-                skipped.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-
             let t0 = Instant::now();
             let reader = match escapepod_signal::Reader::open(pod5_path) {
                 Ok(r) => r,
                 Err(e) => return Some(anyhow::Error::from(e)),
             };
+
+            // A valid existing sidecar is skipped without --force; a stale
+            // or unreadable one (POD5 replaced under it) is rebuilt outright
+            // — its contents were unusable anyway, and "already exists" for
+            // a sidecar the reader refuses to load would be a dead end.
+            if p5s_path.exists() && !force {
+                let identity = match reader.sidecar_identity() {
+                    Ok(id) => id,
+                    Err(e) => return Some(anyhow::Error::from(e)),
+                };
+                match escapepod_signal::pod5::sidecar::read_sidecar_file(&p5s_path, &identity) {
+                    Ok(Some(_)) => {
+                        warn!(
+                            "skipping {} (already indexed, use --force to rebuild)",
+                            style::path(p5s_path.display()),
+                        );
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        warn!(
+                            "{} is stale or unreadable — rebuilding",
+                            style::path(p5s_path.display()),
+                        );
+                    }
+                }
+            }
             let count = match reader.build_and_write_index(&p5s_path) {
                 Ok(c) => c,
                 Err(e) => return Some(anyhow::Error::from(e)),

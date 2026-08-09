@@ -255,6 +255,12 @@ At least one filter criterion must be specified.
         #[arg(long, value_name = "REASONS", value_delimiter = ',')]
         exclude_end_reason: Option<Vec<String>>,
 
+        /// Keep reads whose .p5s sidecar annotation matches (NAME=LABEL,
+        /// e.g. barcode=nbc01 or condition=fresh). Repeatable: same NAME =
+        /// any-of, different NAMEs = all-of
+        #[arg(long, value_name = "NAME=LABEL")]
+        annotation: Option<Vec<String>>,
+
         /// Output POD5 file
         #[arg(short, long, required = true, value_name = "FILE")]
         output: PathBuf,
@@ -499,6 +505,11 @@ Examples:
                                                  Map barcode (combinations) to
                                                  experimental conditions
 ")]
+    #[command(group(
+        clap::ArgGroup::new("action")
+            .required(true)
+            .args(["assignments", "design", "list", "remove", "remove_design"])
+    ))]
     Annotate {
         /// Input POD5 file(s) or directory
         #[arg(required = true, value_name = "FILES")]
@@ -506,13 +517,7 @@ Examples:
 
         /// CSV mapping reads to labels (read_id + barcode/predicted_barcode
         /// columns — the output of `demux classify` or `demux basecall --barcodes`)
-        #[arg(
-            short = 'a',
-            long,
-            value_name = "CSV",
-            required_unless_present = "design",
-            conflicts_with = "design"
-        )]
+        #[arg(short = 'a', long, value_name = "CSV")]
         assignments: Option<PathBuf>,
 
         /// Experimental-design CSV: one column per key annotation (e.g.
@@ -530,6 +535,19 @@ Examples:
         /// Annotation name (the sidecar column to write, with -a)
         #[arg(long, default_value = escapepod_signal::pod5::sidecar::DEFAULT_ANNOTATION_NAME)]
         name: String,
+
+        /// List each file's sidecar contents (index, annotations, design)
+        #[arg(long)]
+        list: bool,
+
+        /// Remove an annotation by name (design columns are refused —
+        /// remove or update the design instead)
+        #[arg(long, value_name = "NAME")]
+        remove: Option<String>,
+
+        /// Remove the experimental design and its derived columns
+        #[arg(long)]
+        remove_design: bool,
 
         /// Replace a stale or unreadable sidecar instead of erroring
         #[arg(long)]
@@ -789,6 +807,7 @@ fn main() -> anyhow::Result<()> {
             max_samples,
             end_reason,
             exclude_end_reason,
+            annotation,
             output,
             threads: _,
             force,
@@ -800,6 +819,7 @@ fn main() -> anyhow::Result<()> {
             max_samples,
             end_reason,
             exclude_end_reason,
+            annotation,
             output,
             force,
             profile,
@@ -870,9 +890,22 @@ fn main() -> anyhow::Result<()> {
             design,
             keys,
             name,
+            list,
+            remove,
+            remove_design,
             force,
             threads: _,
-        } => commands::annotate::run(inputs, assignments, design, keys, name, force),
+        } => commands::annotate::run(commands::annotate::AnnotateCmd {
+            inputs,
+            assignments,
+            design,
+            keys,
+            name,
+            list,
+            remove,
+            remove_design,
+            force,
+        }),
 
         #[cfg(not(feature = "experimental"))]
         Commands::Annotate { .. } => feature_disabled("annotate", "experimental"),

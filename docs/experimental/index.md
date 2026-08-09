@@ -36,13 +36,36 @@ a stale sidecar or one copied next to the wrong file fails loudly. Writes
 are atomic and section-preserving: `index` keeps annotations, `annotate`
 keeps the index and other annotations.
 
-Typical demux flow, with no intermediate per-barcode POD5s kept around:
+Typical demux flow, with no intermediate per-barcode POD5s (or even a CSV)
+kept around:
 
 ```bash
-escpod demux detect … | escpod demux basecall --barcodes … -o demux.csv
-escpod annotate -a demux.csv reads.pod5      # record assignments in reads.pod5.p5s
-escpod demux split reads.pod5 --sidecar -d out/   # materialize per-barcode files on demand
+# One step: demux straight into the sidecar (no split files, no CSV)
+escpod demux reads.pod5 --model <bundle> --annotate
+
+# Then materialize exactly what a downstream tool needs, when it needs it:
+escpod demux split reads.pod5 --sidecar -d out/          # all barcodes
+escpod filter reads.pod5 --annotation barcode=nbc05 -o nbc05.pod5   # one group
 ```
+
+`--annotate` combines with `-d` (write split files AND the sidecar) and with
+`--classifications` (also keep the CSV). The stepwise route still works:
+`escpod annotate -a demux.csv reads.pod5` records an existing classifications
+CSV into the sidecar.
+
+Working with annotations:
+
+```bash
+escpod inspect summary reads.pod5        # shows the sidecar: index, annotations, design
+escpod annotate --list reads.pod5        # per-annotation labels + read counts
+escpod annotate --remove sample reads.pod5
+escpod annotate --remove-design reads.pod5   # drops the design + derived columns
+escpod view reads.pod5 --include read_id,barcode,condition   # join columns into TSV
+escpod filter reads.pod5 --annotation condition=fresh --annotation replicate=r1 -o out.pod5
+```
+
+`filter --annotation` is repeatable: pairs with the same name are any-of,
+different names are all-of, and `--ids` intersects on top.
 
 The sidecar can also carry the **experimental design** — a samplesheet
 mapping barcode labels (or combinations of annotations, e.g. `ldx,edx`) to

@@ -133,8 +133,16 @@ pub struct RunArgs {
     pub info: bool,
 
     /// Output directory for the per-barcode demultiplexed POD5 files
+    /// (optional with --annotate: sidecar-only, no split files written)
     #[arg(short = 'd', long, value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
+
+    /// Record each read's barcode assignment in the input's .p5s sidecar
+    /// (`escpod annotate` format). With no -d/--output-dir this is the only
+    /// output: demux without duplicating the POD5, split on demand later
+    /// with `demux split --sidecar`
+    #[arg(long)]
+    pub annotate: bool,
 
     /// Also write a per-read classifications table (CSV). Off by default —
     /// the pipeline streams in memory and only writes demuxed POD5.
@@ -499,15 +507,14 @@ fn route(
     if let Some(ctx) = class_tx {
         let _ = ctx.send((read.read_id, barcode.clone(), confidence));
     }
-    let tx = routers
-        .get(&barcode)
-        .or_else(|| routers.get(UNCLASSIFIED))
-        .expect("unclassified router always present");
-    let _ = tx.send(Routed {
-        read,
-        chunks,
-        run_infos,
-    });
+    // Empty on sidecar-only runs (--annotate without -d): no POD5 leg.
+    if let Some(tx) = routers.get(&barcode).or_else(|| routers.get(UNCLASSIFIED)) {
+        let _ = tx.send(Routed {
+            read,
+            chunks,
+            run_infos,
+        });
+    }
 }
 
 /// Which classifier head the fused pipeline drives.
@@ -657,10 +664,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     if args.input.is_empty() {
         anyhow::bail!("no input POD5 file(s) given");
     }
-    let output_dir = args
-        .output_dir
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("-d/--output-dir <DIR> is required"))?;
+    let output_dir = match args.output_dir.clone() {
+        Some(dir) => Some(dir),
+        None if args.annotate => None, // sidecar-only: no split outputs
+        None => anyhow::bail!(
+            "-d/--output-dir <DIR> is required (or --annotate for sidecar-only demux)"
+        ),
+    };
 
     // Three heads: DTW-SVM (with an optional GPU DTW path), the native GBM tree
     // ensemble (CPU-only), and the CTC-CRF basecaller. A CRF bundle is a
@@ -868,7 +878,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let fp = FpParams::default();
 
-    std::fs::create_dir_all(&output_dir)?;
+    if let Some(dir) = &output_dir {
+        std::fs::create_dir_all(dir)?;
+    }
 
     info!("{} fused streaming demux", style::action("Running"));
     info!(
@@ -881,11 +893,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         style::label("Model:"),
         style::path(model_path.display())
     );
-    info!(
-        "{} {}",
-        style::label("Output:"),
-        style::path(output_dir.display())
-    );
+    match &output_dir {
+        Some(dir) => info!("{} {}", style::label("Output:"), style::path(dir.display())),
+        None => info!(
+            "{} .p5s sidecar annotations only (no split files)",
+            style::label("Output:")
+        ),
+    }
 
     let total = super::utils::total_read_count(&args.input);
     let pb = create_progress_bar(total as u64, "Demuxing")?;
@@ -933,21 +947,28 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Sidecar-only runs (--annotate without -d) spawn no writers: `routers`
+    // stays empty and `route` simply drops the POD5 leg.
     let mut routers: Routers = HashMap::new();
     let mut writer_handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<usize>>)> =
         Vec::new();
-    for bc in barcodes {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(router_depth);
-        let path = output_dir.join(format!("{}_{}.pod5", args.prefix, bc));
-        let dicts = predefined.clone();
-        let handle = std::thread::spawn(move || writer_thread(rx, &path, dicts));
-        routers.insert(bc.clone(), tx);
-        writer_handles.push((bc, handle));
+    if let Some(dir) = &output_dir {
+        for bc in barcodes {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Routed>(router_depth);
+            let path = dir.join(format!("{}_{}.pod5", args.prefix, bc));
+            let dicts = predefined.clone();
+            let handle = std::thread::spawn(move || writer_thread(rx, &path, dicts));
+            routers.insert(bc.clone(), tx);
+            writer_handles.push((bc, handle));
+        }
     }
     let routers = Arc::new(routers);
 
-    // Optional classifications CSV writer (a single small-record stream).
-    let (class_tx, class_handle) = spawn_class_writer(args.classifications.as_deref())?;
+    // Optional classifications CSV writer (a single small-record stream);
+    // with --annotate the same thread also collects the assignment map the
+    // sidecar write needs.
+    let (class_tx, class_handle) =
+        spawn_class_writer(args.classifications.as_deref(), args.annotate)?;
 
     // ---- Stages A/B: produce classified reads ----
     let produce_result = match &*model {
@@ -1062,14 +1083,49 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             summary.per_barcode.push((bc, n));
         }
     }
+    let mut assignments: Option<HashMap<Uuid, String>> = None;
     if let Some(h) = class_handle {
-        h.join()
+        assignments = h
+            .join()
             .map_err(|e| anyhow::anyhow!("classifications writer panicked: {e:?}"))??;
     }
     summary.per_barcode.sort();
     produce_result?;
 
     pb.finish_with_message("complete");
+
+    // --annotate: record the collected assignments in each input's sidecar.
+    // write_annotation intersects the map with the reads actually present in
+    // each file, so one global map serves all inputs without provenance
+    // tracking. Runs after produce_result? so a failed run writes nothing.
+    if args.annotate {
+        let assignments = assignments.unwrap_or_default();
+        let options = escapepod_signal::operations::AnnotateOptions::default();
+        for path in &args.input {
+            let result =
+                escapepod_signal::operations::write_annotation(path, &assignments, &options)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            info!(
+                "{} {} — {} of {} reads assigned across {} labels",
+                style::action("wrote"),
+                style::path(result.sidecar_path.display()),
+                style::count(result.assigned_reads),
+                style::count(result.total_reads),
+                style::count(result.labels),
+            );
+        }
+        // Sidecar-only runs have no writer threads; fill the summary from
+        // the assignment map so the barcode table still prints.
+        if summary.per_barcode.is_empty() {
+            let mut counts: HashMap<&String, usize> = HashMap::new();
+            for barcode in assignments.values() {
+                *counts.entry(barcode).or_default() += 1;
+            }
+            summary.per_barcode = counts.into_iter().map(|(bc, n)| (bc.clone(), n)).collect();
+            summary.per_barcode.sort();
+        }
+    }
+
     print_summary(&summary);
     timer.report(profile);
 
@@ -2249,29 +2305,46 @@ fn writer_thread(
     Ok(count)
 }
 
-/// Optional classifications-CSV writer thread.
+/// Optional classifications-CSV writer thread. With `collect` it also
+/// accumulates the read → barcode map for the `--annotate` sidecar write,
+/// returned through the join handle.
 #[allow(clippy::type_complexity)]
 fn spawn_class_writer(
     path: Option<&Path>,
+    collect: bool,
 ) -> anyhow::Result<(
     Option<SyncSender<(Uuid, String, f64)>>,
-    Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    Option<std::thread::JoinHandle<anyhow::Result<Option<HashMap<Uuid, String>>>>>,
 )> {
-    let Some(path) = path else {
+    if path.is_none() && !collect {
         return Ok((None, None));
-    };
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Uuid, String, f64)>(16_384);
-    let path = path.to_path_buf();
-    let handle = std::thread::spawn(move || -> anyhow::Result<()> {
+    let path = path.map(Path::to_path_buf);
+    let handle = std::thread::spawn(move || -> anyhow::Result<Option<HashMap<Uuid, String>>> {
         use std::io::Write;
-        let file = std::fs::File::create(&path)?;
-        let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
-        writeln!(w, "read_id,barcode,confidence")?;
+        let mut writer = match &path {
+            Some(path) => {
+                let file = std::fs::File::create(path)?;
+                let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+                writeln!(w, "read_id,barcode,confidence")?;
+                Some(w)
+            }
+            None => None,
+        };
+        let mut collected = collect.then(HashMap::new);
         for (read_id, barcode, conf) in rx.iter() {
-            writeln!(w, "{read_id},{barcode},{conf:.6}")?;
+            if let Some(w) = &mut writer {
+                writeln!(w, "{read_id},{barcode},{conf:.6}")?;
+            }
+            if let Some(map) = &mut collected {
+                map.insert(read_id, barcode);
+            }
         }
-        w.flush()?;
-        Ok(())
+        if let Some(w) = &mut writer {
+            w.flush()?;
+        }
+        Ok(collected)
     });
     Ok((Some(tx), Some(handle)))
 }

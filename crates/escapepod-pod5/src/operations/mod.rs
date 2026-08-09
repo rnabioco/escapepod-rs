@@ -12,7 +12,7 @@ mod subset;
 
 pub use annotate::{
     AnnotateOptions, AnnotateResult, DesignOptions, DesignResult, read_annotation, read_design,
-    write_annotation, write_design,
+    remove_annotation, remove_design, write_annotation, write_design,
 };
 pub use filter::{
     FilterCriteria, FilterOptions, FilterResult, SubsetOutcome, filter_files,

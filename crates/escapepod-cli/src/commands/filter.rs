@@ -12,7 +12,7 @@ use crate::util::{
 };
 use escapepod_signal::Durability;
 use escapepod_signal::operations::{
-    FilterCriteria, FilterOptions, filter_files_with_criteria, read_ids_from_file,
+    FilterCriteria, FilterOptions, filter_files_with_criteria, read_annotation, read_ids_from_file,
 };
 use escapepod_signal::types::EndReason;
 use std::collections::HashSet;
@@ -27,6 +27,7 @@ pub fn run(
     max_samples: Option<u64>,
     end_reason: Option<Vec<String>>,
     exclude_end_reason: Option<Vec<String>>,
+    annotation: Option<Vec<String>>,
     output: PathBuf,
     force: bool,
     profile: bool,
@@ -81,11 +82,64 @@ pub fn run(
         criteria.exclude_end_reasons = Some(parsed);
     }
 
+    // Resolve sidecar-annotation filters into read IDs. Same-name pairs are
+    // any-of, different names all-of, and an explicit --ids list further
+    // intersects.
+    if let Some(pairs) = annotation {
+        timer.phase("Resolve annotations");
+        let mut by_name: std::collections::HashMap<String, HashSet<String>> = Default::default();
+        for pair in &pairs {
+            let (name, label) = pair
+                .split_once('=')
+                .filter(|(n, l)| !n.is_empty() && !l.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("--annotation takes NAME=LABEL, got '{pair}'"))?;
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .insert(label.to_string());
+        }
+        let mut selected: Option<HashSet<escapepod_signal::Uuid>> = None;
+        for (name, labels) in &by_name {
+            let mut ids = HashSet::new();
+            let mut known_labels: HashSet<&str> = HashSet::new();
+            let annotations: Vec<_> = files
+                .iter()
+                .map(|file| {
+                    read_annotation(file, Some(name))
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            for ann in &annotations {
+                known_labels.extend(ann.labels().iter().map(String::as_str));
+                for (uuid, label) in ann.iter() {
+                    if labels.contains(label) {
+                        ids.insert(uuid);
+                    }
+                }
+            }
+            for label in labels {
+                if !known_labels.contains(label.as_str()) {
+                    warn!("label '{label}' does not occur in annotation '{name}'");
+                }
+            }
+            selected = Some(match selected {
+                None => ids,
+                Some(prev) => prev.intersection(&ids).copied().collect(),
+            });
+        }
+        if let Some(selected) = selected {
+            criteria.read_ids = Some(match criteria.read_ids.take() {
+                None => selected,
+                Some(user) => user.intersection(&selected).copied().collect(),
+            });
+        }
+    }
+
     // Validate that at least one criterion is set
     if criteria.is_empty() {
         anyhow::bail!(
             "No filter criteria specified. Use --ids, --min-samples, --max-samples, \
-             --end-reason, or --exclude-end-reason"
+             --end-reason, --exclude-end-reason, or --annotation"
         );
     }
 
@@ -113,12 +167,19 @@ pub fn run(
 
     // Print active criteria
     if let Some(ref ids) = criteria.read_ids {
-        info!(
-            "{} {} read IDs from {}",
-            style::label("IDs:"),
-            style::count(ids.len()),
-            style::path(ids_file.as_ref().unwrap().display())
-        );
+        match &ids_file {
+            Some(path) => info!(
+                "{} {} read IDs from {}",
+                style::label("IDs:"),
+                style::count(ids.len()),
+                style::path(path.display())
+            ),
+            None => info!(
+                "{} {} read IDs from sidecar annotations",
+                style::label("IDs:"),
+                style::count(ids.len()),
+            ),
+        }
     }
     if let Some(min) = criteria.min_samples {
         info!("{} >= {}", style::label("Samples:"), style::value(min));

@@ -36,6 +36,19 @@
   refused, keeping the design the single source of truth. Python:
   `Reader.design()`.
 
+- **Sidecar usability across the CLI.** `escpod demux … --annotate` records
+  assignments straight into each input's `.p5s` during the fused pipeline —
+  with no `-d` it is the only output, so demultiplexing no longer has to
+  duplicate the POD5 or produce a CSV at all. `escpod filter --annotation
+  NAME=LABEL` materializes one group on demand (repeatable: same name =
+  any-of, different names = all-of, `--ids` intersects). `escpod view
+  --include read_id,barcode,condition` joins sidecar columns into the TSV.
+  `escpod inspect summary` shows the sidecar (index, annotations with label
+  and read counts, design). `escpod annotate --list` / `--remove NAME` /
+  `--remove-design` inspect and prune without pyarrow. `escpod index` now
+  rebuilds a *stale* sidecar without `--force` instead of "skipping" a file
+  the reader refuses to load.
+
 ### Changed
 
 - **The `.p5i` read-index sidecar is retired in favor of `.p5s`** — same
