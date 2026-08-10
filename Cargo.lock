@@ -1008,6 +1008,7 @@ dependencies = [
  "parquet",
  "rand 0.10.2",
  "rayon",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "uuid",

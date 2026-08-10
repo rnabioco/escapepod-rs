@@ -1,0 +1,15 @@
+# comment line
+kmer	level_mean
+AAAAA	0.95838
+AAAAC	-1.25
+AAACG	0.75
+AACGT	1e-3
+ACGTA	2.5
+CGTAC	-0.125
+acgtt	0.3333333333333333
+AAAAA	1.5
+GGGGG 0.125
+AAAAT	9.0
+onlyonefield
+
+CCCCC	-0.5

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- **k-mer level primitives moved down from leech** (#204).
+  `escapepod_signal::resquiggle` gains `load_kmer_table` (lenient
+  Remora-convention table parse, gz-aware, `f64` levels), `extract_levels`
+  (expected level per base with an explicit center index; unknown k-mers and
+  short sequences yield zeros, not errors), and `rough_rescale_quantile`
+  (the quantile fit that puts observed signal into k-mer level units).
+  These are the primitives the tRNA charging classifier's k-mer *residual*
+  feature is defined against, so leech and `escpod` must share one
+  implementation; parity with leech's NumPy references is pinned at the bit
+  level by golden-vector tests (including NumPy's dtype-dependent quantile
+  interpolation). Distinct from the existing `KmerTable`, which keeps its
+  fishnet conventions for the `resquiggle` command.
+
 ## 0.9.0 (2026-08-09)
 
 ### Changed
