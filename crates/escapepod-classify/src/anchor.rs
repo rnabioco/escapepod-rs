@@ -19,8 +19,6 @@ use anyhow::{Result, bail};
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::record::data::field::Tag;
-use noodles_sam::alignment::record_buf::data::field::Value;
-use noodles_sam::alignment::record_buf::data::field::value::Array;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -154,32 +152,10 @@ pub enum ScanOutcome {
 
 /// Extract `(stride, moves, ns, ts)` from a record's `mv`/`ns`/`ts` tags.
 fn move_table(record: &RecordBuf) -> Option<(usize, Vec<u8>, i64, i64)> {
-    let mv_tag = Tag::new(b'm', b'v');
-    let (stride, moves) = match record.data().get(&mv_tag) {
-        Some(Value::Array(Array::UInt8(d))) if d.len() >= 2 => (d[0] as usize, d[1..].to_vec()),
-        Some(Value::Array(Array::Int8(d))) if d.len() >= 2 => {
-            (d[0] as usize, d[1..].iter().map(|&b| b as u8).collect())
-        }
-        _ => return None,
-    };
-    if stride == 0 {
-        return None;
-    }
-    let ns = int_tag(record, Tag::new(b'n', b's'))?;
-    let ts = int_tag(record, Tag::new(b't', b's')).unwrap_or(0);
+    let (stride, moves) = crate::bam_tags::parse_mv_tag(record).ok()?;
+    let ns = crate::bam_tags::int_tag(record, Tag::new(b'n', b's'))?;
+    let ts = crate::bam_tags::int_tag(record, Tag::new(b't', b's')).unwrap_or(0);
     Some((stride, moves, ns, ts))
-}
-
-fn int_tag(record: &RecordBuf, tag: Tag) -> Option<i64> {
-    match record.data().get(&tag) {
-        Some(Value::Int8(v)) => Some(*v as i64),
-        Some(Value::UInt8(v)) => Some(*v as i64),
-        Some(Value::Int16(v)) => Some(*v as i64),
-        Some(Value::UInt16(v)) => Some(*v as i64),
-        Some(Value::Int32(v)) => Some(*v as i64),
-        Some(Value::UInt32(v)) => Some(*v as i64),
-        _ => None,
-    }
 }
 
 /// Build the Remora-convention query→signal map from a move table:

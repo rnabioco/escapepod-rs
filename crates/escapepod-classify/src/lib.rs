@@ -39,6 +39,7 @@
 //! the model bundle's `metadata.json` ([`bundle`]), not from flags.
 
 pub mod anchor;
+pub mod bam_tags;
 pub mod bundle;
 pub mod features;
 pub mod geometry;
