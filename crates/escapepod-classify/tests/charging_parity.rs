@@ -6,21 +6,22 @@
 //! `tests/fixtures/gen_charging_golden.py` from leech's tRNA fixtures;
 //! floats travel as IEEE-754 bit patterns.
 //!
+//! The scan → index → classify orchestration under test is
+//! [`escapepod_classify::pipeline`] — the same code the `escpod classify`
+//! command runs, so the golden pins the shipped path, not a test replica.
+//!
 //! Contract: the anchoring chain (spans, orientation, mask boundary, NaN
 //! pattern) and dwell are exact; mean/std/resid may differ from NumPy by
 //! reduction rounding only (sequential f64 vs pairwise/SIMD summation —
 //! bounded here at 1e-4 absolute, observed orders tighter), and the final
 //! probability within 1e-6 with identical `cl` bytes.
 
-use escapepod_classify::anchor::{AnchoredRead, finalize, scan_record};
 use escapepod_classify::{
-    ChargingBundle, Orientation, OrientationVotes, ScanOutcome, cl_from_probability,
-    expected_levels_z, junction_features, junction_positions, resolve_orientation,
+    ChargingBundle, Orientation, Pod5Index, cl_from_probability, classify_reads, feature_grid,
+    junction_positions, resolve_orientation, scan_bam,
 };
-use escapepod_demux::GbmPredictor;
-use noodles_bam as bam;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 fn fixtures() -> PathBuf {
@@ -32,60 +33,6 @@ fn golden() -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
-/// Scan the fixture BAM into deduped anchored reads + resolved orientation.
-fn scan_fixture(bundle: &ChargingBundle) -> (HashMap<uuid::Uuid, AnchoredRead>, Orientation) {
-    let geometry = junction_positions(
-        &fixtures().join("trna_reference.fa"),
-        &bundle.anchor.motif,
-        bundle.anchor.motif_offset,
-        &bundle.anchor.common_arm,
-    )
-    .unwrap();
-
-    let file = std::fs::File::open(fixtures().join("trna_mappings_padded.bam")).unwrap();
-    let mut reader = bam::io::Reader::new(file);
-    let header = reader.read_header().unwrap();
-    let ref_names: Vec<String> = header
-        .reference_sequences()
-        .keys()
-        .map(|k| k.to_string())
-        .collect();
-
-    let mut votes = OrientationVotes::default();
-    let mut anchored: HashMap<uuid::Uuid, AnchoredRead> = HashMap::new();
-    let mut record = noodles_sam::alignment::RecordBuf::default();
-    loop {
-        if reader.read_record_buf(&header, &mut record).unwrap() == 0 {
-            break;
-        }
-        let Some(ref_name) = record
-            .reference_sequence_id()
-            .and_then(|id| ref_names.get(id))
-        else {
-            continue;
-        };
-        if let ScanOutcome::Anchored(read) =
-            scan_record(&record, ref_name, &geometry, &bundle.offsets, 1)
-        {
-            votes.add(&read);
-            let e = anchored.entry(read.read_id);
-            match e {
-                std::collections::hash_map::Entry::Occupied(mut o) => {
-                    if read.mapq > o.get().mapq {
-                        o.insert(*read);
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(*read);
-                }
-            }
-        }
-    }
-    // The padded fixture carries >= 50 informative reads by construction.
-    let orientation = resolve_orientation(&votes, 50).unwrap();
-    (anchored, orientation)
-}
-
 #[test]
 fn charging_chain_matches_reference() {
     let bundle = ChargingBundle::load(&fixtures().join("bundle")).unwrap();
@@ -95,65 +42,74 @@ fn charging_chain_matches_reference() {
     assert!(bundle.operating_point.is_some());
 
     let g = golden();
-    let (anchored, orientation) = scan_fixture(&bundle);
 
-    // Orientation must match what the reference detected on the same BAM.
+    // The pipeline the CLI command runs: scan, orientation, index, classify.
+    let geometry = junction_positions(
+        &fixtures().join("trna_reference.fa"),
+        &bundle.anchor.motif,
+        bundle.anchor.motif_offset,
+        &bundle.anchor.common_arm,
+    )
+    .unwrap();
+    let scan = scan_bam(
+        &fixtures().join("trna_mappings_padded.bam"),
+        &geometry,
+        &bundle.offsets,
+        1,
+    )
+    .unwrap();
+    // The padded fixture carries >= 50 informative reads by construction.
+    let orientation = resolve_orientation(&scan.votes, 50).unwrap();
     let want_orientation = match g["orientation"].as_str().unwrap() {
         "reversed" => Orientation::Reversed,
         _ => Orientation::Time,
     };
     assert_eq!(orientation, want_orientation);
 
-    // POD5 signal index.
-    let reader = escapepod_signal::Reader::open(fixtures().join("trna_reads.pod5")).unwrap();
-    let mut pod5: HashMap<uuid::Uuid, (f32, f32, Vec<u64>)> = HashMap::new();
-    for batch in reader.read_batches().unwrap() {
-        let batch = batch.unwrap();
-        let view = escapepod_signal::ReadsBatchView::new(&batch, false).unwrap();
-        for row in 0..view.num_rows() {
-            let read = view.read(row).unwrap();
-            pod5.insert(
-                read.read_id,
-                (
-                    read.calibration_offset,
-                    read.calibration_scale,
-                    read.signal_rows,
-                ),
-            );
-        }
-    }
-    let extractor = reader.signal_extractor().unwrap();
-
-    let predictor = GbmPredictor::new(&bundle.gbm);
-    let kmer = bundle.kmer.as_ref().unwrap();
+    let wanted: HashSet<uuid::Uuid> = scan.anchored.keys().copied().collect();
+    let pod5 = Pod5Index::build(&[fixtures().join("trna_reads.pod5")], &wanted).unwrap();
+    let (calls, stats) = classify_reads(&bundle, &scan.anchored, &pod5, orientation).unwrap();
+    // The renamed-UUID duplicates anchor but have no signal.
+    assert!(stats.no_signal > 0);
+    assert_eq!(stats.ns_mismatch, 0);
 
     let reads = g["reads"].as_array().unwrap();
     assert!(reads.len() >= 15);
+    assert_eq!(calls.len(), reads.len(), "classified read count");
+    let by_id: HashMap<uuid::Uuid, _> = calls.iter().map(|c| (c.read_id, c)).collect();
+
+    // End-to-end calls: probability within 1e-6, cl bytes identical.
+    for gr in reads {
+        let id: uuid::Uuid = gr["read_id"].as_str().unwrap().parse().unwrap();
+        let call = by_id
+            .get(&id)
+            .unwrap_or_else(|| panic!("golden read {id} not classified"));
+        let p_ref = f64::from_bits(gr["p_bits"].as_u64().unwrap());
+        assert!(
+            (call.p - p_ref).abs() <= 1e-6,
+            "read {id}: P = {} vs reference {p_ref}",
+            call.p
+        );
+        assert_eq!(
+            call.cl as u64,
+            gr["cl"].as_u64().unwrap(),
+            "read {id}: cl byte differs"
+        );
+        assert_eq!(call.cl, cl_from_probability(call.p));
+    }
+
+    // Feature-level diagnostics: recompute each read's grid through the
+    // same pipeline helpers and compare per feature.
+    let extractors = pod5.extractors().unwrap();
     let mut max_dev = 0.0f64;
     for gr in reads {
         let id: uuid::Uuid = gr["read_id"].as_str().unwrap().parse().unwrap();
-        let read = anchored
-            .get(&id)
-            .unwrap_or_else(|| panic!("golden read {id} not anchored"));
-        let (offset, scale, rows) = pod5.get(&id).expect("golden read has signal");
-        let raw = extractor.get_signal(rows).unwrap();
-        assert_eq!(raw.len() as i64, read.ns, "ns tag vs signal length");
-        let sig_pa: Vec<f32> = raw
-            .iter()
-            .map(|&adc| (adc as f32 + offset) * scale)
-            .collect();
+        let read = &scan.anchored[&id];
+        let info = pod5.reads().get(&id).expect("golden read has signal");
+        let sig_pa = escapepod_classify::signal_pa(info, &extractors).unwrap();
+        assert_eq!(sig_pa.len() as i64, read.ns, "ns tag vs signal length");
 
-        let coords = finalize(read, orientation, &bundle.offsets);
-        let expected = expected_levels_z(
-            &read.seq,
-            &kmer.map,
-            kmer.k,
-            kmer.center_idx,
-            &read.qf,
-            read.nb,
-        );
-        let grid = junction_features(&sig_pa, &coords, Some(&expected));
-
+        let grid = feature_grid(&bundle, read, orientation, &sig_pa);
         let want: Vec<f32> = gr["features_bits"]
             .as_array()
             .unwrap()
@@ -181,21 +137,6 @@ fn charging_chain_matches_reference() {
                 "read {id} feature {i} ({stat}): {got} vs {w} (dev {dev:e})"
             );
         }
-
-        // Probability + cl.
-        let features = bundle.select_columns(&grid);
-        let (probs, _) = predictor.predict(&features).unwrap();
-        let p = probs[1];
-        let p_ref = f64::from_bits(gr["p_bits"].as_u64().unwrap());
-        assert!(
-            (p - p_ref).abs() <= 1e-6,
-            "read {id}: P = {p} vs reference {p_ref}"
-        );
-        assert_eq!(
-            cl_from_probability(p) as u64,
-            gr["cl"].as_u64().unwrap(),
-            "read {id}: cl byte differs"
-        );
     }
     // Reduction-rounding headroom check: deviations should sit far below
     // the tolerance, not hug it.

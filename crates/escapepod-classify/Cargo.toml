@@ -16,13 +16,16 @@ anyhow = { workspace = true }
 escapepod-demux = { workspace = true }
 # k-mer level primitives (extract_levels, load_kmer_table) and the POD5 surface.
 escapepod-signal = { workspace = true }
-# BAM record types only (mv/ns/ts tags, CIGAR); file I/O stays in the CLI.
+# BAM reading for the pipeline (record types + the scan loop); writing the
+# cl-tagged output BAM stays in the CLI.
+noodles-bam = "0.94"
+noodles-bgzf = "0.51"
 noodles-sam = "0.89"
+rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-noodles-bam = "0.94"
 tempfile = "3"

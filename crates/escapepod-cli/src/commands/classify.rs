@@ -11,12 +11,14 @@
 //! recommended operating point) comes from the model bundle's
 //! `metadata.json`, not from flags — a caller computing the features
 //! differently gets a wrong answer, not an error. See
-//! `escapepod_classify::bundle` for the contract.
+//! `escapepod_classify::bundle` for the contract. The scan → index →
+//! classify orchestration lives in `escapepod_classify::pipeline` (shared
+//! with the golden-parity tests); this command adds flags, progress,
+//! reporting, and the output BAM/TSV writing.
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use clap::Args;
-use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -29,11 +31,11 @@ use sam::alignment::record::data::field::Tag;
 use sam::alignment::record_buf::data::field::Value;
 use sam::header::record::value::map::{Map, Program, program::tag as pg_tag};
 
+use escapepod_classify::anchor::SkipReason;
 use escapepod_classify::{
-    AnchoredRead, ChargingBundle, Orientation, OrientationVotes, ScanOutcome, cl_from_probability,
-    expected_levels_z, junction_features, junction_positions, resolve_orientation,
+    ChargingBundle, Orientation, Pod5Index, cl_from_probability, classify_reads,
+    junction_positions, resolve_orientation, scan_bam,
 };
-use escapepod_demux::GbmPredictor;
 
 use crate::progress::create_spinner;
 use crate::style;
@@ -101,12 +103,16 @@ fn parse_orientation(s: &str) -> Result<OrientationArg, String> {
     }
 }
 
-/// Per-read signal lookup info from the POD5 index.
-struct Pod5ReadInfo {
-    reader_idx: usize,
-    calibration_scale: f32,
-    calibration_offset: f32,
-    signal_rows: Vec<u64>,
+fn skip_label(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::Filtered => "unmapped/filtered",
+        SkipReason::LowMapq => "low mapq",
+        SkipReason::NoGeometry => "reference without junction",
+        SkipReason::NoTags => "missing mv/ns tags",
+        SkipReason::Unanchored => "junction not aligned",
+        SkipReason::QueryOutOfRange => "query outside move table",
+        SkipReason::BadName => "non-UUID read name",
+    }
 }
 
 pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
@@ -160,84 +166,21 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
 
     // --- Pass 1: scan the BAM, anchor reads, vote on orientation ---------
     let spinner = create_spinner("scanning BAM")?;
-    let file = std::fs::File::open(&args.bam)
-        .with_context(|| format!("cannot open BAM {}", args.bam.display()))?;
-    let decoder = bgzf::io::MultithreadedReader::new(file);
-    let mut reader = bam::io::Reader::from(decoder);
-    let header = reader.read_header()?;
-    let ref_names: Vec<String> = header
-        .reference_sequences()
-        .keys()
-        .map(|k| k.to_string())
-        .collect();
-
-    let mut votes = OrientationVotes::default();
-    let mut anchored: HashMap<uuid::Uuid, AnchoredRead> = HashMap::new();
-    let mut skips: HashMap<&'static str, u64> = HashMap::new();
-    let mut total: u64 = 0;
-    let mut record = RecordBuf::default();
-    loop {
-        if reader.read_record_buf(&header, &mut record)? == 0 {
-            break;
-        }
-        total += 1;
-        let Some(ref_name) = record
-            .reference_sequence_id()
-            .and_then(|id| ref_names.get(id))
-        else {
-            *skips.entry("unmapped/filtered").or_default() += 1;
-            continue;
-        };
-        match escapepod_classify::anchor::scan_record(
-            &record,
-            ref_name,
-            &geometry,
-            &bundle.offsets,
-            args.min_mapq,
-        ) {
-            ScanOutcome::Anchored(read) => {
-                votes.add(&read);
-                // One record per read, best alignment wins.
-                match anchored.entry(read.read_id) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if read.mapq > e.get().mapq {
-                            e.insert(*read);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(*read);
-                    }
-                }
-            }
-            ScanOutcome::Skip(reason) => {
-                use escapepod_classify::anchor::SkipReason::*;
-                let key = match reason {
-                    Filtered => "unmapped/filtered",
-                    LowMapq => "low mapq",
-                    NoGeometry => "reference without junction",
-                    NoTags => "missing mv/ns tags",
-                    Unanchored => "junction not aligned",
-                    QueryOutOfRange => "query outside move table",
-                    BadName => "non-UUID read name",
-                };
-                *skips.entry(key).or_default() += 1;
-            }
-        }
-    }
+    let scan = scan_bam(&args.bam, &geometry, &bundle.offsets, args.min_mapq)?;
     spinner.finish_with_message(format!(
         "{} BAM records scanned, {} reads anchored",
-        style::count(total as usize),
-        style::count(anchored.len())
+        style::count(scan.records_scanned as usize),
+        style::count(scan.anchored.len())
     ));
     info!(
         "{} records scanned; {} unique anchored reads",
-        total,
-        anchored.len()
+        scan.records_scanned,
+        scan.anchored.len()
     );
-    for (reason, n) in &skips {
-        info!("  skipped ({}): {}", reason, n);
+    for (reason, n) in &scan.skips {
+        info!("  skipped ({}): {}", skip_label(*reason), n);
     }
-    if anchored.is_empty() {
+    if scan.anchored.is_empty() {
         bail!("no reads could be anchored; nothing to classify");
     }
 
@@ -245,7 +188,7 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let orientation = match args.orientation {
         OrientationArg::Time => Orientation::Time,
         OrientationArg::Reversed => Orientation::Reversed,
-        OrientationArg::Auto => resolve_orientation(&votes, 50)?,
+        OrientationArg::Auto => resolve_orientation(&scan.votes, 50)?,
     };
     info!(
         "move-table frame: {} (votes: time={}, reversed={}{})",
@@ -253,8 +196,8 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
             Orientation::Time => "time-ordered",
             Orientation::Reversed => "reversed",
         },
-        votes.time,
-        votes.reversed,
+        scan.votes.time,
+        scan.votes.reversed,
         if args.orientation == OrientationArg::Auto {
             ""
         } else {
@@ -262,104 +205,36 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         },
     );
 
-    // --- POD5 index -------------------------------------------------------
+    // --- POD5 index + classification --------------------------------------
     let pod5_files = resolve_pod5_inputs(&args.input)?;
-    let mut pod5_reads: HashMap<uuid::Uuid, Pod5ReadInfo> = HashMap::new();
-    let mut pod5_readers: Vec<escapepod_signal::Reader> = Vec::new();
-    for (reader_idx, path) in pod5_files.iter().enumerate() {
-        let reader = escapepod_signal::Reader::open(path)?;
-        for batch_result in reader.read_batches()? {
-            let batch = batch_result?;
-            let view = escapepod_signal::ReadsBatchView::new(&batch, false)?;
-            for row in 0..view.num_rows() {
-                let read = view.read(row)?;
-                if anchored.contains_key(&read.read_id) {
-                    pod5_reads.insert(
-                        read.read_id,
-                        Pod5ReadInfo {
-                            reader_idx,
-                            calibration_scale: read.calibration_scale,
-                            calibration_offset: read.calibration_offset,
-                            signal_rows: read.signal_rows,
-                        },
-                    );
-                }
-            }
-        }
-        pod5_readers.push(reader);
-    }
+    let wanted: HashSet<uuid::Uuid> = scan.anchored.keys().copied().collect();
+    let pod5 = Pod5Index::build(&pod5_files, &wanted)?;
     info!(
         "{} of {} anchored reads have signal in {} POD5 file(s)",
-        pod5_reads.len(),
-        anchored.len(),
-        pod5_files.len()
+        pod5.reads().len(),
+        scan.anchored.len(),
+        pod5.n_files()
     );
-    let signal_extractors: Vec<_> = pod5_readers
-        .iter()
-        .map(|r| r.signal_extractor())
-        .collect::<escapepod_signal::Result<_>>()?;
 
-    // --- Features + prediction -------------------------------------------
-    let predictor = GbmPredictor::new(&bundle.gbm);
-    let reads: Vec<&AnchoredRead> = anchored.values().collect();
-    let mut ns_mismatch = 0u64;
-    let mut no_signal = 0u64;
-    let results: Vec<Option<(uuid::Uuid, String, f64)>> = reads
-        .par_iter()
-        .map(|read| {
-            let info = pod5_reads.get(&read.read_id)?;
-            let raw = signal_extractors[info.reader_idx]
-                .get_signal(&info.signal_rows)
-                .ok()?;
-            if raw.len() as i64 != read.ns {
-                // The move-table frame is defined over `ns` samples; a
-                // different signal length (e.g. a split read) would put
-                // every span in the wrong place.
-                return Some((read.read_id, String::new(), f64::NAN));
-            }
-            let sig_pa: Vec<f32> = raw
-                .iter()
-                .map(|&adc| (adc as f32 + info.calibration_offset) * info.calibration_scale)
-                .collect();
-            let coords = escapepod_classify::anchor::finalize(read, orientation, &bundle.offsets);
-            let expected = bundle.kmer.as_ref().map(|k| {
-                expected_levels_z(&read.seq, &k.map, k.k, k.center_idx, &read.qf, read.nb)
-            });
-            let grid = junction_features(&sig_pa, &coords, expected.as_deref());
-            let features = bundle.select_columns(&grid);
-            let (probs, _) = predictor.predict(&features).ok()?;
-            Some((read.read_id, read.reference.clone(), probs[1]))
-        })
-        .collect();
-
-    let mut calls: HashMap<uuid::Uuid, (String, f64, u8)> = HashMap::new();
-    for r in results {
-        match r {
-            None => no_signal += 1,
-            Some((_, _, p)) if p.is_nan() => ns_mismatch += 1,
-            Some((id, reference, p)) => {
-                calls.insert(id, (reference, p, cl_from_probability(p)));
-            }
-        }
-    }
-    if no_signal > 0 {
+    let (calls, stats) = classify_reads(&bundle, &scan.anchored, &pod5, orientation)?;
+    if stats.no_signal > 0 {
         warn!(
             "{} anchored reads had no fetchable signal (dorado read splitting \
              mints child ids absent from the POD5; see --disable-read-splitting)",
-            no_signal
+            stats.no_signal
         );
     }
-    if ns_mismatch > 0 {
+    if stats.ns_mismatch > 0 {
         warn!(
             "{} reads skipped: signal length != ns tag (split or trimmed reads)",
-            ns_mismatch
+            stats.ns_mismatch
         );
     }
     if calls.is_empty() {
         bail!("no reads could be classified");
     }
 
-    let mut ps: Vec<f64> = calls.values().map(|(_, p, _)| *p).collect();
+    let mut ps: Vec<f64> = calls.iter().map(|c| c.p).collect();
     ps.sort_unstable_by(|a, b| a.total_cmp(b));
     let median_p = ps[ps.len() / 2];
     info!(
@@ -383,15 +258,15 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     if let Some(tsv_path) = &args.tsv {
         let mut w = std::io::BufWriter::new(std::fs::File::create(tsv_path)?);
         writeln!(w, "read_id\treference\tp_{}\tcl", bundle.classes[1])?;
-        let mut rows: Vec<_> = calls.iter().collect();
-        rows.sort_by_key(|(id, _)| *id);
-        for (id, (reference, p, cl)) in rows {
-            writeln!(w, "{}\t{}\t{:.6}\t{}", id, reference, p, cl)?;
+        for c in &calls {
+            writeln!(w, "{}\t{}\t{:.6}\t{}", c.read_id, c.reference, c.p, c.cl)?;
         }
         info!("wrote {} calls to {}", calls.len(), tsv_path.display());
     }
 
     // --- Pass 2: write the BAM with `cl` ----------------------------------
+    let cl_by_id: HashMap<uuid::Uuid, u8> = calls.iter().map(|c| (c.read_id, c.cl)).collect();
+
     let file = std::fs::File::open(&args.bam)?;
     let decoder = bgzf::io::MultithreadedReader::new(file);
     let mut reader = bam::io::Reader::from(decoder);
@@ -421,13 +296,13 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         if reader.read_record_buf(&out_header, &mut record)? == 0 {
             break;
         }
-        let call = record
+        let cl = record
             .name()
             .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
             .and_then(|s| escapepod_signal::parse_uuid_flexible(s).ok())
-            .and_then(|id| calls.get(&id));
-        if let Some((_, _, cl)) = call {
-            record.data_mut().insert(cl_tag, Value::UInt8(*cl));
+            .and_then(|id| cl_by_id.get(&id));
+        if let Some(&cl) = cl {
+            record.data_mut().insert(cl_tag, Value::UInt8(cl));
             tagged += 1;
         }
         {
@@ -439,7 +314,7 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     info!(
         "wrote {}: {} records, {} tagged with cl",
         args.output.display(),
-        total,
+        scan.records_scanned,
         tagged
     );
 

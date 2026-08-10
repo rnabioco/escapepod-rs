@@ -42,11 +42,15 @@ pub mod anchor;
 pub mod bundle;
 pub mod features;
 pub mod geometry;
+pub mod pipeline;
 
 pub use anchor::{AnchoredRead, Orientation, OrientationVotes, ScanOutcome, resolve_orientation};
 pub use bundle::{ChargingBundle, OperatingPoint};
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
 pub use geometry::{RefGeometry, junction_positions};
+pub use pipeline::{
+    BamScan, ClassifyStats, Pod5Index, ReadCall, classify_reads, feature_grid, scan_bam, signal_pa,
+};
 
 /// Encode a probability as the `cl` BAM tag value: `round(p * 255)` as u8.
 ///
