@@ -434,6 +434,23 @@ POD5 per stage; prefer the fused form unless you want the intermediate files.
         args: Vec<String>,
     },
 
+    /// Classify reads against a model bundle (tRNA charging) from POD5 + aligned BAM
+    #[cfg(feature = "classify")]
+    Classify(commands::classify::ClassifyArgs),
+
+    /// Classify reads against a model bundle (rebuild with `--features classify` to enable)
+    #[cfg(not(feature = "classify"))]
+    #[command(hide = true)]
+    Classify {
+        /// Classify arguments (ignored; feature not enabled)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+
     /// Refine signal-to-base mapping using banded DP (experimental; requires `--features experimental`)
     #[cfg(feature = "experimental")]
     Resquiggle(commands::resquiggle::ResquiggleArgs),
@@ -608,6 +625,11 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         Commands::Demux(args) => commands::demux::requested_threads(args),
         #[cfg(not(feature = "demux"))]
         Commands::Demux { .. } => None,
+
+        #[cfg(feature = "classify")]
+        Commands::Classify(args) => args.threads,
+        #[cfg(not(feature = "classify"))]
+        Commands::Classify { .. } => None,
 
         // No `--threads` flag; these run on the default pool.
         Commands::View { .. }
@@ -866,6 +888,12 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(not(feature = "demux"))]
         Commands::Demux { .. } => feature_disabled("demux", "demux"),
+
+        #[cfg(feature = "classify")]
+        Commands::Classify(args) => commands::classify::run(args),
+
+        #[cfg(not(feature = "classify"))]
+        Commands::Classify { .. } => feature_disabled("classify", "classify"),
 
         #[cfg(feature = "experimental")]
         Commands::Resquiggle(args) => commands::resquiggle::run(args),

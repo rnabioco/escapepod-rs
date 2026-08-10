@@ -4,6 +4,30 @@
 
 ### Added
 
+- **`escpod classify` — the tRNA charging (aminoacylation) classifier**
+  (#204 §2/§3), in a new `escapepod-classify` crate. Takes POD5 *and* an
+  aligned BAM with move tables (the input pair `remora infer
+  from_pod5_and_bam` takes): the model anchors on the CCA–aa junction,
+  which only exists in reference coordinates. The chain — CCAGGC junction
+  location, CIGAR ref→query, Remora-convention move-table mapping, per-run
+  frame-orientation detection (voted from the data, never assumed),
+  per-base dwell/mean/std plus the z-scored k-mer *residual*, divergent
+  region masked — is a parity-tested port of the training-corpus
+  implementation in escapepod-models. The recipe (feature order, offsets,
+  mask rule, k-mer table pinned by sha256, recommended operating point)
+  comes from the model bundle's `metadata.json`, not flags: a caller
+  computing features differently gets a wrong answer, not an error.
+  Output is the input BAM with `cl = round(P(charged)·255)` (uint8)
+  written directly onto every record of each classified read — no modbase
+  `ML`→`cl` round-trip — plus an optional TSV; the summary reports against
+  the bundle's operating point rather than the legacy hard-coded 200.
+- **Binary (sigmoid-head) GBM support** in `escapepod-demux`'s native GBM
+  runtime and `scripts/export_gbm_model.py`: sklearn binary
+  `HistGradientBoostingClassifier` models (one tree per iteration, raw
+  score = logit of class 1) now export and run alongside the multiclass
+  softmax layout, discriminated by a `head` field. NaN feature routing
+  (`missing_go_to_left`) was already supported and applies to both.
+
 - **k-mer level primitives moved down from leech** (#204).
   `escapepod_signal::resquiggle` gains `load_kmer_table` (lenient
   Remora-convention table parse, gz-aware, `f64` levels), `extract_levels`

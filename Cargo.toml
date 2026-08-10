@@ -26,6 +26,7 @@ ctrlc = { version = "3", features = ["termination"] }
 # GPU acceleration (opt-in via `gpu` feature; runtime-compiled CUDA kernels via NVRTC).
 cudarc = { version = "0.19", default-features = false, features = ["cuda-12020", "driver", "nvrtc", "std", "dynamic-loading"] }
 # Workspace crates
+escapepod-classify = { path = "crates/escapepod-classify", version = "0.9.0" }
 escapepod-demux = { path = "crates/escapepod-demux", version = "0.9.0" }
 escapepod-pod5 = { path = "crates/escapepod-pod5", version = "0.9.0" }
 escapepod-signal = { path = "crates/escapepod-signal", version = "0.9.0" }

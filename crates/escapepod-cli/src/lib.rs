@@ -59,3 +59,8 @@ pub use escapepod_signal as signal;
 /// adapter detection and GPU acceleration.
 #[cfg(feature = "demux")]
 pub use escapepod_demux as demux;
+
+/// Read-level classification against escapepod-models bundles — the tRNA
+/// charging classifier over POD5 + aligned BAM.
+#[cfg(feature = "classify")]
+pub use escapepod_classify as classify;

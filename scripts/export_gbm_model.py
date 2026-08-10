@@ -10,10 +10,11 @@ The model whose head this reproduces (`WDX4_tRNA_rna004_v1_0`) is itself
 gradient-boosted (`fpt_boost`); the bake-off arm `_wdx_gbm.py` (escapepod-models)
 fits the HistGradientBoostingClassifier this script consumes.
 
-Only **multiclass** models are supported (one tree per class per boosting
-iteration, combined with softmax) — the 5-barcode bake-off case. Binary models
-(1 tree/iter + sigmoid) and categorical splits are rejected explicitly rather
-than silently mis-exported.
+Both sklearn heads are supported and recorded as `head` in the JSON:
+**multiclass** (one tree per class per boosting iteration, softmax — the
+barcode models) and **binary** (one tree per iteration, sigmoid — the
+charging classifier). Categorical splits are rejected explicitly rather than
+silently mis-exported.
 
 Usage:
     python export_gbm_model.py model.joblib output.json
@@ -81,22 +82,29 @@ def export_model(clf, label_map_override=None, thresholds=None) -> dict:
 
     predictors = clf._predictors  # [n_iterations][n_trees_per_iteration]
     n_trees_per_iter = len(predictors[0])
-    if n_trees_per_iter != n_classes:
+    if n_trees_per_iter == n_classes:
+        head = "softmax"
+    elif n_trees_per_iter == 1 and n_classes == 2:
+        # sklearn's binary log-loss head: one tree per iteration, the raw
+        # score is the logit of class 1.
+        head = "sigmoid"
+    else:
         raise SystemExit(
-            f"Model has {n_trees_per_iter} trees/iteration but {n_classes} classes; "
-            "binary/sigmoid models are unsupported (multiclass softmax only).")
+            f"Model has {n_trees_per_iter} trees/iteration for {n_classes} "
+            "classes; expected n_classes (softmax) or 1 with 2 classes "
+            "(sigmoid).")
 
-    # baseline raw score per class (raveled to length n_classes, class order).
+    # Raw-score baseline(s), raveled: length n_classes (softmax) or 1 (sigmoid).
     baseline = np.asarray(clf._baseline_prediction, dtype=float).ravel().tolist()
-    if len(baseline) != n_classes:
+    if len(baseline) != n_trees_per_iter:
         raise SystemExit(
-            f"baseline has {len(baseline)} entries, expected {n_classes}.")
+            f"baseline has {len(baseline)} entries, expected {n_trees_per_iter}.")
 
     n_features = int(getattr(clf, "n_features_in_", getattr(clf, "_n_features", 0)))
     if n_features <= 0:
         raise SystemExit("Could not determine n_features_in_ from the model.")
 
-    trees = [[export_tree(predictors[it][k].nodes) for k in range(n_classes)]
+    trees = [[export_tree(predictors[it][k].nodes) for k in range(n_trees_per_iter)]
              for it in range(len(predictors))]
 
     if label_map_override is not None:
@@ -107,6 +115,7 @@ def export_model(clf, label_map_override=None, thresholds=None) -> dict:
 
     model = {
         "model_type": "gbm",
+        "head": head,
         "n_classes": n_classes,
         "n_features": n_features,
         "baseline": baseline,
