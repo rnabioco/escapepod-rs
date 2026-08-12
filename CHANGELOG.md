@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A long `--gpu` run no longer exhausts device memory and stalls.**
+  onnxruntime's default `kNextPowerOfTwo` arena strategy doubles the CUDA
+  arena on every extension and never returns it. Demux gives `Session::run`
+  a different batch shape constantly — a full `batch_rows` mid-file, a short
+  tail at every POD5 boundary, whatever the halve-and-retry leaves after an
+  OOM — so each unseen shape forces an extension, and the arena ends holding
+  the whole device in bins too small to serve the next request. The CUDA EP
+  now asks for `kSameAsRequested`, which extends by exactly what was
+  requested, so fragmentation stops compounding.
+
+  The failure scales with how **long** the stream is, not how big the batch
+  is, which is why it survived testing: on a 24 GB A30 with RNA004 nbc16,
+  1.0M- and 1.8M-read runs finish clean while a 4.88M-read run wedged 61% in
+  after 409 failed ~780 MB `Reshape` allocations. It does not surface as an
+  error — allocations fail, the process keeps running, and `nvidia-smi`
+  shows 100% memory at 0% utilisation, which reads as a slow job rather than
+  a dead one. Measured at the same point in the same run: 411 MiB and 0
+  failures, against 24,145 MiB and 409. No numerics change — same graph,
+  same inputs, same arithmetic, same calls.
+
 ### Added
 
 - **k-mer level primitives moved down from leech** (#204).
