@@ -25,6 +25,7 @@ escpod bam-filter -b <BAM> -o <OUTPUT> [OPTIONS] <INPUT>
 | `--mapped` | Keep only mapped reads |
 | `--region <REGION>` | Filter by genomic region (chr or chr:start-end) |
 | `--quality <MAPQ>` | Minimum mapping quality |
+| `-t, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-f, --force` | Overwrite the output file if it exists |
 | `--profile` | Print per-phase timing breakdown |
 | `-h, --help` | Print help |
@@ -110,3 +111,8 @@ Note: 5000 BAM read IDs were not found in POD5 file(s)
 - Signal data is kept compressed during copying for efficiency
 - Run info is preserved and deduplicated when processing multiple files
 - Reads not found in the BAM file are excluded from output
+- Work fans out one thread per input file, and signal is read through an mmap.
+  On a network filesystem a directory of POD5s is bound by page-fault latency
+  rather than CPU, so raising `--threads` past the core count is what speeds it
+  up — the default is capped at available CPUs, which is too low inside a small
+  Slurm allocation.

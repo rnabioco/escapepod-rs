@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Added
+
+- **`bam-filter` takes `-t/--threads`.** It fans out over a POD5 directory
+  through the same `filter_files` core as `filter` and `subset`, both of which
+  have always accepted the flag, but `bam-filter` was listed among the commands
+  that "run on the default pool" — so its width was pinned to
+  `available_parallelism()` with no way to raise it.
+
+  That is the wrong default for this workload. Extraction reads signal rows
+  through an mmap, so on a network filesystem the run is bound by page-fault
+  latency rather than CPU or bandwidth — and page-ins do not show up in
+  `read_bytes`, so a run in this state looks stalled even while it progresses.
+
+  Pulling 97,386 reads out of 3.8M across a 42 GB / 8-file directory on a
+  network filesystem, same host and same input, only `--threads` varying:
+
+  | threads | wall | CPU |
+  |---|---|---|
+  | 2 | 503s | 11s |
+  | 16 | 237s | 9s |
+
+  2.1x faster for the same 9-11s of CPU — the work is waiting, not computing,
+  and only concurrency moves it. Selection is unaffected: both runs emit the
+  same 97,386 reads with byte-identical signal. On a larger 208 GB / 66-file
+  directory the same extraction spends 28m47s wall for **25s of CPU** (1.5%
+  utilization), so the pool wants to be well above the core count.
+
 ### Fixed
 
 - **Rescaling no longer returns a wild scale when the fit does not identify

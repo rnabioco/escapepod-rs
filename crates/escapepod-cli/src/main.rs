@@ -284,9 +284,14 @@ Examples:
   escpod bam-filter reads.pod5 -b aligned.bam -o mapped.pod5 --mapped
   escpod bam-filter reads.pod5 -b aligned.bam -o chr1.pod5 --region chr1
   escpod bam-filter reads.pod5 -b aligned.bam -o hq.pod5 --quality 20
+  escpod bam-filter run_pod5/ -b aligned.bam -o sel.pod5 --mapped -t 16
 
 Region queries (`--region`) require a BAI index next to the BAM file; one is \
 created automatically if not present (written as <bam>.bai).
+
+Work fans out one thread per input file, and signal is read through an mmap, \
+so a directory on a network filesystem is bound by page-fault latency rather \
+than by CPU. Raising `-t/--threads` past the core count is the way to hide it.
 ")]
     BamFilter {
         /// Input POD5 file or directory
@@ -311,6 +316,10 @@ created automatically if not present (written as <bam>.bai).
         /// Minimum mapping quality
         #[arg(long, value_name = "N")]
         quality: Option<u8>,
+
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+        threads: Option<usize>,
 
         /// Overwrite the output file if it already exists
         #[arg(short, long)]
@@ -586,7 +595,8 @@ fn requested_threads(command: &Commands) -> Option<usize> {
     match command {
         Commands::Merge { threads, .. }
         | Commands::Filter { threads, .. }
-        | Commands::Subset { threads, .. } => *threads,
+        | Commands::Subset { threads, .. }
+        | Commands::BamFilter { threads, .. } => *threads,
 
         #[cfg(feature = "experimental")]
         Commands::Index { threads, .. } => *threads,
@@ -612,7 +622,6 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         // No `--threads` flag; these run on the default pool.
         Commands::View { .. }
         | Commands::Inspect { .. }
-        | Commands::BamFilter { .. }
         | Commands::Summary(_)
         | Commands::Repack { .. } => None,
     }
@@ -833,6 +842,7 @@ fn main() -> anyhow::Result<()> {
             mapped,
             region,
             quality,
+            threads: _, // consumed by threads::init before dispatch
             force,
             profile,
         } => commands::bam_filter::run(
@@ -1010,6 +1020,29 @@ mod tests {
             None
         );
         assert_eq!(threads_for(&["escpod", "view", "in.pod5"]), None);
+    }
+
+    /// `bam-filter` fans out over a directory through the same `filter_files`
+    /// core as `filter` and `subset`, so it needs the same width control. It
+    /// shipped without one, which left it pinned to `available_parallelism()`:
+    /// on a 2-CPU allocation reading POD5 over a network filesystem, the run is
+    /// bound by mmap page-fault latency that only extra threads can hide.
+    #[test]
+    fn bam_filter_threads_reach_main() {
+        let base = [
+            "escpod",
+            "bam-filter",
+            "in.pod5",
+            "-b",
+            "in.bam",
+            "-o",
+            "o.pod5",
+        ];
+        for flag in ["-j", "-t", "--threads"] {
+            let argv = [&base[..], &[flag, "12"]].concat();
+            assert_eq!(threads_for(&argv), Some(12), "bam-filter dropped {flag}");
+        }
+        assert_eq!(threads_for(&base), None);
     }
 
     /// With no subcommand, `demux` is the fused pipeline and its flags live in
