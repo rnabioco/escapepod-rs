@@ -1029,7 +1029,15 @@ mod tests {
     /// bound by mmap page-fault latency that only extra threads can hide.
     #[test]
     fn bam_filter_threads_reach_main() {
-        let base = ["escpod", "bam-filter", "in.pod5", "-b", "in.bam", "-o", "o.pod5"];
+        let base = [
+            "escpod",
+            "bam-filter",
+            "in.pod5",
+            "-b",
+            "in.bam",
+            "-o",
+            "o.pod5",
+        ];
         for flag in ["-j", "-t", "--threads"] {
             let argv = [&base[..], &[flag, "12"]].concat();
             assert_eq!(threads_for(&argv), Some(12), "bam-filter dropped {flag}");
