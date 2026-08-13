@@ -26,6 +26,7 @@ required-features = ["cli"]
 escapepod-pod5 = { workspace = true, optional = true }
 escapepod-signal = { workspace = true, optional = true }
 escapepod-demux = { workspace = true, optional = true }
+escapepod-classify = { workspace = true, optional = true }
 
 # CLI-only dependencies. All optional and rolled into the `cli` feature so the
 # library surface stays lean.
@@ -72,6 +73,11 @@ default = ["cli"]
 pod5 = ["dep:escapepod-pod5"]
 signal = ["dep:escapepod-signal"]
 demux = ["dep:escapepod-demux"]
+# Read-level classification against model bundles (`escpod classify`, the tRNA
+# charging classifier). Adds no third-party crates beyond the CLI graph
+# (noodles-sam, serde, sha2 are already linked), so it ships in the default
+# build like `demux`.
+classify = ["dep:escapepod-classify"]
 
 # The `escpod` binary and everything it links. Implies the `signal`, `demux`
 # and `cnn-detect` layers. `demux` is in the default build because it pulls in
@@ -86,6 +92,7 @@ demux = ["dep:escapepod-demux"]
 cli = [
     "signal",
     "demux",
+    "classify",
     "cnn-detect",
     "crf-decode",
     "demux-models",
@@ -139,7 +146,10 @@ crf-gpu = ["crf-decode", "escapepod-demux/crf-gpu"]
 # detect --method cnn --gpu`). Implies `cnn-detect` for the shared CPU path and
 # preprocessing. Needs a CUDA-enabled libonnxruntime + visible GPU at runtime.
 cnn-gpu = ["cnn-detect", "escapepod-demux/cnn-gpu"]
-experimental = []
+# Implies `classify`: resquiggle shares classify's basecaller-tag decoders
+# (and the two are expected to grow together — both are BAM + move-table
+# signal-anchored analyses).
+experimental = ["classify"]
 # Shared model-prefetch machinery: HTTPS (ureq/rustls), sha256 verification, and
 # zip extraction for release bundles. Split out so the demux model fetch can
 # ship by default without dragging in `experimental`, which gates the whole

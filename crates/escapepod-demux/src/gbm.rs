@@ -58,13 +58,28 @@ pub struct GbmTree {
     pub nodes: Vec<GbmNode>,
 }
 
-/// A gradient-boosted tree-ensemble barcode classifier, deserialized from the
-/// JSON emitted by `scripts/export_gbm_model.py`.
+/// How per-class raw scores become probabilities — sklearn's two
+/// `HistGradientBoostingClassifier` heads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GbmHead {
+    /// Multinomial: one tree per class per iteration, softmax over the
+    /// per-class raw scores. The default (and the only head older exports
+    /// carry, which omit the field).
+    #[default]
+    Softmax,
+    /// Binary: ONE tree per iteration; the single raw score is the logit of
+    /// class 1 (`P(class 1) = 1 / (1 + e^-raw)`), matching sklearn's
+    /// binary log-loss head. `baseline` and each iteration hold one entry.
+    Sigmoid,
+}
+
+/// A gradient-boosted tree-ensemble classifier, deserialized from the JSON
+/// emitted by `scripts/export_gbm_model.py`.
 ///
-/// Multiclass only: every boosting iteration contributes one tree per class
-/// (`n_trees_per_iteration == n_classes`), and the per-class raw scores are
-/// combined with softmax — matching sklearn's multinomial `HistGradientBoosting`
-/// head. Binary models (1 tree/iter + sigmoid) are intentionally unsupported.
+/// Two layouts, discriminated by [`GbmHead`]: multiclass (one tree per class
+/// per iteration, softmax — the barcode models) and binary (one tree per
+/// iteration, sigmoid — the charging classifier).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GbmModel {
     /// Schema discriminator; always `"gbm"`. Lets [`crate::load_any_model`]
@@ -72,18 +87,25 @@ pub struct GbmModel {
     /// carries `label_mapper`, so this must win).
     pub model_type: String,
 
-    /// Number of barcode classes (= per-iteration tree count).
+    /// Probability head. Absent in older (multiclass) exports → softmax.
+    #[serde(default)]
+    pub head: GbmHead,
+
+    /// Number of classes. For [`GbmHead::Softmax`] this is also the
+    /// per-iteration tree count; for [`GbmHead::Sigmoid`] it is 2 while each
+    /// iteration holds a single tree.
     pub n_classes: usize,
 
     /// Feature dimension expected of every query fingerprint.
     pub n_features: usize,
 
-    /// Per-class initial raw score (`clf._baseline_prediction`), length
-    /// `n_classes`. Raw scores start here before the trees are summed in.
+    /// Initial raw score(s) (`clf._baseline_prediction`): length `n_classes`
+    /// for softmax, length 1 for sigmoid. Raw scores start here before the
+    /// trees are summed in.
     pub baseline: Vec<f64>,
 
-    /// Boosted trees, indexed `[iteration][class]`. Every inner vector has
-    /// length `n_classes`.
+    /// Boosted trees, indexed `[iteration][score]`. Every inner vector has
+    /// length `n_classes` for softmax, length 1 for sigmoid.
     pub trees: Vec<Vec<GbmTree>>,
 
     /// Maps class index (`0..n_classes`) to barcode ID. Same convention as
@@ -108,6 +130,28 @@ impl GbmModel {
         self.trees.len()
     }
 
+    /// Trees per boosting iteration (independent raw-score accumulators):
+    /// `n_classes` under softmax, 1 under sigmoid.
+    pub fn score_groups(&self) -> usize {
+        match self.head {
+            GbmHead::Softmax => self.n_classes,
+            GbmHead::Sigmoid => 1,
+        }
+    }
+
+    /// Turn accumulated raw scores (one per score group) into a per-class
+    /// probability vector of length `n_classes`.
+    fn head_probs(&self, raw: &[f64]) -> Vec<f64> {
+        match self.head {
+            GbmHead::Softmax => softmax(raw),
+            GbmHead::Sigmoid => {
+                // sklearn's binary log-loss head: raw is the logit of class 1.
+                let p1 = 1.0 / (1.0 + (-raw[0]).exp());
+                vec![1.0 - p1, p1]
+            }
+        }
+    }
+
     /// Validate structural invariants. Returns `Err(msg)` on the first problem.
     pub fn validate(&self) -> Result<(), String> {
         if self.model_type != "gbm" {
@@ -122,24 +166,32 @@ impl GbmModel {
                 self.n_classes
             ));
         }
-        if self.baseline.len() != self.n_classes {
+        if self.head == GbmHead::Sigmoid && self.n_classes != 2 {
             return Err(format!(
-                "baseline has {} entries, expected n_classes={}",
-                self.baseline.len(),
+                "sigmoid head requires exactly 2 classes, got {}",
                 self.n_classes
+            ));
+        }
+        let groups = self.score_groups();
+        if self.baseline.len() != groups {
+            return Err(format!(
+                "baseline has {} entries, expected {} ({:?} head)",
+                self.baseline.len(),
+                groups,
+                self.head
             ));
         }
         if self.trees.is_empty() {
             return Err("trees is empty (no boosting iterations)".to_string());
         }
         for (it, iter_trees) in self.trees.iter().enumerate() {
-            if iter_trees.len() != self.n_classes {
+            if iter_trees.len() != groups {
                 return Err(format!(
-                    "iteration {} has {} trees, expected n_classes={} \
-                     (binary/sigmoid models are unsupported)",
+                    "iteration {} has {} trees, expected {} ({:?} head)",
                     it,
                     iter_trees.len(),
-                    self.n_classes
+                    groups,
+                    self.head
                 ));
             }
             for (cls, tree) in iter_trees.iter().enumerate() {
@@ -262,11 +314,12 @@ impl CompiledGbm {
     /// [`GbmModel::validate`] having already bounds-checked child/feature
     /// indices, so the walk needs no re-validation.
     fn from_model(m: &GbmModel) -> Self {
+        let groups = m.score_groups();
         let cap = m.trees.iter().flatten().map(|t| t.nodes.len()).sum();
         let mut nodes: Vec<CompactNode> = Vec::with_capacity(cap);
         let mut values: Vec<f64> = Vec::with_capacity(cap);
-        let mut class_roots: Vec<Vec<u32>> = vec![Vec::with_capacity(m.trees.len()); m.n_classes];
-        let mut tree_depth: Vec<Vec<u16>> = vec![Vec::with_capacity(m.trees.len()); m.n_classes];
+        let mut class_roots: Vec<Vec<u32>> = vec![Vec::with_capacity(m.trees.len()); groups];
+        let mut tree_depth: Vec<Vec<u16>> = vec![Vec::with_capacity(m.trees.len()); groups];
         for (k, (roots, depths)) in class_roots
             .iter_mut()
             .zip(tree_depth.iter_mut())
@@ -376,7 +429,7 @@ impl<'a> GbmPredictor<'a> {
         }
 
         // raw[k] = baseline[k] + Σ_iter tree[iter][k].leaf_value(x), accumulated
-        // class-by-class so each class's contiguous sub-arena streams once.
+        // group-by-group so each group's contiguous sub-arena streams once.
         let c = &self.compiled;
         let mut raw = c.baseline.clone();
         for (k, roots) in c.class_roots.iter().enumerate() {
@@ -387,7 +440,7 @@ impl<'a> GbmPredictor<'a> {
             raw[k] += acc;
         }
 
-        let probs = softmax(&raw);
+        let probs = m.head_probs(&raw);
         let result = process_probabilities(&probs, &m.label_mapper, m.thresholds.as_deref());
         Ok((probs, result))
     }
@@ -468,7 +521,7 @@ impl<'a> GbmPredictor<'a> {
                 }
             }
             for raw_lane in raw {
-                let probs = softmax(&raw_lane);
+                let probs = m.head_probs(&raw_lane);
                 let result =
                     process_probabilities(&probs, &m.label_mapper, m.thresholds.as_deref());
                 out.push((probs, result));
@@ -540,6 +593,7 @@ mod tests {
         label_mapper.insert(1, 7);
         GbmModel {
             model_type: "gbm".to_string(),
+            head: GbmHead::Softmax,
             n_classes: 2,
             n_features: 1,
             baseline: vec![0.0, 0.0],
@@ -632,6 +686,109 @@ mod tests {
         let (_probs, res) = p.predict(&[0.0]).unwrap();
         assert!(!res.is_confident);
         assert_eq!(res.predicted_barcode, -1);
+    }
+
+    /// Binary (sigmoid-head) model: one stump per iteration on feature 0.
+    fn toy_binary_model() -> GbmModel {
+        let stump = |left_val: f64, right_val: f64| GbmTree {
+            nodes: vec![
+                GbmNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    left: 1,
+                    right: 2,
+                    missing_left: true,
+                    value: 0.0,
+                    leaf: false,
+                },
+                GbmNode {
+                    feature: -1,
+                    threshold: 0.0,
+                    left: 0,
+                    right: 0,
+                    missing_left: false,
+                    value: left_val,
+                    leaf: true,
+                },
+                GbmNode {
+                    feature: -1,
+                    threshold: 0.0,
+                    left: 0,
+                    right: 0,
+                    missing_left: false,
+                    value: right_val,
+                    leaf: true,
+                },
+            ],
+        };
+        let mut label_mapper = HashMap::new();
+        label_mapper.insert(0, 0);
+        label_mapper.insert(1, 1);
+        GbmModel {
+            model_type: "gbm".to_string(),
+            head: GbmHead::Sigmoid,
+            n_classes: 2,
+            n_features: 1,
+            baseline: vec![0.25],
+            // One tree per iteration: raw is the logit of class 1.
+            trees: vec![vec![stump(-1.0, 1.0)], vec![stump(-1.0, 1.0)]],
+            label_mapper,
+            thresholds: None,
+            classes: Some(vec![0, 1]),
+        }
+    }
+
+    #[test]
+    fn sigmoid_head_validates_and_predicts() {
+        let m = toy_binary_model();
+        m.validate().expect("binary model should validate");
+        let p = GbmPredictor::new(&m);
+
+        // x[0]=1.0 > 0.5: raw = 0.25 + 2 = 2.25 → P(class 1) = σ(2.25).
+        let (probs, res) = p.predict(&[1.0]).unwrap();
+        let want = 1.0 / (1.0 + (-2.25f64).exp());
+        assert!((probs[1] - want).abs() < 1e-12);
+        assert!((probs[0] - (1.0 - want)).abs() < 1e-12);
+        assert_eq!(res.predicted_index, 1);
+
+        // x[0]=0.0 ≤ 0.5: raw = 0.25 - 2 = -1.75 → class 0.
+        let (probs, res) = p.predict(&[0.0]).unwrap();
+        assert!(probs[0] > probs[1]);
+        assert_eq!(res.predicted_index, 0);
+
+        // NaN routes left (missing_left) → same as low-feature case.
+        let (_probs, res) = p.predict(&[f64::NAN]).unwrap();
+        assert_eq!(res.predicted_index, 0);
+    }
+
+    #[test]
+    fn sigmoid_head_batched_matches_scalar() {
+        let m = toy_binary_model();
+        let p = GbmPredictor::new(&m);
+        let fps: Vec<Vec<f64>> = (0..19).map(|i| vec![i as f64 / 10.0]).collect();
+        let refs: Vec<&[f64]> = fps.iter().map(|v| v.as_slice()).collect();
+        let batched = p.predict_many(&refs).unwrap();
+        for (fp, (probs, _)) in refs.iter().zip(&batched) {
+            let (scalar, _) = p.predict(fp).unwrap();
+            assert_eq!(probs, &scalar);
+        }
+    }
+
+    #[test]
+    fn sigmoid_head_rejects_bad_layout() {
+        let mut m = toy_binary_model();
+        // Two trees per iteration under sigmoid is invalid.
+        let extra = m.trees[0][0].clone();
+        m.trees[0].push(extra);
+        assert!(m.validate().is_err());
+
+        let mut m = toy_binary_model();
+        m.baseline = vec![0.0, 0.0];
+        assert!(m.validate().is_err());
+
+        let mut m = toy_binary_model();
+        m.n_classes = 3;
+        assert!(m.validate().is_err());
     }
 
     #[test]

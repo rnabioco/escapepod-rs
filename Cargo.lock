@@ -901,6 +901,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "escapepod-classify"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "escapepod-demux",
+ "escapepod-signal",
+ "noodles-bam",
+ "noodles-bgzf",
+ "noodles-sam",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "escapepod-cli"
 version = "0.9.0"
 dependencies = [
@@ -911,6 +929,7 @@ dependencies = [
  "clap",
  "csv",
  "ctrlc",
+ "escapepod-classify",
  "escapepod-demux",
  "escapepod-pod5",
  "escapepod-signal",

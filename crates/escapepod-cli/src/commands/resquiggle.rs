@@ -9,6 +9,9 @@ use clap::Args;
 use rayon::prelude::*;
 use tracing::{info, warn};
 
+// Basecaller tag decoders shared with `escpod classify` (the `experimental`
+// feature implies `classify` for exactly this coupling).
+use escapepod_classify::bam_tags::int_tag as get_int_tag;
 use escapepod_signal::parse_uuid_flexible;
 use escapepod_signal::resquiggle::{
     BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
@@ -566,30 +569,8 @@ fn refine_single_read(
         None => bail!("no matching POD5 read"),
     };
 
-    // Extract move table from mv tag
-    let mv_tag = Tag::new(b'm', b'v');
-    let (stride, moves) = match record.data().get(&mv_tag) {
-        Some(Value::Array(Array::UInt8(data))) => {
-            if data.len() < 2 {
-                bail!("mv tag too short (UInt8)");
-            }
-            (data[0] as usize, data[1..].to_vec())
-        }
-        Some(Value::Array(Array::Int8(data))) => {
-            if data.len() < 2 {
-                bail!("mv tag too short (Int8)");
-            }
-            (
-                data[0] as usize,
-                data[1..].iter().map(|&b| b as u8).collect::<Vec<u8>>(),
-            )
-        }
-        _ => bail!("no mv tag"),
-    };
-
-    if stride == 0 {
-        bail!("stride is 0");
-    }
+    // Extract move table from mv tag (decoder shared with classify).
+    let (stride, moves) = escapepod_classify::bam_tags::parse_mv_tag(record)?;
 
     // Extract sequence (noodles already decodes BAM 4-bit to ASCII)
     let sequence: &[u8] = record.sequence().as_ref();
@@ -606,9 +587,9 @@ fn refine_single_read(
     let ts_tag = Tag::new(b't', b's');
     let ns_tag = Tag::new(b'n', b's');
 
-    let parent_signal_offset = get_int_tag(record, &sp_tag).unwrap_or(0) as usize;
-    let trimmed_signal_len = get_int_tag(record, &ts_tag).unwrap_or(0) as usize;
-    let subread_signal_len = get_int_tag(record, &ns_tag);
+    let parent_signal_offset = get_int_tag(record, sp_tag).unwrap_or(0) as usize;
+    let trimmed_signal_len = get_int_tag(record, ts_tag).unwrap_or(0) as usize;
+    let subread_signal_len = get_int_tag(record, ns_tag);
 
     let signal_start = parent_signal_offset + trimmed_signal_len;
     let signal_end = match subread_signal_len {
@@ -802,19 +783,6 @@ fn build_query_to_signal_map(
 fn get_float_tag(record: &RecordBuf, tag: &Tag) -> Option<f32> {
     match record.data().get(tag) {
         Some(Value::Float(f)) => Some(*f),
-        _ => None,
-    }
-}
-
-/// Extract an integer value from a BAM auxiliary tag.
-fn get_int_tag(record: &RecordBuf, tag: &Tag) -> Option<i64> {
-    match record.data().get(tag) {
-        Some(Value::Int8(v)) => Some(*v as i64),
-        Some(Value::UInt8(v)) => Some(*v as i64),
-        Some(Value::Int16(v)) => Some(*v as i64),
-        Some(Value::UInt16(v)) => Some(*v as i64),
-        Some(Value::Int32(v)) => Some(*v as i64),
-        Some(Value::UInt32(v)) => Some(*v as i64),
         _ => None,
     }
 }
