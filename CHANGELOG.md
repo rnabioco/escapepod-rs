@@ -4,6 +4,29 @@
 
 ### Fixed
 
+- **Rescaling no longer returns a wild scale when the fit does not identify
+  one.** All three estimators return `scale / slope`, and all three only
+  rejected an *exactly* zero slope. A slope merely close to zero is not "no
+  change" — it is a scale multiplied by `1/slope`.
+
+  This is reached by ordinary data, not a pathological input. When the window
+  being rescaled sits in a constant adapter or a homopolymer the expected levels
+  carry almost no spread, the fitted slope collapses toward zero, and the caller
+  gets a scale orders of magnitude off. On real tRNA chunks the returned scales
+  ranged from 15 to 1084 and were **frequently negative** — a sign-flipped read.
+  Applying that transform destroys the per-base levels: a measured-vs-expected
+  k-mer correlation that should sit near +0.8 came out at -0.03.
+
+  `least_squares`, `theil_sen` and `least_squares_with_drift` now require a
+  finite, positive slope of at least 0.01 (already a 100x rescale) before using
+  it, and otherwise return the caller's parameters unchanged — the same
+  "no information, leave it alone" behaviour the exactly-singular case already
+  had. `theil_sen` returns them rather than erroring, so refinement still runs.
+
+  Note for callers: rejection is necessarily per-read, so a caller feeding
+  already-normalized signal is better off keeping its own normalization than
+  applying a mix of fitted and unfitted transforms across its reads.
+
 - **A long `--gpu` run no longer exhausts device memory and stalls.**
   onnxruntime's default `kNextPowerOfTwo` arena strategy doubles the CUDA
   arena on every extension and never returns it. Demux gives `Session::run`

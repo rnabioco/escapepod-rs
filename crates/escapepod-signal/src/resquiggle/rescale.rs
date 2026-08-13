@@ -8,6 +8,34 @@ use rand::seq::IteratorRandom;
 
 use super::types::{RescaleAlgo, RoughRescaleAlgo};
 
+/// Smallest regression slope that still identifies a rescale.
+///
+/// Both estimators return the caller's parameters divided by the fitted slope
+/// (`new_scale = scale / slope`), so a slope near zero does not mean "no
+/// change" — it means a scale blown up by `1/slope`. A slope of 0.01 already
+/// implies a 100x rescale, which no real signal-to-level fit produces.
+const MIN_IDENTIFIABLE_SLOPE: f32 = 0.01;
+
+/// Does a fitted slope actually identify a rescale?
+///
+/// Guards the `scale / slope` division in both estimators. A fit is usable only
+/// when the slope is finite and comfortably positive:
+///
+/// * **near zero** — the expected levels carry almost no spread over this
+///   window, so the fit is unidentifiable. This is not exotic: a window sitting
+///   in a constant adapter or homopolymer has essentially one expected level,
+///   and the resulting `scale` lands orders of magnitude off.
+/// * **negative** — implies the signal runs *opposite* to the level model,
+///   which for this transform means a sign-flipped read rather than a rescale.
+///
+/// Rejecting both is strictly better than propagating the value: the caller
+/// keeps the parameters it came in with, which is the documented
+/// "no information, leave it alone" behaviour the exactly-singular case
+/// already had.
+fn slope_identifies_scale(slope: f32) -> bool {
+    slope.is_finite() && slope >= MIN_IDENTIFIABLE_SLOPE
+}
+
 /// Rough rescale using the specified algorithm.
 ///
 /// Returns `(shift, scale, drift)`. Drift is always 0.0 at the rough stage.
@@ -144,7 +172,7 @@ fn least_squares(x: &[f32], y: &[f32], shift: f32, scale: f32) -> Result<(f32, f
         numerator / denominator
     };
 
-    if scale_est == 0.0 {
+    if !slope_identifies_scale(scale_est) {
         return Ok((shift, scale));
     }
 
@@ -205,8 +233,11 @@ fn theil_sen(
     // which the `== 0.0` check below would reject anyway.
     let median_slope = crate::stats::median_via_select(&mut slopes);
 
-    if median_slope == 0.0 {
-        bail!("theil_sen: median slope is zero");
+    if !slope_identifies_scale(median_slope) {
+        // Not an error — the window simply does not determine a rescale. Hand
+        // back the caller's parameters so refinement still runs on the signal
+        // as it was normalized, rather than on a wildly rescaled copy.
+        return Ok((shift, scale));
     }
 
     let mut intercepts: Vec<f32> = x
@@ -451,7 +482,10 @@ fn least_squares_with_drift(
     let a = a as f32;
     let c = c as f32;
 
-    if b.abs() < f32::EPSILON {
+    // Same identifiability requirement as the 2-parameter fits: `new_scale`
+    // is `scale / b`, so a near-zero or negative `b` yields a scale that is
+    // an artefact of the division rather than a measurement.
+    if !slope_identifies_scale(b) {
         return Ok((shift, scale, drift));
     }
 
@@ -534,6 +568,49 @@ fn theil_sen_with_drift(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A near-flat level model must not produce a giant rescale.
+    ///
+    /// This is the real failure: a window sitting in a constant adapter has
+    /// almost no spread in expected levels, the fitted slope collapses toward
+    /// zero, and `scale / slope` returns a scale orders of magnitude off.
+    #[test]
+    fn unidentifiable_slope_leaves_parameters_alone() {
+        let signal: Vec<f32> = (0..9).map(|i| i as f32 * 0.5).collect();
+        let flat_levels = vec![1.0f32; 9];
+
+        let (shift, scale) = least_squares(&signal, &flat_levels, 0.0, 1.0).unwrap();
+        assert_eq!((shift, scale), (0.0, 1.0));
+
+        let (shift, scale) = theil_sen(&signal, &flat_levels, 0.0, 1.0, 0, None).unwrap();
+        assert_eq!((shift, scale), (0.0, 1.0));
+    }
+
+    /// A negative slope means the signal runs opposite to the level model,
+    /// which would sign-flip the read rather than rescale it.
+    #[test]
+    fn negative_slope_is_rejected() {
+        let x: Vec<f32> = (0..9).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..9).map(|i| -(i as f32)).collect();
+
+        assert_eq!(least_squares(&x, &y, 0.0, 1.0).unwrap(), (0.0, 1.0));
+        assert_eq!(theil_sen(&x, &y, 0.0, 1.0, 0, None).unwrap(), (0.0, 1.0));
+    }
+
+    /// A well-conditioned fit still rescales — the guard must not swallow
+    /// legitimate corrections.
+    #[test]
+    fn identifiable_slope_still_rescales() {
+        // levels = 2 * signal, so scale should come back halved (scale / 2).
+        let x: Vec<f32> = (0..9).map(|i| i as f32).collect();
+        let y: Vec<f32> = x.iter().map(|v| 2.0 * v).collect();
+
+        let (_, scale) = least_squares(&x, &y, 0.0, 1.0).unwrap();
+        assert!((scale - 0.5).abs() < 1e-5, "expected ~0.5, got {scale}");
+
+        let (_, scale) = theil_sen(&x, &y, 0.0, 1.0, 0, None).unwrap();
+        assert!((scale - 0.5).abs() < 1e-5, "expected ~0.5, got {scale}");
+    }
 
     #[test]
     fn test_calculate_quantiles_basic() {
