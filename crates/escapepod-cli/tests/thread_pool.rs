@@ -90,6 +90,24 @@ fn demux_detect_honours_threads_for_every_method() {
     }
 }
 
+/// `bam-filter` sizes the pool like every other fan-out command.
+#[test]
+fn bam_filter_threads_bound_the_pool() {
+    assert_pool_width(
+        &[
+            "bam-filter",
+            "no-such-file.pod5",
+            "-b",
+            "no-such-file.bam",
+            "-o",
+            "out.pod5",
+            "-t",
+            "3",
+        ],
+        3,
+    );
+}
+
 /// `-t 0` would mean "rayon picks for me", i.e. another silently-ignored flag.
 #[test]
 fn zero_threads_is_rejected() {

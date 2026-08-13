@@ -27,6 +27,77 @@
   score = logit of class 1) now export and run alongside the multiclass
   softmax layout, discriminated by a `head` field. NaN feature routing
   (`missing_go_to_left`) was already supported and applies to both.
+- **`bam-filter` takes `-t/--threads`.** It fans out over a POD5 directory
+  through the same `filter_files` core as `filter` and `subset`, both of which
+  have always accepted the flag, but `bam-filter` was listed among the commands
+  that "run on the default pool" — so its width was pinned to
+  `available_parallelism()` with no way to raise it.
+
+  That is the wrong default for this workload. Extraction reads signal rows
+  through an mmap, so on a network filesystem the run is bound by page-fault
+  latency rather than CPU or bandwidth — and page-ins do not show up in
+  `read_bytes`, so a run in this state looks stalled even while it progresses.
+
+  Pulling 97,386 reads out of 3.8M across a 42 GB / 8-file directory on a
+  network filesystem, same host and same input, only `--threads` varying:
+
+  | threads | wall | CPU |
+  |---|---|---|
+  | 2 | 503s | 11s |
+  | 16 | 237s | 9s |
+
+  2.1x faster for the same 9-11s of CPU — the work is waiting, not computing,
+  and only concurrency moves it. Selection is unaffected: both runs emit the
+  same 97,386 reads with byte-identical signal. On a larger 208 GB / 66-file
+  directory the same extraction spends 28m47s wall for **25s of CPU** (1.5%
+  utilization), so the pool wants to be well above the core count.
+
+### Fixed
+
+- **Rescaling no longer returns a wild scale when the fit does not identify
+  one.** All three estimators return `scale / slope`, and all three only
+  rejected an *exactly* zero slope. A slope merely close to zero is not "no
+  change" — it is a scale multiplied by `1/slope`.
+
+  This is reached by ordinary data, not a pathological input. When the window
+  being rescaled sits in a constant adapter or a homopolymer the expected levels
+  carry almost no spread, the fitted slope collapses toward zero, and the caller
+  gets a scale orders of magnitude off. On real tRNA chunks the returned scales
+  ranged from 15 to 1084 and were **frequently negative** — a sign-flipped read.
+  Applying that transform destroys the per-base levels: a measured-vs-expected
+  k-mer correlation that should sit near +0.8 came out at -0.03.
+
+  `least_squares`, `theil_sen` and `least_squares_with_drift` now require a
+  finite, positive slope of at least 0.01 (already a 100x rescale) before using
+  it, and otherwise return the caller's parameters unchanged — the same
+  "no information, leave it alone" behaviour the exactly-singular case already
+  had. `theil_sen` returns them rather than erroring, so refinement still runs.
+
+  Note for callers: rejection is necessarily per-read, so a caller feeding
+  already-normalized signal is better off keeping its own normalization than
+  applying a mix of fitted and unfitted transforms across its reads.
+
+- **A long `--gpu` run no longer exhausts device memory and stalls.**
+  onnxruntime's default `kNextPowerOfTwo` arena strategy doubles the CUDA
+  arena on every extension and never returns it. Demux gives `Session::run`
+  a different batch shape constantly — a full `batch_rows` mid-file, a short
+  tail at every POD5 boundary, whatever the halve-and-retry leaves after an
+  OOM — so each unseen shape forces an extension, and the arena ends holding
+  the whole device in bins too small to serve the next request. The CUDA EP
+  now asks for `kSameAsRequested`, which extends by exactly what was
+  requested, so fragmentation stops compounding.
+
+  The failure scales with how **long** the stream is, not how big the batch
+  is, which is why it survived testing: on a 24 GB A30 with RNA004 nbc16,
+  1.0M- and 1.8M-read runs finish clean while a 4.88M-read run wedged 61% in
+  after 409 failed ~780 MB `Reshape` allocations. It does not surface as an
+  error — allocations fail, the process keeps running, and `nvidia-smi`
+  shows 100% memory at 0% utilisation, which reads as a slow job rather than
+  a dead one. Measured at the same point in the same run: 411 MiB and 0
+  failures, against 24,145 MiB and 409. No numerics change — same graph,
+  same inputs, same arithmetic, same calls.
+
+### Added
 
 - **k-mer level primitives moved down from leech** (#204).
   `escapepod_signal::resquiggle` gains `load_kmer_table` (lenient
