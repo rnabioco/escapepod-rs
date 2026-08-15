@@ -221,6 +221,111 @@ fn write_row(
 }
 
 /// Run the basecall subcommand.
+/// One batch handed from the reader to the encoder: per-read `(id, adapter_end)`
+/// and the prepped windows, in the same order and the same length.
+type Block = (Vec<uuid::Uuid>, Vec<usize>, Vec<Option<Vec<f32>>>);
+
+/// The reader half of the pipeline: one sequential sweep of the inputs, prepping
+/// each Arrow batch and handing it off.
+///
+/// The sweep is single-streamed on purpose — fanning per-read signal reads across
+/// workers collapses throughput on a network filesystem (#72), which is why this
+/// has the same shape as `fingerprint`. Only the *handoff* is concurrent, so the
+/// encoder can run batch N while this reads batch N+1.
+fn produce_blocks(
+    inputs: &[PathBuf],
+    boundaries: &std::collections::HashMap<uuid::Uuid, escapepod_demux::ReadBoundaries>,
+    meta: &escapepod_demux::crf::CrfMetadata,
+    tx: &std::sync::mpsc::SyncSender<Block>,
+) {
+    for path in inputs {
+        let Ok(reader) = Reader::open(path) else {
+            warn!("skipping unreadable file {}", path.display());
+            continue;
+        };
+        let Ok(batches) = reader.read_batches() else {
+            continue;
+        };
+        for batch_result in batches {
+            let Ok(batch) = batch_result else { continue };
+            let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                continue;
+            };
+            let reads: Vec<_> = (0..view.num_rows())
+                .filter_map(|row| view.read(row).ok())
+                .filter(|r| !r.signal_rows.is_empty() && boundaries.contains_key(&r.read_id))
+                .collect();
+            if reads.is_empty() {
+                continue;
+            }
+
+            let keyed: Vec<(usize, Vec<u64>)> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.signal_rows.clone()))
+                .collect();
+            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
+                continue;
+            };
+
+            // Signal decompression, calibration and standardisation are all
+            // CPU work and independent per read, so they fan out here; the
+            // encoder then sees a ready batch (which is what lets the GPU path
+            // submit one call per Arrow batch).
+            let prepped: Vec<(uuid::Uuid, usize, Option<Vec<f32>>)> = bulk
+                .par_iter()
+                .map(|(i, chunks)| {
+                    let read = &reads[*i];
+                    let adapter_end = boundaries
+                        .get(&read.read_id)
+                        .map(|b| b.adapter_end)
+                        .unwrap_or(0);
+                    let window = (|| {
+                        // Only the window ending at the adapter is ever read,
+                        // so decode that prefix rather than a whole transcript
+                        // — and calibrate only the window, not the prefix.
+                        //
+                        // Under clamping the window can extend PAST the adapter,
+                        // to `[0, chunk]`, so the prefix has to reach `chunk` or
+                        // the read arrives one sample short of its own window and
+                        // is refused for a reason that looks like geometry.
+                        let need = if meta.clamp_max_shift() > 0 {
+                            adapter_end.max(meta.signal.chunk)
+                        } else {
+                            adapter_end
+                        };
+                        let adc = decode_chunks_to(chunks, Some(need))?;
+                        let mut w = Vec::new();
+                        meta.prep_adc_into(
+                            &adc,
+                            adapter_end,
+                            read.calibration_offset,
+                            read.calibration_scale,
+                            &mut w,
+                        )
+                        .then_some(w)
+                    })();
+                    (read.read_id, adapter_end, window)
+                })
+                .collect();
+
+            // Split rather than clone: the encoder wants the windows by
+            // themselves, and they are the large half of the block.
+            let mut ids = Vec::with_capacity(prepped.len());
+            let mut ends = Vec::with_capacity(prepped.len());
+            let mut windows = Vec::with_capacity(prepped.len());
+            for (id, adapter_end, window) in prepped {
+                ids.push(id);
+                ends.push(adapter_end);
+                windows.push(window);
+            }
+            if tx.send((ids, ends, windows)).is_err() {
+                return; // consumer stopped early; its error surfaces at the join
+            }
+        }
+    }
+}
+
 pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     info!("{} barcode regions", style::action("Basecalling"));
     info!(
@@ -347,99 +452,54 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     )?;
     let mut written = 0usize;
 
-    // One Arrow batch at a time, then decode + basecall in parallel — the same
-    // single-sequential-sweep shape as `fingerprint`, for the same reason
-    // (fanning per-read signal reads across workers collapses throughput on a
-    // network filesystem).
-    for path in &args.input {
-        let Ok(reader) = Reader::open(path) else {
-            warn!("skipping unreadable file {}", path.display());
-            continue;
-        };
-        let Ok(batches) = reader.read_batches() else {
-            continue;
-        };
-        for batch_result in batches {
-            let Ok(batch) = batch_result else { continue };
-            let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                continue;
-            };
-            let reads: Vec<_> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
-                .filter(|r| !r.signal_rows.is_empty() && boundaries.contains_key(&r.read_id))
-                .collect();
-            if reads.is_empty() {
-                continue;
-            }
+    // Read ahead by one batch so the encoder is not idle across the signal read.
+    //
+    // The read itself is unchanged — still one sequential sweep, for the reason
+    // in `produce_blocks` — but it now runs on its own thread, because the two
+    // stages alternating in lockstep is what starves the encoder. Measured on a
+    // 136 GB / 20-file input (A30, `--gpu`): 62% mean GPU utilisation with 20% of
+    // samples below 5%, the dead windows being the reader stalled in a page fault
+    // at ~2.4 MB/s while the device had nothing queued.
+    //
+    // Depth 2 is the whole buffer: one block in flight, one being built, so the
+    // extra memory is bounded by a single batch of windows. The CPU encoder gets
+    // the same overlap — it wants it for the same reason, and splitting the paths
+    // would mean two copies of this loop.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Block>(2);
+    let inputs = &args.input;
+    let bounds = &boundaries;
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        scope.spawn(move || produce_blocks(inputs, bounds, meta, &tx));
 
-            let keyed: Vec<(usize, Vec<u64>)> = reads
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (i, r.signal_rows.clone()))
-                .collect();
-            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
-                continue;
-            };
-
-            // Signal decompression, calibration and standardisation are all
-            // CPU work and independent per read, so they fan out here; the
-            // encoder then sees a ready batch (which is what lets the GPU path
-            // submit one call per Arrow batch).
-            let prepped: Vec<(uuid::Uuid, usize, Option<Vec<f32>>)> = bulk
-                .par_iter()
-                .map(|(i, chunks)| {
-                    let read = &reads[*i];
-                    let adapter_end = boundaries
-                        .get(&read.read_id)
-                        .map(|b| b.adapter_end)
-                        .unwrap_or(0);
-                    let window = (|| {
-                        // Only the window ending at the adapter is ever read,
-                        // so decode that prefix rather than a whole transcript
-                        // — and calibrate only the window, not the prefix.
-                        //
-                        // Under clamping the window can extend PAST the adapter,
-                        // to `[0, chunk]`, so the prefix has to reach `chunk` or
-                        // the read arrives one sample short of its own window and
-                        // is refused for a reason that looks like geometry.
-                        let need = if meta.clamp_max_shift() > 0 {
-                            adapter_end.max(meta.signal.chunk)
-                        } else {
-                            adapter_end
-                        };
-                        let adc = decode_chunks_to(chunks, Some(need))?;
-                        let mut w = Vec::new();
-                        meta.prep_adc_into(
-                            &adc,
-                            adapter_end,
-                            read.calibration_offset,
-                            read.calibration_scale,
-                            &mut w,
-                        )
-                        .then_some(w)
-                    })();
-                    (read.read_id, adapter_end, window)
-                })
-                .collect();
-
-            let windows: Vec<Option<Vec<f32>>> =
-                prepped.iter().map(|(_, _, w)| w.clone()).collect();
+        // Encode, match and write on this thread: `out`/`written` stay plain
+        // locals, and blocks arrive in sweep order, so the output is unchanged.
+        //
+        // Consuming `rx` (rather than `rx.iter()`) is load-bearing on the error
+        // path: it moves the receiver into this closure, so an early `?` below
+        // drops it, the producer's next `send` fails, and the scope's join can
+        // finish. Borrowed from outside, the receiver would outlive the closure
+        // and a failed write would deadlock the join against a producer parked
+        // on a full channel — turning an I/O error into a hang.
+        for (ids, ends, windows) in rx {
+            let n = ids.len();
             let sequences = encoder.basecall_prepped(&windows)?;
+            drop(windows);
 
             // Matching is independent per read and cheap next to the decode,
             // but 96 references x one alignment each is still worth fanning out.
-            let decoded: Vec<Decoded> = prepped
-                .iter()
+            let decoded: Vec<Decoded> = ids
+                .into_iter()
+                .zip(ends)
                 .zip(sequences)
                 .collect::<Vec<_>>()
                 .into_par_iter()
-                .map(|((read_id, adapter_end, _), seq)| {
+                .map(|((read_id, adapter_end), seq)| {
                     let call = seq
                         .as_ref()
                         .and_then(|s| refs.as_ref().and_then(|r| r.match_sequence(s.as_bytes())));
                     Decoded {
-                        read_id: *read_id,
-                        adapter_end: *adapter_end,
+                        read_id,
+                        adapter_end,
                         sequence: seq,
                         call,
                     }
@@ -454,9 +514,10 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
                 write_row(&mut out, d, refs.as_ref(), args.min_margin)?;
             }
             written += decoded.len();
-            progress.inc(reads.len() as u64);
+            progress.inc(n as u64);
         }
-    }
+        Ok(())
+    })?;
     out.flush()?;
     progress.finish_and_clear();
 
