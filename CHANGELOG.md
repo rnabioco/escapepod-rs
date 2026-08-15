@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0 (2026-08-14)
+
 ### Added
 
 - **`escpod classify` — the tRNA charging (aminoacylation) classifier**
@@ -52,6 +54,19 @@
   directory the same extraction spends 28m47s wall for **25s of CPU** (1.5%
   utilization), so the pool wants to be well above the core count.
 
+- **k-mer level primitives moved down from leech** (#204).
+  `escapepod_signal::resquiggle` gains `load_kmer_table` (lenient
+  Remora-convention table parse, gz-aware, `f64` levels), `extract_levels`
+  (expected level per base with an explicit center index; unknown k-mers and
+  short sequences yield zeros, not errors), and `rough_rescale_quantile`
+  (the quantile fit that puts observed signal into k-mer level units).
+  These are the primitives the tRNA charging classifier's k-mer *residual*
+  feature is defined against, so leech and `escpod` must share one
+  implementation; parity with leech's NumPy references is pinned at the bit
+  level by golden-vector tests (including NumPy's dtype-dependent quantile
+  interpolation). Distinct from the existing `KmerTable`, which keeps its
+  fishnet conventions for the `resquiggle` command.
+
 ### Fixed
 
 - **Rescaling no longer returns a wild scale when the fit does not identify
@@ -96,21 +111,6 @@
   a dead one. Measured at the same point in the same run: 411 MiB and 0
   failures, against 24,145 MiB and 409. No numerics change — same graph,
   same inputs, same arithmetic, same calls.
-
-### Added
-
-- **k-mer level primitives moved down from leech** (#204).
-  `escapepod_signal::resquiggle` gains `load_kmer_table` (lenient
-  Remora-convention table parse, gz-aware, `f64` levels), `extract_levels`
-  (expected level per base with an explicit center index; unknown k-mers and
-  short sequences yield zeros, not errors), and `rough_rescale_quantile`
-  (the quantile fit that puts observed signal into k-mer level units).
-  These are the primitives the tRNA charging classifier's k-mer *residual*
-  feature is defined against, so leech and `escpod` must share one
-  implementation; parity with leech's NumPy references is pinned at the bit
-  level by golden-vector tests (including NumPy's dtype-dependent quantile
-  interpolation). Distinct from the existing `KmerTable`, which keeps its
-  fishnet conventions for the `resquiggle` command.
 
 ## 0.9.0 (2026-08-09)
 
