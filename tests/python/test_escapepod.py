@@ -1349,6 +1349,41 @@ class TestAnchoredReads:
             "junction_fallback",
         }
 
+    def test_storage_order_is_a_permutation_and_batches_stay_local(self):
+        """Select randomly, THEN order by storage, then batch.
+
+        `extract` sorts within a batch, which does nothing for a caller that
+        shuffles ids and slices them: every batch then touches every file, so
+        the POD5 set is swept once per batch instead of once. On an 8M-read run
+        that was ~32 passes over 136 GB and it dominated everything else.
+        """
+        ar = self._build(24)
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        ids = ar.read_ids_with_signal
+        ordered = ar.storage_order(ids)
+        assert sorted(ordered) == sorted(ids), "must be a permutation"
+
+        # Shuffling first must not change the result: the order is a property
+        # of where the reads live, not of how they were asked for.
+        shuffled = list(reversed(ids))
+        assert ar.storage_order(shuffled) == ordered
+
+        # Ids with no signal cannot be extracted, so they are dropped rather
+        # than silently reordered to the front.
+        assert (
+            ar.storage_order(ids + ["00000000-0000-0000-0000-000000000000"]) == ordered
+        )
+
+        # And the ordering is the one extract itself uses, so a caller that
+        # pre-sorts gets batches that are already local.
+        out = ar.extract(ordered, left=600, right=400)
+        assert out["read_id"] == [r for r in ordered if r in set(out["read_id"])]
+
+    def test_storage_order_needs_an_index(self):
+        ar = self._build(24)
+        with pytest.raises(ValueError):
+            ar.storage_order([])
+
     def test_extract_requires_an_index_and_valid_geometry(self):
         ar = self._build(24)
         with pytest.raises(ValueError):

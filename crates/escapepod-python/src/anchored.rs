@@ -241,6 +241,38 @@ impl AnchoredReads {
         Ok(n)
     }
 
+    /// Reorder `read_ids` into POD5 storage order.
+    ///
+    /// `extract` already sorts each batch this way, but that only helps WITHIN
+    /// a batch: a caller that shuffles ids and then slices them into batches
+    /// makes every batch touch every file, so a run gets swept once per batch
+    /// rather than once. On an 8M-read run in 250k batches that is ~32 passes
+    /// over the whole POD5 set, which on a network filesystem is the entire
+    /// cost of extraction.
+    ///
+    /// Select randomly, then order by storage, then batch. Ids with no signal
+    /// are dropped -- they cannot be extracted anyway.
+    fn storage_order(&self, read_ids: Vec<String>) -> PyResult<Vec<String>> {
+        let idx = self
+            .pod5
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("call index_pod5 first"))?;
+        let mut keyed: Vec<(usize, u64, String)> = read_ids
+            .into_iter()
+            .filter_map(|s| {
+                let id = s.parse::<uuid::Uuid>().ok()?;
+                let info = idx.reads().get(&id)?;
+                Some((
+                    info.reader_idx,
+                    info.signal_rows.first().copied().unwrap_or(0),
+                    s,
+                ))
+            })
+            .collect();
+        keyed.sort_unstable_by_key(|(f, r, _)| (*f, *r));
+        Ok(keyed.into_iter().map(|(_, _, s)| s).collect())
+    }
+
     /// Read ids that anchored **and** have signal, in sorted order.
     #[getter]
     fn read_ids_with_signal(&self) -> PyResult<Vec<String>> {
