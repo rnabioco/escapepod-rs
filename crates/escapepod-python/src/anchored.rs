@@ -77,8 +77,7 @@ struct Row {
     idx: usize,
     window: Vec<f32>,
     features: Vec<f32>,
-    junction_sig: i64,
-    common_start_sig: i64,
+    coords: escapepod_classify::JunctionCoords,
     mask_source: &'static str,
 }
 
@@ -360,9 +359,8 @@ impl AnchoredReads {
                         idx: i,
                         window,
                         features,
-                        junction_sig: coords.junction_sig,
-                        common_start_sig: coords.common_start_sig,
                         mask_source: mask_source_name(coords.mask_source),
+                        coords,
                     })
                 })
                 .collect()
@@ -374,9 +372,16 @@ impl AnchoredReads {
         let n = rows.len();
         let mut x = Vec::with_capacity(n * w);
         let mut f = Vec::with_capacity(n * n_feat);
-        let (mut js, mut cs) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        let (mut kept, mut msrc, mut refs, mut mapq) = (
-            Vec::with_capacity(n),
+        // Column vectors, one per corpus metadata field. The caller writes a
+        // row per read, so everything it would otherwise recompute from the
+        // read travels back with the features.
+        let col = |_n: usize| Vec::<i64>::with_capacity(n);
+        let (mut js, mut cs) = (col(n), col(n));
+        let (mut cca_sig, mut cca_dwell, mut j_dwell) = (col(n), col(n), col(n));
+        let (mut arm_depth, mut aln_depth) = (col(n), col(n));
+        let (mut polya, mut body) = (col(n), col(n));
+        let (mut ns, mut ts, mut mapq) = (col(n), col(n), col(n));
+        let (mut kept, mut msrc, mut refs) = (
             Vec::with_capacity(n),
             Vec::with_capacity(n),
             Vec::with_capacity(n),
@@ -384,14 +389,24 @@ impl AnchoredReads {
         for r in &rows {
             x.extend_from_slice(&r.window);
             f.extend_from_slice(&r.features);
-            js.push(r.junction_sig);
-            cs.push(r.common_start_sig);
+            let c = &r.coords;
+            js.push(c.junction_sig);
+            cs.push(c.common_start_sig);
+            cca_sig.push(c.cca_a_sig);
+            cca_dwell.push(c.cca_a_dwell);
+            j_dwell.push(c.junction_dwell);
+            arm_depth.push(c.arm_resolved_depth as i64);
+            aln_depth.push(c.aligner_arm_depth as i64);
+            polya.push(c.polya_mid_sig);
+            body.push(c.body_mid_sig);
             msrc.push(r.mask_source);
             let id = ids[r.idx];
             kept.push(id.to_string());
             let read = &self.anchored[&id];
             refs.push(read.reference.clone());
             mapq.push(read.mapq as i64);
+            ns.push(read.ns);
+            ts.push(read.ts);
         }
 
         let out = PyDict::new(py);
@@ -400,9 +415,22 @@ impl AnchoredReads {
         out.set_item("mask_source", msrc)?;
         out.set_item("X", PyArray1::from_vec(py, x).reshape([n, w])?)?;
         out.set_item("F", PyArray1::from_vec(py, f).reshape([n, n_feat])?)?;
-        out.set_item("junction_sig", PyArray1::from_vec(py, js))?;
-        out.set_item("common_start_sig", PyArray1::from_vec(py, cs))?;
-        out.set_item("mapq", PyArray1::from_vec(py, mapq))?;
+        for (name, v) in [
+            ("junction_sig", js),
+            ("common_start_sig", cs),
+            ("cca_a_sig", cca_sig),
+            ("cca_a_dwell", cca_dwell),
+            ("junction_dwell", j_dwell),
+            ("arm_resolved_depth", arm_depth),
+            ("aligner_arm_depth", aln_depth),
+            ("polya_mid_sig", polya),
+            ("body_mid_sig", body),
+            ("mapq", mapq),
+            ("ns", ns),
+            ("ts", ts),
+        ] {
+            out.set_item(name, PyArray1::from_vec(py, v))?;
+        }
         Ok(out)
     }
 }
