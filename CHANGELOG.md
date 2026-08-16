@@ -41,6 +41,26 @@
   caller already resolved, so a caller wanting both a window and the features
   runs `finalize` once instead of keeping its own residual computation.
 
+- **The signal-window rule moved out of the pyo3 binding** into
+  `escapepod_classify::window` (`signal_window`, `BaseJustify`). Anchoring
+  inside the junction base, the `[anchor-left, anchor+right)` slice, `NaN`
+  padding and the mask of everything earlier than the common-arm start are
+  model contract — the Rust inference path has to reproduce them exactly —
+  but the only implementation lived in `escapepod-python`, where that path
+  could not see it. That is the same structural mistake that left this
+  pipeline with two divergent feature definitions once already. The binding
+  now calls it, and the rule is pinned by unit tests in the crate that owns
+  it: padding at both ends, each justification, and the mask boundary landing
+  on `common_start_sig` exactly (first masked / first surviving sample).
+
+  Two things the move made visible, both preserved deliberately rather than
+  fixed: the reject rule counts real samples across the *whole* window, not
+  samples after the anchor (a read short on the right is kept if the left
+  makes up the count) — the docs said the latter; and the justification shift
+  uses `JunctionCoords::junction_dwell` rather than recomputing the dwell from
+  the move table, which is the same number and cannot be resolved against
+  different coords than the window is cut from.
+
 ## 0.10.0 (2026-08-14)
 
 ### Added

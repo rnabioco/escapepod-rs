@@ -32,7 +32,9 @@
 //!    minus expected level), the model's decisive feature — [`features`];
 //! 7. everything earlier in time than the common arm is never read: the
 //!    training libraries' adapters diverge 17 nt after the CCA, so those
-//!    samples would classify the adapter, not the chemistry.
+//!    samples would classify the adapter, not the chemistry — [`features`]
+//!    for the per-base grid, [`window`] for the raw window a signal-level
+//!    model takes instead.
 //!
 //! The recipe — feature order, offsets, stat layout, mask rule, the k-mer
 //! table pinned by sha256, and the recommended operating point — comes from
@@ -50,6 +52,7 @@ pub mod features;
 pub mod geometry;
 pub mod pipeline;
 pub mod recipe;
+pub mod window;
 
 pub use anchor::{
     AnchoredRead, MaskSource, Orientation, OrientationVotes, ScanOutcome, SpanMode,
@@ -64,6 +67,7 @@ pub use pipeline::{
     scan_bam, signal_pa,
 };
 pub use recipe::{FeatureRecipe, KmerLevels};
+pub use window::{BaseJustify, signal_window};
 
 /// Encode a probability as the `cl` BAM tag value: `round(p * 255)` as u8.
 ///
