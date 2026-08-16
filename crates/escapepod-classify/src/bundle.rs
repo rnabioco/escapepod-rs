@@ -93,6 +93,24 @@ struct FeaturesBlock {
     offsets: Vec<i32>,
     stats: Vec<String>,
     order: Vec<String>,
+    #[serde(default)]
+    resolution: ResolutionBlock,
+}
+
+/// How each offset's signal span is found — the half of the feature contract
+/// that is not the offsets themselves. `escapepod-models` writes this as
+/// `features.resolution`.
+///
+/// Asking the aligner and walking the query give different spans on precisely
+/// the reads that matter, because bwa stops at the adduct. A bundle scored
+/// under the wrong one gets a confident wrong answer, not an error.
+///
+/// Absent means the aligner path: bundles built before the counting anchor
+/// existed (`charging_cnn_rna004@v0.1.0`, 2026-08-10) genuinely used it.
+#[derive(Debug, Default, Deserialize)]
+struct ResolutionBlock {
+    #[serde(default)]
+    count_arm_bases: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +157,8 @@ pub struct ChargingBundle {
     pub anchor: AnchorBlock,
     /// Feature offsets relative to the junction, recipe order.
     pub offsets: Vec<i32>,
+    /// How each offset's signal span is found (`features.resolution`).
+    pub span_mode: crate::anchor::SpanMode,
     /// Model input columns as `(offset index, stat index)` into the
     /// canonical `offsets × FEAT_STATS` grid, in `features.order` order.
     pub columns: Vec<(usize, usize)>,
@@ -288,6 +308,9 @@ impl ChargingBundle {
             gbm,
             anchor: meta.anchor,
             offsets: meta.features.offsets,
+            span_mode: crate::anchor::SpanMode::from_arm_bases(
+                meta.features.resolution.count_arm_bases,
+            ),
             columns,
             kmer,
             operating_point: meta.operating_point,

@@ -59,6 +59,11 @@ sys.path.insert(0, str(LEECH_SRC))
 spec = importlib.util.spec_from_file_location("charging", CHARGING_PY)
 charging = importlib.util.module_from_spec(spec)
 sys.modules["charging"] = charging  # dataclasses resolve via sys.modules
+# Register before exec: `charging.JunctionRecord` is a `@dataclass(slots=True)`,
+# and slots rebuilds the class, which makes dataclasses look `cls.__module__`
+# up in sys.modules. A spec-loaded module that is not registered there fails
+# with an opaque AttributeError on None.
+sys.modules[spec.name] = charging
 spec.loader.exec_module(charging)
 
 import pysam  # noqa: E402

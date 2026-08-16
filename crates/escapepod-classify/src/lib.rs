@@ -45,7 +45,11 @@ pub mod features;
 pub mod geometry;
 pub mod pipeline;
 
-pub use anchor::{AnchoredRead, Orientation, OrientationVotes, ScanOutcome, resolve_orientation};
+pub use anchor::{
+    AnchoredRead, MaskSource, Orientation, OrientationVotes, ScanOutcome, SpanMode,
+    resolve_orientation,
+};
+pub use anchor::{finalize, query_positions};
 pub use bundle::{ChargingBundle, OperatingPoint};
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
 pub use geometry::{RefGeometry, junction_positions};

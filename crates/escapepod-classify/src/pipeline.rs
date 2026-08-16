@@ -180,10 +180,17 @@ pub fn feature_grid(
     orientation: Orientation,
     sig_pa: &[f32],
 ) -> Vec<f32> {
-    let coords = anchor::finalize(read, orientation, &bundle.offsets);
-    let expected = bundle.kmer.as_ref().map(|k| {
-        features::expected_levels_z(&read.seq, &k.map, k.k, k.center_idx, &read.qf, read.nb)
-    });
+    let mode = bundle.span_mode;
+    let coords = anchor::finalize(read, orientation, &bundle.offsets, mode);
+    // The SAME positions the spans came from. Under the counting anchor
+    // `read.qf` is the aligner's answer, which is not what the offsets
+    // resolved to -- using it here leaves dwell/mean/std right and the
+    // residual silently wrong.
+    let qf = anchor::query_positions(read, &bundle.offsets, mode);
+    let expected = bundle
+        .kmer
+        .as_ref()
+        .map(|k| features::expected_levels_z(&read.seq, &k.map, k.k, k.center_idx, &qf, read.nb));
     features::junction_features(sig_pa, &coords, expected.as_deref())
 }
 
