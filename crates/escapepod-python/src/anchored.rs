@@ -92,6 +92,9 @@ pub struct AnchoredReads {
     pod5: Option<Pod5Index>,
     kmer: Option<(HashMap<String, f64>, usize, usize)>,
     n_records: usize,
+    records_scanned: u64,
+    skips: HashMap<escapepod_classify::SkipReason, u64>,
+    votes: (usize, usize),
 }
 
 #[pymethods]
@@ -146,6 +149,9 @@ impl AnchoredReads {
         order.sort_unstable();
         Ok(Self {
             n_records: scan.anchored.len(),
+            records_scanned: scan.records_scanned,
+            skips: scan.skips.clone(),
+            votes: (scan.votes.time, scan.votes.reversed),
             anchored: scan.anchored,
             order,
             orientation,
@@ -174,6 +180,31 @@ impl AnchoredReads {
     #[getter]
     fn n_anchored(&self) -> usize {
         self.n_records
+    }
+
+    /// Total BAM records read, before any filtering.
+    #[getter]
+    fn records_scanned(&self) -> u64 {
+        self.records_scanned
+    }
+
+    /// Why records were dropped, keyed by reason.
+    ///
+    /// The corpus builder's retention audit compares these run to run: a
+    /// rejection rate that differs by class is a label-correlated filter,
+    /// which is how two separate bugs got into this pipeline.
+    #[getter]
+    fn skips(&self) -> HashMap<&'static str, u64> {
+        self.skips
+            .iter()
+            .map(|(reason, n)| (reason.as_str(), *n))
+            .collect()
+    }
+
+    /// Move-table frame votes as `(time, reversed)`.
+    #[getter]
+    fn orientation_votes(&self) -> (usize, usize) {
+        self.votes
     }
 
     /// Index POD5 files, keeping only reads this scan anchored.
