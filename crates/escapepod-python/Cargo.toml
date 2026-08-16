@@ -14,7 +14,9 @@ crate-type = ["cdylib"]
 name = "escapepod_python"
 
 [dependencies]
+escapepod-classify = { workspace = true }
 escapepod-signal = { workspace = true }
 numpy = { workspace = true }
 rayon = { workspace = true }
+uuid = { workspace = true }
 pyo3 = { workspace = true }

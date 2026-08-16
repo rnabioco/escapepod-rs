@@ -1012,10 +1012,12 @@ dependencies = [
 name = "escapepod-python"
 version = "0.10.0"
 dependencies = [
+ "escapepod-classify",
  "escapepod-signal",
  "numpy",
  "pyo3",
  "rayon",
+ "uuid",
 ]
 
 [[package]]
