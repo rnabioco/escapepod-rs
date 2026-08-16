@@ -6,8 +6,6 @@
 #[cfg(feature = "experimental")]
 pub mod annotate;
 pub mod bam_filter;
-#[cfg(feature = "classify")]
-pub mod classify;
 #[cfg(feature = "demux")]
 pub mod demux;
 pub mod filter;
@@ -22,6 +20,8 @@ pub mod repack;
 pub mod resquiggle;
 #[cfg(feature = "experimental")]
 pub mod resquiggle_models;
+#[cfg(feature = "classify")]
+pub mod signal;
 pub mod subset;
 pub mod summary;
 pub mod view;

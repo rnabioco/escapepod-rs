@@ -30,37 +30,12 @@ use pyo3::types::PyDict;
 use rayon::prelude::*;
 
 use escapepod_classify::{
-    AnchoredRead, MaskSource, Orientation, Pod5Index, SpanMode, finalize, junction_positions,
-    query_positions, resolve_orientation, scan_bam,
+    AnchoredRead, BaseJustify, FeatureRecipe, KmerLevels, MaskSource, Orientation, Pod5Index,
+    SpanMode, finalize, junction_positions, resolve_orientation, scan_bam, signal_window,
 };
 
 fn value_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
-}
-
-/// Where the window sits inside the junction base's own signal span.
-///
-/// A fixed offset from the base's START makes the window cover a different
-/// number of *bases* on a fast read than a slow one, which encodes
-/// translocation rate — the nuisance variable that tracks flowcell.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BaseJustify {
-    Start,
-    Center,
-    End,
-}
-
-impl BaseJustify {
-    fn parse(s: &str) -> PyResult<Self> {
-        match s {
-            "start" => Ok(Self::Start),
-            "center" => Ok(Self::Center),
-            "end" => Ok(Self::End),
-            other => Err(PyValueError::new_err(format!(
-                "base_justify must be start|center|end, got {other:?}"
-            ))),
-        }
-    }
 }
 
 fn mask_source_name(m: MaskSource) -> &'static str {
@@ -90,7 +65,7 @@ pub struct AnchoredReads {
     offsets: Vec<i32>,
     mode: SpanMode,
     pod5: Option<Pod5Index>,
-    kmer: Option<(HashMap<String, f64>, usize, usize)>,
+    kmer: Option<KmerLevels>,
     n_records: usize,
     records_scanned: u64,
     skips: HashMap<escapepod_classify::SkipReason, u64>,
@@ -298,15 +273,14 @@ impl AnchoredReads {
     /// shift moves every residual, so the override exists and is explicit.
     #[pyo3(signature = (path, center_idx = None))]
     fn load_kmer_table(&mut self, path: PathBuf, center_idx: Option<usize>) -> PyResult<usize> {
-        let (levels, k) =
-            escapepod_signal::resquiggle::load_kmer_table(&path).map_err(value_err)?;
-        let centre = center_idx.unwrap_or(k / 2);
-        if centre >= k {
+        let (map, k) = escapepod_signal::resquiggle::load_kmer_table(&path).map_err(value_err)?;
+        let center_idx = center_idx.unwrap_or(k / 2);
+        if center_idx >= k {
             return Err(PyValueError::new_err(format!(
-                "center_idx {centre} outside a {k}-mer"
+                "center_idx {center_idx} outside a {k}-mer"
             )));
         }
-        self.kmer = Some((levels, k, centre));
+        self.kmer = Some(KmerLevels { map, k, center_idx });
         Ok(k)
     }
 
@@ -315,10 +289,12 @@ impl AnchoredReads {
     /// Returns a dict of column arrays. `X` is `(n, left + right)` raw pA with
     /// `NaN` for padding and for everything earlier in time than the
     /// common-arm start; `F` is `(n, len(offsets) * 4)` in offsets-outer,
-    /// (dwell, mean, std, resid) order.
+    /// (dwell, mean, std, resid) order. Both come from
+    /// `escapepod_classify` ([`signal_window`], `feature_grid_at`) — the
+    /// window and the grid are model contract, so this layer only marshals.
     ///
-    /// Reads with no signal, or whose window would not hold `right` samples
-    /// after the anchor, are dropped — `read_id` says which survived rather
+    /// Reads with no signal, or with fewer than `right` real samples falling
+    /// inside the window, are dropped — `read_id` says which survived rather
     /// than the caller having to infer it from a shorter array.
     #[pyo3(signature = (read_ids, left, right, base_justify = "start"))]
     fn extract<'py>(
@@ -329,7 +305,7 @@ impl AnchoredReads {
         right: i64,
         base_justify: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let justify = BaseJustify::parse(base_justify)?;
+        let justify: BaseJustify = base_justify.parse().map_err(value_err)?;
         if left < 0 || right <= 0 {
             return Err(PyValueError::new_err("left >= 0 and right > 0 required"));
         }
@@ -346,6 +322,10 @@ impl AnchoredReads {
 
         let w = (left + right) as usize;
         let n_feat = self.offsets.len() * escapepod_classify::FEAT_STATS.len();
+        // The feature space, borrowed: offsets, span mode, k-mer levels. The
+        // grid itself is computed by escapepod-classify, so the corpus this
+        // builds and the model that scores it cannot drift apart.
+        let recipe = FeatureRecipe::new(&self.offsets, self.mode, self.kmer.as_ref());
 
         // Per-read work is independent and entirely numeric, so it runs off
         // the GIL. Rows carry their input index so the output keeps the
@@ -375,48 +355,14 @@ impl AnchoredReads {
                     if sig.len() as i64 != read.ns {
                         return None;
                     }
-                    let coords = finalize(read, self.orientation, &self.offsets, self.mode);
-
-                    let mut anchor = coords.junction_sig;
-                    let dwell = read_junction_dwell(read, self.orientation);
-                    if dwell > 0 {
-                        anchor += match justify {
-                            BaseJustify::Start => 0,
-                            BaseJustify::Center => dwell / 2,
-                            BaseJustify::End => dwell,
-                        };
-                    }
-
-                    let (lo, hi) = (anchor - left, anchor + right);
-                    let (src_lo, src_hi) = (lo.max(0), hi.min(sig.len() as i64));
-                    if src_hi - src_lo < right {
-                        return None;
-                    }
-
-                    let mut window = vec![f32::NAN; w];
-                    let dst = (src_lo - lo) as usize;
-                    window[dst..dst + (src_hi - src_lo) as usize]
-                        .copy_from_slice(&sig[src_lo as usize..src_hi as usize]);
-                    // Mask everything earlier than the common arm: poly(A) and
-                    // the divergent 13-mer, which differ between libraries.
-                    let cut = coords.common_start_sig - lo;
-                    if cut > 0 {
-                        let end = (cut as usize).min(w);
-                        window[..end].fill(f32::NAN);
-                    }
-
-                    let expected = self.kmer.as_ref().map(|(levels, k, centre)| {
-                        // The SAME positions the spans came from — under the
-                        // counting anchor `read.qf` is the aligner's answer,
-                        // and using it here leaves dwell/mean/std right while
-                        // the residual is silently wrong.
-                        let qf = query_positions(read, &self.offsets, self.mode);
-                        escapepod_classify::expected_levels_z(
-                            &read.seq, levels, *k, *centre, &qf, read.nb,
-                        )
-                    });
+                    let coords = finalize(read, self.orientation, recipe.offsets, recipe.span_mode);
+                    // Anchoring, padding and the mask boundary are model
+                    // contract, not binding convenience -- they live in
+                    // escapepod-classify so the Rust inference path reproduces
+                    // exactly the window the corpus was cut with.
+                    let window = signal_window(&sig, &coords, left, right, justify)?;
                     let features =
-                        escapepod_classify::junction_features(&sig, &coords, expected.as_deref());
+                        escapepod_classify::feature_grid_at(&recipe, read, &coords, &sig);
 
                     Some(Row {
                         idx: i,
@@ -496,22 +442,6 @@ impl AnchoredReads {
         }
         Ok(out)
     }
-}
-
-/// Samples assigned to the junction base, in the run's frame.
-fn read_junction_dwell(read: &AnchoredRead, orientation: Orientation) -> i64 {
-    let s2s = &read.seq_to_sig;
-    let i = read.q_junction;
-    if i + 1 >= s2s.len() {
-        return 0;
-    }
-    let (a, b) = (s2s[i], s2s[i + 1]);
-    let (a, b) = if orientation == Orientation::Reversed {
-        (read.ns - b, read.ns - a)
-    } else {
-        (a, b)
-    };
-    (b - a).max(0)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

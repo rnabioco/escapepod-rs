@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+### Changed
+
+- **`escpod classify` is now `escpod signal classify`.** The bare top-level
+  spelling sat one word away from `escpod demux classify` while meaning
+  something else entirely: `demux classify` assigns a barcode from a DTW/GBM
+  adapter fingerprint, whereas the charging classifier scores a read-level
+  model against raw signal anchored on the CCA–aa junction in *reference*
+  coordinates (different inputs, different output, different failure modes).
+  Two commands that share a verb and share nothing else is a trap in a shell
+  history or a pipeline script, so the charging classifier moved into a
+  `signal` group named for what it operates on.
+
+  The old spelling still works: it is a hidden alias that logs
+  ``warn: `escpod classify` is deprecated; use `escpod signal classify`.``
+  and forwards to the same runner — verified by an end-to-end test that
+  asserts the two invocations produce byte-identical calls, so the alias
+  cannot drift into a second implementation.
+
+  `signal` has no default action, so unlike `demux` and `resquiggle` it is a
+  plain required subcommand enum with no flattened run-args struct.
+
+- **`escapepod_classify::feature_grid` takes a `FeatureRecipe`, not a
+  `ChargingBundle`.** The grid only ever read three things out of the bundle —
+  the offsets, the span mode, and the k-mer levels the residual is taken
+  against — but taking the whole bundle meant anything that wanted features
+  had to own weights, an operating point and a set of verified checksums it
+  had no use for. The caller that most needs the features is the corpus
+  builder, which by definition has no model yet, so it was left choosing
+  between a fake bundle and its own copy of the definition. This repo has
+  already shipped two divergent feature definitions once.
+
+  `FeatureRecipe` is a borrowed view (`bundle.recipe()`, or
+  `FeatureRecipe::from(&bundle)`), so there is no second copy to drift.
+  `ChargingBundle` still owns parsing and verifying `metadata.json`.
+  `KmerLevels` moves from `bundle` to the new `recipe` module and is
+  re-exported at the crate root. A new `feature_grid_at` takes coords the
+  caller already resolved, so a caller wanting both a window and the features
+  runs `finalize` once instead of keeping its own residual computation.
+
+- **The signal-window rule moved out of the pyo3 binding** into
+  `escapepod_classify::window` (`signal_window`, `BaseJustify`). Anchoring
+  inside the junction base, the `[anchor-left, anchor+right)` slice, `NaN`
+  padding and the mask of everything earlier than the common-arm start are
+  model contract — the Rust inference path has to reproduce them exactly —
+  but the only implementation lived in `escapepod-python`, where that path
+  could not see it. That is the same structural mistake that left this
+  pipeline with two divergent feature definitions once already. The binding
+  now calls it, and the rule is pinned by unit tests in the crate that owns
+  it: padding at both ends, each justification, and the mask boundary landing
+  on `common_start_sig` exactly (first masked / first surviving sample).
+
+  Two things the move made visible, both preserved deliberately rather than
+  fixed: the reject rule counts real samples across the *whole* window, not
+  samples after the anchor (a read short on the right is kept if the left
+  makes up the count) — the docs said the latter; and the justification shift
+  uses `JunctionCoords::junction_dwell` rather than recomputing the dwell from
+  the move table, which is the same number and cannot be resolved against
+  different coords than the window is cut from.
+
 ## 0.10.0 (2026-08-14)
 
 ### Added

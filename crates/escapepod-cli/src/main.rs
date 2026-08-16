@@ -443,9 +443,42 @@ POD5 per stage; prefer the fused form unless you want the intermediate files.
         args: Vec<String>,
     },
 
-    /// Classify reads against a model bundle (tRNA charging) from POD5 + aligned BAM
+    /// Read-level models over the raw signal
     #[cfg(feature = "classify")]
-    Classify(commands::classify::ClassifyArgs),
+    #[command(after_help = "\
+Examples:
+  escpod signal classify reads.pod5 -b aln.bam -r ref.fa -m bundle/ -o out.bam
+
+`signal classify` answers a different question from `demux classify`: it scores
+a read-level model (today the tRNA charging classifier) against the raw signal
+anchored in reference coordinates, rather than assigning a barcode from an
+adapter fingerprint.
+")]
+    Signal {
+        #[command(subcommand)]
+        command: commands::signal::SignalCommand,
+    },
+
+    /// Read-level models over the raw signal (rebuild with `--features classify` to enable)
+    #[cfg(not(feature = "classify"))]
+    #[command(hide = true)]
+    Signal {
+        /// Signal subcommand and arguments (ignored; feature not enabled)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+
+    /// Deprecated alias for `escpod signal classify`.
+    ///
+    /// Hidden rather than removed: it was the shipped spelling in 0.10.0, so
+    /// existing pipeline scripts still name it. It warns and forwards.
+    #[cfg(feature = "classify")]
+    #[command(hide = true)]
+    Classify(commands::signal::ClassifyArgs),
 
     /// Classify reads against a model bundle (rebuild with `--features classify` to enable)
     #[cfg(not(feature = "classify"))]
@@ -636,6 +669,14 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         #[cfg(not(feature = "demux"))]
         Commands::Demux { .. } => None,
 
+        // Like `demux`, `signal` flattens each stage's flags under a subcommand.
+        #[cfg(feature = "classify")]
+        Commands::Signal { command } => commands::signal::requested_threads(command),
+        #[cfg(not(feature = "classify"))]
+        Commands::Signal { .. } => None,
+
+        // The deprecated `escpod classify` alias parses the same args as
+        // `signal classify`, so it must reach the pool sizing the same way.
         #[cfg(feature = "classify")]
         Commands::Classify(args) => args.threads,
         #[cfg(not(feature = "classify"))]
@@ -900,7 +941,16 @@ fn main() -> anyhow::Result<()> {
         Commands::Demux { .. } => feature_disabled("demux", "demux"),
 
         #[cfg(feature = "classify")]
-        Commands::Classify(args) => commands::classify::run(args),
+        Commands::Signal { command } => commands::signal::run(command),
+
+        #[cfg(not(feature = "classify"))]
+        Commands::Signal { .. } => feature_disabled("signal", "classify"),
+
+        #[cfg(feature = "classify")]
+        Commands::Classify(args) => {
+            tracing::warn!("`escpod classify` is deprecated; use `escpod signal classify`.");
+            commands::signal::classify::run(args)
+        }
 
         #[cfg(not(feature = "classify"))]
         Commands::Classify { .. } => feature_disabled("classify", "classify"),
@@ -1152,5 +1202,35 @@ mod tests {
             ]),
             Some(4)
         );
+    }
+
+    /// `escpod classify` moved under the `signal` group; the old spelling is a
+    /// hidden alias. Both parse the same `ClassifyArgs`, so both must reach the
+    /// pool sizing — a deprecated path that silently loses `-j` is the #155 bug
+    /// wearing a different hat.
+    #[cfg(feature = "classify")]
+    #[test]
+    fn signal_classify_and_its_deprecated_alias_forward_threads() {
+        let tail = [
+            "in.pod5", "-b", "a.bam", "-r", "ref.fa", "-m", "bundle", "-o", "o.bam",
+        ];
+        for prefix in [
+            &["escpod", "signal", "classify"][..],
+            &["escpod", "classify"],
+        ] {
+            assert_eq!(threads_for(&[prefix, &tail].concat()), None);
+            for flag in ["-t", "-j", "--threads"] {
+                let argv = [prefix, &tail, &[flag, "9"]].concat();
+                assert_eq!(threads_for(&argv), Some(9), "{prefix:?} dropped {flag}");
+            }
+        }
+    }
+
+    /// The group is a namespace, not a command: `escpod signal` alone is a
+    /// usage error rather than a silent no-op.
+    #[cfg(feature = "classify")]
+    #[test]
+    fn signal_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["escpod", "signal"]).is_err());
     }
 }

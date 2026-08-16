@@ -7,8 +7,9 @@
 //! floats travel as IEEE-754 bit patterns.
 //!
 //! The scan → index → classify orchestration under test is
-//! [`escapepod_classify::pipeline`] — the same code the `escpod classify`
-//! command runs, so the golden pins the shipped path, not a test replica.
+//! [`escapepod_classify::pipeline`] — the same code the
+//! `escpod signal classify` command runs, so the golden pins the shipped
+//! path, not a test replica.
 //!
 //! Contract: the anchoring chain (spans, orientation, mask boundary, NaN
 //! pattern) and dwell are exact; mean/std/resid may differ from NumPy by
@@ -109,7 +110,7 @@ fn charging_chain_matches_reference() {
         let sig_pa = escapepod_classify::signal_pa(info, &extractors).unwrap();
         assert_eq!(sig_pa.len() as i64, read.ns, "ns tag vs signal length");
 
-        let grid = feature_grid(&bundle, read, orientation, &sig_pa);
+        let grid = feature_grid(&bundle.recipe(), read, orientation, &sig_pa);
         let want: Vec<f32> = gr["features_bits"]
             .as_array()
             .unwrap()
@@ -243,7 +244,7 @@ fn counted_anchor_matches_reference() {
             assert_eq!((a, b), (wa, wb), "read {id} offset index {i}: span");
         }
 
-        let grid = feature_grid(&bundle, read, orientation, &sig_pa);
+        let grid = feature_grid(&bundle.recipe(), read, orientation, &sig_pa);
         let want: Vec<f32> = gr["f_bits"]
             .as_array()
             .unwrap()

@@ -2,10 +2,11 @@
 
 //! End-to-end classification pipeline: BAM scan → POD5 index → calls.
 //!
-//! One implementation of the orchestration the `escpod classify` command,
-//! the parity tests, and any future binding all need: scan an aligned BAM
-//! into anchored reads and orientation votes, index the POD5 set for the
-//! reads that anchored, then compute features and classify in parallel.
+//! One implementation of the orchestration the `escpod signal classify`
+//! command, the parity tests, and any future binding all need: scan an
+//! aligned BAM into anchored reads and orientation votes, index the POD5
+//! set for the reads that anchored, then compute features and classify in
+//! parallel.
 //! Keeping it here (rather than in the CLI) means the golden-parity tests
 //! exercise the very code the command runs.
 
@@ -13,6 +14,7 @@ use crate::anchor::{self, AnchoredRead, Orientation, OrientationVotes, ScanOutco
 use crate::bundle::ChargingBundle;
 use crate::features;
 use crate::geometry::RefGeometry;
+use crate::recipe::FeatureRecipe;
 use anyhow::{Context, Result};
 use escapepod_demux::GbmPredictor;
 use rayon::prelude::*;
@@ -206,26 +208,44 @@ pub fn signal_pa(
 }
 
 /// The canonical `offsets × FEAT_STATS` feature grid for one read: spans
-/// resolved in the run's frame, expected levels z-scored (when the bundle
+/// resolved in the run's frame, expected levels z-scored (when the recipe
 /// carries a k-mer table), per-base stats over the calibrated signal.
+///
+/// Takes a [`FeatureRecipe`], not a bundle: the three things that define the
+/// feature space are all it reads, and the corpus builder that computes these
+/// same features has no weights to hand it. `bundle.recipe()` produces one
+/// for the inference path.
 pub fn feature_grid(
-    bundle: &ChargingBundle,
+    recipe: &FeatureRecipe<'_>,
     read: &AnchoredRead,
     orientation: Orientation,
     sig_pa: &[f32],
 ) -> Vec<f32> {
-    let mode = bundle.span_mode;
-    let coords = anchor::finalize(read, orientation, &bundle.offsets, mode);
+    let coords = anchor::finalize(read, orientation, recipe.offsets, recipe.span_mode);
+    feature_grid_at(recipe, read, &coords, sig_pa)
+}
+
+/// [`feature_grid`] for a caller that already resolved the read's coords.
+///
+/// Callers that also want the window or the coord columns (the corpus
+/// builder) would otherwise run [`anchor::finalize`] twice — or, worse, keep
+/// their own copy of the k-mer/residual half of the grid, which is how this
+/// pipeline came to have two feature definitions once already.
+pub fn feature_grid_at(
+    recipe: &FeatureRecipe<'_>,
+    read: &AnchoredRead,
+    coords: &crate::JunctionCoords,
+    sig_pa: &[f32],
+) -> Vec<f32> {
     // The SAME positions the spans came from. Under the counting anchor
     // `read.qf` is the aligner's answer, which is not what the offsets
     // resolved to -- using it here leaves dwell/mean/std right and the
     // residual silently wrong.
-    let qf = anchor::query_positions(read, &bundle.offsets, mode);
-    let expected = bundle
+    let qf = anchor::query_positions(read, recipe.offsets, recipe.span_mode);
+    let expected = recipe
         .kmer
-        .as_ref()
         .map(|k| features::expected_levels_z(&read.seq, &k.map, k.k, k.center_idx, &qf, read.nb));
-    features::junction_features(sig_pa, &coords, expected.as_deref())
+    features::junction_features(sig_pa, coords, expected.as_deref())
 }
 
 /// One classified read.
@@ -261,6 +281,7 @@ pub fn classify_reads(
 ) -> Result<(Vec<ReadCall>, ClassifyStats)> {
     let extractors = pod5.extractors()?;
     let predictor = GbmPredictor::new(&bundle.gbm);
+    let recipe = bundle.recipe();
     let reads: Vec<&AnchoredRead> = anchored.values().collect();
 
     enum Outcome {
@@ -278,7 +299,7 @@ pub fn classify_reads(
             if sig_pa.len() as i64 != read.ns {
                 return Ok(Outcome::NsMismatch);
             }
-            let grid = feature_grid(bundle, read, orientation, &sig_pa);
+            let grid = feature_grid(&recipe, read, orientation, &sig_pa);
             let features = bundle.select_columns(&grid);
             let (probs, _) = predictor
                 .predict(&features)

@@ -32,11 +32,18 @@
 //!    minus expected level), the model's decisive feature — [`features`];
 //! 7. everything earlier in time than the common arm is never read: the
 //!    training libraries' adapters diverge 17 nt after the CCA, so those
-//!    samples would classify the adapter, not the chemistry.
+//!    samples would classify the adapter, not the chemistry — [`features`]
+//!    for the per-base grid, [`window`] for the raw window a signal-level
+//!    model takes instead.
 //!
 //! The recipe — feature order, offsets, stat layout, mask rule, the k-mer
 //! table pinned by sha256, and the recommended operating point — comes from
 //! the model bundle's `metadata.json` ([`bundle`]), not from flags.
+//!
+//! The part of it that defines the *feature space* (offsets, span mode,
+//! k-mer levels) is [`recipe::FeatureRecipe`], separate from the bundle that
+//! parses it: computing these features is also what builds the training
+//! corpus, and that caller has no weights to hand over.
 
 pub mod anchor;
 pub mod bam_tags;
@@ -44,6 +51,8 @@ pub mod bundle;
 pub mod features;
 pub mod geometry;
 pub mod pipeline;
+pub mod recipe;
+pub mod window;
 
 pub use anchor::{
     AnchoredRead, MaskSource, Orientation, OrientationVotes, ScanOutcome, SpanMode,
@@ -54,8 +63,11 @@ pub use bundle::{ChargingBundle, OperatingPoint};
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
 pub use geometry::{RefGeometry, junction_positions};
 pub use pipeline::{
-    BamScan, ClassifyStats, Pod5Index, ReadCall, classify_reads, feature_grid, scan_bam, signal_pa,
+    BamScan, ClassifyStats, Pod5Index, ReadCall, classify_reads, feature_grid, feature_grid_at,
+    scan_bam, signal_pa,
 };
+pub use recipe::{FeatureRecipe, KmerLevels};
+pub use window::{BaseJustify, signal_window};
 
 /// Encode a probability as the `cl` BAM tag value: `round(p * 255)` as u8.
 ///
