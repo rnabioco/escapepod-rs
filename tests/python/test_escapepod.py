@@ -1142,6 +1142,117 @@ class TestSignalBindings:
         assert levels.dtype == np.float32
         assert levels.shape[0] == 20
 
+    def test_kmer_dominant_base_and_explicit_centre(self):
+        """The level position is empirical, so it is exposed rather than assumed.
+
+        `extract_levels` centres on `dominant_base`, which is chosen by a
+        Kruskal-Wallis test at load time and is NOT necessarily `k // 2` -- on
+        the RNA004 9-mer table it is 3 while the midpoint is 4. Code that picks
+        the midpoint by hand gets levels shifted a base, silently, so both the
+        chosen position and an explicit override are part of the API.
+        """
+        kt = escapepod.KmerTable.from_file(str(KMER_TABLE))
+        dom = kt.dominant_base
+        assert isinstance(dom, int)
+        assert 0 <= dom < kt.k
+
+        seq = "ACGT" * 5
+        default = kt.extract_levels(seq)
+        explicit = kt.extract_levels_at(seq, dom)
+        np.testing.assert_array_equal(default, explicit)
+
+        other = 0 if dom != 0 else 1
+        shifted = kt.extract_levels_at(seq, other)
+        assert shifted.dtype == np.float32
+        assert shifted.shape == default.shape
+        # A different centre is a pure shift of the same levels.
+        assert default[dom] == shifted[other]
+        with pytest.raises(ValueError):
+            kt.extract_levels_at(seq, kt.k)
+
+    def test_span_statistics(self):
+        """Dwell/mean/sd per span, with NaN for spans that do not resolve."""
+        sig = np.concatenate(
+            [
+                np.zeros(10, np.float32),
+                np.full(10, 4.0, np.float32),
+                np.zeros(10, np.float32),
+            ]
+        )
+        spans = np.array([[10, 20], [-1, -1], [25, 25], [20, 999]], dtype=np.int64)
+        dwell, mean, sd = escapepod.span_statistics(sig, spans)
+
+        assert dwell.dtype == np.float32
+        assert dwell[0] == 10.0
+        assert mean[0] == pytest.approx(4.0)
+        assert sd[0] == 0.0, (
+            "a constant span has zero spread, not a negative-variance NaN"
+        )
+        # Unresolved, empty and out-of-range spans all abstain rather than guess.
+        for i in (1, 2, 3):
+            assert np.isnan(dwell[i]) and np.isnan(mean[i]) and np.isnan(sd[i])
+
+        # This signal is 2/3 zeros, so its MAD is 0 and the mad_floor fallback
+        # leaves the scale at 1 -- normalising it must be a no-op, not a
+        # division by ~0.
+        _, flat_norm, _ = escapepod.span_statistics(sig, spans, mad_floor=1e-3)
+        assert flat_norm[0] == mean[0]
+
+        # On a signal with real spread, normalisation does change the levels.
+        rng = np.random.RandomState(1)
+        spread = rng.randn(300).astype(np.float32) * 5.0 + 100.0
+        one = np.array([[100, 150]], dtype=np.int64)
+        _, raw_mean, _ = escapepod.span_statistics(spread, one)
+        _, norm_mean, _ = escapepod.span_statistics(spread, one, mad_floor=1e-3)
+        assert raw_mean[0] != norm_mean[0]
+        assert abs(norm_mean[0]) < abs(raw_mean[0]), "centred on the read median"
+
+    def test_span_statistics_batch_matches_per_read(self):
+        """The batched, parallel path must agree with the single-read one."""
+        rng = np.random.RandomState(0)
+        sigs = [rng.randn(rng.randint(500, 2000)).astype(np.float32) for _ in range(7)]
+        n_spans = 4
+        spans = []
+        for s in sigs:
+            base = rng.randint(50, len(s) - 200)
+            rows = []
+            for i in range(n_spans):
+                if i == 2:
+                    rows.append([-1, -1])  # an unresolved span in every read
+                else:
+                    rows.append([base, base + 30])
+                    base += 30
+            spans.append(np.array(rows, dtype=np.int64))
+
+        offsets = np.zeros(len(sigs) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum([len(s) for s in sigs])
+        flat = np.concatenate(sigs)
+        all_spans = np.concatenate(spans, axis=0)
+
+        d, m, sd = escapepod.span_statistics_batch(
+            flat, offsets, all_spans, n_spans, mad_floor=1e-3
+        )
+        assert d.shape == (len(sigs), n_spans)
+
+        for i, (sig, sp) in enumerate(zip(sigs, spans)):
+            ed, em, es = escapepod.span_statistics(sig, sp, mad_floor=1e-3)
+            np.testing.assert_array_equal(d[i], ed)
+            np.testing.assert_array_equal(m[i], em)
+            np.testing.assert_array_equal(sd[i], es)
+
+    def test_span_statistics_batch_rejects_bad_shapes(self):
+        sig = np.zeros(100, np.float32)
+        offsets = np.array([0, 50, 100], dtype=np.int64)
+        spans = np.zeros((4, 2), dtype=np.int64)
+        with pytest.raises(ValueError):
+            escapepod.span_statistics_batch(sig, offsets, spans, 3)  # 4 != 2 * 3
+        with pytest.raises(ValueError):
+            escapepod.span_statistics_batch(sig, offsets, spans, 0)
+        with pytest.raises(ValueError):
+            escapepod.span_statistics_batch(
+                sig, np.array([0, 50, 500], dtype=np.int64), spans, 2
+            )
+
     def test_refine_signal_map(self):
         kt = escapepod.KmerTable.from_file(str(KMER_TABLE))
         rng = np.random.RandomState(0)
