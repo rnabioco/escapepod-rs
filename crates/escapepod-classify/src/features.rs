@@ -218,6 +218,13 @@ mod tests {
             common_start_sig: 0,
             junction_sig: 10,
             mask_source: crate::anchor::MaskSource::Exact,
+            cca_a_sig: 0,
+            cca_a_dwell: 0,
+            junction_dwell: 0,
+            arm_resolved_depth: 0,
+            aligner_arm_depth: 0,
+            polya_mid_sig: -1,
+            body_mid_sig: -1,
         };
         let f = junction_features(&sig, &coords, None);
         assert_eq!(f.len(), 16);

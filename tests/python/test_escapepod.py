@@ -1272,6 +1272,55 @@ class TestAnchoredReads:
         assert not np.isnan(row[cut]), "the boundary sample itself must survive"
         assert not np.isnan(row[1400]), "the anchor sample must survive"
 
+    def test_extract_returns_every_corpus_metadata_column(self):
+        """The caller writes one corpus row per read, so nothing it needs may
+        be missing -- a dropped column is a training-time crash at best and a
+        silently different corpus at worst."""
+        ar = self._build(24)
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        out = ar.extract(ar.read_ids_with_signal, left=600, right=400)
+        expected = {
+            "read_id",
+            "reference",
+            "mask_source",
+            "X",
+            "F",
+            "junction_sig",
+            "common_start_sig",
+            "cca_a_sig",
+            "cca_a_dwell",
+            "junction_dwell",
+            "arm_resolved_depth",
+            "aligner_arm_depth",
+            "polya_mid_sig",
+            "body_mid_sig",
+            "mapq",
+            "ns",
+            "ts",
+        }
+        assert expected <= set(out), f"missing: {sorted(expected - set(out))}"
+
+        n = len(out["read_id"])
+        for k in expected - {"X", "F"}:
+            assert len(out[k]) == n, f"{k} has {len(out[k])} rows, expected {n}"
+
+        # Sanity, not just presence.
+        assert (out["cca_a_dwell"] > 0).all(), "the CCA A always has samples"
+        assert (out["junction_dwell"] > 0).all()
+        assert (out["ns"] > 0).all()
+        assert (
+            (out["arm_resolved_depth"] >= 0) & (out["arm_resolved_depth"] <= 24)
+        ).all()
+        # The aligner depth is recorded whatever the span mode, so counting
+        # cannot mask which reads the alignment never actually reached.
+        assert (out["aligner_arm_depth"] <= out["arm_resolved_depth"]).any()
+        assert set(out["mask_source"]) <= {
+            "exact",
+            "counted",
+            "arm_fallback",
+            "junction_fallback",
+        }
+
     def test_extract_requires_an_index_and_valid_geometry(self):
         ar = self._build(24)
         with pytest.raises(ValueError):

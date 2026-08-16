@@ -49,7 +49,7 @@ pub use anchor::{
     AnchoredRead, MaskSource, Orientation, OrientationVotes, ScanOutcome, SpanMode,
     resolve_orientation,
 };
-pub use anchor::{finalize, query_positions, scan_record};
+pub use anchor::{JunctionCoords, finalize, query_positions, scan_record};
 pub use bundle::{ChargingBundle, OperatingPoint};
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
 pub use geometry::{RefGeometry, junction_positions};

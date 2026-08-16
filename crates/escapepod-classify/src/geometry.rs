@@ -26,6 +26,14 @@ pub struct RefGeometry {
     pub divergent: usize,
     /// Middle of the tRNA body (orientation anchor).
     pub body_mid: usize,
+    /// 4 nt into the trailing poly(A) (orientation + QC).
+    ///
+    /// Located from the reference's own trailing A-run rather than assumed:
+    /// the stretch between the arm and the poly(A) is adapter-family specific
+    /// (13 nt in the v2 single-adapter references, 18 in every edx*), so a
+    /// fixed `divergent + 13 + 4` lands inside the barcode on an edx
+    /// reference instead of in the tail.
+    pub polya_mid: usize,
 }
 
 /// Read a FASTA into `name → uppercase sequence` (name = first word).
@@ -85,6 +93,14 @@ pub fn junction_positions(
                 cca_a: j - 1,
                 divergent: j + common_arm.len(),
                 body_mid: (FIVEP_LEN + j) / 2,
+                polya_mid: {
+                    let n_a = seq.len() - seq.trim_end_matches('A').len();
+                    if n_a >= 5 {
+                        seq.len() - n_a + 4
+                    } else {
+                        seq.len()
+                    }
+                },
             },
         );
     }

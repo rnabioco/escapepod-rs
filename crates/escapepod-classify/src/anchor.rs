@@ -117,9 +117,13 @@ pub struct AnchoredRead {
     pub nb: usize,
     pub q_junction: usize,
     pub q_cca_a: usize,
+    /// Dorado's `ts` trim offset, carried so callers can record it.
+    pub ts: i64,
     /// Query position of the last common-arm base in reference order
     /// (`divergent - 1`) — the arm's *first* base in time, the mask boundary.
     pub q_div_m1: Option<usize>,
+    /// Query position of the mid-poly(A) anchor, if it mapped.
+    pub q_polya_mid: Option<usize>,
     pub q_body_mid: Option<usize>,
     /// Query position per feature offset; `-1` = unaligned.
     pub qf: Vec<i64>,
@@ -284,6 +288,7 @@ pub fn scan_record(
         g.junction as i64,
         g.divergent as i64 - 1,
         g.body_mid as i64,
+        g.polya_mid as i64,
     ];
     wanted.extend(offsets.iter().map(|&o| g.junction as i64 + o as i64));
     let (q, donor) = ref_to_query(record, &wanted, REF_TO_QUERY_SLOP, Some(g.divergent as i64));
@@ -340,8 +345,10 @@ pub fn scan_record(
         nb,
         q_junction: qj,
         q_cca_a: qa,
+        ts,
         q_div_m1: q.get(&(g.divergent as i64 - 1)).copied(),
         q_body_mid: q.get(&(g.body_mid as i64)).copied(),
+        q_polya_mid: q.get(&(g.polya_mid as i64)).copied(),
         qf,
     }))
 }
@@ -416,6 +423,25 @@ pub struct JunctionCoords {
     pub junction_sig: i64,
     /// How `common_start_sig` was established.
     pub mask_source: MaskSource,
+    /// Start of the CCA A base (where the amino acid attaches).
+    pub cca_a_sig: i64,
+    /// Samples assigned to the CCA A base; an adduct inflates this.
+    pub cca_a_dwell: i64,
+    /// Samples assigned to the junction base.
+    pub junction_dwell: i64,
+    /// Deepest arm offset with a resolved span, under the active span mode.
+    /// Feature availability, in one number.
+    pub arm_resolved_depth: i32,
+    /// Deepest arm offset the ALIGNER exactly placed, whatever the span mode.
+    ///
+    /// Kept separately because counting gives every read the same features --
+    /// which is the point -- but also erases the signal identifying reads no
+    /// model can actually read, and inference still has to abstain on those.
+    pub aligner_arm_depth: i32,
+    /// Start of the mid-poly(A) anchor, or -1.
+    pub polya_mid_sig: i64,
+    /// Start of the tRNA-body anchor, or -1.
+    pub body_mid_sig: i64,
 }
 
 /// Query position per feature offset, under a span mode.
@@ -516,7 +542,36 @@ pub fn finalize(
         },
     };
 
+    let a_span = sig_span(s2s, read.ns, read.q_cca_a, reversed);
+    // `start()` in the reference implementation: -1 when the anchor did not
+    // map or maps past the move table. These use the BACKFILLED positions --
+    // only the feature bases are exact-only.
+    let anchor_start = |q: Option<usize>| -> i64 {
+        match q {
+            Some(qp) if qp < read.nb => sig_span(s2s, read.ns, qp, reversed).0,
+            _ => -1,
+        }
+    };
+    let depth_of = |resolved: &dyn Fn(usize) -> bool| -> i32 {
+        offsets
+            .iter()
+            .enumerate()
+            .filter(|&(i, &o)| o >= 1 && resolved(i))
+            .map(|(_, &o)| o)
+            .max()
+            .unwrap_or(0)
+    };
+
     JunctionCoords {
+        arm_resolved_depth: depth_of(&|i| feat_spans[i].0 >= 0),
+        // Independent of the span mode: read.qf is always the aligner's
+        // exact-only answer, so counting cannot mask this.
+        aligner_arm_depth: depth_of(&|i| read.qf[i] >= 0 && (read.qf[i] as usize) < read.nb),
+        cca_a_sig: a_span.0,
+        cca_a_dwell: a_span.1 - a_span.0,
+        junction_dwell: j_span.1 - j_span.0,
+        polya_mid_sig: anchor_start(read.q_polya_mid),
+        body_mid_sig: anchor_start(read.q_body_mid),
         feat_spans,
         common_start_sig,
         junction_sig: j_span.0,
@@ -541,8 +596,10 @@ mod tests {
             nb,
             q_junction: 20,
             q_cca_a: 19,
+            ts: 0,
             q_div_m1,
             q_body_mid: None,
+            q_polya_mid: None,
             qf,
         }
     }
