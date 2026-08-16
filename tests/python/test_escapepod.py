@@ -1164,6 +1164,34 @@ class TestAnchoredReads:
         assert len(ar.read_ids) > len(g["reads"])
         assert len(set(ar.read_ids)) == len(ar.read_ids)
 
+    def test_scan_statistics_are_reachable(self):
+        """The corpus builder's retention audit is a mandatory gate, and it
+        compares rejection rates run to run -- a rate that differs by class is
+        a label-correlated filter. So the scan's own bookkeeping has to come
+        back, not just the reads that survived."""
+        g = self._golden()
+        ar = self._build(g["count_arm_bases"])
+        assert ar.records_scanned >= ar.n_anchored
+        skips = ar.skips
+        assert isinstance(skips, dict)
+        assert set(skips) <= {
+            "filtered",
+            "low_mapq",
+            "no_geometry",
+            "no_tags",
+            "unanchored",
+            "query_out_of_range",
+            "bad_name",
+        }
+        # Unique anchored reads plus skipped records cannot exceed the records
+        # read: dedup only ever removes. Equality would not hold -- n_anchored
+        # counts READS, skips count RECORDS.
+        assert ar.n_anchored + sum(skips.values()) <= ar.records_scanned
+        assert sum(skips.values()) > 0, "the padded fixture has skipped records"
+        t, r = ar.orientation_votes
+        assert (t + r) > 0
+        assert (ar.orientation == "reversed") == (r > t)
+
     def test_orientation_override_and_validation(self):
         ar = escapepod.AnchoredReads(
             str(CLASSIFY_FIXTURES / "trna_mappings_padded.bam"),

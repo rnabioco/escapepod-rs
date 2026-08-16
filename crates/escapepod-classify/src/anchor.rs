@@ -148,6 +148,21 @@ pub enum SkipReason {
     BadName,
 }
 
+impl SkipReason {
+    /// Stable snake_case name, for reports and for keying QC output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Filtered => "filtered",
+            Self::LowMapq => "low_mapq",
+            Self::NoGeometry => "no_geometry",
+            Self::NoTags => "no_tags",
+            Self::Unanchored => "unanchored",
+            Self::QueryOutOfRange => "query_out_of_range",
+            Self::BadName => "bad_name",
+        }
+    }
+}
+
 /// Outcome of scanning one BAM record.
 pub enum ScanOutcome {
     Anchored(Box<AnchoredRead>),
