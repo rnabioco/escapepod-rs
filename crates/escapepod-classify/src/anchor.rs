@@ -545,7 +545,15 @@ pub fn finalize(
                     MaskSource::Counted,
                 )
             } else {
-                (j_span.0, MaskSource::JunctionFallback)
+                // The counted base ran off the end of the move table. Both
+                // modes share the same fallback chain from here: any resolved
+                // arm base over-masks least, and only a read with none at all
+                // masks the whole window. Going straight to the junction here
+                // over-masked 4 reads in 842 against the reference.
+                match arm_min {
+                    Some(a) => (a, MaskSource::ArmFallback),
+                    None => (j_span.0, MaskSource::JunctionFallback),
+                }
             }
         }
         SpanMode::Aligner => match read.q_div_m1 {
@@ -684,14 +692,37 @@ mod tests {
         );
     }
 
+    /// When the counted boundary runs off the move table, counting falls back
+    /// exactly as the aligner mode does -- arm first, junction only as a last
+    /// resort. Going straight to the junction over-masks: it disagreed with
+    /// the reference on 4 reads in 842 of a real run, and the golden fixture
+    /// missed it because all 19 of its reads resolve as `counted`.
     #[test]
-    fn counted_boundary_past_the_read_falls_back_to_the_junction() {
+    fn counted_boundary_past_the_read_prefers_a_resolved_arm_base() {
+        // Arm offsets still resolve by counting (qj + o), so there IS an arm
+        // base to fall back to even though the boundary base is out of range.
         let read = read_with(vec![19, 20, 21, 22, 23], None);
         let c = finalize(
             &read,
             Orientation::Time,
             &OFFSETS,
             SpanMode::Counted { arm_bases: 100 },
+        );
+        assert_eq!(c.mask_source, MaskSource::ArmFallback);
+        assert_eq!(c.common_start_sig, 210, "earliest counted arm base");
+    }
+
+    #[test]
+    fn counted_boundary_past_the_read_and_no_arm_masks_everything() {
+        // arm_bases = 0 would be Aligner, so use a read whose arm offsets are
+        // all past the move table: nothing resolves, nothing to fall back to.
+        let mut read = read_with(vec![19, 20, -1, -1, -1], None);
+        read.q_junction = 39; // the last base; qj + o is out of range for o >= 1
+        let c = finalize(
+            &read,
+            Orientation::Time,
+            &OFFSETS,
+            SpanMode::Counted { arm_bases: 3 },
         );
         assert_eq!(c.mask_source, MaskSource::JunctionFallback);
         assert_eq!(c.common_start_sig, c.junction_sig);
