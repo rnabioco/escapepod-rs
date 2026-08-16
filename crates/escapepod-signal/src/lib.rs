@@ -24,6 +24,7 @@
 
 // Signal-processing modules live in this crate.
 pub mod dtw;
+pub mod features;
 pub mod resquiggle;
 pub mod segmentation;
 pub mod stats;

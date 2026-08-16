@@ -159,12 +159,39 @@ impl KmerTable {
         Ok(self.levels[idx])
     }
 
-    /// Extract expected levels for each position in a sequence.
+    /// Which position within a kmer this table assigns its level to.
+    ///
+    /// Determined empirically by [`determine_dominant_base`] when the table is
+    /// loaded, which is **not** necessarily the middle: on the RNA004 9-mer
+    /// table it is 3, while the midpoint is 4. Callers that need a specific
+    /// convention must say so via [`Self::extract_levels_at`] rather than
+    /// assume, because a one-base shift in the level assignment silently moves
+    /// every downstream residual.
+    pub fn dominant_base(&self) -> usize {
+        self.dominant_base
+    }
+
+    /// Extract expected levels for each position in a sequence, assigning each
+    /// kmer's level to [`Self::dominant_base`].
     ///
     /// Uses rolling 2-bit encoding for O(1) per-position lookup.
     pub fn extract_levels(&self, seq: &[u8]) -> Result<Vec<f32>> {
+        self.extract_levels_at(seq, self.dominant_base)
+    }
+
+    /// [`Self::extract_levels`] with an explicit position within the kmer.
+    ///
+    /// Exists because callers genuinely disagree: this crate's resquiggle uses
+    /// the empirically dominant base, while the k-mer level path inherited
+    /// from leech centres at `k / 2`. On the RNA004 9-mer table those are 3 and
+    /// 4 -- a one-base shift in every predicted level. Neither is wrong in
+    /// general, so the choice is the caller's and has to be written down.
+    pub fn extract_levels_at(&self, seq: &[u8], centre: usize) -> Result<Vec<f32>> {
         if seq.len() < self.k {
             bail!("sequence length {} < kmer size {}", seq.len(), self.k);
+        }
+        if centre >= self.k {
+            bail!("centre {} outside kmer of size {}", centre, self.k);
         }
 
         let mut levels = vec![0.0f32; seq.len()];
@@ -177,14 +204,14 @@ impl KmerTable {
                 .ok_or_else(|| anyhow::anyhow!("invalid base at position {}", i))?;
             idx = (idx << 2) | b;
         }
-        levels[self.dominant_base] = self.levels[idx];
+        levels[centre] = self.levels[idx];
 
         // Rolling encode for remaining positions
         for pos in 1..=(seq.len() - self.k) {
             let new_base = encode_base(seq[pos + self.k - 1])
                 .ok_or_else(|| anyhow::anyhow!("invalid base at position {}", pos + self.k - 1))?;
             idx = ((idx << 2) | new_base) & mask;
-            levels[pos + self.dominant_base] = self.levels[idx];
+            levels[pos + centre] = self.levels[idx];
         }
 
         Ok(levels)
@@ -303,6 +330,44 @@ mod tests {
         assert_eq!(median_f32(&[1.0, 2.0, 3.0]), Some(2.0));
         assert_eq!(median_f32(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
         assert_eq!(median_f32(&[]), None);
+    }
+
+    /// The dominant base is NOT the midpoint on the table we actually ship
+    /// against, so `extract_levels` and a naive `k / 2` centring disagree by
+    /// one position. Pinned here because swapping one for the other silently
+    /// shifts every predicted level.
+    #[test]
+    fn rna004_dominant_base_is_not_the_midpoint() {
+        let p = std::path::Path::new(
+            "/beevol/home/jhessel/devel/rnabioco/aa-tRNA-seq-pipeline/resources/kmers/9mer_levels_v1.txt",
+        );
+        if !p.exists() {
+            eprintln!("RNA004 kmer table not present; skipping");
+            return;
+        }
+        let t = KmerTable::from_file(p).expect("load");
+        assert_eq!(t.k(), 9);
+        assert_eq!(t.dominant_base(), 3, "empirically dominant base");
+        assert_ne!(t.dominant_base(), t.k() / 2, "midpoint would be 4");
+
+        let seq = b"ACGTACGTACGTACGTACGT";
+        let dom = t.extract_levels(seq).expect("dominant");
+        let mid = t.extract_levels_at(seq, t.k() / 2).expect("midpoint");
+        assert_ne!(dom, mid, "the two conventions must not silently agree");
+        // ...and the difference is exactly a one-position shift.
+        assert_eq!(dom[3], mid[4]);
+    }
+
+    #[test]
+    fn extract_levels_at_rejects_a_centre_outside_the_kmer() {
+        let p = std::path::Path::new(
+            "/beevol/home/jhessel/devel/rnabioco/aa-tRNA-seq-pipeline/resources/kmers/9mer_levels_v1.txt",
+        );
+        if !p.exists() {
+            return;
+        }
+        let t = KmerTable::from_file(p).expect("load");
+        assert!(t.extract_levels_at(b"ACGTACGTACGTACGT", 9).is_err());
     }
 
     #[test]

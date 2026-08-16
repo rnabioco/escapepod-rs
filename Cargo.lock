@@ -990,6 +990,7 @@ dependencies = [
  "escapepod-signal",
  "numpy",
  "pyo3",
+ "rayon",
 ]
 
 [[package]]
