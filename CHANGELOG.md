@@ -23,6 +23,24 @@
   `signal` has no default action, so unlike `demux` and `resquiggle` it is a
   plain required subcommand enum with no flattened run-args struct.
 
+- **`escapepod_classify::feature_grid` takes a `FeatureRecipe`, not a
+  `ChargingBundle`.** The grid only ever read three things out of the bundle —
+  the offsets, the span mode, and the k-mer levels the residual is taken
+  against — but taking the whole bundle meant anything that wanted features
+  had to own weights, an operating point and a set of verified checksums it
+  had no use for. The caller that most needs the features is the corpus
+  builder, which by definition has no model yet, so it was left choosing
+  between a fake bundle and its own copy of the definition. This repo has
+  already shipped two divergent feature definitions once.
+
+  `FeatureRecipe` is a borrowed view (`bundle.recipe()`, or
+  `FeatureRecipe::from(&bundle)`), so there is no second copy to drift.
+  `ChargingBundle` still owns parsing and verifying `metadata.json`.
+  `KmerLevels` moves from `bundle` to the new `recipe` module and is
+  re-exported at the crate root. A new `feature_grid_at` takes coords the
+  caller already resolved, so a caller wanting both a window and the features
+  runs `finalize` once instead of keeping its own residual computation.
+
 ## 0.10.0 (2026-08-14)
 
 ### Added

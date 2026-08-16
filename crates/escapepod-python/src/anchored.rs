@@ -30,8 +30,8 @@ use pyo3::types::PyDict;
 use rayon::prelude::*;
 
 use escapepod_classify::{
-    AnchoredRead, MaskSource, Orientation, Pod5Index, SpanMode, finalize, junction_positions,
-    query_positions, resolve_orientation, scan_bam,
+    AnchoredRead, FeatureRecipe, KmerLevels, MaskSource, Orientation, Pod5Index, SpanMode,
+    finalize, junction_positions, resolve_orientation, scan_bam,
 };
 
 fn value_err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -90,7 +90,7 @@ pub struct AnchoredReads {
     offsets: Vec<i32>,
     mode: SpanMode,
     pod5: Option<Pod5Index>,
-    kmer: Option<(HashMap<String, f64>, usize, usize)>,
+    kmer: Option<KmerLevels>,
     n_records: usize,
     records_scanned: u64,
     skips: HashMap<escapepod_classify::SkipReason, u64>,
@@ -298,15 +298,14 @@ impl AnchoredReads {
     /// shift moves every residual, so the override exists and is explicit.
     #[pyo3(signature = (path, center_idx = None))]
     fn load_kmer_table(&mut self, path: PathBuf, center_idx: Option<usize>) -> PyResult<usize> {
-        let (levels, k) =
-            escapepod_signal::resquiggle::load_kmer_table(&path).map_err(value_err)?;
-        let centre = center_idx.unwrap_or(k / 2);
-        if centre >= k {
+        let (map, k) = escapepod_signal::resquiggle::load_kmer_table(&path).map_err(value_err)?;
+        let center_idx = center_idx.unwrap_or(k / 2);
+        if center_idx >= k {
             return Err(PyValueError::new_err(format!(
-                "center_idx {centre} outside a {k}-mer"
+                "center_idx {center_idx} outside a {k}-mer"
             )));
         }
-        self.kmer = Some((levels, k, centre));
+        self.kmer = Some(KmerLevels { map, k, center_idx });
         Ok(k)
     }
 
@@ -346,6 +345,10 @@ impl AnchoredReads {
 
         let w = (left + right) as usize;
         let n_feat = self.offsets.len() * escapepod_classify::FEAT_STATS.len();
+        // The feature space, borrowed: offsets, span mode, k-mer levels. The
+        // grid itself is computed by escapepod-classify, so the corpus this
+        // builds and the model that scores it cannot drift apart.
+        let recipe = FeatureRecipe::new(&self.offsets, self.mode, self.kmer.as_ref());
 
         // Per-read work is independent and entirely numeric, so it runs off
         // the GIL. Rows carry their input index so the output keeps the
@@ -375,7 +378,7 @@ impl AnchoredReads {
                     if sig.len() as i64 != read.ns {
                         return None;
                     }
-                    let coords = finalize(read, self.orientation, &self.offsets, self.mode);
+                    let coords = finalize(read, self.orientation, recipe.offsets, recipe.span_mode);
 
                     let mut anchor = coords.junction_sig;
                     let dwell = read_junction_dwell(read, self.orientation);
@@ -405,18 +408,8 @@ impl AnchoredReads {
                         window[..end].fill(f32::NAN);
                     }
 
-                    let expected = self.kmer.as_ref().map(|(levels, k, centre)| {
-                        // The SAME positions the spans came from — under the
-                        // counting anchor `read.qf` is the aligner's answer,
-                        // and using it here leaves dwell/mean/std right while
-                        // the residual is silently wrong.
-                        let qf = query_positions(read, &self.offsets, self.mode);
-                        escapepod_classify::expected_levels_z(
-                            &read.seq, levels, *k, *centre, &qf, read.nb,
-                        )
-                    });
                     let features =
-                        escapepod_classify::junction_features(&sig, &coords, expected.as_deref());
+                        escapepod_classify::feature_grid_at(&recipe, read, &coords, &sig);
 
                     Some(Row {
                         idx: i,

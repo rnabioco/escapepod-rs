@@ -47,11 +47,11 @@
 //! assume the legacy 200.
 
 use crate::features::FEAT_STATS;
+use crate::recipe::{FeatureRecipe, KmerLevels};
 use anyhow::{Context, Result, bail};
 use escapepod_demux::{GbmModel, load_gbm_model};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -133,15 +133,6 @@ pub struct OperatingPoint {
     /// Where the threshold came from.
     #[serde(default)]
     pub source: Option<String>,
-}
-
-/// The k-mer level model the residual feature is defined against.
-#[derive(Debug)]
-pub struct KmerLevels {
-    pub map: HashMap<String, f64>,
-    pub k: usize,
-    /// Which base of the k-mer a level belongs to (default `k / 2`).
-    pub center_idx: usize,
 }
 
 /// A loaded, hash-verified charging-classifier bundle.
@@ -315,6 +306,15 @@ impl ChargingBundle {
             kmer,
             operating_point: meta.operating_point,
         })
+    }
+
+    /// The bundle's feature recipe, borrowed.
+    ///
+    /// The three fields that define the model's input space, handed over
+    /// without the weights, the checksums or the operating point — see
+    /// [`FeatureRecipe`] for why the split exists. Free: it borrows.
+    pub fn recipe(&self) -> FeatureRecipe<'_> {
+        FeatureRecipe::from(self)
     }
 
     /// Select the model's input columns (as `f64`, NaN preserved) from the
