@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! End-to-end `escpod classify`: fixture POD5 + BAM + bundle in, `cl`-tagged
-//! BAM and TSV out, compared against the reference implementation's golden
-//! calls (`escapepod-classify/tests/fixtures/`, generated from
-//! `escapepod_models.charging`).
+//! End-to-end `escpod signal classify`: fixture POD5 + BAM + bundle in,
+//! `cl`-tagged BAM and TSV out, compared against the reference
+//! implementation's golden calls (`escapepod-classify/tests/fixtures/`,
+//! generated from `escapepod_models.charging`).
 
 #![cfg(feature = "classify")]
 
@@ -23,6 +23,33 @@ fn fixtures() -> PathBuf {
         .join("escapepod-classify/tests/fixtures")
 }
 
+/// Run the classifier over the fixtures under `argv` (the command words
+/// before the positional POD5), returning the captured stderr.
+fn run_classifier(argv: &[&str], out_bam: &Path, out_tsv: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_escpod"))
+        .args(argv)
+        .arg(fixtures().join("trna_reads.pod5"))
+        .arg("--bam")
+        .arg(fixtures().join("trna_mappings_padded.bam"))
+        .arg("--reference")
+        .arg(fixtures().join("trna_reference.fa"))
+        .arg("--model")
+        .arg(fixtures().join("bundle"))
+        .arg("--output")
+        .arg(out_bam)
+        .arg("--tsv")
+        .arg(out_tsv)
+        .output()
+        .unwrap_or_else(|e| panic!("escpod {} should launch: {e}", argv.join(" ")));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "escpod {} failed:\n{stderr}",
+        argv.join(" ")
+    );
+    stderr
+}
+
 #[test]
 fn classify_end_to_end_matches_golden() {
     let golden: Json = serde_json::from_str(
@@ -34,22 +61,7 @@ fn classify_end_to_end_matches_golden() {
     let out_bam = out_dir.path().join("out.bam");
     let out_tsv = out_dir.path().join("calls.tsv");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("classify")
-        .arg(fixtures().join("trna_reads.pod5"))
-        .arg("--bam")
-        .arg(fixtures().join("trna_mappings_padded.bam"))
-        .arg("--reference")
-        .arg(fixtures().join("trna_reference.fa"))
-        .arg("--model")
-        .arg(fixtures().join("bundle"))
-        .arg("--output")
-        .arg(&out_bam)
-        .arg("--tsv")
-        .arg(&out_tsv)
-        .status()
-        .expect("escpod classify should launch");
-    assert!(status.success(), "escpod classify failed");
+    run_classifier(&["signal", "classify"], &out_bam, &out_tsv);
 
     // --- TSV vs golden ----------------------------------------------------
     let tsv = std::fs::read_to_string(&out_tsv).unwrap();
@@ -125,5 +137,33 @@ fn classify_end_to_end_matches_golden() {
     assert!(
         header_text.contains("escpod-classify") || !header.programs().as_ref().is_empty(),
         "output header should carry the escpod-classify @PG record"
+    );
+}
+
+/// `escpod classify` was the shipped spelling in 0.10.0 and still appears in
+/// pipeline scripts, so it must keep working — producing the *same* calls, not
+/// merely exiting zero — while telling the user where the command moved to.
+#[test]
+fn deprecated_top_level_classify_alias_warns_and_forwards() {
+    let out_dir = tempfile::tempdir().unwrap();
+    let (grouped_bam, grouped_tsv) = (out_dir.path().join("g.bam"), out_dir.path().join("g.tsv"));
+    let (alias_bam, alias_tsv) = (out_dir.path().join("a.bam"), out_dir.path().join("a.tsv"));
+
+    let grouped_err = run_classifier(&["signal", "classify"], &grouped_bam, &grouped_tsv);
+    let alias_err = run_classifier(&["classify"], &alias_bam, &alias_tsv);
+
+    assert_eq!(
+        std::fs::read_to_string(&grouped_tsv).unwrap(),
+        std::fs::read_to_string(&alias_tsv).unwrap(),
+        "the alias must forward to the same runner, not a divergent copy"
+    );
+    assert!(
+        alias_err.contains("`escpod classify` is deprecated")
+            && alias_err.contains("escpod signal classify"),
+        "the alias should name its replacement:\n{alias_err}"
+    );
+    assert!(
+        !grouped_err.contains("deprecated"),
+        "the current spelling must not warn:\n{grouped_err}"
     );
 }

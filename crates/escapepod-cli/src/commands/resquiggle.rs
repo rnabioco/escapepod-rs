@@ -9,8 +9,8 @@ use clap::Args;
 use rayon::prelude::*;
 use tracing::{info, warn};
 
-// Basecaller tag decoders shared with `escpod classify` (the `experimental`
-// feature implies `classify` for exactly this coupling).
+// Basecaller tag decoders shared with `escpod signal classify` (the
+// `experimental` feature implies `classify` for exactly this coupling).
 use escapepod_classify::bam_tags::int_tag as get_int_tag;
 use escapepod_signal::parse_uuid_flexible;
 use escapepod_signal::resquiggle::{

@@ -7,8 +7,9 @@
 //! floats travel as IEEE-754 bit patterns.
 //!
 //! The scan → index → classify orchestration under test is
-//! [`escapepod_classify::pipeline`] — the same code the `escpod classify`
-//! command runs, so the golden pins the shipped path, not a test replica.
+//! [`escapepod_classify::pipeline`] — the same code the
+//! `escpod signal classify` command runs, so the golden pins the shipped
+//! path, not a test replica.
 //!
 //! Contract: the anchoring chain (spans, orientation, mask boundary, NaN
 //! pattern) and dwell are exact; mean/std/resid may differ from NumPy by

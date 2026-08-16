@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Changed
+
+- **`escpod classify` is now `escpod signal classify`.** The bare top-level
+  spelling sat one word away from `escpod demux classify` while meaning
+  something else entirely: `demux classify` assigns a barcode from a DTW/GBM
+  adapter fingerprint, whereas the charging classifier scores a read-level
+  model against raw signal anchored on the CCA–aa junction in *reference*
+  coordinates (different inputs, different output, different failure modes).
+  Two commands that share a verb and share nothing else is a trap in a shell
+  history or a pipeline script, so the charging classifier moved into a
+  `signal` group named for what it operates on.
+
+  The old spelling still works: it is a hidden alias that logs
+  ``warn: `escpod classify` is deprecated; use `escpod signal classify`.``
+  and forwards to the same runner — verified by an end-to-end test that
+  asserts the two invocations produce byte-identical calls, so the alias
+  cannot drift into a second implementation.
+
+  `signal` has no default action, so unlike `demux` and `resquiggle` it is a
+  plain required subcommand enum with no flattened run-args struct.
+
 ## 0.10.0 (2026-08-14)
 
 ### Added

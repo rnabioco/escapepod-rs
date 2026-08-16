@@ -73,8 +73,8 @@ default = ["cli"]
 pod5 = ["dep:escapepod-pod5"]
 signal = ["dep:escapepod-signal"]
 demux = ["dep:escapepod-demux"]
-# Read-level classification against model bundles (`escpod classify`, the tRNA
-# charging classifier). Adds no third-party crates beyond the CLI graph
+# Read-level classification against model bundles (`escpod signal classify`,
+# the tRNA charging classifier). Adds no third-party crates beyond the CLI graph
 # (noodles-sam, serde, sha2 are already linked), so it ships in the default
 # build like `demux`.
 classify = ["dep:escapepod-classify"]

@@ -2,10 +2,11 @@
 
 //! End-to-end classification pipeline: BAM scan → POD5 index → calls.
 //!
-//! One implementation of the orchestration the `escpod classify` command,
-//! the parity tests, and any future binding all need: scan an aligned BAM
-//! into anchored reads and orientation votes, index the POD5 set for the
-//! reads that anchored, then compute features and classify in parallel.
+//! One implementation of the orchestration the `escpod signal classify`
+//! command, the parity tests, and any future binding all need: scan an
+//! aligned BAM into anchored reads and orientation votes, index the POD5
+//! set for the reads that anchored, then compute features and classify in
+//! parallel.
 //! Keeping it here (rather than in the CLI) means the golden-parity tests
 //! exercise the very code the command runs.
 

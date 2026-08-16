@@ -2,7 +2,7 @@
 
 //! The charging-classifier model bundle: weights + the full feature recipe.
 //!
-//! `escpod classify` reads the recipe from the bundle's `metadata.json`
+//! `escpod signal classify` reads the recipe from the bundle's `metadata.json`
 //! rather than taking flags: a caller that computes the features differently
 //! gets a **wrong answer, not an error**, so the definition travels with the
 //! weights (rnabioco/escapepod-rs#204). The k-mer table is pinned by sha256
