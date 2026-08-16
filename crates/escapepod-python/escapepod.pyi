@@ -385,6 +385,49 @@ def create_run_info(
 
 # --- Signal processing (escapepod-signal) --------------------------------
 
+class AnchoredReads:
+    """Motif-anchored per-read signal windows and per-offset statistics.
+
+    Scans an aligned BAM for a reference motif, resolves the move-table frame,
+    and extracts windows plus per-offset summary statistics in parallel. The
+    offsets, mask rule and k-mer table are the caller's recipe.
+    """
+
+    def __init__(
+        self,
+        bam_path: Union[str, PathLike[str]],
+        ref_fasta: Union[str, PathLike[str]],
+        offsets: list[int],
+        count_arm_bases: int,
+        motif: str = ...,
+        motif_offset: int = ...,
+        common_arm: str = ...,
+        min_mapq: int = ...,
+        min_orientation_votes: int = ...,
+        orientation: Optional[str] = ...,
+    ) -> None: ...
+    @property
+    def orientation(self) -> str: ...
+    @property
+    def read_ids(self) -> list[str]: ...
+    @property
+    def read_ids_with_signal(self) -> list[str]: ...
+    @property
+    def n_anchored(self) -> int: ...
+    def index_pod5(self, paths: list[Union[str, PathLike[str]]]) -> int: ...
+    def load_kmer_table(
+        self,
+        path: Union[str, PathLike[str]],
+        center_idx: Optional[int] = ...,
+    ) -> int: ...
+    def extract(
+        self,
+        read_ids: list[str],
+        left: int,
+        right: int,
+        base_justify: str = ...,
+    ) -> dict[str, Any]: ...
+
 class KmerTable:
     """A kmer level table loaded from a ``kmer\\tlevel`` file (gzip supported)."""
 

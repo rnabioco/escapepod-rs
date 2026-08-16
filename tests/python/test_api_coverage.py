@@ -23,7 +23,15 @@ import os
 import escapepod
 
 # Public classes whose members should be exercised, plus module-level names.
-CLASSES = ["Reader", "DatasetReader", "Writer", "ReadData", "RunInfo", "KmerTable"]
+CLASSES = [
+    "Reader",
+    "DatasetReader",
+    "Writer",
+    "ReadData",
+    "RunInfo",
+    "KmerTable",
+    "AnchoredReads",
+]
 MODULE_LEVEL = {
     "create_run_info": "func",
     "Pod5Error": "exc",

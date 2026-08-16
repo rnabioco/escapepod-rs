@@ -59,36 +59,70 @@ pub fn scan_bam(
         .collect();
 
     let mut scan = BamScan::default();
-    let mut record = RecordBuf::default();
+
+    // Anchoring is ~66% of this scan (9.2 us/record against 2.9 us to decode
+    // one) and is pure per-record CPU, so records are decoded into a batch and
+    // anchored in parallel. Decoding stays serial -- BGZF is already
+    // multithreaded underneath, and the reader is a single cursor.
+    //
+    // The fold back into `scan` is serial and in batch order, so the dedup
+    // (best mapq wins) and the orientation vote see records in file order
+    // exactly as they did before: same result, deterministically.
+    const BATCH: usize = 8192;
+    let mut batch: Vec<RecordBuf> = vec![RecordBuf::default(); BATCH];
+    let mut outcomes: Vec<ScanOutcome> = Vec::with_capacity(BATCH);
     loop {
-        if reader.read_record_buf(&header, &mut record)? == 0 {
+        let mut n = 0;
+        while n < BATCH {
+            if reader.read_record_buf(&header, &mut batch[n])? == 0 {
+                break;
+            }
+            n += 1;
+        }
+        if n == 0 {
             break;
         }
-        scan.records_scanned += 1;
-        let Some(ref_name) = record
-            .reference_sequence_id()
-            .and_then(|id| ref_names.get(id))
-        else {
-            *scan.skips.entry(SkipReason::Filtered).or_default() += 1;
-            continue;
-        };
-        match anchor::scan_record(&record, ref_name, geometry, offsets, min_mapq) {
-            ScanOutcome::Anchored(read) => {
-                scan.votes.add(&read);
-                match scan.anchored.entry(read.read_id) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if read.mapq > e.get().mapq {
+        scan.records_scanned += n as u64;
+
+        outcomes.clear();
+        batch[..n]
+            .par_iter()
+            .map(|record| {
+                match record
+                    .reference_sequence_id()
+                    .and_then(|id| ref_names.get(id))
+                {
+                    Some(ref_name) => {
+                        anchor::scan_record(record, ref_name, geometry, offsets, min_mapq)
+                    }
+                    // A reference the header does not name cannot be placed.
+                    None => ScanOutcome::Skip(SkipReason::Filtered),
+                }
+            })
+            .collect_into_vec(&mut outcomes);
+
+        for outcome in outcomes.drain(..) {
+            match outcome {
+                ScanOutcome::Anchored(read) => {
+                    scan.votes.add(&read);
+                    match scan.anchored.entry(read.read_id) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if read.mapq > e.get().mapq {
+                                e.insert(*read);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
                             e.insert(*read);
                         }
                     }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(*read);
-                    }
+                }
+                ScanOutcome::Skip(reason) => {
+                    *scan.skips.entry(reason).or_default() += 1;
                 }
             }
-            ScanOutcome::Skip(reason) => {
-                *scan.skips.entry(reason).or_default() += 1;
-            }
+        }
+        if n < BATCH {
+            break;
         }
     }
     Ok(scan)

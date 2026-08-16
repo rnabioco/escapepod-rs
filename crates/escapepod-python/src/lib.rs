@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod anchored;
 mod dataset;
 mod error;
 mod read_data;
@@ -30,5 +31,6 @@ fn escapepod(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(writer::create_run_info, m)?)?;
     m.add("Pod5Error", m.py().get_type::<error::Pod5Error>())?;
     signal::register(m)?;
+    anchored::register(m)?;
     Ok(())
 }

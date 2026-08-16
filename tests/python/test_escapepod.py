@@ -1,5 +1,6 @@
 """Tests for the escapepod Python bindings."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -1117,6 +1118,171 @@ class TestBatchWrite:
 
 # Kmer level table shipped with escapepod, used to exercise the signal bindings.
 KMER_TABLE = REPO_ROOT / "data" / "kmer_models" / "rna004_9mer_levels_v1.txt.gz"
+
+
+CLASSIFY_FIXTURES = REPO_ROOT / "crates" / "escapepod-classify" / "tests" / "fixtures"
+
+
+class TestAnchoredReads:
+    """Motif-anchored windows + per-offset statistics, against the Rust golden.
+
+    The same fixtures `escapepod-classify`'s parity test uses, so a divergence
+    between the binding and the crate shows up here rather than in a training
+    run.
+    """
+
+    @staticmethod
+    def _golden():
+        return json.loads(
+            (CLASSIFY_FIXTURES / "charging_golden_counted.json").read_text()
+        )
+
+    @staticmethod
+    def _recipe():
+        meta = json.loads((CLASSIFY_FIXTURES / "bundle" / "metadata.json").read_text())
+        return meta["anchor"], meta["features"]["offsets"]
+
+    def _build(self, count_arm_bases):
+        anchor, offsets = self._recipe()
+        return escapepod.AnchoredReads(
+            str(CLASSIFY_FIXTURES / "trna_mappings_padded.bam"),
+            str(CLASSIFY_FIXTURES / "trna_reference.fa"),
+            offsets,
+            count_arm_bases,
+            motif=anchor["motif"],
+            motif_offset=anchor["motif_offset"],
+            common_arm=anchor["common_arm"],
+        )
+
+    def test_scan_resolves_the_frame_and_dedups(self):
+        g = self._golden()
+        ar = self._build(g["count_arm_bases"])
+        assert ar.orientation == g["orientation"]
+        # One entry per read, best mapq wins -- the padded fixture carries
+        # renamed duplicates that anchor but have no signal.
+        assert ar.n_anchored == len(ar.read_ids)
+        assert len(ar.read_ids) > len(g["reads"])
+        assert len(set(ar.read_ids)) == len(ar.read_ids)
+
+    def test_orientation_override_and_validation(self):
+        ar = escapepod.AnchoredReads(
+            str(CLASSIFY_FIXTURES / "trna_mappings_padded.bam"),
+            str(CLASSIFY_FIXTURES / "trna_reference.fa"),
+            self._recipe()[1],
+            24,
+            orientation="time",
+        )
+        assert ar.orientation == "time"
+        with pytest.raises(ValueError):
+            escapepod.AnchoredReads(
+                str(CLASSIFY_FIXTURES / "trna_mappings_padded.bam"),
+                str(CLASSIFY_FIXTURES / "trna_reference.fa"),
+                self._recipe()[1],
+                24,
+                orientation="sideways",
+            )
+
+    def test_extract_matches_the_golden(self):
+        g = self._golden()
+        ar = self._build(g["count_arm_bases"])
+        n_sig = ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        assert n_sig >= len(g["reads"])
+        with_signal = ar.read_ids_with_signal
+        assert set(g[r"reads"][0].keys()) >= {"read_id", "f_bits"}
+
+        k = ar.load_kmer_table(str(CLASSIFY_FIXTURES / "bundle" / "kmer_levels.tsv"))
+        assert k >= 3, "kmer table looks empty"
+        out = ar.extract(with_signal, left=600, right=400)
+
+        assert out["X"].shape == (len(out["read_id"]), 1000)
+        assert out["F"].shape[1] == len(self._recipe()[1]) * 4
+        assert out["X"].dtype == np.float32 and out["F"].dtype == np.float32
+
+        want = {r["read_id"]: r for r in g["reads"]}
+        checked = 0
+        for i, rid in enumerate(out["read_id"]):
+            if rid not in want:
+                continue
+            checked += 1
+            w = np.array(
+                [
+                    np.float32(
+                        np.frombuffer(np.uint32(b).tobytes(), dtype=np.float32)[0]
+                    )
+                    for b in want[rid]["f_bits"]
+                ],
+                dtype=np.float32,
+            )
+            got = out["F"][i]
+            assert np.array_equal(np.isnan(got), np.isnan(w)), f"{rid}: NaN mask"
+            fin = ~np.isnan(w)
+            assert np.allclose(got[fin], w[fin], atol=1e-4), f"{rid}: features"
+            assert out["junction_sig"][i] == want[rid]["junction_sig"]
+            assert out["common_start_sig"][i] == want[rid]["common_start_sig"]
+            assert out["mask_source"][i] == want[rid]["cs_source"]
+        assert checked >= 15, f"only {checked} golden reads compared"
+
+    def test_output_keeps_the_callers_order(self):
+        """Reads are fetched in POD5 storage order; output must not be.
+
+        `extract` sorts internally by (file, signal row) to make the IO a
+        sequential sweep rather than random access. That reordering must not
+        leak into the result, or every column would be silently misaligned
+        against the caller's read list.
+        """
+        ar = self._build(24)
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        ids = ar.read_ids_with_signal
+        out = ar.extract(ids, left=600, right=400)
+        # Survivors appear in the order asked for (some reads may drop out).
+        assert out["read_id"] == [r for r in ids if r in set(out["read_id"])]
+
+        # And a permuted request permutes the output the same way, with each
+        # read's row travelling with it.
+        rev = list(reversed(ids))
+        out_rev = ar.extract(rev, left=600, right=400)
+        assert out_rev["read_id"] == list(reversed(out["read_id"]))
+        first = out["read_id"][0]
+        i, j = out["read_id"].index(first), out_rev["read_id"].index(first)
+        np.testing.assert_array_equal(out["X"][i], out_rev["X"][j])
+        np.testing.assert_array_equal(
+            np.nan_to_num(out["F"][i], nan=-7.0),
+            np.nan_to_num(out_rev["F"][j], nan=-7.0),
+        )
+
+    def test_window_is_masked_before_the_common_arm(self):
+        g = self._golden()
+        ar = self._build(g["count_arm_bases"])
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        # At left=600 the window starts AFTER the mask boundary on this
+        # fixture, so nothing is masked. That is the correct answer; asserting
+        # otherwise would be asserting the fixture rather than the rule.
+        near = ar.extract(ar.read_ids_with_signal, left=600, right=400)
+        assert near["common_start_sig"][0] < near["junction_sig"][0] - 600
+        assert not np.isnan(near["X"][0]).any()
+
+        # Reach back past the boundary and the mask must appear, exactly up to
+        # it: sample `left` is the anchor, so index cs - (anchor - left) is the
+        # first sample that survives.
+        far = ar.extract(ar.read_ids_with_signal, left=1400, right=400)
+        row, cs, js = far["X"][0], far["common_start_sig"][0], far["junction_sig"][0]
+        cut = cs - (js - 1400)
+        assert cut > 0, "fixture no longer reaches past the boundary"
+        assert np.isnan(row[:cut]).all(), "samples before the arm must be masked"
+        assert not np.isnan(row[cut]), "the boundary sample itself must survive"
+        assert not np.isnan(row[1400]), "the anchor sample must survive"
+
+    def test_extract_requires_an_index_and_valid_geometry(self):
+        ar = self._build(24)
+        with pytest.raises(ValueError):
+            ar.extract([], left=600, right=400)
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        with pytest.raises(ValueError):
+            ar.extract(ar.read_ids_with_signal, left=600, right=0)
+        with pytest.raises(ValueError):
+            ar.extract(
+                ar.read_ids_with_signal, left=600, right=400, base_justify="sideways"
+            )
 
 
 class TestSignalBindings:
