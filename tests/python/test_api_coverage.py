@@ -30,6 +30,8 @@ MODULE_LEVEL = {
     "mad_normalize": "func",
     "normalize_signal": "func",
     "refine_signal_map": "func",
+    "span_statistics": "func",
+    "span_statistics_batch": "func",
 }
 _THIS = os.path.basename(__file__)
 

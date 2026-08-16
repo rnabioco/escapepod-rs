@@ -2,18 +2,17 @@
 //! level tables, and signal-to-sequence refinement (resquiggle).
 
 use numpy::{
-    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
-    PyUntypedArrayMethods,
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
+use escapepod_signal::features::{Normalization, SpanScratch, SpanStatsOut, span_stats};
 use escapepod_signal::resquiggle::{
     BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
     RoughRescaleAlgo, refine_signal_map,
 };
-use escapepod_signal::features::{Normalization, SpanScratch, SpanStatsOut, span_stats};
 use escapepod_signal::segmentation;
 use rayon::prelude::*;
 
@@ -156,7 +155,11 @@ fn span_statistics<'py>(
         sp,
         normalization(mad_floor),
         &mut scratch,
-        SpanStatsOut { dwell: &mut d, mean: &mut m, sd: &mut s },
+        SpanStatsOut {
+            dwell: &mut d,
+            mean: &mut m,
+            sd: &mut s,
+        },
     );
     Ok((
         PyArray1::from_vec(py, d),
@@ -224,7 +227,11 @@ fn span_statistics_batch<'py>(
     }
 
     let total = n_reads * spans_per_read;
-    let (mut d, mut m, mut s) = (vec![0.0f32; total], vec![0.0f32; total], vec![0.0f32; total]);
+    let (mut d, mut m, mut s) = (
+        vec![0.0f32; total],
+        vec![0.0f32; total],
+        vec![0.0f32; total],
+    );
     let norm = normalization(mad_floor);
 
     py.detach(|| {
@@ -243,14 +250,17 @@ fn span_statistics_batch<'py>(
                     rs,
                     norm,
                     &mut scratch,
-                    SpanStatsOut { dwell: dw, mean: mn, sd },
+                    SpanStatsOut {
+                        dwell: dw,
+                        mean: mn,
+                        sd,
+                    },
                 );
             });
     });
 
     let reshape = |v: Vec<f32>| -> PyResult<Bound<'py, PyArray2<f32>>> {
-        PyArray1::from_vec(py, v)
-            .reshape([n_reads, spans_per_read])
+        PyArray1::from_vec(py, v).reshape([n_reads, spans_per_read])
     };
     Ok((reshape(d)?, reshape(m)?, reshape(s)?))
 }

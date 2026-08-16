@@ -137,7 +137,11 @@ pub fn span_stats(
 mod tests {
     use super::*;
 
-    fn run(signal: &[f32], spans: &[[i64; 2]], norm: Normalization) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn run(
+        signal: &[f32],
+        spans: &[[i64; 2]],
+        norm: Normalization,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let n = spans.len();
         let (mut d, mut m, mut s) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         let mut scratch = SpanScratch::default();
@@ -146,19 +150,30 @@ mod tests {
             spans,
             norm,
             &mut scratch,
-            SpanStatsOut { dwell: &mut d, mean: &mut m, sd: &mut s },
+            SpanStatsOut {
+                dwell: &mut d,
+                mean: &mut m,
+                sd: &mut s,
+            },
         );
         (d, m, s)
     }
 
     /// The obvious per-span loop, as the oracle for the prefix-sum version.
-    fn reference(signal: &[f32], spans: &[[i64; 2]], norm: Normalization) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn reference(
+        signal: &[f32],
+        spans: &[[i64; 2]],
+        norm: Normalization,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let (centre, scale) = match norm {
             Normalization::None => (0.0f64, 1.0f64),
             Normalization::MedianMad { mad_floor } => {
                 let mut buf = Vec::new();
                 let (med, mad) = median_and_mad_with_scratch(signal, &mut buf);
-                (med as f64, if mad > mad_floor { 1.4826 * mad } else { 1.0 } as f64)
+                (
+                    med as f64,
+                    if mad > mad_floor { 1.4826 * mad } else { 1.0 } as f64,
+                )
             }
         };
         let n = spans.len();
@@ -220,7 +235,10 @@ mod tests {
             for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
                 assert_eq!(w.is_nan(), g.is_nan(), "{name}[{i}] NaN pattern");
                 if !w.is_nan() {
-                    assert!((w - g).abs() <= 1e-5 * w.abs().max(1.0), "{name}[{i}]: {w} vs {g}");
+                    assert!(
+                        (w - g).abs() <= 1e-5 * w.abs().max(1.0),
+                        "{name}[{i}]: {w} vs {g}"
+                    );
                 }
             }
         }
@@ -248,10 +266,28 @@ mod tests {
         let n = spans.len();
         let (mut d1, mut m1, mut s1) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         let (mut d2, mut m2, mut s2) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-        span_stats(&sig, &spans, norm, &mut scratch,
-                   SpanStatsOut { dwell: &mut d1, mean: &mut m1, sd: &mut s1 });
-        span_stats(&sig, &spans, norm, &mut scratch,
-                   SpanStatsOut { dwell: &mut d2, mean: &mut m2, sd: &mut s2 });
+        span_stats(
+            &sig,
+            &spans,
+            norm,
+            &mut scratch,
+            SpanStatsOut {
+                dwell: &mut d1,
+                mean: &mut m1,
+                sd: &mut s1,
+            },
+        );
+        span_stats(
+            &sig,
+            &spans,
+            norm,
+            &mut scratch,
+            SpanStatsOut {
+                dwell: &mut d2,
+                mean: &mut m2,
+                sd: &mut s2,
+            },
+        );
         // to_bits, not ==: NaN never equals itself, and these are mostly NaN.
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&d1), bits(&d2));
@@ -262,8 +298,15 @@ mod tests {
     #[test]
     fn mad_floor_prevents_blowup_on_a_flat_read() {
         let sig = vec![42.0f32; 1000];
-        let (_, m, s) = run(&sig, &[[10, 50]], Normalization::MedianMad { mad_floor: 1e-3 });
-        assert_eq!(m[0], 0.0, "flat read centres to zero, scale falls back to 1");
+        let (_, m, s) = run(
+            &sig,
+            &[[10, 50]],
+            Normalization::MedianMad { mad_floor: 1e-3 },
+        );
+        assert_eq!(
+            m[0], 0.0,
+            "flat read centres to zero, scale falls back to 1"
+        );
         assert_eq!(s[0], 0.0);
     }
 
