@@ -146,6 +146,142 @@ fn charging_chain_matches_reference() {
     );
 }
 
+/// Parity for the COUNTING span anchor (`count_arm_bases > 0`).
+///
+/// `charging_chain_matches_reference` pins the aligner-derived anchor, which
+/// is what the shipped bundle was trained with. Every charging config written
+/// since 2026-08-13 uses counting instead, and it is a different feature
+/// space: arm offsets come from walking the query rather than the alignment,
+/// offsets past the cap are unresolved for every read, and the mask boundary
+/// is the counted base. Scoring a counting-trained model through the aligner
+/// path returns a confident wrong answer, so both sides are pinned.
+///
+/// Only the feature grid and mask boundary are compared. The fixture GBM was
+/// fitted on aligner features, so its probabilities carry no meaning here.
+#[test]
+fn counted_anchor_matches_reference() {
+    let g: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixtures().join("charging_golden_counted.json")).unwrap(),
+    )
+    .unwrap();
+    let arm_bases = g["count_arm_bases"].as_u64().unwrap();
+
+    // A copy of the bundle whose recipe asks for counting. metadata.json is
+    // not itself hashed, so the gbm/kmer pins stay valid -- and this exercises
+    // the recipe -> SpanMode path rather than constructing the mode by hand.
+    let dir = tempfile::tempdir().unwrap();
+    for f in ["metadata.json", "model.gbm.json", "kmer_levels.tsv"] {
+        std::fs::copy(fixtures().join("bundle").join(f), dir.path().join(f)).unwrap();
+    }
+    let mp = dir.path().join("metadata.json");
+    let mut meta: Value = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+    meta["features"]["resolution"]["count_arm_bases"] = serde_json::json!(arm_bases);
+    std::fs::write(&mp, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let bundle = ChargingBundle::load(dir.path()).unwrap();
+    assert_eq!(
+        bundle.span_mode,
+        escapepod_classify::SpanMode::Counted {
+            arm_bases: arm_bases as u32
+        }
+    );
+
+    let geometry = junction_positions(
+        &fixtures().join("trna_reference.fa"),
+        &bundle.anchor.motif,
+        bundle.anchor.motif_offset,
+        &bundle.anchor.common_arm,
+    )
+    .unwrap();
+    let scan = scan_bam(
+        &fixtures().join("trna_mappings_padded.bam"),
+        &geometry,
+        &bundle.offsets,
+        1,
+    )
+    .unwrap();
+    let orientation = resolve_orientation(&scan.votes, 50).unwrap();
+
+    let wanted: HashSet<uuid::Uuid> = scan.anchored.keys().copied().collect();
+    let pod5 = Pod5Index::build(&[fixtures().join("trna_reads.pod5")], &wanted).unwrap();
+    let extractors = pod5.extractors().unwrap();
+
+    let reads = g["reads"].as_array().unwrap();
+    assert!(reads.len() >= 15);
+    let mut max_dev = 0.0f64;
+    let mut n_nan = 0usize;
+    for gr in reads {
+        let id: uuid::Uuid = gr["read_id"].as_str().unwrap().parse().unwrap();
+        let read = &scan.anchored[&id];
+        let info = pod5.reads().get(&id).expect("golden read has signal");
+        let sig_pa = escapepod_classify::signal_pa(info, &extractors).unwrap();
+
+        // The anchoring itself: spans, boundary, and how the boundary was
+        // established, all exact.
+        let coords =
+            escapepod_classify::finalize(read, orientation, &bundle.offsets, bundle.span_mode);
+        assert_eq!(
+            coords.common_start_sig,
+            gr["common_start_sig"].as_i64().unwrap(),
+            "read {id}: mask boundary"
+        );
+        assert_eq!(
+            coords.junction_sig,
+            gr["junction_sig"].as_i64().unwrap(),
+            "read {id}: junction"
+        );
+        assert_eq!(
+            format!("{:?}", coords.mask_source).to_lowercase(),
+            gr["cs_source"].as_str().unwrap().replace('_', ""),
+            "read {id}: mask source"
+        );
+        let want_spans = gr["feat_spans"].as_array().unwrap();
+        assert_eq!(coords.feat_spans.len(), want_spans.len());
+        for (i, (&(a, b), w)) in coords.feat_spans.iter().zip(want_spans).enumerate() {
+            let wa = w[0].as_i64().unwrap();
+            let wb = w[1].as_i64().unwrap();
+            assert_eq!((a, b), (wa, wb), "read {id} offset index {i}: span");
+        }
+
+        let grid = feature_grid(&bundle, read, orientation, &sig_pa);
+        let want: Vec<f32> = gr["f_bits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| f32::from_bits(v.as_u64().unwrap() as u32))
+            .collect();
+        assert_eq!(grid.len(), want.len());
+        for (i, (&got, &w)) in grid.iter().zip(&want).enumerate() {
+            let stat = escapepod_classify::FEAT_STATS[i % 4];
+            if w.is_nan() || got.is_nan() {
+                assert!(
+                    w.is_nan() && got.is_nan(),
+                    "read {id} feature {i} ({stat}): NaN mask differs ({got} vs {w})"
+                );
+                n_nan += 1;
+                continue;
+            }
+            if stat == "dwell" {
+                assert_eq!(got, w, "read {id} feature {i}: dwell must be exact");
+                continue;
+            }
+            let dev = (got as f64 - w as f64).abs();
+            max_dev = max_dev.max(dev);
+            assert!(
+                dev <= 1e-4,
+                "read {id} feature {i} ({stat}): {got} vs {w} (dev {dev:e})"
+            );
+        }
+    }
+    // The cap leaves offsets past `arm_bases` unresolved for every read, so a
+    // run with no NaN at all would mean the cap silently did nothing.
+    assert!(n_nan > 0, "counting cap produced no unresolved offsets");
+    assert!(
+        max_dev <= 1e-5,
+        "feature deviations unexpectedly large: {max_dev:e}"
+    );
+}
+
 #[test]
 fn bundle_rejects_tampered_checksums() {
     // Copy the bundle, flip one byte of the GBM file, expect a load error.

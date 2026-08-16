@@ -217,6 +217,7 @@ mod tests {
             feat_spans: vec![(10, 20), (20, 26), (-1, -1), (90, 120)],
             common_start_sig: 0,
             junction_sig: 10,
+            mask_source: crate::anchor::MaskSource::Exact,
         };
         let f = junction_features(&sig, &coords, None);
         assert_eq!(f.len(), 16);

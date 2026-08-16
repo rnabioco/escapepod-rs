@@ -58,3 +58,6 @@ data/
 
 # notes
 notes/
+
+# leech caches a parsed kmer table beside the .tsv; a build artifact, not a fixture.
+*.tsv.pkl
