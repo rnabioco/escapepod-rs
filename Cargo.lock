@@ -921,6 +921,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tracing",
  "tract-onnx",
  "uuid",
 ]

@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The charging feature-model CNN scores 6.1× faster — 305 → 50 µs/read —
+  by hoisting the convolution padding out of the graph at load.** A `Conv`
+  lowers to im2col + matmul in tract, and tract's im2col has a fast block-copy
+  path that it abandons the moment `pads != 0`, falling back to a per-element
+  bounds-checked loop. On the shipped `charging_fnn_ldx16x_rna004` the second
+  convolution (96→96, k=3, over 33 offsets) spent **257 µs of the model's 310 µs
+  building a 9,504-float buffer** — ~26 ns per element, about 100× a memcpy.
+  The matmul it feeds is fine at 63 GFLOP/s; only the packing was broken.
+
+  Zero padding *is* a concatenation of zeros, so `FeatureNet::load` now rewrites
+  each padded `Conv` into `Concat(zeros) + Conv(pads=0)` on the ONNX proto
+  before tract sees it. Bit-identical by construction and in fact: exactly equal
+  logits over 200 random inputs against the original graph, and
+  `tests/charging_fnn_parity.rs` — which pins the fixture bundle, the same
+  two-padded-conv architecture, against golden vectors bit-exactly — runs
+  through the rewrite.
+
+  Two other spellings were measured and rejected. An ONNX `Pad` node before an
+  unpadded `Conv` is fused straight back into the convolution by tract's
+  optimizer, restoring the slow path (272 µs); and a larger batch amortises
+  nothing, because the cost is per row, not per call (252 µs/read at batch 64).
+  `Concat` is used precisely because it survives optimization.
+
+  This lives in the loader rather than in escapepod-models' export on purpose.
+  The natural PyTorch spelling (`ConstantPad1d` + `padding=0`) emits `Pad`, so
+  an export-side fix would need the *same* protobuf surgery — but applied to a
+  published, sha256-pinned artifact, which would then carry zero-concat nodes
+  that exist only because of one Rust runtime, and would leave every
+  already-shipped bundle slow. Here it fixes bundles that already exist, and if
+  tract's padded im2col is ever fixed the rewrite degrades to a no-op that costs
+  one graph node — never a wrong answer.
+
+  The rewrite refuses anything it cannot be sure of rather than guessing: a
+  single spatial axis only, the default ONNX domain, `group = 1`, explicit
+  non-negative `pads`, a weight that is a graph initializer, and never when
+  `auto_pad` is computing the padding.
+
+  For scale: the LSTM arm is untouched (it has no convolutions) at 468 µs/read,
+  and the GBM arm is microseconds. At 2M reads on 32 cores the CNN scorer now
+  costs ~3 s rather than ~19 s.
+
 ### Added
 
 - **`escpod signal classify` loads the per-base-feature ONNX charging model
