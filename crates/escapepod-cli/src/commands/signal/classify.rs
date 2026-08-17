@@ -152,6 +152,17 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
              caller's responsibility (do not assume the legacy 200)"
         ),
     }
+    // The bundle names reads it says must not be scored, and this runtime
+    // scores them anyway (rnabioco/escapepod-rs#230). Said out loud because a
+    // rule that is declared, parsed and then ignored is worse than one that
+    // was never written down — the output looks exactly as it should.
+    if let Some(ab) = &bundle.abstain {
+        warn!(
+            "bundle declares an abstain rule ({}) that this runtime does not apply — \
+             every anchored read is scored, including the ones it excludes (#230)",
+            ab.rule
+        );
+    }
 
     // --- Reference geometry ----------------------------------------------
     let geometry = junction_positions(

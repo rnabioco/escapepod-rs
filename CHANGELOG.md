@@ -61,6 +61,55 @@
 
 ### Changed
 
+- **A charging bundle's metadata is now a closed schema: a key this runtime
+  does not implement is refused, not ignored.** `metadata.json` was parsed
+  leniently, so any block the loader did not model was dropped silently at
+  parse time — and every key in that file is a *rule the model was built
+  with*. Two were already being dropped, both of them undetectable downstream
+  because a bundle scored against the wrong one produces exactly the output it
+  should:
+
+  - `abstain` — which reads must not be scored at all. The shipped GBM bundle
+    has always declared `aligner_arm_depth == 0`, measured at balanced
+    accuracy 0.4993 with **100% of the uncharged library called charged**, and
+    the runtime scored those reads anyway.
+  - `features.feature_set` — whether the dwell columns were divided by the
+    read's own median before training (`rel_dwell`, `all_rel`). The transformed
+    columns keep their plain names, so `features.order` cannot express the
+    difference and nothing further down can catch it.
+
+  Every block that can carry a rule is now `deny_unknown_fields`, which means
+  the schema *names* the builder's prose (`anchor.description`,
+  `features.per_base`, `feature_model.input.fold`, …) rather than allowing it
+  by omission: documenting a rule stays free, introducing one does not.
+  `provenance`, `metrics` and `caveats` are deliberately exempt and stay
+  free-form — nothing under them can change what the model sees, and that is
+  where new documentation with no natural home belongs. The trade is explicit:
+  a bundle from a *newer* builder now fails to load rather than loading with
+  its new rule quietly ignored, and refusing to answer is the recoverable half
+  of that.
+
+  Two named rules are refused outright, because the runtime could so nearly
+  run them: a non-empty `refinement.opts` (a banded DP that re-fits the
+  signal-to-base mapping *before* the features are taken — this runtime's
+  spans come straight from the move table), and a `features.feature_set`
+  that transforms its columns per read. An unrecognised feature-set name is
+  refused too rather than assumed harmless; a bare offset rule (`arm_le24`,
+  `collapse_safe`) is matched by shape, so widening the cap is not a new name
+  to teach. `abstain` is named and *carried* instead —
+  `ChargingBundle::abstain` hands it to the caller, and `escpod signal
+  classify` warns at startup that it is not applying it (#230), which is the
+  honest state until that lands.
+
+  Deciding the variant now happens before the strict parse, which also fixes
+  the raw-signal CNN refusal for older bundles: `charging_cnn_rna004@v0.1.0`
+  predates `classes` and spells its k-mer table `path`, so it used to fail
+  with `missing field \`classes\`` — the exact "go looking for a corrupt file"
+  failure the by-name refusal was written to prevent. Verified against the
+  real shipped bundles: `charging_gbm_ldx16x_rna004@v0.1.0` loads unchanged
+  (132 columns, abstain rule carried), and the raw-signal CNN gets its own
+  message.
+
 - **`escpod classify` is now `escpod signal classify`.** The bare top-level
   spelling sat one word away from `escpod demux classify` while meaning
   something else entirely: `demux classify` assigns a barcode from a DTW/GBM
