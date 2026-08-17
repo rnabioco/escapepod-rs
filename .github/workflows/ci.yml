@@ -34,17 +34,30 @@ jobs:
   cross-check:
     name: Check (aarch64)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Post-merge, not per-PR: `github.event_name == 'push'` is main only, since
+    # that is the only branch this workflow triggers a push on.
+    #
     # Every other job here is x86_64, so code reachable only through the
     # `target_arch = "x86_64"` SIMD backends (DTW, SVB16, the CRF kernels) is
     # never compiled with those backends cfg'd out. Under `-Dwarnings` that
     # turns an unused helper or an unmutated `mut` into a hard error on
     # aarch64 only. The one such build used to be `release.yml`'s macOS job,
     # which runs on tag push — so the first sign of a break was a failed
-    # release. This catches it on the PR instead.
+    # release.
+    #
+    # Running it on main keeps that early warning (a break surfaces minutes
+    # after merge, not at the next tag) while taking it off the PR path, where
+    # it was the slowest job by an order of magnitude: it is the only job whose
+    # dependency graph is compiled for a second target, so a `Cargo.lock`
+    # change misses the cache and it rebuilds everything. Typical run is ~2
+    # minutes; a cold one hit the 20-minute wall on #233 four seconds from
+    # finishing, blocking a merge over an artefact of caching. The wall is 30
+    # now, and nothing waits on it.
     #
     # `cargo check` never links, but zstd-sys still compiles C for the target,
     # hence the cross gcc.
+    if: github.event_name == 'push'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
