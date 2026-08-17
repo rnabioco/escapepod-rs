@@ -11,7 +11,7 @@
 //! exercise the very code the command runs.
 
 use crate::anchor::{self, AnchoredRead, Orientation, OrientationVotes, ScanOutcome, SkipReason};
-use crate::bundle::ChargingBundle;
+use crate::bundle::{ChargingBundle, ChargingScorer};
 use crate::features;
 use crate::geometry::RefGeometry;
 use crate::recipe::FeatureRecipe;
@@ -269,6 +269,41 @@ pub struct ClassifyStats {
     pub ns_mismatch: u64,
 }
 
+/// The bundle's scorer, made ready to run: `P(classes[1])` from the flat
+/// column vector, whichever model the bundle carries.
+///
+/// The two arms take the same input and differ only in what runs on it, so
+/// this is the entire model-specific part of the pipeline — everything above
+/// (anchoring, spans, features, column selection) is shared verbatim.
+enum Scorer<'a> {
+    Gbm(GbmPredictor<'a>),
+    #[cfg(feature = "fnn-onnx")]
+    FeatureNn(&'a crate::fnn::FeatureNet),
+}
+
+impl Scorer<'_> {
+    fn new(bundle: &ChargingBundle) -> Scorer<'_> {
+        match &bundle.scorer {
+            ChargingScorer::Gbm(g) => Scorer::Gbm(GbmPredictor::new(g)),
+            #[cfg(feature = "fnn-onnx")]
+            ChargingScorer::FeatureNn(net) => Scorer::FeatureNn(net),
+        }
+    }
+
+    fn p_positive(&self, features: &[f64]) -> Result<f64> {
+        match self {
+            Self::Gbm(p) => {
+                let (probs, _) = p
+                    .predict(features)
+                    .map_err(|e| anyhow::anyhow!("GBM predict failed: {e}"))?;
+                Ok(probs[1])
+            }
+            #[cfg(feature = "fnn-onnx")]
+            Self::FeatureNn(net) => Ok(net.predict(features)?[1]),
+        }
+    }
+}
+
 /// Classify every anchored read with signal, in parallel.
 ///
 /// Returns calls sorted by read id (deterministic output order) plus the
@@ -280,7 +315,7 @@ pub fn classify_reads(
     orientation: Orientation,
 ) -> Result<(Vec<ReadCall>, ClassifyStats)> {
     let extractors = pod5.extractors()?;
-    let predictor = GbmPredictor::new(&bundle.gbm);
+    let predictor = Scorer::new(bundle);
     let recipe = bundle.recipe();
     let reads: Vec<&AnchoredRead> = anchored.values().collect();
 
@@ -301,10 +336,7 @@ pub fn classify_reads(
             }
             let grid = feature_grid(&recipe, read, orientation, &sig_pa);
             let features = bundle.select_columns(&grid);
-            let (probs, _) = predictor
-                .predict(&features)
-                .map_err(|e| anyhow::anyhow!("GBM predict failed: {e}"))?;
-            let p = probs[1];
+            let p = predictor.p_positive(&features)?;
             Ok(Outcome::Call(ReadCall {
                 read_id: read.read_id,
                 reference: read.reference.clone(),

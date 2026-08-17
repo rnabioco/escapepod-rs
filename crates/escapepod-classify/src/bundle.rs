@@ -9,13 +9,14 @@
 //! for the same reason — the residual is defined relative to it, so a
 //! swapped table is a different feature space and an invalid model.
 //!
-//! Bundle layout (format `escapepod-charging-classifier/1`, the GBM
-//! variant; emitted by escapepod-models' `build_charging_bundle.py`):
+//! Bundle layout (format `escapepod-charging-classifier/1`; emitted by
+//! escapepod-models' `build_charging_bundle.py`):
 //!
 //! ```text
 //! <bundle dir>/
 //!   metadata.json     — the contract below
-//!   <gbm file>        — GbmModel JSON (scripts/export_gbm_model.py)
+//!   <gbm file>        — GbmModel JSON (scripts/export_gbm_model.py), or
+//!   <onnx file>       — the per-base-feature network (`feature_model`)
 //!   <kmer table>      — tab-separated k-mer levels (optionally .gz)
 //! ```
 //!
@@ -40,11 +41,28 @@
 //! ```
 //!
 //! `features.order` is the model's exact input column order (names
-//! `b<+/-offset>_<stat>`); `n_features` of the GBM must equal its length.
+//! `b<+/-offset>_<stat>`); the scorer's input width must equal its length.
 //! `kmer_table` is required whenever a `resid` column is present.
 //! `operating_point` is the recommended call threshold derived from the
 //! cross-experiment evaluation — consumers should read it rather than
 //! assume the legacy 200.
+//!
+//! # Two scorers over one feature space
+//!
+//! The format tag names three models: a raw-signal ONNX CNN, a
+//! per-base-feature GBM (`gbm`), and a per-base-feature ONNX network
+//! (`feature_model`). The last two read the **same features** — the same
+//! `features` block, the same offsets, the same [`ChargingBundle::select_columns`]
+//! output — and differ only in what consumes the flat vector, so they load
+//! through the same path here and diverge at [`ChargingScorer`]. The
+//! raw-signal CNN is a different input space and is not implemented; it is
+//! recognised by its top-level `onnx` block and refused by name.
+//!
+//! Exactly one of `gbm` / `feature_model` must be present. Sharing a format
+//! tag across variants is how a mismatch went unnoticed for three days
+//! (escapepod-models `build_charging_bundle.py`), so "neither" and "both"
+//! are load errors that name what they found rather than a preference for
+//! whichever the code happens to check first.
 
 use crate::features::FEAT_STATS;
 use crate::recipe::{FeatureRecipe, KmerLevels};
@@ -59,7 +77,22 @@ struct MetaFile {
     format: String,
     model: ModelBlock,
     classes: Vec<String>,
-    gbm: FileRef,
+    /// The GBM variant's weights. Optional *only* because the feature-network
+    /// variant exists — see the module docs; exactly one of the two is
+    /// required, and the check is explicit rather than positional.
+    #[serde(default)]
+    gbm: Option<FileRef>,
+    /// The per-base-feature ONNX variant's weights and input contract.
+    #[serde(default)]
+    feature_model: Option<FeatureModelBlock>,
+    /// Read for the error message only. The *raw-signal* CNN variant of this
+    /// format names its graph here, at the top level, beside a `signal` block
+    /// describing a window rather than columns. It is a different input space
+    /// and this runtime does not implement it — but a refusal that says so is
+    /// worth five lines, because the alternative ("no `gbm` field") sent
+    /// someone looking for a corrupt file for three days.
+    #[serde(default)]
+    onnx: Option<String>,
     anchor: AnchorBlock,
     features: FeaturesBlock,
     #[serde(default)]
@@ -113,6 +146,41 @@ struct ResolutionBlock {
     count_arm_bases: u32,
 }
 
+/// The per-base-feature network variant: weights plus the three rules that
+/// turn `features.order`'s flat vector into the graph's input tensor.
+///
+/// Only the fields consumption needs are deserialised; the block also carries
+/// prose (`input.fold`, `standardisation.apply`, `missing`) that documents the
+/// same rules for a human reader, and `arch` / `opset` for provenance.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
+struct FeatureModelBlock {
+    file: String,
+    sha256: String,
+    input: FeatureModelInput,
+    standardisation: FeatureModelStd,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
+struct FeatureModelInput {
+    /// Tensor channel names: `n_val` value channels (a subset of
+    /// [`FEAT_STATS`], in that order) followed by one `<stat>_observed`
+    /// indicator each, in the same order.
+    channels: Vec<String>,
+    /// The tensor's length axis — how many base offsets the model reads.
+    n_offsets: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
+struct FeatureModelStd {
+    /// One per **value** channel. The observed-mask channels are indicators
+    /// and are never standardised, so this is half as long as `channels`.
+    mu: Vec<f64>,
+    sd: Vec<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct KmerTableBlock {
     file: String,
@@ -135,6 +203,44 @@ pub struct OperatingPoint {
     pub source: Option<String>,
 }
 
+/// What scores the feature vector, once it has been selected.
+///
+/// Both arms read the identical input — the flat `Vec<f64>` that
+/// [`ChargingBundle::select_columns`] produces from the canonical
+/// `offsets × FEAT_STATS` grid — so the whole model-specific part of the
+/// pipeline is this enum. Which one a bundle carries is a property of the
+/// bundle, never a flag.
+#[derive(Debug)]
+pub enum ChargingScorer {
+    /// Gradient-boosted trees over the flat vector, `NaN` routed natively.
+    Gbm(GbmModel),
+    /// A network over the same features, folded to `[channel, offset]`,
+    /// standardised, with missingness carried in explicit mask channels.
+    #[cfg(feature = "fnn-onnx")]
+    FeatureNn(crate::fnn::FeatureNet),
+}
+
+impl ChargingScorer {
+    /// Short name for logs and `--info`-style output, so an operator can see
+    /// which of the two variants a directory actually holds.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Gbm(_) => "gbm",
+            #[cfg(feature = "fnn-onnx")]
+            Self::FeatureNn(_) => "feature-nn (onnx)",
+        }
+    }
+
+    /// The GBM weights, if this is the GBM variant.
+    pub fn as_gbm(&self) -> Option<&GbmModel> {
+        match self {
+            Self::Gbm(g) => Some(g),
+            #[cfg(feature = "fnn-onnx")]
+            _ => None,
+        }
+    }
+}
+
 /// A loaded, hash-verified charging-classifier bundle.
 #[derive(Debug)]
 pub struct ChargingBundle {
@@ -144,7 +250,9 @@ pub struct ChargingBundle {
     /// Class names in probability order; the `cl` tag encodes
     /// `P(classes[1])`.
     pub classes: [String; 2],
-    pub gbm: GbmModel,
+    /// The model itself — see [`ChargingScorer`]. Both variants score the
+    /// same [`select_columns`](Self::select_columns) vector.
+    pub scorer: ChargingScorer,
     pub anchor: AnchorBlock,
     /// Feature offsets relative to the junction, recipe order.
     pub offsets: Vec<i32>,
@@ -211,6 +319,100 @@ fn parse_column(name: &str, offsets: &[i32]) -> Result<(usize, usize)> {
     Ok((oi, si))
 }
 
+/// Check that `features.order` folds into the `feature_model`'s declared
+/// `[channel, offset]` tensor, and return the value-channel count.
+///
+/// The declared fold is "the k-th selected column is offset `k / n_val`,
+/// value channel `k % n_val`". That is only meaningful if the column names
+/// actually lay out that way, so this reads them back:
+///
+/// * `channels` is `n_val` value channels followed by their `_observed`
+///   partners, in the same order (the mask channels are indicators, which is
+///   why only the value half is standardised);
+/// * each block of `n_val` consecutive columns names one offset, and its
+///   stats are exactly the value channels in order;
+/// * offsets advance strictly across blocks.
+///
+/// A feature set that drops a statistic at some offsets but not others makes
+/// the reshape ragged and lands here rather than in a transposed tensor.
+#[cfg(feature = "fnn-onnx")]
+fn check_feature_fold(
+    order: &[String],
+    columns: &[(usize, usize)],
+    channels: &[String],
+    n_off: usize,
+) -> Result<usize> {
+    if channels.is_empty() || !channels.len().is_multiple_of(2) {
+        bail!(
+            "feature_model.input.channels has {} entries; it must be n value channels \
+             followed by n observed-mask channels",
+            channels.len()
+        );
+    }
+    let n_val = channels.len() / 2;
+    let (values, masks) = channels.split_at(n_val);
+    for (v, m) in values.iter().zip(masks) {
+        if !FEAT_STATS.contains(&v.as_str()) {
+            bail!(
+                "feature_model value channel {:?} is not one of {:?}",
+                v,
+                FEAT_STATS
+            );
+        }
+        if m != &format!("{v}_observed") {
+            bail!(
+                "feature_model channels are not (values..., observed...): expected \
+                 {:?} to pair with {:?}, got {:?}",
+                v,
+                format!("{v}_observed"),
+                m
+            );
+        }
+    }
+    if order.len() != n_val * n_off {
+        bail!(
+            "feature_model declares {} value channels x {} offsets = {} inputs, but \
+             the recipe orders {} columns",
+            n_val,
+            n_off,
+            n_val * n_off,
+            order.len()
+        );
+    }
+    let mut prev_offset: Option<usize> = None;
+    for (k, name) in order.iter().enumerate() {
+        let (oi, si) = columns[k];
+        let want = &values[k % n_val];
+        if FEAT_STATS[si] != want.as_str() {
+            bail!(
+                "column {k} ({name:?}) is stat {:?}, but the declared fold puts value \
+                 channel {:?} there — the tensor would be built from the wrong columns",
+                FEAT_STATS[si],
+                want
+            );
+        }
+        if k % n_val == 0 {
+            if let Some(p) = prev_offset
+                && oi <= p
+            {
+                bail!(
+                    "column {k} ({name:?}) does not start a new, later offset block; \
+                     `features.order` must be offsets-outer and ascending for the fold \
+                     to be a reshape"
+                );
+            }
+            prev_offset = Some(oi);
+        } else if Some(oi) != prev_offset {
+            bail!(
+                "column {k} ({name:?}) belongs to a different offset than the block it \
+                 folds into; the feature set does not keep its statistics uniformly \
+                 across offsets"
+            );
+        }
+    }
+    Ok(n_val)
+}
+
 impl ChargingBundle {
     /// Load a bundle from its directory (or a direct `metadata.json` path),
     /// verifying every pinned checksum.
@@ -242,20 +444,6 @@ impl ChargingBundle {
             .try_into()
             .map_err(|c: Vec<String>| anyhow::anyhow!("expected 2 classes, got {}", c.len()))?;
 
-        let gbm_path = dir.join(&meta.gbm.file);
-        verify_sha256(&gbm_path, &meta.gbm.sha256, "GBM model")?;
-        let gbm = load_gbm_model(&gbm_path)?;
-        if gbm.n_classes != 2 {
-            bail!("charging GBM must have 2 classes, has {}", gbm.n_classes);
-        }
-        if gbm.n_features != meta.features.order.len() {
-            bail!(
-                "GBM expects {} features but the recipe orders {} columns",
-                gbm.n_features,
-                meta.features.order.len()
-            );
-        }
-
         for s in &meta.features.stats {
             if !FEAT_STATS.contains(&s.as_str()) {
                 bail!("recipe stat {:?} is not one of {:?}", s, FEAT_STATS);
@@ -267,6 +455,46 @@ impl ChargingBundle {
             .iter()
             .map(|n| parse_column(n, &meta.features.offsets))
             .collect::<Result<Vec<_>>>()?;
+
+        // Exactly one scorer. Both variants consume `columns`; see the module
+        // docs on why "neither" and "both" are named rather than resolved by
+        // check order.
+        let scorer = match (&meta.gbm, &meta.feature_model) {
+            (Some(_), Some(_)) => bail!(
+                "bundle declares both `gbm` and `feature_model`; they are different \
+                 models over the same features and nothing here can choose between \
+                 them — ship one"
+            ),
+            (None, None) if meta.onnx.is_some() => bail!(
+                "this is the raw-signal CNN variant of escapepod-charging-classifier/1 \
+                 (a top-level `onnx` block, {:?}): it scores a raw signal window, not \
+                 the per-base feature columns, and this runtime does not implement it. \
+                 The per-base-feature variants are `gbm` and `feature_model`",
+                meta.onnx.as_deref().unwrap_or_default()
+            ),
+            (None, None) => bail!(
+                "bundle declares neither `gbm` nor `feature_model`, so nothing here can \
+                 score its features — one of the two is required by \
+                 escapepod-charging-classifier/1"
+            ),
+            (Some(g), None) => {
+                let gbm_path = dir.join(&g.file);
+                verify_sha256(&gbm_path, &g.sha256, "GBM model")?;
+                let gbm = load_gbm_model(&gbm_path)?;
+                if gbm.n_classes != 2 {
+                    bail!("charging GBM must have 2 classes, has {}", gbm.n_classes);
+                }
+                if gbm.n_features != meta.features.order.len() {
+                    bail!(
+                        "GBM expects {} features but the recipe orders {} columns",
+                        gbm.n_features,
+                        meta.features.order.len()
+                    );
+                }
+                ChargingScorer::Gbm(gbm)
+            }
+            (None, Some(fm)) => Self::load_feature_model(&dir, fm, &meta.features.order, &columns)?,
+        };
 
         let needs_resid = columns.iter().any(|&(_, si)| FEAT_STATS[si] == "resid");
         let kmer = match (&meta.kmer_table, needs_resid) {
@@ -296,7 +524,7 @@ impl ChargingBundle {
             model_id: meta.model.id,
             model_version: meta.model.version,
             classes: [c0, c1],
-            gbm,
+            scorer,
             anchor: meta.anchor,
             offsets: meta.features.offsets,
             span_mode: crate::anchor::SpanMode::from_arm_bases(
@@ -306,6 +534,52 @@ impl ChargingBundle {
             kmer,
             operating_point: meta.operating_point,
         })
+    }
+
+    /// Load and contract-check the `feature_model` variant.
+    ///
+    /// The fold is checked against `features.order` *before* the graph is
+    /// opened, because it is the rule a consumer is most likely to get wrong
+    /// and the one whose failure is invisible: fold channels-outer instead of
+    /// offsets-outer and every read still scores, confidently, on a
+    /// transposed input. Here the declared channels must reproduce the
+    /// declared column names exactly, so a mismatch is a load error naming
+    /// the column.
+    #[cfg(feature = "fnn-onnx")]
+    fn load_feature_model(
+        dir: &Path,
+        fm: &FeatureModelBlock,
+        order: &[String],
+        columns: &[(usize, usize)],
+    ) -> Result<ChargingScorer> {
+        let n_val = check_feature_fold(order, columns, &fm.input.channels, fm.input.n_offsets)?;
+        let path = dir.join(&fm.file);
+        verify_sha256(&path, &fm.sha256, "feature model")?;
+        let net = crate::fnn::FeatureNet::load(
+            &path,
+            n_val,
+            fm.input.n_offsets,
+            &fm.standardisation.mu,
+            &fm.standardisation.sd,
+        )?;
+        Ok(ChargingScorer::FeatureNn(net))
+    }
+
+    /// Without `fnn-onnx` there is no ONNX runtime linked, so the bundle is
+    /// refused with the rebuild hint rather than silently mis-scored or
+    /// reported as malformed.
+    #[cfg(not(feature = "fnn-onnx"))]
+    fn load_feature_model(
+        _dir: &Path,
+        _fm: &FeatureModelBlock,
+        _order: &[String],
+        _columns: &[(usize, usize)],
+    ) -> Result<ChargingScorer> {
+        bail!(
+            "this bundle is the per-base-feature ONNX variant (`feature_model`), but \
+             escapepod-classify was built without the `fnn-onnx` feature — rebuild with \
+             it enabled (the `escpod` CLI enables it as part of `classify`)"
+        )
     }
 
     /// The bundle's feature recipe, borrowed.
@@ -340,5 +614,125 @@ mod tests {
         assert!(parse_column("b+17_mean", &offsets).is_err()); // not in recipe
         assert!(parse_column("b+1_bogus", &offsets).is_err());
         assert!(parse_column("x+1_mean", &offsets).is_err());
+    }
+
+    #[cfg(feature = "fnn-onnx")]
+    mod fold {
+        use super::*;
+
+        /// `order` + its parsed columns for a recipe over `offsets` keeping
+        /// `stats` at every offset, offsets-outer — what
+        /// `escapepod_models.charging.selected_feature_names` emits.
+        fn recipe(offsets: &[i32], stats: &[&str]) -> (Vec<String>, Vec<(usize, usize)>) {
+            let order: Vec<String> = offsets
+                .iter()
+                .flat_map(|o| stats.iter().map(move |s| format!("b{o:+}_{s}")))
+                .collect();
+            let cols = order
+                .iter()
+                .map(|n| parse_column(n, offsets).unwrap())
+                .collect();
+            (order, cols)
+        }
+
+        fn channels(stats: &[&str]) -> Vec<String> {
+            stats
+                .iter()
+                .map(|s| s.to_string())
+                .chain(stats.iter().map(|s| format!("{s}_observed")))
+                .collect()
+        }
+
+        #[test]
+        fn accepts_the_full_grid() {
+            let offsets: Vec<i32> = (-8..=16).collect();
+            let stats = ["dwell", "mean", "std", "resid"];
+            let (order, cols) = recipe(&offsets, &stats);
+            assert_eq!(
+                check_feature_fold(&order, &cols, &channels(&stats), 25).unwrap(),
+                4
+            );
+        }
+
+        #[test]
+        fn accepts_a_subset_feature_set() {
+            // `level_resid@arm_le*`: two statistics, fewer offsets.
+            let offsets: Vec<i32> = (-8..=8).collect();
+            let stats = ["mean", "resid"];
+            let (order, cols) = recipe(&offsets, &stats);
+            assert_eq!(
+                check_feature_fold(&order, &cols, &channels(&stats), 17).unwrap(),
+                2
+            );
+        }
+
+        /// The failure the fold exists to prevent: channels-outer columns
+        /// against an offsets-outer declaration. Nothing about the shapes is
+        /// wrong — 4 x 25 either way — so only the names catch it.
+        #[test]
+        fn rejects_a_channels_outer_order() {
+            let offsets: Vec<i32> = (-8..=16).collect();
+            let stats = ["dwell", "mean", "std", "resid"];
+            let order: Vec<String> = stats
+                .iter()
+                .flat_map(|s| offsets.iter().map(move |o| format!("b{o:+}_{s}")))
+                .collect();
+            let cols: Vec<_> = order
+                .iter()
+                .map(|n| parse_column(n, &offsets).unwrap())
+                .collect();
+            let err = check_feature_fold(&order, &cols, &channels(&stats), 25)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("declared fold"), "{err}");
+        }
+
+        #[test]
+        fn rejects_a_channel_count_the_columns_cannot_fill() {
+            let offsets: Vec<i32> = (-8..=16).collect();
+            let stats = ["dwell", "mean", "std", "resid"];
+            let (order, cols) = recipe(&offsets, &stats);
+            // 4 value channels x 24 offsets != 100 columns.
+            let err = check_feature_fold(&order, &cols, &channels(&stats), 24)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("orders 100 columns"), "{err}");
+        }
+
+        #[test]
+        fn rejects_unpaired_mask_channels() {
+            let offsets: Vec<i32> = (-1..=1).collect();
+            let stats = ["mean", "resid"];
+            let (order, cols) = recipe(&offsets, &stats);
+            let ch = vec![
+                "mean".into(),
+                "resid".into(),
+                "resid_observed".into(),
+                "mean_observed".into(),
+            ];
+            let err = check_feature_fold(&order, &cols, &ch, 3)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("(values..., observed...)"), "{err}");
+        }
+
+        #[test]
+        fn rejects_a_ragged_selection() {
+            // `resid` present at +0 only: the reshape would silently slide.
+            let offsets: Vec<i32> = (-1..=1).collect();
+            let order: Vec<String> = ["b-1_mean", "b-1_std", "b+0_mean", "b+0_resid"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let cols: Vec<_> = order
+                .iter()
+                .map(|n| parse_column(n, &offsets).unwrap())
+                .collect();
+            let ch = channels(&["mean", "std"]);
+            let err = check_feature_fold(&order, &cols, &ch, 2)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("declared fold"), "{err}");
+        }
     }
 }

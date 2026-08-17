@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+### Added
+
+- **`escpod signal classify` loads the per-base-feature ONNX charging model
+  (`feature_model`).** The `escapepod-charging-classifier/1` format names three
+  models; the runtime implemented one of them, the GBM, and refused the others
+  with `missing field \`gbm\``. The one worth shipping is the third: a small
+  network over the *same* per-base features, which on a held-out flowcell
+  (three paired seeds) scores AUROC 0.9621 ± 0.0001 against the GBM's
+  0.9475 ± 0.0001 and MCC 0.8399 against 0.7928 — and calls **0.727 of reads at
+  99% precision against the GBM's 0.449**, so the gap is ~28 points of usable
+  yield, not a decimal on a summary statistic.
+
+  Almost nothing had to change to run it. The two models read one feature
+  space, so anchoring, spans, the k-mer residual, the mask and the column
+  selection are shared verbatim; a bundle now carries `gbm` **or**
+  `feature_model` and the whole model-specific part of the pipeline is a
+  two-armed `ChargingScorer`. Which arm a directory holds is a property of the
+  bundle, never a flag, and `escpod signal classify` names it in its startup
+  line.
+
+  Three rules stand between the flat feature vector the runtime already builds
+  and the graph, and each fails *silently* if guessed: the fold from
+  offsets-outer columns to a `[channel, offset]` tensor, the per-channel
+  standardisation (constants fitted on the training split and shipped, never
+  recomputed per batch), and missingness — `NaN` is never handed to the
+  network, whose value channel is zeroed while a paired observed channel
+  carries the indicator. All three are declared in the bundle and reproduced
+  from what it declares. The fold in particular is checked against
+  `features.order` at load: the declared channels must reproduce the declared
+  column names, because folding the other way transposes every input and still
+  scores.
+
+  Refusals stay explicit rather than positional. A bundle declaring **both**
+  scorers, or **neither** (the raw-signal CNN variant, a different input space
+  this runtime does not implement), is rejected with its own message; the ONNX
+  is pinned by sha256 like every other bundle dependency; and a load-time shape
+  probe insists on `[1, 2]` logits, so a differently-headed graph fails at load
+  with the file named rather than downstream as a wrong probability on every
+  read.
+
+  No new third-party crate: `tract-onnx` was already in the binary via
+  `cnn-detect`. Library consumers select it with `escapepod-classify`'s
+  `fnn-onnx` feature, which the CLI's `classify` feature turns on; without it
+  such a bundle is refused with a rebuild hint.
+
+  Parity is pinned two ways. `tests/charging_fnn_parity.rs` folds the
+  *reference implementation's own* feature vectors so the input tensor
+  comparison is **bit-exact**, then runs the full pipeline for the probability
+  (max |ΔP| 2.1e-7 over the fixture reads) — a golden built only end to end
+  could not tell a wrong rule from the feature grid's known 1e-4 rounding
+  headroom. `examples/verify_feature_model.rs` plus
+  `scripts/dump_feature_model_reference.py` do the same against a real bundle
+  on real weights and a real corpus, where the shipped feature set is a subset
+  (2 statistics of 4, 33 offsets) and `select_columns` is not the identity:
+  24,576 reads over two corpus slices, max |ΔP| 2.4e-7, median 1.1e-8, none
+  above 1e-5.
+
 ### Changed
 
 - **`escpod classify` is now `escpod signal classify`.** The bare top-level
