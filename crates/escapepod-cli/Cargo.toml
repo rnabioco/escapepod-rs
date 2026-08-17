@@ -76,8 +76,13 @@ demux = ["dep:escapepod-demux"]
 # Read-level classification against model bundles (`escpod signal classify`,
 # the tRNA charging classifier). Adds no third-party crates beyond the CLI graph
 # (noodles-sam, serde, sha2 are already linked), so it ships in the default
-# build like `demux`.
-classify = ["dep:escapepod-classify"]
+# build like `demux`. `fnn-onnx` (the per-base-feature ONNX variant of a
+# charging bundle) is included for the same reason `cnn-detect` is in `cli`:
+# tract is already in the binary, and the feature-network variant is the model
+# worth shipping — 0.727 of reads callable at 99% precision against the GBM's
+# 0.449 on a held-out flowcell. A binary that cannot load it would leave the
+# only supported bundle unusable.
+classify = ["dep:escapepod-classify", "escapepod-classify/fnn-onnx"]
 
 # The `escpod` binary and everything it links. Implies the `signal`, `demux`
 # and `cnn-detect` layers. `demux` is in the default build because it pulls in

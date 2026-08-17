@@ -120,13 +120,16 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     // --- Bundle ---------------------------------------------------------
     let bundle = ChargingBundle::load(&args.model)?;
     info!(
-        "model {}{}: {} features over offsets {}..{}, classes [{}, {}]",
+        "model {}{} [{}]: {} features over offsets {}..{}, classes [{}, {}]",
         bundle.model_id,
         bundle
             .model_version
             .as_deref()
             .map(|v| format!(" v{v}"))
             .unwrap_or_default(),
+        // Which of the two scorers the directory holds. Both read the same
+        // features, so nothing else in this line distinguishes them.
+        bundle.scorer.kind(),
         bundle.columns.len(),
         bundle.offsets.first().copied().unwrap_or(0),
         bundle.offsets.last().copied().unwrap_or(0),

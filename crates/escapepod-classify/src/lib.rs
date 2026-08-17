@@ -44,11 +44,18 @@
 //! k-mer levels) is [`recipe::FeatureRecipe`], separate from the bundle that
 //! parses it: computing these features is also what builds the training
 //! corpus, and that caller has no weights to hand over.
+//!
+//! Two models are scored over that one feature space — gradient-boosted
+//! trees and a small network ([`bundle::ChargingScorer`], [`fnn`]) — so the
+//! chain above is shared entirely and only the last step differs. Which one
+//! a bundle carries is a property of the bundle, never a flag.
 
 pub mod anchor;
 pub mod bam_tags;
 pub mod bundle;
 pub mod features;
+#[cfg(feature = "fnn-onnx")]
+pub mod fnn;
 pub mod geometry;
 pub mod pipeline;
 pub mod recipe;
@@ -59,8 +66,10 @@ pub use anchor::{
     resolve_orientation,
 };
 pub use anchor::{JunctionCoords, SkipReason, finalize, query_positions, scan_record};
-pub use bundle::{ChargingBundle, OperatingPoint};
+pub use bundle::{ChargingBundle, ChargingScorer, OperatingPoint};
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
+#[cfg(feature = "fnn-onnx")]
+pub use fnn::FeatureNet;
 pub use geometry::{RefGeometry, junction_positions};
 pub use pipeline::{
     BamScan, ClassifyStats, Pod5Index, ReadCall, classify_reads, feature_grid, feature_grid_at,
