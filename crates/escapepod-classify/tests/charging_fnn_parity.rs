@@ -161,7 +161,10 @@ fn fnn_bundle_classifies_like_the_reference() {
         spread.1 - spread.0 > 0.25,
         "golden probabilities span only {spread:?} — the fixture discriminates nothing"
     );
-    eprintln!("fnn end-to-end: max |dP| = {max_dev:e} over {} reads", reads.len());
+    eprintln!(
+        "fnn end-to-end: max |dP| = {max_dev:e} over {} reads",
+        reads.len()
+    );
 }
 
 /// A bundle naming both scorers, or neither, is refused by name.
@@ -178,7 +181,11 @@ fn exactly_one_scorer_is_required() {
 
     // Both: graft the GBM bundle's `gbm` block onto the fnn bundle.
     let dir = tempfile::tempdir().unwrap();
-    for f in ["metadata.json", "charging_fnn_fixture.onnx", "kmer_levels.tsv"] {
+    for f in [
+        "metadata.json",
+        "charging_fnn_fixture.onnx",
+        "kmer_levels.tsv",
+    ] {
         std::fs::copy(fixtures().join("bundle_fnn").join(f), dir.path().join(f)).unwrap();
     }
     std::fs::copy(
@@ -209,7 +216,10 @@ fn exactly_one_scorer_is_required() {
     )
     .unwrap();
     let err = ChargingBundle::load(dir.path()).unwrap_err().to_string();
-    assert!(err.contains("neither `gbm` nor `feature_model`"), "got: {err}");
+    assert!(
+        err.contains("neither `gbm` nor `feature_model`"),
+        "got: {err}"
+    );
 
     // The raw-signal CNN variant: the same tag, a top-level `onnx`, and a
     // different input space. It is named, because "no `gbm` field" is what
@@ -230,7 +240,11 @@ fn exactly_one_scorer_is_required() {
 #[test]
 fn fnn_bundle_rejects_a_tampered_graph() {
     let dir = tempfile::tempdir().unwrap();
-    for f in ["metadata.json", "charging_fnn_fixture.onnx", "kmer_levels.tsv"] {
+    for f in [
+        "metadata.json",
+        "charging_fnn_fixture.onnx",
+        "kmer_levels.tsv",
+    ] {
         std::fs::copy(fixtures().join("bundle_fnn").join(f), dir.path().join(f)).unwrap();
     }
     let onnx = dir.path().join("charging_fnn_fixture.onnx");
@@ -248,7 +262,11 @@ fn fnn_bundle_rejects_a_tampered_graph() {
 #[test]
 fn a_channel_order_the_columns_contradict_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    for f in ["metadata.json", "charging_fnn_fixture.onnx", "kmer_levels.tsv"] {
+    for f in [
+        "metadata.json",
+        "charging_fnn_fixture.onnx",
+        "kmer_levels.tsv",
+    ] {
         std::fs::copy(fixtures().join("bundle_fnn").join(f), dir.path().join(f)).unwrap();
     }
     let mp = dir.path().join("metadata.json");

@@ -35,7 +35,12 @@ use std::path::{Path, PathBuf};
 
 fn read_f32(path: &Path) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    assert_eq!(bytes.len() % 4, 0, "{}: not a whole f32 array", path.display());
+    assert_eq!(
+        bytes.len() % 4,
+        0,
+        "{}: not a whole f32 array",
+        path.display()
+    );
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -44,7 +49,12 @@ fn read_f32(path: &Path) -> Vec<f32> {
 
 fn read_f64(path: &Path) -> Vec<f64> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    assert_eq!(bytes.len() % 8, 0, "{}: not a whole f64 array", path.display());
+    assert_eq!(
+        bytes.len() % 8,
+        0,
+        "{}: not a whole f64 array",
+        path.display()
+    );
     bytes
         .chunks_exact(8)
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
