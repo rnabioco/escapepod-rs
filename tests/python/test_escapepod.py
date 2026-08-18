@@ -267,7 +267,9 @@ class TestSignal:
         full = reader.get_signal(read)
         full_pa = reader.get_signal_pa(read)
         for n in (0, 1, 7, 8, 100, len(full) - 1, len(full)):
-            np.testing.assert_array_equal(reader.get_signal(read, max_samples=n), full[:n])
+            np.testing.assert_array_equal(
+                reader.get_signal(read, max_samples=n), full[:n]
+            )
             np.testing.assert_array_equal(
                 reader.get_signal_pa(read, max_samples=n), full_pa[:n]
             )
@@ -1017,7 +1019,9 @@ class TestDatasetReader:
         ds = escapepod.DatasetReader(dataset_dir)
         read = ds.reads(selection=[_IDS_B[1]])[0]
         expected = np.arange(500, dtype=np.int16) + 1
-        np.testing.assert_array_equal(ds.get_signal(read, max_samples=40), expected[:40])
+        np.testing.assert_array_equal(
+            ds.get_signal(read, max_samples=40), expected[:40]
+        )
         # Against the full read's own pA, not a re-derived one: calibration uses
         # a fused multiply-add, so recomputing it here differs by ~1 ulp.
         np.testing.assert_array_equal(
