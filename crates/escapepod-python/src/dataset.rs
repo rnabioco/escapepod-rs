@@ -268,29 +268,44 @@ impl PyDatasetReader {
 
     /// Raw ADC signal for a read as a numpy int16 array.
     ///
-    /// Routes to whichever file in the dataset owns the read.
+    /// Routes to whichever file in the dataset owns the read. `max_samples`
+    /// decodes at most that many leading samples, as on `Reader.get_signal`.
+    #[pyo3(signature = (read, max_samples=None))]
     fn get_signal<'py>(
         &self,
         py: Python<'py>,
         read: &PyReadData,
+        max_samples: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<i16>>> {
         let reader = self.owning_reader(read)?;
         let signal_rows = read.inner.signal_rows.clone();
-        let signal = py.detach(|| reader.get_signal(&signal_rows).map_err(to_py_err))?;
+        let take = max_samples.unwrap_or(usize::MAX);
+        let signal = py.detach(|| {
+            reader
+                .get_signal_prefix(&signal_rows, take)
+                .map_err(to_py_err)
+        })?;
         Ok(PyArray1::from_vec(py, signal))
     }
 
     /// Calibrated pA signal for a read as a numpy float32 array.
+    #[pyo3(signature = (read, max_samples=None))]
     fn get_signal_pa<'py>(
         &self,
         py: Python<'py>,
         read: &PyReadData,
+        max_samples: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let reader = self.owning_reader(read)?;
         let signal_rows = read.inner.signal_rows.clone();
         let offset = read.inner.calibration_offset;
         let scale = read.inner.calibration_scale;
-        let raw = py.detach(|| reader.get_signal(&signal_rows).map_err(to_py_err))?;
+        let take = max_samples.unwrap_or(usize::MAX);
+        let raw = py.detach(|| {
+            reader
+                .get_signal_prefix(&signal_rows, take)
+                .map_err(to_py_err)
+        })?;
         Ok(PyArray1::from_vec(py, adc_to_pa(&raw, offset, scale)))
     }
 
@@ -311,12 +326,15 @@ impl PyDatasetReader {
     /// Raw ADC signal for multiple reads, decoded per owning file in parallel.
     ///
     /// Returns a list of (read_id, signal) tuples in the input order.
+    /// `max_samples` truncates each read, as on `Reader.get_signal`.
+    #[pyo3(signature = (reads, max_samples=None))]
     fn get_signals<'py>(
         &self,
         py: Python<'py>,
         reads: Vec<PyRef<'_, PyReadData>>,
+        max_samples: Option<usize>,
     ) -> PyResult<Vec<(String, Bound<'py, PyArray1<i16>>)>> {
-        let decoded = self.decode_bulk(py, &reads)?;
+        let decoded = self.decode_bulk(py, &reads, max_samples.unwrap_or(usize::MAX))?;
         Ok(decoded
             .into_iter()
             .map(|(id, sig)| (id, PyArray1::from_vec(py, sig)))
@@ -324,10 +342,12 @@ impl PyDatasetReader {
     }
 
     /// Calibrated pA signal for multiple reads, decoded per owning file.
+    #[pyo3(signature = (reads, max_samples=None))]
     fn get_signals_pa<'py>(
         &self,
         py: Python<'py>,
         reads: Vec<PyRef<'_, PyReadData>>,
+        max_samples: Option<usize>,
     ) -> PyResult<Vec<(String, Bound<'py, PyArray1<f32>>)>> {
         let cal: HashMap<String, (f32, f32)> = reads
             .iter()
@@ -338,7 +358,7 @@ impl PyDatasetReader {
                 )
             })
             .collect();
-        let decoded = self.decode_bulk(py, &reads)?;
+        let decoded = self.decode_bulk(py, &reads, max_samples.unwrap_or(usize::MAX))?;
         Ok(decoded
             .into_iter()
             .map(|(id, raw)| {
@@ -463,6 +483,7 @@ impl PyDatasetReader {
         &self,
         py: Python<'_>,
         reads: &[PyRef<'_, PyReadData>],
+        max_samples: usize,
     ) -> PyResult<Vec<(String, Vec<i16>)>> {
         let index = self.id_index()?;
 
@@ -491,7 +512,7 @@ impl PyDatasetReader {
                     .collect();
                 let results = self.readers[*reader_idx]
                     .1
-                    .get_signal_bulk(&inputs)
+                    .get_signal_bulk_prefix(&inputs, max_samples)
                     .map_err(to_py_err)?;
                 // get_signal_bulk preserves input order, so zip back to (pos, id).
                 for ((pos, id, _), (_, sig)) in items.iter().zip(results) {

@@ -212,30 +212,51 @@ impl PyReader {
 
     /// Get raw ADC signal for a read as a numpy int16 array.
     ///
+    /// With `max_samples`, decodes at most that many leading samples — the
+    /// same array `get_signal(read)[:max_samples]` would give, without paying
+    /// to decode the tail. A read shorter than `max_samples` comes back whole.
+    ///
     /// Releases the GIL during VBZ decompression.
+    #[pyo3(signature = (read, max_samples=None))]
     fn get_signal<'py>(
         &self,
         py: Python<'py>,
         read: &PyReadData,
+        max_samples: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<i16>>> {
         let signal_rows = read.inner.signal_rows.clone();
-        let signal = py.detach(|| self.inner.get_signal(&signal_rows).map_err(to_py_err))?;
+        let take = max_samples.unwrap_or(usize::MAX);
+        let signal = py.detach(|| {
+            self.inner
+                .get_signal_prefix(&signal_rows, take)
+                .map_err(to_py_err)
+        })?;
         Ok(PyArray1::from_vec(py, signal))
     }
 
     /// Get calibrated signal in picoamperes as a numpy float32 array.
     ///
     /// Applies: pA = (ADC + calibration_offset) * calibration_scale
+    ///
+    /// `max_samples` truncates as in `get_signal`; calibration is applied to
+    /// the returned prefix.
+    #[pyo3(signature = (read, max_samples=None))]
     fn get_signal_pa<'py>(
         &self,
         py: Python<'py>,
         read: &PyReadData,
+        max_samples: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let signal_rows = read.inner.signal_rows.clone();
         let offset = read.inner.calibration_offset;
         let scale = read.inner.calibration_scale;
+        let take = max_samples.unwrap_or(usize::MAX);
 
-        let raw = py.detach(|| self.inner.get_signal(&signal_rows).map_err(to_py_err))?;
+        let raw = py.detach(|| {
+            self.inner
+                .get_signal_prefix(&signal_rows, take)
+                .map_err(to_py_err)
+        })?;
         Ok(PyArray1::from_vec(py, adc_to_pa(&raw, offset, scale)))
     }
 
@@ -243,17 +264,25 @@ impl PyReader {
     ///
     /// Returns a list of (read_id, signal) tuples. Uses rayon for
     /// parallel VBZ decompression. Releases the GIL during decompression.
+    /// `max_samples` truncates each read as in `get_signal`.
+    #[pyo3(signature = (reads, max_samples=None))]
     fn get_signals<'py>(
         &self,
         py: Python<'py>,
         reads: Vec<PyRef<'_, PyReadData>>,
+        max_samples: Option<usize>,
     ) -> PyResult<Vec<(String, Bound<'py, PyArray1<i16>>)>> {
         let inputs: Vec<(String, Vec<u64>)> = reads
             .iter()
             .map(|r| (r.inner.read_id.to_string(), r.inner.signal_rows.clone()))
             .collect();
+        let take = max_samples.unwrap_or(usize::MAX);
 
-        let results = py.detach(|| self.inner.get_signal_bulk(&inputs).map_err(to_py_err))?;
+        let results = py.detach(|| {
+            self.inner
+                .get_signal_bulk_prefix(&inputs, take)
+                .map_err(to_py_err)
+        })?;
 
         results
             .into_iter()
@@ -265,10 +294,13 @@ impl PyReader {
     ///
     /// Returns a list of (read_id, signal_pa) tuples. Uses rayon for
     /// parallel VBZ decompression, then applies per-read calibration.
+    /// `max_samples` truncates each read as in `get_signal`.
+    #[pyo3(signature = (reads, max_samples=None))]
     fn get_signals_pa<'py>(
         &self,
         py: Python<'py>,
         reads: Vec<PyRef<'_, PyReadData>>,
+        max_samples: Option<usize>,
     ) -> PyResult<Vec<(String, Bound<'py, PyArray1<f32>>)>> {
         let inputs: Vec<(String, Vec<u64>)> = reads
             .iter()
@@ -278,9 +310,14 @@ impl PyReader {
             .iter()
             .map(|r| (r.inner.calibration_offset, r.inner.calibration_scale))
             .collect();
+        let take = max_samples.unwrap_or(usize::MAX);
 
         // get_signal_bulk preserves input order, so we can zip with `cal` directly.
-        let raw_results = py.detach(|| self.inner.get_signal_bulk(&inputs).map_err(to_py_err))?;
+        let raw_results = py.detach(|| {
+            self.inner
+                .get_signal_bulk_prefix(&inputs, take)
+                .map_err(to_py_err)
+        })?;
 
         raw_results
             .into_iter()

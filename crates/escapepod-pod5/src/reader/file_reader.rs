@@ -456,22 +456,30 @@ impl Reader {
     /// never deserializes the surrounding batch. Thread-safe and lock-free:
     /// the same primitive backs the parallel [`SignalExtractor`].
     pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
+        self.get_signal_prefix(signal_rows, usize::MAX)
+    }
+
+    /// Like [`Self::get_signal`] but decodes at most the first `max_samples`
+    /// samples of the read — identical to `get_signal(..)[..max_samples]`, and
+    /// shorter when the read is.
+    ///
+    /// For a consumer that already knows its boundary (adapter detection,
+    /// fingerprinting, barcode windows) this skips the SVB16 decode of the
+    /// unread tail, plus whole 128 KiB ZSTD blocks once a read is long enough
+    /// to span several. It cannot skip a partial ZSTD block, so a read that
+    /// fits in one — anything up to ~110k samples — saves the SVB16 stage only.
+    pub fn get_signal_prefix(&self, signal_rows: &[u64], max_samples: usize) -> Result<Vec<i16>> {
         let Some(footer) = self.signal_ipc_footer() else {
             // No parseable signal footer (missing table / edge case): fall back
-            // to Arrow's own IPC reader.
-            return self.get_signal_fallback(signal_rows);
+            // to Arrow's own IPC reader, which has no prefix path of its own.
+            let mut all = self.get_signal_fallback(signal_rows)?;
+            all.truncate(max_samples);
+            return Ok(all);
         };
 
         let signal_bytes = self.signal_table_bytes()?;
         let raw_chunks = footer.extract_signal_rows(signal_rows, signal_bytes)?;
-        let total_samples: usize = raw_chunks.iter().map(|c| c.samples as usize).sum();
-        let mut all_samples = Vec::with_capacity(total_samples);
-        for chunk in &raw_chunks {
-            let decompressed =
-                compression::decompress_signal(chunk.signal, chunk.samples as usize)?;
-            all_samples.extend_from_slice(&decompressed);
-        }
-        Ok(all_samples)
+        super::signal_extractor::decode_chunks(&raw_chunks, max_samples)
     }
 
     /// Fallback signal retrieval for edge cases (no signal metadata).
@@ -605,53 +613,65 @@ impl Reader {
         &self,
         reads: &[(K, Vec<u64>)],
     ) -> Result<Vec<(K, Vec<i16>)>> {
+        self.get_signal_bulk_prefix(reads, usize::MAX)
+    }
+
+    /// Like [`Self::get_signal_bulk`] but decodes at most the first
+    /// `max_samples` samples of each read. See [`Self::get_signal_prefix`] for
+    /// what a prefix does and does not save.
+    pub fn get_signal_bulk_prefix<K: Clone + Send>(
+        &self,
+        reads: &[(K, Vec<u64>)],
+        max_samples: usize,
+    ) -> Result<Vec<(K, Vec<i16>)>> {
         use crate::arrow_ipc::ArrowIpcFooter;
-        use crate::compression::vbz::decompress_signal;
         use rayon::prelude::*;
 
         let signal_bytes = self.signal_table_bytes()?;
         let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
 
-        // Collect all signal rows with back-references to which read they belong to
-        // (read_index, chunk_index_within_read, signal_row)
-        let mut all_rows: Vec<(usize, usize, u64)> = Vec::new();
-        for (read_idx, (_key, rows)) in reads.iter().enumerate() {
-            for (chunk_idx, &row) in rows.iter().enumerate() {
-                all_rows.push((read_idx, chunk_idx, row));
-            }
+        // Flatten every read's rows into one list so the extraction is a single
+        // batch-grouped, ascending-order sweep (see `get_compressed_signal_bulk`
+        // for why that matters on a cold network filesystem).
+        let row_indices: Vec<u64> = reads
+            .iter()
+            .flat_map(|(_key, rows)| rows.iter().copied())
+            .collect();
+        let raw_chunks = signal_footer.extract_signal_rows(&row_indices, signal_bytes)?;
+        if raw_chunks.len() != row_indices.len() {
+            // A requested row was out of bounds, so the returned chunks no
+            // longer line up positionally with the reads that asked for them.
+            return Err(Error::InvalidFooter(format!(
+                "signal table returned {} chunks for {} requested rows",
+                raw_chunks.len(),
+                row_indices.len()
+            )));
         }
 
-        // Extract all signal rows at once (batch-grouped, sequential I/O)
-        let row_indices: Vec<u64> = all_rows.iter().map(|&(_, _, row)| row).collect();
-        let raw_chunks = signal_footer.extract_signal_rows(&row_indices, signal_bytes)?;
+        // Re-slice the flat chunk list back into per-read runs — the extraction
+        // preserved input order, so each read's chunks are contiguous and in
+        // the order its `signal_rows` listed them.
+        let mut per_read: Vec<&[crate::arrow_ipc::RawSignalChunk<'_>]> =
+            Vec::with_capacity(reads.len());
+        let mut offset = 0usize;
+        for (_key, rows) in reads {
+            per_read.push(&raw_chunks[offset..offset + rows.len()]);
+            offset += rows.len();
+        }
 
-        // Decompress in parallel (VBZ decompression is CPU-bound)
-        let decompressed: Vec<Result<Vec<i16>>> = raw_chunks
+        // Decompress in parallel; VBZ decode is CPU-bound and reads are
+        // independent. One read per task, so the per-read prefix budget stays
+        // local to the task that spends it.
+        let decoded: Vec<Result<Vec<i16>>> = per_read
             .par_iter()
-            .map(|chunk| decompress_signal(chunk.signal, chunk.samples as usize))
+            .map(|chunks| super::signal_extractor::decode_chunks(chunks, max_samples))
             .collect();
 
-        // Assemble per-read
-        let mut result_chunks: Vec<Vec<(usize, Vec<i16>)>> = vec![Vec::new(); reads.len()];
-        for (i, decompressed_result) in decompressed.into_iter().enumerate() {
-            let (read_idx, chunk_idx, _) = all_rows[i];
-            result_chunks[read_idx].push((chunk_idx, decompressed_result?));
-        }
-
-        // Sort chunks within each read and concatenate
-        let mut results = Vec::with_capacity(reads.len());
-        for (read_idx, (key, _)) in reads.iter().enumerate() {
-            let chunks = &mut result_chunks[read_idx];
-            chunks.sort_by_key(|(idx, _)| *idx);
-            // Pre-size the concatenated signal so the flat_map doesn't grow-and-
-            // realloc; the total length is the sum of the per-chunk lengths.
-            let total: usize = chunks.iter().map(|(_, s)| s.len()).sum();
-            let mut signal = Vec::with_capacity(total);
-            signal.extend(chunks.iter().flat_map(|(_, s)| s.iter().copied()));
-            results.push((key.clone(), signal));
-        }
-
-        Ok(results)
+        reads
+            .iter()
+            .zip(decoded)
+            .map(|((key, _), signal)| Ok((key.clone(), signal?)))
+            .collect()
     }
 
     /// Bulk-extract **compressed** signal chunks for many reads in one pass.

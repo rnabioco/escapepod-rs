@@ -261,6 +261,40 @@ class TestSignal:
             assert isinstance(read_id, str)
             assert signal_pa.dtype == np.float32
 
+    def test_max_samples_matches_full_slice(self, reader):
+        """max_samples=n must give exactly what [:n] of the full read gives."""
+        read = reader.reads()[0]
+        full = reader.get_signal(read)
+        full_pa = reader.get_signal_pa(read)
+        for n in (0, 1, 7, 8, 100, len(full) - 1, len(full)):
+            np.testing.assert_array_equal(reader.get_signal(read, max_samples=n), full[:n])
+            np.testing.assert_array_equal(
+                reader.get_signal_pa(read, max_samples=n), full_pa[:n]
+            )
+
+    def test_max_samples_past_end_returns_whole_read(self, reader):
+        read = reader.reads()[0]
+        full = reader.get_signal(read)
+        np.testing.assert_array_equal(
+            reader.get_signal(read, max_samples=len(full) + 5_000), full
+        )
+
+    def test_max_samples_bulk(self, reader):
+        reads = reader.reads()[:3]
+        full = dict(reader.get_signals(reads))
+        full_pa = dict(reader.get_signals_pa(reads))
+        n = 64
+        for read_id, signal in reader.get_signals(reads, max_samples=n):
+            np.testing.assert_array_equal(signal, full[read_id][:n])
+        for read_id, signal_pa in reader.get_signals_pa(reads, max_samples=n):
+            np.testing.assert_array_equal(signal_pa, full_pa[read_id][:n])
+
+    def test_max_samples_default_is_whole_read(self, reader):
+        read = reader.reads()[0]
+        np.testing.assert_array_equal(
+            reader.get_signal(read, max_samples=None), reader.get_signal(read)
+        )
+
 
 class TestIterator:
     def test_iter(self, reader):
@@ -978,6 +1012,27 @@ class TestDatasetReader:
         n = ds.byte_count(read)
         # Compressed size is positive and smaller than the raw int16 payload.
         assert 0 < n < read.num_samples * 2
+
+    def test_max_samples(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        read = ds.reads(selection=[_IDS_B[1]])[0]
+        expected = np.arange(500, dtype=np.int16) + 1
+        np.testing.assert_array_equal(ds.get_signal(read, max_samples=40), expected[:40])
+        # Against the full read's own pA, not a re-derived one: calibration uses
+        # a fused multiply-add, so recomputing it here differs by ~1 ulp.
+        np.testing.assert_array_equal(
+            ds.get_signal_pa(read, max_samples=40), ds.get_signal_pa(read)[:40]
+        )
+
+    def test_max_samples_bulk_routes_per_file(self, dataset_dir):
+        ds = escapepod.DatasetReader(dataset_dir)
+        reads = ds.reads(selection=_IDS_A + _IDS_B)
+        full = dict(ds.get_signals(reads))
+        full_pa = dict(ds.get_signals_pa(reads))
+        for read_id, sig in ds.get_signals(reads, max_samples=17):
+            np.testing.assert_array_equal(sig, full[read_id][:17])
+        for read_id, sig in ds.get_signals_pa(reads, max_samples=17):
+            np.testing.assert_array_equal(sig, full_pa[read_id][:17])
 
 
 class TestContextManagerIndex:

@@ -1,6 +1,33 @@
 //! Thread-safe signal extractor for parallel per-read signal extraction.
 
+use crate::arrow_ipc::RawSignalChunk;
 use crate::error::Result;
+
+/// Decode a read's compressed chunks in order, stopping once `max_samples`
+/// samples have been produced.
+///
+/// The single definition of "a read's signal, optionally truncated" — every
+/// reader path (single, bulk, extractor) funnels through here so the prefix
+/// and full decodes cannot drift. Pass `usize::MAX` for a whole read.
+pub(crate) fn decode_chunks(chunks: &[RawSignalChunk<'_>], max_samples: usize) -> Result<Vec<i16>> {
+    use crate::compression::vbz::decompress_signal_prefix;
+
+    let available: usize = chunks.iter().map(|c| c.samples as usize).sum();
+    let mut result = Vec::with_capacity(available.min(max_samples));
+    let mut remaining = max_samples;
+    for chunk in chunks {
+        if remaining == 0 {
+            break;
+        }
+        let cs = chunk.samples as usize;
+        let take = cs.min(remaining);
+        // `decompress_signal_prefix(.., cs, cs)` is the full decode, so this
+        // needs no special case for the last chunk.
+        result.extend_from_slice(&decompress_signal_prefix(chunk.signal, cs, take)?);
+        remaining -= take;
+    }
+    Ok(result)
+}
 
 /// Thread-safe signal extractor for parallel per-read signal extraction.
 ///
@@ -17,50 +44,22 @@ impl<'a> SignalExtractor<'a> {
     ///
     /// Thread-safe: no shared mutable state.
     pub fn get_signal(&self, signal_rows: &[u64]) -> Result<Vec<i16>> {
-        use crate::compression::vbz::decompress_signal;
-
-        let raw_chunks = self
-            .footer
-            .extract_signal_rows(signal_rows, self.signal_bytes)?;
-        let total_samples: usize = raw_chunks.iter().map(|c| c.samples as usize).sum();
-        let mut result = Vec::with_capacity(total_samples);
-
-        for chunk in &raw_chunks {
-            let decompressed = decompress_signal(chunk.signal, chunk.samples as usize)?;
-            result.extend_from_slice(&decompressed);
-        }
-
-        Ok(result)
+        self.get_signal_prefix(signal_rows, usize::MAX)
     }
 
-    /// Like [`Self::get_signal`] but decompresses only the first `max_samples`
-    /// samples, decoding just the needed prefix of the chunk that crosses the
-    /// boundary (the rest of the ZSTD stream is skipped). Identical to
-    /// `get_signal(..)[..max_samples]`. Useful when a consumer (e.g. CNN adapter
-    /// detection) only looks at a fixed leading window of a potentially long
-    /// read.
+    /// Like [`Self::get_signal`] but decodes at most the first `max_samples`
+    /// samples — identical to `get_signal(..)[..max_samples]`, and shorter when
+    /// the read is. Useful when a consumer (e.g. CNN adapter detection) only
+    /// looks at a leading window of a potentially long read.
+    ///
+    /// The saving is in the SVB16 stage, and in whole 128 KiB ZSTD blocks for
+    /// reads long enough to span several; see
+    /// [`decompress_signal_prefix`](crate::compression::decompress_signal_prefix)
+    /// for why a short read cannot do better than a full inflate.
     pub fn get_signal_prefix(&self, signal_rows: &[u64], max_samples: usize) -> Result<Vec<i16>> {
-        use crate::compression::vbz::{decompress_signal, decompress_signal_prefix};
-
         let raw_chunks = self
             .footer
             .extract_signal_rows(signal_rows, self.signal_bytes)?;
-        let mut result = Vec::with_capacity(max_samples);
-        let mut remaining = max_samples;
-        for chunk in &raw_chunks {
-            if remaining == 0 {
-                break;
-            }
-            let cs = chunk.samples as usize;
-            let take = cs.min(remaining);
-            let decoded = if take == cs {
-                decompress_signal(chunk.signal, cs)?
-            } else {
-                decompress_signal_prefix(chunk.signal, cs, take)?
-            };
-            result.extend_from_slice(&decoded);
-            remaining -= take;
-        }
-        Ok(result)
+        decode_chunks(&raw_chunks, max_samples)
     }
 }

@@ -154,9 +154,35 @@ pub fn decode(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
         )));
     }
 
+    let (keys, values) = data.split_at(keys_len);
+    decode_split(keys, values, sample_count)
+}
+
+/// Decode `sample_count` samples from an already-split `(keys, values)` pair.
+///
+/// Runtime-dispatches exactly as [`decode`] does; that function is this one
+/// after splitting a contiguous buffer at `key_length(sample_count)`.
+///
+/// `keys` may be **longer** than `key_length(sample_count)` — a key section
+/// sized for a whole chunk is fine when decoding a prefix of it, because both
+/// the SIMD loops and the scalar tail only address bits `0..sample_count`.
+/// That is what lets the VBZ prefix path share these decoders instead of
+/// keeping a second, scalar-only one: this function replaced a `decode_prefix`
+/// that never dispatched to SIMD and so ran a prefix slower than a full decode.
+pub fn decode_split(keys: &[u8], values: &[u8], sample_count: usize) -> Result<Vec<i16>> {
+    if sample_count == 0 {
+        return Ok(Vec::new());
+    }
+    if keys.len() < key_length(sample_count) {
+        return Err(Error::Decompression(format!(
+            "SVB16 key section too short: expected at least {} bytes, got {}",
+            key_length(sample_count),
+            keys.len()
+        )));
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
-        let (keys, values) = data.split_at(keys_len);
         let mut out: Vec<i16> = Vec::with_capacity(sample_count);
         if is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 verified at runtime.
@@ -176,7 +202,7 @@ pub fn decode(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
         }
     }
 
-    decode_scalar(data, sample_count)
+    decode_split_scalar(keys, values, sample_count)
 }
 
 /// Scalar SVB16 decode. Always available; serves as the fallback and the
@@ -196,6 +222,16 @@ pub fn decode_scalar(data: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     }
 
     let (keys, values) = data.split_at(keys_len);
+    decode_split_scalar(keys, values, sample_count)
+}
+
+/// Scalar counterpart of [`decode_split`]: the reference every SIMD path is
+/// checked against, and the fallback off x86_64.
+///
+/// As in `decode_split`, `keys` may cover more samples than `sample_count`
+/// — only bits `0..sample_count` are read, and `values` need only hold those
+/// samples' bytes.
+pub fn decode_split_scalar(keys: &[u8], values: &[u8], sample_count: usize) -> Result<Vec<i16>> {
     let mut samples = Vec::with_capacity(sample_count);
     let mut data_offset = 0;
     let mut prev: u16 = 0;
@@ -248,43 +284,6 @@ pub fn value_bytes(keys: &[u8], n: usize) -> usize {
         total += if two { 2 } else { 1 };
     }
     total
-}
-
-/// Decode the first `n` samples from an already-split `keys` / `values` pair,
-/// where `keys` is the full key section (sized for the chunk's total samples)
-/// and `values` holds at least the first `n` samples' bytes. Bit-identical to
-/// the first `n` entries of a full [`decode`] (zigzag + delta is sequential and
-/// starts from 0). The `keys` slice must cover the whole chunk so bit `i` lines
-/// up with sample `i`.
-pub fn decode_prefix(keys: &[u8], values: &[u8], n: usize) -> Result<Vec<i16>> {
-    let mut samples = Vec::with_capacity(n);
-    let mut data_offset = 0usize;
-    let mut prev: u16 = 0;
-    for i in 0..n {
-        let two = (keys[i / 8] >> (i % 8)) & 1 == 1;
-        let value = if two {
-            if data_offset + 2 > values.len() {
-                return Err(Error::Decompression(
-                    "SVB16 prefix truncated: expected 2-byte value".to_string(),
-                ));
-            }
-            let v = u16::from_le_bytes([values[data_offset], values[data_offset + 1]]);
-            data_offset += 2;
-            v
-        } else {
-            if data_offset >= values.len() {
-                return Err(Error::Decompression(
-                    "SVB16 prefix truncated: expected 1-byte value".to_string(),
-                ));
-            }
-            let v = values[data_offset] as u16;
-            data_offset += 1;
-            v
-        };
-        prev = prev.wrapping_add(zigzag_decode(value));
-        samples.push(prev as i16);
-    }
-    Ok(samples)
 }
 
 /// Validate SVB16 encoded data without fully decoding.
@@ -397,6 +396,57 @@ mod tests {
             enc, enc_scalar,
             "dispatched encode must match scalar encode"
         );
+    }
+
+    /// `decode_split` must accept a key section sized for the whole chunk and
+    /// decode just the first `n` samples from it — that over-long `keys` is the
+    /// entire reason the prefix path can share the SIMD decoders instead of
+    /// keeping a scalar copy. Checked against both the scalar reference and a
+    /// truncated full decode, at every alignment around the 8- and 16-sample
+    /// block boundaries the SIMD loops step by.
+    #[test]
+    fn test_decode_split_prefix_of_chunk_keys() {
+        let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+        let samples: Vec<i16> = (0..3000)
+            .map(|i| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // Mix 1-byte and 2-byte deltas so key bits vary across any cut.
+                if i % 11 == 0 {
+                    (s >> 48) as i16
+                } else {
+                    (i as i16 % 7) - 3
+                }
+            })
+            .collect();
+        let total = samples.len();
+        let encoded = encode(&samples).unwrap();
+        let (keys, values) = encoded.split_at(key_length(total));
+
+        for n in [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 999, 1000, 2999, total,
+        ] {
+            let want = &samples[..n];
+            let vlen = value_bytes(keys, n);
+            // Values trimmed to exactly the prefix: no load headroom, so the
+            // SIMD tail handling is what gets exercised.
+            let tight = decode_split(keys, &values[..vlen], n).unwrap();
+            assert_eq!(tight, want, "tight decode_split mismatch at n={n}");
+            // ...and with the whole value section available, which is what the
+            // one-shot VBZ path hands over.
+            let loose = decode_split(keys, values, n).unwrap();
+            assert_eq!(loose, want, "loose decode_split mismatch at n={n}");
+            let scalar = decode_split_scalar(keys, &values[..vlen], n).unwrap();
+            assert_eq!(tight, scalar, "SIMD/scalar disagree at n={n}");
+        }
+    }
+
+    #[test]
+    fn test_decode_split_rejects_short_keys() {
+        let samples: Vec<i16> = (0..100).collect();
+        let encoded = encode(&samples).unwrap();
+        let (keys, values) = encoded.split_at(key_length(100));
+        // 12 key bytes cover 96 samples; asking for 100 must not read past them.
+        assert!(decode_split(&keys[..12], values, 100).is_err());
     }
 
     #[test]

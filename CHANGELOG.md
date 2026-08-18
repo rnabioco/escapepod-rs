@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+### Added
+
+- **Bounded signal reads: `max_samples` on the Python reader API** (#237).
+  `Reader.get_signal{,_pa}`, `Reader.get_signals{,_pa}` and the same four on
+  `DatasetReader` take an optional `max_samples`, returning exactly what
+  `[:max_samples]` of the full read would give without paying to decode the
+  tail. Default `None` is today's behaviour; a read shorter than `max_samples`
+  comes back whole. Backed by `Reader::get_signal_prefix` and
+  `Reader::get_signal_bulk_prefix` in `escapepod-pod5`.
+
+  **What it saves, honestly.** Decode is 79% ZSTD / 21% SVB16 on tRNA-length
+  reads (87/16 on mRNA), and ZSTD inflates a whole 128 KiB block into its
+  window before emitting any of it. A chunk that fits in one block — every read
+  up to ~110k samples — therefore cannot skip ZSTD work at all, only SVB16. The
+  sample ratio is not the time ratio: end to end against 0.11.0, asking for
+  5,400 of 9,828 samples is **1.26x**, not the 1.8x the ratio suggests. Smaller
+  windows and longer reads do better — 1.41x at a 10% tRNA prefix, 1.85x at a
+  10% mRNA prefix, and once a read is long enough to span several ZSTD blocks
+  the streaming path takes over: on 1M-sample chunks a 10k-sample prefix is
+  **9.9x** a full decode.
+
+### Changed
+
+- **VBZ decode reuses a per-thread ZSTD context.** `zstd::decode_all` built a
+  fresh `Decoder` per call — a `DCtx`, its window buffer, and a 32 KB
+  `BufReader` — which at POD5 chunk sizes is a large share of the decode.
+  Measured **1.13x on tRNA-length reads and 1.49x on mRNA**, for every caller
+  of `decompress_signal`, with no API change. Buffers are sized from the ZSTD
+  frame's content size rather than the SVB16 worst case (~1.75x over what real
+  signal encodes to), and the thread-local scratch is capped at 1 MiB so one
+  pathological read cannot pin memory per rayon worker.
+
+- `Reader::get_signal_bulk` now errors when the signal table returns fewer
+  chunks than rows requested. It previously carried on and mis-assigned the
+  remaining chunks to the wrong reads — reachable only from a malformed file,
+  but silent when it happened. `get_compressed_signal_bulk` already guarded
+  this.
+
+### Fixed
+
+- **`decompress_signal_prefix` no longer loses to a full decode.** It gated the
+  streaming path on a sample fraction (`n*4 >= total`), which put the crossover
+  where streaming is *slowest*: a 25% prefix measured **0.80x** — slower than
+  decoding the whole read. Two causes, both fixed. The gate was on the wrong
+  quantity: what governs early exit is whether a whole 128 KiB ZSTD block can
+  be skipped, which at tRNA read lengths is never, so streaming ran and saved
+  nothing. And the SVB16 half ran a scalar decoder while the full path
+  dispatches to AVX2 — forced at a 75% prefix, that path cost 0.43x a full
+  decode. Both branches now share the SIMD decode via the new
+  `svb16::decode_split`, which accepts a chunk-sized key section; the
+  scalar-only `svb16::decode_prefix` is gone, superseded by it. `escpod demux
+  detect`/`fingerprint`, which already read prefixes, pick this up unchanged.
+
 ## 0.11.0 (2026-08-17)
 
 ### Fixed
