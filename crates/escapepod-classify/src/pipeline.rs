@@ -11,7 +11,7 @@
 //! exercise the very code the command runs.
 
 use crate::anchor::{self, AnchoredRead, Orientation, OrientationVotes, ScanOutcome, SkipReason};
-use crate::bundle::{ChargingBundle, ChargingScorer};
+use crate::bundle::{Abstain, AbstainRule, ChargingBundle, ChargingScorer};
 use crate::features;
 use crate::geometry::RefGeometry;
 use crate::recipe::FeatureRecipe;
@@ -259,14 +259,84 @@ pub struct ReadCall {
     pub cl: u8,
 }
 
+/// Why an anchored read has no call.
+///
+/// Named per read rather than tallied, because a drop that is only a count is
+/// a drop nobody can chase: the same 12% that
+/// `rnabioco/aa-tRNA-seq-pipeline#110` had to infer from the difference
+/// between two rows of a QC table, because remora reports no per-read reason.
+/// Every read that anchors leaves this pipeline either with a probability or
+/// with one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCallReason {
+    /// Excluded by the bundle's abstain rule, which one — see [`abstains`].
+    ///
+    /// Carries the rule rather than a bare "abstained" so the reason column
+    /// names the **population**, not the mechanism that caught it. What the
+    /// rule catches is a real class of molecule, not a degraded tRNA read:
+    /// measured over a 1.06M-read run (`aligner_arm_depth == 0`, 0.85% of
+    /// scoreable reads), the alignment stops exactly at the junction with a
+    /// median 81-101 nt of unaligned sequence after it, at *higher* mapq than
+    /// the reads that were called, and that sequence is
+    ///
+    /// | 3' tail                              | share |
+    /// |--------------------------------------|-------|
+    /// | reverse complement of the common arm | 51.8% |
+    /// | other                                | 42.5% |
+    /// | poly(A)                              |  4.2% |
+    /// | the arm, present but unaligned       |  1.4% |
+    ///
+    /// The common partner oligo is the revcomp of the arm, so the plurality
+    /// are reads of the **wrong strand of the duplex**. They are not reads the
+    /// model scores badly; they are reads of something else, and lumping them
+    /// under "could not classify" hides a population worth counting on its own.
+    Abstained(crate::bundle::AbstainRule),
+    /// No signal in the POD5 set (dorado read splitting mints child ids that
+    /// are not in the file).
+    NoSignal,
+    /// Signal length disagreed with the `ns` tag, so the move-table frame
+    /// would put every span in the wrong place.
+    NsMismatch,
+}
+
+impl NoCallReason {
+    /// Stable token for the `reason` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Abstained(AbstainRule::NoAlignedArm) => "no_aligned_arm",
+            Self::NoSignal => "no_signal",
+            Self::NsMismatch => "ns_mismatch",
+        }
+    }
+}
+
+/// An anchored read that got no probability, and why.
+#[derive(Debug, Clone)]
+pub struct NoCall {
+    pub read_id: Uuid,
+    pub reference: String,
+    pub reason: NoCallReason,
+}
+
 /// Reads that anchored but could not be classified.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ClassifyStats {
+    /// Every unscored read, with its reason — the attributable form of the
+    /// counters below.
+    pub no_calls: Vec<NoCall>,
     /// No signal in the POD5 set (e.g. dorado read-splitting children).
     pub no_signal: u64,
     /// Signal length disagreed with the `ns` tag (split/trimmed reads);
     /// the move-table frame would put every span in the wrong place.
     pub ns_mismatch: u64,
+    /// Excluded by the bundle's own abstain rule: anchored, with signal, and
+    /// deliberately not scored.
+    ///
+    /// Distinct from the two above, which are reads the runtime *could not*
+    /// score. This one is a refusal, and its rate belongs beside any charging
+    /// fraction computed from the calls — arm resolvability is correlated with
+    /// the label, so a fraction over called reads alone is biased.
+    pub abstained: u64,
 }
 
 /// The bundle's scorer, made ready to run: `P(classes[1])` from the flat
@@ -304,6 +374,29 @@ impl Scorer<'_> {
     }
 }
 
+/// Does the bundle's abstain rule exclude this read?
+///
+/// Separate from [`classify_reads`] so the decision can be tested on coords
+/// directly: the rule fires on a population no small fixture is guaranteed to
+/// contain (reads the aligner could not place a single arm base on), and a
+/// test that silently never fires would be worse than none. Its rate on a real
+/// corpus is what the CLI reports.
+pub fn abstained_by(
+    abstain: Option<&Abstain>,
+    coords: &crate::JunctionCoords,
+) -> Option<AbstainRule> {
+    match abstain.map(|a| a.kind) {
+        // The aligner reached no arm base at all. Note this is NOT "the window
+        // was short": under the counting anchor the read still has arm
+        // features, walked along the query. See [`NoCallReason::Abstained`]
+        // for what these reads turn out to be.
+        Some(AbstainRule::NoAlignedArm) if coords.aligner_arm_depth == 0 => {
+            Some(AbstainRule::NoAlignedArm)
+        }
+        _ => None,
+    }
+}
+
 /// Classify every anchored read with signal, in parallel.
 ///
 /// Returns calls sorted by read id (deterministic output order) plus the
@@ -321,20 +414,33 @@ pub fn classify_reads(
 
     enum Outcome {
         Call(ReadCall),
-        NoSignal,
-        NsMismatch,
+        None(NoCall),
     }
+    let no_call = |read: &AnchoredRead, reason| {
+        Outcome::None(NoCall {
+            read_id: read.read_id,
+            reference: read.reference.clone(),
+            reason,
+        })
+    };
     let outcomes: Vec<Outcome> = reads
         .par_iter()
         .map(|read| {
             let Some(info) = pod5.reads().get(&read.read_id) else {
-                return Ok(Outcome::NoSignal);
+                return Ok(no_call(read, NoCallReason::NoSignal));
             };
             let sig_pa = signal_pa(info, &extractors)?;
             if sig_pa.len() as i64 != read.ns {
-                return Ok(Outcome::NsMismatch);
+                return Ok(no_call(read, NoCallReason::NsMismatch));
             }
-            let grid = feature_grid(&recipe, read, orientation, &sig_pa);
+            // Resolved once and reused: the abstain rule reads the same coords
+            // the features are taken from, so the two cannot disagree about
+            // what the aligner reached.
+            let coords = anchor::finalize(read, orientation, recipe.offsets, recipe.span_mode);
+            if let Some(rule) = abstained_by(bundle.abstain.as_ref(), &coords) {
+                return Ok(no_call(read, NoCallReason::Abstained(rule)));
+            }
+            let grid = feature_grid_at(&recipe, read, &coords, &sig_pa);
             let features = bundle.select_columns(&grid);
             let p = predictor.p_positive(&features)?;
             Ok(Outcome::Call(ReadCall {
@@ -351,10 +457,17 @@ pub fn classify_reads(
     for o in outcomes {
         match o {
             Outcome::Call(c) => calls.push(c),
-            Outcome::NoSignal => stats.no_signal += 1,
-            Outcome::NsMismatch => stats.ns_mismatch += 1,
+            Outcome::None(n) => {
+                match n.reason {
+                    NoCallReason::NoSignal => stats.no_signal += 1,
+                    NoCallReason::NsMismatch => stats.ns_mismatch += 1,
+                    NoCallReason::Abstained(_) => stats.abstained += 1,
+                }
+                stats.no_calls.push(n);
+            }
         }
     }
     calls.sort_by_key(|c| c.read_id);
+    stats.no_calls.sort_by_key(|n| n.read_id);
     Ok((calls, stats))
 }

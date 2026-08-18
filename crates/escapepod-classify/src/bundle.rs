@@ -233,12 +233,6 @@ pub struct AnchorBlock {
 }
 
 /// When the bundle says the model must not be asked.
-///
-/// Parsed and carried, **not applied**: this crate scores every read it can
-/// anchor, so honouring the rule is still the caller's job
-/// (rnabioco/escapepod-rs#230). Naming it is the point — until now the block
-/// was dropped at parse time, so the shipped GBM bundle's rule went unapplied
-/// with nothing anywhere to say so.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // `Doc` fields: named, never read
@@ -253,6 +247,58 @@ pub struct AbstainBlock {
     why: Doc,
     #[serde(default)]
     reporting: Doc,
+}
+
+/// A bundle's abstain condition, resolved to something the runtime evaluates.
+///
+/// The rule arrives as prose (`"aligner_arm_depth == 0"`), and it is matched
+/// against the forms this runtime implements rather than parsed as a general
+/// expression. An unrecognised rule is a **load error**: a condition saying
+/// which reads must not be scored, silently unapplied, is precisely the
+/// failure this whole file is built to prevent — and it is the one that
+/// actually happened (rnabioco/escapepod-rs#230).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbstainRule {
+    /// `aligner_arm_depth == 0`: the aligner placed no common-arm base at all.
+    ///
+    /// Not the same as a short window. Under the counting anchor such a read
+    /// still *has* arm features — walked along the query — they simply do not
+    /// discriminate: the bundle measures balanced accuracy 0.4993 on that
+    /// population, with 100% of the uncharged library called charged. So the
+    /// read is untrustworthy rather than incomplete, and the answer is no
+    /// answer.
+    NoAlignedArm,
+}
+
+/// A bundle's abstain rule: what it says, and what it means here.
+#[derive(Clone, Debug)]
+pub struct Abstain {
+    /// Verbatim, for logs and reports.
+    pub rule: String,
+    /// What the runtime evaluates per read.
+    pub kind: AbstainRule,
+}
+
+impl Abstain {
+    /// Resolve the declared rule, refusing one this runtime cannot evaluate.
+    fn parse(block: &AbstainBlock) -> Result<Self> {
+        // Whitespace is presentation: `a == 0` and `a==0` are one rule.
+        let normalised: String = block.rule.split_whitespace().collect();
+        let kind = match normalised.as_str() {
+            "aligner_arm_depth==0" => AbstainRule::NoAlignedArm,
+            _ => bail!(
+                "the bundle declares an abstain rule this runtime cannot evaluate: \
+                 {:?}. It names the reads the model must not be asked about, so \
+                 running without it would score exactly the reads the bundle says \
+                 are untrustworthy. Supported: `aligner_arm_depth == 0`",
+                block.rule
+            ),
+        };
+        Ok(Self {
+            rule: block.rule.clone(),
+            kind,
+        })
+    }
 }
 
 /// Mapping refinement the training corpus was built with.
@@ -529,9 +575,10 @@ pub struct ChargingBundle {
     /// Present iff the recipe uses `resid` columns.
     pub kmer: Option<KmerLevels>,
     pub operating_point: Option<OperatingPoint>,
-    /// When the bundle says the model must not be asked. Carried so a caller
-    /// can apply it — this crate does not (rnabioco/escapepod-rs#230).
-    pub abstain: Option<AbstainBlock>,
+    /// When the model must not be asked. Applied by
+    /// [`classify_reads`](crate::classify_reads), which emits no call for a
+    /// read the rule excludes.
+    pub abstain: Option<Abstain>,
 }
 
 /// sha256 of a file, lowercase hex.
@@ -917,7 +964,7 @@ impl ChargingBundle {
             columns,
             kmer,
             operating_point: meta.operating_point,
-            abstain: meta.abstain,
+            abstain: meta.abstain.as_ref().map(Abstain::parse).transpose()?,
         })
     }
 

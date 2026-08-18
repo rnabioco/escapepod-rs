@@ -4,6 +4,41 @@
 
 ### Fixed
 
+- **`escpod signal classify` applies the bundle's abstain rule, and every
+  unscored read now says why.** A charging bundle can name reads the model must
+  not be asked about; the block was parsed and then dropped, so those reads got
+  a confident `cl` like any other (#230). The rule is now evaluated, and one it
+  cannot evaluate is a load error rather than a silent pass — accepting an
+  unknown rule would score exactly the reads the bundle excludes.
+
+  **What the rule catches is a distinct population, not a scoring failure.**
+  Measured on a 1.06M-read edx07 corpus it fires on **0.85%** of scoreable
+  reads. On those reads the alignment stops exactly at the CCA-adapter
+  junction with a median 81-101 nt of unaligned sequence after it, at *higher*
+  mapq than the reads that were called, and that 3' sequence is the reverse
+  complement of the common arm 51.8% of the time (the common partner oligo is
+  the arm's revcomp, so the plurality are reads of the wrong strand of the
+  duplex), poly(A) 4.2%, the arm-but-unaligned 1.4%, other 42.5%. They are
+  reads of something else, so the `reason` column names the population
+  (`no_aligned_arm`) rather than the mechanism that caught them.
+
+  The bundle's own rationale is stale and worth correcting upstream: it cites
+  23-34% of charged-library reads, measured under the *aligner*-derived span
+  rule on the yeast/v2 adapters. Under the counting anchor on this adapter
+  family the geometry it was written for has largely been fixed, which is the
+  outcome `rnabioco/aa-tRNA-seq-pipeline#110` is after.
+
+  **Every anchored read is now accounted for.** `--tsv` gains a `reason`
+  column and emits a row per unscored read — `no_aligned_arm`, `no_signal`,
+  `ns_mismatch` — where before they simply vanished and were visible only as
+  an aggregate warning. That is the same failure #110 raises against remora
+  one layer up: a 12% drop that had to be inferred from the gap between two QC
+  rows. The column is empty for a call, so the file still reads as
+  `read_id, reference, p, cl` for anything that only wants calls. No-called
+  reads get no `cl` tag on the BAM, per the bundle's `emit` contract.
+
+### Fixed
+
 - **The charging feature-model CNN scores 6.1× faster — 305 → 50 µs/read —
   by hoisting the convolution padding out of the graph at load.** A `Conv`
   lowers to im2col + matmul in tract, and tract's im2col has a fast block-copy

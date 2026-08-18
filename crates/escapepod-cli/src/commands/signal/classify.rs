@@ -152,16 +152,11 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
              caller's responsibility (do not assume the legacy 200)"
         ),
     }
-    // The bundle names reads it says must not be scored, and this runtime
-    // scores them anyway (rnabioco/escapepod-rs#230). Said out loud because a
-    // rule that is declared, parsed and then ignored is worse than one that
-    // was never written down — the output looks exactly as it should.
-    if let Some(ab) = &bundle.abstain {
-        warn!(
-            "bundle declares an abstain rule ({}) that this runtime does not apply — \
-             every anchored read is scored, including the ones it excludes (#230)",
-            ab.rule
-        );
+    match &bundle.abstain {
+        Some(ab) => info!("abstain rule: {} — those reads get no call", ab.rule),
+        // Not a defect, but worth saying: every bundle escapepod-models ships
+        // carries one, so its absence usually means an old or hand-made bundle.
+        None => info!("bundle declares no abstain rule; every anchored read is scored"),
     }
 
     // --- Reference geometry ----------------------------------------------
@@ -245,6 +240,21 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
             stats.ns_mismatch
         );
     }
+    // The no-call rate is reported at info level rather than buried, because
+    // the bundle asks for it: arm resolvability is correlated with charging,
+    // so a charging fraction over called reads alone is biased low, and the
+    // reader cannot correct for a number they never saw.
+    if let Some(ab) = &bundle.abstain {
+        let total = stats.abstained + calls.len() as u64;
+        info!(
+            "{} of {} scoreable reads ({:.1}%) were no-called by the bundle's \
+             abstain rule ({}); report this rate beside any charging fraction",
+            stats.abstained,
+            total,
+            100.0 * stats.abstained as f64 / total.max(1) as f64,
+            ab.rule,
+        );
+    }
     if calls.is_empty() {
         bail!("no reads could be classified");
     }
@@ -270,13 +280,35 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     }
 
     // --- TSV --------------------------------------------------------------
+    //
+    // Every anchored read gets a row: a probability, or an empty one and the
+    // reason it has none. A read that simply vanishes from the output is a
+    // drop nobody can chase later — the failure
+    // `rnabioco/aa-tRNA-seq-pipeline#110` had to reverse-engineer from the gap
+    // between two QC rows, since remora reports no per-read reason. The
+    // `reason` column is empty for a call, so the file still reads as
+    // `read_id, reference, p, cl` for anything that only wants calls.
     if let Some(tsv_path) = &args.tsv {
         let mut w = std::io::BufWriter::new(std::fs::File::create(tsv_path)?);
-        writeln!(w, "read_id\treference\tp_{}\tcl", bundle.classes[1])?;
+        writeln!(w, "read_id\treference\tp_{}\tcl\treason", bundle.classes[1])?;
         for c in &calls {
-            writeln!(w, "{}\t{}\t{:.6}\t{}", c.read_id, c.reference, c.p, c.cl)?;
+            writeln!(w, "{}\t{}\t{:.6}\t{}\t", c.read_id, c.reference, c.p, c.cl)?;
         }
-        info!("wrote {} calls to {}", calls.len(), tsv_path.display());
+        for n in &stats.no_calls {
+            writeln!(
+                w,
+                "{}\t{}\t\t\t{}",
+                n.read_id,
+                n.reference,
+                n.reason.as_str()
+            )?;
+        }
+        info!(
+            "wrote {} calls + {} no-calls to {}",
+            calls.len(),
+            stats.no_calls.len(),
+            tsv_path.display()
+        );
     }
 
     // --- Pass 2: write the BAM with `cl` ----------------------------------
