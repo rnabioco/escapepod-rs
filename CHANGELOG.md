@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 (2026-08-17)
+
 ### Fixed
 
 - **`escpod signal classify` applies the bundle's abstain rule, and every
@@ -37,7 +39,27 @@
   `read_id, reference, p, cl` for anything that only wants calls. No-called
   reads get no `cl` tag on the BAM, per the bundle's `emit` contract.
 
-### Fixed
+- **The counting anchor falls back to a resolved arm base, not straight to the
+  junction (#226).** When the counted boundary base runs off the end of the move
+  table, the reference implementation falls back as the aligner mode does — any
+  resolved arm base first, since it over-masks least, and the junction only when
+  nothing of the arm resolved at all. Counting mode went straight to the
+  junction, masking more of the window than it should. Found by comparing a real
+  corpus rather than the fixture: 4 reads in 842 came back `junction_fallback`
+  against the reference's `arm_fallback`, which moved their mask boundary and so
+  changed the features. All 19 fixture reads resolve as `counted`, so the golden
+  could not catch it; both modes now share one fallback chain.
+
+- **`escapepod-classify` matched the charging feature definition as it stood on
+  2026-08-10, not the current one (#222).** Two commits landed in
+  escapepod-models on 2026-08-13 and neither was carried over, so every charging
+  model trained since computed different features from the ones `escpod
+  classify` would score it with — silently, because the recipe recorded nothing
+  that could catch it. Regenerating the golden from the current reference showed
+  it stale by **116 / 1900 features (6.1%)** in NaN pattern with **zero**
+  finite-value mismatches: the arithmetic always agreed, *which offsets resolve*
+  did not. The Rust matched the stale golden, so the parity test was green
+  against a superseded definition.
 
 - **The charging feature-model CNN scores 6.1× faster — 305 → 50 µs/read —
   by hoisting the convolution padding out of the graph at load.** A `Conv`
@@ -80,7 +102,53 @@
   and the GBM arm is microseconds. At 2M reads on 32 cores the CNN scorer now
   costs ~3 s rather than ~19 s.
 
+### Performance
+
+- **`demux basecall` reads ahead one batch, so the encoder is not idle (#218).**
+  The per-Arrow-batch stages ran in lockstep — read signal → prep → encode →
+  match → write — with nothing overlapping. On a live production run (136 GB /
+  20 files, A30, `--gpu`) that measured **62% mean GPU utilisation with 20% of
+  samples below 5%**, the dead windows being the reader stalled *inside a page
+  fault* demand-paging off the network filesystem at ~2.4 MB/s, with only ~1.4
+  of 16 allocated cores busy.
+
 ### Added
+
+- **Python: `AnchoredReads` — motif-anchored windows and per-offset statistics
+  (#223, #224, #225, #227).** `escapepod-classify` already scans a BAM, indexes
+  POD5 and reduces each read to per-offset statistics in parallel; there was no
+  way into it from Python, so the training side reimplemented the loop in NumPy
+  on one core. Nothing in the binding names an assay: it takes a reference
+  motif, base offsets, a mask rule and optionally a k-mer table, and returns the
+  signal window plus `(dwell, mean, std, resid)` per offset, so a corpus build
+  and `escpod signal classify` compute features from the same code rather than
+  two ports that agree until they don't.
+
+  `extract` returns the **full corpus row** rather than five of its fields
+  (#224) — `JunctionCoords` now carries `cca_a_sig`, `cca_a_dwell`,
+  `junction_dwell`, `arm_resolved_depth`, `aligner_arm_depth`, `polya_mid_sig`
+  and `body_mid_sig`, computed once where the spans are, because recomputing
+  them in the caller is how two implementations of one rule start.
+
+  The scan's own bookkeeping is exposed too (#225): `records_scanned`, `skips`
+  keyed by a stable snake_case reason, and `orientation_votes`. The corpus
+  builder's retention audit is a mandatory gate that compares rejection rates
+  run to run — a rate that differs by class is a label-correlated filter, which
+  is how two separate bugs got into this pipeline.
+
+  `storage_order(read_ids)` (#227) reorders a selection the way `extract` will
+  read it. `extract` already sorted *within* a batch (199 s → 55 s on 60k
+  reads); a caller that shuffled 8M ids into 250k-read batches still swept all
+  20 POD5 files per batch — ~32 passes over 136 GB on a network filesystem,
+  presenting as "huge RAM, no CPU" with `read_bytes` flat at zero, because POD5
+  is mmap'd and its page faults never appear as `read()` bytes.
+
+- **`escapepod-signal` gains two model-agnostic primitives (#221).**
+  `features::span_stats` reduces caller-supplied `[start, end)` intervals to
+  dwell, mean level and sd via prefix sums over the spanned region — one pass
+  plus O(1) per span, rather than a pass per span. How a base maps to signal is
+  the caller's business; the reduction is identical either way. K-mer level
+  centring is now explicit rather than assumed.
 
 - **`escpod signal classify` loads the per-base-feature ONNX charging model
   (`feature_model`).** The `escapepod-charging-classifier/1` format names three
