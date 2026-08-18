@@ -66,13 +66,41 @@ fn classify_end_to_end_matches_golden() {
     // --- TSV vs golden ----------------------------------------------------
     let tsv = std::fs::read_to_string(&out_tsv).unwrap();
     let mut calls: HashMap<String, (f64, u8)> = HashMap::new();
+    let mut no_calls: HashMap<String, String> = HashMap::new();
+    // Every anchored read gets a row now: a probability, or an empty one and
+    // the reason it has none. The `reason` column is what makes a drop
+    // attributable rather than a read that silently vanished.
     for line in tsv.lines().skip(1) {
-        let mut it = line.split('\t');
-        let id = it.next().unwrap().to_string();
-        let _reference = it.next().unwrap();
-        let p: f64 = it.next().unwrap().parse().unwrap();
-        let cl: u8 = it.next().unwrap().parse().unwrap();
-        calls.insert(id, (p, cl));
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 5, "row does not carry the reason column: {line}");
+        let id = f[0].to_string();
+        match f[4] {
+            "" => {
+                calls.insert(id, (f[2].parse().unwrap(), f[3].parse().unwrap()));
+            }
+            reason => {
+                assert!(
+                    f[2].is_empty() && f[3].is_empty(),
+                    "no-call {id} carries a probability"
+                );
+                no_calls.insert(id, reason.to_string());
+            }
+        }
+    }
+    // The padded duplicates have fresh UUIDs and no POD5 signal, so the
+    // fixture always exercises at least one no-call reason.
+    assert!(
+        !no_calls.is_empty(),
+        "expected no-call rows for the reads without signal"
+    );
+    for (id, reason) in &no_calls {
+        assert!(
+            matches!(
+                reason.as_str(),
+                "no_signal" | "ns_mismatch" | "no_aligned_arm"
+            ),
+            "read {id}: unknown reason {reason:?}"
+        );
     }
 
     let reads = golden["reads"].as_array().unwrap();
