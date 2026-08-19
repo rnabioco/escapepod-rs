@@ -4,6 +4,32 @@
 
 ### Added
 
+- **`escpod demux detect --method cnn --gpu --profile` reports a per-stage
+  breakdown** (#239). The GPU path is a producer (decode + prep on the rayon
+  pool) feeding a batched onnxruntime consumer through a bounded channel, and
+  until now the only way to ask which of them was the constraint was to sample
+  `nvidia-smi` from outside and guess. `--profile` now prints, alongside the
+  existing phase total:
+
+  ```text
+  GPU pipeline
+    index (reads table)                0.31s
+    read + decode (cpu-time)          16.82s (summed)
+    prep (cpu-time)                   20.91s (summed)
+    producer block                     2.36s
+    producer blocked on GPU            2.38s
+    GPU starved for blocks             0.00s
+    GPU inference                      3.64s
+  ```
+
+  `read + decode` and `prep` are summed across the workers that ran them, so
+  they are CPU time and exceed the producer's wall-clock; the rest is wall.
+  The two waiting rows are the point: `GPU starved for blocks` is the idle GPU
+  #239 measured from outside, and `producer blocked on GPU` is the opposite
+  case, so the pair names the bottleneck instead of implying one. Output is
+  bit-identical and the added timing costs ~1% (measured over three interleaved
+  warm reps on 150k reads).
+
 - **Bounded signal reads: `max_samples` on the Python reader API** (#237).
   `Reader.get_signal{,_pa}`, `Reader.get_signals{,_pa}` and the same four on
   `DatasetReader` take an optional `max_samples`, returning exactly what
