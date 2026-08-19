@@ -97,20 +97,6 @@ pub fn init(requested: Option<usize>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Width the global pool was built at.
-///
-/// For callers that must size a *second* pool to match — notably the
-/// onnxruntime intra-op pool on the `cnn-gpu` path, which would otherwise
-/// spawn its own full-width pool alongside rayon's and put total process
-/// threads back out of `--threads`' reach.
-#[cfg_attr(not(feature = "cnn-gpu"), allow(dead_code))]
-pub fn width() -> usize {
-    POOL_WIDTH
-        .get()
-        .copied()
-        .unwrap_or_else(rayon::current_num_threads)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

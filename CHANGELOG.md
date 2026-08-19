@@ -4,6 +4,32 @@
 
 ### Added
 
+- **`escpod demux detect --method cnn --gpu --profile` reports a per-stage
+  breakdown** (#239). The GPU path is a producer (decode + prep on the rayon
+  pool) feeding a batched onnxruntime consumer through a bounded channel, and
+  until now the only way to ask which of them was the constraint was to sample
+  `nvidia-smi` from outside and guess. `--profile` now prints, alongside the
+  existing phase total:
+
+  ```text
+  GPU pipeline
+    index (reads table)                0.31s
+    read + decode (cpu-time)          16.82s (summed)
+    prep (cpu-time)                   20.91s (summed)
+    producer block                     2.36s
+    producer blocked on GPU            2.38s
+    GPU starved for blocks             0.00s
+    GPU inference                      3.64s
+  ```
+
+  `read + decode` and `prep` are summed across the workers that ran them, so
+  they are CPU time and exceed the producer's wall-clock; the rest is wall.
+  The two waiting rows are the point: `GPU starved for blocks` is the idle GPU
+  #239 measured from outside, and `producer blocked on GPU` is the opposite
+  case, so the pair names the bottleneck instead of implying one. Output is
+  bit-identical and the added timing costs ~1% (measured over three interleaved
+  warm reps on 150k reads).
+
 - **Bounded signal reads: `max_samples` on the Python reader API** (#237).
   `Reader.get_signal{,_pa}`, `Reader.get_signals{,_pa}` and the same four on
   `DatasetReader` take an optional `max_samples`, returning exactly what
@@ -24,6 +50,35 @@
   **9.9x** a full decode.
 
 ### Changed
+
+- **The boundary-CNN CUDA session no longer runs a 16-thread onnxruntime pool**
+  (#239). The graph runs on the device, so onnxruntime's intra-op pool has
+  nothing to compute — but it was sized to `--threads` and spawned *on top of*
+  rayon's, and it did not sit idle. Profiling `demux detect --method cnn --gpu`
+  over 150k reads, 15 pool threads accounted for **~35% of all CPU samples** in
+  the process, next to 4% for the preprocessing they were starving. The session
+  is now pinned to one non-spinning intra-op thread.
+
+  Both halves are needed and neither works alone (warm, three interleaved reps):
+  16 threads spinning 7.34 s, 1 thread still spinning 7.42 s, 16 threads without
+  spinning 7.37 s, **1 thread without spinning 6.93 s**. One thread removes the
+  per-op fan-out and join; disabling the spin stops that thread burning a core
+  between calls.
+
+  Against 0.11.0, on 150k reads with eight interleaved reps: **6.13 s -> 5.95 s**
+  (non-overlapping ranges), process CPU **340% -> 274%**, threads **36 -> 21**.
+  Replicated on a second node (7.29 -> 7.02 s, 6.28 -> 5.96 s). The fused
+  pipeline shares the loader and also improves slightly (19.7/18.4 -> 19.1/18.0 s).
+  Output is bit-identical throughout — 150,001 of 150,001 boundaries, and the
+  fused pipeline's classifications likewise.
+
+  This also finishes what #155 started: `--threads 16` on a 16-CPU allocation now
+  means 16 worker threads, not 16 plus onnxruntime's own 16.
+
+  **API**: `AdapterCnnGpu::load_with_threads` is gone and `load_with_config`
+  /`load_with_config_on_device` lose their `intra_threads` parameter. The thread
+  count was never the caller's to choose — it is a property of running on CUDA —
+  and a parameter that is accepted and ignored is worse than no parameter.
 
 - **VBZ decode reuses a per-thread ZSTD context.** `zstd::decode_all` built a
   fresh `Decoder` per call — a `DCtx`, its window buffer, and a 32 KB

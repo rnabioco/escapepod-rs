@@ -87,38 +87,24 @@ pub struct AdapterCnnGpu {
 }
 
 impl AdapterCnnGpu {
-    /// Load an ONNX model with the default (ADAPTed/rna004) preprocessing config
-    /// and onnxruntime's own choice of intra-op width.
-    ///
-    /// Prefer [`Self::load_with_threads`] from the CLI: onnxruntime's default
-    /// intra-op pool is `available_parallelism()` wide and is spawned *on top of*
-    /// rayon's, so leaving it unset puts total process threads back out of
-    /// `--threads`' reach (the GPU-side half of #155).
+    /// Load an ONNX model with the default (ADAPTed/rna004) preprocessing config.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, AdapterCnnError> {
-        Self::load_with_config(path, AdapterCnnConfig::default(), None)
-    }
-
-    /// Load with the default preprocessing config and a bounded intra-op pool.
-    pub fn load_with_threads(
-        path: impl AsRef<Path>,
-        intra_threads: usize,
-    ) -> Result<Self, AdapterCnnError> {
-        Self::load_with_config(path, AdapterCnnConfig::default(), Some(intra_threads))
+        Self::load_with_config(path, AdapterCnnConfig::default())
     }
 
     /// Load with an explicit preprocessing config, registering the CUDA EP.
     ///
-    /// `intra_threads` bounds onnxruntime's intra-op pool; `None` leaves ORT's
-    /// default. The thread count is deliberately *not* part of
-    /// [`AdapterCnnConfig`] — that struct is `Copy` and carries preprocessing
-    /// semantics the CPU/GPU parity tests compare, so a scheduling knob has no
-    /// business in it.
+    /// Thread counts are *not* a parameter: this type is always a CUDA session,
+    /// and a CUDA session wants no intra-op pool at all (see
+    /// [`load_with_config_on_device`](Self::load_with_config_on_device)). Nor do
+    /// they belong in [`AdapterCnnConfig`] — that struct is `Copy` and carries
+    /// preprocessing semantics the CPU/GPU parity tests compare, so a scheduling
+    /// knob has no business in it either.
     pub fn load_with_config(
         path: impl AsRef<Path>,
         config: AdapterCnnConfig,
-        intra_threads: Option<usize>,
     ) -> Result<Self, AdapterCnnError> {
-        Self::load_with_config_on_device(path, config, intra_threads, 0)
+        Self::load_with_config_on_device(path, config, 0)
     }
 
     /// [`load_with_config`](Self::load_with_config) pinned to a CUDA ordinal.
@@ -131,19 +117,40 @@ impl AdapterCnnGpu {
     pub fn load_with_config_on_device(
         path: impl AsRef<Path>,
         config: AdapterCnnConfig,
-        intra_threads: Option<usize>,
         device: i32,
     ) -> Result<Self, AdapterCnnError> {
-        let mut builder = Session::builder().map_err(|e| AdapterCnnError::Load(e.to_string()))?;
-        if let Some(n) = intra_threads {
-            builder = builder
-                .with_intra_threads(n.max(1))
-                .map_err(|e| AdapterCnnError::Load(e.to_string()))?
-                // Only meaningful under parallel execution mode, which we don't
-                // enable; set it anyway so the bound holds if that ever changes.
-                .with_inter_threads(1)
-                .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
-        }
+        let builder = Session::builder()
+            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
+            // The graph runs on the device, so onnxruntime's intra-op pool has
+            // nothing to compute — but left at its default it is
+            // `available_parallelism()` threads wide, spawned *on top of*
+            // rayon's, and it does not sit idle: profiling `demux detect
+            // --method cnn --gpu` on 150 k reads, 15 pool threads accounted for
+            // ~35% of all CPU samples in the process, next to 4% for the
+            // preprocessing they were starving.
+            //
+            // Both settings are needed and neither works alone (measured warm,
+            // three interleaved reps): the default 16 threads spinning ran
+            // 7.34 s, 1 thread still spinning 7.42 s, 16 threads without
+            // spinning 7.37 s, and **1 thread without spinning 6.93 s** at 274%
+            // CPU against 340%. One thread is what removes the per-op fan-out
+            // and join; disabling the spin is what stops that one thread
+            // burning a core between calls. Output is bit-identical across all
+            // four (150,001 of 150,001 boundaries), as are the fused pipeline's
+            // classifications.
+            //
+            // A graph the CUDA EP cannot place entirely on the device would run
+            // its leftovers single-threaded here. That is the right trade for
+            // this path — reads are the parallel axis, and the caller already
+            // has every core busy on decode and prep.
+            .with_intra_threads(1)
+            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
+            // Only meaningful under parallel execution mode, which we don't
+            // enable; set it anyway so the bound holds if that ever changes.
+            .with_inter_threads(1)
+            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
+            .with_intra_op_spinning(false)
+            .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         let session = builder
             .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?

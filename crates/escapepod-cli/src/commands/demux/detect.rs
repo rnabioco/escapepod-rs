@@ -158,6 +158,87 @@ fn llr_boundaries(
     (start * scale_factor, end * scale_factor)
 }
 
+/// Wall-clock spent in — and waiting between — the `--gpu` pipeline's stages,
+/// reported by `--profile`.
+///
+/// The producer and the GPU consumer run concurrently, so these do not sum to
+/// the run: what they answer is *which* stage the other is waiting on.
+/// `index`/`read_decode`/`prep`/`gpu_infer` are time doing work; `*_blocked` is
+/// a stage stalled because the next one is behind, and `gpu_wait` is the GPU
+/// starved because the producer is. #239 was filed after inferring an idle GPU
+/// from `nvidia-smi` sampling, which is what this replaces.
+///
+/// `read_decode` and `prep` are summed across the rayon workers that ran them,
+/// so they measure CPU time and can exceed the wall-clock the producer took.
+#[cfg(feature = "cnn-gpu")]
+#[derive(Default)]
+struct StageTimes {
+    /// Producer: reading the reads table and sorting it, per file. Wall.
+    index: Stage,
+    /// Producer: per-read signal extraction + bounded VBZ decode. Summed over
+    /// workers.
+    read_decode: Stage,
+    /// Producer: `i16 -> f32` and the CNN's prep. Summed over workers.
+    prep: Stage,
+    /// Producer: one block's parallel decode+prep. Wall.
+    block: Stage,
+    /// Producer stalled — the GPU has not drained a block.
+    block_blocked: Stage,
+    /// GPU starved — no prepped block yet. This is what #239 measured as an
+    /// idle GPU.
+    gpu_wait: Stage,
+    /// GPU: batched onnxruntime inference.
+    gpu_infer: Stage,
+}
+
+#[cfg(feature = "cnn-gpu")]
+#[derive(Default)]
+struct Stage(std::sync::atomic::AtomicU64);
+
+#[cfg(feature = "cnn-gpu")]
+impl Stage {
+    /// Add the time since `since` to this stage's total.
+    fn add(&self, since: std::time::Instant) {
+        self.add_nanos(since.elapsed().as_nanos() as u64);
+    }
+
+    fn add_nanos(&self, nanos: u64) {
+        self.0
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn secs(&self) -> f64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+    }
+}
+
+#[cfg(feature = "cnn-gpu")]
+impl StageTimes {
+    fn report(&self, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        eprintln!();
+        eprintln!("{}", style::action("GPU pipeline"));
+        for (name, s, wall) in [
+            ("index (reads table)", &self.index, true),
+            ("read + decode (cpu-time)", &self.read_decode, false),
+            ("prep (cpu-time)", &self.prep, false),
+            ("producer block", &self.block, true),
+            ("producer blocked on GPU", &self.block_blocked, true),
+            ("GPU starved for blocks", &self.gpu_wait, true),
+            ("GPU inference", &self.gpu_infer, true),
+        ] {
+            eprintln!(
+                "  {:<30} {:>8.2}s{}",
+                name,
+                s.secs(),
+                if wall { "" } else { " (summed)" }
+            );
+        }
+    }
+}
+
 /// Run the detect subcommand.
 pub fn run(args: DetectArgs) -> anyhow::Result<()> {
     let Some(method) = args.method.clone() else {
@@ -437,20 +518,28 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             let model_path = cnn_model_path.clone();
             let pb = &progress_bar;
             let bnd = &boundaries;
-            std::thread::scope(|scope| -> anyhow::Result<Vec<DetectRow>> {
+            let stages = StageTimes::default();
+            let st = &stages;
+            let rows = std::thread::scope(|scope| -> anyhow::Result<Vec<DetectRow>> {
                 let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<DetectRow>> {
-                    // Bound onnxruntime's intra-op pool too. Left unset it
-                    // spawns `available_parallelism()` threads alongside
-                    // rayon's, so `--threads` would not bound the process
-                    // (#155, GPU half).
-                    let gpu = escapepod_demux::AdapterCnnGpu::load_with_threads(
-                        &model_path,
-                        crate::threads::width(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
+                    // The session pins its own onnxruntime thread pool to one
+                    // non-spinning thread — see `AdapterCnnGpu`. Left at ORT's
+                    // default it is `available_parallelism()` wide, spawned
+                    // alongside rayon's, so `--threads` would not bound the
+                    // process (#155, GPU half) and the pool would take a third
+                    // of the CPU from the producers (#239).
+                    let gpu = escapepod_demux::AdapterCnnGpu::load(&model_path)
+                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
                     let mut out = Vec::new();
-                    for (meta, prepped) in rx.iter() {
+                    loop {
+                        let waited = std::time::Instant::now();
+                        let Ok((meta, prepped)) = rx.recv() else {
+                            break;
+                        };
+                        st.gpu_wait.add(waited);
+                        let inferring = std::time::Instant::now();
                         let ends = gpu.detect_prepped(&prepped);
+                        st.gpu_infer.add(inferring);
                         pb.inc(meta.len() as u64);
                         for (end, (read_id, num_samples)) in ends.into_iter().zip(meta) {
                             // `--emit-llr-delta` is rejected with `--gpu` above, so the
@@ -497,6 +586,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                 // kernel choice, not a bug here. No gain is worth perturbing
                 // output for.
                 for path in &args.input {
+                    let indexing = std::time::Instant::now();
                     let reader = Reader::open(path)?;
                     let mut reads: Vec<_> = reader
                         .reads()?
@@ -505,7 +595,9 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                         .collect();
                     reads.sort_by_key(|r| r.num_samples);
                     let extractor = reader.signal_extractor()?;
+                    st.index.add(indexing);
                     for window in reads.chunks(GPU_BLOCK) {
+                        let filling = std::time::Instant::now();
                         let prepped: Vec<(Uuid, u64, Option<escapepod_demux::PreppedWindow>)> =
                             window
                                 .par_iter()
@@ -513,23 +605,34 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                                     // Only the leading `max_obs_trace` samples feed the
                                     // CNN; skip decompressing the rest (matters for long
                                     // mRNA reads).
-                                    let p = extractor
+                                    let decoding = std::time::Instant::now();
+                                    let signal = extractor
                                         .get_signal_prefix(&r.signal_rows, cfg.max_obs_trace)
-                                        .ok()
-                                        .and_then(|s| {
-                                            let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
-                                            cfg.prep(&f)
-                                        });
+                                        .ok();
+                                    let decoded = decoding.elapsed();
+                                    let p = signal.and_then(|s| {
+                                        let f: Vec<f32> = s.iter().map(|&x| x as f32).collect();
+                                        cfg.prep(&f)
+                                    });
+                                    // Summed across workers, so the split between
+                                    // I/O+decode and prep survives the parallelism.
+                                    st.read_decode.add_nanos(decoded.as_nanos() as u64);
+                                    st.prep
+                                        .add_nanos((decoding.elapsed() - decoded).as_nanos() as u64);
                                     (r.read_id, r.num_samples, p)
                                 })
                                 .collect();
+                        st.block.add(filling);
                         let mut meta = Vec::with_capacity(prepped.len());
                         let mut preps = Vec::with_capacity(prepped.len());
                         for (id, ns, p) in prepped {
                             meta.push((id, ns));
                             preps.push(p);
                         }
-                        if tx.send((meta, preps)).is_err() {
+                        let sending = std::time::Instant::now();
+                        let sent = tx.send((meta, preps)).is_ok();
+                        st.block_blocked.add(sending);
+                        if !sent {
                             break; // GPU thread died; its error surfaces at join
                         }
                     }
@@ -538,7 +641,9 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                 gpu_handle
                     .join()
                     .map_err(|_| anyhow::anyhow!("GPU detection thread panicked"))?
-            })?
+            })?;
+            stages.report(profile);
+            rows
         }
         #[cfg(not(feature = "cnn-gpu"))]
         unreachable!("--gpu is unavailable without the cnn-gpu feature")
