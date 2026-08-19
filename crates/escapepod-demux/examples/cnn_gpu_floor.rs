@@ -44,8 +44,8 @@ fn main() -> anyhow::Result<()> {
     let iters: usize = args.next().map_or(Ok(10), |s| s.parse())?;
 
     let cfg = AdapterCnnConfig::default();
-    let detector = AdapterCnnGpu::load_with_threads(&onnx, 16)
-        .map_err(|e| anyhow::anyhow!("loading {onnx}: {e}"))?;
+    let detector =
+        AdapterCnnGpu::load(&onnx).map_err(|e| anyhow::anyhow!("loading {onnx}: {e}"))?;
 
     // Derive the prepped length from the real preprocessing rather than
     // hardcoding it — if the config's window or downscale ever changes, this

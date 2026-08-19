@@ -51,8 +51,7 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: cnn_pad_probe <adapter.onnx>"))?;
     let cfg = AdapterCnnConfig::default();
-    let det =
-        AdapterCnnGpu::load_with_threads(&onnx, 4).map_err(|e| anyhow::anyhow!("load: {e}"))?;
+    let det = AdapterCnnGpu::load(&onnx).map_err(|e| anyhow::anyhow!("load: {e}"))?;
 
     let full_len = cfg.input_len();
     // A few short reads. `prep` pads every read to `input_len` now, so truncate

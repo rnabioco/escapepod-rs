@@ -522,15 +522,14 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             let st = &stages;
             let rows = std::thread::scope(|scope| -> anyhow::Result<Vec<DetectRow>> {
                 let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<DetectRow>> {
-                    // Bound onnxruntime's intra-op pool too. Left unset it
-                    // spawns `available_parallelism()` threads alongside
-                    // rayon's, so `--threads` would not bound the process
-                    // (#155, GPU half).
-                    let gpu = escapepod_demux::AdapterCnnGpu::load_with_threads(
-                        &model_path,
-                        crate::threads::width(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
+                    // The session pins its own onnxruntime thread pool to one
+                    // non-spinning thread — see `AdapterCnnGpu`. Left at ORT's
+                    // default it is `available_parallelism()` wide, spawned
+                    // alongside rayon's, so `--threads` would not bound the
+                    // process (#155, GPU half) and the pool would take a third
+                    // of the CPU from the producers (#239).
+                    let gpu = escapepod_demux::AdapterCnnGpu::load(&model_path)
+                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
                     let mut out = Vec::new();
                     loop {
                         let waited = std::time::Instant::now();

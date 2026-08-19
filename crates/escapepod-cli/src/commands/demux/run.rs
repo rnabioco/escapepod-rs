@@ -2448,12 +2448,8 @@ fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<De
                 #[cfg(feature = "cnn-gpu")]
                 if args.gpu {
                     return Ok(Detector::CnnGpu(Box::new(
-                        escapepod_demux::AdapterCnnGpu::load_with_config(
-                            path,
-                            config,
-                            Some(crate::threads::width()),
-                        )
-                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
+                        escapepod_demux::AdapterCnnGpu::load_with_config(path, config)
+                            .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
                     )));
                 }
                 Ok(Detector::Cnn(Box::new(
