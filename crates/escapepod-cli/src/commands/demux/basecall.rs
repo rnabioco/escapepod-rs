@@ -76,11 +76,10 @@ pub struct BasecallArgs {
     /// log-odds in nats against its best alternative, so it goes negative when
     /// the lattice prefers something else; `crf_best` names what that is.
     ///
-    /// Off by default because it is not free: measured at +25% on this
-    /// command over 20k RNA004 reads, because the scan calls scalar
-    /// `exp`/`ln_1p` where the decode uses vector kernels. With `--gpu` it
-    /// costs more still — the constrained scan needs the raw scores, so the
-    /// decode comes back to the host while the encoder stays on the device.
+    /// Measured at +7.6% on this command over 20k RNA004 reads. Off by default
+    /// anyway: the columns are an output change, and with `--gpu` it costs more
+    /// than that — the constrained scan needs the raw scores, so the decode
+    /// comes back to the host while the encoder stays on the device.
     #[arg(long, requires = "barcodes")]
     pub ref_scores: bool,
 

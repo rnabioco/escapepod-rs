@@ -71,27 +71,40 @@
 //! the whole panel. For a designed panel with a constant leader this collapses
 //! the entire head to one copy.
 //!
-//! # Cost, and where the next factor is
+//! # Cost
 //!
 //! For the shipped 16-plex (44-nt references, `t_len = 300`) the panel is 961
-//! cells: 256 that can only stay (pure adds, no transcendental), 85 head cells
-//! with fan-in `n_base`, and 640 tail cells with fan-in 1. That is ~218k
+//! cells: 256 that can only stay (pure adds, no transcendental), 640 tail cells
+//! with fan-in 1, and 85 head cells with fan-in `n_base`. That is ~218k
 //! `exp`/`ln` pairs per read against the decode's ~1.15M `exp`.
 //!
-//! **Measured** on `demux basecall` over 20k RNA004 reads (rna, 48 cores,
-//! interleaved arms): 25.34 s without, 31.69 s with — **+25%** on the whole
-//! command, not on the decode alone.
+//! Measured on `demux basecall` over 20k RNA004 reads (rna, 48 cores,
+//! interleaved arms), as the scan was vectorised:
 //!
-//! That is more than the operation count suggests, and the reason is not loop
-//! overhead: specialising the two common fan-ins into their own loops moved it
-//! only from +25.7% to +25.1%. The scan is **transcendental-bound like the
-//! decode is**, but it calls scalar `exp`/`ln_1p` while the decode's own
-//! `logsumexp` runs through the AVX2/AVX-512 Cephes kernels in
-//! [`super::avx2`]/[`super::avx512`] at a fraction of the per-element cost. So
-//! the remaining factor is a vector kernel for this scan, not a tighter loop —
-//! the fan-in-1 cells are 65% of the lattice and independent within a timestep,
-//! wanting four gathers, a vector `exp` and a vector `ln1p`. Until that exists
-//! the scoring is opt-in (`demux basecall --ref-scores`).
+//! ```text
+//! scalar                        +25.1%   (25.34 -> 31.69 s)
+//! vector tail                   +11.1%
+//! vector tail and head           +7.6%   (25.15 -> 27.05 s)
+//! ```
+//!
+//! and +3.6% on the fused `demux`, where detection and I/O dilute it further.
+//! The scan itself is **3.3x** faster than the scalar one it started as.
+//!
+//! Two things that measurement settled, both against the obvious guess:
+//!
+//! * The scan was never loop-bound. Specialising the two fan-ins into their own
+//!   scalar loops moved it 25.7% -> 25.1%. It is **transcendental-bound exactly
+//!   as the decode is** — the difference was that it called scalar `exp`/`ln_1p`
+//!   while the decode ran the Cephes kernels in
+//!   [`super::avx2`]/[`super::avx512`].
+//! * The head is a tenth of the cells and a third of the work, five terms per
+//!   cell against the tail's two. Vectorising only the tail capped the whole
+//!   scan at 2.15x, almost exactly the Amdahl bound; the head kernel is what
+//!   turned that into 3.3x.
+//!
+//! Still opt-in (`--ref-scores`), now for a weaker reason than it was: 3.6% is
+//! close to free, but the columns are an output change and `--gpu` still pulls
+//! the decode back to the host to run this.
 //!
 //! The scan runs on the *raw* transposed scores, which
 //! [`super::lattice::decode_with_refs`] hands over before pass 1 overwrites
@@ -111,7 +124,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use super::lattice::CrfLayout;
+use super::lattice::{Backend, CrfLayout};
 
 /// One read's decode plus what the lattice thought of each reference.
 ///
@@ -252,20 +265,27 @@ pub struct RefChains {
     finals: Vec<u32>,
     /// Widest fan-in over all cells, so the scan can size its accumulator once.
     max_fan: usize,
-    /// Cells with exactly one incoming move — the tail positions, and ~65% of
-    /// the lattice at the RNA004 geometry.
+    /// Cells `n_start .. n_start + n_tail` have exactly one incoming move — the
+    /// tail positions, and ~65% of the lattice at the RNA004 geometry. Cells
+    /// above that are the head, with a full `n_base`.
     ///
-    /// The two common fan-ins get their own loops so the general CSR path —
-    /// with its accumulator round-trip through memory and its dynamic-length
-    /// call — runs only over the head. Worth 0.6 points of the 25% the scoring
-    /// costs, and no more than that: the scan is transcendental-bound, so this
-    /// is the shape a vector kernel wants rather than the win itself.
+    /// [`Self::partition`] puts the cells in that order, and the whole vector
+    /// kernel rests on it: with each fan-in class contiguous, a cell's own
+    /// `alpha` is a unit-stride load and its result a unit-stride store, so the
+    /// gathers are only for the two score indices. AVX2 has no scatter at all,
+    /// so an unordered lattice could not be vectorised on it.
+    n_tail: usize,
+    /// The head's incoming moves transposed to `[edge][cell]`: `n_base` arrays
+    /// of `n_cells - n_start - n_tail` entries each, against the CSR's
+    /// per-cell runs.
     ///
-    /// Index lists rather than a reordering of the cells, so a cell's index
-    /// still means what it meant at build time.
-    tail: Vec<u32>,
-    /// Cells with a full `n_base` incoming moves — the unresolved-prefix head.
-    head: Vec<u32>,
+    /// Same information, laid out so a vector kernel can walk one edge across
+    /// many cells with a unit-stride index load. In CSR order edge `d` of
+    /// consecutive cells is stride `n_base`, which would need a gather to fetch
+    /// the *indices* before the gather that fetches the values — two dependent
+    /// gathers per edge, which is most of what the kernel was going to save.
+    head_src: Vec<u32>,
+    head_score: Vec<u32>,
 }
 
 impl RefChains {
@@ -304,8 +324,9 @@ impl RefChains {
             move_score: Vec::new(),
             finals: Vec::with_capacity(seqs.len()),
             max_fan: 0,
-            tail: Vec::new(),
-            head: Vec::new(),
+            n_tail: 0,
+            head_src: Vec::new(),
+            head_score: Vec::new(),
         };
 
         // Chain position 0: every state, no incoming moves, shared by the whole
@@ -391,15 +412,84 @@ impl RefChains {
             chains.finals.push(prev_base);
         }
 
+        chains.partition();
         Ok(chains)
     }
 
-    fn push_cell(&mut self, state: u32, incoming: &[(u32, u32)]) {
-        match incoming.len() {
-            0 => {}
-            1 => self.tail.push(self.n_cells as u32),
-            _ => self.head.push(self.n_cells as u32),
+    /// Reorder the cells so each fan-in class is contiguous: chain position 0
+    /// first, then the tail, then the head.
+    ///
+    /// Cell order does not affect the result — the scan double-buffers, so
+    /// every cell reads the previous timestep whatever order they are visited
+    /// in — which is exactly what makes this free to do. What it buys is a
+    /// vector kernel: see [`Self::n_tail`].
+    ///
+    /// Stable within each class, so a reference's tail cells stay in position
+    /// order and the trie's sharing is unchanged.
+    fn partition(&mut self) {
+        let fan = |c: usize| (self.move_off[c + 1] - self.move_off[c]) as usize;
+        let mut order: Vec<u32> = Vec::with_capacity(self.n_cells);
+        for class in 0..3 {
+            order.extend(
+                (0..self.n_cells)
+                    .filter(|&c| fan(c).min(2) == class)
+                    .map(|c| c as u32),
+            );
         }
+        debug_assert_eq!(order.len(), self.n_cells);
+
+        let mut at = vec![0u32; self.n_cells];
+        for (new, &old) in order.iter().enumerate() {
+            at[old as usize] = new as u32;
+        }
+
+        let mut stay = Vec::with_capacity(self.n_cells);
+        let mut move_off = Vec::with_capacity(self.n_cells + 1);
+        let mut move_src = Vec::with_capacity(self.move_src.len());
+        let mut move_score = Vec::with_capacity(self.move_score.len());
+        move_off.push(0);
+        for &old in &order {
+            let old = old as usize;
+            stay.push(self.stay[old]);
+            for i in self.move_off[old] as usize..self.move_off[old + 1] as usize {
+                move_src.push(at[self.move_src[i] as usize]);
+                move_score.push(self.move_score[i]);
+            }
+            move_off.push(move_src.len() as u32);
+        }
+
+        self.n_tail = (0..self.n_cells).filter(|&c| fan(c) == 1).count();
+        self.stay = stay;
+        self.move_off = move_off;
+        self.move_src = move_src;
+        self.move_score = move_score;
+        for f in &mut self.finals {
+            *f = at[*f as usize];
+        }
+        // Chain position 0 was built first and in state order, so after a
+        // stable partition its cells are `0..n_start` with `stay[c] == c`. The
+        // free-start loop reads the score row directly on the strength of that
+        // — see `partition_groups_cells_by_fan_in` for the test that holds it.
+        debug_assert!((0..self.n_start).all(|c| self.stay[c] as usize == c));
+
+        // Head moves, transposed. Every head cell has the same fan-in, so this
+        // is a rectangular `[edge][cell]` block rather than a ragged one.
+        let head = self.n_start + self.n_tail;
+        let n_head = self.n_cells - head;
+        let fan = self.max_fan;
+        self.head_src = vec![0; fan * n_head];
+        self.head_score = vec![0; fan * n_head];
+        for k in 0..n_head {
+            let lo = self.move_off[head + k] as usize;
+            debug_assert_eq!(self.move_off[head + k + 1] as usize - lo, fan);
+            for d in 0..fan {
+                self.head_src[d * n_head + k] = self.move_src[lo + d];
+                self.head_score[d * n_head + k] = self.move_score[lo + d];
+            }
+        }
+    }
+
+    fn push_cell(&mut self, state: u32, incoming: &[(u32, u32)]) {
         self.stay.push(state);
         for &(src, score) in incoming {
             self.move_src.push(src);
@@ -432,6 +522,9 @@ impl RefChains {
     /// `scores` is one read in the decoder's transposed `[t][edge][dest]`
     /// order — the *raw* encoder scores, not log-posteriors. `cur`/`next` are
     /// caller-owned scratch so a per-read call allocates nothing.
+    // The buffers are caller-owned so a per-read call allocates nothing, which
+    // is the whole reason they are parameters rather than fields.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward(
         &self,
         scores: &[f32],
@@ -440,6 +533,7 @@ impl RefChains {
         cur: &mut Vec<f32>,
         next: &mut Vec<f32>,
         out: &mut Vec<f32>,
+        backend: Backend,
     ) {
         cur.clear();
         cur.resize(self.n_cells, f32::NEG_INFINITY);
@@ -452,41 +546,137 @@ impl RefChains {
             let row = &scores[t * n_score..(t + 1) * n_score];
 
             // Chain position 0: it can only ever stay, so a quarter of the
-            // lattice is one add and no transcendental at all.
-            for cell in 0..self.n_start {
-                next[cell] = cur[cell] + row[self.stay[cell] as usize];
+            // lattice is one add and no transcendental at all. `stay[c] == c`
+            // here (see `partition`), which makes it a plain vector add that
+            // the autovectoriser takes without help.
+            for (cell, dst) in next[..self.n_start].iter_mut().enumerate() {
+                *dst = cur[cell] + row[cell];
             }
 
             // The tail: stay, or advance from the single position before it.
-            for &cell in &self.tail {
-                let cell = cell as usize;
-                let i = self.move_off[cell] as usize;
-                let stay = cur[cell] + row[self.stay[cell] as usize];
-                let moved = cur[self.move_src[i] as usize] + row[self.move_score[i] as usize];
-                next[cell] = logaddexp(stay, moved);
-            }
+            self.tail_step(cur, next, row, backend);
 
             // The head, where the unresolved prefix means `n_base` sources.
-            // Left on the general path: it is under a tenth of the cells, and
-            // its width is `n_base`, which is not a constant here.
-            for &cell in &self.head {
-                let cell = cell as usize;
-                let (lo, hi) = (
-                    self.move_off[cell] as usize,
-                    self.move_off[cell + 1] as usize,
-                );
-                acc[0] = cur[cell] + row[self.stay[cell] as usize];
-                for (k, i) in (lo..hi).enumerate() {
-                    acc[1 + k] = cur[self.move_src[i] as usize] + row[self.move_score[i] as usize];
-                }
-                next[cell] = logsumexp(&acc[..1 + hi - lo]);
-            }
+            self.head_step(cur, next, row, &mut acc, backend);
 
             std::mem::swap(cur, next);
         }
 
         out.clear();
         out.extend(self.finals.iter().map(|&c| cur[c as usize]));
+    }
+
+    /// One timestep over the fan-in-1 cells — the scan's hot loop, and the only
+    /// part of it that is vectorised.
+    ///
+    /// The cells are `n_start .. n_start + n_tail`, so a cell's own `alpha` and
+    /// its result are unit-stride and only the two score indices and the move's
+    /// source need gathering. Every cell has exactly one incoming move, so
+    /// `move_off[n_start + i] == i` and the CSR arrays index directly.
+    fn tail_step(&self, cur: &[f32], next: &mut [f32], row: &[f32], backend: Backend) {
+        let (base, n) = (self.n_start, self.n_tail);
+        let stay = &self.stay[base..base + n];
+        let src = &self.move_src[..n];
+        let mv = &self.move_score[..n];
+        debug_assert_eq!(self.move_off[base] as usize, 0);
+        debug_assert_eq!(self.move_off[base + n] as usize, n);
+
+        let done = match backend {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `available()` gated the backend choice, and the kernel is
+            // handed slices whose lengths it re-derives — the gathered indices
+            // are built by `partition` and are in range by construction, which
+            // `indices_are_in_range` holds.
+            Backend::Avx2 => unsafe {
+                super::avx2::chain_tail(cur, next, row, stay, src, mv, base)
+            },
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: see above.
+            Backend::Avx512 => unsafe {
+                super::avx512::chain_tail(cur, next, row, stay, src, mv, base)
+            },
+            Backend::Scalar => 0,
+        };
+
+        // The scalar remainder, which is also the whole loop under
+        // `Backend::Scalar` and the reference the kernels are checked against.
+        for i in done..n {
+            let cell = base + i;
+            let a = cur[cell] + row[stay[i] as usize];
+            let b = cur[src[i] as usize] + row[mv[i] as usize];
+            next[cell] = logaddexp(a, b);
+        }
+    }
+
+    /// One timestep over the head's fan-in-`n_base` cells.
+    ///
+    /// A tenth of the cells but a third of the transcendentals — five terms
+    /// each against the tail's two — so leaving it scalar capped the whole
+    /// scan at ~2.2x however wide the tail kernel got.
+    ///
+    /// The vector path assumes `n_base == 4`, which every backend but
+    /// `Scalar` already guarantees: `Backend::best_for` only selects one when
+    /// `supported(layout)` holds, and both modules' `supported` require it.
+    fn head_step(
+        &self,
+        cur: &[f32],
+        next: &mut [f32],
+        row: &[f32],
+        acc: &mut [f32],
+        backend: Backend,
+    ) {
+        let base = self.n_start + self.n_tail;
+        let n = self.n_cells - base;
+        let stay = &self.stay[base..];
+        debug_assert_eq!(self.head_src.len(), self.max_fan * n);
+
+        let done = match backend {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `available()` gated the backend choice, `supported()`
+            // pinned `n_base == 4`, and every index came from `partition`.
+            Backend::Avx2 => unsafe {
+                debug_assert_eq!(self.max_fan, 4);
+                super::avx2::chain_head(
+                    cur,
+                    next,
+                    row,
+                    stay,
+                    &self.head_src,
+                    &self.head_score,
+                    base,
+                    n,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: see above.
+            Backend::Avx512 => unsafe {
+                debug_assert_eq!(self.max_fan, 4);
+                super::avx512::chain_head(
+                    cur,
+                    next,
+                    row,
+                    stay,
+                    &self.head_src,
+                    &self.head_score,
+                    base,
+                    n,
+                )
+            },
+            Backend::Scalar => 0,
+        };
+
+        for k in done..n {
+            let cell = base + k;
+            let (lo, hi) = (
+                self.move_off[cell] as usize,
+                self.move_off[cell + 1] as usize,
+            );
+            acc[0] = cur[cell] + row[stay[k] as usize];
+            for (j, i) in (lo..hi).enumerate() {
+                acc[1 + j] = cur[self.move_src[i] as usize] + row[self.move_score[i] as usize];
+            }
+            next[cell] = logsumexp(&acc[..1 + hi - lo]);
+        }
     }
 }
 
@@ -586,11 +776,10 @@ mod tests {
             .map(|&c| b"ACGT".iter().position(|&x| x == c).unwrap())
             .collect();
 
-        // Cell for chain position j > state_len, in build order: starts after
-        // the 256 + 64 + 16 + 4 + 1 head.
-        let head = 256 + 64 + 16 + 4 + 1;
+        // `partition` puts the fan-in-1 cells directly after the free-start
+        // layer, in position order, so one reference's tail is `n_start + k`.
         for j in (l.state_len + 1)..=seq.len() {
-            let cell = head + (j - l.state_len - 1);
+            let cell = chains.n_start + (j - l.state_len - 1);
             // The k-mer this position spells, oldest base most significant.
             let state = bases[j - l.state_len..j]
                 .iter()
@@ -619,13 +808,56 @@ mod tests {
         }
     }
 
+    /// The layout the vector kernel depends on: chain position 0 first and
+    /// score-index-identical to its cell, then every fan-in-1 cell, then the
+    /// head. Get this wrong and `chain_tail` reads the wrong `alpha`.
+    #[test]
+    fn partition_groups_cells_by_fan_in() {
+        let l = layout();
+        let refs: Vec<&[u8]> = vec![b"ACGTACGT", b"CGTACGTA", b"ACGTTTTT"];
+        let chains = RefChains::build(&l, b"NACGT", &refs).unwrap();
+
+        assert_eq!(chains.n_start, l.n_states);
+        for cell in 0..chains.n_start {
+            assert_eq!(chains.move_off[cell + 1], chains.move_off[cell]);
+            assert_eq!(chains.stay[cell] as usize, cell, "start {cell} is identity");
+        }
+        for cell in chains.n_start..chains.n_start + chains.n_tail {
+            assert_eq!(
+                chains.move_off[cell + 1] - chains.move_off[cell],
+                1,
+                "tail cell {cell}"
+            );
+            // Every tail cell contributes exactly one move entry and they are
+            // the first ones, so `move_off[n_start + i] == i` — the identity the
+            // kernel indexes `move_src`/`move_score` with.
+            assert_eq!(chains.move_off[cell] as usize, cell - chains.n_start);
+        }
+        for cell in chains.n_start + chains.n_tail..chains.n_cells {
+            assert_eq!(
+                (chains.move_off[cell + 1] - chains.move_off[cell]) as usize,
+                l.n_base,
+                "head cell {cell}"
+            );
+        }
+        // Every source index has to survive the remap.
+        assert!(
+            chains
+                .move_src
+                .iter()
+                .all(|&s| (s as usize) < chains.n_cells)
+        );
+        assert!(chains.finals.iter().all(|&f| (f as usize) < chains.n_cells));
+    }
+
     /// Head cells carry `n_base` incoming moves, one per prefix that could have
     /// preceded them, and each names the base it drops.
     #[test]
     fn head_fan_in_is_one_per_unresolved_prefix() {
         let l = layout();
         let chains = RefChains::build(&l, b"NACGT", &[b"ACGTACGT".as_slice()]).unwrap();
-        for cell in 256..256 + 64 + 16 + 4 + 1 {
+        let head = chains.n_start + chains.n_tail;
+        for cell in head..chains.n_cells {
             let (lo, hi) = (
                 chains.move_off[cell] as usize,
                 chains.move_off[cell + 1] as usize,
@@ -746,7 +978,15 @@ mod tests {
         let chains = RefChains::build(&l, b"NAC", &refs).unwrap();
 
         let (mut cur, mut next, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        chains.forward(&sc, t_len, l.n_score, &mut cur, &mut next, &mut out);
+        chains.forward(
+            &sc,
+            t_len,
+            l.n_score,
+            &mut cur,
+            &mut next,
+            &mut out,
+            Backend::Scalar,
+        );
 
         for (k, want) in wanted.iter().enumerate() {
             let expect = logsumexp_f64(
@@ -836,7 +1076,15 @@ mod tests {
         let refs: Vec<&[u8]> = seqs.iter().map(Vec::as_slice).collect();
         let chains = RefChains::build(&l, b"NAC", &refs).unwrap();
         let (mut cur, mut next, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        chains.forward(&sc, t_len, l.n_score, &mut cur, &mut next, &mut out);
+        chains.forward(
+            &sc,
+            t_len,
+            l.n_score,
+            &mut cur,
+            &mut next,
+            &mut out,
+            Backend::Scalar,
+        );
 
         let mut total: f64 = out.iter().map(|&v| (f64::from(v) - logz).exp()).sum();
         for e in &short {
@@ -881,6 +1129,115 @@ mod tests {
     fn call_margin_is_absent_with_a_single_reference() {
         assert_eq!(scored(&[-1.25]).call(0), Some((-1.25, None)));
         assert_eq!(scored(&[-1.25]).call(1), None);
+    }
+
+    /// Every vector backend has to agree with the scalar scan, which is the
+    /// reference implementation and the one the brute-force tests above pin.
+    ///
+    /// Not bit-identity: the kernels use polynomial `exp`/`ln` and reach
+    /// `ln(1 + exp(d))` where the scalar path uses `exp(d).ln_1p()`, so the
+    /// contract is a tight tolerance — the same one the decode's own backend
+    /// equivalence test uses.
+    #[test]
+    fn simd_backends_agree_with_scalar() {
+        let l = layout();
+        let backends = Backend::all_supported(&l);
+        if backends.len() == 1 {
+            eprintln!("skipping: no SIMD backend on this host");
+            return;
+        }
+        // Enough references, and enough of them sharing prefixes, that the tail
+        // runs past one vector width and the head is genuinely shared.
+        let seqs: Vec<Vec<u8>> = (0..24)
+            .map(|i: usize| {
+                let mut s = b"ACGTACGTACGTACGTACGTACGT".to_vec();
+                s[20 + i % 4] = b"ACGT"[i / 4 % 4];
+                s[8 + i % 8] = b"ACGT"[i % 4];
+                s
+            })
+            .collect();
+        let refs: Vec<&[u8]> = seqs.iter().map(Vec::as_slice).collect();
+        let chains = RefChains::build(&l, b"NACGT", &refs).unwrap();
+        // Both classes have to be wide enough that the vector path runs and
+        // long enough that its scalar remainder does too, or this test would
+        // silently compare the scalar loop against itself.
+        let n_head = chains.cells() - chains.n_start - chains.n_tail;
+        assert!(chains.n_tail > 16, "tail too short to exercise a kernel");
+        assert!(n_head > 16, "head too short to exercise a kernel");
+        assert!(!chains.n_tail.is_multiple_of(16), "tail has no remainder");
+        assert!(!n_head.is_multiple_of(16), "head has no remainder");
+
+        let t_len = 40;
+        for seed in [3u32, 19, 101] {
+            let sc = scores(t_len * l.n_score, seed);
+            let (mut cur, mut next, mut want) = (Vec::new(), Vec::new(), Vec::new());
+            chains.forward(
+                &sc,
+                t_len,
+                l.n_score,
+                &mut cur,
+                &mut next,
+                &mut want,
+                Backend::Scalar,
+            );
+
+            for backend in backends.iter().copied().filter(|&b| b != Backend::Scalar) {
+                let (mut c, mut n, mut got) = (Vec::new(), Vec::new(), Vec::new());
+                chains.forward(&sc, t_len, l.n_score, &mut c, &mut n, &mut got, backend);
+                assert_eq!(got.len(), want.len());
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 2e-3 * w.abs().max(1.0),
+                        "{backend:?}: reference {k} got {g} want {w} (seed {seed})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A panel whose tail is not a whole number of vector widths still has to
+    /// come out right — the kernels stop short and hand the remainder back.
+    #[test]
+    fn simd_handles_a_ragged_tail() {
+        let l = layout();
+        let backends = Backend::all_supported(&l);
+        if backends.len() == 1 {
+            eprintln!("skipping: no SIMD backend on this host");
+            return;
+        }
+        // One reference of 9 emitted bases: 5 tail cells, fewer than either
+        // vector width, so the kernel does nothing and the scalar loop does all
+        // of it. The 24-reference case above covers the opposite end.
+        for extra in 0..4usize {
+            let seq: Vec<u8> = b"ACGTACGTA"
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(b'C', extra))
+                .collect();
+            let chains = RefChains::build(&l, b"NACGT", &[seq.as_slice()]).unwrap();
+            let t_len = 20;
+            let sc = scores(t_len * l.n_score, 7);
+            let (mut cur, mut next, mut want) = (Vec::new(), Vec::new(), Vec::new());
+            chains.forward(
+                &sc,
+                t_len,
+                l.n_score,
+                &mut cur,
+                &mut next,
+                &mut want,
+                Backend::Scalar,
+            );
+            for backend in backends.iter().copied().filter(|&b| b != Backend::Scalar) {
+                let (mut c, mut n, mut got) = (Vec::new(), Vec::new(), Vec::new());
+                chains.forward(&sc, t_len, l.n_score, &mut c, &mut n, &mut got, backend);
+                assert!(
+                    (got[0] - want[0]).abs() <= 2e-3 * want[0].abs().max(1.0),
+                    "{backend:?}: extra={extra} got {} want {}",
+                    got[0],
+                    want[0]
+                );
+            }
+        }
     }
 
     /// Lowercase references are the same references.

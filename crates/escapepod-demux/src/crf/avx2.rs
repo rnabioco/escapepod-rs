@@ -477,6 +477,111 @@ pub(super) unsafe fn log_softmax_floored(src: &[f32], dst: &mut [f32], floor: f3
     }
 }
 
+/// One timestep of the constrained-chain scan's fan-in-1 cells
+/// ([`super::refchain`]), eight at a time. Returns how many were done, leaving
+/// the remainder to the caller's scalar loop.
+///
+/// `cur[base + i]` and `next[base + i]` are unit-stride because
+/// `RefChains::partition` made that class of cell contiguous — which is what
+/// makes this vectorisable on AVX2 at all, since there is no scatter to write
+/// results back to scattered cells with. The three gathers that remain are the
+/// stay score, the move's source cell, and the move score.
+///
+/// `log(exp(a) + exp(b))` as `max + ln(1 + exp(-|a - b|))`: one `exp` and one
+/// `ln` per cell, against the general `logsumexp`'s two.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn chain_tail(
+    cur: &[f32],
+    next: &mut [f32],
+    row: &[f32],
+    stay: &[u32],
+    src: &[u32],
+    mv: &[u32],
+    base: usize,
+) -> usize {
+    unsafe {
+        let n = stay.len();
+        let (zero, one) = (_mm256_setzero_ps(), _mm256_set1_ps(1.0));
+        let mut i = 0;
+        while i + 8 <= n {
+            let idx = |p: *const u32| _mm256_loadu_si256(p.add(i) as *const __m256i);
+            let a = _mm256_add_ps(
+                _mm256_loadu_ps(cur.as_ptr().add(base + i)),
+                _mm256_i32gather_ps::<4>(row.as_ptr(), idx(stay.as_ptr())),
+            );
+            let b = _mm256_add_ps(
+                _mm256_i32gather_ps::<4>(cur.as_ptr(), idx(src.as_ptr())),
+                _mm256_i32gather_ps::<4>(row.as_ptr(), idx(mv.as_ptr())),
+            );
+
+            let m = _mm256_max_ps(a, b);
+            // A cell no path has reached yet has `-inf` on both terms, so their
+            // difference is `NaN`. `min(_, 0)` turns that into 0 — `_mm256_min_ps`
+            // returns its second operand for an unordered compare — and the
+            // result is `-inf + ln(2)`, still `-inf`. For a reachable cell the
+            // difference is already `<= 0`, so this is a no-op.
+            //
+            // Deleting it does not change any output today, and no test catches
+            // it: `ln8`'s `_mm256_max_ps(x, MIN_POSITIVE)` clamp scrubs the same
+            // `NaN` by the same unordered rule. That is an argument-order
+            // accident two functions away, and it would reverse silently — every
+            // scored read `NaN` — if `ln8` ever clamped the other way round. One
+            // `vminps` per eight lanes to not depend on it.
+            let d = _mm256_min_ps(_mm256_sub_ps(_mm256_min_ps(a, b), m), zero);
+            let r = _mm256_add_ps(m, ln8(_mm256_add_ps(one, exp8(d))));
+            _mm256_storeu_ps(next.as_mut_ptr().add(base + i), r);
+            i += 8;
+        }
+        i
+    }
+}
+
+/// One timestep of the constrained-chain scan's fan-in-4 cells — the
+/// unresolved-prefix head ([`super::refchain`]) — eight at a time. Returns how
+/// many were done.
+///
+/// Five terms per cell against [`chain_tail`]'s two, which is why the head is a
+/// third of the scan's transcendental work despite being a tenth of its cells.
+/// `src` and `score` are `[edge][cell]`, so each edge's indices are a
+/// unit-stride load and only their values need gathering; the reduction is the
+/// same [`lse5`] the decode's own forward pass uses.
+// Three index arrays, three buffers, and where in each the head starts. A
+// struct would name the same things one indirection away from the intrinsics.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn chain_head(
+    cur: &[f32],
+    next: &mut [f32],
+    row: &[f32],
+    stay: &[u32],
+    src: &[u32],
+    score: &[u32],
+    base: usize,
+    n: usize,
+) -> usize {
+    unsafe {
+        debug_assert_eq!(src.len(), 4 * n);
+        let mut i = 0;
+        while i + 8 <= n {
+            let idx = |p: *const u32, at: usize| _mm256_loadu_si256(p.add(at) as *const __m256i);
+            let mut v = [_mm256_setzero_ps(); 5];
+            v[0] = _mm256_add_ps(
+                _mm256_loadu_ps(cur.as_ptr().add(base + i)),
+                _mm256_i32gather_ps::<4>(row.as_ptr(), idx(stay.as_ptr(), i)),
+            );
+            for d in 0..4 {
+                v[1 + d] = _mm256_add_ps(
+                    _mm256_i32gather_ps::<4>(cur.as_ptr(), idx(src.as_ptr(), d * n + i)),
+                    _mm256_i32gather_ps::<4>(row.as_ptr(), idx(score.as_ptr(), d * n + i)),
+                );
+            }
+            _mm256_storeu_ps(next.as_mut_ptr().add(base + i), lse5(v));
+            i += 8;
+        }
+        i
+    }
+}
+
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn hmax(v: __m256) -> f32 {
@@ -590,6 +695,58 @@ mod tests {
 
     /// Inputs far below the clamp must still collapse to zero rather than
     /// wrapping around through the exponent-field trick.
+    /// A chain cell no path has reached yet has `-inf` on both terms, so their
+    /// difference is `NaN`. The kernel must still produce `-inf`.
+    ///
+    /// Pins the behaviour, not the line that implements it: two mechanisms
+    /// currently deliver it (see the `min(_, 0)` in `chain_tail`), so removing
+    /// either one alone leaves this passing. It is here because the scan cannot
+    /// show the difference at all — an escaped `NaN` is added to `-inf` and
+    /// disappears — so without it nothing in the suite touches the case.
+    #[test]
+    fn chain_tail_absorbs_unreached() {
+        if !available() {
+            return;
+        }
+        let cur = vec![f32::NEG_INFINITY; 8];
+        let mut next = vec![0.0f32; 8];
+        let row = vec![0.0f32; 8];
+        let (stay, src, mv) = ([0u32; 8], [0u32; 8], [0u32; 8]);
+        // SAFETY: `available()` checked; every index is 0 and in range.
+        let done = unsafe { chain_tail(&cur, &mut next, &row, &stay, &src, &mv, 0) };
+        assert_eq!(done, 8);
+        for (i, v) in next.iter().enumerate() {
+            assert!(v.is_infinite() && v.is_sign_negative(), "lane {i} is {v}");
+        }
+    }
+
+    /// The ordinary case, against the scalar `logaddexp` the scan falls back to.
+    #[test]
+    fn chain_tail_matches_scalar_logaddexp() {
+        if !available() {
+            return;
+        }
+        let cur: Vec<f32> = (0..16).map(|i| -0.5 * i as f32).collect();
+        let row: Vec<f32> = (0..16).map(|i| 0.25 * i as f32 - 2.0).collect();
+        let stay: [u32; 8] = [0, 3, 5, 7, 9, 11, 13, 15];
+        let src: [u32; 8] = [1, 2, 4, 6, 8, 10, 12, 14];
+        let mv: [u32; 8] = [15, 12, 10, 8, 6, 4, 2, 0];
+        let mut next = vec![0.0f32; 16];
+        // SAFETY: `available()` checked; indices are all below 16.
+        unsafe { chain_tail(&cur, &mut next, &row, &stay, &src, &mv, 8) };
+        for i in 0..8 {
+            let a = cur[8 + i] + row[stay[i] as usize];
+            let b = cur[src[i] as usize] + row[mv[i] as usize];
+            let m = a.max(b);
+            let want = m + (-(a - b).abs()).exp().ln_1p();
+            assert!(
+                (next[8 + i] - want).abs() < 1e-5,
+                "lane {i}: got {} want {want}",
+                next[8 + i]
+            );
+        }
+    }
+
     #[test]
     fn exp8_underflows_to_zero() {
         if !available() {

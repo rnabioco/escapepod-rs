@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Performance
+
+- **AVX2 and AVX-512 kernels for the reference-scoring scan — 3.3x** (#241).
+  `--ref-scores` cost +25% on `demux basecall` when it landed; it now costs
+  +7.6%, and +3.6% on the fused `demux`.
+
+  Two measurements shaped this, both against the obvious guess. The scan was
+  never loop-bound: specialising its two fan-in classes into separate scalar
+  loops moved it 25.7% → 25.1%. It was transcendental-bound exactly as the
+  decode is, and the difference was simply that it called scalar `exp`/`ln_1p`
+  while the decode ran the crate's Cephes kernels. And vectorising only the
+  fan-in-1 cells — 65% of the lattice — capped the whole scan at 2.15x, almost
+  exactly the Amdahl bound, because the head is a tenth of the cells but a
+  third of the work at five terms per cell against two.
+
+  The kernels rest on a reordering: cells are now partitioned by fan-in, so a
+  cell's own `alpha` is a unit-stride load and its result a unit-stride store,
+  and only the score indices need gathering. AVX2 has no scatter at all, so an
+  unordered lattice could not have been vectorised on it. The head's moves are
+  additionally stored transposed to `[edge][cell]`, so each edge's indices are
+  a unit-stride load rather than a gather feeding a gather.
+
+  Checked against the scalar scan on 20k real reads: 20,000/20,000 identical
+  barcode calls, largest `crf_logp` difference 0.0002 nats.
+
 ### Added
 
 - **The CRF can now say how sure it is: `escpod demux basecall --ref-scores`**
@@ -44,9 +69,7 @@
   bundle's references do not carry, plus the identity that the probabilities of
   all possible emissions sum to 1.
 
-  Opt-in: measured at +25% on `demux basecall` and +11% on the fused `demux`,
-  because the scan calls scalar `exp`/`ln_1p` where the decode uses the crate's
-  AVX2/AVX-512 kernels. A vector kernel for it is the remaining factor.
+  Opt-in, and cheap: +7.6% on `demux basecall`, +3.6% on the fused `demux`.
 
 - **A precision/recall dial that actually turns: `--min-crf-margin` and
   `--min-crf-prob`** (#241), on both `escpod demux` and `escpod demux

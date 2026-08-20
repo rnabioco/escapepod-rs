@@ -93,9 +93,9 @@ pub struct RunArgs {
     /// for precision (#241). This computes what the lattice actually thought,
     /// which is continuous, and adds it to `--classifications`.
     ///
-    /// Costs ~25% on the decode; with `--gpu` more, because the constrained
-    /// scan reads the raw scores and so brings the decode back to the host
-    /// while the encoder stays on the device.
+    /// Costs +3.6% on this pipeline; with `--gpu` more, because the
+    /// constrained scan reads the raw scores and so brings the decode back to
+    /// the host while the encoder stays on the device.
     #[cfg(feature = "crf-decode")]
     #[arg(long, help_heading = "Advanced Options")]
     pub ref_scores: bool,

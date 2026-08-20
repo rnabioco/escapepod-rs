@@ -441,6 +441,87 @@ pub(super) unsafe fn log_softmax_floored(src: &[f32], dst: &mut [f32], floor: f3
     }
 }
 
+/// One timestep of the constrained-chain scan's fan-in-1 cells, sixteen at a
+/// time. See [`super::avx2::chain_tail`] for what it computes and why the cells
+/// are laid out the way they are.
+#[target_feature(enable = "avx512f")]
+pub(super) unsafe fn chain_tail(
+    cur: &[f32],
+    next: &mut [f32],
+    row: &[f32],
+    stay: &[u32],
+    src: &[u32],
+    mv: &[u32],
+    base: usize,
+) -> usize {
+    unsafe {
+        let n = stay.len();
+        let (zero, one) = (_mm512_setzero_ps(), _mm512_set1_ps(1.0));
+        let mut i = 0;
+        while i + 16 <= n {
+            let idx = |p: *const u32| _mm512_loadu_si512(p.add(i) as *const __m512i);
+            // AVX-512 gathers take the index vector first, the opposite of
+            // AVX2's `(base, index)`.
+            let a = _mm512_add_ps(
+                _mm512_loadu_ps(cur.as_ptr().add(base + i)),
+                _mm512_i32gather_ps::<4>(idx(stay.as_ptr()), row.as_ptr()),
+            );
+            let b = _mm512_add_ps(
+                _mm512_i32gather_ps::<4>(idx(src.as_ptr()), cur.as_ptr()),
+                _mm512_i32gather_ps::<4>(idx(mv.as_ptr()), row.as_ptr()),
+            );
+
+            let m = _mm512_max_ps(a, b);
+            // See the AVX2 kernel for why this is here and why no test catches
+            // its removal: it turns an unreached cell's `-inf - -inf = NaN`
+            // into 0, rather than leaving the `NaN` for `ln16`'s clamp to
+            // scrub by accident.
+            let d = _mm512_min_ps(_mm512_sub_ps(_mm512_min_ps(a, b), m), zero);
+            let r = _mm512_add_ps(m, ln16(_mm512_add_ps(one, exp16(d))));
+            _mm512_storeu_ps(next.as_mut_ptr().add(base + i), r);
+            i += 16;
+        }
+        i
+    }
+}
+
+/// One timestep of the constrained-chain scan's fan-in-4 cells, sixteen at a
+/// time. See [`super::avx2::chain_head`].
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f")]
+pub(super) unsafe fn chain_head(
+    cur: &[f32],
+    next: &mut [f32],
+    row: &[f32],
+    stay: &[u32],
+    src: &[u32],
+    score: &[u32],
+    base: usize,
+    n: usize,
+) -> usize {
+    unsafe {
+        debug_assert_eq!(src.len(), 4 * n);
+        let mut i = 0;
+        while i + 16 <= n {
+            let idx = |p: *const u32, at: usize| _mm512_loadu_si512(p.add(at) as *const __m512i);
+            let mut v = [_mm512_setzero_ps(); 5];
+            v[0] = _mm512_add_ps(
+                _mm512_loadu_ps(cur.as_ptr().add(base + i)),
+                _mm512_i32gather_ps::<4>(idx(stay.as_ptr(), i), row.as_ptr()),
+            );
+            for d in 0..4 {
+                v[1 + d] = _mm512_add_ps(
+                    _mm512_i32gather_ps::<4>(idx(src.as_ptr(), d * n + i), cur.as_ptr()),
+                    _mm512_i32gather_ps::<4>(idx(score.as_ptr(), d * n + i), row.as_ptr()),
+                );
+            }
+            _mm512_storeu_ps(next.as_mut_ptr().add(base + i), lse5(v));
+            i += 16;
+        }
+        i
+    }
+}
+
 /// The `(dest, edge)` with the highest score, ties broken toward the lowest
 /// `dest * n_edges + edge`. See [`super::avx2::argmax_edge`].
 #[target_feature(enable = "avx512f")]
@@ -486,6 +567,51 @@ mod tests {
             let mut out = [0f32; 16];
             _mm512_storeu_ps(out.as_mut_ptr(), f(_mm512_loadu_ps(xs.as_ptr())));
             out
+        }
+    }
+
+    /// See [`super::avx2`]'s twin: an unreached cell's `-inf - -inf = NaN` has
+    /// to come back out as `-inf`, and nothing downstream can observe it.
+    #[test]
+    fn chain_tail_absorbs_unreached() {
+        if !available() {
+            return;
+        }
+        let cur = vec![f32::NEG_INFINITY; 16];
+        let mut next = vec![0.0f32; 16];
+        let row = vec![0.0f32; 16];
+        let (stay, src, mv) = ([0u32; 16], [0u32; 16], [0u32; 16]);
+        // SAFETY: `available()` checked; every index is 0 and in range.
+        let done = unsafe { chain_tail(&cur, &mut next, &row, &stay, &src, &mv, 0) };
+        assert_eq!(done, 16);
+        for (i, v) in next.iter().enumerate() {
+            assert!(v.is_infinite() && v.is_sign_negative(), "lane {i} is {v}");
+        }
+    }
+
+    #[test]
+    fn chain_tail_matches_scalar_logaddexp() {
+        if !available() {
+            return;
+        }
+        let cur: Vec<f32> = (0..32).map(|i| -0.5 * i as f32).collect();
+        let row: Vec<f32> = (0..32).map(|i| 0.25 * i as f32 - 2.0).collect();
+        let stay: [u32; 16] = std::array::from_fn(|i| (2 * i + 1) as u32);
+        let src: [u32; 16] = std::array::from_fn(|i| (2 * i) as u32);
+        let mv: [u32; 16] = std::array::from_fn(|i| (31 - 2 * i) as u32);
+        let mut next = vec![0.0f32; 32];
+        // SAFETY: `available()` checked; indices are all below 32.
+        unsafe { chain_tail(&cur, &mut next, &row, &stay, &src, &mv, 16) };
+        for i in 0..16 {
+            let a = cur[16 + i] + row[stay[i] as usize];
+            let b = cur[src[i] as usize] + row[mv[i] as usize];
+            let m = a.max(b);
+            let want = m + (-(a - b).abs()).exp().ln_1p();
+            assert!(
+                (next[16 + i] - want).abs() < 1e-5,
+                "lane {i}: got {} want {want}",
+                next[16 + i]
+            );
         }
     }
 

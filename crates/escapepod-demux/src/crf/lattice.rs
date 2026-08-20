@@ -682,6 +682,7 @@ fn decode_inner(
             &mut scratch.chain_cur,
             &mut scratch.chain_next,
             out,
+            backend,
         );
     }
 
