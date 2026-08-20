@@ -39,7 +39,8 @@ use thiserror::Error;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_core::model::TypedRunnableModel;
 
-use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with};
+use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs};
+use super::refchain::{RefChains, ScoredDecode};
 
 /// Errors from loading or running the CRF encoder.
 #[derive(Debug, Error)]
@@ -74,6 +75,8 @@ pub enum CrfError {
     BadAlphabet { got: usize, expected: usize },
     #[error("decode failed: {0}")]
     Decode(String),
+    #[error("reference panel is not scorable against this model: {0}")]
+    RefChain(#[from] super::refchain::RefChainError),
 }
 
 /// The `metadata.json` sidecar that travels with a CRF encoder export.
@@ -608,6 +611,63 @@ impl CrfEncoder {
     pub fn encode(&self, prepped: &[f32]) -> Result<Vec<f32>, CrfError> {
         let outputs = self.run_encoder(prepped)?;
         Ok(self.scores_of(&outputs)?.to_vec())
+    }
+
+    /// Build the constrained lattices for a reference panel, once per run.
+    ///
+    /// `seqs` are the sequences the model **emits** — what a bundle's
+    /// `barcodes[].sequence` holds, already trimmed to `target[state_len..]`.
+    /// Passing full-length training targets here scores a longer string than
+    /// the model can emit and drives every reference's probability to zero,
+    /// the same trap that inflates every edit distance on the matching path.
+    pub fn ref_chains(&self, seqs: &[&[u8]]) -> Result<RefChains, CrfError> {
+        Ok(RefChains::build(&self.layout, &self.alphabet, seqs)?)
+    }
+
+    /// [`Self::decode_scores`], additionally scoring every reference in
+    /// `chains`: `out` receives `log P(reference | signal)` per reference.
+    ///
+    /// See [`super::refchain`] for what that is and why the decode is where it
+    /// has to be computed.
+    pub fn decode_scores_with_refs(
+        &self,
+        scores: &[f32],
+        scratch: &mut CrfScratch,
+        backend: Backend,
+        chains: &RefChains,
+        out: &mut Vec<f32>,
+    ) -> Result<String, CrfError> {
+        decode_with_refs(
+            &self.layout,
+            &self.alphabet,
+            scores,
+            self.meta.t_len(),
+            scratch,
+            backend,
+            chains,
+            out,
+        )
+        .map_err(|e| CrfError::Decode(e.to_string()))
+    }
+
+    /// [`Self::basecall_prepped`], additionally scoring every reference in
+    /// `chains`.
+    pub fn basecall_prepped_with_refs(
+        &self,
+        prepped: &[f32],
+        scratch: &mut CrfScratch,
+        chains: &RefChains,
+    ) -> Result<ScoredDecode, CrfError> {
+        let outputs = self.run_encoder(prepped)?;
+        let scores = self.scores_of(&outputs)?;
+        let mut ref_logp = Vec::with_capacity(chains.len());
+        let sequence =
+            self.decode_scores_with_refs(scores, scratch, self.backend, chains, &mut ref_logp)?;
+        Ok(ScoredDecode {
+            sequence,
+            ref_logp,
+            mean_logpost: scratch.path_score() / self.meta.t_len().max(1) as f32,
+        })
     }
 
     /// Basecall one already-prepped read.

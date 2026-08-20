@@ -23,7 +23,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use escapepod_demux::crf::{BarcodeMatch, BarcodeRefs, CrfEncoder, CrfScratch};
+use escapepod_demux::crf::{
+    BarcodeMatch, BarcodeRefs, CrfEncoder, CrfScratch, RefChains, ScoredDecode,
+};
 use escapepod_signal::{Reader, ReadsBatchView};
 use rayon::prelude::*;
 use tracing::{info, warn};
@@ -63,6 +65,24 @@ pub struct BasecallArgs {
     /// outright ties; gate downstream instead if you want the raw margins.
     #[arg(long, default_value = "0", value_name = "N", requires = "barcodes")]
     pub min_margin: u32,
+
+    /// Also score every reference against the lattice itself, adding
+    /// `crf_logp`, `crf_best`, `crf_margin` and `mean_logpost` columns.
+    ///
+    /// `crf_logp` is `log P(called barcode | signal)` — a real probability,
+    /// unlike `confidence`, which is an edit distance between two strings and
+    /// on a designed panel measures how far apart the references are rather
+    /// than how sure the model is (#241). `crf_margin` is the log-odds in nats
+    /// against the runner-up, and `crf_best` names the reference the lattice
+    /// itself prefers, which need not be the one edit distance called.
+    ///
+    /// Off by default because it is not free: measured at +25% on this
+    /// command over 20k RNA004 reads, because the scan calls scalar
+    /// `exp`/`ln_1p` where the decode uses vector kernels. With `--gpu` it
+    /// costs more still — the constrained scan needs the raw scores, so the
+    /// decode comes back to the host while the encoder stays on the device.
+    #[arg(long, requires = "barcodes")]
+    pub ref_scores: bool,
 
     /// Overrule the bundle's declared `boundary.margin` for this run.
     ///
@@ -157,6 +177,37 @@ impl Basecaller {
             Self::Gpu(encoder) => Ok(encoder.basecall_batch(prepped)?),
         }
     }
+
+    fn ref_chains(&self, seqs: &[&[u8]]) -> anyhow::Result<RefChains> {
+        Ok(match self {
+            Self::Cpu(e) => e.ref_chains(seqs)?,
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.ref_chains(seqs)?,
+        })
+    }
+
+    /// [`Self::basecall_prepped`], additionally scoring every reference in
+    /// `chains` against the lattice — see `--ref-scores`.
+    fn basecall_prepped_scored(
+        &self,
+        prepped: &[Option<Vec<f32>>],
+        chains: &RefChains,
+    ) -> anyhow::Result<Vec<Option<ScoredDecode>>> {
+        match self {
+            Self::Cpu(encoder) => Ok(prepped
+                .par_iter()
+                .map_init(CrfScratch::new, |scratch, w| {
+                    let w = w.as_ref()?;
+                    encoder
+                        .basecall_prepped_with_refs(w, scratch, chains)
+                        .inspect_err(|e| warn!("encoder: {e}"))
+                        .ok()
+                })
+                .collect()),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(encoder) => Ok(encoder.basecall_batch_with_refs(prepped, chains)?),
+        }
+    }
 }
 
 /// One read's result. `sequence` is `None` when the read had no usable window.
@@ -165,6 +216,8 @@ struct Decoded {
     adapter_end: usize,
     sequence: Option<String>,
     call: Option<BarcodeMatch>,
+    /// The lattice's own view of the panel, under `--ref-scores`.
+    scored: Option<ScoredDecode>,
 }
 
 /// escpod's own sentinel for a read that could not be placed (`demux/run.rs`).
@@ -206,7 +259,7 @@ fn write_row(
         ),
         None => (UNCLASSIFIED, String::new(), String::new(), String::new()),
     };
-    writeln!(
+    write!(
         out,
         "{},{},{},{},{},{},{},{}",
         d.read_id,
@@ -217,7 +270,30 @@ fn write_row(
         d.adapter_end,
         seq.len(),
         seq
-    )
+    )?;
+    let Some(scored) = &d.scored else {
+        return writeln!(out);
+    };
+    // `crf_logp` is the probability of the barcode this row actually calls, so
+    // an unclassified row leaves it empty rather than reporting the score of a
+    // call it did not make.
+    match (
+        d.call.as_ref().filter(|_| barcode != UNCLASSIFIED),
+        scored.best(),
+    ) {
+        (call, Some((top, _, lattice_margin))) => writeln!(
+            out,
+            ",{},{},{},{:.4}",
+            call.map(|c| format!("{:.4}", scored.ref_logp[c.index]))
+                .unwrap_or_default(),
+            refs.name(top),
+            lattice_margin
+                .map(|m| format!("{m:.4}"))
+                .unwrap_or_default(),
+            scored.mean_logpost,
+        ),
+        (_, None) => writeln!(out, ",,,,{:.4}", scored.mean_logpost),
+    }
 }
 
 /// Run the basecall subcommand.
@@ -441,13 +517,33 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     let progress = create_progress_bar(boundaries.len() as u64, "Basecalling")?;
     let skipped = AtomicUsize::new(0);
     let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
+    // Scoring needs the panel, so `--ref-scores` without `--barcodes` is a clap
+    // `requires` error rather than a silent no-op.
+    let chains = match (&refs, args.ref_scores) {
+        (Some(r), true) => Some(encoder.ref_chains(&r.sequences())?),
+        _ => None,
+    };
+    if let Some(c) = &chains {
+        info!(
+            "{} {} references over {} shared lattice cells",
+            style::label("Scoring:"),
+            style::count(c.len()),
+            style::count(c.cells()),
+        );
+    }
+
     writeln!(
         out,
-        "{}",
+        "{}{}",
         if refs.is_some() {
             "read_id,barcode,confidence,best_dist,second_best_dist,adapter_end,decoded_len,decoded_seq"
         } else {
             "read_id,adapter_end,decoded_len,decoded_seq"
+        },
+        if chains.is_some() {
+            ",crf_logp,crf_best,crf_margin,mean_logpost"
+        } else {
+            ""
         }
     )?;
     let mut written = 0usize;
@@ -482,7 +578,21 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         // on a full channel — turning an I/O error into a hang.
         for (ids, ends, windows) in rx {
             let n = ids.len();
-            let sequences = encoder.basecall_prepped(&windows)?;
+            // Two shapes of the same call: with `--ref-scores` the decode also
+            // returns the panel scores, so the reference scan runs inside it
+            // rather than over scores nothing kept.
+            let results: Vec<(Option<String>, Option<ScoredDecode>)> = match &chains {
+                Some(c) => encoder
+                    .basecall_prepped_scored(&windows, c)?
+                    .into_iter()
+                    .map(|s| (s.as_ref().map(|s| s.sequence.clone()), s))
+                    .collect(),
+                None => encoder
+                    .basecall_prepped(&windows)?
+                    .into_iter()
+                    .map(|s| (s, None))
+                    .collect(),
+            };
             drop(windows);
 
             // Matching is independent per read and cheap next to the decode,
@@ -490,10 +600,10 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             let decoded: Vec<Decoded> = ids
                 .into_iter()
                 .zip(ends)
-                .zip(sequences)
+                .zip(results)
                 .collect::<Vec<_>>()
                 .into_par_iter()
-                .map(|((read_id, adapter_end), seq)| {
+                .map(|((read_id, adapter_end), (seq, scored))| {
                     let call = seq
                         .as_ref()
                         .and_then(|s| refs.as_ref().and_then(|r| r.match_sequence(s.as_bytes())));
@@ -502,6 +612,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
                         adapter_end,
                         sequence: seq,
                         call,
+                        scored,
                     }
                 })
                 .collect();

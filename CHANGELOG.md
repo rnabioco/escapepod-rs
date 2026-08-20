@@ -4,6 +4,52 @@
 
 ### Added
 
+- **The CRF can now say how sure it is: `escpod demux basecall --ref-scores`**
+  (#241). Demultiplexing reports `confidence` as the edit-distance margin to
+  the runner-up, and on a designed panel that measures how far apart the
+  references are, not how sure the model is. Measured over one production
+  16-plex flowcell (1,001,307 reads): 99% of classified reads take one of three
+  margin values, so sweeping `--min-margin` does nothing and then falls off a
+  cliff, and 90% of the reads two independently trained bundles disagree about
+  are *exact* matches to a reference. There was no way to buy precision at any
+  price.
+
+  The lattice has an opinion and it was never surfaced. Every path through a
+  CTC-CRF emits exactly one string, so restricting the forward recursion to the
+  paths that emit a given reference and normalising by the full partition
+  function gives a real probability:
+
+  ```text
+  crf_logp = logZ_target(reference) - logZ_full = log P(reference | signal)
+  ```
+
+  `--ref-scores` computes that for every reference in one shared lattice —
+  references with a common prefix share their cells — and adds four columns:
+  `crf_logp` (the called barcode's log-probability), `crf_best` (the reference
+  the lattice itself prefers, which need not be the one edit distance called),
+  `crf_margin` (log-odds in nats against the runner-up), and `mean_logpost`
+  (the decoded path's mean per-timestep log-posterior, which the Viterbi pass
+  was already computing and discarding).
+
+  Over 20k RNA004 reads: `confidence` takes 15 distinct values with 98.7% of
+  reads in three of them; `crf_margin` takes 14,818 over 16,747 reads. 98.4% of
+  reads match a reference exactly, and *within that group* `P(barcode | signal)`
+  still spans below 0.1 (26 reads) through 0.1–0.5 (828, 5.0%) to 0.9–0.99
+  (91.8%) — reads a clean decode cannot tell apart and the lattice can.
+
+  The scan is folded into the decode rather than bolted on after it, because it
+  reads the raw scores and pass 1 overwrites them in place with log-posteriors.
+  Correctness is pinned against exhaustive enumeration of every path through a
+  small lattice, including the marginalisation over the `state_len` bases a
+  bundle's references do not carry, plus the identity that the probabilities of
+  all possible emissions sum to 1.
+
+  Opt-in: measured at +25% on `demux basecall`, because the scan calls scalar
+  `exp`/`ln_1p` where the decode uses the crate's AVX2/AVX-512 kernels. A
+  vector kernel for it is the remaining factor; a gate (`--min-crf-margin`) and
+  a `.p5s` numeric column to carry the score through `demux --annotate` are
+  still to come.
+
 - **`escpod demux detect --method cnn --gpu --profile` reports a per-stage
   breakdown** (#239). The GPU path is a producer (decode + prep on the rayon
   pool) feeding a batched onnxruntime consumer through a bounded channel, and

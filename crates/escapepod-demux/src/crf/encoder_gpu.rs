@@ -100,7 +100,8 @@ use ort::value::Tensor;
 use rayon::prelude::*;
 
 use super::encoder::{CrfError, CrfMetadata};
-use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with};
+use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs};
+use super::refchain::{RefChains, ScoredDecode};
 
 /// Rows one device may have in flight across *all* encoders sharing it.
 ///
@@ -702,6 +703,113 @@ impl CrfEncoderGpu {
     /// whole caller batch would retain gigabytes of host memory for an Arrow
     /// batch of a few thousand reads. Interleaving caps that at `batch_rows`
     /// reads' worth regardless of how many reads are handed in.
+    /// Build the constrained lattices for a reference panel — see
+    /// [`CrfEncoder::ref_chains`](super::encoder::CrfEncoder::ref_chains).
+    pub fn ref_chains(&self, seqs: &[&[u8]]) -> Result<RefChains, CrfError> {
+        Ok(RefChains::build(&self.layout, &self.alphabet, seqs)?)
+    }
+
+    /// [`Self::basecall_batch`], additionally scoring every reference in
+    /// `chains` against each read (`log P(reference | signal)`).
+    ///
+    /// The encoder still runs on the device — it is 91% of the pipeline — but
+    /// the decode comes back to the host even when a CUDA lattice is
+    /// available, because the constrained scan reads the raw scores and only
+    /// the host decode has them. Scoring on the device is a separate kernel and
+    /// a separate change (#241); this keeps the expensive half accelerated
+    /// rather than making `--gpu` and reference scoring mutually exclusive.
+    pub fn basecall_batch_with_refs(
+        &self,
+        prepped: &[Option<Vec<f32>>],
+        chains: &RefChains,
+    ) -> Result<Vec<Option<ScoredDecode>>, CrfError> {
+        let valid: Vec<usize> = (0..prepped.len())
+            .filter(|&i| prepped[i].is_some())
+            .collect();
+
+        let backend = Backend::best_for(&self.layout);
+        let mut out = vec![None; prepped.len()];
+
+        for idx in valid.chunks(self.batch_rows()) {
+            let rows: Vec<&[f32]> = idx
+                .iter()
+                .map(|&i| prepped[i].as_deref().unwrap())
+                .collect();
+            for (&i, scored) in idx
+                .iter()
+                .zip(self.run_and_decode_with_refs(&rows, backend, chains)?)
+            {
+                out[i] = Some(scored);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The scoring counterpart of [`Self::run_and_decode`], including its
+    /// halve-on-OOM retry — an encode OOM is a property of the batch size, not
+    /// of what the host does with the scores afterwards.
+    fn run_and_decode_with_refs(
+        &self,
+        rows: &[&[f32]],
+        backend: Backend,
+        chains: &RefChains,
+    ) -> Result<Vec<ScoredDecode>, CrfError> {
+        match self.try_run_and_decode_with_refs(rows, backend, chains) {
+            Err(CrfError::Run(msg) | CrfError::Decode(msg)) if is_oom(&msg) && rows.len() > 1 => {
+                let half = rows.len().div_ceil(2);
+                let mut first = self.run_and_decode_with_refs(&rows[..half], backend, chains)?;
+                first.extend(self.run_and_decode_with_refs(&rows[half..], backend, chains)?);
+                Ok(first)
+            }
+            other => other,
+        }
+    }
+
+    fn try_run_and_decode_with_refs(
+        &self,
+        rows: &[&[f32]],
+        backend: Backend,
+        chains: &RefChains,
+    ) -> Result<Vec<ScoredDecode>, CrfError> {
+        self.run_raw(rows, |data, t_len, batch, n_score| {
+            (0..batch)
+                .into_par_iter()
+                .map_init(
+                    || {
+                        (
+                            CrfScratch::new(),
+                            Vec::<f32>::with_capacity(t_len * n_score),
+                        )
+                    },
+                    |(scratch, buf), b| {
+                        buf.clear();
+                        for t in 0..t_len {
+                            let off = (t * batch + b) * n_score;
+                            buf.extend_from_slice(&data[off..off + n_score]);
+                        }
+                        let mut ref_logp = Vec::with_capacity(chains.len());
+                        let sequence = decode_with_refs(
+                            &self.layout,
+                            &self.alphabet,
+                            buf.as_slice(),
+                            t_len,
+                            scratch,
+                            backend,
+                            chains,
+                            &mut ref_logp,
+                        )
+                        .map_err(|e| CrfError::Decode(e.to_string()))?;
+                        Ok(ScoredDecode {
+                            sequence,
+                            ref_logp,
+                            mean_logpost: scratch.path_score() / t_len.max(1) as f32,
+                        })
+                    },
+                )
+                .collect()
+        })
+    }
+
     pub fn basecall_batch(
         &self,
         prepped: &[Option<Vec<f32>>],
