@@ -8,8 +8,9 @@ mod common;
 use std::collections::HashMap;
 
 use escapepod_pod5::operations::{
-    AnnotateOptions, ColumnValues, ColumnWrite, DesignOptions, read_annotation, read_design,
-    read_score, remove_annotation, remove_design, write_annotation, write_columns, write_design,
+    AnnotateOptions, ColumnValues, ColumnWrite, DesignOptions, read_annotation, read_columns,
+    read_design, read_score, remove_annotation, remove_design, write_annotation, write_columns,
+    write_design,
 };
 use escapepod_pod5::sidecar::{AnnotationSection, P5S_VERSION, P5S_VERSION_SCORES, sidecar_path};
 use escapepod_pod5::{Reader, Uuid};
@@ -737,4 +738,53 @@ fn reading_a_label_as_a_score_says_which_it_is() {
     .unwrap();
     let err = read_score(&path, "barcode").unwrap_err().to_string();
     assert!(err.contains("is a label column"), "unexpected error: {err}");
+}
+
+/// Requesting no columns must not require a sidecar.
+///
+/// `escpod view` resolves its `--include` names into built-in read fields and
+/// sidecar columns, and the overwhelmingly common case is that the sidecar list
+/// is empty. Reading the sidecar before looking at the names turned every plain
+/// `view` on a file without a `.p5s` into an error — caught by the POD5 compat
+/// suite, not by anything in this file, which is why it is now here.
+#[test]
+fn reading_no_columns_needs_no_sidecar() {
+    let (_tmp, path, _ids, _original) = fixture();
+    assert!(!sidecar_path(&path).exists());
+    let empty: [&str; 0] = [];
+    assert!(read_columns(&path, &empty).unwrap().is_empty());
+
+    // And a named column against a file with no sidecar is still an error.
+    let err = read_columns(&path, &["barcode"]).unwrap_err().to_string();
+    assert!(err.contains("no sidecar"), "unexpected error: {err}");
+}
+
+/// A name is one column, so a score and a label cannot both claim it: writing
+/// one kind over the other replaces it rather than producing a sidecar that
+/// cannot be written.
+#[test]
+fn a_score_and_a_label_cannot_share_a_name() {
+    let (_tmp, path, ids, _original) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    write_columns(
+        &path,
+        &[ColumnWrite {
+            name: "barcode".into(),
+            values: ColumnValues::Scores(make_scores(&ids, 3)),
+        }],
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(read_score(&path, "barcode").unwrap().len(), 3);
+    let err = read_annotation(&path, Some("barcode"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no annotation"), "unexpected error: {err}");
 }

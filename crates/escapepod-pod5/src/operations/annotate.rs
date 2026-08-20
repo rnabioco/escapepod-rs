@@ -477,6 +477,14 @@ pub fn read_columns(
     pod5_path: impl AsRef<Path>,
     names: &[impl AsRef<str>],
 ) -> Result<Vec<SidecarColumn>> {
+    // Asking for no columns needs no sidecar. Without this, `escpod view` with
+    // only built-in fields — the overwhelmingly common case — starts demanding
+    // a `.p5s` that has nothing to do with what it was asked for, which is how
+    // this arrived: the loop it replaced never touched the sidecar when the
+    // name list was empty, because there was nothing to iterate.
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
     let pod5_path = pod5_path.as_ref();
     let reader = Reader::open(pod5_path)?;
     let identity = reader.sidecar_identity()?;
