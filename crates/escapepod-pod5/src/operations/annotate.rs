@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::sidecar::{
-    self, AnnotationSection, DEFAULT_ANNOTATION_NAME, Design, Sidecar, sidecar_path,
+    self, AnnotationSection, DEFAULT_ANNOTATION_NAME, Design, ScoreSection, Sidecar, sidecar_path,
 };
 use crate::types::Uuid;
 
@@ -63,6 +63,84 @@ pub fn write_annotation(
     assignments: &HashMap<Uuid, String>,
     options: &AnnotateOptions,
 ) -> Result<AnnotateResult> {
+    let column = ColumnWrite {
+        name: options.name.clone(),
+        values: ColumnValues::Labels(assignments.clone()),
+    };
+    let out = write_columns(pod5_path, std::slice::from_ref(&column), options.overwrite)?;
+    let (assigned_reads, labels) = out
+        .columns
+        .first()
+        .map_or((0, 0), |c| (c.assigned, c.labels));
+    Ok(AnnotateResult {
+        total_reads: out.total_reads,
+        assigned_reads,
+        labels,
+        annotations_in_sidecar: out.columns_in_sidecar,
+        sidecar_path: out.sidecar_path,
+    })
+}
+
+/// One column to write into a sidecar.
+#[derive(Debug, Clone)]
+pub struct ColumnWrite {
+    /// Column name, e.g. `barcode` or `crf_logp`.
+    pub name: String,
+    /// Its per-read values, and by their type which kind of column it is.
+    pub values: ColumnValues,
+}
+
+/// The two kinds of annotation column a sidecar can hold.
+#[derive(Debug, Clone)]
+pub enum ColumnValues {
+    /// Dictionary-encoded utf8 labels. Empty labels are dropped — an
+    /// unassigned read is represented by absence.
+    Labels(HashMap<Uuid, String>),
+    /// `Float32` scores. `NaN` is refused rather than dropped, because unlike
+    /// an empty label it is a value someone may have meant.
+    Scores(HashMap<Uuid, f32>),
+}
+
+/// What one column write did.
+#[derive(Debug, Clone)]
+pub struct ColumnStat {
+    pub name: String,
+    /// Reads that got a value (present in the file AND in the mapping).
+    pub assigned: usize,
+    /// Distinct labels; 0 for a score column, which has no dictionary.
+    pub labels: usize,
+}
+
+/// Outcome of [`write_columns`].
+#[derive(Debug, Clone)]
+pub struct ColumnsResult {
+    /// Reads present in the POD5 file.
+    pub total_reads: usize,
+    /// Per column, in the order given.
+    pub columns: Vec<ColumnStat>,
+    /// Annotation columns of both kinds in the sidecar after the write.
+    pub columns_in_sidecar: usize,
+    /// Where the sidecar was written.
+    pub sidecar_path: PathBuf,
+}
+
+/// Write several columns into the `.p5s` sidecar in **one** read-modify-write.
+///
+/// [`write_annotation`] is this with a single label column. Batching matters
+/// because a scored demux run produces five columns at once (a barcode, the
+/// lattice's preferred reference, and three numbers): writing them one at a
+/// time would re-read, re-decode and re-encode the whole sidecar five times,
+/// and leave four intermediate states on disk that describe a run that never
+/// happened.
+///
+/// Each mapping is intersected with the reads actually present in the file. An
+/// existing valid sidecar is merged into — its read index and other columns
+/// survive; a column of the same name is replaced, whichever kind it was.
+pub fn write_columns(
+    pod5_path: impl AsRef<Path>,
+    columns: &[ColumnWrite],
+    overwrite: bool,
+) -> Result<ColumnsResult> {
     let pod5_path = pod5_path.as_ref();
     let reader = Reader::open(pod5_path)?;
     let identity = reader.sidecar_identity()?;
@@ -74,54 +152,81 @@ pub fn write_annotation(
     let mut sc = match sidecar::read_sidecar_file(&p5s_path, &identity) {
         Ok(Some(existing)) => existing,
         Ok(None) => Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec()),
-        Err(_) if options.overwrite => {
+        Err(_) if overwrite => {
             Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec())
         }
         Err(e) => return Err(e),
     };
 
-    if let Some(design) = sc.design()
-        && design.value_columns.contains(&options.name)
-    {
-        return Err(Error::Parse(format!(
-            "annotation '{}' is derived from the experimental design; \
-             update the design instead",
-            options.name
-        )));
+    let mut stats = Vec::with_capacity(columns.len());
+    let mut touched_key = false;
+    for column in columns {
+        if let Some(design) = sc.design()
+            && design.value_columns.contains(&column.name)
+        {
+            return Err(Error::Parse(format!(
+                "annotation '{}' is derived from the experimental design; \
+                 update the design instead",
+                column.name
+            )));
+        }
+
+        let stat = match &column.values {
+            ColumnValues::Labels(assignments) => {
+                let annotation = AnnotationSection::from_pairs(
+                    &column.name,
+                    sc.entries().iter().filter_map(|&(uuid_bytes, _, _)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        assignments
+                            .get(&uuid)
+                            .filter(|label| !label.is_empty())
+                            .map(|label| (uuid, label.as_str()))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: annotation.len(),
+                    labels: annotation.labels().len(),
+                };
+                sc.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::Scores(values) => {
+                let score = ScoreSection::from_pairs(
+                    &column.name,
+                    sc.entries().iter().filter_map(|&(uuid_bytes, _, _)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        values.get(&uuid).map(|&v| (uuid, v))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: score.len(),
+                    labels: 0,
+                };
+                sc.set_score(score);
+                stat
+            }
+        };
+        touched_key |= sc
+            .design()
+            .is_some_and(|d| d.key_columns.contains(&column.name));
+        stats.push(stat);
     }
 
-    let annotation = AnnotationSection::from_pairs(
-        &options.name,
-        sc.entries().iter().filter_map(|&(uuid_bytes, _, _)| {
-            let uuid = Uuid::from_bytes(uuid_bytes);
-            assignments
-                .get(&uuid)
-                .filter(|label| !label.is_empty())
-                .map(|label| (uuid, label.as_str()))
-        }),
-    )?;
-
-    let result = AnnotateResult {
-        total_reads: sc.len(),
-        assigned_reads: annotation.len(),
-        labels: annotation.labels().len(),
-        annotations_in_sidecar: 0, // fixed up below
-        sidecar_path: p5s_path.clone(),
-    };
-    sc.set_annotation(annotation);
     // Rewriting a design key column changes what each read's key combination
-    // resolves to — keep the derived columns in sync.
-    if sc
-        .design()
-        .is_some_and(|d| d.key_columns.contains(&options.name))
-    {
+    // resolves to — keep the derived columns in sync. Once, after all the
+    // columns are in, rather than per column.
+    if touched_key {
         sc.derive_design_columns()?;
     }
     sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
 
-    Ok(AnnotateResult {
-        annotations_in_sidecar: sc.annotations().len(),
-        ..result
+    Ok(ColumnsResult {
+        total_reads: sc.len(),
+        columns: stats,
+        columns_in_sidecar: sc.annotations().len() + sc.scores().len(),
+        sidecar_path: p5s_path,
     })
 }
 
@@ -341,6 +446,104 @@ fn parse_design_csv(path: &Path, keys: Option<&[String]>, sc: &Sidecar) -> Resul
         key_columns,
         value_columns,
         rows,
+    })
+}
+
+/// One sidecar column, of whichever kind it turned out to be stored as.
+#[derive(Debug, Clone)]
+pub enum SidecarColumn {
+    Labels(AnnotationSection),
+    Scores(ScoreSection),
+}
+
+impl SidecarColumn {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Labels(a) => a.name(),
+            Self::Scores(s) => s.name(),
+        }
+    }
+}
+
+/// Read several named columns from the sidecar in one pass, whichever kind each
+/// one is.
+///
+/// For a consumer that just wants a column by name — `escpod view --include`
+/// being the one — and should not have to know in advance whether it holds
+/// labels or numbers. Also one sidecar read for all of them rather than one
+/// per name, and one error listing everything available rather than a list per
+/// kind that omits the column the caller actually asked for.
+pub fn read_columns(
+    pod5_path: impl AsRef<Path>,
+    names: &[impl AsRef<str>],
+) -> Result<Vec<SidecarColumn>> {
+    let pod5_path = pod5_path.as_ref();
+    let reader = Reader::open(pod5_path)?;
+    let identity = reader.sidecar_identity()?;
+    let p5s_path = sidecar_path(pod5_path);
+
+    let sc = sidecar::read_sidecar_file(&p5s_path, &identity)?.ok_or_else(|| {
+        Error::Parse(format!(
+            "no sidecar at {}; create one with `escpod annotate`",
+            p5s_path.display()
+        ))
+    })?;
+
+    names
+        .iter()
+        .map(|name| {
+            let name = name.as_ref();
+            if let Some(a) = sc.annotation(name) {
+                return Ok(SidecarColumn::Labels(a.clone()));
+            }
+            if let Some(s) = sc.score(name) {
+                return Ok(SidecarColumn::Scores(s.clone()));
+            }
+            let mut available = sc.annotation_names();
+            available.extend(sc.score_names());
+            available.sort_unstable();
+            Err(Error::Parse(format!(
+                "no column '{name}' in {} (available: {})",
+                p5s_path.display(),
+                join_or_none(&available)
+            )))
+        })
+        .collect()
+}
+
+/// Read a score column from the `.p5s` sidecar next to a POD5.
+///
+/// Always by name, unlike [`read_annotation`]'s `None`: score columns arrive in
+/// groups (a scored demux writes three at once), so "the only one" is not a
+/// useful default and guessing between `crf_logp` and `crf_margin` would be
+/// worse than asking.
+pub fn read_score(pod5_path: impl AsRef<Path>, name: &str) -> Result<ScoreSection> {
+    let pod5_path = pod5_path.as_ref();
+    let reader = Reader::open(pod5_path)?;
+    let identity = reader.sidecar_identity()?;
+    let p5s_path = sidecar_path(pod5_path);
+
+    let sc = sidecar::read_sidecar_file(&p5s_path, &identity)?.ok_or_else(|| {
+        Error::Parse(format!(
+            "no sidecar at {}; create one with `escpod annotate`",
+            p5s_path.display()
+        ))
+    })?;
+
+    sc.score(name).cloned().ok_or_else(|| {
+        // A name that is present as a label column is the likely mistake, so
+        // say that rather than only listing what is available.
+        if sc.annotation(name).is_some() {
+            return Error::Parse(format!(
+                "'{name}' in {} is a label column, not a score column",
+                p5s_path.display()
+            ));
+        }
+        Error::Parse(format!(
+            "no score column '{name}' in {} (available: {})",
+            p5s_path.display(),
+            join_or_none(&sc.score_names())
+        ))
     })
 }
 

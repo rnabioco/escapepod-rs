@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **`.p5s` sidecars carry numbers, not only labels** (#241). Every annotation
+  column was a dictionary-encoded utf8 label, which is the wrong shape for a
+  per-read score: a continuous value over a million reads is a million distinct
+  "labels", past the 65535 limit, with a dictionary larger than the data it
+  indexes. Sidecar-only demux (`--annotate` with no `-d`) writes no CSV either,
+  so a scored run computed `crf_logp` and then had nowhere to put it.
+
+  A column is now labels (`Dictionary(Int32, Utf8)`) or scores (`Float32`), and
+  a reader dispatches on the Arrow type rather than on a convention. Null means
+  the read has no value — for a score, absence rather than a sentinel, since
+  every `f32` is a possible answer. `NaN` is refused on the way in for the same
+  reason: it is the one float that already means "no value".
+
+  `demux --annotate --ref-scores` now records `barcode`, `crf_best`,
+  `crf_logp`, `crf_margin` and `mean_logpost` in **one** read-modify-write
+  (`write_columns`), rather than five that would leave four intermediate
+  sidecars on disk describing a run that never happened. `escpod view --include
+  crf_logp`, `escpod inspect`, and the Python `Reader.score()` /
+  `.score_names()` all read them back.
+
+  **The version bump is gated on content**: a sidecar with only label columns
+  still declares `1`, so an escpod that predates this reads it exactly as
+  before; only one that actually carries a numeric column declares `2`. Bumping
+  every write would have made older binaries reject barcode-only sidecars they
+  handle perfectly well, and without any bump they would have failed on a score
+  column with a message about it not being "dictionary-encoded utf8" — true,
+  but not something a user can act on.
+
+  Verified end to end on 20k reads: sidecar and classifications CSV agree on
+  all 20,000, and the POD5 is byte-identical as always.
+
 ### Performance
 
 - **AVX2 and AVX-512 kernels for the reference-scoring scan — 3.3x** (#241).
@@ -110,6 +141,8 @@
   checked against each other on real data: over 19,980 shared reads they agree
   on 100.00% of barcodes, gated and ungated, with a largest `crf_logp`
   difference of 0.
+
+  Sidecar-only demux keeps the scores too — see the `.p5s` entry below.
 
 - **`escpod demux detect --method cnn --gpu --profile` reports a per-stage
   breakdown** (#239). The GPU path is a producer (decode + prep on the rayon

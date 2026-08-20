@@ -10,10 +10,20 @@
 //!
 //! `batch_idx`/`row_idx` locate the read in the POD5 reads table — this *is*
 //! the read index (successor of the retired `.p5i` format). Every additional
-//! column is a named **annotation**: a dictionary-encoded utf8 label per
-//! read (e.g. `barcode` from demultiplexing), null where unassigned. The
-//! index columns are a rebuildable cache; annotation columns are data
-//! products that exist nowhere else once the CSV that produced them is gone.
+//! column is a named **annotation** in one of two kinds, null where the read
+//! has no value:
+//!
+//! * **labels** — dictionary-encoded utf8, e.g. `barcode` from demultiplexing
+//!   ([`AnnotationSection`]);
+//! * **scores** — `Float32`, e.g. `crf_logp` from `demux --ref-scores`
+//!   ([`ScoreSection`]).
+//!
+//! A column's Arrow type is what says which kind it is, so a reader dispatches
+//! on the schema rather than on a convention. The index columns are a
+//! rebuildable cache; both kinds of annotation column are data products that
+//! exist nowhere else once the CSV that produced them is gone — which is the
+//! whole reason scores had to become a column at all, since sidecar-only demux
+//! (`--annotate` with no `-d`) writes no CSV to keep them in.
 //!
 //! The POD5 file itself is never modified — raw sequencer output stays
 //! byte-identical and checksummable. And because the sidecar is an ordinary
@@ -39,8 +49,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeBinaryBuilder, Int32Builder, StringArray,
-    UInt32Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeBinaryBuilder, Float32Array, Int32Builder,
+    StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::ipc::CompressionType;
@@ -60,8 +70,24 @@ pub const P5S_DESIGN_KEY: &str = "escapepod:design";
 pub const P5S_FILE_ID_KEY: &str = "escapepod:file_identifier";
 /// Schema-metadata key binding the sidecar to the POD5's byte size.
 pub const P5S_POD5_SIZE_KEY: &str = "escapepod:pod5_size";
-/// Current sidecar format version (stored under [`P5S_VERSION_KEY`]).
+/// Sidecar format version for a file whose annotations are all label columns.
+///
+/// Still what gets written whenever no numeric column is present, which is
+/// every sidecar `escpod annotate` produces and every demux run without
+/// `--ref-scores`. See [`P5S_VERSION_SCORES`] for why the bump is gated on
+/// content rather than applied to every write.
 pub const P5S_VERSION: &str = "1";
+
+/// Sidecar format version for a file that carries at least one numeric
+/// (`Float32`) column.
+///
+/// Written **only** when one is present. An escpod that predates score columns
+/// rejects any column it cannot downcast to a dictionary, with a message about
+/// the column not being "dictionary-encoded utf8" — accurate but not
+/// actionable. Declaring the version instead makes that failure say what it is,
+/// while a version bump on every write would have made older escpods reject
+/// barcode-only sidecars they can read perfectly well.
+pub const P5S_VERSION_SCORES: &str = "2";
 /// Default annotation column name (what `escpod annotate` writes).
 pub const DEFAULT_ANNOTATION_NAME: &str = "barcode";
 
@@ -198,6 +224,98 @@ impl AnnotationSection {
     }
 }
 
+/// A named read → number annotation.
+///
+/// The numeric counterpart of [`AnnotationSection`], for per-read quantities
+/// rather than labels — `crf_logp` from `demux --ref-scores` is the one that
+/// motivated it. Dictionary-encoding those would be absurd: a continuous score
+/// over a million reads is a million distinct "labels", well past the
+/// [`AnnotationSection`] limit of 65535, and the dictionary would be larger
+/// than the data it indexes.
+///
+/// Like a label annotation, an unscored read is represented by **absence**
+/// rather than a sentinel, which is why `NaN` is refused on the way in: it is
+/// the one `f32` that already means "no value" and would make the two
+/// representations ambiguous. Infinities are allowed — `log P = -inf` is a real
+/// answer, not a missing one.
+#[derive(Debug, Clone)]
+pub struct ScoreSection {
+    name: String,
+    /// (uuid bytes, value), sorted by UUID for binary search.
+    entries: Vec<([u8; 16], f32)>,
+}
+
+impl ScoreSection {
+    /// Build a score column from `(read, value)` pairs.
+    pub fn from_pairs(name: &str, pairs: impl IntoIterator<Item = (Uuid, f32)>) -> Result<Self> {
+        if name.is_empty() || RESERVED_COLUMNS.contains(&name) {
+            return Err(Error::Parse(format!(
+                "'{name}' is not a valid annotation name"
+            )));
+        }
+        let mut entries: Vec<([u8; 16], f32)> = pairs
+            .into_iter()
+            .map(|(uuid, value)| {
+                if value.is_nan() {
+                    return Err(Error::Parse(format!(
+                        "NaN score for read {uuid} in '{name}' (omit unscored reads instead)"
+                    )));
+                }
+                Ok((*uuid.as_bytes(), value))
+            })
+            .collect::<Result<_>>()?;
+        entries.sort_unstable_by_key(|e| e.0);
+        entries.dedup_by_key(|e| e.0);
+
+        Ok(Self {
+            name: name.to_string(),
+            entries,
+        })
+    }
+
+    /// The column name (e.g. `"crf_logp"`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Number of scored reads.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether any reads are scored.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Look up a read's score.
+    pub fn get(&self, uuid: &Uuid) -> Option<f32> {
+        self.entries
+            .binary_search_by_key(uuid.as_bytes(), |&(k, _)| k)
+            .ok()
+            .map(|i| self.entries[i].1)
+    }
+
+    /// Iterate over `(read, score)` pairs in UUID order.
+    pub fn iter(&self) -> impl Iterator<Item = (Uuid, f32)> + '_ {
+        self.entries
+            .iter()
+            .map(|&(bytes, v)| (Uuid::from_bytes(bytes), v))
+    }
+
+    /// Collect into an owned map.
+    pub fn to_map(&self) -> HashMap<Uuid, f32> {
+        self.iter().collect()
+    }
+
+    fn value_of(&self, key: &[u8; 16]) -> Option<f32> {
+        self.entries
+            .binary_search_by_key(key, |&(k, _)| k)
+            .ok()
+            .map(|i| self.entries[i].1)
+    }
+}
+
 /// An experimental-design table: maps combinations of annotation labels
 /// (key columns) to experimental variables (value columns) — e.g.
 /// `(ldx, edx) → condition`. Stored as JSON in the sidecar's schema
@@ -272,6 +390,8 @@ pub struct Sidecar {
     entries: Vec<([u8; 16], u32, u32)>,
     /// Name-sorted annotations; entries are subsets of `entries`.
     annotations: Vec<AnnotationSection>,
+    /// Name-sorted numeric columns; entries are subsets of `entries`.
+    scores: Vec<ScoreSection>,
     /// Experimental design, if one has been recorded.
     design: Option<Design>,
 }
@@ -284,6 +404,7 @@ impl Sidecar {
         Self {
             entries,
             annotations: Vec::new(),
+            scores: Vec::new(),
             design: None,
         }
     }
@@ -320,7 +441,14 @@ impl Sidecar {
 
     /// Replace (or add) an annotation, keyed by its name. Annotation entries
     /// for reads not in the index are dropped at write time.
+    ///
+    /// A name is one Arrow column, so this also displaces a **score** column of
+    /// the same name — the alternative is an in-memory sidecar that cannot be
+    /// written. Writing a label column over a numeric one is a deliberate act;
+    /// it is not something the demux or annotate paths can do by accident,
+    /// since they choose both the names and the kinds.
     pub fn set_annotation(&mut self, annotation: AnnotationSection) {
+        self.scores.retain(|s| s.name != annotation.name);
         match self
             .annotations
             .iter_mut()
@@ -330,6 +458,39 @@ impl Sidecar {
             None => self.annotations.push(annotation),
         }
         self.annotations.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// The score column with the given name, if present.
+    pub fn score(&self, name: &str) -> Option<&ScoreSection> {
+        self.scores.iter().find(|s| s.name == name)
+    }
+
+    /// All score columns, in name order.
+    pub fn scores(&self) -> &[ScoreSection] {
+        &self.scores
+    }
+
+    /// The score column names, in order.
+    pub fn score_names(&self) -> Vec<&str> {
+        self.scores.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// Replace (or add) a score column, keyed by its name. Displaces a
+    /// same-named annotation — see [`Self::set_annotation`].
+    pub fn set_score(&mut self, score: ScoreSection) {
+        self.annotations.retain(|a| a.name != score.name);
+        match self.scores.iter_mut().find(|s| s.name == score.name) {
+            Some(slot) => *slot = score,
+            None => self.scores.push(score),
+        }
+        self.scores.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// Remove a score column by name; returns whether it was present.
+    pub fn remove_score(&mut self, name: &str) -> bool {
+        let before = self.scores.len();
+        self.scores.retain(|s| s.name != name);
+        self.scores.len() != before
     }
 
     /// Replace the read-index entries (one per read, any order).
@@ -474,10 +635,11 @@ pub fn read_sidecar_file(
     let metadata = schema.metadata();
 
     match metadata.get(P5S_VERSION_KEY).map(String::as_str) {
-        Some(P5S_VERSION) => {}
+        Some(P5S_VERSION | P5S_VERSION_SCORES) => {}
         Some(other) => {
             return Err(Error::Parse(format!(
-                ".p5s version {other} unsupported (expected {P5S_VERSION})"
+                ".p5s version {other} unsupported (this escpod reads \
+                 {P5S_VERSION} and {P5S_VERSION_SCORES})"
             )));
         }
         None => {
@@ -506,16 +668,33 @@ pub fn read_sidecar_file(
     let read_id_idx = schema.index_of("read_id")?;
     let batch_idx_idx = schema.index_of("batch_idx")?;
     let row_idx_idx = schema.index_of("row_idx")?;
-    let annotation_columns: Vec<(usize, String)> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !RESERVED_COLUMNS.contains(&f.name().as_str()))
-        .map(|(i, f)| (i, f.name().clone()))
-        .collect();
+    // A column's Arrow type is what says which kind it is; the version in the
+    // metadata only says whether numeric ones are expected at all.
+    let mut annotation_columns: Vec<(usize, String)> = Vec::new();
+    let mut score_columns: Vec<(usize, String)> = Vec::new();
+    for (i, f) in schema.fields().iter().enumerate() {
+        if RESERVED_COLUMNS.contains(&f.name().as_str()) {
+            continue;
+        }
+        match f.data_type() {
+            DataType::Dictionary(_, _) => annotation_columns.push((i, f.name().clone())),
+            DataType::Float32 => score_columns.push((i, f.name().clone())),
+            other => {
+                return Err(Error::Parse(format!(
+                    ".p5s column '{}' is {other}; expected a dictionary-encoded \
+                     utf8 label column or a float32 score column",
+                    f.name()
+                )));
+            }
+        }
+    }
 
     let mut entries: Vec<([u8; 16], u32, u32)> = Vec::new();
     let mut annotation_pairs: HashMap<String, Vec<(Uuid, String)>> = annotation_columns
+        .iter()
+        .map(|(_, name)| (name.clone(), Vec::new()))
+        .collect();
+    let mut score_pairs: HashMap<String, Vec<(Uuid, f32)>> = score_columns
         .iter()
         .map(|(_, name)| (name.clone(), Vec::new()))
         .collect();
@@ -573,6 +752,24 @@ pub fn read_sidecar_file(
                 pairs.push((Uuid::from_bytes(uuid_bytes), values.value(key).to_string()));
             }
         }
+
+        for (col, name) in &score_columns {
+            let values = batch
+                .column(*col)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    Error::Parse(format!(".p5s score column '{name}' is not float32"))
+                })?;
+            let pairs = score_pairs.get_mut(name).expect("initialized above");
+            for i in 0..batch.num_rows() {
+                if values.is_null(i) {
+                    continue;
+                }
+                let uuid_bytes: [u8; 16] = ids.value(i).try_into().unwrap();
+                pairs.push((Uuid::from_bytes(uuid_bytes), values.value(i)));
+            }
+        }
     }
 
     let mut sidecar = Sidecar::new(entries);
@@ -581,6 +778,12 @@ pub fn read_sidecar_file(
         sidecar.set_annotation(AnnotationSection::from_pairs(
             name,
             pairs.iter().map(|(u, l)| (*u, l.as_str())),
+        )?);
+    }
+    for (_, name) in &score_columns {
+        sidecar.set_score(ScoreSection::from_pairs(
+            name,
+            score_pairs[name].iter().copied(),
         )?);
     }
     if let Some(json) = metadata.get(P5S_DESIGN_KEY) {
@@ -600,7 +803,12 @@ pub fn write_sidecar_file(
     sidecar: &Sidecar,
 ) -> Result<()> {
     let mut metadata = HashMap::new();
-    metadata.insert(P5S_VERSION_KEY.to_string(), P5S_VERSION.to_string());
+    let version = if sidecar.scores.is_empty() {
+        P5S_VERSION
+    } else {
+        P5S_VERSION_SCORES
+    };
+    metadata.insert(P5S_VERSION_KEY.to_string(), version.to_string());
     metadata.insert(P5S_FILE_ID_KEY.to_string(), identity.file_id.to_string());
     metadata.insert(P5S_POD5_SIZE_KEY.to_string(), identity.size.to_string());
     if let Some(design) = &sidecar.design {
@@ -626,6 +834,15 @@ pub fn write_sidecar_file(
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             true,
         ));
+    }
+    for score in &sidecar.scores {
+        if sidecar.annotations.iter().any(|a| a.name == score.name) {
+            return Err(Error::Parse(format!(
+                "'{}' is both a label and a score column; a name is one column",
+                score.name
+            )));
+        }
+        fields.push(Field::new(score.name(), DataType::Float32, true));
     }
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
 
@@ -654,6 +871,16 @@ pub fn write_sidecar_file(
         let values = Arc::new(StringArray::from_iter_values(annotation.labels().iter()));
         let dict = DictionaryArray::<Int32Type>::try_new(keys.finish(), values)?;
         columns.push(Arc::new(dict));
+    }
+    for score in &sidecar.scores {
+        // Null, not a sentinel, for a read this column has no value for —
+        // every f32 is a possible score.
+        columns.push(Arc::new(Float32Array::from_iter(
+            sidecar
+                .entries
+                .iter()
+                .map(|(uuid_bytes, _, _)| score.value_of(uuid_bytes)),
+        )));
     }
     let batch = RecordBatch::try_new(schema.clone(), columns)?;
 

@@ -5,6 +5,7 @@
 use crate::util::{
     OpenResult, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
 };
+use escapepod_signal::operations::SidecarColumn;
 use escapepod_signal::{determine_fields, write_field_value};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -77,17 +78,13 @@ pub fn run(
             OpenResult::Err(e) => return Err(e),
         };
 
-        // Load this file's requested annotation columns up front; a missing
+        // Load this file's requested sidecar columns up front; a missing
         // sidecar or column is a hard error (it lists what is available)
-        // rather than a silently empty column.
-        let annotations: Vec<escapepod_signal::pod5::sidecar::AnnotationSection> =
-            annotation_fields
-                .iter()
-                .map(|name| {
-                    escapepod_signal::operations::read_annotation(file_path, Some(name))
-                        .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))
-                })
-                .collect::<anyhow::Result<_>>()?;
+        // rather than a silently empty column. Label and score columns are
+        // both just columns here — the caller asked for a name, and which
+        // kind it is is the sidecar's business.
+        let annotations = escapepod_signal::operations::read_columns(file_path, &annotation_fields)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))?;
 
         // Write reads
         let reads_iter = match get_reads_iter_with_warning(&reader, file_path, is_directory) {
@@ -117,9 +114,20 @@ pub fn run(
                     write_field_value(&mut writer, &read, f)?;
                     first = false;
                 }
-                for annotation in &annotations {
+                for column in &annotations {
                     writer.write_all(sep_bytes)?;
-                    writer.write_all(annotation.get(&read.read_id).unwrap_or("").as_bytes())?;
+                    match column {
+                        SidecarColumn::Labels(a) => {
+                            writer.write_all(a.get(&read.read_id).unwrap_or("").as_bytes())?
+                        }
+                        // A read with no value gets an empty cell, the same as
+                        // an unassigned label — not a 0.0 that reads as data.
+                        SidecarColumn::Scores(s) => {
+                            if let Some(v) = s.get(&read.read_id) {
+                                write!(writer, "{v:.4}")?;
+                            }
+                        }
+                    }
                 }
                 writer.write_all(b"\n")?;
             }

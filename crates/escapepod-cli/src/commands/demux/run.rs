@@ -32,6 +32,7 @@ use escapepod_demux::{
     extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
+use escapepod_signal::operations::{ColumnValues, ColumnWrite};
 use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
 use escapepod_signal::{
     CompressedSignalChunk, PredefinedDictionaries, ReadData, Reader, ReadsBatchView, RunInfoData,
@@ -1243,7 +1244,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             summary.per_barcode.push((bc, n));
         }
     }
-    let mut assignments: Option<HashMap<Uuid, String>> = None;
+    let mut assignments: Option<Collected> = None;
     if let Some(h) = class_handle {
         assignments = h
             .join()
@@ -1259,19 +1260,37 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // each file, so one global map serves all inputs without provenance
     // tracking. Runs after produce_result? so a failed run writes nothing.
     if args.annotate {
-        let assignments = assignments.unwrap_or_default();
-        let options = escapepod_signal::operations::AnnotateOptions::default();
+        let collected = assignments.unwrap_or_default();
+        // Kept for the barcode summary below, which counts labels rather than
+        // reading them back off the sidecar.
+        let assignments = collected.barcode.clone();
+        let columns = collected.into_columns();
         for path in &args.input {
-            let result =
-                escapepod_signal::operations::write_annotation(path, &assignments, &options)
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            // One read-modify-write for all five columns: five separate ones
+            // would rewrite the sidecar five times and leave four intermediate
+            // states on disk describing a run that never happened.
+            let result = escapepod_signal::operations::write_columns(path, &columns, false)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            let barcode = result.columns.first();
             info!(
-                "{} {} — {} of {} reads assigned across {} labels",
+                "{} {} — {} of {} reads assigned across {} labels{}",
                 style::action("wrote"),
                 style::path(result.sidecar_path.display()),
-                style::count(result.assigned_reads),
+                style::count(barcode.map_or(0, |c| c.assigned)),
                 style::count(result.total_reads),
-                style::count(result.labels),
+                style::count(barcode.map_or(0, |c| c.labels)),
+                if result.columns.len() > 1 {
+                    format!(
+                        ", plus {}",
+                        result.columns[1..]
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    )
+                } else {
+                    String::new()
+                },
             );
         }
         // Sidecar-only runs have no writer threads; fill the summary from
@@ -2530,9 +2549,65 @@ fn writer_thread(
     Ok(count)
 }
 
+/// What `--annotate` records in the sidecar, accumulated by the classifications
+/// writer thread as rows go past.
+///
+/// Sidecar-only demux writes no CSV, so without this the lattice scores would
+/// be computed and then dropped on exactly the runs that have nowhere else to
+/// keep them (#241).
+#[derive(Default)]
+struct Collected {
+    barcode: HashMap<Uuid, String>,
+    /// Only populated under `--ref-scores`.
+    crf: Option<CollectedScores>,
+}
+
+/// The lattice columns, held as reference *indices* for `crf_best` and resolved
+/// to names once at the end — a million short `String`s to say `nbc07` is a
+/// million allocations for sixteen distinct values.
+#[derive(Default)]
+struct CollectedScores {
+    names: Vec<String>,
+    best: HashMap<Uuid, u32>,
+    logp: HashMap<Uuid, f32>,
+    margin: HashMap<Uuid, f32>,
+    mean_logpost: HashMap<Uuid, f32>,
+}
+
+impl Collected {
+    /// The sidecar columns this run produced, in write order.
+    fn into_columns(self) -> Vec<ColumnWrite> {
+        let mut out = vec![ColumnWrite {
+            name: "barcode".to_string(),
+            values: ColumnValues::Labels(self.barcode),
+        }];
+        let Some(crf) = self.crf else { return out };
+        out.push(ColumnWrite {
+            name: "crf_best".to_string(),
+            values: ColumnValues::Labels(
+                crf.best
+                    .into_iter()
+                    .filter_map(|(id, i)| crf.names.get(i as usize).map(|n| (id, n.clone())))
+                    .collect(),
+            ),
+        });
+        for (name, values) in [
+            ("crf_logp", crf.logp),
+            ("crf_margin", crf.margin),
+            ("mean_logpost", crf.mean_logpost),
+        ] {
+            out.push(ColumnWrite {
+                name: name.to_string(),
+                values: ColumnValues::Scores(values),
+            });
+        }
+        out
+    }
+}
+
 /// Optional classifications-CSV writer thread. With `collect` it also
-/// accumulates the read → barcode map for the `--annotate` sidecar write,
-/// returned through the join handle.
+/// accumulates what the `--annotate` sidecar write records, returned through
+/// the join handle.
 #[allow(clippy::type_complexity)]
 fn spawn_class_writer(
     path: Option<&Path>,
@@ -2540,14 +2615,14 @@ fn spawn_class_writer(
     ref_names: Option<Vec<String>>,
 ) -> anyhow::Result<(
     Option<ClassTx>,
-    Option<std::thread::JoinHandle<anyhow::Result<Option<HashMap<Uuid, String>>>>>,
+    Option<std::thread::JoinHandle<anyhow::Result<Option<Collected>>>>,
 )> {
     if path.is_none() && !collect {
         return Ok((None, None));
     }
     let (tx, rx) = std::sync::mpsc::sync_channel::<ClassRow>(16_384);
     let path = path.map(Path::to_path_buf);
-    let handle = std::thread::spawn(move || -> anyhow::Result<Option<HashMap<Uuid, String>>> {
+    let handle = std::thread::spawn(move || -> anyhow::Result<Option<Collected>> {
         use std::io::Write;
         // The score columns exist for the whole file or not at all — whether
         // the run scores is a property of the head, not of a read — so the
@@ -2571,7 +2646,13 @@ fn spawn_class_writer(
             }
             None => None,
         };
-        let mut collected = collect.then(HashMap::new);
+        let mut collected = collect.then(|| Collected {
+            crf: scored.then(|| CollectedScores {
+                names: names.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         for row in rx.iter() {
             let ClassRow {
                 read_id,
@@ -2600,8 +2681,19 @@ fn spawn_class_writer(
                     writeln!(w)?;
                 }
             }
-            if let Some(map) = &mut collected {
-                map.insert(read_id, barcode);
+            if let Some(out) = &mut collected {
+                out.barcode.insert(read_id, barcode);
+                // Recorded for gated reads too, matching the CSV: a sidecar
+                // that says `unclassified` should still say what it was
+                // rejected for.
+                if let (Some(dst), Some(c)) = (out.crf.as_mut(), crf) {
+                    dst.best.insert(read_id, c.best);
+                    dst.logp.insert(read_id, c.logp);
+                    if let Some(m) = c.margin {
+                        dst.margin.insert(read_id, m);
+                    }
+                    dst.mean_logpost.insert(read_id, c.mean_logpost);
+                }
             }
         }
         if let Some(w) = &mut writer {

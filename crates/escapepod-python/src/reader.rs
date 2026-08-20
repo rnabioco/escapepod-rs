@@ -386,6 +386,45 @@ impl PyReader {
         })
     }
 
+    /// The score (numeric) column names in the .p5s sidecar, in name order.
+    ///
+    /// Separate from ``annotation_names`` because the two are different Arrow
+    /// types and read back as different Python types — one dict of strings, one
+    /// of floats.
+    fn score_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let path = self.path.clone();
+        py.detach(|| {
+            let identity = self.inner.sidecar_identity().map_err(to_py_err)?;
+            let p5s = escapepod_signal::pod5::sidecar::sidecar_path(&path);
+            let sidecar = escapepod_signal::pod5::sidecar::read_sidecar_file(&p5s, &identity)
+                .map_err(to_py_err)?;
+            Ok(sidecar
+                .map(|s| s.score_names().into_iter().map(str::to_string).collect())
+                .unwrap_or_default())
+        })
+    }
+
+    /// Read a score column from the .p5s sidecar as a dict of
+    /// ``read_id -> float`` (read IDs as standard UUID strings).
+    ///
+    /// Always by name, unlike ``annotation``: a scored demux writes three of
+    /// them at once, so "the only one" is not a useful default. Unscored reads
+    /// are absent from the dict rather than present as NaN.
+    fn score(
+        &self,
+        py: Python<'_>,
+        name: &str,
+    ) -> PyResult<std::collections::HashMap<String, f32>> {
+        let path = self.path.clone();
+        py.detach(|| {
+            let score = escapepod_signal::operations::read_score(&path, name).map_err(to_py_err)?;
+            Ok(score
+                .iter()
+                .map(|(uuid, v)| (uuid.to_string(), v))
+                .collect())
+        })
+    }
+
     /// The experimental design recorded in the .p5s sidecar, or None.
     ///
     /// Returns a dict with ``key_columns`` (annotation names forming the

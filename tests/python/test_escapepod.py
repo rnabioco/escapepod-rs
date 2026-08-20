@@ -846,6 +846,36 @@ class TestSidecarAnnotations:
             with pytest.raises(Exception, match="sidecar"):
                 reader.annotation("barcode")
 
+    def test_score_names_empty_without_sidecar(self):
+        if not TEST_POD5.exists():
+            pytest.skip("Test POD5 not found")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil
+
+            tmp_pod5 = Path(tmpdir) / "test.pod5"
+            shutil.copy2(TEST_POD5, tmp_pod5)
+
+            reader = escapepod.Reader(str(tmp_pod5))
+            assert reader.score_names() == []
+            reader.build_index()
+            assert reader.score_names() == []
+
+    def test_score_raises_without_scores(self):
+        if not TEST_POD5.exists():
+            pytest.skip("Test POD5 not found")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil
+
+            tmp_pod5 = Path(tmpdir) / "test.pod5"
+            shutil.copy2(TEST_POD5, tmp_pod5)
+
+            reader = escapepod.Reader(str(tmp_pod5))
+            # Score columns are always named — there is no "the only one".
+            with pytest.raises(Exception, match="sidecar"):
+                reader.score("crf_logp")
+
     def test_design_none_without_sidecar(self):
         if not TEST_POD5.exists():
             pytest.skip("Test POD5 not found")
