@@ -19,6 +19,11 @@
 
 pub mod lattice;
 
+/// Constrained partition functions over known references — the CRF's own
+/// opinion of a barcode, as opposed to an edit distance to its decode.
+/// Always compiled, like [`lattice`], so CI exercises it without a model file.
+pub mod refchain;
+
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 
@@ -43,7 +48,10 @@ pub mod lattice_gpu;
 #[cfg(feature = "crf-gpu")]
 mod lattice_gpu_kernel;
 
-pub use lattice::{Backend, CrfDecodeError, CrfLayout, CrfScratch, decode, decode_with};
+pub use lattice::{
+    Backend, CrfDecodeError, CrfLayout, CrfScratch, decode, decode_with, decode_with_refs,
+};
+pub use refchain::{RefChainError, RefChains, ScoredDecode};
 
 #[cfg(feature = "crf-decode")]
 pub use barcode::{BarcodeError, BarcodeMatch, BarcodeRefs};

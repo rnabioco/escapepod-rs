@@ -8,10 +8,11 @@ mod common;
 use std::collections::HashMap;
 
 use escapepod_pod5::operations::{
-    AnnotateOptions, DesignOptions, read_annotation, read_design, remove_annotation, remove_design,
-    write_annotation, write_design,
+    AnnotateOptions, ColumnValues, ColumnWrite, DesignOptions, read_annotation, read_columns,
+    read_design, read_score, remove_annotation, remove_design, write_annotation, write_columns,
+    write_design,
 };
-use escapepod_pod5::sidecar::{AnnotationSection, sidecar_path};
+use escapepod_pod5::sidecar::{AnnotationSection, P5S_VERSION, P5S_VERSION_SCORES, sidecar_path};
 use escapepod_pod5::{Reader, Uuid};
 use tempfile::TempDir;
 
@@ -600,4 +601,190 @@ fn index_via_sidecar_matches_scan() {
             "sidecar index diverges from scan for {id}"
         );
     }
+}
+
+/// Assign a float to the first `n` reads.
+fn make_scores(ids: &[Uuid], n: usize) -> HashMap<Uuid, f32> {
+    ids.iter()
+        .take(n)
+        .enumerate()
+        .map(|(i, id)| (*id, -0.25 * i as f32))
+        .collect()
+}
+
+#[test]
+fn scores_round_trip_alongside_labels() {
+    let (_tmp, path, ids, original) = fixture();
+    let mut scores = make_scores(&ids, 8);
+    // A score for a read not in this file must be dropped, like a label.
+    scores.insert(Uuid::new_v4(), 1.0);
+
+    let result = write_columns(
+        &path,
+        &[
+            ColumnWrite {
+                name: "barcode".into(),
+                values: ColumnValues::Labels(make_assignments(&ids, 10)),
+            },
+            ColumnWrite {
+                name: "crf_logp".into(),
+                values: ColumnValues::Scores(scores),
+            },
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.total_reads, N_READS);
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.columns[0].assigned, 10);
+    assert_eq!(result.columns[0].labels, 2);
+    assert_eq!(result.columns[1].assigned, 8, "foreign read must not count");
+    assert_eq!(result.columns[1].labels, 0, "a score has no dictionary");
+    assert_eq!(result.columns_in_sidecar, 2);
+
+    // The POD5 is still byte-identical — the whole point of the sidecar.
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+
+    let back = read_score(&path, "crf_logp").unwrap();
+    assert_eq!(back.len(), 8);
+    for (i, id) in ids.iter().take(8).enumerate() {
+        assert_eq!(back.get(id), Some(-0.25 * i as f32));
+    }
+    // Reads past the eighth are unscored, which is absence rather than 0.0.
+    assert_eq!(back.get(&ids[8]), None);
+    // And the label column is untouched by the score column beside it.
+    assert_eq!(read_annotation(&path, Some("barcode")).unwrap().len(), 10);
+}
+
+/// The version is gated on content: a barcode-only sidecar keeps declaring v1,
+/// so an escpod that predates score columns can still read it. Only a file that
+/// actually carries a numeric column declares v2.
+#[test]
+fn version_is_bumped_only_when_a_score_column_exists() {
+    let (_tmp, path, ids, _original) = fixture();
+
+    let version = |p: &std::path::Path| -> String {
+        let file = std::fs::File::open(sidecar_path(p)).unwrap();
+        let reader = arrow::ipc::reader::FileReader::try_new(file, None).unwrap();
+        reader.schema().metadata()["escapepod:p5s_version"].clone()
+    };
+
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(version(&path), P5S_VERSION, "labels only");
+
+    write_columns(
+        &path,
+        &[ColumnWrite {
+            name: "crf_logp".into(),
+            values: ColumnValues::Scores(make_scores(&ids, 5)),
+        }],
+        false,
+    )
+    .unwrap();
+    assert_eq!(version(&path), P5S_VERSION_SCORES, "a score column exists");
+}
+
+/// `NaN` is the one float that already means "no value", so it is refused
+/// rather than written — otherwise absence and NaN would be the same thing on
+/// the way back in.
+#[test]
+fn nan_scores_are_refused() {
+    let (_tmp, path, ids, _original) = fixture();
+    let scores: HashMap<Uuid, f32> = [(ids[0], f32::NAN)].into_iter().collect();
+    let err = write_columns(
+        &path,
+        &[ColumnWrite {
+            name: "crf_logp".into(),
+            values: ColumnValues::Scores(scores),
+        }],
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("NaN"), "unexpected error: {err}");
+
+    // Infinities are real answers, not missing ones, and do round-trip.
+    let scores: HashMap<Uuid, f32> = [(ids[0], f32::NEG_INFINITY)].into_iter().collect();
+    write_columns(
+        &path,
+        &[ColumnWrite {
+            name: "crf_logp".into(),
+            values: ColumnValues::Scores(scores),
+        }],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        read_score(&path, "crf_logp").unwrap().get(&ids[0]),
+        Some(f32::NEG_INFINITY)
+    );
+}
+
+/// Asking for a score column that is really a label says so, rather than
+/// reporting it missing next to a list that plainly contains it.
+#[test]
+fn reading_a_label_as_a_score_says_which_it_is() {
+    let (_tmp, path, ids, _original) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+    let err = read_score(&path, "barcode").unwrap_err().to_string();
+    assert!(err.contains("is a label column"), "unexpected error: {err}");
+}
+
+/// Requesting no columns must not require a sidecar.
+///
+/// `escpod view` resolves its `--include` names into built-in read fields and
+/// sidecar columns, and the overwhelmingly common case is that the sidecar list
+/// is empty. Reading the sidecar before looking at the names turned every plain
+/// `view` on a file without a `.p5s` into an error — caught by the POD5 compat
+/// suite, not by anything in this file, which is why it is now here.
+#[test]
+fn reading_no_columns_needs_no_sidecar() {
+    let (_tmp, path, _ids, _original) = fixture();
+    assert!(!sidecar_path(&path).exists());
+    let empty: [&str; 0] = [];
+    assert!(read_columns(&path, &empty).unwrap().is_empty());
+
+    // And a named column against a file with no sidecar is still an error.
+    let err = read_columns(&path, &["barcode"]).unwrap_err().to_string();
+    assert!(err.contains("no sidecar"), "unexpected error: {err}");
+}
+
+/// A name is one column, so a score and a label cannot both claim it: writing
+/// one kind over the other replaces it rather than producing a sidecar that
+/// cannot be written.
+#[test]
+fn a_score_and_a_label_cannot_share_a_name() {
+    let (_tmp, path, ids, _original) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    write_columns(
+        &path,
+        &[ColumnWrite {
+            name: "barcode".into(),
+            values: ColumnValues::Scores(make_scores(&ids, 3)),
+        }],
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(read_score(&path, "barcode").unwrap().len(), 3);
+    let err = read_annotation(&path, Some("barcode"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no annotation"), "unexpected error: {err}");
 }

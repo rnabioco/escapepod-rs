@@ -11,8 +11,9 @@ mod split;
 mod subset;
 
 pub use annotate::{
-    AnnotateOptions, AnnotateResult, DesignOptions, DesignResult, read_annotation, read_design,
-    remove_annotation, remove_design, write_annotation, write_design,
+    AnnotateOptions, AnnotateResult, ColumnStat, ColumnValues, ColumnWrite, ColumnsResult,
+    DesignOptions, DesignResult, SidecarColumn, read_annotation, read_columns, read_design,
+    read_score, remove_annotation, remove_design, write_annotation, write_columns, write_design,
 };
 pub use filter::{
     FilterCriteria, FilterOptions, FilterResult, SubsetOutcome, filter_files,

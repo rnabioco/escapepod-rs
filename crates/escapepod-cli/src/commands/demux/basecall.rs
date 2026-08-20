@@ -23,7 +23,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use escapepod_demux::crf::{BarcodeMatch, BarcodeRefs, CrfEncoder, CrfScratch};
+use escapepod_demux::crf::{
+    BarcodeMatch, BarcodeRefs, CrfEncoder, CrfScratch, RefChains, ScoredDecode,
+};
 use escapepod_signal::{Reader, ReadsBatchView};
 use rayon::prelude::*;
 use tracing::{info, warn};
@@ -63,6 +65,49 @@ pub struct BasecallArgs {
     /// outright ties; gate downstream instead if you want the raw margins.
     #[arg(long, default_value = "0", value_name = "N", requires = "barcodes")]
     pub min_margin: u32,
+
+    /// Also score every reference against the lattice itself, adding
+    /// `crf_logp`, `crf_margin`, `crf_best` and `mean_logpost` columns.
+    ///
+    /// `crf_logp` is `log P(called barcode | signal)` — a real probability,
+    /// unlike `confidence`, which is an edit distance between two strings and
+    /// on a designed panel measures how far apart the references are rather
+    /// than how sure the model is (#241). `crf_margin` is the called barcode's
+    /// log-odds in nats against its best alternative, so it goes negative when
+    /// the lattice prefers something else; `crf_best` names what that is.
+    ///
+    /// Measured at +7.6% on this command over 20k RNA004 reads. Off by default
+    /// anyway: the columns are an output change, and with `--gpu` it costs more
+    /// than that — the constrained scan needs the raw scores, so the decode
+    /// comes back to the host while the encoder stays on the device.
+    #[arg(long, requires = "barcodes")]
+    pub ref_scores: bool,
+
+    /// Call a read `unclassified` when the lattice's log-odds for the called
+    /// barcode against its best alternative are below this, in nats
+    /// (implies `--ref-scores`).
+    ///
+    /// The gate `--min-margin` cannot be. Edit distance to a designed panel
+    /// takes a handful of values — over one production flowcell, 99% of reads
+    /// land on three of them — so `--min-margin` is a cliff, not a dial. This
+    /// is continuous, and because the margin is measured against the *called*
+    /// barcode it is negative whenever the lattice prefers a different one, so
+    /// any positive threshold also drops those.
+    ///
+    /// Rough scale: 0.7 nats is 2:1 odds, 2.3 is 10:1, 4.6 is 100:1.
+    #[arg(long, value_name = "NATS", requires = "barcodes")]
+    pub min_crf_margin: Option<f32>,
+
+    /// Call a read `unclassified` when `P(called barcode | signal)` is below
+    /// this (implies `--ref-scores`).
+    ///
+    /// A different question from `--min-crf-margin`: this asks whether the
+    /// model is confident in absolute terms, rather than whether it can tell
+    /// the call apart from the next reference. A read can be certain it is
+    /// *not* the other 15 barcodes and still put only half its mass on any
+    /// reference at all.
+    #[arg(long, value_name = "P", requires = "barcodes")]
+    pub min_crf_prob: Option<f32>,
 
     /// Overrule the bundle's declared `boundary.margin` for this run.
     ///
@@ -157,6 +202,37 @@ impl Basecaller {
             Self::Gpu(encoder) => Ok(encoder.basecall_batch(prepped)?),
         }
     }
+
+    fn ref_chains(&self, seqs: &[&[u8]]) -> anyhow::Result<RefChains> {
+        Ok(match self {
+            Self::Cpu(e) => e.ref_chains(seqs)?,
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.ref_chains(seqs)?,
+        })
+    }
+
+    /// [`Self::basecall_prepped`], additionally scoring every reference in
+    /// `chains` against the lattice — see `--ref-scores`.
+    fn basecall_prepped_scored(
+        &self,
+        prepped: &[Option<Vec<f32>>],
+        chains: &RefChains,
+    ) -> anyhow::Result<Vec<Option<ScoredDecode>>> {
+        match self {
+            Self::Cpu(encoder) => Ok(prepped
+                .par_iter()
+                .map_init(CrfScratch::new, |scratch, w| {
+                    let w = w.as_ref()?;
+                    encoder
+                        .basecall_prepped_with_refs(w, scratch, chains)
+                        .inspect_err(|e| warn!("encoder: {e}"))
+                        .ok()
+                })
+                .collect()),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(encoder) => Ok(encoder.basecall_batch_with_refs(prepped, chains)?),
+        }
+    }
 }
 
 /// One read's result. `sequence` is `None` when the read had no usable window.
@@ -165,10 +241,54 @@ struct Decoded {
     adapter_end: usize,
     sequence: Option<String>,
     call: Option<BarcodeMatch>,
+    /// The lattice's own view of the panel, under `--ref-scores`.
+    scored: Option<ScoredDecode>,
 }
 
 /// escpod's own sentinel for a read that could not be placed (`demux/run.rs`).
 const UNCLASSIFIED: &str = "unclassified";
+
+/// The thresholds that can turn a matched read into `unclassified`.
+///
+/// Grouped rather than passed loose because they compose: a read has to clear
+/// all of them, and which ones are set is a property of the run, not of the row
+/// being written.
+struct Gates {
+    min_margin: u32,
+    min_crf_margin: Option<f32>,
+    min_crf_prob: Option<f32>,
+}
+
+impl Gates {
+    /// Whether `call` survives every gate.
+    ///
+    /// A reference with no runner-up passes the margin gates rather than
+    /// failing them: with nothing to compare against there is no margin to
+    /// test, which is not the same as a margin of zero. Both the edit-distance
+    /// and the lattice margin treat it that way, so `--min-margin` and
+    /// `--min-crf-margin` cannot disagree about a single-reference panel.
+    fn passes(&self, call: &BarcodeMatch, scored: Option<&ScoredDecode>) -> bool {
+        if !call.margin.is_none_or(|m| m >= self.min_margin) {
+            return false;
+        }
+        // The CRF gates are `requires = "ref_scores"`, so a run that sets one
+        // always has the scores to test it against.
+        let Some((logp, margin)) = scored.and_then(|s| s.call(call.index)) else {
+            return true;
+        };
+        if let Some(t) = self.min_crf_margin
+            && margin.is_some_and(|m| m < t)
+        {
+            return false;
+        }
+        if let Some(t) = self.min_crf_prob
+            && logp.exp() < t
+        {
+            return false;
+        }
+        true
+    }
+}
 
 /// Write one row, in whichever of the two column sets is in effect.
 ///
@@ -180,33 +300,27 @@ fn write_row(
     out: &mut impl Write,
     d: &Decoded,
     refs: Option<&BarcodeRefs>,
-    min_margin: u32,
+    gates: &Gates,
 ) -> std::io::Result<()> {
     let seq = d.sequence.as_deref().unwrap_or("");
     let Some(refs) = refs else {
         return writeln!(out, "{},{},{},{}", d.read_id, d.adapter_end, seq.len(), seq);
     };
+    let dist = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_default();
     let (barcode, best, second, margin) = match &d.call {
-        // A margin below the gate means the runner-up is too close to call.
-        Some(c) if c.margin.is_none_or(|m| m >= min_margin) => (
-            refs.name(c.index),
-            c.best_dist.to_string(),
-            c.second_best_dist
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            c.margin.map(|v| v.to_string()).unwrap_or_default(),
-        ),
         Some(c) => (
-            UNCLASSIFIED,
+            if gates.passes(c, d.scored.as_ref()) {
+                refs.name(c.index)
+            } else {
+                UNCLASSIFIED
+            },
             c.best_dist.to_string(),
-            c.second_best_dist
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            c.margin.map(|v| v.to_string()).unwrap_or_default(),
+            dist(c.second_best_dist),
+            dist(c.margin),
         ),
         None => (UNCLASSIFIED, String::new(), String::new(), String::new()),
     };
-    writeln!(
+    write!(
         out,
         "{},{},{},{},{},{},{},{}",
         d.read_id,
@@ -217,6 +331,30 @@ fn write_row(
         d.adapter_end,
         seq.len(),
         seq
+    )?;
+    let Some(scored) = &d.scored else {
+        return writeln!(out);
+    };
+    // These describe the barcode the edit distance matched, whether or not a
+    // gate then rejected it: a row that reads `unclassified` should say what it
+    // was rejected for, the same way `best_dist` stays populated on a row
+    // `--min-margin` dropped.
+    let (logp, call_margin) = d.call.as_ref().and_then(|c| scored.call(c.index)).map_or(
+        (String::new(), String::new()),
+        |(l, m)| {
+            (
+                format!("{l:.4}"),
+                m.map(|m| format!("{m:.4}")).unwrap_or_default(),
+            )
+        },
+    );
+    writeln!(
+        out,
+        ",{},{},{},{:.4}",
+        logp,
+        call_margin,
+        scored.best().map(|(i, _, _)| refs.name(i)).unwrap_or(""),
+        scored.mean_logpost,
     )
 }
 
@@ -441,13 +579,42 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     let progress = create_progress_bar(boundaries.len() as u64, "Basecalling")?;
     let skipped = AtomicUsize::new(0);
     let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
+    // A gate implies the scores it gates on, matching the fused `demux`: the
+    // flags are not independent choices, and `--min-crf-margin` silently doing
+    // nothing would be the worse failure. Scoring needs the panel, so
+    // `--ref-scores` without `--barcodes` is a clap `requires` error.
+    let want_scores =
+        args.ref_scores || args.min_crf_margin.is_some() || args.min_crf_prob.is_some();
+    let chains = match (&refs, want_scores) {
+        (Some(r), true) => Some(encoder.ref_chains(&r.sequences())?),
+        _ => None,
+    };
+    if let Some(c) = &chains {
+        info!(
+            "{} {} references over {} shared lattice cells",
+            style::label("Scoring:"),
+            style::count(c.len()),
+            style::count(c.cells()),
+        );
+    }
+    let gates = Gates {
+        min_margin: args.min_margin,
+        min_crf_margin: args.min_crf_margin,
+        min_crf_prob: args.min_crf_prob,
+    };
+
     writeln!(
         out,
-        "{}",
+        "{}{}",
         if refs.is_some() {
             "read_id,barcode,confidence,best_dist,second_best_dist,adapter_end,decoded_len,decoded_seq"
         } else {
             "read_id,adapter_end,decoded_len,decoded_seq"
+        },
+        if chains.is_some() {
+            ",crf_logp,crf_margin,crf_best,mean_logpost"
+        } else {
+            ""
         }
     )?;
     let mut written = 0usize;
@@ -482,7 +649,21 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         // on a full channel — turning an I/O error into a hang.
         for (ids, ends, windows) in rx {
             let n = ids.len();
-            let sequences = encoder.basecall_prepped(&windows)?;
+            // Two shapes of the same call: with `--ref-scores` the decode also
+            // returns the panel scores, so the reference scan runs inside it
+            // rather than over scores nothing kept.
+            let results: Vec<(Option<String>, Option<ScoredDecode>)> = match &chains {
+                Some(c) => encoder
+                    .basecall_prepped_scored(&windows, c)?
+                    .into_iter()
+                    .map(|s| (s.as_ref().map(|s| s.sequence.clone()), s))
+                    .collect(),
+                None => encoder
+                    .basecall_prepped(&windows)?
+                    .into_iter()
+                    .map(|s| (s, None))
+                    .collect(),
+            };
             drop(windows);
 
             // Matching is independent per read and cheap next to the decode,
@@ -490,10 +671,10 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             let decoded: Vec<Decoded> = ids
                 .into_iter()
                 .zip(ends)
-                .zip(sequences)
+                .zip(results)
                 .collect::<Vec<_>>()
                 .into_par_iter()
-                .map(|((read_id, adapter_end), seq)| {
+                .map(|((read_id, adapter_end), (seq, scored))| {
                     let call = seq
                         .as_ref()
                         .and_then(|s| refs.as_ref().and_then(|r| r.match_sequence(s.as_bytes())));
@@ -502,6 +683,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
                         adapter_end,
                         sequence: seq,
                         call,
+                        scored,
                     }
                 })
                 .collect();
@@ -511,7 +693,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
                 Ordering::Relaxed,
             );
             for d in &decoded {
-                write_row(&mut out, d, refs.as_ref(), args.min_margin)?;
+                write_row(&mut out, d, refs.as_ref(), &gates)?;
             }
             written += decoded.len();
             progress.inc(n as u64);

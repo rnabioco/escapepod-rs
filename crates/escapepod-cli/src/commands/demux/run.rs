@@ -24,12 +24,15 @@ use crate::style;
 #[cfg(feature = "crf-gpu")]
 use escapepod_demux::crf::CrfEncoderGpu;
 #[cfg(feature = "crf-decode")]
-use escapepod_demux::crf::{BarcodeRefs, CrfEncoder, CrfScratch};
+use escapepod_demux::crf::{
+    BarcodeRefs, CrfEncoder, CrfError, CrfScratch, RefChains, ScoredDecode,
+};
 use escapepod_demux::{
     AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace,
     extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
+use escapepod_signal::operations::{ColumnValues, ColumnWrite};
 use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
 use escapepod_signal::{
     CompressedSignalChunk, PredefinedDictionaries, ReadData, Reader, ReadsBatchView, RunInfoData,
@@ -80,6 +83,46 @@ pub struct RunArgs {
         help_heading = "Advanced Options"
     )]
     pub min_margin: u32,
+
+    /// Score every reference against the lattice, giving each read a real
+    /// `log P(barcode | signal)` (CRF head only).
+    ///
+    /// `confidence` is the edit-distance margin to the runner-up, which on a
+    /// designed panel measures how far apart the references are, not how sure
+    /// the model is: over one production 16-plex flowcell 99% of classified
+    /// reads take one of three values, so `--min-margin` cannot trade recall
+    /// for precision (#241). This computes what the lattice actually thought,
+    /// which is continuous, and adds it to `--classifications`.
+    ///
+    /// Costs +3.6% on this pipeline; with `--gpu` more, because the
+    /// constrained scan reads the raw scores and so brings the decode back to
+    /// the host while the encoder stays on the device.
+    #[cfg(feature = "crf-decode")]
+    #[arg(long, help_heading = "Advanced Options")]
+    pub ref_scores: bool,
+
+    /// Call a read `unclassified` when the lattice's log-odds for the called
+    /// barcode against its best alternative are below this, in nats
+    /// (implies `--ref-scores`).
+    ///
+    /// The dial `--min-margin` is not: it is continuous, and it goes negative
+    /// when the lattice prefers a different reference, so any positive
+    /// threshold drops those too. 0.7 nats is 2:1 odds, 2.3 is 10:1, 4.6 is
+    /// 100:1.
+    #[cfg(feature = "crf-decode")]
+    #[arg(long, value_name = "NATS", help_heading = "Advanced Options")]
+    pub min_crf_margin: Option<f32>,
+
+    /// Call a read `unclassified` when `P(called barcode | signal)` is below
+    /// this (implies `--ref-scores`).
+    ///
+    /// Asks whether the model is confident in absolute terms, where
+    /// `--min-crf-margin` asks whether it can tell the call from the next
+    /// reference. A read can be sure it is not any of the other barcodes and
+    /// still put little mass on any reference at all.
+    #[cfg(feature = "crf-decode")]
+    #[arg(long, value_name = "P", help_heading = "Advanced Options")]
+    pub min_crf_prob: Option<f32>,
 
     /// Overrule the bundle's declared `boundary.margin` — the samples of
     /// `adapter_end` a read needs beyond the model's `chunk` before it decodes
@@ -493,19 +536,94 @@ fn collect_dictionaries(input: &[PathBuf]) -> anyhow::Result<(Vec<String>, Vec<S
 /// so producers on any thread can route concurrently.
 type Routers = HashMap<String, SyncSender<Routed>>;
 
+/// What a head decided about one read.
+///
+/// One type rather than a widening tuple: every head produces a barcode and a
+/// confidence, and the CRF head under `--ref-scores` also produces what the
+/// lattice thought, which has to reach the classifications writer through the
+/// same channel.
+struct Call {
+    barcode: String,
+    confidence: f64,
+    crf: Option<CrfRowScores>,
+}
+
+impl Call {
+    /// A read no head could place.
+    fn unclassified() -> Self {
+        Self {
+            barcode: UNCLASSIFIED.to_string(),
+            confidence: 0.0,
+            crf: None,
+        }
+    }
+
+    /// A call from a head that has no lattice to consult — the two fingerprint
+    /// heads, and the CRF head without `--ref-scores`.
+    fn scoreless(barcode: String, confidence: f64) -> Self {
+        Self {
+            barcode,
+            confidence,
+            crf: None,
+        }
+    }
+}
+
+/// The lattice's opinion of one read, as it reaches the classifications CSV.
+///
+/// `Copy` and reference *indices* rather than names: this crosses a channel
+/// once per read, and at a million reads a per-read `String` for a name the
+/// writer can look up is pure allocator traffic.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "crf-decode"), allow(dead_code))]
+struct CrfRowScores {
+    /// `log P(called barcode | signal)`.
+    logp: f32,
+    /// The called barcode's log-odds in nats against its best alternative;
+    /// `None` with a single reference. Negative when the lattice prefers
+    /// something else.
+    margin: Option<f32>,
+    /// Index of the reference the lattice itself prefers.
+    best: u32,
+    /// Mean per-timestep log-posterior of the decoded path.
+    mean_logpost: f32,
+}
+
+/// One classified read on its way to the classifications CSV and the
+/// `--annotate` sidecar.
+struct ClassRow {
+    read_id: Uuid,
+    barcode: String,
+    confidence: f64,
+    crf: Option<CrfRowScores>,
+}
+
+/// The classifications channel. Named because it appears in eight producer
+/// signatures and widening it once should not mean editing all of them.
+type ClassTx = SyncSender<ClassRow>;
+
 /// Route one classified read to its barcode writer + (optionally) the
 /// classifications CSV.
 fn route(
     routers: &Routers,
-    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    class_tx: Option<&ClassTx>,
     read: ReadData,
-    barcode: String,
+    call: Call,
     chunks: Vec<CompressedSignalChunk>,
     run_infos: Arc<Vec<RunInfoData>>,
-    confidence: f64,
 ) {
+    let Call {
+        barcode,
+        confidence,
+        crf,
+    } = call;
     if let Some(ctx) = class_tx {
-        let _ = ctx.send((read.read_id, barcode.clone(), confidence));
+        let _ = ctx.send(ClassRow {
+            read_id: read.read_id,
+            barcode: barcode.clone(),
+            confidence,
+            crf,
+        });
     }
     // Empty on sidecar-only runs (--annotate without -d): no POD5 leg.
     if let Some(tx) = routers.get(&barcode).or_else(|| routers.get(UNCLASSIFIED)) {
@@ -544,6 +662,12 @@ struct CrfHead {
     encoder: CrfEncoderAny,
     refs: BarcodeRefs,
     min_margin: u32,
+    /// The constrained lattices for `refs`, under `--ref-scores`. Built once
+    /// per run: the structure depends on the panel and the model geometry, not
+    /// on a read.
+    chains: Option<RefChains>,
+    min_crf_margin: Option<f32>,
+    min_crf_prob: Option<f32>,
 }
 
 /// Where CRF encoder inference runs. The lattice decode is on the CPU either
@@ -585,6 +709,14 @@ impl CrfEncoderAny {
             Self::Cpu(e) => e.set_clamp_max_shift(shift),
             #[cfg(feature = "crf-gpu")]
             Self::Gpu(e) => e.set_clamp_max_shift(shift),
+        }
+    }
+
+    fn ref_chains(&self, seqs: &[&[u8]]) -> Result<RefChains, CrfError> {
+        match self {
+            Self::Cpu(e) => e.ref_chains(seqs),
+            #[cfg(feature = "crf-gpu")]
+            Self::Gpu(e) => e.ref_chains(seqs),
         }
     }
 }
@@ -804,10 +936,29 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                 refs.min_pairwise_distance()
                     .map_or_else(|| "n/a".to_string(), |d| d.to_string()),
             );
+            // A gate implies the scores it gates on, rather than erroring: the
+            // flags are not independent choices, and `--min-crf-margin` alone
+            // silently doing nothing would be the worse failure.
+            let want_scores =
+                args.ref_scores || args.min_crf_margin.is_some() || args.min_crf_prob.is_some();
+            let chains = want_scores
+                .then(|| encoder.ref_chains(&refs.sequences()))
+                .transpose()?;
+            if let Some(c) = &chains {
+                info!(
+                    "{} {} references over {} shared lattice cells",
+                    style::label("Lattice scoring:"),
+                    style::count(c.len()),
+                    style::count(c.cells()),
+                );
+            }
             ClassifyModel::Crf(Box::new(CrfHead {
                 encoder,
                 refs,
                 min_margin: args.min_margin,
+                chains,
+                min_crf_margin: args.min_crf_margin,
+                min_crf_prob: args.min_crf_prob,
             }))
         }
         #[cfg(not(feature = "crf-decode"))]
@@ -967,8 +1118,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // Optional classifications CSV writer (a single small-record stream);
     // with --annotate the same thread also collects the assignment map the
     // sidecar write needs.
+    // The writer resolves `crf_best` from an index, so it needs the panel's
+    // names — and their presence is also what tells it to emit the score
+    // columns at all.
+    #[cfg(feature = "crf-decode")]
+    let ref_names = match &*model {
+        ClassifyModel::Crf(head) if head.chains.is_some() => Some(head.refs.names().to_vec()),
+        _ => None,
+    };
+    #[cfg(not(feature = "crf-decode"))]
+    let ref_names = None;
     let (class_tx, class_handle) =
-        spawn_class_writer(args.classifications.as_deref(), args.annotate)?;
+        spawn_class_writer(args.classifications.as_deref(), args.annotate, ref_names)?;
 
     // ---- Stages A/B: produce classified reads ----
     let produce_result = match &*model {
@@ -1083,7 +1244,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             summary.per_barcode.push((bc, n));
         }
     }
-    let mut assignments: Option<HashMap<Uuid, String>> = None;
+    let mut assignments: Option<Collected> = None;
     if let Some(h) = class_handle {
         assignments = h
             .join()
@@ -1099,19 +1260,37 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // each file, so one global map serves all inputs without provenance
     // tracking. Runs after produce_result? so a failed run writes nothing.
     if args.annotate {
-        let assignments = assignments.unwrap_or_default();
-        let options = escapepod_signal::operations::AnnotateOptions::default();
+        let collected = assignments.unwrap_or_default();
+        // Kept for the barcode summary below, which counts labels rather than
+        // reading them back off the sidecar.
+        let assignments = collected.barcode.clone();
+        let columns = collected.into_columns();
         for path in &args.input {
-            let result =
-                escapepod_signal::operations::write_annotation(path, &assignments, &options)
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            // One read-modify-write for all five columns: five separate ones
+            // would rewrite the sidecar five times and leave four intermediate
+            // states on disk describing a run that never happened.
+            let result = escapepod_signal::operations::write_columns(path, &columns, false)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            let barcode = result.columns.first();
             info!(
-                "{} {} — {} of {} reads assigned across {} labels",
+                "{} {} — {} of {} reads assigned across {} labels{}",
                 style::action("wrote"),
                 style::path(result.sidecar_path.display()),
-                style::count(result.assigned_reads),
+                style::count(barcode.map_or(0, |c| c.assigned)),
                 style::count(result.total_reads),
-                style::count(result.labels),
+                style::count(barcode.map_or(0, |c| c.labels)),
+                if result.columns.len() > 1 {
+                    format!(
+                        ", plus {}",
+                        result.columns[1..]
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    )
+                } else {
+                    String::new()
+                },
             );
         }
         // Sidecar-only runs have no writer threads; fill the summary from
@@ -1394,7 +1573,7 @@ fn produce_cpu(
     model: &DtwSvmModel,
     fp: FpParams,
     routers: &Routers,
-    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     let predictor = SvmPredictor::new(model);
@@ -1419,10 +1598,9 @@ fn produce_cpu(
                             routers,
                             class_tx,
                             read.for_writing(read.run_info_index),
-                            barcode,
+                            Call::scoreless(barcode, conf),
                             chunks,
                             run_infos,
-                            conf,
                         );
                     }
                     pb.inc(1);
@@ -1476,7 +1654,7 @@ fn produce_cpu_gbm(
     model: &GbmModel,
     fp: FpParams,
     routers: &Routers,
-    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     let predictor = GbmPredictor::new(model);
@@ -1543,10 +1721,9 @@ fn produce_cpu_gbm(
                         routers,
                         class_tx,
                         read.for_writing(read.run_info_index),
-                        barcode,
+                        Call::scoreless(barcode, conf),
                         chunks,
                         run_infos,
-                        conf,
                     );
                 }
                 pb.inc(features.len() as u64);
@@ -1581,7 +1758,7 @@ fn produce_cpu_crf(
     head: &CrfHead,
     encoder: &CrfEncoder,
     routers: &Routers,
-    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     let meta = encoder.metadata();
@@ -1593,7 +1770,7 @@ fn produce_cpu_crf(
             sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
                 || (CrfScratch::new(), Vec::<f32>::new()),
                 |(scratch, window), ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
-                    let (barcode, conf) = (|| {
+                    let call = (|| {
                         let adc = signal.as_ref()?;
                         // The detector reports `adapter_end` as an index into
                         // the decoded prefix, which is what `prep` wants. Only
@@ -1608,22 +1785,32 @@ fn produce_cpu_crf(
                         ) {
                             return None;
                         }
-                        let seq = encoder
-                            .basecall_prepped(window, scratch)
-                            .inspect_err(|e| tracing::warn!("encoder: {e}"))
-                            .ok()?;
-                        call_barcode(head, &seq)
+                        match &head.chains {
+                            Some(chains) => encoder
+                                .basecall_prepped_with_refs(window, scratch, chains)
+                                .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                                .ok()
+                                .map(|s| call_barcode_scored(head, &s)),
+                            None => {
+                                let seq = encoder
+                                    .basecall_prepped(window, scratch)
+                                    .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                                    .ok()?;
+                                call_barcode(head, &seq)
+                                    .map(|(b, c)| Call::scoreless(b, c))
+                                    .or_else(|| Some(Call::unclassified()))
+                            }
+                        }
                     })()
-                    .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0));
+                    .unwrap_or_else(Call::unclassified);
 
                     route(
                         routers,
                         class_tx,
                         read.for_writing(read.run_info_index),
-                        barcode,
+                        call,
                         chunks,
                         run_infos,
-                        conf,
                     );
                     pb.inc(1);
                 },
@@ -1654,6 +1841,45 @@ fn call_barcode(head: &CrfHead, seq: &str) -> Option<(String, f64)> {
         head.refs.name(m.index).to_string(),
         f64::from(m.margin.unwrap_or(0)),
     ))
+}
+
+/// [`call_barcode`] with the lattice consulted as well — `--ref-scores`.
+///
+/// The edit distance still makes the assignment, so a run that only adds
+/// `--ref-scores` calls exactly what it called before and merely records what
+/// the lattice thought. The lattice gates (`--min-crf-margin`,
+/// `--min-crf-prob`) are what turn that record into a decision, and they only
+/// ever *reject*: an assignment the edit distance did not make cannot be
+/// created here.
+///
+/// Scores are attached to rejected reads too, so a `unclassified` row in the
+/// classifications CSV says which gate dropped it and by how much.
+#[cfg(feature = "crf-decode")]
+fn call_barcode_scored(head: &CrfHead, scored: &ScoredDecode) -> Call {
+    let Some(m) = head.refs.match_sequence(scored.sequence.as_bytes()) else {
+        return Call::unclassified();
+    };
+    let crf = scored.call(m.index).map(|(logp, margin)| CrfRowScores {
+        logp,
+        margin,
+        best: scored.best().map_or(m.index, |(i, _, _)| i) as u32,
+        mean_logpost: scored.mean_logpost,
+    });
+    let gated = !m.margin.is_none_or(|v| v >= head.min_margin)
+        || crf.is_some_and(|c| {
+            head.min_crf_margin
+                .is_some_and(|t| c.margin.is_some_and(|m| m < t))
+                || head.min_crf_prob.is_some_and(|t| c.logp.exp() < t)
+        });
+    Call {
+        barcode: if gated {
+            UNCLASSIFIED.to_string()
+        } else {
+            head.refs.name(m.index).to_string()
+        },
+        confidence: f64::from(m.margin.unwrap_or(0)),
+        crf,
+    }
 }
 
 /// Reads whose prepped windows are handed to the GPU encoder in one go
@@ -1861,7 +2087,7 @@ fn produce_gpu_crf(
     encoder: &CrfEncoderGpu,
     bundle: &Path,
     routers: &Routers,
-    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     /// Prepped windows (`None` = no usable window) aligned with their reads.
@@ -1945,9 +2171,20 @@ fn produce_gpu_crf(
                     // out across rayon. `None` windows never reach the device
                     // and come back `None`, so this stays aligned with `items`.
                     let t_enc = std::time::Instant::now();
-                    let seqs = enc
-                        .basecall_batch(&windows)
-                        .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?;
+                    let scored = match &head.chains {
+                        Some(chains) => Some(
+                            enc.basecall_batch_with_refs(&windows, chains)
+                                .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?,
+                        ),
+                        None => None,
+                    };
+                    let seqs = match &scored {
+                        Some(_) => None,
+                        None => Some(
+                            enc.basecall_batch(&windows)
+                                .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?,
+                        ),
+                    };
                     if tracing_on {
                         GpuTrace::add(&trace.encode_decode_ms, t_enc);
                     }
@@ -1955,29 +2192,38 @@ fn produce_gpu_crf(
                     // to the decode, but it is still per-read work worth fanning
                     // out.
                     let t_match = std::time::Instant::now();
-                    let calls: Vec<(String, f64)> = seqs
-                        .par_iter()
-                        .map(|seq| {
-                            seq.as_deref()
-                                .and_then(|s| call_barcode(head, s))
-                                .unwrap_or_else(|| (UNCLASSIFIED.to_string(), 0.0))
-                        })
-                        .collect();
+                    let calls: Vec<Call> = match (&scored, &seqs) {
+                        (Some(scored), _) => scored
+                            .par_iter()
+                            .map(|s| {
+                                s.as_ref().map_or_else(Call::unclassified, |s| {
+                                    call_barcode_scored(head, s)
+                                })
+                            })
+                            .collect(),
+                        (None, Some(seqs)) => seqs
+                            .par_iter()
+                            .map(|seq| {
+                                seq.as_deref()
+                                    .and_then(|s| call_barcode(head, s))
+                                    .map_or_else(Call::unclassified, |(b, c)| Call::scoreless(b, c))
+                            })
+                            .collect(),
+                        (None, None) => unreachable!("one of the two arms always ran"),
+                    };
                     if tracing_on {
                         GpuTrace::add(&trace.match_ms, t_match);
                     }
                     let n = items.len() as u64;
                     let t_route = std::time::Instant::now();
-                    for ((read, chunks, run_infos), (barcode, conf)) in items.into_iter().zip(calls)
-                    {
+                    for ((read, chunks, run_infos), call) in items.into_iter().zip(calls) {
                         route(
                             routers,
                             class_tx,
                             read.for_writing(read.run_info_index),
-                            barcode,
+                            call,
                             chunks,
                             run_infos,
-                            conf,
                         );
                     }
                     if tracing_on {
@@ -2105,7 +2351,7 @@ fn produce_gpu(
     model: &DtwSvmModel,
     fp: FpParams,
     routers: &Routers,
-    class_tx: Option<&SyncSender<(Uuid, String, f64)>>,
+    class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     use escapepod_signal::dtw::GpuDtwContext;
@@ -2139,10 +2385,9 @@ fn produce_gpu(
                         routers_ref,
                         class_ref,
                         read,
-                        barcode_label(result.predicted_barcode),
+                        Call::scoreless(barcode_label(result.predicted_barcode), result.confidence),
                         chunks,
                         run_infos,
-                        result.confidence,
                     );
                 }
             }
@@ -2227,10 +2472,9 @@ fn produce_gpu(
                                 routers,
                                 class_tx,
                                 read,
-                                UNCLASSIFIED.to_string(),
+                                Call::unclassified(),
                                 chunks,
                                 run_infos.clone(),
-                                0.0,
                             ),
                         }
                     }
@@ -2305,40 +2549,151 @@ fn writer_thread(
     Ok(count)
 }
 
+/// What `--annotate` records in the sidecar, accumulated by the classifications
+/// writer thread as rows go past.
+///
+/// Sidecar-only demux writes no CSV, so without this the lattice scores would
+/// be computed and then dropped on exactly the runs that have nowhere else to
+/// keep them (#241).
+#[derive(Default)]
+struct Collected {
+    barcode: HashMap<Uuid, String>,
+    /// Only populated under `--ref-scores`.
+    crf: Option<CollectedScores>,
+}
+
+/// The lattice columns, held as reference *indices* for `crf_best` and resolved
+/// to names once at the end — a million short `String`s to say `nbc07` is a
+/// million allocations for sixteen distinct values.
+#[derive(Default)]
+struct CollectedScores {
+    names: Vec<String>,
+    best: HashMap<Uuid, u32>,
+    logp: HashMap<Uuid, f32>,
+    margin: HashMap<Uuid, f32>,
+    mean_logpost: HashMap<Uuid, f32>,
+}
+
+impl Collected {
+    /// The sidecar columns this run produced, in write order.
+    fn into_columns(self) -> Vec<ColumnWrite> {
+        let mut out = vec![ColumnWrite {
+            name: "barcode".to_string(),
+            values: ColumnValues::Labels(self.barcode),
+        }];
+        let Some(crf) = self.crf else { return out };
+        out.push(ColumnWrite {
+            name: "crf_best".to_string(),
+            values: ColumnValues::Labels(
+                crf.best
+                    .into_iter()
+                    .filter_map(|(id, i)| crf.names.get(i as usize).map(|n| (id, n.clone())))
+                    .collect(),
+            ),
+        });
+        for (name, values) in [
+            ("crf_logp", crf.logp),
+            ("crf_margin", crf.margin),
+            ("mean_logpost", crf.mean_logpost),
+        ] {
+            out.push(ColumnWrite {
+                name: name.to_string(),
+                values: ColumnValues::Scores(values),
+            });
+        }
+        out
+    }
+}
+
 /// Optional classifications-CSV writer thread. With `collect` it also
-/// accumulates the read → barcode map for the `--annotate` sidecar write,
-/// returned through the join handle.
+/// accumulates what the `--annotate` sidecar write records, returned through
+/// the join handle.
 #[allow(clippy::type_complexity)]
 fn spawn_class_writer(
     path: Option<&Path>,
     collect: bool,
+    ref_names: Option<Vec<String>>,
 ) -> anyhow::Result<(
-    Option<SyncSender<(Uuid, String, f64)>>,
-    Option<std::thread::JoinHandle<anyhow::Result<Option<HashMap<Uuid, String>>>>>,
+    Option<ClassTx>,
+    Option<std::thread::JoinHandle<anyhow::Result<Option<Collected>>>>,
 )> {
     if path.is_none() && !collect {
         return Ok((None, None));
     }
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Uuid, String, f64)>(16_384);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ClassRow>(16_384);
     let path = path.map(Path::to_path_buf);
-    let handle = std::thread::spawn(move || -> anyhow::Result<Option<HashMap<Uuid, String>>> {
+    let handle = std::thread::spawn(move || -> anyhow::Result<Option<Collected>> {
         use std::io::Write;
+        // The score columns exist for the whole file or not at all — whether
+        // the run scores is a property of the head, not of a read — so the
+        // header is decided once here rather than per row.
+        let names = ref_names.unwrap_or_default();
+        let scored = !names.is_empty();
         let mut writer = match &path {
             Some(path) => {
                 let file = std::fs::File::create(path)?;
                 let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
-                writeln!(w, "read_id,barcode,confidence")?;
+                writeln!(
+                    w,
+                    "read_id,barcode,confidence{}",
+                    if scored {
+                        ",crf_logp,crf_margin,crf_best,mean_logpost"
+                    } else {
+                        ""
+                    }
+                )?;
                 Some(w)
             }
             None => None,
         };
-        let mut collected = collect.then(HashMap::new);
-        for (read_id, barcode, conf) in rx.iter() {
+        let mut collected = collect.then(|| Collected {
+            crf: scored.then(|| CollectedScores {
+                names: names.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        for row in rx.iter() {
+            let ClassRow {
+                read_id,
+                barcode,
+                confidence,
+                crf,
+            } = row;
             if let Some(w) = &mut writer {
-                writeln!(w, "{read_id},{barcode},{conf:.6}")?;
+                write!(w, "{read_id},{barcode},{confidence:.6}")?;
+                if scored {
+                    // Empty rather than absent for a read that never decoded:
+                    // the column count has to stay constant, and a zero would
+                    // read as a confident score of 1.0.
+                    match crf {
+                        Some(c) => writeln!(
+                            w,
+                            ",{:.4},{},{},{:.4}",
+                            c.logp,
+                            c.margin.map(|m| format!("{m:.4}")).unwrap_or_default(),
+                            names.get(c.best as usize).map_or("", String::as_str),
+                            c.mean_logpost,
+                        )?,
+                        None => writeln!(w, ",,,,")?,
+                    }
+                } else {
+                    writeln!(w)?;
+                }
             }
-            if let Some(map) = &mut collected {
-                map.insert(read_id, barcode);
+            if let Some(out) = &mut collected {
+                out.barcode.insert(read_id, barcode);
+                // Recorded for gated reads too, matching the CSV: a sidecar
+                // that says `unclassified` should still say what it was
+                // rejected for.
+                if let (Some(dst), Some(c)) = (out.crf.as_mut(), crf) {
+                    dst.best.insert(read_id, c.best);
+                    dst.logp.insert(read_id, c.logp);
+                    if let Some(m) = c.margin {
+                        dst.margin.insert(read_id, m);
+                    }
+                    dst.mean_logpost.insert(read_id, c.mean_logpost);
+                }
             }
         }
         if let Some(w) = &mut writer {

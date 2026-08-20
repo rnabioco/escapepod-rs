@@ -203,6 +203,32 @@ fn print_sidecar_summary(reader: &Reader, pod5_path: &std::path::Path) {
             style::value(described.join(", "))
         );
     }
+    // Listed separately from the label columns rather than merged into them: a
+    // score column has no dictionary, so "N labels" would be a lie about it,
+    // and the range is what a reader wants to see anyway.
+    if !sidecar.scores().is_empty() {
+        let described: Vec<String> = sidecar
+            .scores()
+            .iter()
+            .map(|s| {
+                let (lo, hi) = s
+                    .iter()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |a, (_, v)| {
+                        (a.0.min(v), a.1.max(v))
+                    });
+                if s.is_empty() {
+                    format!("{} (0 reads)", s.name())
+                } else {
+                    format!("{} ({} reads, {lo:.4}..{hi:.4})", s.name(), s.len())
+                }
+            })
+            .collect();
+        println!(
+            "  {}: {}",
+            style::key("scores"),
+            style::value(described.join(", "))
+        );
+    }
     if let Some(design) = sidecar.design() {
         println!(
             "  {}: [{}] → [{}], {} rows",

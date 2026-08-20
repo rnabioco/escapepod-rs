@@ -53,6 +53,8 @@
 
 use std::fmt;
 
+use super::refchain::RefChains;
+
 /// Natural log of the blank floor bonito adds before taking logs
 /// (`posteriors(x) + 1e-8`). Kept as the literal so the port reads like the
 /// Python.
@@ -247,6 +249,18 @@ pub struct CrfScratch {
     /// Winning edge per timestep as a flat `dest * n_edges + edge` index —
     /// bonito's `posteriors(s2, Max).argmax(2)`.
     traceback: Vec<u32>,
+    /// `logsumexp(alpha[t_len])` under the log semiring: the partition function
+    /// over every path. Recorded because pass 1 has already computed it and it
+    /// is what normalises a constrained score into a probability (#241).
+    logz: f32,
+    /// The best path's total score under the max semiring, in log-posterior
+    /// space. Also already computed — `argmax_edge` finds it at every timestep
+    /// and used to throw it away.
+    path_score: f32,
+    /// Double buffer for [`super::refchain::RefChains::forward`], kept here so
+    /// a per-read reference scoring allocates nothing.
+    chain_cur: Vec<f32>,
+    chain_next: Vec<f32>,
 }
 
 impl CrfScratch {
@@ -287,6 +301,24 @@ impl CrfScratch {
     /// pins the destination state too.
     pub fn traceback(&self) -> &[u32] {
         &self.traceback
+    }
+
+    /// `logZ` over the whole lattice from the most recent decode — the log of
+    /// the total probability mass over every path, and the denominator that
+    /// turns a constrained score into `log P(sequence | signal)`.
+    pub fn logz(&self) -> f32 {
+        self.logz
+    }
+
+    /// The decoded path's total score from the most recent decode, as a sum of
+    /// per-timestep log-posteriors (so `<= 0`, and `path_score / t_len` is the
+    /// mean per-timestep log-posterior).
+    ///
+    /// A measure of how peaked the lattice is around its own answer, which is
+    /// *not* the same question as how much it preferred that answer to a
+    /// specific alternative — see [`super::refchain`] for the latter.
+    pub fn path_score(&self) -> f32 {
+        self.path_score
     }
 }
 
@@ -545,6 +577,63 @@ pub fn decode_with(
     scratch: &mut CrfScratch,
     backend: Backend,
 ) -> Result<String, CrfDecodeError> {
+    decode_inner(layout, alphabet, scores, t_len, scratch, backend, None)
+}
+
+/// [`decode_with`], additionally scoring every reference in `chains` against
+/// the same encoder output.
+///
+/// `out` receives `log P(reference | signal)` per reference, in the order the
+/// chains were built — a genuine probability, because every path through the
+/// lattice emits exactly one string, so restricting the forward recursion to
+/// the paths that emit a reference and dividing by [`CrfScratch::logz`] is a
+/// normalised quantity. Unlike the edit-distance margin to the runner-up it is
+/// continuous, which is what makes it usable as a precision/recall gate (#241).
+///
+/// This has to live inside the decode rather than beside it: the scan reads the
+/// **raw** transposed scores, and pass 1 overwrites them in place with
+/// log-posteriors. Nothing is copied for the sake of it.
+// `decode_with`'s parameters plus the panel and where to put its scores.
+// Bundling them into a struct would name the same arguments one indirection
+// further away, and this is a leaf called from three places.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_with_refs(
+    layout: &CrfLayout,
+    alphabet: &[u8],
+    scores: &[f32],
+    t_len: usize,
+    scratch: &mut CrfScratch,
+    backend: Backend,
+    chains: &RefChains,
+    out: &mut Vec<f32>,
+) -> Result<String, CrfDecodeError> {
+    let seq = decode_inner(
+        layout,
+        alphabet,
+        scores,
+        t_len,
+        scratch,
+        backend,
+        Some((chains, out)),
+    )?;
+    // `logZ_target - logZ_full`, applied after the scan so the scan itself
+    // stays the plain partition function the reference implementation is.
+    let logz = scratch.logz;
+    for v in out.iter_mut() {
+        *v -= logz;
+    }
+    Ok(seq)
+}
+
+fn decode_inner(
+    layout: &CrfLayout,
+    alphabet: &[u8],
+    scores: &[f32],
+    t_len: usize,
+    scratch: &mut CrfScratch,
+    backend: Backend,
+    refs: Option<(&RefChains, &mut Vec<f32>)>,
+) -> Result<String, CrfDecodeError> {
     if alphabet.len() != layout.n_edges {
         return Err(CrfDecodeError::AlphabetLen {
             got: alphabet.len(),
@@ -580,6 +669,23 @@ pub fn decode_with(
         &mut scratch.work,
         backend,
     );
+    scratch.logz = Semiring::Log.reduce(&scratch.alpha[t_len * layout.n_states..]);
+
+    // Before the posterior loop below overwrites `scratch.scores`: the
+    // constrained scans need the raw scores, and this is the last moment they
+    // exist.
+    if let Some((chains, out)) = refs {
+        chains.forward(
+            &scratch.scores,
+            t_len,
+            layout.n_score,
+            &mut scratch.chain_cur,
+            &mut scratch.chain_next,
+            out,
+            backend,
+        );
+    }
+
     backward_dispatch(
         layout,
         &scratch.scores,
@@ -624,6 +730,7 @@ pub fn decode_with(
     );
 
     let mut seq = String::with_capacity(t_len);
+    scratch.path_score = f32::NEG_INFINITY;
     for t in 0..t_len {
         let (lo, hi) = (t * layout.n_score, (t + 1) * layout.n_score);
         edge_scores_dispatch(
@@ -636,6 +743,14 @@ pub fn decode_with(
             backend,
         );
         let (dest, edge) = argmax_edge(layout, &scratch.edge, backend);
+        // Every path takes exactly one edge per timestep, so the winning edge
+        // score *is* the best path's total score, the same value at every `t`.
+        // Taken as a max rather than off one arbitrary timestep so float noise
+        // cannot make it depend on which one.
+        let best = scratch.edge[edge * layout.n_states + dest];
+        if best > scratch.path_score {
+            scratch.path_score = best;
+        }
         scratch.traceback[t] = layout.score_index(dest, edge) as u32;
         match layout.emitted_base(dest, edge) {
             Some(base) => {

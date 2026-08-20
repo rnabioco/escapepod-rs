@@ -2,7 +2,147 @@
 
 ## Unreleased
 
+- **`.p5s` sidecars carry numbers, not only labels** (#241). Every annotation
+  column was a dictionary-encoded utf8 label, which is the wrong shape for a
+  per-read score: a continuous value over a million reads is a million distinct
+  "labels", past the 65535 limit, with a dictionary larger than the data it
+  indexes. Sidecar-only demux (`--annotate` with no `-d`) writes no CSV either,
+  so a scored run computed `crf_logp` and then had nowhere to put it.
+
+  A column is now labels (`Dictionary(Int32, Utf8)`) or scores (`Float32`), and
+  a reader dispatches on the Arrow type rather than on a convention. Null means
+  the read has no value — for a score, absence rather than a sentinel, since
+  every `f32` is a possible answer. `NaN` is refused on the way in for the same
+  reason: it is the one float that already means "no value".
+
+  `demux --annotate --ref-scores` now records `barcode`, `crf_best`,
+  `crf_logp`, `crf_margin` and `mean_logpost` in **one** read-modify-write
+  (`write_columns`), rather than five that would leave four intermediate
+  sidecars on disk describing a run that never happened. `escpod view --include
+  crf_logp`, `escpod inspect`, and the Python `Reader.score()` /
+  `.score_names()` all read them back.
+
+  **The version bump is gated on content**: a sidecar with only label columns
+  still declares `1`, so an escpod that predates this reads it exactly as
+  before; only one that actually carries a numeric column declares `2`. Bumping
+  every write would have made older binaries reject barcode-only sidecars they
+  handle perfectly well, and without any bump they would have failed on a score
+  column with a message about it not being "dictionary-encoded utf8" — true,
+  but not something a user can act on.
+
+  Verified end to end on 20k reads: sidecar and classifications CSV agree on
+  all 20,000, and the POD5 is byte-identical as always.
+
+### Performance
+
+- **AVX2 and AVX-512 kernels for the reference-scoring scan — 3.3x** (#241).
+  `--ref-scores` cost +25% on `demux basecall` when it landed; it now costs
+  +7.6%, and +3.6% on the fused `demux`.
+
+  Two measurements shaped this, both against the obvious guess. The scan was
+  never loop-bound: specialising its two fan-in classes into separate scalar
+  loops moved it 25.7% → 25.1%. It was transcendental-bound exactly as the
+  decode is, and the difference was simply that it called scalar `exp`/`ln_1p`
+  while the decode ran the crate's Cephes kernels. And vectorising only the
+  fan-in-1 cells — 65% of the lattice — capped the whole scan at 2.15x, almost
+  exactly the Amdahl bound, because the head is a tenth of the cells but a
+  third of the work at five terms per cell against two.
+
+  The kernels rest on a reordering: cells are now partitioned by fan-in, so a
+  cell's own `alpha` is a unit-stride load and its result a unit-stride store,
+  and only the score indices need gathering. AVX2 has no scatter at all, so an
+  unordered lattice could not have been vectorised on it. The head's moves are
+  additionally stored transposed to `[edge][cell]`, so each edge's indices are
+  a unit-stride load rather than a gather feeding a gather.
+
+  Checked against the scalar scan on 20k real reads: 20,000/20,000 identical
+  barcode calls, largest `crf_logp` difference 0.0002 nats.
+
 ### Added
+
+- **The CRF can now say how sure it is: `escpod demux basecall --ref-scores`**
+  (#241). Demultiplexing reports `confidence` as the edit-distance margin to
+  the runner-up, and on a designed panel that measures how far apart the
+  references are, not how sure the model is. Measured over one production
+  16-plex flowcell (1,001,307 reads): 99% of classified reads take one of three
+  margin values, so sweeping `--min-margin` does nothing and then falls off a
+  cliff, and 90% of the reads two independently trained bundles disagree about
+  are *exact* matches to a reference. There was no way to buy precision at any
+  price.
+
+  The lattice has an opinion and it was never surfaced. Every path through a
+  CTC-CRF emits exactly one string, so restricting the forward recursion to the
+  paths that emit a given reference and normalising by the full partition
+  function gives a real probability:
+
+  ```text
+  crf_logp = logZ_target(reference) - logZ_full = log P(reference | signal)
+  ```
+
+  `--ref-scores` computes that for every reference in one shared lattice —
+  references with a common prefix share their cells — and adds four columns:
+  `crf_logp` (the called barcode's log-probability), `crf_best` (the reference
+  the lattice itself prefers, which need not be the one edit distance called),
+  `crf_margin` (log-odds in nats against the runner-up), and `mean_logpost`
+  (the decoded path's mean per-timestep log-posterior, which the Viterbi pass
+  was already computing and discarding).
+
+  Over 20k RNA004 reads: `confidence` takes 15 distinct values with 98.7% of
+  reads in three of them; `crf_margin` takes 14,818 over 16,747 reads. 98.4% of
+  reads match a reference exactly, and *within that group* `P(barcode | signal)`
+  still spans below 0.1 (26 reads) through 0.1–0.5 (828, 5.0%) to 0.9–0.99
+  (91.8%) — reads a clean decode cannot tell apart and the lattice can.
+
+  The scan is folded into the decode rather than bolted on after it, because it
+  reads the raw scores and pass 1 overwrites them in place with log-posteriors.
+  Correctness is pinned against exhaustive enumeration of every path through a
+  small lattice, including the marginalisation over the `state_len` bases a
+  bundle's references do not carry, plus the identity that the probabilities of
+  all possible emissions sum to 1.
+
+  Opt-in, and cheap: +7.6% on `demux basecall`, +3.6% on the fused `demux`.
+
+- **A precision/recall dial that actually turns: `--min-crf-margin` and
+  `--min-crf-prob`** (#241), on both `escpod demux` and `escpod demux
+  basecall`. Below the threshold a read becomes `unclassified` rather than a
+  possibly-wrong assignment.
+
+  `crf_margin` is the *called* barcode's log-odds against its best alternative,
+  not the lattice's own top-two gap, which is what makes one threshold enough:
+  it is positive when the lattice agrees with the call by that much and
+  **negative when the lattice prefers something else**, so any positive
+  threshold rejects both the ambiguous reads and the ones the lattice actively
+  disagrees with. Measured over 20k RNA004 reads, all 218 reads whose
+  `crf_best` differs from their call have a negative margin, and
+  `--min-crf-margin 0.5` removes every one of them for 4.4% of recall:
+
+  ```text
+  gate                  classified   recall   lattice disagreements
+  none                      16,747  100.00%                     218
+  --min-crf-margin 0.5      16,015   95.63%                       0
+  --min-crf-margin 2.3      15,393   91.91%                       0
+  --min-crf-margin 4.6      14,939   89.20%                       0
+  --min-crf-prob 0.5        15,688   93.68%                       0
+  ```
+
+  `--min-crf-prob` is a different cut, not a rescaling of the same one: it asks
+  whether the model is confident in absolute terms rather than whether it can
+  tell the call from the next reference. A read can be certain it is not any of
+  the other 15 barcodes and still put little mass on any reference at all.
+
+  The fused `demux --classifications` gains the same four columns
+  (`crf_logp,crf_margin,crf_best,mean_logpost`), which it did not have at all —
+  it emitted `read_id,barcode,confidence` and nothing else. A gated row keeps
+  its scores rather than blanking them, so `unclassified` says which gate
+  dropped it and by how much. On both commands a gate implies `--ref-scores`,
+  rather than silently doing nothing without it.
+
+  The gate is reached through separate code in the two commands, so they are
+  checked against each other on real data: over 19,980 shared reads they agree
+  on 100.00% of barcodes, gated and ungated, with a largest `crf_logp`
+  difference of 0.
+
+  Sidecar-only demux keeps the scores too — see the `.p5s` entry below.
 
 - **`escpod demux detect --method cnn --gpu --profile` reports a per-stage
   breakdown** (#239). The GPU path is a producer (decode + prep on the rayon

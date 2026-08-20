@@ -200,6 +200,17 @@ impl BarcodeRefs {
         &self.names[index]
     }
 
+    /// The reference sequence at `index` — the sequence the model emits, as
+    /// loaded. Callers scoring against the lattice need these, not the names.
+    pub fn sequence(&self, index: usize) -> &[u8] {
+        &self.seqs[index]
+    }
+
+    /// Every reference sequence, in name order.
+    pub fn sequences(&self) -> Vec<&[u8]> {
+        self.seqs.iter().map(Vec::as_slice).collect()
+    }
+
     pub fn names(&self) -> &[String] {
         &self.names
     }
