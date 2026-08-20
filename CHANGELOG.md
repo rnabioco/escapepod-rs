@@ -44,11 +44,49 @@
   bundle's references do not carry, plus the identity that the probabilities of
   all possible emissions sum to 1.
 
-  Opt-in: measured at +25% on `demux basecall`, because the scan calls scalar
-  `exp`/`ln_1p` where the decode uses the crate's AVX2/AVX-512 kernels. A
-  vector kernel for it is the remaining factor; a gate (`--min-crf-margin`) and
-  a `.p5s` numeric column to carry the score through `demux --annotate` are
-  still to come.
+  Opt-in: measured at +25% on `demux basecall` and +11% on the fused `demux`,
+  because the scan calls scalar `exp`/`ln_1p` where the decode uses the crate's
+  AVX2/AVX-512 kernels. A vector kernel for it is the remaining factor.
+
+- **A precision/recall dial that actually turns: `--min-crf-margin` and
+  `--min-crf-prob`** (#241), on both `escpod demux` and `escpod demux
+  basecall`. Below the threshold a read becomes `unclassified` rather than a
+  possibly-wrong assignment.
+
+  `crf_margin` is the *called* barcode's log-odds against its best alternative,
+  not the lattice's own top-two gap, which is what makes one threshold enough:
+  it is positive when the lattice agrees with the call by that much and
+  **negative when the lattice prefers something else**, so any positive
+  threshold rejects both the ambiguous reads and the ones the lattice actively
+  disagrees with. Measured over 20k RNA004 reads, all 218 reads whose
+  `crf_best` differs from their call have a negative margin, and
+  `--min-crf-margin 0.5` removes every one of them for 4.4% of recall:
+
+  ```text
+  gate                  classified   recall   lattice disagreements
+  none                      16,747  100.00%                     218
+  --min-crf-margin 0.5      16,015   95.63%                       0
+  --min-crf-margin 2.3      15,393   91.91%                       0
+  --min-crf-margin 4.6      14,939   89.20%                       0
+  --min-crf-prob 0.5        15,688   93.68%                       0
+  ```
+
+  `--min-crf-prob` is a different cut, not a rescaling of the same one: it asks
+  whether the model is confident in absolute terms rather than whether it can
+  tell the call from the next reference. A read can be certain it is not any of
+  the other 15 barcodes and still put little mass on any reference at all.
+
+  The fused `demux --classifications` gains the same four columns
+  (`crf_logp,crf_margin,crf_best,mean_logpost`), which it did not have at all —
+  it emitted `read_id,barcode,confidence` and nothing else. A gated row keeps
+  its scores rather than blanking them, so `unclassified` says which gate
+  dropped it and by how much. On both commands a gate implies `--ref-scores`,
+  rather than silently doing nothing without it.
+
+  The gate is reached through separate code in the two commands, so they are
+  checked against each other on real data: over 19,980 shared reads they agree
+  on 100.00% of barcodes, gated and ungated, with a largest `crf_logp`
+  difference of 0.
 
 - **`escpod demux detect --method cnn --gpu --profile` reports a per-stage
   breakdown** (#239). The GPU path is a producer (decode + prep on the rayon

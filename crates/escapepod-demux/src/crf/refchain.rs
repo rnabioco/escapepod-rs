@@ -130,6 +130,31 @@ pub struct ScoredDecode {
 }
 
 impl ScoredDecode {
+    /// What the lattice says about one particular reference: its
+    /// `log P(reference | signal)`, and its log-odds in nats against the best
+    /// *other* reference.
+    ///
+    /// The margin is relative to the reference asked about, not to the
+    /// lattice's own favourite, which is what makes it a gate: it is positive
+    /// when the lattice agrees with the call by that much and **negative when
+    /// it prefers something else**, so one threshold rejects both an ambiguous
+    /// read and a read the lattice actively disagrees with. Against
+    /// [`Self::best`]'s index the two coincide.
+    ///
+    /// `None` if `index` is out of range; the margin is `None` with a single
+    /// reference, where there is no alternative to compare against.
+    pub fn call(&self, index: usize) -> Option<(f32, Option<f32>)> {
+        let &logp = self.ref_logp.get(index)?;
+        let other = self
+            .ref_logp
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != index)
+            .map(|(_, &v)| v)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Some((logp, other.is_finite().then_some(logp - other)))
+    }
+
     /// The best-scoring reference: `(index, log P, margin in nats to the
     /// runner-up)`.
     ///
@@ -822,6 +847,40 @@ mod tests {
             (total - 1.0).abs() < 1e-4,
             "emission probabilities sum to {total}, not 1"
         );
+    }
+
+    fn scored(logp: &[f32]) -> ScoredDecode {
+        ScoredDecode {
+            sequence: String::new(),
+            ref_logp: logp.to_vec(),
+            mean_logpost: -0.5,
+        }
+    }
+
+    /// The gate's whole point: asking about the reference the lattice does
+    /// *not* prefer must come back negative, so one threshold rejects both an
+    /// ambiguous read and one the lattice disagrees with.
+    #[test]
+    fn call_margin_is_negative_when_the_lattice_disagrees() {
+        let s = scored(&[-3.0, -0.5, -2.0]);
+        let (logp, margin) = s.call(0).unwrap();
+        assert_eq!(logp, -3.0);
+        assert_eq!(margin, Some(-2.5));
+
+        // Against the lattice's own favourite it is the top-2 margin.
+        let (index, best_logp, best_margin) = s.best().unwrap();
+        assert_eq!(index, 1);
+        let (logp, margin) = s.call(index).unwrap();
+        assert_eq!((logp, margin), (best_logp, best_margin));
+        assert_eq!(margin, Some(1.5));
+    }
+
+    /// With one reference there is no alternative, so there is no margin —
+    /// not a margin of zero, which would mean "tied with something".
+    #[test]
+    fn call_margin_is_absent_with_a_single_reference() {
+        assert_eq!(scored(&[-1.25]).call(0), Some((-1.25, None)));
+        assert_eq!(scored(&[-1.25]).call(1), None);
     }
 
     /// Lowercase references are the same references.
