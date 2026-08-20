@@ -59,10 +59,14 @@ pub fn run(inputs: Vec<PathBuf>, force: bool) -> anyhow::Result<()> {
                         return None;
                     }
                     Ok(None) => {}
-                    Err(_) => {
+                    Err(e) => {
+                        // Say what is lost, not just that something happened:
+                        // annotations and scores live nowhere but the sidecar,
+                        // and the rebuild drops them. `e` names the file and,
+                        // for a mismatch, what it was built from.
                         warn!(
-                            "{} is stale or unreadable — rebuilding",
-                            style::path(p5s_path.display()),
+                            "{e} — rebuilding; any annotations or scores it held \
+                             described another file and are discarded",
                         );
                     }
                 }

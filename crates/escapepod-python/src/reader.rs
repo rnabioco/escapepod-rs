@@ -348,7 +348,11 @@ impl PyReader {
 
     // -- Sidecar management ------------------------------------------------
 
-    /// Check if a .p5s sidecar exists for this file.
+    /// Check if a .p5s sidecar file exists next to this POD5.
+    ///
+    /// Existence only — this does not open or validate the sidecar, so it
+    /// reports True for one bound to a different POD5. Reading through it
+    /// (``annotation``, ``score``, ``design``) is what raises in that case.
     #[getter]
     fn has_index(&self) -> bool {
         escapepod_signal::pod5::sidecar::sidecar_path(&self.path).exists()

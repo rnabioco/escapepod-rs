@@ -182,6 +182,11 @@ fn print_sidecar_summary(reader: &Reader, pod5_path: &std::path::Path) {
         style::key("index"),
         style::count(sidecar.len())
     );
+    // Absent on sidecars written before the provenance keys existed, which is
+    // not worth a line saying so.
+    if let Some(origin) = sidecar.provenance().describe() {
+        println!("  {}: {}", style::key("built"), origin);
+    }
     if sidecar.annotations().is_empty() {
         println!("  {}: none", style::key("annotations"));
     } else {

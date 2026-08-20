@@ -31,9 +31,11 @@ table = ipc.open_file("reads.pod5.p5s").read_all()
 ```
 
 It is bound to its POD5 by file identifier and size, so a stale sidecar or
-one copied next to the wrong file fails loudly. `index` preserves
-annotations, and `annotate` preserves the index and other annotations —
-each command touches only its own columns. Format details:
+one copied next to the wrong file fails loudly — and says what it *was* built
+from, which is the thing you want to know at that moment. Reading it directly
+with pyarrow, as above, skips that check: a direct reader owns it. `index`
+preserves annotations, and `annotate` preserves the index and other
+annotations — each command touches only its own columns. Format details:
 [The `.p5s` Sidecar](../format/sidecar.md).
 
 Typical demux flow, with no intermediate per-barcode POD5s (or even a CSV)
