@@ -64,6 +64,39 @@ pub enum Error {
     #[error("Batch index {index} out of bounds (max: {max})")]
     BatchIndexOutOfBounds { index: usize, max: usize },
 
+    /// The `.p5s` read index pointed at a row that holds a different read.
+    ///
+    /// The sidecar passed its identity check (same POD5 `file_identifier` and
+    /// byte size) but its locators disagree with the reads table, so following
+    /// them would return another read's data under the requested ID. Reachable
+    /// from a hand-built or bit-rotted sidecar, or from a bug in index
+    /// construction — never from a sidecar this escpod wrote for this file.
+    #[error(
+        "read index for {requested} points at batch {batch} row {row}, which holds {found}; \
+         the .p5s does not describe this file's reads — rebuild it with `escpod index`"
+    )]
+    SidecarIndexMismatch {
+        requested: uuid::Uuid,
+        found: uuid::Uuid,
+        batch: usize,
+        row: usize,
+    },
+
+    /// The `.p5s` read index pointed past the end of a record batch.
+    ///
+    /// Caught before the row reaches an Arrow accessor, which would panic
+    /// rather than error.
+    #[error(
+        "read index for {requested} points at row {row} of batch {batch}, which has {rows} rows; \
+         the .p5s does not describe this file's reads — rebuild it with `escpod index`"
+    )]
+    SidecarRowOutOfBounds {
+        requested: uuid::Uuid,
+        batch: usize,
+        row: usize,
+        rows: usize,
+    },
+
     /// Writer has already been finalized.
     #[error("Writer has already been finalized")]
     WriterFinalized,

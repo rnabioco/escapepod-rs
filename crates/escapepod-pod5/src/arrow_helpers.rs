@@ -284,6 +284,55 @@ fn optional_typed<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) ->
     batch.column_by_name(name)?.as_any().downcast_ref::<T>()
 }
 
+/// Resolve a reads-table batch's `read_id` column.
+///
+/// By name rather than by position, so it works on the column-projected
+/// readers the signal paths use as well as on a full batch.
+pub fn read_id_column(batch: &RecordBatch) -> Result<&FixedSizeBinaryArray> {
+    require_typed::<FixedSizeBinaryArray>(batch, "read_id", "FixedSizeBinaryArray")
+}
+
+/// Confirm a `.p5s` read-index locator points at the read it claims to.
+///
+/// The identity guard in `sidecar::read_sidecar_file` proves the sidecar
+/// belongs to *this* POD5; it says nothing about whether the `(batch_idx,
+/// row_idx)` locators inside it are right. Following one blind returns a
+/// **different real read, correctly self-labelled** — which is worse than
+/// garbage, because nothing downstream can tell. So every indexed lookup
+/// confirms the row before using it.
+///
+/// The cost is a bounds check and a 16-byte compare against the cost of
+/// decoding a read; the column is already resolved by the caller, and the
+/// signal paths already project it.
+pub fn verify_index_row(
+    read_ids: &FixedSizeBinaryArray,
+    requested: Uuid,
+    batch_idx: usize,
+    row: usize,
+) -> Result<()> {
+    // Ahead of the compare, not folded into it: `FixedSizeBinaryArray::value`
+    // panics out of range rather than erroring.
+    if row >= read_ids.len() {
+        return Err(Error::SidecarRowOutOfBounds {
+            requested,
+            batch: batch_idx,
+            row,
+            rows: read_ids.len(),
+        });
+    }
+    let found =
+        Uuid::from_slice(read_ids.value(row)).map_err(|e| Error::InvalidUuid(e.to_string()))?;
+    if found != requested {
+        return Err(Error::SidecarIndexMismatch {
+            requested,
+            found,
+            batch: batch_idx,
+            row,
+        });
+    }
+    Ok(())
+}
+
 /// Append an optional f32 column, filling `default` × `n` when the column is
 /// absent — matching `ReadsBatchView::read`'s `.map(..).unwrap_or(default)`.
 fn extend_opt_f32(dst: &mut Vec<f32>, arr: Option<&Float32Array>, n: usize, default: f32) {
@@ -557,6 +606,12 @@ impl<'a> ReadsBatchView<'a> {
     /// Read ID of a single row (for fast UUID scans without building a full ReadData).
     pub fn read_id(&self, row: usize) -> Result<Uuid> {
         Uuid::from_slice(self.read_id.value(row)).map_err(|e| Error::InvalidUuid(e.to_string()))
+    }
+
+    /// Confirm a `.p5s` locator points at the read it claims to, before this
+    /// row is used. See [`verify_index_row`].
+    pub fn verify_row(&self, requested: Uuid, batch_idx: usize, row: usize) -> Result<()> {
+        verify_index_row(self.read_id, requested, batch_idx, row)
     }
 
     /// Build a `ReadData` for one row from the resolved columns.

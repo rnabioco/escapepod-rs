@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
 
 use escapepod_signal::operations::{
     AnnotateOptions, DesignOptions, parse_barcode_mapping, remove_annotation, remove_design,
@@ -160,6 +160,11 @@ fn run_assignments(
         overwrite: force,
     };
     let annotated = AtomicUsize::new(0);
+    // Assignments are intersected with each file's own reads, so a CSV from
+    // the wrong run drops every row and still writes a valid (empty) column.
+    // Track the overlap so that failure is reported rather than inferred from
+    // an "0 of N assigned" line nobody reads — and which `-q` hides entirely.
+    let assigned_total = AtomicUsize::new(0);
 
     let errors: Vec<anyhow::Error> = files
         .par_iter()
@@ -171,6 +176,17 @@ fn run_assignments(
                     return Some(anyhow::Error::from(e).context(pod5_path.display().to_string()));
                 }
             };
+            assigned_total.fetch_add(result.assigned_reads, Ordering::Relaxed);
+            // Per file this is only suspicious: one demux CSV legitimately
+            // spans many POD5s and covers none of some of them. Across *all*
+            // inputs it is conclusive, which is why the error is raised below.
+            if result.assigned_reads == 0 {
+                warn!(
+                    "{} — none of the {} assignments match any read in this file",
+                    style::path(pod5_path.display()),
+                    style::count(mapping.len()),
+                );
+            }
             info!(
                 "{} {} — {} of {} reads assigned across {} labels in {:.1}s",
                 style::action("wrote"),
@@ -189,9 +205,25 @@ fn run_assignments(
         return Err(first_err);
     }
 
+    let assigned_total = assigned_total.load(Ordering::Relaxed);
+    if assigned_total == 0 && !mapping.is_empty() {
+        anyhow::bail!(
+            "none of the {} assignments in {} match any read in the {} input file(s) — \
+             this is almost always the wrong CSV for these POD5s. The '{}' column was \
+             written but is empty; drop it with `escpod annotate --remove {}`.",
+            mapping.len(),
+            assignments.display(),
+            files.len(),
+            options.name,
+            options.name,
+        );
+    }
+
     info!(
-        "{} file(s) annotated",
-        style::count(annotated.load(Ordering::Relaxed))
+        "{} file(s) annotated — {} of {} assignments matched",
+        style::count(annotated.load(Ordering::Relaxed)),
+        style::count(assigned_total),
+        style::count(mapping.len()),
     );
     Ok(())
 }

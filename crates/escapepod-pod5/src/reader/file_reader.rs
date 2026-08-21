@@ -1136,6 +1136,14 @@ impl Reader {
 
     /// Check whether a read index is already available (`.p5s` sidecar
     /// or previously built in-memory) without triggering a build.
+    ///
+    /// Existence only — validating here would mean decoding the whole sidecar
+    /// on a question asked per lookup. A `.p5s` that is present but bound to
+    /// another POD5 therefore routes the caller down the indexed path and
+    /// surfaces as the identity error from [`Self::read_index`], which names
+    /// the file and how to rebuild it. That is the documented fail-loudly
+    /// policy: a stale sidecar is never silently stepped over in favour of a
+    /// scan that would have worked.
     fn has_index(&self) -> bool {
         if self.read_index.get().is_some() {
             return true;
@@ -1226,7 +1234,8 @@ impl Reader {
             })??;
             // Resolve columns once per batch, then loop targets.
             let view = ReadsBatchView::new(&batch, true)?;
-            for (_uuid, row) in targets {
+            for (uuid, row) in targets {
+                view.verify_row(uuid, batch_idx, row)?;
                 results.push(view.read(row)?);
             }
         }
@@ -1301,7 +1310,11 @@ impl Reader {
                         field: "signal".to_string(),
                         message: "Expected ListArray".to_string(),
                     })?;
+            // read_id is already in the projection; without this the returned
+            // signal would carry the *queried* UUID whatever row it came from.
+            let read_ids = crate::arrow_helpers::read_id_column(&batch)?;
             for (uuid, row) in targets {
+                crate::arrow_helpers::verify_index_row(read_ids, uuid, batch_idx, row)?;
                 let values = signal_col.value(row);
                 let u64_arr =
                     values
@@ -1371,7 +1384,12 @@ impl Reader {
                     field: "calibration_scale".to_string(),
                     message: "Expected Float32Array".to_string(),
                 })?;
+            // read_id is already in the projection; without this the returned
+            // signal and calibration would carry the *queried* UUID whatever
+            // row they came from.
+            let read_ids = crate::arrow_helpers::read_id_column(&batch)?;
             for (uuid, row) in targets {
+                crate::arrow_helpers::verify_index_row(read_ids, uuid, batch_idx, row)?;
                 let values = signal_col.value(row);
                 let u64_arr =
                     values

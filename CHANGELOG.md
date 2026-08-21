@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The `.p5s` read index is no longer trusted past the read it names.** A
+  sidecar's `(batch_idx, row_idx)` locators were dereferenced unchecked, so an
+  index that passed the file-level identity guard but held wrong offsets
+  returned a **different real read, correctly self-labelled** — which nothing
+  downstream could detect. The signal paths were worse: they projected
+  `read_id`, never read it, and stamped the *queried* UUID onto whatever row
+  they landed on. Every indexed lookup now confirms the row's `read_id` before
+  using it (a 16-byte compare against the cost of decoding a read; the column
+  was already resolved) and reports which read the locator actually pointed at.
+
+  An out-of-range `row_idx` previously reached an Arrow accessor and **panicked**
+  (`Trying to access an element at index 10000 from a PrimitiveArray of length
+  25`); it is now bounds-checked into an error. Both failures are pinned by
+  tests that forge an identity-valid sidecar with permuted and out-of-range
+  locators — a round trip cannot reach this code, because a sidecar escapepod
+  wrote for a file is correct by construction.
+
+- **`escpod annotate` no longer succeeds silently on the wrong CSV.**
+  Assignments are intersected with each file's own reads, so a classifications
+  CSV from another run dropped every row, wrote a valid but empty column, and
+  exited 0 — reporting `0 of 50000 reads assigned` at info level, which `-q`
+  hides. Zero overlap on one input now warns, zero across *all* inputs is an
+  error naming the CSV and pointing at `annotate --remove`, and the summary
+  line reports how many assignments matched.
+
+### Added
+
+- **The sidecar records where it came from** — `escapepod:source_name` (the
+  POD5's base name), `escapepod:read_count` and `escapepod:writer`, surfaced in
+  a mismatch error and in `escpod inspect summary`. Identity remains
+  `file_identifier` + `pod5_size` and nothing else; these are descriptive and
+  **never compared**, because matching a filename would break every legitimate
+  rename. They exist for the moment identity fails, when the error otherwise
+  knows only that two UUIDs differ — precisely when a filename is what you
+  want. All three are optional on read, so this is not a format-version bump:
+  older sidecars still load and an older escpod ignores the new keys. No write
+  timestamp, since the sidecar file's mtime already records it.
+
+### Changed
+
+- `escpod index` says what a rebuild discards. Replacing a stale sidecar drops
+  annotations and scores that exist nowhere else; the warning now says so, and
+  carries the identity error's description of what the sidecar was built from.
+
+### Documentation
+
+- `docs/format/sidecar.md` had drifted from the format it specifies: it gave the
+  version as "currently `1`" (`2` ships whenever a score column is present) and
+  omitted `Float32` score columns from the layout table entirely. It now also
+  states what identity *means* — a UUID and a byte length, with no content hash
+  — and why: a v4 `file_identifier` is a 122-bit per-file token that answers
+  "same file?" better than a checksum, while hashing a multi-gigabyte POD5 on
+  every open would cost more than the scan the sidecar exists to avoid. The
+  documented pyarrow escape hatch is now marked as bypassing that check.
+
 ## 0.12.0 (2026-08-20)
 
 ### Performance

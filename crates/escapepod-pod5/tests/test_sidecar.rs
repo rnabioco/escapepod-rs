@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use escapepod_pod5::operations::{
     AnnotateOptions, ColumnValues, ColumnWrite, DesignOptions, read_annotation, read_columns,
@@ -787,4 +787,212 @@ fn a_score_and_a_label_cannot_share_a_name() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("no annotation"), "unexpected error: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Locator trust: identity says the sidecar belongs to this POD5, and nothing
+// says its `(batch_idx, row_idx)` locators are right. Following one blind
+// returns a *different real read, correctly self-labelled* — which no caller
+// can detect — so every indexed lookup confirms the row it landed on.
+//
+// These forge a sidecar that passes the identity gate and has wrong locators,
+// which is the only way to reach the check: a sidecar this crate wrote for
+// this file is correct by construction, so a round-trip test is blind here.
+// ---------------------------------------------------------------------------
+
+/// Rewrite the sidecar's locators with `f`, keeping its identity valid.
+fn forge_locators(path: &std::path::Path, f: impl Fn(&mut Vec<([u8; 16], u32, u32)>)) -> Vec<Uuid> {
+    use escapepod_pod5::sidecar::{Sidecar, read_sidecar_file, write_sidecar_file};
+
+    let reader = Reader::open(path).unwrap();
+    let identity = reader.sidecar_identity().unwrap();
+    let p5s = sidecar_path(path);
+    let existing = read_sidecar_file(&p5s, &identity).unwrap().unwrap();
+
+    let mut entries = existing.entries().to_vec();
+    f(&mut entries);
+    let ids: Vec<Uuid> = entries.iter().map(|e| Uuid::from_bytes(e.0)).collect();
+
+    write_sidecar_file(&p5s, &identity, &Sidecar::new(entries)).unwrap();
+    ids
+}
+
+/// Build a fixture whose sidecar exists, and return its first two read ids.
+fn fixture_with_index() -> (TempDir, std::path::PathBuf, Vec<Uuid>) {
+    let (tmp, path, ids, _) = fixture();
+    Reader::open(&path)
+        .unwrap()
+        .build_and_write_index(sidecar_path(&path))
+        .unwrap();
+    (tmp, path, ids)
+}
+
+#[test]
+fn indexed_reads_reject_a_locator_pointing_at_another_read() {
+    let (_tmp, path, _ids) = fixture_with_index();
+    // Swap two entries' locators: each UUID now points at the other's row.
+    // Both rows exist, so only a read-ID confirmation can catch this.
+    let ids = forge_locators(&path, |entries| {
+        let (b0, r0) = (entries[0].1, entries[0].2);
+        entries[0].1 = entries[1].1;
+        entries[0].2 = entries[1].2;
+        entries[1].1 = b0;
+        entries[1].2 = r0;
+    });
+
+    let reader = Reader::open(&path).unwrap();
+    let targets: HashSet<Uuid> = [ids[0]].into_iter().collect();
+
+    let err = reader.reads_by_ids(&targets).unwrap_err().to_string();
+    assert!(
+        err.contains("read index for") && err.contains("which holds"),
+        "swapped locator returned another read instead of erroring: {err}"
+    );
+
+    // Same guard on the signal path, which is worse without it: it labels the
+    // signal with the *queried* UUID whatever row it came from.
+    let err = reader
+        .find_signal_rows_by_ids(&targets)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("read index for") && err.contains("which holds"),
+        "swapped locator returned another read's signal: {err}"
+    );
+}
+
+#[test]
+fn indexed_reads_reject_an_out_of_range_locator() {
+    let (_tmp, path, _ids) = fixture_with_index();
+    // Past the end of the batch. Without a bounds check this reaches an Arrow
+    // accessor and panics rather than erroring.
+    let ids = forge_locators(&path, |entries| {
+        entries[0].2 = 10_000;
+    });
+
+    let reader = Reader::open(&path).unwrap();
+    let targets: HashSet<Uuid> = [ids[0]].into_iter().collect();
+
+    let err = reader.reads_by_ids(&targets).unwrap_err().to_string();
+    assert!(
+        err.contains("which has") && err.contains("rows"),
+        "out-of-range row was not reported as an error: {err}"
+    );
+
+    let err = reader
+        .find_signal_rows_by_ids(&targets)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("which has") && err.contains("rows"),
+        "out-of-range row was not reported on the signal path: {err}"
+    );
+}
+
+#[test]
+fn a_correct_sidecar_still_reads_through_the_confirmation() {
+    // The guard must not cost correctness on the happy path: indexed results
+    // stay identical to the scan the sidecar replaces.
+    let (tmp, path, ids) = fixture_with_index();
+    let bare = tmp.path().join("bare.pod5");
+    std::fs::copy(&path, &bare).unwrap();
+
+    let targets: HashSet<Uuid> = ids.iter().take(5).copied().collect();
+    let indexed = Reader::open(&path).unwrap().reads_by_ids(&targets).unwrap();
+    let scanned = Reader::open(&bare).unwrap().reads_by_ids(&targets).unwrap();
+
+    assert_eq!(indexed.len(), 5);
+    let mut a: Vec<Uuid> = indexed.iter().map(|r| r.read_id).collect();
+    let mut b: Vec<Uuid> = scanned.iter().map(|r| r.read_id).collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// Provenance: descriptive, optional, never a gate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provenance_names_the_source_in_a_mismatch_error() {
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let sidecar = escapepod_pod5::sidecar::read_sidecar_file(
+        sidecar_path(&path),
+        &Reader::open(&path).unwrap().sidecar_identity().unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let prov = sidecar.provenance();
+    assert_eq!(prov.source_name.as_deref(), Some("reads.pod5"));
+    assert_eq!(prov.read_count, Some(N_READS as u64));
+    assert!(
+        prov.writer
+            .as_deref()
+            .unwrap()
+            .starts_with("escapepod-pod5 ")
+    );
+
+    // Replace the POD5; the mismatch error must now say what it came from.
+    write_fixture(&path, "replacement_acq", N_READS + 3, 500);
+    let err = read_annotation(&path, Some("barcode"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not match") && err.contains("reads.pod5") && err.contains("25 reads"),
+        "mismatch error does not identify the sidecar's origin: {err}"
+    );
+}
+
+#[test]
+fn a_sidecar_without_provenance_keys_still_loads() {
+    // The keys are additive, not a version bump: strip them and the sidecar
+    // must still be accepted, with empty provenance and no error.
+    use escapepod_pod5::sidecar::{
+        P5S_READ_COUNT_KEY, P5S_SOURCE_NAME_KEY, P5S_WRITER_KEY, read_sidecar_file,
+    };
+
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    let identity = Reader::open(&path).unwrap().sidecar_identity().unwrap();
+
+    // Rewrite the IPC file with the provenance keys removed from the schema.
+    let table = {
+        let f = std::fs::File::open(&p5s).unwrap();
+        let mut r = arrow::ipc::reader::FileReader::try_new(f, None).unwrap();
+        let schema = r.schema();
+        let batch = r.next().unwrap().unwrap();
+        let mut md = schema.metadata().clone();
+        md.remove(P5S_SOURCE_NAME_KEY);
+        md.remove(P5S_READ_COUNT_KEY);
+        md.remove(P5S_WRITER_KEY);
+        let stripped = std::sync::Arc::new(
+            arrow::datatypes::Schema::new(schema.fields().clone()).with_metadata(md),
+        );
+        (stripped, batch)
+    };
+    {
+        let f = std::fs::File::create(&p5s).unwrap();
+        let mut w = arrow::ipc::writer::FileWriter::try_new(f, &table.0).unwrap();
+        w.write(&table.1).unwrap();
+        w.finish().unwrap();
+    }
+
+    let sidecar = read_sidecar_file(&p5s, &identity).unwrap().unwrap();
+    assert_eq!(sidecar.len(), N_READS, "stripped sidecar must still load");
+    assert_eq!(sidecar.provenance().describe(), None);
+    assert_eq!(read_annotation(&path, Some("barcode")).unwrap().len(), 5);
 }

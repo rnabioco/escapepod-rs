@@ -39,7 +39,12 @@
 //! ([`P5S_FILE_ID_KEY`], [`P5S_POD5_SIZE_KEY`], [`P5S_VERSION_KEY`]) and is
 //! validated from the IPC footer before any record batch is decoded, so a
 //! sidecar copied next to the wrong file — or left behind after the POD5
-//! was replaced — fails loudly. Writes are atomic (temp file + rename) and
+//! was replaced — fails loudly. Separately, [`SidecarProvenance`] records what
+//! the sidecar was built *from*, so that failure can name a file rather than
+//! only report that two UUIDs differ; it is descriptive and never compared.
+//! The binding is file-level, and a locator inside a bound sidecar is still
+//! confirmed against the row's own `read_id` before use — see
+//! `arrow_helpers::verify_index_row`. Writes are atomic (temp file + rename) and
 //! column-preserving: rebuilding the index keeps annotations, annotating
 //! keeps everything else, and a crash cannot lose the previous sidecar.
 
@@ -70,6 +75,68 @@ pub const P5S_DESIGN_KEY: &str = "escapepod:design";
 pub const P5S_FILE_ID_KEY: &str = "escapepod:file_identifier";
 /// Schema-metadata key binding the sidecar to the POD5's byte size.
 pub const P5S_POD5_SIZE_KEY: &str = "escapepod:pod5_size";
+
+// ---------------------------------------------------------------------------
+// Provenance — descriptive, never a gate
+//
+// Identity is `file_identifier` + `pod5_size` and nothing else. The keys below
+// exist so that a sidecar which *fails* that check can say what it was built
+// from: without them the error knows only that the UUIDs differ, which is
+// precisely the moment the operator needs a filename. They are never compared
+// against anything — matching them would break every legitimate rename — and
+// every one is optional on read, so a sidecar written before they existed
+// still loads and an older escpod ignores them. That is why adding them is not
+// a version bump.
+//
+// Deliberately absent: a write timestamp. The sidecar file's own mtime already
+// records it, and duplicating the filesystem would have cost the format crate
+// a hard `chrono` dependency it does not otherwise carry.
+// ---------------------------------------------------------------------------
+
+/// Schema-metadata key recording the POD5's file name at write time.
+///
+/// Base name only. The path is deliberately not recorded: it would go stale on
+/// any legitimate move and leak directory layout, while the base name is the
+/// part an operator recognises.
+pub const P5S_SOURCE_NAME_KEY: &str = "escapepod:source_name";
+/// Schema-metadata key recording how many reads the index covers.
+pub const P5S_READ_COUNT_KEY: &str = "escapepod:read_count";
+/// Schema-metadata key recording what wrote the sidecar.
+pub const P5S_WRITER_KEY: &str = "escapepod:writer";
+
+/// What a sidecar says about its own origin.
+///
+/// Every field is optional: sidecars written before these keys existed carry
+/// none of them, and that is not an error. Used only to make messages and
+/// `escpod inspect summary` informative — never to accept or reject.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidecarProvenance {
+    /// The POD5's base name when the sidecar was written.
+    pub source_name: Option<String>,
+    /// Reads covered by the index when the sidecar was written.
+    pub read_count: Option<u64>,
+    /// The crate and version that wrote it, e.g. `escapepod-pod5 0.12.0`.
+    pub writer: Option<String>,
+}
+
+impl SidecarProvenance {
+    /// Render as a trailing clause for an error or report, or `None` when the
+    /// sidecar predates these keys and there is nothing to say.
+    pub fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(name) = &self.source_name {
+            parts.push(format!("from \"{name}\""));
+        }
+        if let Some(n) = self.read_count {
+            parts.push(format!("{n} reads"));
+        }
+        if let Some(w) = &self.writer {
+            parts.push(format!("written by {w}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
 /// Sidecar format version for a file whose annotations are all label columns.
 ///
 /// Still what gets written whenever no numeric column is present, which is
@@ -394,9 +461,20 @@ pub struct Sidecar {
     scores: Vec<ScoreSection>,
     /// Experimental design, if one has been recorded.
     design: Option<Design>,
+    /// What the file said about its own origin. Read-only: rewriting a sidecar
+    /// re-stamps this from the file being written, never from here.
+    provenance: SidecarProvenance,
 }
 
 impl Sidecar {
+    /// What this sidecar recorded about its origin when it was written.
+    ///
+    /// Empty for a sidecar written before the provenance keys existed, and for
+    /// one built in memory rather than loaded.
+    pub fn provenance(&self) -> &SidecarProvenance {
+        &self.provenance
+    }
+
     /// Build a sidecar from the read index entries (one per read in the
     /// POD5, any order).
     pub fn new(mut entries: Vec<([u8; 16], u32, u32)>) -> Self {
@@ -406,6 +484,7 @@ impl Sidecar {
             annotations: Vec::new(),
             scores: Vec::new(),
             design: None,
+            provenance: SidecarProvenance::default(),
         }
     }
 
@@ -649,6 +728,16 @@ pub fn read_sidecar_file(
             )));
         }
     }
+    // Read before the gate, not after: the mismatch message is the one place
+    // provenance earns its keep, and by then we have already returned.
+    let provenance = SidecarProvenance {
+        source_name: metadata.get(P5S_SOURCE_NAME_KEY).cloned(),
+        read_count: metadata
+            .get(P5S_READ_COUNT_KEY)
+            .and_then(|s| s.parse().ok()),
+        writer: metadata.get(P5S_WRITER_KEY).cloned(),
+    };
+
     let stored_file_id = metadata
         .get(P5S_FILE_ID_KEY)
         .and_then(|s| Uuid::parse_str(s).ok())
@@ -658,10 +747,15 @@ pub fn read_sidecar_file(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Error::Parse(format!("{} has no valid pod5 size", p5s_path.display())))?;
     if stored_file_id != expect.file_id || stored_size != expect.size {
+        let origin = provenance
+            .describe()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
         return Err(Error::Parse(format!(
-            "{} does not match this POD5 file (stale or copied from another); \
+            "{} does not match this POD5 file (stale or copied from another){}; \
              rebuild with `escpod index` / `escpod annotate`",
-            p5s_path.display()
+            p5s_path.display(),
+            origin
         )));
     }
 
@@ -773,6 +867,7 @@ pub fn read_sidecar_file(
     }
 
     let mut sidecar = Sidecar::new(entries);
+    sidecar.provenance = provenance;
     for (_, name) in &annotation_columns {
         let pairs = &annotation_pairs[name];
         sidecar.set_annotation(AnnotationSection::from_pairs(
@@ -811,6 +906,30 @@ pub fn write_sidecar_file(
     metadata.insert(P5S_VERSION_KEY.to_string(), version.to_string());
     metadata.insert(P5S_FILE_ID_KEY.to_string(), identity.file_id.to_string());
     metadata.insert(P5S_POD5_SIZE_KEY.to_string(), identity.size.to_string());
+
+    // Provenance is re-derived from what is being written, never carried over
+    // from `sidecar.provenance` — a read-modify-write of a sidecar whose POD5
+    // was renamed should record the name it has now.
+    //
+    // The POD5's name comes from the sidecar's own path: `sidecar_path` only
+    // ever appends `.p5s`, so stripping it back off is exact, and it saves
+    // every caller from threading the source path through a second argument.
+    if let Some(source) = p5s_path
+        .as_ref()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".p5s"))
+    {
+        metadata.insert(P5S_SOURCE_NAME_KEY.to_string(), source.to_string());
+    }
+    metadata.insert(
+        P5S_READ_COUNT_KEY.to_string(),
+        sidecar.entries.len().to_string(),
+    );
+    metadata.insert(
+        P5S_WRITER_KEY.to_string(),
+        concat!("escapepod-pod5 ", env!("CARGO_PKG_VERSION")).to_string(),
+    );
     if let Some(design) = &sidecar.design {
         let json = serde_json::to_string(design)
             .map_err(|e| Error::Parse(format!("design serialization failed: {e}")))?;
