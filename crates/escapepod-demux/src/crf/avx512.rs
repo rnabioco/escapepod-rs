@@ -168,7 +168,9 @@ unsafe fn expand(src: &[f32], n_states: usize, group: usize, dst: &mut [f32]) {
             let row = &src[j * group..j * group + group];
             let out = &mut dst[j * n_states..(j + 1) * n_states];
             // 16 inputs become 64 outputs: each source value four times.
-            for (chunk, o) in row.chunks_exact(16).zip(out.chunks_exact_mut(64)) {
+            let (src_chunks, _) = row.as_chunks::<16>();
+            let (dst_chunks, _) = out.as_chunks_mut::<64>();
+            for (chunk, o) in src_chunks.iter().zip(dst_chunks) {
                 let v = _mm512_loadu_ps(chunk.as_ptr());
                 for i in 0..4 {
                     let base = 4 * i as i32;

@@ -202,7 +202,9 @@ unsafe fn expand(src: &[f32], n_states: usize, group: usize, dst: &mut [f32]) {
             let row = &src[j * group..j * group + group];
             let out = &mut dst[j * n_states..(j + 1) * n_states];
             // Each 8 inputs become 32 outputs: lanes [0,0,0,0,1,1,1,1] and so on.
-            for (chunk, o) in row.chunks_exact(8).zip(out.chunks_exact_mut(32)) {
+            let (src_chunks, _) = row.as_chunks::<8>();
+            let (dst_chunks, _) = out.as_chunks_mut::<32>();
+            for (chunk, o) in src_chunks.iter().zip(dst_chunks) {
                 let v = _mm256_loadu_ps(chunk.as_ptr());
                 let q0 = _mm256_permutevar8x32_ps(v, _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1));
                 let q1 = _mm256_permutevar8x32_ps(v, _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3));
