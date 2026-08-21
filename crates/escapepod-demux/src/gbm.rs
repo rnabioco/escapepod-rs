@@ -490,9 +490,8 @@ impl<'a> GbmPredictor<'a> {
         }
 
         let mut out: Vec<(Vec<f64>, ProbabilityResult)> = Vec::with_capacity(fingerprints.len());
-        let mut chunks = fingerprints.chunks_exact(K);
-        for ch in &mut chunks {
-            let xs: [&[f64]; K] = ch.try_into().expect("chunks_exact yields exactly K");
+        let (chunks, remainder) = fingerprints.as_chunks::<K>();
+        for xs in chunks {
             // raw[lane] starts at the per-class baseline and accumulates trees.
             let mut raw: [Vec<f64>; K] = std::array::from_fn(|_| c.baseline.clone());
             for (k, (roots, depths)) in c.class_roots.iter().zip(&c.tree_depth).enumerate() {
@@ -527,7 +526,7 @@ impl<'a> GbmPredictor<'a> {
                 out.push((probs, result));
             }
         }
-        for &fp in chunks.remainder() {
+        for &fp in remainder {
             out.push(self.predict(fp)?);
         }
         Ok(out)

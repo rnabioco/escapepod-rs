@@ -54,8 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so it bypasses `prep` and goes straight to the encoder.
     let raw = std::fs::read(&signal_path)?;
     let signal: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
         .collect();
     assert!(
         signal.len().is_multiple_of(chunk),
