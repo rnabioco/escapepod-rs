@@ -34,6 +34,21 @@ pub struct RefGeometry {
     /// fixed `divergent + 13 + 4` lands inside the barcode on an edx
     /// reference instead of in the tail.
     pub polya_mid: usize,
+    /// Flank anchors, OUTSIDE the basecall damage the modification causes.
+    ///
+    /// On aa-tRNA the amino acid mis-calls the junction it is attached to:
+    /// 51.9% of charged reads carry a CIGAR indel across `CCAGGC` against 2.4%
+    /// of uncharged (23x construct-matched), and the unaligned-base rate is
+    /// elevated from offset -6 to +15, peaking at +5. Both classes align
+    /// equally well at <= -8 and >= +19, so a junction that did not align can
+    /// be placed from there instead of from a nearest-neighbour backfill that
+    /// is biased toward the adapter.
+    ///
+    /// `None` when the reference cannot support the anchor — see
+    /// [`junction_positions`], which refuses a right anchor that is not
+    /// constant across the panel.
+    pub left_anchor: Option<usize>,
+    pub right_anchor: Option<usize>,
 }
 
 /// Read a FASTA into `name → uppercase sequence` (name = first word).
@@ -72,11 +87,40 @@ pub fn junction_positions(
     motif_offset: usize,
     common_arm: &str,
 ) -> Result<HashMap<String, RefGeometry>> {
+    junction_positions_with_anchors(fasta_path, motif, motif_offset, common_arm, None)
+}
+
+/// Reference offsets of the flank anchors, relative to the junction.
+///
+/// Chosen from the measured damage profile: the unaligned-base rate on charged
+/// reads is elevated from -6 to +15 and back to the uncharged baseline by -8
+/// on the left and +19 on the right.
+pub const FLANK_ANCHORS: (i64, i64) = (-10, 20);
+
+/// As [`junction_positions`], with flank anchors installed when usable.
+///
+/// The RIGHT anchor is adapter-family specific and cannot be assumed: at +20 it
+/// lies past a 17 nt common arm, in the `AGGAAGGC` every edx/ndx adapter
+/// shares — but on the v2 single-adapter references those offsets are the
+/// divergent 13-mer, which IS the library label. Anchoring there would place
+/// the window from the one region the design forbids the model to read, so the
+/// anchor is installed only when its context is CONSTANT across every record,
+/// and disabled everywhere if any record disagrees. A per-record decision would
+/// silently anchor some references differently from others.
+pub fn junction_positions_with_anchors(
+    fasta_path: &Path,
+    motif: &str,
+    motif_offset: usize,
+    common_arm: &str,
+    flank_anchors: Option<(i64, i64)>,
+) -> Result<HashMap<String, RefGeometry>> {
+    let (lo_off, hi_off) = flank_anchors.unwrap_or(FLANK_ANCHORS);
     let mut out = HashMap::new();
     let seqs = read_fasta(fasta_path)?;
     if seqs.is_empty() {
         bail!("no records in reference FASTA {}", fasta_path.display());
     }
+    let mut ref_ctx: Vec<Option<String>> = Vec::new();
     for (name, seq) in seqs {
         let n = seq.matches(motif).count();
         if n != 1 {
@@ -86,6 +130,21 @@ pub fn junction_positions(
         if seq.len() < j + common_arm.len() || &seq[j..j + common_arm.len()] != common_arm {
             bail!("{}: common arm mismatch at {}", name, j);
         }
+        let anchor_at = |off: i64| -> Option<usize> {
+            let p = j as i64 + off;
+            if p >= 0 && (p as usize) < seq.len() {
+                Some(p as usize)
+            } else {
+                None
+            }
+        };
+        let right = anchor_at(hi_off);
+        // Two bases either side, so a single-base difference between panels
+        // still disqualifies the anchor.
+        ref_ctx.push(right.and_then(|r| {
+            let (a, b) = (r.saturating_sub(2), (r + 3).min(seq.len()));
+            seq.get(a..b).map(|s| s.to_string())
+        }));
         out.insert(
             name,
             RefGeometry {
@@ -101,8 +160,22 @@ pub fn junction_positions(
                         seq.len()
                     }
                 },
+                left_anchor: anchor_at(lo_off),
+                right_anchor: right,
             },
         );
+    }
+
+    // Disable the right anchor everywhere unless every record agrees on its
+    // context. See the doc comment: on a divergent panel this is the library
+    // label, and anchoring on it would be worse than not anchoring at all.
+    let usable = !ref_ctx.is_empty()
+        && ref_ctx[0].is_some()
+        && ref_ctx.iter().all(|c| c == &ref_ctx[0]);
+    if !usable {
+        for g in out.values_mut() {
+            g.right_anchor = None;
+        }
     }
     Ok(out)
 }

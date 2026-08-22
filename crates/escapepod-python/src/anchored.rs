@@ -54,6 +54,11 @@ struct Row {
     features: Vec<f32>,
     coords: escapepod_classify::JunctionCoords,
     mask_source: &'static str,
+    /// Which rule placed the junction: "exact", "flank_interp" or
+    /// "backfill". Carried per read because the flank rule fires ~30x
+    /// more often on modified reads, so its footprint is itself
+    /// class-correlated and a corpus needs to be auditable by it.
+    anchor_source: &'static str,
 }
 
 /// A scanned BAM, ready to extract windows and statistics in parallel.
@@ -369,6 +374,7 @@ impl AnchoredReads {
                         window,
                         features,
                         mask_source: mask_source_name(coords.mask_source),
+                        anchor_source: read.anchor_source.name(),
                         coords,
                     })
                 })
@@ -390,6 +396,7 @@ impl AnchoredReads {
         let (mut arm_depth, mut aln_depth) = (col(n), col(n));
         let (mut polya, mut body) = (col(n), col(n));
         let (mut ns, mut ts, mut mapq) = (col(n), col(n), col(n));
+        let mut asrc: Vec<&'static str> = Vec::with_capacity(n);
         let (mut kept, mut msrc, mut refs) = (
             Vec::with_capacity(n),
             Vec::with_capacity(n),
@@ -409,6 +416,7 @@ impl AnchoredReads {
             polya.push(c.polya_mid_sig);
             body.push(c.body_mid_sig);
             msrc.push(r.mask_source);
+            asrc.push(r.anchor_source);
             let id = ids[r.idx];
             kept.push(id.to_string());
             let read = &self.anchored[&id];
@@ -422,6 +430,7 @@ impl AnchoredReads {
         out.set_item("read_id", kept)?;
         out.set_item("reference", refs)?;
         out.set_item("mask_source", msrc)?;
+        out.set_item("anchor_source", asrc)?;
         out.set_item("X", PyArray1::from_vec(py, x).reshape([n, w])?)?;
         out.set_item("F", PyArray1::from_vec(py, f).reshape([n, n_feat])?)?;
         for (name, v) in [
@@ -446,5 +455,12 @@ impl AnchoredReads {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AnchoredReads>()?;
+    // Capability marker. A caller that needs the flank-anchored junction must
+    // be able to tell whether THIS binary has it, and a version string cannot
+    // answer that -- it can be patched, backported, or built from a dirty
+    // tree. Exporting the vocabulary the extractor emits makes the question
+    // decidable without a BAM in hand. Consumed by
+    // `escapepod_models.charging.rs_reports_anchor_source`.
+    m.add("ANCHOR_SOURCES", vec!["exact", "flank_interp", "backfill"])?;
     Ok(())
 }
