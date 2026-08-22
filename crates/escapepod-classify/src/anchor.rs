@@ -268,7 +268,11 @@ fn ref_to_query(
 }
 
 /// Which rule placed the junction's query base.
+/// Discriminants are pinned: `coords` writes them into an npz as bare
+/// integers indexing `ANCHOR_SOURCES`, so reordering the variants would
+/// silently relabel every stored read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AnchorSource {
     /// The aligner put a query base on the junction itself.
     Exact,
@@ -488,7 +492,11 @@ impl SpanMode {
 /// Not cosmetic: `JunctionFallback` means no arm base resolved at all, so the
 /// whole left window is masked and the read is **not readable** — callers are
 /// expected to abstain rather than score it.
+/// Discriminants are pinned: `coords` writes them into an npz as bare
+/// integers indexing `MASK_SOURCES`, so reordering the variants would
+/// silently relabel every stored read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MaskSource {
     /// The arm's last reference base (`divergent - 1`) aligned.
     Exact,

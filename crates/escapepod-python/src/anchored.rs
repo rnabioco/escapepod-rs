@@ -157,6 +157,91 @@ impl AnchoredReads {
         self.order.iter().map(|u| u.to_string()).collect()
     }
 
+    /// Per-read junction coordinates, WITHOUT touching POD5.
+    ///
+    /// Everything returned here was decided by the BAM scan that already ran in
+    /// `new`: the anchor, the mask boundary, the spans. `extract` reports the
+    /// same coordinates but has to pull signal to do it, and on a real corpus
+    /// that is ~136 GB of POD5 for ~15.9M reads -- I/O-bound, measured at 4.18
+    /// of 48 allocated cores. Asking a question about GEOMETRY should not cost
+    /// that.
+    ///
+    /// It is what makes an incremental re-extract possible. Changing the anchor
+    /// rule moves ~1% of reads; this says which ones from the BAM alone, so the
+    /// signal pass can be restricted to them and spliced into the corpus that
+    /// already exists.
+    ///
+    /// Every value is a numpy array, so the result saves as-is:
+    ///
+    /// ```python
+    /// np.savez(path, **reads.coords())
+    /// ```
+    ///
+    /// `read_id` is a flat ASCII buffer, `.view("S36")` for the UUIDs -- 15.9M
+    /// Python strings would be ~1.3 GB of PyObject to build and throw away.
+    /// `anchor_source` and `mask_source` are indices into the module constants
+    /// `ANCHOR_SOURCES` and `MASK_SOURCES`, so an npz round-trip keeps them
+    /// interpretable without carrying the strings per read.
+    fn coords<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        struct Row {
+            id: [u8; 36],
+            anchor: u8,
+            mask: u8,
+            junction_sig: i64,
+            common_start_sig: i64,
+            cca_a_sig: i64,
+            junction_dwell: i64,
+            cca_a_dwell: i64,
+            arm_depth: i32,
+        }
+
+        let rows: Vec<Row> = py.detach(|| {
+            self.order
+                .par_iter()
+                .filter_map(|id| {
+                    let read = self.anchored.get(id)?;
+                    let c = finalize(read, self.orientation, &self.offsets, self.mode);
+                    let mut buf = [0u8; 36];
+                    let mut enc = uuid::Uuid::encode_buffer();
+                    buf.copy_from_slice(id.as_hyphenated().encode_lower(&mut enc).as_bytes());
+                    Some(Row {
+                        id: buf,
+                        anchor: read.anchor_source as u8,
+                        mask: c.mask_source as u8,
+                        junction_sig: c.junction_sig,
+                        common_start_sig: c.common_start_sig,
+                        cca_a_sig: c.cca_a_sig,
+                        junction_dwell: c.junction_dwell,
+                        cca_a_dwell: c.cca_a_dwell,
+                        arm_depth: c.arm_resolved_depth,
+                    })
+                })
+                .collect()
+        });
+
+        let mut ids = Vec::with_capacity(rows.len() * 36);
+        for r in &rows {
+            ids.extend_from_slice(&r.id);
+        }
+
+        let out = PyDict::new(py);
+        out.set_item("read_id", PyArray1::from_vec(py, ids))?;
+        let col_u8 = |f: fn(&Row) -> u8| PyArray1::from_vec(py, rows.iter().map(f).collect());
+        let col_i64 = |f: fn(&Row) -> i64| PyArray1::from_vec(py, rows.iter().map(f).collect());
+        out.set_item("anchor_source", col_u8(|r| r.anchor))?;
+        out.set_item("mask_source", col_u8(|r| r.mask))?;
+        out.set_item("junction_sig", col_i64(|r| r.junction_sig))?;
+        out.set_item("common_start_sig", col_i64(|r| r.common_start_sig))?;
+        out.set_item("cca_a_sig", col_i64(|r| r.cca_a_sig))?;
+        out.set_item("junction_dwell", col_i64(|r| r.junction_dwell))?;
+        out.set_item("cca_a_dwell", col_i64(|r| r.cca_a_dwell))?;
+        out.set_item(
+            "arm_resolved_depth",
+            PyArray1::from_vec(py, rows.iter().map(|r| r.arm_depth).collect::<Vec<i32>>()),
+        )?;
+        Ok(out)
+    }
+
     #[getter]
     fn n_anchored(&self) -> usize {
         self.n_records
@@ -462,5 +547,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // decidable without a BAM in hand. Consumed by
     // `escapepod_models.charging.rs_reports_anchor_source`.
     m.add("ANCHOR_SOURCES", vec!["exact", "flank_interp", "backfill"])?;
+    // Both lists are ORDERED: `coords` emits an index into them rather
+    // than the string, so a reader of a saved npz needs them to decode
+    // its `anchor_source` / `mask_source` columns.
+    m.add(
+        "MASK_SOURCES",
+        vec!["exact", "counted", "arm_fallback", "junction_fallback"],
+    )?;
     Ok(())
 }

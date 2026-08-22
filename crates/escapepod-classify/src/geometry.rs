@@ -169,9 +169,8 @@ pub fn junction_positions_with_anchors(
     // Disable the right anchor everywhere unless every record agrees on its
     // context. See the doc comment: on a divergent panel this is the library
     // label, and anchoring on it would be worse than not anchoring at all.
-    let usable = !ref_ctx.is_empty()
-        && ref_ctx[0].is_some()
-        && ref_ctx.iter().all(|c| c == &ref_ctx[0]);
+    let usable =
+        !ref_ctx.is_empty() && ref_ctx[0].is_some() && ref_ctx.iter().all(|c| c == &ref_ctx[0]);
     if !usable {
         for g in out.values_mut() {
             g.right_anchor = None;
