@@ -6,9 +6,13 @@ use numpy::{
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 use std::path::PathBuf;
 
-use escapepod_signal::features::{Normalization, SpanScratch, SpanStatsOut, span_stats};
+use escapepod_signal::features::{
+    MedianConvention, Normalization, SpanBounds, SpanConfig, SpanFill, SpanScratch, SpanStatsOut,
+    span_stats,
+};
 use escapepod_signal::resquiggle::{
     BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
     RoughRescaleAlgo, refine_signal_map,
@@ -111,19 +115,6 @@ impl PyKmerTable {
     }
 }
 
-/// `(dwell, mean, sd)`, one entry per span.
-type SpanTriple1<'py> = (
-    Bound<'py, PyArray1<f32>>,
-    Bound<'py, PyArray1<f32>>,
-    Bound<'py, PyArray1<f32>>,
-);
-/// `(dwell, mean, sd)`, `(n_reads, spans_per_read)` each.
-type SpanTriple2<'py> = (
-    Bound<'py, PyArray2<f32>>,
-    Bound<'py, PyArray2<f32>>,
-    Bound<'py, PyArray2<f32>>,
-);
-
 fn normalization(mad_floor: Option<f32>) -> Normalization {
     match mad_floor {
         Some(f) => Normalization::MedianMad { mad_floor: f },
@@ -131,41 +122,122 @@ fn normalization(mad_floor: Option<f32>) -> Normalization {
     }
 }
 
+/// Assemble the Rust-side [`SpanConfig`] from the keyword knobs.
+///
+/// `fill = None` is `SpanFill::Nan`; any float is `SpanFill::Value`, of which
+/// `0.0` is the `SpanFill::Zero` a model-feeding caller wants. The two string
+/// knobs are spelled out rather than boolean because they are policies, not
+/// switches, and a wrong one has to be visible in the traceback.
+fn span_config(
+    mad_floor: Option<f32>,
+    fill: Option<f32>,
+    bounds: &str,
+    median_convention: &str,
+) -> PyResult<SpanConfig> {
+    let bounds = match bounds {
+        "skip" => SpanBounds::Skip,
+        "clamp" => SpanBounds::Clamp,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "bounds must be 'skip' or 'clamp', got {other:?}"
+            )));
+        }
+    };
+    let median = match median_convention {
+        "select" => MedianConvention::SelectTotalCmp,
+        "sort" => MedianConvention::SortPartialCmp,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "median_convention must be 'select' or 'sort', got {other:?}"
+            )));
+        }
+    };
+    Ok(SpanConfig {
+        norm: normalization(mad_floor),
+        fill: fill.map_or(SpanFill::Nan, SpanFill::Value),
+        bounds,
+        median,
+    })
+}
+
 /// Per-span `(dwell, mean, sd)` for one read.
 ///
-/// `spans` is `(n, 2)` of `[start, end)` signal indices; invalid or unresolved
-/// spans come back `NaN` in all three outputs. `mad_floor` selects per-read
+/// `spans` is `(n, 2)` of `[start, end)` signal indices; a span that does not
+/// resolve comes back as `fill` in every output. `mad_floor` selects per-read
 /// median/MAD normalisation with that flat-read fallback threshold; omit it to
 /// summarise the signal as given.
+///
+/// The optional knobs, all keyword-only and all defaulting to the historical
+/// behaviour:
+///
+/// - `median=True` / `range=True` append a fourth and fifth output array, in
+///   that order. Neither is computed unless asked for -- the median needs its
+///   own pass and a select over each span, which a caller wanting only
+///   `dwell`/`mean`/`sd` should not pay for.
+/// - `fill` is the value written for an unresolved span: `None` (the default)
+///   means `NaN`, and any float is used verbatim -- pass `0.0` when the arrays
+///   feed a network that a `NaN` would poison.
+/// - `bounds` is `"skip"` (default; a span that is negative or runs past the
+///   end does not resolve at all) or `"clamp"` (intersect it with the signal
+///   and summarise what survives, with `dwell` reporting the *clamped* length).
+/// - `median_convention` is `"select"` (default; `select_nth_unstable` with
+///   `total_cmp`, the convention every other median in escapepod-signal uses)
+///   or `"sort"` (a full sort with `partial_cmp`, reproducing `numpy.median`
+///   exactly, `NaN` propagation included). Both average the two middle
+///   elements on an even-length span.
 #[pyfunction]
-#[pyo3(signature = (signal, spans, mad_floor=None))]
+#[pyo3(signature = (
+    signal,
+    spans,
+    mad_floor=None,
+    *,
+    median=false,
+    range=false,
+    fill=None,
+    bounds="skip",
+    median_convention="select",
+))]
+#[allow(clippy::too_many_arguments)]
 fn span_statistics<'py>(
     py: Python<'py>,
     signal: PyReadonlyArray1<'py, f32>,
     spans: PyReadonlyArray2<'py, i64>,
     mad_floor: Option<f32>,
-) -> PyResult<SpanTriple1<'py>> {
+    median: bool,
+    range: bool,
+    fill: Option<f32>,
+    bounds: &str,
+    median_convention: &str,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let cfg = span_config(mad_floor, fill, bounds, median_convention)?;
     let sig = signal.as_slice()?;
     let sp = spans_as_pairs(&spans)?;
     let n = sp.len();
     let (mut d, mut m, mut s) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    let mut med = vec![0.0f32; if median { n } else { 0 }];
+    let mut rng = vec![0.0f32; if range { n } else { 0 }];
     let mut scratch = SpanScratch::default();
-    span_stats(
-        sig,
-        sp,
-        normalization(mad_floor),
-        &mut scratch,
-        SpanStatsOut {
-            dwell: &mut d,
-            mean: &mut m,
-            sd: &mut s,
-        },
-    );
-    Ok((
+    let mut out = SpanStatsOut::new(&mut d, &mut m, &mut s);
+    if median {
+        out = out.with_median(&mut med);
+    }
+    if range {
+        out = out.with_range(&mut rng);
+    }
+    span_stats(sig, sp, cfg, &mut scratch, out);
+
+    let mut cols = vec![
         PyArray1::from_vec(py, d),
         PyArray1::from_vec(py, m),
         PyArray1::from_vec(py, s),
-    ))
+    ];
+    if median {
+        cols.push(PyArray1::from_vec(py, med));
+    }
+    if range {
+        cols.push(PyArray1::from_vec(py, rng));
+    }
+    PyTuple::new(py, cols)
 }
 
 /// Reinterpret an `(n, 2)` i64 array as `&[[i64; 2]]` without copying.
@@ -192,7 +264,20 @@ fn spans_as_pairs<'a>(spans: &'a PyReadonlyArray2<'a, i64>) -> PyResult<&'a [[i6
 /// Rust: the work is embarrassingly parallel and entirely numeric, so it scales
 /// with cores instead of being serialised behind the interpreter.
 #[pyfunction]
-#[pyo3(signature = (signal, read_offsets, spans, spans_per_read, mad_floor=None))]
+#[pyo3(signature = (
+    signal,
+    read_offsets,
+    spans,
+    spans_per_read,
+    mad_floor=None,
+    *,
+    median=false,
+    range=false,
+    fill=None,
+    bounds="skip",
+    median_convention="select",
+))]
+#[allow(clippy::too_many_arguments)]
 fn span_statistics_batch<'py>(
     py: Python<'py>,
     signal: PyReadonlyArray1<'py, f32>,
@@ -200,7 +285,13 @@ fn span_statistics_batch<'py>(
     spans: PyReadonlyArray2<'py, i64>,
     spans_per_read: usize,
     mad_floor: Option<f32>,
-) -> PyResult<SpanTriple2<'py>> {
+    median: bool,
+    range: bool,
+    fill: Option<f32>,
+    bounds: &str,
+    median_convention: &str,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let cfg = span_config(mad_floor, fill, bounds, median_convention)?;
     let sig = signal.as_slice()?;
     let offs = read_offsets.as_slice()?;
     let sp = spans_as_pairs(&spans)?;
@@ -232,37 +323,58 @@ fn span_statistics_batch<'py>(
         vec![0.0f32; total],
         vec![0.0f32; total],
     );
-    let norm = normalization(mad_floor);
+    let mut med = vec![0.0f32; if median { total } else { 0 }];
+    let mut rng = vec![0.0f32; if range { total } else { 0 }];
+
+    // An unrequested optional output is `None` for every read rather than a
+    // zero-length buffer, so the rayon zip below keeps one arm per read either
+    // way and nothing is allocated for it.
+    fn per_read(buf: &mut [f32], on: bool, k: usize, n_reads: usize) -> Vec<Option<&mut [f32]>> {
+        if on {
+            buf.chunks_mut(k).map(Some).collect()
+        } else {
+            (0..n_reads).map(|_| None).collect()
+        }
+    }
+    let mut med_rows = per_read(&mut med, median, spans_per_read, n_reads);
+    let mut rng_rows = per_read(&mut rng, range, spans_per_read, n_reads);
 
     py.detach(|| {
         d.par_chunks_mut(spans_per_read)
             .zip(m.par_chunks_mut(spans_per_read))
             .zip(s.par_chunks_mut(spans_per_read))
+            .zip(med_rows.par_iter_mut())
+            .zip(rng_rows.par_iter_mut())
             .enumerate()
-            .for_each(|(i, ((dw, mn), sd))| {
+            .for_each(|(i, ((((dw, mn), sd), md), rg))| {
                 let read = &sig[offs[i] as usize..offs[i + 1] as usize];
                 let rs = &sp[i * spans_per_read..(i + 1) * spans_per_read];
                 // Scratch is per-task, not shared: rayon may run any number of
                 // these concurrently.
                 let mut scratch = SpanScratch::default();
-                span_stats(
-                    read,
-                    rs,
-                    norm,
-                    &mut scratch,
-                    SpanStatsOut {
-                        dwell: dw,
-                        mean: mn,
-                        sd,
-                    },
-                );
+                let mut out = SpanStatsOut::new(dw, mn, sd);
+                if let Some(row) = md.take() {
+                    out = out.with_median(row);
+                }
+                if let Some(row) = rg.take() {
+                    out = out.with_range(row);
+                }
+                span_stats(read, rs, cfg, &mut scratch, out);
             });
     });
+    drop((med_rows, rng_rows));
 
     let reshape = |v: Vec<f32>| -> PyResult<Bound<'py, PyArray2<f32>>> {
         PyArray1::from_vec(py, v).reshape([n_reads, spans_per_read])
     };
-    Ok((reshape(d)?, reshape(m)?, reshape(s)?))
+    let mut cols = vec![reshape(d)?, reshape(m)?, reshape(s)?];
+    if median {
+        cols.push(reshape(med)?);
+    }
+    if range {
+        cols.push(reshape(rng)?);
+    }
+    PyTuple::new(py, cols)
 }
 
 /// Refine a signal-to-sequence boundary map against a level model.

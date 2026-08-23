@@ -1645,6 +1645,73 @@ class TestSignalBindings:
         assert raw_mean[0] != norm_mean[0]
         assert abs(norm_mean[0]) < abs(raw_mean[0]), "centred on the read median"
 
+    def test_span_statistics_median_range_fill_and_bounds(self):
+        """The optional outputs and the fill/bounds/median policies."""
+        sig = np.arange(10, dtype=np.float32)
+        spans = np.array([[0, 4], [-4, 4], [-9, -3]], dtype=np.int64)
+
+        # Three outputs unless asked otherwise; median then range appended.
+        assert len(escapepod.span_statistics(sig, spans)) == 3
+        d, m, s, med = escapepod.span_statistics(sig, spans, median=True)
+        assert med[0] == 1.5, "even-length spans average the two middles"
+        d2, m2, s2, med2, rng = escapepod.span_statistics(
+            sig, spans, median=True, range=True
+        )
+        np.testing.assert_array_equal(d, d2, "the optional outputs perturb nothing")
+        np.testing.assert_array_equal(m, m2)
+        np.testing.assert_array_equal(s, s2)
+        assert rng[0] == 3.0
+
+        # fill=None is NaN; any float is used verbatim in every output.
+        for i in (1, 2):
+            assert np.isnan(med2[i]) and np.isnan(rng[i])
+        zeroed = escapepod.span_statistics(
+            sig, spans, median=True, range=True, fill=0.0
+        )
+        for col in zeroed:
+            assert col[1] == 0.0 and col[2] == 0.0
+
+        # bounds="clamp" summarises the truncated span [-4, 4) as [0, 4), with
+        # dwell reporting the clamped length; the wholly-outside span still
+        # abstains.
+        cd, cm, _, cmed, crng = escapepod.span_statistics(
+            sig, spans, median=True, range=True, bounds="clamp"
+        )
+        assert cd[1] == 4.0 and cm[1] == 1.5 and cmed[1] == 1.5 and crng[1] == 3.0
+        assert np.isnan(cd[2])
+
+        # Both median conventions are reachable by name, and agree here.
+        for conv in ("select", "sort"):
+            _, _, _, cv = escapepod.span_statistics(
+                sig, spans, median=True, median_convention=conv
+            )
+            assert cv[0] == 1.5
+        with pytest.raises(ValueError):
+            escapepod.span_statistics(sig, spans, bounds="nope")
+        with pytest.raises(ValueError):
+            escapepod.span_statistics(sig, spans, median_convention="nope")
+
+        # ...but not on a span holding a NaN: "sort" is numpy.median, which
+        # propagates it, while "select" reads through it.
+        nan_sig = np.array([1.0, np.nan, 3.0, 2.0], dtype=np.float32)
+        one = np.array([[0, 4]], dtype=np.int64)
+        _, _, _, sel = escapepod.span_statistics(nan_sig, one, median=True)
+        _, _, _, npy = escapepod.span_statistics(
+            nan_sig, one, median=True, median_convention="sort"
+        )
+        assert sel[0] == 2.5
+        assert np.isnan(npy[0])
+        assert np.isnan(np.median(nan_sig)), "which is what numpy itself does"
+
+        # The batch path carries the same knobs.
+        offsets = np.array([0, 10], dtype=np.int64)
+        bd, bm, bs, bmed, brng = escapepod.span_statistics_batch(
+            sig, offsets, spans, 3, median=True, range=True
+        )
+        assert bmed.shape == (1, 3)
+        np.testing.assert_array_equal(bmed[0], med2)
+        np.testing.assert_array_equal(brng[0], rng)
+
     def test_span_statistics_batch_matches_per_read(self):
         """The batched, parallel path must agree with the single-read one."""
         rng = np.random.RandomState(0)

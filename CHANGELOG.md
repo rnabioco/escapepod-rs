@@ -131,6 +131,82 @@
   consumers have each written their own version. It is pinned by a test here
   rather than rediscovered downstream.
 
+### Changed
+
+- **`features::span_stats` gains a median, a range, a fill policy and an
+  out-of-range policy, and takes a `SpanConfig` instead of a bare
+  `Normalization` (#260).** The reduction was already the right one — one pass
+  over the covered region with `f64` prefix sums, O(1) per span, spans supplied
+  by the caller — but three of its choices were baked in, and a consumer that
+  disagreed with any of them could not use the function at all. leech therefore
+  carried its own copy, then a *second* copy, and the two disagreed on exactly
+  one of those choices (rnabioco/leech#200): the Python fast path skipped a
+  span with a negative start and left zeros, the Rust pipeline computed over
+  the truncated span. Same read, different features, depending on which path
+  reached it. The payoff is not line count; it is that the numbers stop
+  depending on which code ran. Precedent: #204, where the rule that decides
+  what a model sees was moved to the crate that owns the reduction rather than
+  re-derived in each caller.
+
+  The three gaps, all now named fields on `SpanConfig` rather than assumptions.
+  `SpanStatsOut` grows optional `median` and `range` buffers, built through
+  `SpanStatsOut::new(..).with_median(..).with_range(..)` — optional because
+  neither can come from the prefix sums (each needs its own pass over the span,
+  and the median a select or a sort on top), so a caller wanting only
+  dwell/mean/sd does not pay for them. `SpanFill { Nan, Zero, Value(f32) }`
+  chooses what an unresolved span gets: `Nan` stays the default and stays the
+  honest answer — an unresolved base has no observation, and a substituted
+  value is indistinguishable from a real one — but that argument does not
+  survive contact with a neural network, where one `NaN` poisons the forward
+  pass, so the alternatives exist for a caller feeding these arrays to a model.
+  `SpanBounds { Skip, Clamp }` chooses what happens to a span hanging off the
+  end: `Skip` (the default, and the old behaviour) treats an out-of-range
+  coordinate as evidence the map is broken; `Clamp` intersects with
+  `[0, len)` and summarises what survives, which is what a reference-anchored
+  map needs once the aligned region is cropped and entries can legitimately go
+  negative while the truncated span still carries real signal. Under `Clamp`,
+  `dwell` is the **clamped** length, not the requested width — every other
+  output is computed from exactly those samples, and pairing a sample count
+  with a mean not taken over that many samples would be a contradiction a model
+  could read.
+
+  **Both median conventions ship, rather than one being chosen silently.**
+  `MedianConvention::SelectTotalCmp` (the default) is
+  `stats::median_via_select`, i.e. `select_nth_unstable` with `total_cmp` — the
+  convention every other median in escapepod-signal already uses.
+  `MedianConvention::SortPartialCmp` is a full sort with `partial_cmp` plus
+  numpy's own `NaN` check, reproducing `numpy.median` over a `float32` array
+  exactly, for a consumer that cross-checks against a Python reference. Both
+  average the two middle order statistics on an even-length span and take the
+  middle one on an odd-length span; neither picks one middle and discards the
+  other. Measured, the two are *bit-identical* over any span of finite values,
+  including the even-length ulp-separated `f32` spans where a ~1e-7 split was
+  expected — `total_cmp` and `partial_cmp` induce the same order on non-`NaN`
+  values, and `numpy.median`'s `float32` two-element mean is bit-for-bit
+  `(a + b) / 2.0`. Where they genuinely diverge is a span containing `NaN`:
+  `SelectTotalCmp` sorts it to the high end and returns a finite median from
+  the values below, `SortPartialCmp` propagates it. That is not exotic — a
+  caller padding a window with `NaN` hits it on every padded base — and the
+  propagating answer is the one consistent with `mean`, which is already `NaN`
+  there. Both behaviours are pinned by tests, the numpy arm against goldens
+  generated from numpy 2.5.1.
+
+  **The API break is behaviour-preserving by construction and proven so.**
+  `SpanConfig::default()` is the old behaviour exactly (`Nan` fill, `Skip`
+  bounds, no normalisation), so `span_stats(sig, spans, SpanConfig::new(norm),
+  ..)` is the old call. A test keeps the pre-`SpanConfig` implementation
+  verbatim as an oracle and asserts the default path is bit-for-bit identical
+  to it across three normalisations and six signal/span fixtures — including
+  with the optional outputs requested, since the point of making them optional
+  is that they cannot perturb the prefix-sum path. The guardrail was checked
+  for teeth by flipping each default in turn and confirming it fails.
+
+  The Python binding exposes the same knobs, keyword-only and all defaulting to
+  the historical behaviour: `median=True` / `range=True` append a fourth and
+  fifth array to the returned tuple, `fill=<float>` replaces the `NaN`
+  sentinel, and `bounds` / `median_convention` take the policy by name. Callers
+  that unpack three arrays are unaffected.
+
 ## 0.14.0 (2026-08-23)
 
 ### Build / Tooling

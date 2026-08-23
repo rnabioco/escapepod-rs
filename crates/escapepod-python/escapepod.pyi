@@ -472,18 +472,26 @@ def span_statistics(
     signal: npt.NDArray[np.float32],
     spans: npt.NDArray[np.int64],
     mad_floor: Optional[float] = None,
-) -> tuple[
-    npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.float32]
-]: ...
+    *,
+    median: bool = False,
+    range: bool = False,
+    fill: Optional[float] = None,
+    bounds: str = "skip",
+    median_convention: str = "select",
+) -> tuple[npt.NDArray[np.float32], ...]: ...
 def span_statistics_batch(
     signal: npt.NDArray[np.float32],
     read_offsets: npt.NDArray[np.int64],
     spans: npt.NDArray[np.int64],
     spans_per_read: int,
     mad_floor: Optional[float] = None,
-) -> tuple[
-    npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.float32]
-]: ...
+    *,
+    median: bool = False,
+    range: bool = False,
+    fill: Optional[float] = None,
+    bounds: str = "skip",
+    median_convention: str = "select",
+) -> tuple[npt.NDArray[np.float32], ...]: ...
 def normalize_signal(signal: npt.NDArray[np.int16]) -> npt.NDArray[np.float32]: ...
 def refine_signal_map(
     signal: npt.NDArray[np.float32],
