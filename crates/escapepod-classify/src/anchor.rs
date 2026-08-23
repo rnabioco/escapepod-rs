@@ -16,6 +16,7 @@
 
 use crate::geometry::RefGeometry;
 use anyhow::{Result, bail};
+use escapepod_signal::mapping::seq_to_signal_from_moves;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::record::data::field::Tag;
@@ -182,16 +183,20 @@ fn move_table(record: &RecordBuf) -> Option<(usize, Vec<u8>, i64, i64)> {
     Some((stride, moves, ns, ts))
 }
 
-/// Build the Remora-convention query→signal map from a move table:
-/// `seq_to_sig[i] = position_of_ith_move * stride + ts`, with a final
-/// boundary entry of `ns`.
+/// Build the Remora-convention query→signal map from a move table, in
+/// **untrimmed** signal coordinates.
+///
+/// [`seq_to_signal_from_moves`] returns the map in trimmed coordinates (base 0
+/// at sample 0, closing boundary `ns - ts`), which is the frame the move table
+/// and `refine_signal_map` are in. This pipeline indexes the raw POD5 signal
+/// array instead — `sig_span` flips spans through `ns`, and the signal is
+/// never sliced — so every entry gets `ts` added back and the closing boundary
+/// lands on `ns`.
 fn seq_to_sig_map(moves: &[u8], stride: usize, ts: i64, ns: i64) -> Vec<i64> {
-    let mut map: Vec<i64> = moves
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &m)| (m == 1).then_some(i as i64 * stride as i64 + ts))
-        .collect();
-    map.push(ns);
+    let mut map = seq_to_signal_from_moves(moves, stride as u32, ts, ns as u64);
+    for v in &mut map {
+        *v += ts;
+    }
     map
 }
 
@@ -928,6 +933,9 @@ mod tests {
     #[test]
     fn test_seq_to_sig_map() {
         // moves [1,0,1,1,0], stride 5, ts 10, ns 40 → bases at 10, 20, 25.
+        // Untrimmed frame: the primitive's trimmed map is [0, 10, 15, 30],
+        // and this pipeline's is that plus ts, closing on ns rather than
+        // ns - ts.
         let map = seq_to_sig_map(&[1, 0, 1, 1, 0], 5, 10, 40);
         assert_eq!(map, vec![10, 20, 25, 40]);
     }

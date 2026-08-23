@@ -89,6 +89,48 @@
   warm-before-publish ordering above is unobservable, and a test that "checked"
   it by calling `read_index()` would only be asserting its own side effect.
 
+- **`escapepod_signal::mapping`: the two Oxford Nanopore coordinate
+  conventions that produce a resquiggle's input.** `refine_signal_map` has
+  always *taken* a sequence→signal map; nothing in the workspace *produced*
+  one. So every consumer wrote its own eight lines off the `mv`/`ns`/`ts` tags
+  and its own CIGAR walk — three copies in this repo alone (the charging
+  classifier's anchoring, the `resquiggle` command, a test helper), plus the
+  ones downstream. Each is a shifted map away from answering a different
+  question than the caller thinks, with no error to show for it, which is the
+  same argument that moved the k-mer level primitives here.
+
+  - `seq_to_signal_from_moves(moves, stride, trim_offset, num_samples)` —
+    Remora's `query_to_signal = np.nonzero(mv)[0] * stride`, returned in
+    **trimmed-signal coordinates** with `num_samples - trim_offset` as the
+    closing boundary, because that is the frame the move table is in and the
+    frame `refine_signal_map` is handed. A caller indexing the untrimmed POD5
+    array adds `trim_offset` back; the charging anchoring now does that
+    explicitly instead of folding `+ ts` into the map's construction, where
+    the frame was invisible.
+  - `ref_to_signal(query_to_signal, cigar)` — reference→signal by the Remora
+    knot convention: trailing non-match ops stripped, knots at the start and
+    `end - 1` of each match block (not `end`, which stretches every gap by a
+    position), exact 1:1 integer lookup inside a block, and linear
+    interpolation only across indel gaps.
+
+  The CIGAR arrives as a local `CigarOp { kind, len }` rather than the
+  `(op, len)` integer pair the convention is usually written with: the crate
+  takes no alignment-library dependency for this, and a bare pair of integers
+  is exactly what a caller transposes without the compiler noticing.
+
+  `ref_to_signal` is integer arithmetic throughout except the one ratio each
+  gap position needs — deliberately not the `ref → float query → float signal`
+  chain that a pair of `np.interp` calls performs. Both interpolations there
+  evaluate `slope * (x - x0) + y0` with a pre-rounded slope, and the result is
+  floored, so a one-ulp difference in the intermediate query coordinate
+  becomes a one-sample difference in the answer: with the map `[0, 7, 8]` and
+  a CIGAR of `1M 6D 1M`, the float chain puts reference position 5 at sample 4
+  instead of 5. It is rare — a 200 000-case sweep of realistic random CIGARs
+  found no difference at all, and it takes a long deletion spanned by short
+  dwells — which is precisely what makes it expensive to find once two
+  consumers have each written their own version. It is pinned by a test here
+  rather than rediscovered downstream.
+
 ## 0.14.0 (2026-08-23)
 
 ### Build / Tooling
