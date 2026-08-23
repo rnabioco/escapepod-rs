@@ -891,8 +891,10 @@ fn indexed_reads_reject_an_out_of_range_locator() {
 
 #[test]
 fn a_correct_sidecar_still_reads_through_the_confirmation() {
-    // The guard must not cost correctness on the happy path: indexed results
-    // stay identical to the scan the sidecar replaces.
+    // The guard must not cost correctness on the happy path. Both readers are
+    // now indexed — the bare one builds its index by projected scan instead of
+    // loading it — so this also pins that a built index and a sidecar-loaded
+    // one resolve the same reads to the same rows.
     let (tmp, path, ids) = fixture_with_index();
     let bare = tmp.path().join("bare.pod5");
     std::fs::copy(&path, &bare).unwrap();
@@ -907,6 +909,68 @@ fn a_correct_sidecar_still_reads_through_the_confirmation() {
     a.sort();
     b.sort();
     assert_eq!(a, b);
+}
+
+/// escapepod-rs#251. A lookup on a POD5 with no sidecar must **build** the
+/// index it already knows how to build — once — and then seek, rather than
+/// rescanning the whole reads table on every call.
+///
+/// The two strategies return identical results, so nothing observable in the
+/// return value can tell them apart; what differs is the work done. This pins
+/// it through the crate's own tracing output, which is also why that output
+/// exists: without it the difference is a day of profiling.
+#[test]
+fn a_lookup_without_a_sidecar_builds_the_index_once() {
+    use std::sync::{Arc, Mutex};
+
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (_tmp, path, ids, _) = fixture();
+    assert!(
+        !sidecar_path(&path).exists(),
+        "this test is only meaningful without a sidecar"
+    );
+
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || Capture(sink.clone()))
+        .finish();
+
+    let targets: HashSet<Uuid> = ids.iter().take(3).copied().collect();
+    let (first, second) = tracing::subscriber::with_default(subscriber, || {
+        let reader = Reader::open(&path).unwrap();
+        // Two lookups on ONE reader: the second must ride the cached index.
+        let a = reader.reads_by_ids(&targets).unwrap();
+        let b = reader.reads_by_ids(&targets).unwrap();
+        (a, b)
+    });
+
+    assert_eq!(first.len(), 3, "first lookup lost reads");
+    assert_eq!(second.len(), 3, "second lookup lost reads");
+
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("read index built from a projected scan")
+            .count(),
+        1,
+        "index must be built exactly once for two lookups on one reader:\n{text}"
+    );
+    assert!(
+        text.contains("no .p5s sidecar"),
+        "a build should say why it happened:\n{text}"
+    );
 }
 
 // ---------------------------------------------------------------------------

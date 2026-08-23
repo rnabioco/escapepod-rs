@@ -371,13 +371,19 @@ impl PyDatasetReader {
     // -- Context manager / dunders -----------------------------------------
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        // Warm each underlying file's in-memory read-id index on entry, so
-        // reads(selection=…) — which loops per file calling reads_by_ids —
-        // takes the O(k) indexed path instead of re-scanning (#97). Gated
-        // per file by its own read count; best-effort. The dataset's own
-        // id_index routing map is still built lazily on first use.
+        // Warm each underlying file's in-memory read-id index on entry so the
+        // build happens here, with the GIL released, rather than inside the
+        // first reads(selection=…) call that needs it (#97). Best-effort; the
+        // dataset's own id_index routing map is still built lazily.
+        //
+        // Still gated per file by read count: this is a *guess* that random
+        // access is coming, and a large file that is only iterated should not
+        // pay for an index nobody asked for. The gate is no longer what makes
+        // selection fast — reads_by_ids indexes on its own now, whatever the
+        // size (escapepod-rs#251) — so above the cap this only defers the
+        // build, it does not fall back to a scan.
         let py = slf.py();
-        let cap = crate::autoindex_max();
+        let cap = escapepod_signal::autoindex_max();
         let readers = &slf.readers;
         py.detach(|| {
             for (_, reader) in readers {

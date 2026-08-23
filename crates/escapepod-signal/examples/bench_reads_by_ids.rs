@@ -1,8 +1,12 @@
-//! Benchmark: reads_by_ids() (indexed vs scan) vs reads().collect() + filter
+//! Benchmark: reads_by_ids() (sidecar vs built index) vs reads().collect() + filter
 //!
 //! Usage: cargo run --release --example bench_reads_by_ids -- <pod5_file> [num_target_ids]
 //!
-//! Temporarily hides the .p5s sidecar to measure the scan path separately.
+//! `reads_by_ids` always goes through the read index. The arm that matters is
+//! therefore not "indexed vs scan" — there is no scan path — but where the
+//! index comes from: loaded from a `.p5s` sidecar, or built by a projected
+//! scan on the first call. The sidecar is temporarily hidden to measure the
+//! build, then restored.
 
 use escapepod_signal::Reader;
 use std::collections::HashSet;
@@ -72,19 +76,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             elapsed,
         );
 
-        // --- Benchmark 2: reads_by_ids() without index (hide .p5s) ---
-        println!("\n=== reads_by_ids() [scan, no index] ===");
+        // --- Benchmark 2: no sidecar — the index is built on first call ---
+        println!("\n=== reads_by_ids() [index built on first call] ===");
         std::fs::rename(&p5i_path, &p5i_hidden)?;
         let reader = Reader::open(pod5_path)?;
         let t0 = Instant::now();
-        let matched_scan = reader.reads_by_ids(&target_ids)?;
-        let elapsed_scan = t0.elapsed();
+        let matched_built = reader.reads_by_ids(&target_ids)?;
+        let elapsed_built = t0.elapsed();
+        // Second call on the same reader: the index is cached, so this is the
+        // steady-state cost every later lookup pays.
+        let t1 = Instant::now();
+        let _ = reader.reads_by_ids(&target_ids)?;
+        let elapsed_warm = t1.elapsed();
         std::fs::rename(&p5i_hidden, &p5i_path)?; // restore
         println!(
-            "  Found {} reads in {:.2?}",
-            matched_scan.len(),
-            elapsed_scan,
+            "  Found {} reads in {:.2?} (first call, includes build)",
+            matched_built.len(),
+            elapsed_built,
         );
+        println!("  Second call on same reader: {:.2?}", elapsed_warm);
 
         // --- Benchmark 3: reads().collect() + filter ---
         println!("\n=== reads().collect() + filter ===");
@@ -112,27 +122,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  reads_by_ids() indexed:    {:.2?} (index load {:.2?} + query {:.2?})",
             indexed_total, idx_load_time, elapsed
         );
-        println!("  reads_by_ids() scan:       {:.2?}", elapsed_scan);
+        println!(
+            "  reads_by_ids() built:      {:.2?} (then {:.2?} per later call)",
+            elapsed_built, elapsed_warm
+        );
         println!("  reads()+filter:            {:.2?}", elapsed_total);
         println!(
             "  Speedup indexed vs old:    {:.1}x",
             elapsed_total.as_secs_f64() / indexed_total.as_secs_f64()
         );
         println!(
-            "  Speedup scan vs old:       {:.1}x",
-            elapsed_total.as_secs_f64() / elapsed_scan.as_secs_f64()
+            "  Speedup built vs old:      {:.1}x",
+            elapsed_total.as_secs_f64() / elapsed_built.as_secs_f64()
         );
 
         assert_eq!(matched.len(), matched_slow.len(), "indexed count mismatch");
         assert_eq!(
-            matched_scan.len(),
+            matched_built.len(),
             matched_slow.len(),
-            "scan count mismatch"
+            "built-index count mismatch"
         );
         println!("  Results match: ✓");
     } else {
-        // No index — just compare scan vs reads().collect()
-        println!("=== reads_by_ids() [scan] ===");
+        // No sidecar — compare the built index against reads().collect()
+        println!("=== reads_by_ids() [index built on first call] ===");
         let reader = Reader::open(pod5_path)?;
         let t0 = Instant::now();
         let matched = reader.reads_by_ids(&target_ids)?;
@@ -158,10 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         println!("\n=== Summary ===");
-        println!("  reads_by_ids() scan:    {:.2?}", elapsed);
+        println!("  reads_by_ids() built:   {:.2?}", elapsed);
         println!("  reads()+filter:         {:.2?}", elapsed_total);
         println!(
-            "  Speedup scan vs old:    {:.1}x",
+            "  Speedup built vs old:   {:.1}x",
             elapsed_total.as_secs_f64() / elapsed.as_secs_f64()
         );
 

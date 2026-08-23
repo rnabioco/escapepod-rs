@@ -42,7 +42,7 @@ pub use escapepod_pod5::{
     FieldError, MergeOptions, MergePhase, MergeProgress, MergeResult, PoreType,
     PredefinedDictionaries, Progress, ProgressCallback, ReadColumns, ReadData, ReadIndex, Reader,
     ReadsBatchView, RecordBatch, RepackOptions, RepackResult, Result, RunInfoData, SignalExtractor,
-    SignalType, Statistics, Uuid, Writer, WriterOptions, abort_all_in_flight_writes, compute_n50,
-    compute_statistics, determine_fields, get_field_value, merge_files, parse_uuid_flexible,
-    repack_files, write_field_value,
+    SignalType, Statistics, Uuid, Writer, WriterOptions, abort_all_in_flight_writes, autoindex_max,
+    compute_n50, compute_statistics, determine_fields, get_field_value, merge_files,
+    parse_uuid_flexible, repack_files, write_field_value,
 };
