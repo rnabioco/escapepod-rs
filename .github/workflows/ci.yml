@@ -204,18 +204,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          # `key` must change whenever the profile this job builds changes.
+          # rust-cache derives its key from Cargo.lock and the toolchain, NOT
+          # from the cargo profile — and GitHub will not overwrite an existing
+          # cache key. So switching profiles without bumping this leaves the
+          # old profile's artefacts sitting in the key forever: every run
+          # restores artefacts it cannot use, rebuilds the whole dependency
+          # graph, and then declines to save because the key already exists.
+          # That is exactly what happened when this job moved off `release`,
+          # and it cost more than the profile change saved (316 s -> 400 s).
+          # Bump the suffix when the profile changes.
+          key: dev-v1
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # `ci-bin`, not `release`. This suite round-trips small fixtures through
-      # the CLI; it needs a binary that runs at a sane speed, not the shipping
-      # artefact. `release` is fat LTO + `codegen-units = 1`, whose whole-program
-      # optimisation and single-threaded codegen made this the longest job in
-      # the workflow (316 s warm, 480 s cold) and therefore the critical path of
-      # every PR. `ci-bin` keeps `opt-level = 3` and drops only the parts that
-      # buy throughput nobody measures here.
+      # The dev profile, deliberately. This suite round-trips a **five-read**
+      # fixture; the binary's throughput is irrelevant to it (the test step
+      # itself measures 1 s), while building an optimised one made this the
+      # longest job in the workflow by an order of magnitude — 363 s of a 400 s
+      # job, for 1 s of testing. Third-party crates still compile at
+      # `opt-level = 2` via `[profile.dev.package."*"]`, so the dependency graph
+      # is not built at -O0; only escapepod's own crates are, and those are the
+      # ones that must rebuild on every source change anyway.
       #
-      # The suite finds the binary via `ESCPOD_BIN`; without it, it looks in
-      # `target/release` then `target/debug` and would silently miss this one.
-      - run: cargo build --profile ci-bin -p escapepod-cli
+      # The suite finds the binary via `ESCPOD_BIN`; without it, it prefers
+      # `target/release` and would silently test a stale optimised build.
+      - run: cargo build -p escapepod-cli
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           environments: python-test
@@ -223,7 +235,7 @@ jobs:
       - name: Round-trip compat vs Python pod5
         run: pixi run -e python-test test-compat
         env:
-          ESCPOD_BIN: ${{ github.workspace }}/target/ci-bin/escpod
+          ESCPOD_BIN: ${{ github.workspace }}/target/debug/escpod
 
   msrv:
     name: MSRV (1.95)
