@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.14.0 (2026-08-23)
+
 ### Build / Tooling
 
 - **CI audit: duplicate compile passes removed, cache churn stopped.** Measured
@@ -103,6 +105,10 @@
   case: loading a `.p5s` sidecar has always built the same in-memory entry
   table with no cap at all, so the same file with a sidecar already holds what
   the threshold claimed to prevent.
+
+- Dependency bumps (lockfile only, no behavior change): the Arrow ecosystem
+  `arrow` + `parquet` 59.1 → 59.2 and the `tract-*` stack 0.23.4 → 0.23.5,
+  plus `bit-vec` 0.9 → 0.11 and `bitflags` 0.19.8 → 0.19.9 (#250).
 
 ### Added
 
