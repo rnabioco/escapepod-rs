@@ -60,18 +60,42 @@ refined_map, scale, shift, drift = escapepod.refine_signal_map(
     expected_levels,
     half_bandwidth=5,      # DP band half-width
     scale_iters=2,         # rescale refinement iterations
-    dwell_target=4.0,      # asymmetric dwell penalty target
-    dwell_weight=0.5,
+    dwell_target=None,     # None = per-read target from the input map's median dwell
+    dwell_weight=None,     # None = the preset's 0.5
     seed=None,             # RNG seed for the Theil-Sen rescale sampling
 )
 ```
 
-The return value is `(refined_seq_to_signal_map, scale, shift, drift)`. Apply
-the recovered rescale to level-match the signal:
+The settings are escapepod's `RefineSettings::move_table_refinement` preset —
+fixed banding, a least-squares rough rescale over the 0.05–0.95 quantiles
+clipped 10 bases, a Theil-Sen inter-iteration rescale over at most 200 points,
+and the asymmetric dwell penalty at weight 0.5. Rust callers wanting the same
+refinement build the same preset, so the two paths cannot drift apart.
+`dwell_target`/`dwell_weight` override the preset when set; leave them `None`
+to use it.
+
+The **dwell target is resolved per read** from the median dwell of the input
+`seq_to_signal_map`. A constant suits exactly one chemistry at one
+translocation rate — RNA004 at 130 bases/s and 4 kHz sits near 31
+samples/base — and because the penalty is asymmetric (quadratic below target,
+logarithmic above), a target set too low actively drags boundaries toward
+dwells the pore never produced.
+
+The return value is `(refined_seq_to_signal_map, scale, shift, drift)`. The
+rescale parameters are returned **for inspection**; applying them is your
+decision, and the refined map is not rescaled for you. They would be applied
+as:
 
 ```python linenums="1"
 matched = (norm - shift - drift * np.arange(len(norm))) / scale
 ```
+
+!!! warning "The rescale fit can be weakly identified"
+    A per-read affine fit estimated over a near-constant stretch of signal —
+    a 3' adapter, a long homopolymer — is poorly constrained, and in practice
+    returns wild or negative scales (observed: 15 to 1084, sign flips
+    included). Pipelines that refine over such a region discard `scale`,
+    `shift` and `drift` and keep their own normalization.
 
 !!! note "Experimental"
     Resquiggle refinement is an evolving, lower-level API — the same one behind

@@ -13,10 +13,7 @@ use escapepod_signal::features::{
     MedianConvention, Normalization, SpanBounds, SpanConfig, SpanFill, SpanScratch, SpanStatsOut,
     span_stats,
 };
-use escapepod_signal::resquiggle::{
-    BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
-    RoughRescaleAlgo, refine_signal_map,
-};
+use escapepod_signal::resquiggle::{KmerTable, RefineAlgo, RefineSettings, refine_signal_map};
 use escapepod_signal::segmentation;
 use rayon::prelude::*;
 
@@ -379,14 +376,32 @@ fn span_statistics_batch<'py>(
 
 /// Refine a signal-to-sequence boundary map against a level model.
 ///
-/// Uses leech's refinement configuration (fixed banding, least-squares rough
-/// rescale over the 0.05–0.95 quantiles clipped 10 bases, Theil-Sen
-/// inter-iteration rescale, asymmetric dwell penalty) so the Python path
-/// matches leech_core's Rust path bit-for-bit.
+/// Uses `RefineSettings::move_table_refinement` — escapepod's named preset for
+/// refining a basecaller move table (fixed banding, least-squares rough rescale
+/// over the 0.05–0.95 quantiles clipped 10 bases, Theil-Sen inter-iteration
+/// rescale over at most 200 points, asymmetric dwell penalty at weight 0.5 with
+/// a per-read target). Rust callers that want the same refinement construct the
+/// same preset rather than transcribing its fields, because a transcription of
+/// this block previously drifted in `dwell_target` and the two paths refined
+/// the same reads to different boundaries.
+///
+/// The dwell target is resolved **per read** from the median dwell of the input
+/// `seq_to_signal_map`, so it tracks the chemistry and translocation rate of
+/// the data instead of a constant. Pass `dwell_target`/`dwell_weight` only to
+/// override the preset; `None` (the default) uses it.
 ///
 /// `signal` must already be normalized. Returns
-/// `(refined_seq_to_signal_map, scale, shift, drift)`; apply the rescale as
-/// `(signal[i] - shift - drift*i) / scale` to recover the level-matched signal.
+/// `(refined_seq_to_signal_map, scale, shift, drift)`.
+///
+/// The rescale parameters are returned **for inspection**; whether to apply
+/// them is the caller's decision, and escapepod does not apply them to the
+/// returned map. They would be applied as
+/// `(signal[i] - shift - drift*i) / scale`. Be aware of how the fit can fail:
+/// a per-read affine fit estimated over a near-constant stretch of signal (a
+/// 3' adapter, a homopolymer) is weakly identified, and in practice produces
+/// wild or negative scales — observed values ranged from 15 to 1084 on tRNA
+/// reads, sign flips included. Downstream consumers that refine over such a
+/// region discard these values and keep their own normalization.
 #[pyfunction]
 #[pyo3(
     name = "refine_signal_map",
@@ -396,8 +411,8 @@ fn span_statistics_batch<'py>(
         expected_levels,
         half_bandwidth = 5,
         scale_iters = 2,
-        dwell_target = 4.0,
-        dwell_weight = 0.5,
+        dwell_target = None,
+        dwell_weight = None,
         seed = None,
     )
 )]
@@ -409,31 +424,17 @@ fn py_refine_signal_map<'py>(
     expected_levels: PyReadonlyArray1<'py, f32>,
     half_bandwidth: usize,
     scale_iters: usize,
-    dwell_target: f32,
-    dwell_weight: f32,
+    dwell_target: Option<f32>,
+    dwell_weight: Option<f32>,
     seed: Option<u64>,
 ) -> PyResult<(Bound<'py, PyArray1<i64>>, f32, f32, f32)> {
-    let settings = RefineSettings {
-        refinement_algo: RefineAlgo::DwellPenalty {
-            target: dwell_target,
-            weight: dwell_weight,
-        },
-        n_refinement_iters: scale_iters,
-        half_bandwidth,
-        adjust_band_min_size: 2,
-        rescale_algo: RescaleAlgo::TheilSen {
-            filter: RescaleFilterParams::default(),
-            max_points: 200,
-            seed,
-        },
-        rough_rescale_algo: RoughRescaleAlgo::LeastSquares {
-            quantiles: RoughRescaleAlgo::default_quantiles(),
-            clip_bases: 10,
-            use_base_center: true,
-        },
-        normalize_levels: false,
-        banding_algo: BandingAlgo::Fixed,
-    };
+    let mut settings = RefineSettings::move_table_refinement(half_bandwidth, scale_iters, seed);
+    if dwell_target.is_some() || dwell_weight.is_some() {
+        settings.refinement_algo = RefineAlgo::DwellPenalty {
+            target: dwell_target.unwrap_or(RefineAlgo::PER_READ_DWELL_TARGET),
+            weight: dwell_weight.unwrap_or(RefineSettings::MOVE_TABLE_DWELL_WEIGHT),
+        };
+    }
 
     let result = refine_signal_map(
         &settings,

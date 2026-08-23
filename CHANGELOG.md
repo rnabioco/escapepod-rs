@@ -207,6 +207,67 @@
   sentinel, and `bounds` / `median_convention` take the policy by name. Callers
   that unpack three arrays are unaffected.
 
+### Fixed
+
+- **One named refinement preset, with a per-read dwell target** (#257). The
+  settings block for refining a basecaller move table existed twice — once in
+  escapepod's own Python binding (`py_refine_signal_map`) and once in a
+  downstream Rust consumer — each carrying a comment asserting that it matched
+  the other. The binding's docstring went further and promised the two paths
+  matched "bit-for-bit". They did not: `dwell_target` had drifted, a fixed
+  `4.0` in the binding against the `0.0` sentinel that asks escapepod to
+  resolve the target from the read's own move-table median dwell.
+
+  That one field is not cosmetic. The dwell penalty is asymmetric — quadratic
+  below target, logarithmic above — so a target set too low does not merely
+  weaken the prior, it actively drags boundaries toward dwells the pore never
+  produced. RNA004 at 130 bases/s and 4 kHz sits near **31 samples/base**, so a
+  target of `4.0` treated every base as roughly 8x too long. Measured across
+  the two backends on the same reads with the same flags: **max |signal delta|
+  3.44 in normalized units, every dwell different, max |feature delta| 3.57**.
+  The two paths refined the same data to different boundaries for four
+  releases, and the comment saying they agreed was there the whole time.
+
+  `RefineSettings::move_table_refinement(half_bandwidth, n_iters, seed)` is now
+  that configuration, as a value rather than a convention: fixed banding, a
+  least-squares rough rescale over the 0.05–0.95 quantiles clipped 10 bases
+  with `use_base_center`, a Theil-Sen inter-iteration rescale over at most 200
+  points, level normalization off, and the asymmetric dwell penalty at weight
+  0.5 with the per-read target. The sentinel gets a name —
+  `RefineAlgo::PER_READ_DWELL_TARGET` — because `0.0` at a call site does not
+  say what it means, and this is the field where that cost something.
+  `RefineAlgo`'s shape is unchanged, so nothing downstream has to move.
+
+  **Behaviour change for `escapepod.refine_signal_map`.** `dwell_target` and
+  `dwell_weight` become `Optional[float]`, default `None`, meaning "use the
+  preset"; passing a number still overrides it. The old default of `4.0` is
+  gone rather than preserved. It is simply wrong for RNA004, it silently
+  corrupted a production corpus, and a caller who wants it back can pass it
+  explicitly — which is a better trade than making every future caller inherit
+  a known-wrong number for bug-compatibility.
+
+  The docstring stops promising bit-for-bit parity, since that promise is not
+  enforceable from inside a docstring and was false when written; it now names
+  the preset both paths construct, which is checkable. It also settles what
+  `(scale, shift, drift)` are for. The return tuple is unchanged, and it had
+  instructed callers to apply the rescale as `(signal[i] - shift - drift*i) /
+  scale` while the downstream Rust path deliberately discarded those same
+  values. Both readings were defensible because escapepod never said which it
+  intended. It now does: the values are returned **for inspection**, applying
+  them is the caller's decision, and the failure mode is documented — a
+  per-read affine fit estimated over a near-constant stretch of signal (a 3'
+  adapter, a homopolymer) is weakly identified, with observed scales ranging
+  from 15 to 1084 and frequently negative.
+
+  Three tests pin this. The preset's fields are asserted one by one, including
+  the rescale filter constants and the quantile grid, so a future edit to any
+  default cannot quietly redefine the preset. Refining an RNA004-like synthetic
+  read under the preset must reproduce refining it under an explicitly named
+  target equal to the input map's median dwell — "per-read" stated as something
+  observable rather than as prose. And the same read must refine *differently*
+  under a fixed `4.0`; restoring the old default fails that test, which was
+  confirmed by restoring it.
+
 ## 0.14.0 (2026-08-23)
 
 ### Build / Tooling
