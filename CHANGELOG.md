@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Build / Tooling
+
+- **CI audit: duplicate compile passes removed, cache churn stopped.** Measured
+  per-job on a warm run (PR #252) and a cold one (a Dependabot lockfile bump),
+  then cut by what the numbers showed rather than by what looked redundant.
+
+  - **`check` is gone; `clippy` covers it.** `cargo clippy --workspace
+    --all-targets` runs the same rustc front-end over the same unit graph as
+    `cargo check --workspace --all-targets` and then adds lints, so a green
+    clippy already implied a green check. The workspace was being compiled
+    twice per PR for no additional signal. The same pair ran in `release.yml`'s
+    macOS gate, where it cost 10x — GitHub bills macOS minutes at ten times
+    Linux.
+
+  - **Doctests moved into the `test` job.** nextest does not run doctests, but
+    `cargo test --doc` needs the same toolchain, profile and unit graph that
+    nextest has just built. As its own job it rebuilt the whole dependency
+    graph from scratch — 406 s cold, against roughly 2 s of actual doctest
+    execution — and held one of the largest caches in the repo. Sharing the
+    target directory makes it nearly free.
+
+  - **The POD5 compat suite stops building a shipping artefact.** It was
+    `cargo build --release`, i.e. fat LTO and `codegen-units = 1`, to produce a
+    binary that round-trips small fixtures. That made it the longest job in the
+    workflow (316 s warm, 480 s cold) and therefore the critical path of every
+    PR. It now builds the new `ci-bin` profile — `opt-level = 3` kept,
+    whole-program optimisation and single-threaded codegen dropped — and points
+    the suite at it through the `ESCPOD_BIN` override the harness already had.
+
+  - **Coverage runs the instrumented suite once instead of twice.** The job
+    ran `cargo llvm-cov nextest` in full for lcov and then again in full for
+    HTML. It now runs once with `--no-report` and renders lcov, the threshold
+    summary and HTML from that single set of profiles.
+
+  - **Two feature builds dropped as duplicates.** The `features` job exists
+    because "the default jobs never compile the opt-in features" — but
+    `cnn-detect` and `crf-decode` are both in escapepod-cli's *default* `cli`
+    feature, so workspace feature unification already compiled escapepod-demux
+    with them in the ordinary `clippy` job. The genuinely opt-in ones (gpu,
+    cnn-gpu, crf-gpu, models-download) are untouched.
+
+  - **PR runs no longer write to the Actions cache.** The repo held 11 GB
+    across 34 entries against GitHub's 10 GB per-repository ceiling, so it sat
+    in permanent LRU eviction — which is why nominally warm jobs still showed
+    cold timings. Every `Swatinem/rust-cache` step now carries
+    `save-if: github.ref == 'refs/heads/main'`, so PRs restore from main's
+    cache but never add to it, and cache entries stop multiplying per branch.
+
+  - **Prose-only changes no longer start a Rust build.** `paths-ignore` on
+    `docs/**`, `**/*.md`, `LICENSE*` and `.gitignore`. A commit touching both
+    prose and code still runs everything — `paths-ignore` suppresses a run only
+    when every changed path matches — and with no branch protection on `main`
+    there are no required checks for a skipped run to block.
+
 ### Fixed
 
 - **A targeted lookup no longer scans the whole reads table when there is no
