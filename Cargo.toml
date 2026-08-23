@@ -83,20 +83,6 @@ codegen-units = 1
 [profile.dist]
 inherits = "release"
 
-# CI-only build of the `escpod` binary for the POD5 compat suite. That suite
-# round-trips small fixtures through the CLI, so it needs a binary that runs at
-# a sane speed — not the shipping artifact. `release`'s fat LTO and single
-# codegen unit buy throughput nobody measures here and cost most of that job's
-# wall clock, and it sits on the critical path of every PR.
-#
-# Named `ci-bin`, not `ci`, because `.config/nextest.toml` already defines a
-# *nextest* profile called `ci` (`cargo nextest run --profile ci`). Two
-# different tools, two different namespaces, one very confusable word.
-[profile.ci-bin]
-inherits = "release"
-lto = false
-codegen-units = 16
-
 # Profiling build: drops LTO and splits codegen so frames aren't inlined
 # away from profilers (valgrind, perf, samply). Slower than release, but
 # faithfully reports call graphs.

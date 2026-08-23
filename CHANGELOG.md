@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Build / Tooling
+
+- **The POD5 compat job stops rebuilding its dependency graph every run.**
+  0.14.0 moved it off `--release` onto an optimised-but-not-LTO profile, which
+  did not work: `Swatinem/rust-cache` derives its key from `Cargo.lock` and the
+  toolchain, **not** from the cargo profile, and GitHub refuses to overwrite an
+  existing cache key. The key therefore still held the old `release` artefacts,
+  so every run restored artefacts it could not use, rebuilt everything, and
+  then declined to save because the key already existed. Measured on main:
+  363 s of a 400 s job was `cargo build`, the compat test itself was **1 s**,
+  and the cache post-step wrote nothing. Warm cost went 316 s → 400 s — the
+  change cost more than it saved.
+
+  Two fixes, both needed. The cache key now carries an explicit suffix that is
+  bumped whenever the profile changes, so a profile switch can actually be
+  saved. And the job builds the **dev** profile rather than an optimised one,
+  because the suite round-trips a *five-read* fixture and the binary's
+  throughput is irrelevant to it; third-party crates still compile at
+  `opt-level = 2` through `[profile.dev.package."*"]`, so only escapepod's own
+  crates drop to `-O0`, and those have to rebuild on any source change anyway.
+  The now-unused `ci-bin` profile is removed.
+
 ## 0.14.0 (2026-08-23)
 
 ### Build / Tooling
