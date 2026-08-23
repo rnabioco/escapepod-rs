@@ -8,6 +8,12 @@ import numpy.typing as npt
 
 __version__: str
 
+# Ordered vocabularies for the small integers `AnchoredReads.coords` emits.
+# A saved npz carries the codes, not the strings, so these lists are what make
+# one readable -- and both Rust enums are `repr(u8)` so the codes cannot drift.
+ANCHOR_SOURCES: list[str]
+MASK_SOURCES: list[str]
+
 class Pod5Error(Exception):
     """Base exception for POD5 file errors."""
 
@@ -444,6 +450,7 @@ class AnchoredReads:
         right: int,
         base_justify: str = ...,
     ) -> dict[str, Any]: ...
+    def coords(self) -> dict[str, npt.NDArray[Any]]: ...
 
 class KmerTable:
     """A kmer level table loaded from a ``kmer\\tlevel`` file (gzip supported)."""

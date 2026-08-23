@@ -1485,6 +1485,77 @@ class TestAnchoredReads:
                 ar.read_ids_with_signal, left=600, right=400, base_justify="sideways"
             )
 
+    # -- coords(): the same geometry, without the signal ------------------- #
+
+    def test_coords_needs_no_pod5(self):
+        """The whole point: geometry is decided by the BAM scan, so asking for
+        it must not require the signal. On a real corpus `extract` reads ~136 GB
+        of POD5 per flowcell and is I/O-bound, which is what made an anchor
+        audit cost a re-extraction."""
+        ar = self._build(24)
+        out = ar.coords()  # no index_pod5 -- that is the assertion
+        assert len(out["junction_sig"]) == ar.n_anchored
+        assert out["read_id"].view("S36").shape == (ar.n_anchored,)
+
+    def test_coords_matches_extract_column_for_column(self):
+        """`coords` and `extract` must not be two implementations of one rule.
+
+        Verified this way on 7,997,543 real reads (zero disagreement on all
+        seven columns); the fixture pins it so a change to `finalize` cannot
+        move one path and not the other.
+        """
+        ar = self._build(24)
+        fast = ar.coords()
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        full = ar.extract(ar.read_ids_with_signal, left=600, right=400)
+
+        want = np.array(full["read_id"], dtype="S36")
+        order = {rid: i for i, rid in enumerate(fast["read_id"].view("S36"))}
+        idx = np.array([order[r] for r in want])
+        assert len(idx) > 0, "the fixture must share reads between the two paths"
+
+        for col in (
+            "junction_sig",
+            "common_start_sig",
+            "cca_a_sig",
+            "cca_a_dwell",
+            "junction_dwell",
+            "arm_resolved_depth",
+        ):
+            np.testing.assert_array_equal(
+                fast[col][idx], np.asarray(full[col]), err_msg=col
+            )
+        masks = [escapepod.MASK_SOURCES[i] for i in fast["mask_source"][idx]]
+        assert masks == list(full["mask_source"])
+
+    def test_coords_codes_decode_through_the_module_lists(self):
+        """The npz stores bare integers, so the lists are the only thing that
+        makes a saved file readable -- and both enums are `repr(u8)` so the
+        codes cannot drift from them."""
+        ar = self._build(24)
+        out = ar.coords()
+        for col, names in (
+            ("anchor_source", escapepod.ANCHOR_SOURCES),
+            ("mask_source", escapepod.MASK_SOURCES),
+        ):
+            assert out[col].max() < len(names)
+            assert {names[i] for i in np.unique(out[col])} <= set(names)
+        assert escapepod.ANCHOR_SOURCES[0] == "exact"
+        assert escapepod.MASK_SOURCES[0] == "exact"
+
+    def test_coords_saves_to_npz_unchanged(self):
+        """It is handed straight to `np.savez`, so every value has to be an
+        array -- a list of 15.9M Python strings is ~1.3 GB of PyObject."""
+        ar = self._build(24)
+        out = ar.coords()
+        assert all(isinstance(v, np.ndarray) for v in out.values())
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "coords.npz"
+            np.savez(p, **out)
+            back = np.load(p)
+            for k, v in out.items():
+                np.testing.assert_array_equal(back[k], v, err_msg=k)
+
 
 class TestSignalBindings:
     """escapepod-signal bindings: normalization, kmer levels, refinement."""
