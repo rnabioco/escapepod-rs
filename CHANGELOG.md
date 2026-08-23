@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.0 (2026-08-23)
+
 ### Fixed
 
 - **The `.p5s` read index is no longer trusted past the read it names.** A
@@ -42,11 +44,61 @@
   older sidecars still load and an older escpod ignores the new keys. No write
   timestamp, since the sidecar file's mtime already records it.
 
+- **`AnchoredReads.coords()` (Python) — junction geometry without reading
+  POD5.** The BAM scan in `AnchoredReads::new` already decides every
+  coordinate the extractor uses, but the only way to read one back was
+  `extract()`, which pulls signal: ~136 GB of POD5 per flowcell, I/O-bound
+  (4.18 of 48 allocated cores), to answer a question about *geometry*.
+  `coords()` runs the same finalization over the scanned reads and returns the
+  coordinates alone — 87 s to scan 13.8 M BAM records plus 2.6 s to finalize
+  12.5 M reads, against 20–30 min for a full extraction — and it is exact, not
+  an approximation: all seven geometry columns agree with a corpus `extract()`
+  had just written on all 7,997,543 shared reads. That makes sizing a rebuild,
+  auditing anchor choice by class, and checking that a new anchoring rule never
+  displaces an already-exact read cost 90 seconds instead of half an hour.
+
+  Every value is a numpy array, so the result saves as-is with
+  `np.savez(path, **reads.coords())`. `read_id` is a flat ASCII buffer
+  (`.view("S36")`) because 15.9 M Python strings would be ~1.3 GB of PyObject
+  built and thrown away. `anchor_source`/`mask_source` are indices into the
+  module lists, and `MASK_SOURCES` is now exported alongside `ANCHOR_SOURCES`
+  so a saved npz decodes standalone; both enums are `#[repr(u8)]`, since an npz
+  stores the bare integer and reordering a variant would silently relabel every
+  stored read.
+
 ### Changed
 
 - `escpod index` says what a rebuild discards. Replacing a stale sidecar drops
   annotations and scores that exist nowhere else; the warning now says so, and
   carries the identity error's description of what the sidecar was built from.
+
+- **The charging junction is anchored from flanks the modification does not
+  damage.** `ref_to_query` resolved a mis-called junction by
+  nearest-aligned-neighbour backfill within `slop=2`, probing `r, r+1, r-1,
+  r+2, r-2` — entirely inside the band the aminoacyl adduct disturbs, and
+  upward first, so the misplacement went toward the adapter. The adduct
+  mis-calls the junction it attaches to: **51.9% of charged reads carry a CIGAR
+  indel across `CCAGGC` against 2.4% of uncharged** (23x, construct-matched),
+  the unaligned-base rate peaks at reference offset +5 (18.3%), and both
+  classes are clean at ≤ −8 and ≥ +19.
+
+  `flank_anchored_qj` therefore takes flanks at (−10, +20) — outside the damage
+  band on both sides — requires **both** donor-exact, and interpolates the
+  junction in query-base space. It fires only when the junction is not already
+  donor-exact, so a read the aligner placed directly is never touched, and the
+  anchor is installed only if its flank context is constant across every
+  reference record: 47/47 on the edx panel, 0/164 on the divergent v2 adapters,
+  where offsets +17..+24 are the library-identifying 13-mer and anchoring on it
+  would be worse than not anchoring at all. Verified read-for-read against
+  `escapepod_models.charging.flank_anchored_qj` on 40,000 charged reads:
+  `anchor_source` and `junction_sig` agree 100.0000%.
+
+  It moves 1.48% of reads, exclusively into `flank_interp` — zero previously
+  `exact` reads are displaced. This is a **placement** fix, not a yield fix:
+  corpus composition is identical before and after (n = 15,872,877, same
+  per-class counts) and the trained model moved 0.9906 → 0.9903 AUROC, within
+  the run-to-run spread. The correctness argument stands on its own; no
+  accuracy claim is being made.
 
 ### Documentation
 
