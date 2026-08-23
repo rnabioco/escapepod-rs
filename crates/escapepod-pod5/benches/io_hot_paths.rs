@@ -3,6 +3,7 @@
 //! Covers the paths that dominate real-world throughput but were previously
 //! unmeasured:
 //! - `Reader::open` (mmap + footer parse)
+//! - `reads_by_ids` (sidecar index / built index / warm index)
 //! - Read-table iteration (no signal decompression)
 //! - Signal extraction (VBZ decompress per read)
 //! - Parallel signal extraction via `SignalExtractor` + rayon
@@ -252,6 +253,64 @@ fn bench_reader_signal_extraction(c: &mut Criterion) {
     group.finish();
 }
 
+/// Targeted lookup — the path escapepod-rs#251 was about.
+///
+/// Three arms, because the interesting variable is where the index comes from:
+/// loaded from a `.p5s`, built by a projected scan on the first call, or
+/// already cached on the reader. The warm arm is the steady state every call
+/// after the first pays.
+///
+/// A caveat worth stating plainly: at fixture scale these numbers cannot show
+/// the failure this path actually had. A few hundred reads is one or two
+/// batches in page cache, where a full scan and an indexed seek cost the same,
+/// which is exactly why a per-call rescan survived here unnoticed. The guard
+/// against *that* is the work-selection invariant in
+/// `test_sidecar::a_lookup_without_a_sidecar_builds_the_index_once`, which
+/// asserts the index is built once for two lookups. These benches track
+/// absolute cost and would catch a gross algorithmic regression (re-opening
+/// the reader per target, say); they are not a substitute for that test.
+fn bench_reads_by_ids(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reads_by_ids");
+    let fixture = &*FIXTURE;
+
+    // Every 4th read, so targets are spread across batches rather than
+    // clustered in the first one.
+    let targets: HashSet<Uuid> = fixture.read_ids.iter().step_by(4).copied().collect();
+    group.throughput(Throughput::Elements(targets.len() as u64));
+
+    // Arm 1: index loaded from a sidecar.
+    let tmp = TempDir::new().expect("tempdir");
+    let with_sidecar = tmp.path().join("indexed.pod5");
+    std::fs::copy(&fixture.path, &with_sidecar).expect("copy fixture");
+    Reader::open(&with_sidecar)
+        .expect("open")
+        .build_and_write_index(escapepod_pod5::sidecar::sidecar_path(&with_sidecar))
+        .expect("write sidecar");
+    group.bench_function("sidecar_index", |bench| {
+        bench.iter(|| {
+            let reader = Reader::open(black_box(&with_sidecar)).expect("open failed");
+            black_box(reader.reads_by_ids(black_box(&targets)).expect("lookup"))
+        });
+    });
+
+    // Arm 2: no sidecar — first call builds the index by projected scan.
+    group.bench_function("built_index_cold", |bench| {
+        bench.iter(|| {
+            let reader = Reader::open(black_box(&fixture.path)).expect("open failed");
+            black_box(reader.reads_by_ids(black_box(&targets)).expect("lookup"))
+        });
+    });
+
+    // Arm 3: steady state — index already cached on the reader.
+    let warm = Reader::open(&fixture.path).expect("open failed");
+    let _ = warm.reads_by_ids(&targets).expect("warm-up");
+    group.bench_function("warm_index", |bench| {
+        bench.iter(|| black_box(warm.reads_by_ids(black_box(&targets)).expect("lookup")));
+    });
+
+    group.finish();
+}
+
 fn bench_writer(c: &mut Criterion) {
     let mut group = c.benchmark_group("writer_end_to_end");
     group.sample_size(bench_sample_size(30));
@@ -388,6 +447,7 @@ criterion_group!(
     bench_reader_open,
     bench_reader_iteration,
     bench_reader_signal_extraction,
+    bench_reads_by_ids,
     bench_writer,
     bench_merge,
     bench_filter,

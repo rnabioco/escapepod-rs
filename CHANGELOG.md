@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A targeted lookup no longer scans the whole reads table when there is no
+  `.p5s` sidecar** (#251). `reads_by_ids`, `find_signal_rows_by_ids` and
+  `find_signal_rows_with_calibration_by_ids` chose between an indexed path and
+  a full scan with a `has_index()` helper that answered *"is there a sidecar on
+  disk?"* — a different question from *"can I use the index?"*, and one with a
+  different answer whenever a sidecar is absent, which is the common case. So
+  every call scanned the file, and none of them built the index that would have
+  made the next call a seek, even though `read_index()` was already there,
+  self-caching, and cheaper than the scan being chosen instead.
+
+  The fallback was never the cheap option. The index *is* a scan, projected to
+  the `read_id` column, so building it moves strictly fewer bytes than one
+  execution of the path it declined — against 22 columns for `reads_by_ids`,
+  2 and 4 for the signal lookups — and it is then cached for every later call.
+  The early exit that justified the scan ("stops once all targets are found")
+  does not fire in the access pattern that matters: targets arrive in BAM
+  order, unrelated to POD5 storage order, so the last one sits near EOF and the
+  scan runs to the end of the file. Per call. Downstream this cost
+  `rnabioco/leech` roughly 10–80x on data preparation, silently; on a 145 GB
+  merged POD5 one call for 1000 ids had not returned after 13.5 minutes.
+
+  All three entry points now go through `read_index()`. The scan variants are
+  gone rather than kept behind a size threshold: what decides whether a scan
+  could win is *where the targets land*, not how many there are, so a threshold
+  on `target_ids.len()` cannot detect the one case it would be for.
+
+### Changed
+
+- **`autoindex_max()` moved from the Python bindings into `escapepod-pod5`**,
+  where the decision it encodes actually lives (#251). It was reachable only
+  from Python — two call sites there warmed the index on context-manager entry
+  to route around the scan described above — so no Rust caller could reach the
+  policy, and the workaround had to be written again in every consumer.
+  `ESCAPEPOD_AUTOINDEX_MAX` and the 5,000,000-read default are unchanged.
+
+  Its meaning is now narrower and honest: it gates *speculative* indexing only.
+  Entering a Python reader as a context manager still checks it, because that
+  is a guess that random access is coming and a large file that is only
+  iterated should not pay for an index nobody asked for. A caller that has
+  actually asked for random access always gets an index, whatever the file
+  size — above the threshold the build is reported at `warn` naming
+  `escpod index`, not traded for a scan. It was never a memory guard in any
+  case: loading a `.p5s` sidecar has always built the same in-memory entry
+  table with no cap at all, so the same file with a sidecar already holds what
+  the threshold claimed to prevent.
+
+### Added
+
+- **`escapepod-pod5` can log.** The format crate — the layer every other one
+  sits on — had no `tracing` dependency at all, which is why a per-call rescan
+  of a 145 GB file was indistinguishable from slow I/O and cost a day of
+  profiling to find. Building a read index now says that it is happening, why
+  (no sidecar), and what it cost (reads, batches, elapsed).
+
+- A `reads_by_ids` group in `io_hot_paths`, covering the three arms that
+  matter: index loaded from a sidecar, index built on the first call, and the
+  warm steady state. Its doc states the limit of what it can prove — at fixture
+  scale a scan and an indexed seek cost the same, so the guard against taking
+  the wrong path is the invariant test that asserts the index is built exactly
+  once for two lookups, not the benchmark.
+
 ## 0.13.0 (2026-08-23)
 
 ### Fixed

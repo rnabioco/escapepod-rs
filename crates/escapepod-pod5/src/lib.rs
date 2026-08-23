@@ -56,6 +56,7 @@ pub use progress::{Progress, ProgressCallback};
 pub use reader::ReadIndex;
 pub use reader::Reader;
 pub use reader::SignalExtractor;
+pub use reader::autoindex_max;
 pub use types::{EndReason, PoreType, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{
     AtomicFile, Durability, PredefinedDictionaries, Writer, WriterOptions,

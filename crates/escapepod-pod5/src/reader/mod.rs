@@ -5,6 +5,6 @@ mod read_index;
 mod read_iter;
 mod signal_extractor;
 
-pub use file_reader::{NonUniformSignalBatch, Reader};
+pub use file_reader::{NonUniformSignalBatch, Reader, autoindex_max};
 pub use read_index::ReadIndex;
 pub use signal_extractor::SignalExtractor;

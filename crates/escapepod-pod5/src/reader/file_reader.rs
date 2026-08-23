@@ -151,6 +151,34 @@ fn probe_header_footer(file: &File) -> Result<()> {
     Ok(())
 }
 
+/// Read count above which building the in-memory read-id index automatically
+/// is worth announcing. Overridable via `ESCAPEPOD_AUTOINDEX_MAX`.
+///
+/// This is a threshold on *speculative* work, not on demanded work, and the
+/// distinction is the whole point. A caller that has asked for random access
+/// — [`Reader::reads_by_ids`] and friends — always gets an index, however
+/// large the file, because the only alternative is a full scan of the reads
+/// table on every call, which is orders of magnitude worse than the memory it
+/// would save. Above this threshold that build is reported at `warn` rather
+/// than `debug`, naming `escpod index`, because it is a cost worth knowing
+/// about even though it is the right cost to pay.
+///
+/// A caller that is merely *guessing* that random access is coming — the
+/// Python context-manager warm-up — should still gate on it, so that opening
+/// a huge file and only iterating it does not pay for an index nobody asked
+/// for.
+///
+/// It is deliberately not a memory guard: [`Reader::read_index`] loads a
+/// `.p5s` sidecar of any size uncapped, so the same file with a sidecar
+/// already holds the same entries in memory. The threshold decides where an
+/// index comes from and how loudly, never whether one exists.
+pub fn autoindex_max() -> usize {
+    std::env::var("ESCAPEPOD_AUTOINDEX_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000)
+}
+
 impl Reader {
     /// Open a POD5 file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -1047,8 +1075,10 @@ impl Reader {
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
 
+        let started = std::time::Instant::now();
         let reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0]))?;
 
+        let mut batches = 0usize;
         let mut entries = Vec::new();
         for (batch_idx, batch_result) in reader.enumerate() {
             let batch = batch_result?;
@@ -1060,6 +1090,7 @@ impl Reader {
                         field: "read_id".to_string(),
                         message: "Expected FixedSizeBinaryArray".to_string(),
                     })?;
+            batches += 1;
             entries.reserve(col.len());
             for row in 0..col.len() {
                 let bytes = col.value(row);
@@ -1070,6 +1101,12 @@ impl Reader {
             }
         }
         entries.sort_unstable_by_key(|e| e.0);
+        tracing::debug!(
+            reads = entries.len(),
+            batches,
+            elapsed_ms = started.elapsed().as_millis(),
+            "read index built from a projected scan"
+        );
         Ok(ReadIndex { entries })
     }
 
@@ -1095,8 +1132,14 @@ impl Reader {
 
     /// Get or lazily build the read UUID index.
     ///
-    /// Checks for a `.p5s` sidecar file first; falls back to a
-    /// column-projected scan of the reads table.
+    /// Checks for a `.p5s` sidecar first and falls back to a column-projected
+    /// scan of the reads table. Either way the result is cached on the reader,
+    /// so the cost is paid once per `Reader`, not once per lookup.
+    ///
+    /// A sidecar that exists but is bound to another POD5 is an **error**, not
+    /// a reason to fall back: it is never silently stepped over in favour of a
+    /// scan that would have worked, because that would turn a stale index into
+    /// a slow success instead of a loud failure.
     pub fn read_index(&self) -> Result<&ReadIndex> {
         if let Some(idx) = self.read_index.get() {
             return Ok(idx);
@@ -1105,7 +1148,29 @@ impl Reader {
         // get_or_init will discard the extra copy.
         let index = match self.load_sidecar_index()? {
             Some(index) => index,
-            None => self.build_read_index_from_scan()?,
+            None => {
+                // Loud above the threshold, because a build of that size is
+                // worth knowing about — but still a build. Falling back to a
+                // scan here is the bug this replaced (escapepod-rs#251).
+                let reads = self.read_count().unwrap_or(0);
+                if reads > autoindex_max() {
+                    tracing::warn!(
+                        file = ?self.file_path,
+                        reads,
+                        "no .p5s sidecar; building an in-memory read index for a \
+                         large file — run `escpod index` to persist it and skip \
+                         this on every future open"
+                    );
+                } else {
+                    tracing::debug!(
+                        file = ?self.file_path,
+                        reads,
+                        "no .p5s sidecar; building the read index in memory \
+                         (`escpod index` persists it across processes)"
+                    );
+                }
+                self.build_read_index_from_scan()?
+            }
         };
         Ok(self.read_index.get_or_init(|| index))
     }
@@ -1134,76 +1199,55 @@ impl Reader {
     // Targeted batch access — indexed or single-pass
     // ------------------------------------------------------------------
 
-    /// Check whether a read index is already available (`.p5s` sidecar
-    /// or previously built in-memory) without triggering a build.
-    ///
-    /// Existence only — validating here would mean decoding the whole sidecar
-    /// on a question asked per lookup. A `.p5s` that is present but bound to
-    /// another POD5 therefore routes the caller down the indexed path and
-    /// surfaces as the identity error from [`Self::read_index`], which names
-    /// the file and how to rebuild it. That is the documented fail-loudly
-    /// policy: a stale sidecar is never silently stepped over in favour of a
-    /// scan that would have worked.
-    fn has_index(&self) -> bool {
-        if self.read_index.get().is_some() {
-            return true;
-        }
-        // Peek for sidecar without loading it yet
-        self.p5s_path().is_some_and(|p| p.exists())
-    }
-
     /// Look up signal rows for a set of target UUIDs.
     ///
-    /// If a `.p5s` index (or in-memory index) exists, uses indexed
-    /// batch access (skips non-target batches). Otherwise does a
-    /// **single-pass** column-projected scan with inline UUID filtering
-    /// — no index is built.
+    /// Goes through the read index, which is built on first use and cached
+    /// (see [`Self::read_index`]), so only batches holding a target are
+    /// touched. See [`Self::reads_by_ids`] for why this is preferred to a
+    /// scan even on the first call.
     pub fn find_signal_rows_by_ids(
         &self,
         target_ids: &HashSet<Uuid>,
     ) -> Result<Vec<(Uuid, Vec<u64>)>> {
-        if self.has_index() {
-            self.find_signal_rows_indexed(target_ids)
-        } else {
-            self.find_signal_rows_scan(target_ids)
-        }
+        self.find_signal_rows_indexed(target_ids)
     }
 
     /// Look up signal rows and calibration data for a set of target UUIDs.
     ///
-    /// Same strategy as [`Self::find_signal_rows_by_ids`]: indexed path when
-    /// an index exists, single-pass scan otherwise.
+    /// Same strategy as [`Self::find_signal_rows_by_ids`].
     #[allow(dead_code)]
     pub(crate) fn find_signal_rows_with_calibration_by_ids(
         &self,
         target_ids: &HashSet<Uuid>,
     ) -> Result<Vec<SignalCalibration>> {
-        if self.has_index() {
-            self.find_signal_rows_with_calibration_indexed(target_ids)
-        } else {
-            self.find_signal_rows_with_calibration_scan(target_ids)
-        }
+        self.find_signal_rows_with_calibration_indexed(target_ids)
     }
 
     /// Retrieve full `ReadData` for a set of target UUIDs.
     ///
-    /// **Indexed path** (when `.p5s` sidecar or in-memory index exists):
-    /// groups targets by batch, opens a full-column reader, and seeks
-    /// directly to each target batch — only the batches that contain
-    /// target UUIDs are deserialized.
+    /// Groups targets by batch through the read index, opens a full-column
+    /// reader, and seeks directly to each target batch — only batches that
+    /// contain a target UUID are deserialized.
     ///
-    /// **Scan path** (no index): iterates all batches but checks the
-    /// UUID column first and only deserializes matching rows. Terminates
-    /// early once all targets are found.
+    /// This always goes through [`Self::read_index`], building the index on
+    /// the first call when no `.p5s` sidecar exists, rather than falling back
+    /// to a scan. Building is not the more expensive option even for a single
+    /// call: the index *is* a scan, projected to the `read_id` column, so it
+    /// moves strictly fewer bytes than one execution of the full 22-column
+    /// scan it replaces — and it is cached on the reader, so every later
+    /// lookup is a seek instead of another pass over the file.
+    ///
+    /// The early exit a scan offers ("stop once all targets are found") does
+    /// not rescue it in the access pattern that matters: targets typically
+    /// arrive in BAM order, which is unrelated to POD5 storage order, so the
+    /// last one sits near EOF and the scan runs to the end of the file anyway.
+    ///
+    /// Persist the index with `escpod index` to skip the build entirely.
     pub fn reads_by_ids(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
         if target_ids.is_empty() {
             return Ok(Vec::new());
         }
-        if self.has_index() {
-            self.reads_by_ids_indexed(target_ids)
-        } else {
-            self.reads_by_ids_scan(target_ids)
-        }
+        self.reads_by_ids_indexed(target_ids)
     }
 
     fn reads_by_ids_indexed(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
@@ -1237,32 +1281,6 @@ impl Reader {
             for (uuid, row) in targets {
                 view.verify_row(uuid, batch_idx, row)?;
                 results.push(view.read(row)?);
-            }
-        }
-        Ok(results)
-    }
-
-    fn reads_by_ids_scan(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
-        let embedded = self
-            .footer
-            .reads_table()
-            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let reader = self.create_arrow_reader(embedded)?;
-
-        let n = target_ids.len();
-        let mut results = Vec::with_capacity(n);
-        for batch_result in reader {
-            let batch = batch_result?;
-            let view = ReadsBatchView::new(&batch, true)?;
-            for row in 0..view.num_rows() {
-                if let Ok(uuid) = view.read_id(row)
-                    && target_ids.contains(&uuid)
-                {
-                    results.push(view.read(row)?);
-                    if results.len() == n {
-                        return Ok(results);
-                    }
-                }
             }
         }
         Ok(results)
@@ -1410,133 +1428,6 @@ impl Reader {
     }
 
     // ---- Single-pass path (no index — column-projected scan with inline filter) ----
-
-    fn find_signal_rows_scan(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<(Uuid, Vec<u64>)>> {
-        use arrow::array::AsArray;
-        use arrow::datatypes::UInt64Type;
-
-        let embedded = self
-            .footer
-            .reads_table()
-            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        // Project only [read_id, signal]
-        let reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1]))?;
-
-        let n = target_ids.len();
-        let mut results = Vec::with_capacity(n);
-        for batch_result in reader {
-            let batch = batch_result?;
-            let id_col =
-                batch
-                    .column(0)
-                    .as_fixed_size_binary_opt()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "read_id".to_string(),
-                        message: "Expected FixedSizeBinaryArray".to_string(),
-                    })?;
-            let signal_col =
-                batch
-                    .column(1)
-                    .as_list_opt::<i32>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
-            for row in 0..batch.num_rows() {
-                if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
-                    && target_ids.contains(&uuid)
-                {
-                    let values = signal_col.value(row);
-                    let u64_arr = values.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
-                        Error::InvalidField {
-                            field: "signal".to_string(),
-                            message: "Expected UInt64Array values".to_string(),
-                        }
-                    })?;
-                    results.push((uuid, u64_arr.values().to_vec()));
-                    if results.len() == n {
-                        return Ok(results);
-                    }
-                }
-            }
-        }
-        Ok(results)
-    }
-
-    fn find_signal_rows_with_calibration_scan(
-        &self,
-        target_ids: &HashSet<Uuid>,
-    ) -> Result<Vec<SignalCalibration>> {
-        use arrow::array::AsArray;
-        use arrow::datatypes::{Float32Type, UInt64Type};
-
-        let embedded = self
-            .footer
-            .reads_table()
-            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        // Project [read_id, signal, calibration_offset, calibration_scale]
-        let reader =
-            self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1, 16, 17]))?;
-
-        let n = target_ids.len();
-        let mut results = Vec::with_capacity(n);
-        for batch_result in reader {
-            let batch = batch_result?;
-            let id_col =
-                batch
-                    .column(0)
-                    .as_fixed_size_binary_opt()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "read_id".to_string(),
-                        message: "Expected FixedSizeBinaryArray".to_string(),
-                    })?;
-            let signal_col =
-                batch
-                    .column(1)
-                    .as_list_opt::<i32>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
-            let cal_offset_col = batch
-                .column(2)
-                .as_primitive_opt::<Float32Type>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "calibration_offset".to_string(),
-                    message: "Expected Float32Array".to_string(),
-                })?;
-            let cal_scale_col = batch
-                .column(3)
-                .as_primitive_opt::<Float32Type>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "calibration_scale".to_string(),
-                    message: "Expected Float32Array".to_string(),
-                })?;
-            for row in 0..batch.num_rows() {
-                if let Ok(uuid) = Uuid::from_slice(id_col.value(row))
-                    && target_ids.contains(&uuid)
-                {
-                    let values = signal_col.value(row);
-                    let u64_arr = values.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
-                        Error::InvalidField {
-                            field: "signal".to_string(),
-                            message: "Expected UInt64Array values".to_string(),
-                        }
-                    })?;
-                    results.push(SignalCalibration {
-                        read_id: uuid,
-                        signal_rows: u64_arr.values().to_vec(),
-                        calibration_offset: cal_offset_col.value(row),
-                        calibration_scale: cal_scale_col.value(row),
-                    });
-                    if results.len() == n {
-                        return Ok(results);
-                    }
-                }
-            }
-        }
-        Ok(results)
-    }
 
     /// Create an Arrow IPC file reader for an embedded file.
     fn create_arrow_reader(
