@@ -127,6 +127,11 @@ pub struct AnchoredRead {
     pub q_body_mid: Option<usize>,
     /// Query position per feature offset; `-1` = unaligned.
     pub qf: Vec<i64>,
+    /// Which rule placed `q_junction`. Carried per read so a corpus can be
+    /// audited by anchor provenance rather than the change being inferred —
+    /// the flank rule fires ~30x more often on charged reads, so its footprint
+    /// is itself class-correlated and worth being able to see.
+    pub anchor_source: AnchorSource,
 }
 
 /// Why a BAM record produced no [`AnchoredRead`].
@@ -262,6 +267,72 @@ fn ref_to_query(
     (out, donor)
 }
 
+/// Which rule placed the junction's query base.
+/// Discriminants are pinned: `coords` writes them into an npz as bare
+/// integers indexing `ANCHOR_SOURCES`, so reordering the variants would
+/// silently relabel every stored read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AnchorSource {
+    /// The aligner put a query base on the junction itself.
+    Exact,
+    /// Interpolated between undamaged flanks, because it did not.
+    FlankInterp,
+    /// Neither — the old nearest-neighbour backfill within `slop`.
+    Backfill,
+}
+
+impl AnchorSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            AnchorSource::Exact => "exact",
+            AnchorSource::FlankInterp => "flank_interp",
+            AnchorSource::Backfill => "backfill",
+        }
+    }
+}
+
+/// Query base index of the junction, placed from undamaged flanks.
+///
+/// Port of `charging.flank_anchored_qj`. The modification mis-calls the
+/// junction it attaches to, and `ref_to_query` then backfills it from the
+/// nearest aligned neighbour, probing `r, r+1, r-1, ...` — upward first, so the
+/// origin every counted arm offset is measured from lands on a stand-in base
+/// biased toward the adapter. The flanks are not damaged, so interpolate
+/// between them instead, in QUERY-BASE space because that is what the counted
+/// offsets index.
+///
+/// Only used when the junction is NOT donor-exact: where the aligner placed it,
+/// that is an observation and interpolation could only add error.
+fn flank_anchored_qj(
+    q: &HashMap<i64, usize>,
+    donor: &HashMap<i64, i64>,
+    g: &RefGeometry,
+    qj_backfill: usize,
+) -> (usize, AnchorSource) {
+    let j = g.junction as i64;
+    if donor.get(&j) == Some(&j) {
+        return (qj_backfill, AnchorSource::Exact);
+    }
+    if let (Some(lo), Some(hi)) = (g.left_anchor, g.right_anchor) {
+        let (lo, hi) = (lo as i64, hi as i64);
+        // Both anchors must be donor-exact: an anchor that is itself backfilled
+        // is a neighbour's base wearing this position's name.
+        if hi > lo
+            && donor.get(&lo) == Some(&lo)
+            && donor.get(&hi) == Some(&hi)
+            && let (Some(&qlo), Some(&qhi)) = (q.get(&lo), q.get(&hi))
+        {
+            let frac = (j - lo) as f64 / (hi - lo) as f64;
+            let est = qlo as f64 + frac * (qhi as f64 - qlo as f64);
+            if est >= 0.0 {
+                return (est.round() as usize, AnchorSource::FlankInterp);
+            }
+        }
+    }
+    (qj_backfill, AnchorSource::Backfill)
+}
+
 /// Scan one BAM record into an [`AnchoredRead`] (or a skip reason).
 ///
 /// `ref_name` is the record's resolved reference sequence name (the caller
@@ -306,11 +377,19 @@ pub fn scan_record(
         g.polya_mid as i64,
     ];
     wanted.extend(offsets.iter().map(|&o| g.junction as i64 + o as i64));
+    // Flank anchors, for placing a junction the modification has mis-called.
+    wanted.extend(
+        [g.left_anchor, g.right_anchor]
+            .iter()
+            .filter_map(|a| a.map(|p| p as i64)),
+    );
     let (q, donor) = ref_to_query(record, &wanted, REF_TO_QUERY_SLOP, Some(g.divergent as i64));
 
-    let (Some(&qj), Some(&qa)) = (q.get(&(g.junction as i64)), q.get(&(g.cca_a as i64))) else {
+    let (Some(&qj_backfill), Some(&qa)) = (q.get(&(g.junction as i64)), q.get(&(g.cca_a as i64)))
+    else {
         return ScanOutcome::Skip(SkipReason::Unanchored);
     };
+    let (qj, anchor_source) = flank_anchored_qj(&q, &donor, g, qj_backfill);
 
     let seq_to_sig = seq_to_sig_map(&moves, stride, ts, ns);
     let nb = seq_to_sig.len() - 1;
@@ -365,6 +444,7 @@ pub fn scan_record(
         q_body_mid: q.get(&(g.body_mid as i64)).copied(),
         q_polya_mid: q.get(&(g.polya_mid as i64)).copied(),
         qf,
+        anchor_source,
     }))
 }
 
@@ -412,7 +492,11 @@ impl SpanMode {
 /// Not cosmetic: `JunctionFallback` means no arm base resolved at all, so the
 /// whole left window is masked and the read is **not readable** — callers are
 /// expected to abstain rather than score it.
+/// Discriminants are pinned: `coords` writes them into an npz as bare
+/// integers indexing `MASK_SOURCES`, so reordering the variants would
+/// silently relabel every stored read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MaskSource {
     /// The arm's last reference base (`divergent - 1`) aligned.
     Exact,
@@ -624,10 +708,80 @@ mod tests {
             q_body_mid: None,
             q_polya_mid: None,
             qf,
+            anchor_source: AnchorSource::Exact,
         }
     }
 
     const OFFSETS: [i32; 5] = [-1, 0, 1, 2, 3];
+
+    // ---- flank-anchored junction placement --------------------------------
+    //
+    // The existing goldens cannot separate the two rules: every fixture read
+    // has a donor-exact junction, so the flank path never fires and a
+    // regression in it would pass silently. These exercise the branch directly.
+
+    fn geom(left: Option<usize>, right: Option<usize>) -> RefGeometry {
+        RefGeometry {
+            junction: 100,
+            cca_a: 99,
+            divergent: 117,
+            body_mid: 50,
+            polya_mid: 160,
+            left_anchor: left,
+            right_anchor: right,
+        }
+    }
+
+    #[test]
+    fn exact_junction_is_used_directly_not_interpolated() {
+        // Where the aligner placed the junction, that is an observation;
+        // interpolating there could only add error.
+        let g = geom(Some(90), Some(120));
+        let q = HashMap::from([(100i64, 500usize), (90, 490), (120, 520)]);
+        let donor = HashMap::from([(100i64, 100i64), (90, 90), (120, 120)]);
+        assert_eq!(
+            flank_anchored_qj(&q, &donor, &g, 500),
+            (500, AnchorSource::Exact)
+        );
+    }
+
+    #[test]
+    fn backfilled_junction_is_placed_between_the_flanks() {
+        // 3 bases of insertion between the anchors, junction 10/30 along:
+        // 490 + 0.333 * 33 = 501, NOT the 999 the backfill would have taken.
+        let g = geom(Some(90), Some(120));
+        let q = HashMap::from([(100i64, 999usize), (90, 490), (120, 523)]);
+        let donor = HashMap::from([(100i64, 101i64), (90, 90), (120, 120)]);
+        assert_eq!(
+            flank_anchored_qj(&q, &donor, &g, 999),
+            (501, AnchorSource::FlankInterp)
+        );
+    }
+
+    #[test]
+    fn a_flank_that_is_itself_backfilled_is_refused() {
+        // An anchor is only an anchor if the aligner actually placed it.
+        let g = geom(Some(90), Some(120));
+        let q = HashMap::from([(100i64, 505usize), (90, 490), (120, 523)]);
+        let donor = HashMap::from([(100i64, 101i64), (90, 90), (120, 121)]);
+        assert_eq!(
+            flank_anchored_qj(&q, &donor, &g, 505),
+            (505, AnchorSource::Backfill)
+        );
+    }
+
+    #[test]
+    fn falls_back_when_the_reference_has_no_right_anchor() {
+        // A divergent panel disables the right anchor entirely; the old rule
+        // must still apply rather than the read being lost.
+        let g = geom(Some(90), None);
+        let q = HashMap::from([(100i64, 505usize), (90, 490)]);
+        let donor = HashMap::from([(100i64, 101i64), (90, 90)]);
+        assert_eq!(
+            flank_anchored_qj(&q, &donor, &g, 505),
+            (505, AnchorSource::Backfill)
+        );
+    }
 
     #[test]
     fn counted_mode_counts_along_the_query_and_ignores_the_aligner() {

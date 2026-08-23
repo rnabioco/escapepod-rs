@@ -40,6 +40,10 @@ MODULE_LEVEL = {
     "refine_signal_map": "func",
     "span_statistics": "func",
     "span_statistics_batch": "func",
+    # Ordered vocabularies for the codes `AnchoredReads.coords` emits. Public
+    # because a saved npz stores the integers, not the strings.
+    "ANCHOR_SOURCES": "const",
+    "MASK_SOURCES": "const",
 }
 _THIS = os.path.basename(__file__)
 
