@@ -24,6 +24,71 @@
   crates drop to `-O0`, and those have to rebuild on any source change anyway.
   The now-unused `ci-bin` profile is removed.
 
+### Added
+
+- **A cache of open, indexed readers, so the read-id index is built once per
+  *file* instead of once per *reader* (#258).** `Reader` caches its index in a
+  `OnceLock` on the instance, so a consumer that opens a reader per batch
+  throws the index away and rebuilds it on the next batch. That is not a small
+  constant: on a 145 GB POD5 on a network filesystem it was minutes of
+  uninterruptible sleep in `folio_wait_bit_common` per batch at ~0.6% of one
+  core — the 10–80x data-preparation regression in rnabioco/leech#176. #251
+  fixed the other half of it (the scan variants are gone and lookups index
+  unconditionally), but "one reader per file per process" was left to every
+  consumer, and each consumer that did not write it silently got the slow path.
+  leech wrote it in Rust, and then wrote the same idea again, independently, in
+  Python.
+
+  Both shapes ship, because they answer different questions. `cached_reader()`
+  is the process-global convenience, and it is the one that makes consumers
+  actually stop hand-rolling this. `ReaderCache` is the owned type underneath
+  it, for a library that needs the lifetime bounded or a process where one
+  stage must not share readers with another; `global_reader_cache()` reaches
+  the global's `len()` / `clear()`.
+
+  The value is in the ordering and the failure semantics rather than in the
+  `static`, so those are the parts worth stating:
+
+  - **The file is opened outside the lock**, which guards only the map. A slow
+    open on one path never blocks a lookup on another, and the lock is never
+    held across I/O, so this cannot deadlock. Two threads racing the same path
+    cost one redundant open and both get the winner's `Arc` — publication goes
+    through `entry`, not `insert`, so a race can never leave two live readers
+    (and two indexes) for one file.
+  - **The index is warmed before the entry is published**, so N workers hitting
+    their first batch together find it built instead of piling up inside one
+    lazy init. The warm-up respects `autoindex_max()`: above that read count it
+    is skipped, because warming is a *guess* that random access is coming and a
+    huge file that is only iterated should not pay for an index nobody asked
+    for. Skipping only defers the build to the first lookup that demands one,
+    and because the reader is now shared that build still happens once per file
+    rather than once per batch — the cache keeps its whole value above the
+    threshold, it just stops guessing.
+  - **A failed index build is logged, not propagated.** `Reader::open` failing
+    *is* an error, because there is no reader to hand back. An un-indexable
+    POD5 is still a perfectly good reader for iteration, metadata, and signal
+    access, and failing an open for a caller that may never do a lookup is
+    worse than the slowdown; a caller that does demand a lookup sees the same
+    error then, from the call that needs it. (One correction to the issue's
+    framing: after #251 such a file is not "readable, just slowly" — the error
+    surfaces from `reads_by_ids` rather than degrading to a scan. The reader
+    stays usable; lookups by read id do not.)
+
+  Keys are canonicalized, falling back to the path as given if that fails, so
+  `reads.pod5`, `./reads.pod5`, and a symlink to it are one entry rather than
+  three readers with three indexes. The reader is opened on the canonical path
+  too, so `.p5s` sidecar resolution does not depend on which spelling happened
+  to arrive first. What stays resident is the index and not the file —
+  ~24 bytes/read, so a few tens of MB even for a multi-million-read POD5 — and
+  entries are never evicted, with `clear()` as the escape hatch for a process
+  that walks an unbounded set of files.
+
+- **`Reader::read_index_if_built()`** — the non-committing half of
+  `read_index()`: it never loads a sidecar and never scans, so it is the only
+  way to ask whether a reader is warm without making it warm. Without it the
+  warm-before-publish ordering above is unobservable, and a test that "checked"
+  it by calling `read_index()` would only be asserting its own side effect.
+
 ## 0.14.0 (2026-08-23)
 
 ### Build / Tooling
