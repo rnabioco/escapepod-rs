@@ -16,7 +16,7 @@ jobs:
   coverage:
     name: llvm-cov
     runs-on: ubuntu-latest
-    # ~8 min typical (instrumented double-run: lcov + html); 25 covers cold.
+    # One instrumented run, then three rendering passes over it; 25 covers cold.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
@@ -41,14 +41,22 @@ jobs:
         # bindings exercised by the Python test harness) and escapepod-cli
         # (binary; command handlers covered end-to-end via compat tests)
         # are intentionally excluded from the lines gate.
+        #
+        # `--no-report` runs the instrumented suite and leaves the raw profile
+        # data in place without rendering anything. Every report below is then
+        # a pure rendering step over that one run. This used to be two full
+        # instrumented runs of the same tests — one for lcov, one for HTML —
+        # which was most of the job's ~8 minutes.
         run: >
           cargo llvm-cov nextest
+          --no-report
           --package escapepod-pod5
           --package escapepod-signal
           --package escapepod-demux
           --features escapepod-demux/train
-          --lcov
-          --output-path lcov.info
+
+      - name: LCOV report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Enforce workspace threshold (libraries only)
         run: cargo llvm-cov report --summary-only --fail-under-lines 60
@@ -60,15 +68,11 @@ jobs:
           path: lcov.info
           retention-days: 30
 
-      - name: Upload HTML report
+      # `always()` so a failed threshold still produces the report that
+      # explains it. Rendering only — the tests are not run again.
+      - name: HTML report
         if: always()
-        run: >
-          cargo llvm-cov nextest
-          --package escapepod-pod5
-          --package escapepod-signal
-          --package escapepod-demux
-          --features escapepod-demux/train
-          --html --output-dir coverage-html
+        run: cargo llvm-cov report --html --output-dir coverage-html
 
       - uses: actions/upload-artifact@v7
         if: always()

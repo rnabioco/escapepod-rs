@@ -24,7 +24,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      # clippy only. `cargo clippy --workspace --all-targets` runs the same
+      # rustc front-end over the same unit graph as `cargo check` and then adds
+      # lints, so checking first was a duplicate compile of the whole workspace
+      # — on macOS runners, which bill at 10x Linux. This job is the tag-time
+      # gate for the aarch64/x86_64 Darwin builds below, and clippy is the
+      # stricter of the two passes it used to run.
       - run: cargo clippy --workspace --all-targets
 
   build:

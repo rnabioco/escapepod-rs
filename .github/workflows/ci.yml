@@ -1,10 +1,28 @@
 name: CI
 
+# Docs and prose never affect a Rust build, so they do not start one. There is
+# no branch protection on `main` and therefore no required status checks, so a
+# workflow that simply does not run blocks nothing — no placeholder "always
+# green" gate job is needed to keep merges unblocked. `docs.yml` still builds
+# and deploys on `docs/**`.
+#
+# A commit touching both prose and code is NOT skipped: `paths-ignore` suppresses
+# a run only when *every* changed path matches.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
+      - '.gitignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
+      - '.gitignore'
 
 # Least privilege: CI only ever reads the tree. Elevate per-job if needed.
 permissions:
@@ -21,15 +39,12 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+  # NOTE: there is deliberately no separate `check` job. `cargo clippy
+  # --workspace --all-targets` runs the same rustc front-end over the same unit
+  # graph as `cargo check --workspace --all-targets` and then adds lints, so a
+  # green clippy already implies a green check. Running both compiled the whole
+  # workspace twice per PR for no extra signal, and — more expensively — kept a
+  # second per-job Rust cache alive against the repo's 10 GB cache ceiling.
 
   cross-check:
     name: Check (aarch64)
@@ -64,6 +79,8 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - run: cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
         env:
@@ -73,13 +90,27 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --profile ci
+      # Doctests live here rather than in a job of their own. nextest does not
+      # run them, but `cargo test --doc` needs the same toolchain, profile and
+      # unit graph that nextest has just built — as a separate job it rebuilt
+      # the entire dependency graph from scratch (406 s on a cold cache, against
+      # ~2 s of actual doctest execution) and held one of the largest Rust
+      # caches in the repo. Sharing this job's target directory makes it nearly
+      # free.
+      #
+      # `--profile ci` above is a *nextest* profile (.config/nextest.toml), not
+      # the cargo profile of the same shape; `--doc` takes the cargo default.
+      - name: Doctests
+        run: cargo test --doc --workspace
       - name: Upload JUnit report
         if: always()
         uses: actions/upload-artifact@v7
@@ -97,6 +128,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       # Exercise the full demux crate surface: default features cover
       # classify + SVM predict, `train` pulls in linfa-svm.
@@ -109,21 +142,12 @@ jobs:
           path: target/nextest/ci/junit.xml
           retention-days: 14
 
-  doctest:
-    name: Doctest
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # nextest does not run doctests; keep them alive on a separate job.
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --doc --workspace
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # No rust-cache: rustfmt never builds the dependency graph, so there is
+    # nothing to restore and a cache entry here would only consume the budget.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -141,6 +165,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets
 
   python:
@@ -154,6 +180,8 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           environments: python-test
@@ -175,13 +203,27 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p escapepod-cli
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `ci-bin`, not `release`. This suite round-trips small fixtures through
+      # the CLI; it needs a binary that runs at a sane speed, not the shipping
+      # artefact. `release` is fat LTO + `codegen-units = 1`, whose whole-program
+      # optimisation and single-threaded codegen made this the longest job in
+      # the workflow (316 s warm, 480 s cold) and therefore the critical path of
+      # every PR. `ci-bin` keeps `opt-level = 3` and drops only the parts that
+      # buy throughput nobody measures here.
+      #
+      # The suite finds the binary via `ESCPOD_BIN`; without it, it looks in
+      # `target/release` then `target/debug` and would silently miss this one.
+      - run: cargo build --profile ci-bin -p escapepod-cli
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           environments: python-test
           cache: true
       - name: Round-trip compat vs Python pod5
         run: pixi run -e python-test test-compat
+        env:
+          ESCPOD_BIN: ${{ github.workspace }}/target/ci-bin/escpod
 
   msrv:
     name: MSRV (1.95)
@@ -193,17 +235,25 @@ jobs:
         with:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace
 
   features:
     name: Feature builds (gpu / cnn / crf)
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    # The default jobs never compile the opt-in features, so a dependency bump
+    # The default jobs never compile the *opt-in* features, so a dependency bump
     # to cudarc / tract-onnx / ort can break these builds while every other
     # check stays green — exactly how the cudarc and tract-onnx Dependabot PRs
     # slipped through. cudarc and ort use runtime dynamic loading, so this needs
     # no CUDA toolkit, libonnxruntime, or GPU.
+    #
+    # "opt-in" is load-bearing, and is why `cnn-detect` and `crf-decode` are not
+    # built here any more: both are in escapepod-cli's *default* `cli` feature,
+    # so `cargo clippy --workspace --all-targets` already compiles escapepod-demux
+    # with them (workspace feature unification), and building them again on their
+    # own was a duplicate pass against this job's own stated premise.
     #
     # These run `clippy`, not `check`. `RUSTFLAGS: -Dwarnings` (workflow env)
     # only denies lints that are actually *evaluated*, and `cargo check` never
@@ -222,18 +272,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: gpu — DTW/SVM CUDA path (cudarc, escapepod-signal)
         run: cargo clippy -p escapepod-signal --features gpu
       - name: gpu — demux batch classify (cudarc, escapepod-demux)
         run: cargo clippy -p escapepod-demux --features gpu
-      - name: cnn-detect — CPU TCN adapter detect (tract-onnx)
-        run: cargo clippy -p escapepod-demux --features cnn-detect
       - name: cnn-gpu — GPU TCN adapter detect (ort + cudarc)
         run: cargo clippy -p escapepod-demux --features cnn-gpu
       - name: cnn-gpu — CLI wiring (escapepod-cli)
         run: cargo clippy -p escapepod-cli --features cnn-gpu
-      - name: crf-decode — CPU CTC-CRF basecall (tract-onnx, fqxv-align)
-        run: cargo clippy -p escapepod-demux --features crf-decode
       - name: crf-gpu — GPU CTC-CRF encoder (ort)
         run: cargo clippy -p escapepod-demux --features crf-gpu
       - name: crf-gpu — CLI wiring (escapepod-cli)
