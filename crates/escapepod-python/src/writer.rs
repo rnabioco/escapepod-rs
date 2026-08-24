@@ -165,7 +165,7 @@ impl PyWriter {
         read_id: &str,
         read_number: u32,
         start_sample: u64,
-        channel: u16,
+        channel: u32,
         well: u8,
         pore_type: &str,
         calibration_offset: f32,

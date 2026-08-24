@@ -308,7 +308,7 @@ fn build_partition_inner<R: PartitionRow>(
     rows: &[R],
     pore_type_map: &HashMap<&str, i16>,
     end_reason_map: &HashMap<&str, i16>,
-) -> PartitionArrays {
+) -> Result<PartitionArrays> {
     let num_reads = rows.len();
 
     let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(num_reads, 16);
@@ -368,7 +368,7 @@ fn build_partition_inner<R: PartitionRow>(
         num_samples_builder.append_value(read.num_samples);
 
         // V3 fields
-        channel_builder.append_value(read.channel);
+        channel_builder.append_value(crate::schema::narrow_channel(read.channel)?);
         well_builder.append_value(read.well);
         let pore_key = pore_type_map
             .get(read.pore_type.as_str())
@@ -393,7 +393,7 @@ fn build_partition_inner<R: PartitionRow>(
         selected_read_level_builder.append_value(read.selected_read_level);
     }
 
-    PartitionArrays {
+    Ok(PartitionArrays {
         read_id: read_id_builder.finish(),
         signal: signal_builder.finish(),
         read_number: read_number_builder.finish(),
@@ -418,7 +418,7 @@ fn build_partition_inner<R: PartitionRow>(
         open_pore_level: open_pore_level_builder.finish(),
         expected_open_pore_level: expected_open_pore_level_builder.finish(),
         selected_read_level: selected_read_level_builder.finish(),
-    }
+    })
 }
 
 /// Build reads Arrow IPC table.
@@ -492,7 +492,7 @@ pub(crate) fn build_reads_table(
     let partition_arrays: Vec<PartitionArrays> = reads
         .par_chunks(chunk_size)
         .map(|chunk| build_partition_inner(chunk, &pore_type_map, &end_reason_map))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     // Phase 4: Concatenate partition arrays and create DictionaryArrays
 
@@ -702,7 +702,7 @@ pub(crate) fn build_reads_table_remapped(
     let partition_arrays: Vec<PartitionArrays> = flat
         .par_chunks(chunk_size)
         .map(|chunk| build_partition_inner(chunk, &pore_type_map, &end_reason_map))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     // Concat partition arrays — identical to build_reads_table from here on.
     macro_rules! concat_arrays {

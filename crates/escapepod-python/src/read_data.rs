@@ -56,7 +56,7 @@ impl PyReadData {
         read_id: &str,
         read_number: u32,
         start_sample: u64,
-        channel: u16,
+        channel: u32,
         well: u8,
         pore_type: &str,
         calibration_offset: f32,
@@ -127,7 +127,7 @@ impl PyReadData {
     }
 
     #[getter]
-    fn channel(&self) -> u16 {
+    fn channel(&self) -> u32 {
         self.inner.channel
     }
 

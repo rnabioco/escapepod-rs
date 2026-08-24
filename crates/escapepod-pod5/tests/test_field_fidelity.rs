@@ -133,7 +133,7 @@ fn make_full_read(read_number: u32, id: Uuid, pore_type: &str, end_reason: EndRe
         read_id: id,
         read_number,
         start_sample: 1_234_567 + read_number as u64,
-        channel: 37 + read_number as u16,
+        channel: 37 + read_number,
         well: 2,
         pore_type: pore_type.into(),
         calibration_offset: 0.5,

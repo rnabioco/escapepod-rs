@@ -32,8 +32,8 @@ struct ReadStats {
     count: u64,
     total_samples: u64,
     lengths: Vec<u64>,
-    channels: HashMap<u16, u64>,
-    max_channel: u16,
+    channels: HashMap<u32, u64>,
+    max_channel: u32,
     wells: [u64; 5], // Index 0 unused, wells 1-4
     end_reasons: HashMap<String, u64>,
 }
@@ -87,7 +87,7 @@ struct StatisticsSummary {
     length_median: u64,
     length_n50: u64,
     active_channels: usize,
-    total_channels: u16,
+    total_channels: u32,
 }
 
 /// Current POD5 version for comparison.
@@ -297,7 +297,7 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
 /// Known flowcell sizes:
 /// - MinION/Flongle: 512 channels
 /// - PromethION/P2: 2675 or 3000 channels
-fn infer_total_channels(max_channel: u16) -> u16 {
+fn infer_total_channels(max_channel: u32) -> u32 {
     if max_channel <= 512 {
         512
     } else if max_channel <= 2675 {
