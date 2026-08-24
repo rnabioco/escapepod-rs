@@ -1130,11 +1130,23 @@ impl Reader {
         }))
     }
 
+    /// The read index **if it is already resident**, without building one.
+    ///
+    /// The non-committing half of [`Self::read_index`]: it never loads a
+    /// sidecar and never scans, so it is the only way to ask whether this
+    /// reader is warm without making it warm. [`crate::ReaderCache`] warms the
+    /// index before a reader is shared; this is how that ordering is
+    /// observable (and testable) at all.
+    pub fn read_index_if_built(&self) -> Option<&ReadIndex> {
+        self.read_index.get()
+    }
+
     /// Get or lazily build the read UUID index.
     ///
     /// Checks for a `.p5s` sidecar first and falls back to a column-projected
     /// scan of the reads table. Either way the result is cached on the reader,
-    /// so the cost is paid once per `Reader`, not once per lookup.
+    /// so the cost is paid once per `Reader`, not once per lookup — and once
+    /// per *file* if readers are shared through [`crate::ReaderCache`].
     ///
     /// A sidecar that exists but is bound to another POD5 is an **error**, not
     /// a reason to fall back: it is never silently stepped over in favour of a
