@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.15.0 (2026-08-23)
+
 ### Build / Tooling
 
 - **The POD5 compat job stops rebuilding its dependency graph every run.**
