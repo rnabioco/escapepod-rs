@@ -12,6 +12,7 @@ use tracing::{info, warn};
 // Basecaller tag decoders shared with `escpod signal classify` (the
 // `experimental` feature implies `classify` for exactly this coupling).
 use escapepod_classify::bam_tags::int_tag as get_int_tag;
+use escapepod_signal::mapping::seq_to_signal_from_moves;
 use escapepod_signal::parse_uuid_flexible;
 use escapepod_signal::resquiggle::{
     BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
@@ -742,8 +743,9 @@ fn refine_single_read(
 
 /// Build a query-to-signal map from the BAM move table.
 ///
-/// The move table has one entry per stride-sized signal block.
-/// A value of 1 means "move to next base", 0 means "stay".
+/// The convention itself is
+/// [`escapepod_signal::mapping::seq_to_signal_from_moves`]; what this adds is
+/// the RNA closing-boundary override and the boundary-count check.
 ///
 /// When `signal_len` is `Some(n)`, the final boundary uses `n` instead of
 /// `moves.len() * stride`. This is needed for RNA where the trimmed signal
@@ -754,16 +756,19 @@ fn build_query_to_signal_map(
     seq_len: usize,
     signal_len: Option<usize>,
 ) -> anyhow::Result<Vec<usize>> {
-    let mut map = Vec::with_capacity(seq_len + 1);
-
-    for (i, &m) in moves.iter().enumerate() {
-        if m == 1 {
-            map.push(i * stride);
-        }
-    }
-
-    // End boundary
-    map.push(signal_len.unwrap_or(moves.len() * stride));
+    // The signal has already been trimmed here, so the map is wanted in
+    // trimmed coordinates: `trim_offset` is 0 and the closing boundary is the
+    // trimmed length itself. What that length is (the `signal_len` override,
+    // for RNA) is this caller's policy, not the convention's.
+    let map: Vec<usize> = seq_to_signal_from_moves(
+        moves,
+        stride as u32,
+        0,
+        signal_len.unwrap_or(moves.len() * stride) as u64,
+    )
+    .into_iter()
+    .map(|v| v as usize)
+    .collect();
 
     if map.len() != seq_len + 1 {
         bail!(
