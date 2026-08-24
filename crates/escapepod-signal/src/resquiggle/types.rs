@@ -12,17 +12,38 @@ pub enum RefineAlgo {
     /// logarithmic above. Discourages short dwells strongly while allowing
     /// genuinely long dwells (e.g., aminoacylation) to survive.
     DwellPenalty {
-        /// Preferred dwell time (0.0 = auto from move table median).
+        /// Preferred dwell time. Non-positive values (see
+        /// [`RefineAlgo::PER_READ_DWELL_TARGET`]) resolve per read from the
+        /// median dwell of the input move table.
         target: f32,
         /// Strength of the penalty.
         weight: f32,
     },
 }
 
+impl RefineAlgo {
+    /// Sentinel `DwellPenalty::target` meaning "resolve the target from this
+    /// read's own move table" rather than pinning a constant.
+    ///
+    /// [`refine_signal_map`](super::refine::refine_signal_map) replaces any
+    /// non-positive `target` with the median dwell of the *input*
+    /// `seq_to_signal_map` before the first DP pass, so the penalty is centred
+    /// on the read's actual samples-per-base instead of on a number chosen for
+    /// some other chemistry. There is no distinct "auto" variant to match on —
+    /// the sentinel *is* the representation, so use this constant rather than
+    /// writing a bare `0.0` whose meaning is invisible at the call site.
+    ///
+    /// This matters more than it looks. RNA004 at 130 bases/s and 4 kHz sits
+    /// near 31 samples/base; a target of `4.0` therefore treats every base as
+    /// roughly 8x too long, and the asymmetric penalty (quadratic below target,
+    /// logarithmic above) pushes boundaries toward implausibly short dwells.
+    pub const PER_READ_DWELL_TARGET: f32 = 0.0;
+}
+
 impl Default for RefineAlgo {
     fn default() -> Self {
         Self::DwellPenalty {
-            target: 0.0,
+            target: Self::PER_READ_DWELL_TARGET,
             weight: 0.5,
         }
     }
@@ -203,4 +224,72 @@ impl Default for RefineSettings {
             banding_algo: BandingAlgo::default(),
         }
     }
+}
+
+impl RefineSettings {
+    /// The refinement configuration for a basecaller move table: fixed banding,
+    /// a least-squares rough rescale over the 0.05–0.95 quantiles clipped 10
+    /// bases with `use_base_center`, a Theil-Sen inter-iteration rescale over
+    /// at most 200 points, level normalization off, and the asymmetric dwell
+    /// penalty at weight 0.5 with a **per-read** target.
+    ///
+    /// This exists because it was written twice — once in escapepod's own
+    /// Python binding and once in a downstream Rust consumer — with a comment
+    /// on each saying it matched the other. One field drifted anyway
+    /// (`dwell_target`: a fixed `4.0` against the per-read resolution), and the
+    /// two paths refined the same reads to different boundaries for four
+    /// releases. A settings block that two callers must agree on bit-for-bit is
+    /// a value, not a convention; this is that value.
+    ///
+    /// The dwell target is [`RefineAlgo::PER_READ_DWELL_TARGET`], the sentinel
+    /// `0.0` that
+    /// [`refine_signal_map`](super::refine::refine_signal_map) replaces with
+    /// the median dwell of the read's own input map. A constant target only
+    /// ever suits one chemistry at one translocation rate, and the penalty is
+    /// asymmetric, so guessing low is not a soft error: it drags boundaries
+    /// toward dwells the pore never produced.
+    ///
+    /// `seed` is the Theil-Sen subsample seed — pass `Some(_)` for
+    /// reproducible features, `None` to sample unseeded.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use escapepod_signal::resquiggle::{RefineAlgo, RefineSettings};
+    ///
+    /// let settings = RefineSettings::move_table_refinement(5, 2, Some(0));
+    /// assert_eq!(
+    ///     settings.refinement_algo,
+    ///     RefineAlgo::DwellPenalty {
+    ///         target: RefineAlgo::PER_READ_DWELL_TARGET,
+    ///         weight: 0.5,
+    ///     }
+    /// );
+    /// ```
+    pub fn move_table_refinement(half_bandwidth: usize, n_iters: usize, seed: Option<u64>) -> Self {
+        Self {
+            refinement_algo: RefineAlgo::DwellPenalty {
+                target: RefineAlgo::PER_READ_DWELL_TARGET,
+                weight: Self::MOVE_TABLE_DWELL_WEIGHT,
+            },
+            n_refinement_iters: n_iters,
+            half_bandwidth,
+            adjust_band_min_size: 2,
+            rescale_algo: RescaleAlgo::TheilSen {
+                filter: RescaleFilterParams::default(),
+                max_points: 200,
+                seed,
+            },
+            rough_rescale_algo: RoughRescaleAlgo::LeastSquares {
+                quantiles: RoughRescaleAlgo::default_quantiles(),
+                clip_bases: 10,
+                use_base_center: true,
+            },
+            normalize_levels: false,
+            banding_algo: BandingAlgo::Fixed,
+        }
+    }
+
+    /// Dwell-penalty weight carried by [`RefineSettings::move_table_refinement`].
+    pub const MOVE_TABLE_DWELL_WEIGHT: f32 = 0.5;
 }
