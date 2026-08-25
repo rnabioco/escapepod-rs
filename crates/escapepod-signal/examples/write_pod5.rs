@@ -68,7 +68,7 @@ fn main() -> escapepod_signal::Result<()> {
             read_id: Uuid::new_v4(),
             read_number: (i + 1) as u32,
             start_sample: (i as u64) * 100_000,
-            channel: (i as u16 % 512) + 1,
+            channel: (i as u32 % 512) + 1,
             well: 1,
             pore_type: "not_set".into(),
             calibration_offset: -220.0,

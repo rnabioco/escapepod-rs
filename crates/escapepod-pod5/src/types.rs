@@ -17,6 +17,14 @@ pub const FOOTER_MAGIC: [u8; 8] = *b"FOOTER\0\0";
 /// Stamped into each written file's `MINKNOW:pod5_version` metadata and footer.
 /// Tracks the upstream release whose reads-table schema we emit — currently V5
 /// (`expected_open_pore_level`, `selected_read_level`), introduced in 0.3.44.
+///
+/// Deliberately *behind* the V6 schema we can read. V6 (upstream 0.3.46)
+/// retypes the existing `channel` column from `uint16` to `uint32`, which no
+/// released reader tolerates — the newest `pod5` on PyPI is 0.3.44 and fails
+/// a V6 file outright with "Schema field 'channel' is incorrect type". So
+/// [`crate::schema::narrow_channel`] keeps the emitted column narrow until
+/// v6-capable wheels ship. See [`ReadData::channel`].
+///
 /// See: <https://pod5-file-format.readthedocs.io/en/latest/SPECIFICATION.html>
 pub const POD5_VERSION: &str = "0.3.44";
 
@@ -181,7 +189,12 @@ pub struct ReadData {
     /// Start sample number (absolute position in acquisition).
     pub start_sample: u64,
     /// Channel number (1-indexed).
-    pub channel: u16,
+    ///
+    /// Read from either physical width: POD5 V6 (upstream 0.3.46) carries this
+    /// as `uint32`, V3-V5 files as `uint16`, and both widen to `u32` here.
+    /// Writing still emits the V5 narrow column, so a value above `u16::MAX`
+    /// is refused rather than truncated — see [`POD5_VERSION`].
+    pub channel: u32,
     /// Well number (typically 1-4).
     pub well: u8,
     /// Pore type for this read. See [`PoreType`].

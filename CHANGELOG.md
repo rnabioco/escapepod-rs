@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- **POD5 V6 files are readable (upstream 0.3.46).** V6's only change is that
+  the reads-table `channel` column is retyped from `uint16` to `uint32` — same
+  name, same position, so nothing about the container moves. But because it
+  retypes an *existing* column rather than appending new ones the way V4 and V5
+  did, it is not a change a narrow reader can ignore: pinned to `uint16`, every
+  V6 file fails outright rather than degrading. `channel` is now resolved to
+  whichever width the file carries and widened to `u32`, on the per-row path,
+  the bulk columnar path, and the row extractor alike. V0–V5 files are
+  unaffected.
+
+  `ReadData.channel`, `ReadColumns.channel`, and the Python `ReadData.channel`
+  / `Writer.add_read` parameter are `u32` accordingly, matching upstream's own
+  C++ `ReadData`. `to_dict`/`to_pandas`/`to_polars` hand back a `uint32` column
+  where they used to give `uint16`.
+
+### Changed
+
+- **Written files stay V5; an unrepresentable channel now fails the write.**
+  Emitting V6 today would make every file escpod produces unreadable by every
+  installable reader: the newest `pod5` on PyPI is 0.3.44, and it rejects a
+  `uint32` `channel` with `Schema field 'channel' is incorrect type: 'uint32'`
+  (verified against an escpod-written V6 file). The trade would be a hard break
+  with the deployed ecosystem in exchange for channel numbers no flow cell
+  produces — PromethION tops out at 3000. So the emitted column stays `uint16`
+  and files stay stamped `0.3.44`, while reading stays lossless at both widths.
+
+  The one input that would lose data — a channel above `u16::MAX`, which can
+  only come from a genuine V6 file — is refused with an error naming V6 rather
+  than silently written as `channel % 65536`. `escpod inspect summary`'s
+  channel statistics widen to match.
+
+  This flips once ONT publishes v6-capable wheels: `narrow_channel` in
+  `escapepod-pod5::schema::reads` is the single site, and
+  `emitted_channel_width_matches_the_stamped_version` pins the schema width and
+  `POD5_VERSION` together so they cannot drift apart.
+
 ## 0.15.0 (2026-08-23)
 
 ### Build / Tooling

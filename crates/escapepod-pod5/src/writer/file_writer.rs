@@ -694,7 +694,7 @@ impl Writer {
             // V2
             num_samples_builder.append_value(read.num_samples);
             // V3
-            channel_builder.append_value(read.channel);
+            channel_builder.append_value(crate::schema::narrow_channel(read.channel)?);
             well_builder.append_value(read.well);
             pore_type_builder.append_value(read.pore_type.as_str());
             calibration_offset_builder.append_value(read.calibration_offset);

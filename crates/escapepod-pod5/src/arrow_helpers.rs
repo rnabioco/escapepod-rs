@@ -90,6 +90,28 @@ impl<'a> BatchFieldExtractor<'a> {
         Ok(arr.value(self.row))
     }
 
+    /// Get a u32 value from a column that may be physically `uint16`.
+    ///
+    /// POD5 V6 (upstream 0.3.46) widened the reads-table `channel` column from
+    /// `uint16` to `uint32` under the same name; V3–V5 files still carry the
+    /// narrow type. Both are accepted here and surfaced as `u32`.
+    pub fn get_u32_or_u16(&self, name: &str) -> Result<u32> {
+        let col = self
+            .batch
+            .column_by_name(name)
+            .ok_or_else(|| Error::MissingField(name.to_string()))?;
+        if let Some(arr) = col.as_primitive_opt::<UInt32Type>() {
+            return Ok(arr.value(self.row));
+        }
+        let arr = col
+            .as_primitive_opt::<UInt16Type>()
+            .ok_or_else(|| Error::InvalidField {
+                field: name.to_string(),
+                message: "Expected UInt32Array (POD5 V6) or UInt16Array (V3–V5)".to_string(),
+            })?;
+        Ok(u32::from(arr.value(self.row)))
+    }
+
     /// Get a u64 value.
     pub fn get_u64(&self, name: &str) -> Result<u64> {
         let col = self
@@ -364,7 +386,7 @@ pub struct ReadColumns {
     pub read_id: Vec<Uuid>,
     pub read_number: Vec<u32>,
     pub start_sample: Vec<u64>,
-    pub channel: Vec<u16>,
+    pub channel: Vec<u32>,
     pub well: Vec<u8>,
     pub pore_type: Vec<PoreType>,
     pub calibration_offset: Vec<f32>,
@@ -425,6 +447,53 @@ impl ReadColumns {
     }
 }
 
+/// The reads-table `channel` column, whichever physical width the file uses.
+///
+/// POD5 V6 (upstream 0.3.46) widened `channel` from `uint16` to `uint32` in
+/// place — same field name, same position — so a reader that pins the narrow
+/// type simply fails on every file written by pod5 0.3.46 and later. Resolving
+/// to this enum keeps both widths readable and hands callers a `u32` either
+/// way, which is what upstream's C++ `ReadData` now uses too.
+enum ChannelColumn<'a> {
+    /// V3-V5 files.
+    U16(&'a UInt16Array),
+    /// V6 and later.
+    U32(&'a UInt32Array),
+}
+
+impl<'a> ChannelColumn<'a> {
+    fn resolve(batch: &'a RecordBatch) -> Result<Self> {
+        let col = require_col(batch, "channel")?;
+        if let Some(arr) = col.as_any().downcast_ref::<UInt32Array>() {
+            return Ok(Self::U32(arr));
+        }
+        col.as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(Self::U16)
+            .ok_or_else(|| Error::InvalidField {
+                field: "channel".to_string(),
+                message: "Expected UInt32Array (POD5 V6) or UInt16Array (V3-V5)".to_string(),
+            })
+    }
+
+    #[inline]
+    fn value(&self, row: usize) -> u32 {
+        match self {
+            Self::U16(arr) => u32::from(arr.value(row)),
+            Self::U32(arr) => arr.value(row),
+        }
+    }
+
+    /// Bulk-append every row to a `u32` column. V6 files copy the buffer
+    /// wholesale; older ones widen element by element.
+    fn extend_into(&self, out: &mut Vec<u32>) {
+        match self {
+            Self::U16(arr) => out.extend(arr.values().iter().copied().map(u32::from)),
+            Self::U32(arr) => out.extend_from_slice(arr.values()),
+        }
+    }
+}
+
 /// Resolved typed columns for a reads-table `RecordBatch`.
 ///
 /// Construct once per batch with `ReadsBatchView::new`, then call `read(row)`
@@ -446,8 +515,8 @@ pub struct ReadsBatchView<'a> {
     time_since_mux_change: Option<&'a Float32Array>,
     // V2
     num_samples: &'a UInt64Array,
-    // V3
-    channel: &'a UInt16Array,
+    // V3 (widened to uint32 in V6)
+    channel: ChannelColumn<'a>,
     well: &'a UInt8Array,
     pore_type_keys: &'a Int16Array,
     /// Pre-built `PoreType` per unique pore-type dictionary value, indexed
@@ -551,7 +620,7 @@ impl<'a> ReadsBatchView<'a> {
             ),
             time_since_mux_change: optional_typed::<Float32Array>(batch, "time_since_mux_change"),
             num_samples: require_typed::<UInt64Array>(batch, "num_samples", "UInt64Array")?,
-            channel: require_typed::<UInt16Array>(batch, "channel", "UInt16Array")?,
+            channel: ChannelColumn::resolve(batch)?,
             well: require_typed::<UInt8Array>(batch, "well", "UInt8Array")?,
             pore_type_keys: pore_type_dict.keys(),
             pore_type_values,
@@ -738,7 +807,7 @@ impl<'a> ReadsBatchView<'a> {
         cols.read_number
             .extend_from_slice(self.read_number.values());
         cols.start_sample.extend_from_slice(self.start.values());
-        cols.channel.extend_from_slice(self.channel.values());
+        self.channel.extend_into(&mut cols.channel);
         cols.well.extend_from_slice(self.well.values());
         cols.calibration_offset
             .extend_from_slice(self.calibration_offset.values());
@@ -804,5 +873,195 @@ impl<'a> ReadsBatchView<'a> {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, ListBuilder,
+        StringDictionaryBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// Build a reads-table batch carrying `channels`, with the `channel`
+    /// column at the V6 width (`uint32`) or the V3-V5 one (`uint16`).
+    ///
+    /// Only the columns `ReadsBatchView::new` requires are built — the
+    /// optional V1/V4/V5 ones are left out on purpose, so this doubles as a
+    /// check that they stay optional.
+    fn reads_batch(channels: &[u32], narrow: bool) -> RecordBatch {
+        let n = channels.len();
+
+        let mut read_id = FixedSizeBinaryBuilder::new(16);
+        let mut signal = ListBuilder::new(UInt64Builder::new());
+        let mut read_number = UInt32Builder::new();
+        let mut start = UInt64Builder::new();
+        let mut median_before = Float32Builder::new();
+        let mut num_minknow_events = UInt64Builder::new();
+        let mut num_samples = UInt64Builder::new();
+        let mut well = UInt8Builder::new();
+        let mut pore_type = StringDictionaryBuilder::<Int16Type>::new();
+        let mut calibration_offset = Float32Builder::new();
+        let mut calibration_scale = Float32Builder::new();
+        let mut end_reason = StringDictionaryBuilder::<Int16Type>::new();
+        let mut end_reason_forced = BooleanBuilder::new();
+        let mut run_info = StringDictionaryBuilder::<Int16Type>::new();
+
+        for i in 0..n {
+            read_id
+                .append_value(Uuid::from_u128(i as u128).as_bytes())
+                .unwrap();
+            signal.values().append_value(i as u64);
+            signal.append(true);
+            read_number.append_value(i as u32);
+            start.append_value(i as u64 * 1000);
+            median_before.append_value(200.0);
+            num_minknow_events.append_value(0);
+            num_samples.append_value(100);
+            well.append_value(1);
+            pore_type.append_value("not_set");
+            calibration_offset.append_value(-220.0);
+            calibration_scale.append_value(0.19);
+            end_reason.append_value("signal_positive");
+            end_reason_forced.append_value(false);
+            run_info.append_value("acq");
+        }
+
+        let channel: ArrayRef = if narrow {
+            let mut b = UInt16Builder::new();
+            for &c in channels {
+                b.append_value(u16::try_from(c).expect("narrow fixture value must fit u16"));
+            }
+            Arc::new(b.finish())
+        } else {
+            let mut b = UInt32Builder::new();
+            for &c in channels {
+                b.append_value(c);
+            }
+            Arc::new(b.finish())
+        };
+
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            ("read_id", Arc::new(read_id.finish())),
+            ("signal", Arc::new(signal.finish())),
+            ("read_number", Arc::new(read_number.finish())),
+            ("start", Arc::new(start.finish())),
+            ("median_before", Arc::new(median_before.finish())),
+            ("num_minknow_events", Arc::new(num_minknow_events.finish())),
+            ("num_samples", Arc::new(num_samples.finish())),
+            ("channel", channel),
+            ("well", Arc::new(well.finish())),
+            ("pore_type", Arc::new(pore_type.finish())),
+            ("calibration_offset", Arc::new(calibration_offset.finish())),
+            ("calibration_scale", Arc::new(calibration_scale.finish())),
+            ("end_reason", Arc::new(end_reason.finish())),
+            ("end_reason_forced", Arc::new(end_reason_forced.finish())),
+            ("run_info", Arc::new(run_info.finish())),
+        ];
+
+        // Derive the schema from the arrays so the two widths stay in step
+        // with whatever Arrow types the builders produced.
+        let schema = Schema::new(
+            columns
+                .iter()
+                .map(|(name, arr)| Field::new(*name, arr.data_type().clone(), false))
+                .collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            columns.into_iter().map(|(_, a)| a).collect(),
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), n);
+        batch
+    }
+
+    /// Every channel value, read three ways: the per-row `ReadsBatchView`, its
+    /// bulk `append_columns` counterpart, and the extractor `read_iter` uses.
+    fn channels_via_all_paths(batch: &RecordBatch) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let view = ReadsBatchView::new(batch, false).unwrap();
+
+        let per_row: Vec<u32> = (0..batch.num_rows())
+            .map(|row| view.read(row).unwrap().channel)
+            .collect();
+
+        let mut cols = ReadColumns::default();
+        view.append_columns(&mut cols).unwrap();
+
+        let extracted: Vec<u32> = (0..batch.num_rows())
+            .map(|row| {
+                BatchFieldExtractor::new(batch, row)
+                    .get_u32_or_u16("channel")
+                    .unwrap()
+            })
+            .collect();
+
+        (per_row, cols.channel, extracted)
+    }
+
+    /// POD5 V6 widened `channel` to `uint32`; values above `u16::MAX` must
+    /// survive every read path intact.
+    #[test]
+    fn v6_uint32_channel_round_trips_above_u16_max() {
+        let want = [1u32, 512, 65_535, 70_000, 1_000_000];
+        let batch = reads_batch(&want, false);
+        let (per_row, bulk, extracted) = channels_via_all_paths(&batch);
+        assert_eq!(per_row, want);
+        assert_eq!(bulk, want);
+        assert_eq!(extracted, want);
+    }
+
+    /// V3-V5 files still carry `channel` as `uint16`. Pinning the reader to
+    /// one width breaks half the corpus whichever width it picks, so the
+    /// narrow column has to widen to the same `u32`.
+    #[test]
+    fn v5_uint16_channel_widens_to_u32() {
+        let want = [1u32, 512, 2675, 65_535];
+        let batch = reads_batch(&want, true);
+        assert_eq!(
+            batch.column_by_name("channel").unwrap().data_type(),
+            &DataType::UInt16,
+            "fixture must actually carry the narrow column"
+        );
+        let (per_row, bulk, extracted) = channels_via_all_paths(&batch);
+        assert_eq!(per_row, want);
+        assert_eq!(bulk, want);
+        assert_eq!(extracted, want);
+    }
+
+    /// A `channel` column of neither width is an error, not a silent zero.
+    #[test]
+    fn wrong_width_channel_is_rejected() {
+        let base = reads_batch(&[1, 2], false);
+        let schema = Schema::new(
+            base.schema()
+                .fields()
+                .iter()
+                .map(|f| {
+                    if f.name() == "channel" {
+                        Arc::new(Field::new("channel", DataType::UInt64, false))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut columns = base.columns().to_vec();
+        let idx = base.schema().index_of("channel").unwrap();
+        let mut b = UInt64Builder::new();
+        b.append_value(1);
+        b.append_value(2);
+        columns[idx] = Arc::new(b.finish());
+        let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
+
+        assert!(ReadsBatchView::new(&batch, false).is_err());
+        assert!(
+            BatchFieldExtractor::new(&batch, 0)
+                .get_u32_or_u16("channel")
+                .is_err()
+        );
     }
 }

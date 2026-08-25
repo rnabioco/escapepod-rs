@@ -219,3 +219,54 @@ fn writer_predefined_dictionaries_enforce_end_reasons() {
         "unexpected error: {msg}"
     );
 }
+
+/// POD5 V6 widened `channel` to `uint32`; the column we emit is still the V5
+/// `uint16`. A channel that does not fit has to fail the write — truncating it
+/// would put a real read on a real channel number that is simply wrong, and
+/// nothing downstream could tell.
+#[test]
+fn writer_refuses_a_channel_wider_than_the_v5_column() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("wide_channel.pod5");
+    let mut writer = Writer::create(&path, WriterOptions::default()).expect("create");
+    let run_idx = writer.add_run_info(make_run_info("wide_channel")).unwrap();
+
+    let mut read = make_read(run_idx, 1, 200);
+    read.channel = 70_000;
+    // Buffered until flush, so the error may surface here or at finish().
+    let err = writer
+        .add_read(read, &synth_signal(200, 0x5150))
+        .and_then(|()| writer.finish())
+        .expect_err("a channel above u16::MAX must not be written");
+    let msg = err.to_string();
+    assert!(msg.contains("channel"), "{msg}");
+    assert!(msg.contains("70000"), "{msg}");
+}
+
+/// The whole point of staying on the V5 column: every channel a real flow cell
+/// produces still round-trips, PromethION's 2675/3000 included.
+#[test]
+fn writer_round_trips_the_full_promethion_channel_range() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("channels.pod5");
+    let want: Vec<u32> = vec![1, 512, 2675, 3000, u16::MAX as u32];
+
+    let mut writer = Writer::create(&path, WriterOptions::default()).expect("create");
+    let run_idx = writer.add_run_info(make_run_info("channels")).unwrap();
+    for (i, &channel) in want.iter().enumerate() {
+        let mut read = make_read(run_idx, i as u32 + 1, 200);
+        read.channel = channel;
+        writer
+            .add_read(read, &synth_signal(200, 0x1234 + i as u64))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = Reader::open(&path).unwrap();
+    let got: Vec<u32> = reader
+        .reads()
+        .unwrap()
+        .map(|r| r.unwrap().channel)
+        .collect();
+    assert_eq!(got, want);
+}
