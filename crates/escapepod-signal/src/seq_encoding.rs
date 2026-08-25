@@ -30,11 +30,16 @@
 //! * The context width is a *pair*, and its halves are not interchangeable
 //!   where the context is cut ([`sequence_ints_with_context`]) even though the
 //!   encoder itself only sees their sum; [`KmerContext`] names them so a caller
-//!   cannot transpose them silently.
+//!   cannot transpose them silently. The cut is offered as bases as well as
+//!   ints ([`sequence_bases_with_context`]) because a caller that *serialises*
+//!   the context — a training corpus writes it out as a string — would
+//!   otherwise keep its own copy of exactly that rule.
 //! * A base whose span is empty (`start == end`) contributes nothing. It is the
 //!   branch a golden test set is most likely to miss entirely.
 //! * A span that hangs off either end of the signal is **intersected** with it,
 //!   not dropped — see [`encode_signal_kmer`].
+
+use std::ops::Range;
 
 /// The value [`sequence_to_int`] gives a base that is not `A`/`C`/`G`/`T`/`U`.
 ///
@@ -42,6 +47,14 @@
 /// information*, and [`encode_signal_kmer`] leaves an all-zero column for that
 /// k-mer position rather than inventing a base the model never saw in training.
 pub const UNKNOWN_BASE: i8 = -1;
+
+/// The base [`UNKNOWN_BASE`] is the encoding of, and what
+/// [`sequence_bases_with_context`] pads with.
+///
+/// `base_to_int(UNKNOWN_BASE_CHAR) == UNKNOWN_BASE`, and that is what makes the
+/// bases form and the int form of the context window the *same* window: running
+/// one through [`sequence_to_int`] gives the other, padding included.
+pub const UNKNOWN_BASE_CHAR: u8 = b'N';
 
 /// Encode one nucleotide as `A = 0`, `C = 1`, `G = 2`, `T`/`U` = 3, anything
 /// else [`UNKNOWN_BASE`]. Case-insensitive.
@@ -148,6 +161,10 @@ impl Default for KmerContext {
 /// itself only depends on the *total* width, so a transposition upstream of
 /// here is invisible downstream of it.
 ///
+/// [`sequence_bases_with_context`] is the same cut as bases, for a caller that
+/// has to serialise the context rather than encode it. The two share one
+/// private window, so they cannot drift apart.
+///
 /// ```
 /// use escapepod_signal::seq_encoding::{KmerContext, sequence_ints_with_context};
 ///
@@ -166,16 +183,67 @@ pub fn sequence_ints_with_context(
     n_bases: usize,
     ctx: KmerContext,
 ) -> Vec<i8> {
-    let lo = core_start as i64 - ctx.before as i64;
-    let hi = lo + (n_bases + ctx.before + ctx.after) as i64;
-    (lo..hi)
-        .map(|i| {
-            usize::try_from(i)
-                .ok()
-                .and_then(|u| sequence.get(u))
-                .map_or(UNKNOWN_BASE, |&b| base_to_int(b))
-        })
+    context_range(core_start, n_bases, ctx)
+        .map(|i| base_at(sequence, i).map_or(UNKNOWN_BASE, base_to_int))
         .collect()
+}
+
+/// [`sequence_ints_with_context`]'s window, as **bases** rather than ints,
+/// padded with [`UNKNOWN_BASE_CHAR`].
+///
+/// The same cut, for a caller that needs the context as text: a training corpus
+/// serialises it alongside the encoding, so it cannot use the int form and
+/// deriving one from the other by hand would be a third copy of the window.
+/// Composing the two is the identity — `sequence_to_int` of this is
+/// `sequence_ints_with_context` — because `base_to_int(UNKNOWN_BASE_CHAR)` is
+/// `UNKNOWN_BASE`, so the padding agrees too. That equivalence is pinned by a
+/// test, and it is the thing that keeps this from being a second rule.
+///
+/// ```
+/// use escapepod_signal::seq_encoding::{KmerContext, sequence_bases_with_context};
+///
+/// // Two core bases (`GT`) with one base of context each way.
+/// let bases = sequence_bases_with_context(b"ACGTA", 2, 2, KmerContext::new(1, 1));
+/// assert_eq!(bases, b"CGTA");
+///
+/// // Context that runs off the start is padded, not shifted.
+/// let bases = sequence_bases_with_context(b"ACGTA", 0, 2, KmerContext::new(2, 0));
+/// assert_eq!(bases, b"NNAC");
+/// ```
+#[must_use]
+pub fn sequence_bases_with_context(
+    sequence: &[u8],
+    core_start: usize,
+    n_bases: usize,
+    ctx: KmerContext,
+) -> Vec<u8> {
+    context_range(core_start, n_bases, ctx)
+        .map(|i| base_at(sequence, i).unwrap_or(UNKNOWN_BASE_CHAR))
+        .collect()
+}
+
+/// The sequence positions a signal window covers *plus* its k-mer context, as
+/// one half-open range. Positions before the sequence are negative and
+/// positions past its end are not bounded here; both public forms pad them,
+/// which is what fixes the width at `n_bases + before + after`.
+///
+/// Private, and the only place the window is defined: [`KmerContext`]'s halves
+/// are not interchangeable here, and a second copy of that arithmetic is the
+/// one this module least wants.
+fn context_range(core_start: usize, n_bases: usize, ctx: KmerContext) -> Range<i64> {
+    let lo = core_start as i64 - ctx.before as i64;
+    // i.e. `core_start + n_bases + ctx.after`, the last base of the window plus
+    // the context that follows it.
+    let hi = lo + (n_bases + ctx.before + ctx.after) as i64;
+    lo..hi
+}
+
+/// The base at a possibly-out-of-range position, `None` where a caller pads.
+fn base_at(sequence: &[u8], i: i64) -> Option<u8> {
+    usize::try_from(i)
+        .ok()
+        .and_then(|u| sequence.get(u))
+        .copied()
 }
 
 /// Scatter the one-hot k-mer context along the signal axis.
@@ -421,6 +489,52 @@ mod seq_encoding_tests {
         ] {
             let ints = sequence_ints_with_context(b"ACGTA", 1, 3, c);
             assert_eq!(ints.len(), 3 + c.before + c.after);
+        }
+    }
+
+    #[test]
+    fn the_bases_form_is_the_same_cut_as_the_int_form() {
+        // What makes the pair composable: the two paddings are each other's.
+        assert_eq!(base_to_int(UNKNOWN_BASE_CHAR), UNKNOWN_BASE);
+
+        let ctx = KmerContext::new(1, 1);
+        assert_eq!(sequence_bases_with_context(b"ACGTA", 2, 2, ctx), b"CGTA");
+        // Off each end: padded, so the width never moves.
+        assert_eq!(sequence_bases_with_context(b"ACGTA", 0, 2, ctx), b"NACG");
+        assert_eq!(sequence_bases_with_context(b"ACGTA", 3, 2, ctx), b"GTAN");
+        // Entirely off the end is all padding, not a short vector.
+        assert_eq!(sequence_bases_with_context(b"AC", 9, 2, ctx), b"NNNN");
+        // A lower-case or ambiguous input is carried through verbatim: this
+        // form is the sequence, not an encoding of it.
+        assert_eq!(sequence_bases_with_context(b"acgXa", 1, 3, ctx), b"acgXa");
+    }
+
+    #[test]
+    fn bases_and_ints_are_one_window() {
+        // The test that matters: if these two ever disagree the windowing has
+        // grown a second definition, which is exactly what having one private
+        // `context_range` is meant to make impossible. Sweep far enough off
+        // both ends that every padding branch is hit.
+        let seq = b"ACGTNacguXTTGCA";
+        for ctx in [
+            KmerContext::new(0, 0),
+            KmerContext::new(1, 1),
+            KmerContext::new(4, 4),
+            KmerContext::new(3, 0),
+            KmerContext::new(0, 3),
+        ] {
+            for core_start in 0..=(seq.len() + 4) {
+                for n_bases in [0, 1, 3, seq.len()] {
+                    let bases = sequence_bases_with_context(seq, core_start, n_bases, ctx);
+                    let ints = sequence_ints_with_context(seq, core_start, n_bases, ctx);
+                    assert_eq!(bases.len(), n_bases + ctx.before + ctx.after);
+                    assert_eq!(
+                        sequence_to_int(&bases),
+                        ints,
+                        "ctx {ctx:?}, core_start {core_start}, n_bases {n_bases}"
+                    );
+                }
+            }
         }
     }
 

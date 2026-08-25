@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Added
+
+- **`sequence_bases_with_context`: the k-mer context window as bases (#274).**
+  #272 moved the signal-level k-mer *encoding* upstream and leech now calls it
+  (rnabioco/leech#222), but one overlap survived, and it was the same shape of
+  problem: leech kept its own copy of the **context windowing**, because
+  `sequence_ints_with_context` returns ints and a training corpus *serialises*
+  the context — `sequence_with_kmer_context` is a string in the chunk format,
+  which `data merge`/`load_chunks` read back as one. So the downstream caller
+  needed bases, and deriving them from the ints by hand would have been a third
+  copy of the window rather than the end of the second.
+
+  The new form is the same cut, padded with `UNKNOWN_BASE_CHAR` (`N`), and it
+  composes exactly: `sequence_to_int` of the bases *is*
+  `sequence_ints_with_context`, padding included, because
+  `base_to_int(UNKNOWN_BASE_CHAR)` is `UNKNOWN_BASE`. That equivalence is what
+  makes this a refactor rather than a new rule, and a test sweeps it over five
+  contexts and every offset from the start of the sequence to past its end, so
+  a divergence between the two forms fails rather than ships. The windowing
+  arithmetic itself is now one private helper (`context_range`) that both
+  public forms call.
+
+  Worth doing because this is the step where `KmerContext`'s halves are *not*
+  interchangeable — swap them and every k-mer is read from a window displaced
+  by `before - after` bases, silently, and `encode_signal_kmer` cannot detect
+  it because it only ever sees their sum. A second copy of precisely that rule
+  is the one this crate least wants to keep.
+
 ## 0.16.0 (2026-08-25)
 
 ### Added
