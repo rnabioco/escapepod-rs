@@ -31,9 +31,19 @@
 //! ```
 //!
 //! This is the CRF's training objective evaluated per read per reference —
-//! `escapepod_models.crf.loss.CtcCrfLoss` computes the same two terms, and its
+//! `leech.crf.loss.CtcCrfLoss` computes the same two terms, and its
 //! `logZ_target(normalised) == logZ_target(raw) - logZ_full` identity is why
 //! neither side has to materialise a normalised score tensor.
+//!
+//! So both terms exist twice, in two languages: here for scoring, and in leech
+//! for training. What leech has that this does not is the *backward* pass —
+//! the edge posteriors that are `d logZ / d score`, which is what makes it a
+//! loss rather than a number. What this has that leech does not is
+//! [`super::avx2`]/[`super::avx512`] and a CUDA path. Nothing currently checks
+//! the two forwards against each other; a shared golden over `logZ_full` and
+//! `logZ_target` is the obvious place to start if they are ever suspected of
+//! disagreeing, since every divergence in this stack so far has been invisible
+//! to the check written for the previous one.
 //!
 //! Unlike the edit-distance margin this is continuous, so it supports the
 //! precision/recall trade the margin cannot: it separates *emitted BC07
