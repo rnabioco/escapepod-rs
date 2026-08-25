@@ -28,6 +28,7 @@ pub mod features;
 pub mod mapping;
 pub mod resquiggle;
 pub mod segmentation;
+pub mod seq_encoding;
 pub mod stats;
 
 // Format layer (POD5 I/O) lives in escapepod-pod5. Re-export its modules and

@@ -4,6 +4,45 @@
 
 ### Added
 
+- **`escapepod-signal` owns the signal-level k-mer encoding
+  (`seq_encoding`, #271).** `mapping` (#262) already *produced* a base→signal
+  map; the primitive that *consumes* one — scattering the one-hot k-mer context
+  along the signal axis, the 36-channel `sequence` input of a leech
+  `seq_encoding="signal_kmer"` model — lived downstream in leech, inside a
+  `cdylib` Python extension module that Rust cannot link. Since that tensor is
+  computed in the dataset it is **not** in leech's exported ONNX graph
+  (rnabioco/leech#220), so a Rust runtime has to build it before it can call
+  the model at all, and "call leech-core" is not an option. The choice was to
+  transcribe the rule or not to run those models — which is how
+  `KmerTable::extract_levels` ended up with two centring conventions and how
+  `escapepod-classify` reproduced a superseded feature definition for two
+  months.
+
+  The new module is `encode_signal_kmer` (plus an `_into` form for a hot loop
+  that would otherwise allocate per chunk), `sequence_ints_with_context` for
+  cutting the context window a chunk needs, and the `A/C/G/T=U` alphabet
+  (`base_to_int`, `sequence_to_int`) that both take —
+  `resquiggle::kmer_table` now shares that one definition rather than carrying
+  its own copy. `KmerContext` names the `(before, after)` pair, since
+  transposing it displaces every k-mer window by `before - after` bases and
+  still returns a correctly shaped tensor, and it is where `channels()` (36 for
+  the usual `(4, 4)`) is computed rather than in each caller.
+
+  Parity with leech's NumPy reference is pinned bit-exactly over 35 cases
+  (`tests/signal_kmer_parity.rs`, regenerate with
+  `tests/fixtures/gen_signal_kmer_golden.py`) — the encoding is exactly zeros
+  and ones, so there is no tolerance to argue about. The golden is generated
+  from the **NumPy** path deliberately: leech's own compiled extension
+  disagrees with its own fallback on a span whose start is negative, because it
+  clamps *after* an `as usize` cast, so the start lands on `signal_len`, the
+  span comes out empty and the base disappears. Measured against
+  `leech_core` 0.8.0 on a 3-base window with a map of `[-8, 10, 20, 30]`: 60
+  hot samples from the extension against 90 from NumPy, and for
+  `[-30, -20, 40, 60]` a span covering the entire window vanishes to 0. This
+  crate keeps the surviving tail, which is both the readable definition and
+  what a reference-anchored map — whose entries legitimately go negative once
+  the aligned region is cropped — needs.
+
 - **POD5 V6 files are readable (upstream 0.3.46).** V6's only change is that
   the reads-table `channel` column is retyped from `uint16` to `uint32` — same
   name, same position, so nothing about the container moves. But because it
