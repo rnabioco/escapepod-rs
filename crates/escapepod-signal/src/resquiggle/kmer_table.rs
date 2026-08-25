@@ -11,15 +11,14 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 /// Encode a nucleotide base to a 2-bit value (A=0, C=1, G=2, T/U=3).
+///
+/// The alphabet itself lives in [`crate::seq_encoding`], which is where a
+/// consumer outside this crate reaches for it; this only re-spells its "not a
+/// base" sentinel as `None` for the index arithmetic below.
 #[inline]
 fn encode_base(b: u8) -> Option<usize> {
-    match b {
-        b'A' | b'a' => Some(0),
-        b'C' | b'c' => Some(1),
-        b'G' | b'g' => Some(2),
-        b'T' | b't' | b'U' | b'u' => Some(3),
-        _ => None,
-    }
+    let idx = crate::seq_encoding::base_to_int(b);
+    (idx >= 0).then_some(idx as usize)
 }
 
 /// Encode a kmer as an integer index for flat array lookup.
