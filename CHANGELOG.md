@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0 (2026-08-25)
+
 ### Added
 
 - **`escapepod-signal` owns the signal-level k-mer encoding
