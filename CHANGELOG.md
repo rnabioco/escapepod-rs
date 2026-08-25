@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.1 (2026-08-25)
+
 ### Added
 
 - **`sequence_bases_with_context`: the k-mer context window as bases (#274).**
