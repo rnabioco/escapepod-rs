@@ -143,14 +143,6 @@ cnn-detect = ["demux", "escapepod-demux/cnn-detect"]
 # it depends on has no third-party dependencies at all.
 crf-decode = ["demux", "escapepod-demux/crf-decode"]
 
-# CTC-CRF encoder inference on the GPU (`escpod demux basecall --gpu`).
-# Opt-in: needs a CUDA-enabled libonnxruntime on `ORT_DYLIB_PATH` and a visible
-# device at run time.
-crf-gpu = ["crf-decode", "escapepod-demux/crf-gpu"]
-# Batched GPU CNN/TCN adapter detection via onnxruntime CUDA (`escpod demux
-# detect --method cnn --gpu`). Implies `cnn-detect` for the shared CPU path and
-# preprocessing. Needs a CUDA-enabled libonnxruntime + visible GPU at runtime.
-cnn-gpu = ["cnn-detect", "escapepod-demux/cnn-gpu"]
 # Implies `classify`: resquiggle shares classify's basecaller-tag decoders
 # (and the two are expected to grow together — both are BAM + move-table
 # signal-anchored analyses).
@@ -174,20 +166,30 @@ models-download = ["experimental", "model-fetch"]
 # the subcommand still lists, resolves and reports the cache, and `fetch` errors
 # with a rebuild hint.
 demux-models = ["demux"]
-# The one user-facing GPU switch: every GPU path in one flag — CUDA DTW
+# The one GPU switch, and the only one: every GPU path in one flag — CUDA DTW
 # (cudarc/NVRTC), GPU CNN adapter detection, and the GPU CTC-CRF encoder
 # (both onnxruntime CUDA). `--gpu` at runtime then uses whichever path fits
 # the model and stage. Nothing is needed at build time; at run time the DTW
 # path needs the CUDA driver + libnvrtc, and the onnxruntime paths need a
 # CUDA-enabled libonnxruntime on ORT_DYLIB_PATH (ort is `load-dynamic`, so a
 # gpu-built binary runs fine on CPU-only boxes as long as --gpu isn't asked
-# for). The granular `cnn-gpu` / `crf-gpu` flags below remain for library
-# consumers and CI isolation builds; CLI users should just use `gpu`.
+# for).
+#
+# There used to be granular `cnn-gpu` / `crf-gpu` flags underneath this one,
+# justified as serving library consumers and CI isolation builds. Neither
+# holds: `escapepod-demux` depends on `fqxv-align` by git URL, so it and this
+# crate cannot be `cargo publish`ed and have no external consumers to serve,
+# and the isolation builds only ever proved that partial-GPU binaries compile —
+# binaries nobody ships, whose sole cost was the runtime prose in
+# `commands/demux/run.rs` explaining which half of `--gpu` was a silent no-op.
+# Folding them in deletes that explaining. `escapepod-signal/gpu` stays
+# separate on purpose: it is cudarc-only (no onnxruntime), genuinely narrower,
+# and that crate has no git dependency blocking publication.
 #
 # Caveat for the DTW leg specifically: on a full node the CPU DTW is *faster*
 # (113.0 s on 64 cores vs 132.4 s on an A30 for 1.22M reads, +~2.2 GB RSS) —
 # the wins are CNN detection and the CRF encoder. See benchmarks/README.md.
-gpu = ["demux", "escapepod-demux/gpu", "cnn-gpu", "crf-gpu"]
+gpu = ["demux", "cnn-detect", "crf-decode", "escapepod-demux/gpu"]
 # Training support for demux SVM models (implies `demux`).
 train = ["demux", "escapepod-demux/train"]
 

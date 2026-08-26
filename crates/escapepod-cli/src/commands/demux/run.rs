@@ -21,7 +21,7 @@ use std::sync::mpsc::SyncSender;
 
 use crate::progress::create_progress_bar;
 use crate::style;
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 use escapepod_demux::crf::CrfEncoderGpu;
 #[cfg(feature = "crf-decode")]
 use escapepod_demux::crf::{
@@ -243,12 +243,11 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// [experimental] Use the GPU where this pipeline supports it: CTC-CRF
-    /// encoder inference (`--features crf-gpu`), batched DTW-SVM classify
-    /// (`--features gpu`), and/or batched CNN adapter detection with
-    /// `--method cnn` (`--features cnn-gpu`). CPU prep stays parallel and feeds
-    /// the GPU; CPU falls back automatically for stages without a GPU path
-    /// (e.g. GBM classify).
+    /// [experimental] Use the GPU where this pipeline supports it (needs a
+    /// `--features gpu` build): CTC-CRF encoder inference, batched DTW-SVM
+    /// classify, and/or batched CNN adapter detection with `--method cnn`. CPU
+    /// prep stays parallel and feeds the GPU; CPU falls back automatically for
+    /// stages without a GPU path (e.g. GBM classify).
     ///
     /// With a CRF bundle this is the case that pays off most: the encoder is
     /// ~91% of that head's CPU cost (13.9 ms/read against a 1.19 ms AVX-512
@@ -259,7 +258,7 @@ pub struct RunArgs {
     /// faster there (measured 113 s CPU on 64 cores vs 132 s with `--gpu` on an
     /// A30, plus ~2.2 GB more RSS). It may help when cores are scarce. GPU CNN
     /// detection (`--method cnn --gpu`) is the case that does pay off.
-    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+    #[cfg(feature = "gpu")]
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
@@ -351,7 +350,7 @@ impl Default for FpParams {
 }
 
 /// Adapter detector — LLR (always available), CPU CNN (`cnn-detect`), or
-/// batched GPU CNN (`cnn-gpu`). The fused pipeline always detects through
+/// batched GPU CNN (`gpu`). The fused pipeline always detects through
 /// [`Detector::detect_batch`] so the GPU variant runs as one onnxruntime call
 /// per block instead of per read.
 enum Detector {
@@ -362,7 +361,7 @@ enum Detector {
     },
     #[cfg(feature = "cnn-detect")]
     Cnn(Box<escapepod_demux::AdapterCnn>),
-    #[cfg(feature = "cnn-gpu")]
+    #[cfg(feature = "gpu")]
     CnnGpu(Box<escapepod_demux::AdapterCnnGpu>),
 }
 
@@ -401,7 +400,7 @@ impl Detector {
             }
             // Per-read is a degenerate single-read batch; the producers always go
             // through `detect_batch`, so this is only a correctness fallback.
-            #[cfg(feature = "cnn-gpu")]
+            #[cfg(feature = "gpu")]
             Detector::CnnGpu(gpu) => {
                 let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
                 let end = gpu
@@ -434,13 +433,13 @@ impl Detector {
     // `split` is only read by the GPU-CNN branch, so it is unused whenever that
     // branch is compiled out. Plain atomics rather than a `&GpuTrace` so this
     // signature needs no feature gate of its own.
-    #[cfg_attr(not(feature = "cnn-gpu"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
     fn detect_batch_traced(
         &self,
         signals: &[Option<Vec<i16>>],
         split: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)>,
     ) -> Vec<(usize, usize)> {
-        #[cfg(feature = "cnn-gpu")]
+        #[cfg(feature = "gpu")]
         if let Detector::CnnGpu(gpu) = self {
             let cfg = gpu.config();
             let t_prep = std::time::Instant::now();
@@ -490,7 +489,7 @@ impl Detector {
             Detector::Llr { .. } => None,
             #[cfg(feature = "cnn-detect")]
             Detector::Cnn(c) => Some(c.config().max_obs_trace),
-            #[cfg(feature = "cnn-gpu")]
+            #[cfg(feature = "gpu")]
             Detector::CnnGpu(g) => Some(g.config().max_obs_trace),
         }
     }
@@ -682,7 +681,7 @@ struct CrfHead {
 #[cfg(feature = "crf-decode")]
 enum CrfEncoderAny {
     Cpu(Box<CrfEncoder>),
-    #[cfg(feature = "crf-gpu")]
+    #[cfg(feature = "gpu")]
     Gpu(Box<CrfEncoderGpu>),
 }
 
@@ -691,7 +690,7 @@ impl CrfEncoderAny {
     fn metadata(&self) -> &escapepod_demux::crf::CrfMetadata {
         match self {
             Self::Cpu(e) => e.metadata(),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.metadata(),
         }
     }
@@ -699,7 +698,7 @@ impl CrfEncoderAny {
     fn set_boundary_margin(&mut self, margin: usize) {
         match self {
             Self::Cpu(e) => e.set_boundary_margin(margin),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.set_boundary_margin(margin),
         }
     }
@@ -707,7 +706,7 @@ impl CrfEncoderAny {
     fn set_clamp_max_shift(&mut self, shift: usize) {
         match self {
             Self::Cpu(e) => e.set_clamp_max_shift(shift),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.set_clamp_max_shift(shift),
         }
     }
@@ -715,7 +714,7 @@ impl CrfEncoderAny {
     fn ref_chains(&self, seqs: &[&[u8]]) -> Result<RefChains, CrfError> {
         match self {
             Self::Cpu(e) => e.ref_chains(seqs),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.ref_chains(seqs),
         }
     }
@@ -824,7 +823,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             // to the device; the lattice decode stays on the CPU regardless.
             // `--threads` bounds onnxruntime's intra-op pool, which is otherwise
             // spawned `available_parallelism()` wide on top of rayon's.
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             let encoder = if args.gpu {
                 // Must match `produce_gpu_crf`'s placement: this instance becomes
                 // worker 0, so it has to land on the first *encoder* device — GPU 1
@@ -872,7 +871,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             } else {
                 CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
             };
-            #[cfg(not(feature = "crf-gpu"))]
+            #[cfg(not(feature = "gpu"))]
             let encoder = CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?));
             #[allow(unused_mut)]
             let mut encoder = encoder;
@@ -1020,9 +1019,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // case that most needs a readable error, and it was the one case the
     // mitigation missed. `LeakIf` fires on every path, and only when a GPU path
     // actually built ORT sessions.
-    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+    #[cfg(feature = "gpu")]
     let leak_ort = args.gpu;
-    #[cfg(not(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu")))]
+    #[cfg(not(feature = "gpu"))]
     let leak_ort = false;
     let model = LeakIf::new(model, leak_ort);
     let detector = LeakIf::new(detector, leak_ort);
@@ -1134,20 +1133,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // ---- Stages A/B: produce classified reads ----
     let produce_result = match &*model {
         ClassifyModel::Svm(svm) => {
-            // `--gpu` exists whenever any GPU feature is compiled in, but DTW-SVM
-            // classify is only accelerated by `gpu`. On a `crf-gpu`-only build the
-            // flag is accepted and does nothing for this model, so warn — unless
-            // `--method cnn` on a `cnn-gpu` build means detection still uses the
-            // device. Without this the flag is a silent no-op, which is the exact
-            // failure this PR removed for the CRF head.
-            #[cfg(all(not(feature = "gpu"), any(feature = "cnn-gpu", feature = "crf-gpu")))]
-            if args.gpu && !(cfg!(feature = "cnn-gpu") && args.method.as_deref() == Some("cnn")) {
-                tracing::warn!(
-                    "--gpu has no effect here: this build has no `gpu` feature, so \
-                     DTW-SVM classify is CPU-only (rebuild with `--features gpu`, or \
-                     use `--method cnn` on a `cnn-gpu` build for GPU adapter detection)."
-                );
-            }
+            // No "`--gpu` does nothing on this head" warning to emit: the flag
+            // only exists when `gpu` is compiled in, and `gpu` is atomic, so it
+            // always carries the batched DTW-SVM classify kernel this arm uses.
+            // (It used to be reachable on a `cnn-gpu`/`crf-gpu`-only build,
+            // which no longer exists.)
             #[cfg(feature = "gpu")]
             {
                 if args.gpu {
@@ -1164,15 +1154,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         ClassifyModel::Gbm(gbm) => {
             // GBM classify is CPU-only; with `--method cnn` the GPU still
             // accelerates adapter detection, so only warn when `--gpu` can do
-            // nothing (CPU classify + CPU detect).
-            // Widened to every GPU feature: `--gpu` is accepted on a
-            // `crf-gpu`-only build too, and there it does nothing at all for GBM.
-            #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
-            if args.gpu && !(cfg!(feature = "cnn-gpu") && args.method.as_deref() == Some("cnn")) {
+            // nothing at all (CPU classify + CPU detect). The method is now the
+            // only thing left to test: `gpu` is atomic, so a binary that accepts
+            // `--gpu` always has the GPU CNN detector compiled in.
+            #[cfg(feature = "gpu")]
+            if args.gpu && args.method.as_deref() != Some("cnn") {
                 tracing::warn!(
                     "--gpu has no effect here: GBM classify is CPU-only and \
                      `--method {}` detection is not running on the GPU (use \
-                     `--method cnn` on a `cnn-gpu` build for GPU adapter detection).",
+                     `--method cnn` for GPU adapter detection).",
                     args.method.as_deref().unwrap_or("<from model>")
                 );
             }
@@ -1180,22 +1170,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         }
         #[cfg(feature = "crf-decode")]
         ClassifyModel::Crf(head) => {
-            // Without `crf-gpu` the encoder is tract on the CPU, one read per
-            // rayon worker, and it is ~91% of this head's cost. `--method cnn`
-            // moving detection to the device does NOT make up for that, so warn
-            // regardless of the method — the previous `!= Some("cnn")` gate
-            // silenced exactly the combination that looks most accelerated and
-            // is not.
-            #[cfg(all(not(feature = "crf-gpu"), any(feature = "gpu", feature = "cnn-gpu")))]
-            if args.gpu {
-                tracing::warn!(
-                    "--gpu leaves the CRF encoder on the CPU: this binary was built \
-                     without `crf-gpu`, and the encoder is ~91% of this head's cost. \
-                     Rebuild with `--features crf-gpu` for a GPU encoder."
-                );
-            }
+            // No "`--gpu` leaves the encoder on the CPU" warning either. That
+            // warned about a build with a GPU feature but not the CRF one, where
+            // `--gpu` silently left ~91% of this head's cost on tract; `gpu` is
+            // atomic now, so `--gpu` always moves the encoder to the device.
+            // Whether the device is usable is a *runtime* question, and the
+            // encoder loader below reports its own fallbacks.
             match &head.encoder {
-                #[cfg(feature = "crf-gpu")]
+                #[cfg(feature = "gpu")]
                 CrfEncoderAny::Gpu(enc) => {
                     // Extra encoder workers load their own session from the same
                     // bundle, so the pool needs the directory the head came from.
@@ -1900,7 +1882,7 @@ fn call_barcode_scored(head: &CrfHead, scored: &ScoredDecode) -> Call {
 /// is the bottleneck there, so the producer is always ahead and deeper buffering
 /// buys nothing. Worth raising only if prep becomes the slower side (many cores
 /// starved of I/O, or a much faster device).
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 fn crf_gpu_block() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -1948,7 +1930,7 @@ fn crf_gpu_block() -> usize {
 /// work to device 0 could slow the stage that is already the ceiling and regress
 /// the case that currently scales, to fix the case that does not. Measure both
 /// columns before changing it.
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 fn crf_encoder_devices(visible: usize) -> Vec<i32> {
     if visible > 1 {
         (1..visible as i32).collect()
@@ -1975,7 +1957,7 @@ fn crf_encoder_devices(visible: usize) -> Vec<i32> {
 /// past a point each does proportionally smaller calls and the per-call overhead
 /// this exists to hide grows back. Before that fix, four workers on one 24 GB
 /// A30 simply exhausted the card and killed the run.
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 fn crf_gpu_workers(devices: usize) -> usize {
     std::env::var("ESCAPEPOD_CRF_GPU_WORKERS")
         .ok()
@@ -2006,7 +1988,7 @@ fn crf_gpu_workers(devices: usize) -> usize {
 /// being starved by its neighbour, and a stage that is mostly *working* is the
 /// constraint. Six plausible fixes for this pipeline's idle GPU were tried and
 /// measured negative before this existed, which is the argument for having it.
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 #[derive(Default)]
 struct GpuTrace {
     /// Producer: batched adapter-CNN detect over a whole block (prep + infer).
@@ -2029,7 +2011,7 @@ struct GpuTrace {
     route_ms: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 impl GpuTrace {
     fn enabled() -> bool {
         std::env::var("ESCAPEPOD_CRF_GPU_TRACE").as_deref() == Ok("1")
@@ -2079,7 +2061,7 @@ impl GpuTrace {
 // One over clippy's limit: the sibling producers take the same seven, and this
 // one additionally needs the bundle directory to load its extra workers.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 fn produce_gpu_crf(
     args: &RunArgs,
     detector: &Detector,
@@ -2799,8 +2781,8 @@ fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<De
                     _ => escapepod_demux::AdapterCnnConfig::default(),
                 };
                 // `--gpu` with `--method cnn` runs detection on the GPU (one
-                // batched onnxruntime call per block) when built with cnn-gpu.
-                #[cfg(feature = "cnn-gpu")]
+                // batched onnxruntime call per block) when built with `gpu`.
+                #[cfg(feature = "gpu")]
                 if args.gpu {
                     return Ok(Detector::CnnGpu(Box::new(
                         escapepod_demux::AdapterCnnGpu::load_with_config(path, config)
@@ -2900,7 +2882,7 @@ fn print_summary(summary: &DemuxSummary) {
     }
 }
 
-#[cfg(all(test, feature = "crf-gpu"))]
+#[cfg(all(test, feature = "gpu"))]
 mod gpu_placement_tests {
     use super::{crf_encoder_devices, crf_gpu_workers};
 

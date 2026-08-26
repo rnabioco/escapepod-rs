@@ -36,16 +36,16 @@ pub mod barcode;
 #[cfg(feature = "crf-decode")]
 pub mod encoder;
 
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 pub mod encoder_gpu;
 
 /// Batched CUDA lattice decode. The CPU decode in [`lattice`] stays the
 /// reference and the only always-compiled path; this is the same two passes
 /// with the batch axis mapped onto the device.
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 pub mod lattice_gpu;
 
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 mod lattice_gpu_kernel;
 
 pub use lattice::{
@@ -90,8 +90,8 @@ pub struct BoundaryInputSpec {
     pub pad_value: f32,
 }
 
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 pub use encoder_gpu::CrfEncoderGpu;
 
-#[cfg(feature = "crf-gpu")]
+#[cfg(feature = "gpu")]
 pub use lattice_gpu::CrfLatticeGpu;

@@ -17,7 +17,7 @@
 //! - Optional `cnn-detect` feature: adapter-end detection by running an
 //!   exported boundary-CNN ONNX graph through tract-onnx ([`AdapterCnn`]).
 //!   This is CPU-only and architecture-agnostic (any `[B,1,L] -> [B,2,L]`
-//!   graph); [`AdapterCnnGpu`] adds a CUDA path under `cnn-gpu`.
+//!   graph); [`AdapterCnnGpu`] adds a CUDA path under `gpu`.
 //!
 //! Basecall-then-match ([`crf`]):
 //!
@@ -25,7 +25,7 @@
 //!   which upstream exists only as CUDA kernels. Pure `f32` with no
 //!   dependencies and no feature gate, plus runtime-dispatched AVX2 kernels.
 //! - Optional `crf-decode` feature: the ONNX encoder through tract
-//!   ([`crf::CrfEncoder`]); `crf-gpu` runs it on onnxruntime + CUDA instead.
+//!   ([`crf::CrfEncoder`]); `gpu` runs it on onnxruntime + CUDA instead.
 //! - [`crf::BarcodeRefs`]: matching a decoded sequence to a barcode reference
 //!   by edit distance (wavefront alignment via `fqxv-align`), with the
 //!   margin-to-second-best as the confidence.
@@ -74,7 +74,7 @@ pub mod crf;
 mod fingerprint;
 mod gbm;
 mod model;
-#[cfg(any(feature = "cnn-gpu", feature = "crf-gpu"))]
+#[cfg(feature = "gpu")]
 mod ort_ep;
 mod probability;
 mod svm;
@@ -85,7 +85,7 @@ mod train;
 #[cfg(feature = "cnn-detect")]
 pub mod adapter_cnn;
 
-#[cfg(feature = "cnn-gpu")]
+#[cfg(feature = "gpu")]
 pub mod adapter_cnn_gpu;
 
 pub use fingerprint::{
@@ -122,5 +122,5 @@ pub use train::*;
 #[cfg(feature = "cnn-detect")]
 pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError, PreppedWindow};
 
-#[cfg(feature = "cnn-gpu")]
+#[cfg(feature = "gpu")]
 pub use adapter_cnn_gpu::AdapterCnnGpu;

@@ -28,7 +28,7 @@
 //! produce.
 //!
 //! ```text
-//! cargo run --release --features cnn-gpu --example cnn_pad_probe -- <adapter.onnx>
+//! cargo run --release --features gpu --example cnn_pad_probe -- <adapter.onnx>
 //! ```
 
 use escapepod_demux::{AdapterCnnConfig, AdapterCnnGpu};

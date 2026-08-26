@@ -84,7 +84,7 @@ features:
 |---------|-------------------|
 | `experimental` | `repack`, `resquiggle`, `index`, `annotate` |
 | `train` | adds `demux train-svm` (SVM training via linfa) |
-| `gpu` | every `--gpu` path — CNN adapter detection, the CTC-CRF encoder, DTW classify (CUDA libraries at run time only) |
+| `gpu` | every `--gpu` path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify (CUDA libraries at run time only) |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 
 Note the sidecar asymmetry: *writing* `.p5s` sidecars (`index`, `annotate`)
@@ -92,8 +92,8 @@ needs `--features experimental`, but consuming them (`demux --annotate`,
 `demux split --sidecar`, `filter --annotation`, `view`, `inspect`) works in
 the default build.
 
-The GPU features need CUDA libraries at run time only; the repository's pixi
-`gpu` environment provides all of them — see
+`gpu` needs CUDA libraries at run time only; the repository's pixi `gpu`
+environment provides all of them — see
 [GPU acceleration](../experimental/demux.md#gpu-acceleration). Building for
 `gpu` is optional: the `x86_64-unknown-linux-gnu-gpu` release artifact above
 already carries it.

@@ -120,7 +120,7 @@ match result {
 | `crf-decode` | CTC-CRF barcode basecalling (`demux basecall`) — *implied by `cli`* |
 | `demux-models` / `model-fetch` | Model-bundle registry and `demux models fetch` — *implied by `cli`* |
 | `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
-| `gpu` | Every `--gpu` path: CNN adapter detection + CRF encoder (onnxruntime CUDA) and DTW classify (cudarc). Implies `cnn-gpu` + `crf-gpu`, which remain individually selectable for library consumers |
+| `gpu` | The one GPU flag: every `--gpu` path — CNN adapter detection + CRF encoder (onnxruntime CUDA) and DTW classify (cudarc). Implies `cnn-detect` and `crf-decode` for the shared prep/decode |
 | `cnn-detect` | Part of `cli`; implies `demux`. CNN/TCN adapter detection through `tract-onnx` (bring-your-own ONNX model — no weights are bundled) |
 | `models-download` | Implies `experimental`; `resquiggle models fetch` (k-mer tables) |
 
@@ -129,11 +129,15 @@ match result {
 | Feature | Effect |
 |---------|--------|
 | `train` | `DtwSvmModel` training via `linfa-svm` |
-| `gpu` | Routes to `escapepod-signal`'s CUDA DTW kernel |
+| `gpu` | Every GPU path in one flag: `escapepod-signal`'s CUDA DTW kernel plus the onnxruntime CUDA CNN detector and CRF encoder (implies `cnn-detect` + `crf-decode`) |
 | `cnn-detect` | ADAPTed-style CNN adapter detection via `tract-onnx` |
+| `crf-decode` | CTC-CRF encoder via `tract-onnx` + barcode matching |
 
 The CLI features forward to the matching demux features, so building the
 CLI with `--features gpu` transitively enables demux's `gpu` feature.
+
+`escapepod-signal`'s own `gpu` feature is narrower on purpose: it is the cudarc
+DTW kernel and nothing else, with no onnxruntime in its graph.
 
 ## Dependencies
 

@@ -40,6 +40,38 @@
 
 ### Changed
 
+- **BREAKING: `cnn-gpu` and `crf-gpu` are gone; `gpu` is the single GPU Cargo
+  feature.** Anyone building with `--features cnn-gpu` or `--features crf-gpu`
+  must switch to `--features gpu`, on `escapepod-cli` and `escapepod-demux`
+  alike. There is no deprecation shim: a stale flag is a hard "feature does not
+  exist" error at `cargo` resolution, not a silent behaviour change. `gpu` is a
+  superset of both, so the fix is always the same substitution, and any build
+  that already said `--features gpu` is unaffected — it already enabled all
+  three.
+
+  The granular flags were kept for "library consumers and CI isolation builds".
+  Neither survives inspection. `escapepod-demux` depends on `fqxv-align` by git
+  URL, so it and `escapepod-cli` cannot be `cargo publish`ed and have no
+  external consumers to serve; the isolation builds only ever proved that a
+  partially-GPU binary *compiles*, and nobody ships one.
+
+  Their real cost was in the fused pipeline. `commands/demux/run.rs` carried
+  three runtime warnings and their `cfg(all(not(…), any(…)))` guards whose sole
+  job was to describe those builds — "this binary has `crf-gpu` but not `gpu`,
+  so `--gpu` does nothing for DTW-SVM classify", and two variations on it. Once
+  `gpu` is atomic those builds cannot exist, so the warnings are deleted rather
+  than ported: `--gpu` now always means every stage with a device path uses it.
+  The one warning that survives is the one about a *runtime* combination — GBM
+  classify with `--method llr`, where the GPU genuinely has nothing to do.
+
+  `escapepod-signal`'s `gpu` feature is deliberately **unchanged**: cudarc DTW
+  only, no onnxruntime, and that crate has no git dependency blocking
+  publication. CI's feature-build job drops from seven clippy steps to three —
+  `escapepod-signal --features gpu`, `escapepod-demux --features gpu`,
+  `escapepod-cli --features gpu` — covering the builds people actually produce
+  instead of combinations they do not. No algorithm, numeric behaviour or CLI
+  flag semantics changed; this is a feature-graph and `#[cfg]` change.
+
 - **The pixi `gpu` environment now supplies CUDA itself, instead of borrowing
   the host's (#278).** `install-ort` pip-downloaded `onnxruntime-gpu` into
   `.pixi/ort/`, which was the only input to the GPU environment that `pixi.lock`

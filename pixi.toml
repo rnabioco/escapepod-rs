@@ -86,13 +86,13 @@ typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escape
   "build-python",
 ] }
 
-# GPU (CUDA) feature. Covers the runtime needs of every GPU cargo feature —
-# all of them `load-dynamic`/dlopen, so nothing here is needed at build time:
-#   * `--features gpu`      — cudarc dlopens libnvrtc for the GPU DTW kernels.
-#   * `--features cnn-gpu`  — onnxruntime CUDA execution provider for batched
-#     CNN adapter detection (`demux detect --method cnn --gpu`).
-#   * `--features crf-gpu`  — the same onnxruntime CUDA EP for the CTC-CRF
-#     encoder (`demux basecall --gpu`, fused `demux --gpu`).
+# GPU (CUDA) feature. Covers the runtime needs of `--features gpu`, which is
+# the whole of escpod's GPU surface. Every leg `load-dynamic`/dlopens, so
+# nothing here is needed at build time:
+#   * cudarc dlopens libnvrtc for the GPU DTW kernels (classify, train).
+#   * onnxruntime's CUDA execution provider runs batched CNN adapter detection
+#     (`demux detect --method cnn --gpu`) and the CTC-CRF encoder
+#     (`demux basecall --gpu`, fused `demux --gpu`).
 #
 # Everything comes from conda-forge and is described by pixi.lock, including
 # libonnxruntime. `pixi install -e gpu` is the whole setup; there is no fetch

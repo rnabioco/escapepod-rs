@@ -118,7 +118,7 @@ reference by edit distance and the output feeds `escpod demux split` directly.
 Without it, only decoded sequences are emitted. Confidence is the edit-distance
 margin to the second-best reference.
 
---gpu needs the `crf-gpu` feature (onnxruntime + CUDA); the lattice decode stays
+--gpu needs the `gpu` feature (onnxruntime + CUDA); the lattice decode stays
 on the CPU regardless.
 ")]
     Basecall(BasecallArgs),

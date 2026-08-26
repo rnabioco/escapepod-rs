@@ -27,7 +27,7 @@
 //! set it explicitly to hold the split fixed while sweeping.
 //!
 //! ```text
-//! cargo run --release --features cnn-gpu --example cnn_gpu_floor -- <adapter.onnx> [iters]
+//! cargo run --release --features gpu --example cnn_gpu_floor -- <adapter.onnx> [iters]
 //! ```
 //!
 //! Needs a CUDA-enabled `libonnxruntime` on `ORT_DYLIB_PATH` and a visible GPU.

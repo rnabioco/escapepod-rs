@@ -1,6 +1,6 @@
 //! GPU CTC-CRF encoder inference via onnxruntime (CUDA execution provider).
 //!
-//! Opt-in via `crf-gpu`. Runs the *same* ONNX graph as [`CrfEncoder`] and hands
+//! Opt-in via `gpu`. Runs the *same* ONNX graph as [`CrfEncoder`] and hands
 //! the scores to the *same* [`lattice`](super::lattice) decode, so the only
 //! thing that changes is where the LSTM stack executes.
 //!
