@@ -54,10 +54,17 @@ Requesting `--gpu` with that binary needs, at run time:
 
 An onnxruntime built for a different CUDA major than the runtime libraries
 still loads, and then falls back to CPU rather than failing — so a `--gpu` run
-that is merely slow is worth reading the warnings of. See
-[GPU acceleration](../experimental/demux.md#gpu-acceleration) for the pixi
-environment that supplies all of the above, and for how to confirm the CUDA
-execution provider actually loaded.
+that is merely slow is worth reading the warnings of.
+
+You do not have to assemble any of that by hand. Both live in one pixi
+environment: from a checkout, [the repository's `gpu` environment
+](../experimental/demux.md#runtime-libraries-the-pixi-environment-from-a-checkout);
+with only the downloaded binary, a [standalone manifest
+](../experimental/demux.md#runtime-libraries-without-a-checkout) you can copy
+into an empty directory. Both fetch the onnxruntime once on a networked
+machine, which matters on clusters where compute nodes cannot reach the
+internet. See also [verifying the GPU is actually in
+use](../experimental/demux.md#verifying-the-gpu-is-actually-in-use).
 
 Without `--gpu`, this artifact needs none of it and behaves exactly like the
 musl one.
