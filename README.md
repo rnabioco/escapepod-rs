@@ -52,9 +52,33 @@ matter; sub-second commands (`inspect`, `view`) are omitted. Measured with
 
 ### CLI (`escpod`)
 
-The `escpod` binary lives in the `escapepod-cli` crate.
+The `escpod` binary lives in the `escapepod-cli` crate. Every tagged version
+publishes prebuilt binaries on the
+[releases page](https://github.com/rnabioco/escapepod-rs/releases):
 
-Default build (stable commands only):
+| Artifact | For |
+|----------|-----|
+| `escpod-<ver>-{x86_64,aarch64}-unknown-linux-musl.tar.gz` | Linux, static — the portable default |
+| `escpod-<ver>-x86_64-unknown-linux-gnu-gpu.tar.gz` | Linux + NVIDIA, built `--features gpu` (glibc ≥ 2.28) |
+| `escpod-<ver>-{x86_64,aarch64}-apple-darwin.tar.gz` | macOS |
+
+```bash
+VER=v0.16.1
+curl -L "https://github.com/rnabioco/escapepod-rs/releases/download/$VER/escpod-$VER-x86_64-unknown-linux-musl.tar.gz" | tar xz
+./escpod --version
+```
+
+Take the **musl** build unless you need `--gpu`: it is static, so it runs on
+any Linux with no library requirements at all. The GPU paths can't be — they
+`dlopen` the CUDA driver and `libonnxruntime` at run time — so they ship only
+in the `-gnu-gpu` artifact, whose extra run-time requirements (CUDA 12,
+cuDNN 9, an onnxruntime pinned to the `ort` crate) are listed in the release
+notes and under
+[GPU acceleration](https://rnabioco.github.io/escapepod-rs/experimental/demux/#gpu-acceleration).
+Without `--gpu` that binary needs none of them.
+
+To build instead — the default build ships stable commands plus the full
+demux tree:
 
 ```bash
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli

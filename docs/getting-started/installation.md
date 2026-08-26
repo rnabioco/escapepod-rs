@@ -2,10 +2,65 @@
 
 ## Prerequisites
 
+Only to build from source:
+
 - Rust 1.95 or later
 - Cargo (comes with Rust)
 
 ## Installing the CLI
+
+### Prebuilt binaries
+
+Every tagged version publishes `escpod` binaries on the
+[releases page](https://github.com/rnabioco/escapepod-rs/releases):
+
+| Artifact | Linkage | `--gpu` |
+|----------|---------|---------|
+| `escpod-<ver>-x86_64-unknown-linux-musl.tar.gz` | static (musl) | no |
+| `escpod-<ver>-aarch64-unknown-linux-musl.tar.gz` | static (musl) | no |
+| `escpod-<ver>-x86_64-unknown-linux-gnu-gpu.tar.gz` | dynamic, glibc ≥ 2.28 | **yes** |
+| `escpod-<ver>-x86_64-apple-darwin.tar.gz` | dynamic | no |
+| `escpod-<ver>-aarch64-apple-darwin.tar.gz` | dynamic | no |
+
+```bash
+VER=v0.16.1
+curl -L "https://github.com/rnabioco/escapepod-rs/releases/download/$VER/escpod-$VER-x86_64-unknown-linux-musl.tar.gz" | tar xz
+install -m755 escpod ~/.local/bin/
+escpod --version
+```
+
+`SHA256SUMS.txt` on the same page covers every archive.
+
+The **musl** builds are the portable default: static, so they run on any
+Linux with no library requirements whatsoever, and the right thing for an
+unattended installer to fetch.
+
+#### The GPU artifact
+
+`--features gpu` cannot be static — every GPU path `dlopen`s its runtime (the
+CUDA driver and `libnvrtc` for DTW, a CUDA-enabled `libonnxruntime` for CNN
+adapter detection and the CTC-CRF encoder) — so it ships in the one
+dynamically linked artifact, `x86_64-unknown-linux-gnu-gpu`. It is built
+against glibc 2.28, which covers RHEL/Rocky/Alma 8+ and Ubuntu 20.04+.
+
+Requesting `--gpu` with that binary needs, at run time:
+
+- The **CUDA 12** runtime on `LD_LIBRARY_PATH` — `libcublas.so.12`,
+  `libcublasLt.so.12`, `libcudart.so.12`, `libcufft.so.11`, `libcudnn.so.9`,
+  and `libnvrtc.so.12` for the DTW kernels — with an NVIDIA driver ≥ 535
+  (the DTW path targets the CUDA 12.2 driver API).
+- `ORT_DYLIB_PATH` pointing at a **CUDA 12** build of **onnxruntime 1.28.x**,
+  the version pinned against the `ort` 2.0.0-rc.13 the binary links.
+
+An onnxruntime built for a different CUDA major than the runtime libraries
+still loads, and then falls back to CPU rather than failing — so a `--gpu` run
+that is merely slow is worth reading the warnings of. See
+[GPU acceleration](../experimental/demux.md#gpu-acceleration) for the pixi
+environment that supplies all of the above, and for how to confirm the CUDA
+execution provider actually loaded.
+
+Without `--gpu`, this artifact needs none of it and behaves exactly like the
+musl one.
 
 ### From Source
 
@@ -48,7 +103,9 @@ the default build.
 
 The GPU features need CUDA libraries at run time only; the repository's pixi
 `gpu` environment provides all of them — see
-[GPU acceleration](../experimental/demux.md#gpu-acceleration).
+[GPU acceleration](../experimental/demux.md#gpu-acceleration). Building for
+`gpu` is optional: the `x86_64-unknown-linux-gnu-gpu` release artifact above
+already carries it.
 
 Combine as needed:
 

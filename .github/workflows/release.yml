@@ -105,9 +105,95 @@ jobs:
           name: escpod-${{ matrix.target }}
           path: escpod-${{ github.ref_name }}-${{ matrix.target }}.*
 
+  # ---------------------------------------------------------------------------
+  # The GPU artifact. Deliberately its own job rather than a row in the matrix
+  # above: it is the only build that needs a container, the only one that is
+  # dynamically linked, and the only one carrying a feature flag — three
+  # special cases that would each need a matrix column, on the path that
+  # already ships four working artifacts.
+  #
+  # Why it cannot be musl: every GPU path dlopens its runtime at run time — the
+  # CUDA driver and libnvrtc for the DTW kernels, a CUDA-enabled libonnxruntime
+  # for CNN adapter detection and the CTC-CRF encoder — which a static binary
+  # cannot do. So `--features gpu` is unreachable from the musl artifacts by
+  # construction, not by omission (#270).
+  #
+  # Why a container: this artifact exists for HPC compute nodes, which are
+  # overwhelmingly RHEL/Rocky/Alma 9 (glibc 2.34). Building natively on the
+  # runner would link against Ubuntu 24.04's glibc 2.39 and produce something
+  # that will not start on the machines that asked for it. manylinux_2_28 puts
+  # the floor in the image name (2.28, AlmaLinux 8) while still providing a
+  # current gcc — and the `_2_28` is fixed by that name, so the rolling tag
+  # cannot raise it underneath us.
+  #
+  # Nothing CUDA-related is needed at build time: ort is load-dynamic and
+  # cudarc uses dynamic-loading, so this builds on a runner with no GPU and no
+  # CUDA toolkit, and the resulting binary runs fine on CPU-only machines as
+  # long as `--gpu` is not requested.
+  build-gpu:
+    name: Build x86_64-unknown-linux-gnu-gpu
+    needs: macos-verify
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    # ort + cudarc on top of a fat-LTO dist build; the musl x86_64 row is ~8 min.
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      NAME: x86_64-unknown-linux-gnu-gpu
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustup directly rather than dtolnay/rust-toolchain: inside a container
+      # the action's PATH handling is one more thing to be wrong, and this job
+      # needs exactly one toolchain with no components.
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --profile dist --target "$TARGET" -p escapepod-cli --features gpu
+        env:
+          RUSTFLAGS: "-C target-cpu=haswell"
+
+      # A dynamically linked artifact is only worth publishing where it loads.
+      # Asserted off the binary rather than assumed from the image, so a base
+      # bump (or someone moving this back to a native runner build) fails the
+      # release instead of shipping something nobody can run.
+      - name: Assert glibc floor
+        run: |
+          set -euo pipefail
+          # `-T` reads .dynsym, which survives the dist profile's strip.
+          max=$(objdump -T "target/$TARGET/dist/escpod" \
+                | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)
+          echo "highest required glibc symbol version: ${max:-<none>}"
+          if [ -z "$max" ]; then
+            echo "::error::no versioned glibc symbols found — the probe is broken"
+            exit 1
+          fi
+          # RHEL/Rocky/Alma 9 ship 2.34 and are the oldest thing we promise.
+          if [ "$(printf '%s\n2.34\n' "$max" | sort -V | tail -1)" != "2.34" ]; then
+            echo "::error::escpod needs glibc $max, above the 2.34 floor (RHEL 9)"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd "target/$TARGET/dist"
+          tar czvf "../../../escpod-${GITHUB_REF_NAME}-${NAME}.tar.gz" escpod
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: escpod-x86_64-unknown-linux-gnu-gpu
+          path: escpod-${{ github.ref_name }}-x86_64-unknown-linux-gnu-gpu.*
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-gpu]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Only this job needs write — it creates the GitHub Release.
@@ -148,6 +234,59 @@ jobs:
           fi
           # Write to file to preserve newlines
           echo "$body" > release_notes.md
+
+      # Appended to every release rather than written into each CHANGELOG entry:
+      # which artifact to take, and what the GPU one expects at run time. That
+      # last part is not discoverable from the file name — the required CUDA
+      # major is fixed by the `ort`/`cudarc` pins the binary was built with, and
+      # a mismatch demotes the work to CPU with a warning rather than failing.
+      - name: Append artifact guide to release notes
+        run: |
+          set -euo pipefail
+          cat >> release_notes.md <<'EOF'
+
+          ---
+
+          ### Which artifact
+
+          | Artifact | Linkage | `--gpu` |
+          |---|---|---|
+          | `…-x86_64-unknown-linux-musl.tar.gz` | static (musl) | no |
+          | `…-aarch64-unknown-linux-musl.tar.gz` | static (musl) | no |
+          | `…-x86_64-unknown-linux-gnu-gpu.tar.gz` | dynamic, glibc ≥ 2.28 | **yes** |
+          | `…-x86_64-apple-darwin.tar.gz` | dynamic | no |
+          | `…-aarch64-apple-darwin.tar.gz` | dynamic | no |
+
+          The **musl** builds are the portable default and the right thing for
+          an unattended installer to fetch. The GPU paths cannot be static —
+          they `dlopen` their runtimes — so they ship in the single dynamically
+          linked `…-linux-gnu-gpu` artifact instead, built against glibc 2.28
+          (RHEL/Rocky/Alma 8+, Ubuntu 20.04+).
+
+          ### What `…-linux-gnu-gpu` needs at run time
+
+          Only when `--gpu` is actually requested. Without it this binary needs
+          nothing beyond glibc and behaves exactly like the musl one.
+
+          - The **CUDA 12** runtime on `LD_LIBRARY_PATH`: `libcublas.so.12`,
+            `libcublasLt.so.12`, `libcudart.so.12`, `libcufft.so.11`,
+            `libcudnn.so.9` (cuDNN 9), plus `libnvrtc.so.12` for the DTW
+            kernels — with an NVIDIA driver ≥ 535, since the DTW path targets
+            the CUDA 12.2 driver API.
+          - `ORT_DYLIB_PATH` pointing at a **CUDA 12** build of **onnxruntime
+            1.28.x** — the version pinned against this binary's `ort`
+            2.0.0-rc.13 — for CNN adapter detection and the CTC-CRF encoder.
+
+          An onnxruntime built for a different CUDA major than the runtime
+          libraries above still loads and then falls back to CPU with a
+          warning, rather than failing: a `--gpu` run that is merely slow is
+          worth reading the warnings of.
+
+          The repository's pixi `gpu` environment supplies all of this. See
+          [GPU acceleration](https://rnabioco.github.io/escapepod-rs/experimental/demux/#gpu-acceleration)
+          for a from-scratch setup and for how to confirm the CUDA execution
+          provider actually loaded.
+          EOF
 
       - name: Create Release
         uses: softprops/action-gh-release@v3

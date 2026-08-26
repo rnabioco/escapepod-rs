@@ -784,12 +784,22 @@ flag then uses whichever fits the model and stage:
 (The granular `cnn-gpu` / `crf-gpu` flags still exist for library consumers
 of `escapepod-demux`; CLI users only need `gpu`.)
 
-### Building
+### Getting a GPU-capable binary
 
-Nothing CUDA-related is needed at **build** time — the GPU runtimes load
-with `dlopen` at **run** time, so you can build on any machine, and a
-gpu-built binary still runs fine on CPU-only nodes as long as `--gpu` isn't
-requested:
+Each release ships one, `escpod-<ver>-x86_64-unknown-linux-gnu-gpu.tar.gz`
+on the [releases page](https://github.com/rnabioco/escapepod-rs/releases) —
+the only artifact built `--features gpu`, and the only dynamically linked
+Linux one, because the GPU runtimes are `dlopen`ed and static musl cannot do
+that. It needs glibc ≥ 2.28 (RHEL/Rocky/Alma 8+, Ubuntu 20.04+). Prefer it
+over a local build where you need a *knowable* version: `escpod --version`
+on a hand-built binary is a local fact, and `adapter_end` — which escpod
+computes and which defines the training window — makes the binary part of a
+model's definition.
+
+To build it yourself instead, nothing CUDA-related is needed at **build**
+time: the GPU runtimes load with `dlopen` at **run** time, so you can build
+on any machine, and a gpu-built binary still runs fine on CPU-only nodes as
+long as `--gpu` isn't requested:
 
 ```bash
 cargo build --release --features gpu -p escapepod-cli
@@ -819,7 +829,10 @@ pixi run -e gpu ./target/release/escpod demux reads.pod5 --model <bundle> --gpu 
 
 Activating the environment (`pixi run -e gpu …` or `pixi shell -e gpu`) sets
 `LD_LIBRARY_PATH` and `ORT_DYLIB_PATH` automatically. The only system
-requirement on the node itself is an NVIDIA driver new enough for CUDA 12.
+requirement on the node itself is an NVIDIA driver new enough for CUDA 12.2
+(≥ 535) — the DTW kernels target that driver API. This works the same for the
+released `-gnu-gpu` binary as for a local build; point the command at wherever
+you unpacked it.
 
 ### Verifying the GPU is actually in use
 

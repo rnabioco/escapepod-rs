@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Added
+
+- **A GPU-enabled Linux release artifact (#270).** Every release from v0.10.0
+  to v0.16.1 published four `escpod` archives and none of them could carry
+  `--features gpu`: the Linux builds are static musl, and every GPU path
+  `dlopen`s its runtime (the CUDA driver and `libnvrtc` for DTW, a CUDA-enabled
+  `libonnxruntime` for CNN detection and the CTC-CRF encoder). So the feature
+  was unreachable from a release by construction, and the only way to get it was
+  `cargo install --git`, which needs a Rust toolchain and — the part that
+  actually bites — produces a binary whose version is a local fact. escpod
+  computes `adapter_end`, `adapter_end` defines the training window, so the
+  binary is part of a model's definition; a downstream consumer pinning
+  `escpod_version` found four hand-built binaries on one machine, three of them
+  referenced by config and none matching the pin.
+
+  Releases now also publish `escpod-<ver>-x86_64-unknown-linux-gnu-gpu.tar.gz`,
+  built `--features gpu`. musl stays the portable default and the thing an
+  unattended installer should fetch; this is the one dynamically linked Linux
+  artifact, and the name says so. Without `--gpu` it behaves exactly like the
+  musl build.
+
+  Two decisions worth reviewing. It builds inside a `manylinux_2_28` container
+  rather than natively on the runner, because a runner build links against
+  Ubuntu 24.04's glibc 2.39 and the RHEL 9 compute nodes this exists for are on
+  2.34 — it would not start on the machines that asked for it. The image name
+  fixes the floor at 2.28, and a build step then asserts it off `objdump -T`
+  rather than trusting the image, so a base bump fails the release instead of
+  shipping a binary nobody can run. And the CUDA expectations are appended to
+  *every* release's notes by the workflow rather than written into each
+  CHANGELOG entry: the required CUDA major is fixed by the `ort`/`cudarc` pins
+  the binary was built with, is not discoverable from the file name, and a
+  mismatch demotes the work to CPU with a warning rather than failing outright.
+
+  Prebuilt binaries are now documented in the README and the installation guide,
+  which previously described only `cargo install`.
+
 ## 0.16.1 (2026-08-25)
 
 ### Added
