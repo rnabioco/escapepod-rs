@@ -80,8 +80,8 @@ Examples:
   escpod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
   escpod summary input.pod5                 Comprehensive statistics
 
-Experimental commands (repack, resquiggle, index, demux) are not built by default.
-Rebuild with `--features experimental` and/or `--features demux` to enable them.
+Experimental commands (repack, resquiggle, annotate) are not built by default.
+Rebuild with `--features experimental` to enable them.
 ")]
 struct Cli {
     /// Silence all output except errors. Overrides `--verbose`.
@@ -511,40 +511,39 @@ adapter fingerprint.
         args: Vec<String>,
     },
 
-    /// Build .p5s read index for fast UUID lookup (experimental; requires `--features experimental`)
-    #[cfg(feature = "experimental")]
+    /// Build the .p5s caches — read index and signal batch geometry — for fast
+    /// read lookup and fast signal access
     #[command(after_help = "\
+Both caches are rebuildable from the POD5, which is never modified. The read
+index gives O(log n) lookup by read ID; the signal batch geometry saves a
+scattered read of every signal batch header, which is paid on every process
+start otherwise and grows with the file.
+
+Worth running once on a networked node before submitting jobs against a large
+file — the same reason `escpod resquiggle models fetch` exists.
+
 Examples:
   escpod index input.pod5                   Index one file
   escpod index *.pod5                       Index all POD5 files
   escpod index data_dir/                    Index directory recursively
-  escpod index input.pod5 --force           Overwrite existing index
+  escpod index input.pod5 --force           Rebuild an existing sidecar
+
+A sidecar that already holds both caches is skipped; one missing either (e.g.
+written by `demux --annotate`, which records the index but not the geometry) is
+completed in place, preserving annotations and scores.
 ")]
     Index {
         /// Input POD5 file(s) or directory
         #[arg(required = true, value_name = "FILES")]
         inputs: Vec<PathBuf>,
 
-        /// Rebuild existing .p5s indexes (annotations are preserved)
+        /// Rebuild existing .p5s sidecars (annotations are preserved)
         #[arg(short, long)]
         force: bool,
 
         /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
         #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
-    },
-
-    /// Build .p5s read index for fast UUID lookup (rebuild with `--features experimental` to enable)
-    #[cfg(not(feature = "experimental"))]
-    #[command(hide = true)]
-    Index {
-        /// Index arguments (ignored; feature not enabled)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
     },
 
     /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar (experimental; requires `--features experimental`)
@@ -609,7 +608,7 @@ Examples:
         #[arg(long)]
         remove_design: bool,
 
-        /// Replace a stale or unreadable sidecar instead of erroring
+        /// Replace a sidecar bound to a different POD5 instead of erroring
         #[arg(long)]
         force: bool,
 
@@ -649,10 +648,7 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         | Commands::Subset { threads, .. }
         | Commands::BamFilter { threads, .. } => *threads,
 
-        #[cfg(feature = "experimental")]
         Commands::Index { threads, .. } => *threads,
-        #[cfg(not(feature = "experimental"))]
-        Commands::Index { .. } => None,
 
         #[cfg(feature = "experimental")]
         Commands::Annotate { threads, .. } => *threads,
@@ -962,15 +958,11 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "experimental"))]
         Commands::Resquiggle { .. } => feature_disabled("resquiggle", "experimental"),
 
-        #[cfg(feature = "experimental")]
         Commands::Index {
             inputs,
             force,
             threads: _,
         } => commands::index::run(inputs, force),
-
-        #[cfg(not(feature = "experimental"))]
-        Commands::Index { .. } => feature_disabled("index", "experimental"),
 
         #[cfg(feature = "experimental")]
         Commands::Annotate {

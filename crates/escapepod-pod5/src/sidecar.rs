@@ -104,6 +104,103 @@ pub const P5S_READ_COUNT_KEY: &str = "escapepod:read_count";
 /// Schema-metadata key recording what wrote the sidecar.
 pub const P5S_WRITER_KEY: &str = "escapepod:writer";
 
+// ---------------------------------------------------------------------------
+// Signal batch geometry — a cache for the POD5's own layout
+// ---------------------------------------------------------------------------
+
+/// Schema-metadata key holding the signal table's per-batch row counts,
+/// run-length encoded (see [`encode_batch_rows`]).
+///
+/// This is the row count of every record batch in the POD5's *signal* table,
+/// which is the one part of that table's Arrow IPC footer that the footer
+/// itself does not carry. Recovering it means reading each batch's message
+/// header — one scattered touch per batch, and on a network filesystem that
+/// measured 15-24 ms *each* cold, 27-39% of a cold scattered fetch and a flat
+/// ~5 s per process on a 33 GB file with 8866 batches. It is also pure
+/// function of a file that never changes, so paying for it more than once is
+/// waste. `escpod index` walks it once and records the answer here.
+///
+/// Two things it deliberately is **not**:
+///
+/// * It is not an *assumption* about the stride. The obvious cheap fix is to
+///   read batch 0, assume every batch matches, and derive the rest — which the
+///   official `pod5` library and dorado do, and which `Reader::nonuniform_signal_batch`
+///   exists to catch them out on. Storing the measured counts costs a few
+///   bytes and is exact for a non-uniform file too, so escapepod does not have
+///   to make that bet at all.
+/// * It is not a change to POD5. The sidecar caches what the POD5 already
+///   says; the POD5 is never read differently because of it, and never
+///   written. A reader that finds this key still spot-checks it against the
+///   file (see `ArrowIpcFooter::parse_with_row_counts`) and falls back to the
+///   full walk if it does not fit.
+///
+/// Optional on read, like the provenance keys and for the same reason: a
+/// sidecar written before it existed still loads, and an older escpod ignores
+/// it. Adding it is therefore not a version bump.
+pub const P5S_SIGNAL_BATCH_ROWS_KEY: &str = "escapepod:signal_batch_rows";
+
+/// Cap on the encoded geometry, so a pathological file cannot bloat a sidecar.
+///
+/// Only a file whose batch row counts genuinely alternate reaches this — a
+/// uniform file encodes to about 15 bytes however many batches it has. Past
+/// the cap the key is simply omitted and readers walk the footer as before.
+const MAX_ENCODED_BATCH_ROWS: usize = 1 << 20;
+
+/// Run-length encode per-batch row counts as `"<runs>x<rows>,…"`.
+///
+/// A conformant POD5 has one run: every batch but the last holds exactly the
+/// writer's `signal_batch_size`, so 8866 batches encode as `"8865x100,1x37"`.
+/// A non-uniform file degrades gracefully to one term per run rather than
+/// being rejected — the point is to record what is there, not to insist on
+/// what should be.
+pub fn encode_batch_rows(counts: &[u64]) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut run_value = counts[0];
+    let mut run_len = 0u64;
+    for &c in counts {
+        if c == run_value {
+            run_len += 1;
+        } else {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(&format!("{run_len}x{run_value}"));
+            run_value = c;
+            run_len = 1;
+        }
+        if out.len() > MAX_ENCODED_BATCH_ROWS {
+            return None;
+        }
+    }
+    if !out.is_empty() {
+        out.push(',');
+    }
+    out.push_str(&format!("{run_len}x{run_value}"));
+    (out.len() <= MAX_ENCODED_BATCH_ROWS).then_some(out)
+}
+
+/// Decode [`encode_batch_rows`]. `None` on anything malformed — the geometry
+/// is a cache, so a value that does not parse means "walk the footer", never
+/// an error that fails the open.
+pub fn decode_batch_rows(s: &str) -> Option<Vec<u64>> {
+    let mut out = Vec::new();
+    for term in s.split(',') {
+        let (n, value) = term.split_once('x')?;
+        let n: u64 = n.parse().ok()?;
+        let value: u64 = value.parse().ok()?;
+        // A run of zero batches is meaningless, and an enormous one is a
+        // malformed value trying to make us allocate.
+        if n == 0 || out.len() as u64 + n > u32::MAX as u64 {
+            return None;
+        }
+        out.extend(std::iter::repeat_n(value, n as usize));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// What a sidecar says about its own origin.
 ///
 /// Every field is optional: sidecars written before these keys existed carry
@@ -464,6 +561,14 @@ pub struct Sidecar {
     /// What the file said about its own origin. Read-only: rewriting a sidecar
     /// re-stamps this from the file being written, never from here.
     provenance: SidecarProvenance,
+    /// Cached per-batch row counts of the POD5's signal table, if recorded.
+    ///
+    /// Unlike [`Self::provenance`] this **is** carried through a
+    /// read-modify-write: it describes the POD5, which identity binding
+    /// already proves has not changed, so an `annotate` that does not look at
+    /// the signal table has no reason to discard it. Only `escpod index`
+    /// re-measures it.
+    signal_batch_rows: Option<Vec<u64>>,
 }
 
 impl Sidecar {
@@ -485,7 +590,47 @@ impl Sidecar {
             scores: Vec::new(),
             design: None,
             provenance: SidecarProvenance::default(),
+            signal_batch_rows: None,
         }
+    }
+
+    /// The cached signal-table batch row counts, if this sidecar records them.
+    ///
+    /// See [`P5S_SIGNAL_BATCH_ROWS_KEY`] for why they are worth caching and
+    /// what they are not.
+    pub fn signal_batch_rows(&self) -> Option<&[u64]> {
+        self.signal_batch_rows.as_deref()
+    }
+
+    /// Record the signal-table batch row counts, as measured from the POD5.
+    ///
+    /// Only a caller that has actually walked the signal footer should call
+    /// this — the value is trusted (subject to the reader's spot check) on
+    /// every later open, so a guess here is worse than nothing.
+    ///
+    /// An **empty** `counts` is "I could not measure", not "there are no
+    /// batches", and leaves any existing value alone. The distinction is not
+    /// academic: `Reader::measure_signal_batch_rows` returns an empty vec for
+    /// every failure it has — no signal table, a slice past EOF, an
+    /// unparseable footer — so treating empty as a value let a single failed
+    /// re-measure erase a geometry an earlier run had recorded correctly, and
+    /// silently, since the sidecar stays valid and merely gets slow again.
+    /// Nothing is lost by declining to record: the POD5 still holds the
+    /// answer.
+    pub fn set_signal_batch_rows(&mut self, counts: Vec<u64>) {
+        if counts.is_empty() {
+            return;
+        }
+        self.signal_batch_rows = Some(counts);
+    }
+
+    /// Forget any recorded signal-table batch geometry.
+    ///
+    /// Separate from [`Self::set_signal_batch_rows`] so that discarding the
+    /// cache is something a caller has to say, rather than something an empty
+    /// vec does by accident.
+    pub fn clear_signal_batch_rows(&mut self) {
+        self.signal_batch_rows = None;
     }
 
     /// The read-index entries, sorted by UUID.
@@ -686,9 +831,90 @@ impl Sidecar {
     }
 }
 
+/// The `.p5s` version gate, shared by [`read_sidecar_file`] and
+/// [`read_sidecar_metadata`] so the two can never disagree about whether a
+/// sidecar is loadable.
+fn check_version(metadata: &HashMap<String, String>, p5s_path: &Path) -> Result<()> {
+    match metadata.get(P5S_VERSION_KEY).map(String::as_str) {
+        Some(P5S_VERSION | P5S_VERSION_SCORES) => Ok(()),
+        Some(other) => Err(Error::Parse(format!(
+            ".p5s version {other} unsupported (this escpod reads \
+             {P5S_VERSION} and {P5S_VERSION_SCORES})"
+        ))),
+        None => Err(Error::Parse(format!(
+            "{} has no {P5S_VERSION_KEY} metadata; not an escapepod sidecar",
+            p5s_path.display()
+        ))),
+    }
+}
+
+/// Why a sidecar could not be loaded — the distinction that decides whether
+/// replacing it is repair or destruction.
+///
+/// A sidecar mixes a rebuildable cache with data products that exist nowhere
+/// else: a demux run that took hours leaves its barcode and score columns here
+/// and nowhere else. So "could not load it, start fresh" is only ever right
+/// when there is nothing to lose ([`Self::Absent`]) or when what would be lost
+/// describes a different file ([`Self::Foreign`]). Every other failure —
+/// a truncated file, a transient read error, a version this build does not
+/// know — must stop the write, because the annotations are probably still
+/// there and a rebuild would replace them with an empty column set.
+#[derive(Debug)]
+pub enum SidecarLoad {
+    /// Loaded and bound to this POD5.
+    Loaded(Box<Sidecar>),
+    /// No sidecar exists. Nothing to lose.
+    Absent,
+    /// Exists, but is bound to a different (or since-replaced) POD5. Its
+    /// contents describe another file, so replacing it loses nothing that
+    /// applies here.
+    Foreign(Error),
+    /// Exists and belongs here as far as anyone can tell, but could not be
+    /// read. **Never** a reason to replace it.
+    Unreadable(Error),
+}
+
+/// Load the sidecar at `p5s_path`, classifying a failure rather than
+/// flattening it into one error.
+///
+/// Use this instead of [`read_sidecar_file`] anywhere the next step is a
+/// *write*. `read_sidecar_file` cannot tell a caller whether an error means
+/// "this belongs to another file" or "this is your data and I could not read
+/// it", and a caller that guesses wrong turns a bad read into permanent loss.
+pub fn load_sidecar_for_write(p5s_path: impl AsRef<Path>, expect: &Pod5Identity) -> SidecarLoad {
+    let p5s_path = p5s_path.as_ref();
+    if !p5s_path.exists() {
+        return SidecarLoad::Absent;
+    }
+    match read_sidecar_file(p5s_path, expect) {
+        Ok(Some(sc)) => SidecarLoad::Loaded(Box::new(sc)),
+        Ok(None) => SidecarLoad::Absent,
+        Err(e) => {
+            // Identity is the one failure that proves the contents are not
+            // about this POD5. `read_sidecar_metadata` re-reads the binding
+            // without decoding a batch, so a mismatch is separable from a
+            // sidecar that merely would not parse.
+            match read_sidecar_metadata(p5s_path, expect) {
+                Err(inner) if is_identity_mismatch(&inner) => SidecarLoad::Foreign(e),
+                _ => SidecarLoad::Unreadable(e),
+            }
+        }
+    }
+}
+
+/// Whether an error from the sidecar readers is the identity gate refusing a
+/// sidecar bound to another POD5.
+fn is_identity_mismatch(e: &Error) -> bool {
+    matches!(e, Error::Parse(msg) if msg.contains("does not match this POD5 file"))
+}
+
 /// Load the sidecar at `p5s_path`, validating it against the POD5's
 /// identity. `Ok(None)` when no sidecar exists; an error when one exists
 /// but is malformed, or bound to a different / since-replaced POD5.
+///
+/// Callers that intend to **write** the sidecar back should use
+/// [`load_sidecar_for_write`] instead, which says *why* a load failed — the
+/// difference between a sidecar worth replacing and one worth protecting.
 ///
 /// Identity is checked from the IPC footer's schema metadata before any
 /// record batch is decoded.
@@ -713,21 +939,7 @@ pub fn read_sidecar_file(
     let schema = reader.schema();
     let metadata = schema.metadata();
 
-    match metadata.get(P5S_VERSION_KEY).map(String::as_str) {
-        Some(P5S_VERSION | P5S_VERSION_SCORES) => {}
-        Some(other) => {
-            return Err(Error::Parse(format!(
-                ".p5s version {other} unsupported (this escpod reads \
-                 {P5S_VERSION} and {P5S_VERSION_SCORES})"
-            )));
-        }
-        None => {
-            return Err(Error::Parse(format!(
-                "{} has no {P5S_VERSION_KEY} metadata; not an escapepod sidecar",
-                p5s_path.display()
-            )));
-        }
-    }
+    check_version(metadata, p5s_path)?;
     // Read before the gate, not after: the mismatch message is the one place
     // provenance earns its keep, and by then we have already returned.
     let provenance = SidecarProvenance {
@@ -887,15 +1099,124 @@ pub fn read_sidecar_file(
         design.validate()?;
         sidecar.design = Some(design);
     }
+    // A geometry that will not parse is dropped, not fatal: it is a cache of
+    // something the POD5 still holds, so the cost of ignoring it is a slower
+    // open rather than a wrong answer.
+    sidecar.signal_batch_rows = metadata
+        .get(P5S_SIGNAL_BATCH_ROWS_KEY)
+        .and_then(|s| decode_batch_rows(s));
     Ok(Some(sidecar))
+}
+
+/// The parts of a sidecar that live in its schema metadata, read **without
+/// decoding any record batch**.
+///
+/// [`read_sidecar_file`] materialises every column, which for a multi-million
+/// read index is far more work than a caller that only wants the signal
+/// geometry should pay. Arrow's file reader loads the footer eagerly and the
+/// batches lazily, so this is a footer read and nothing more.
+///
+/// Identity is validated exactly as in [`read_sidecar_file`] — a sidecar bound
+/// to another POD5 is an error here too, never a silent `None`.
+pub fn read_sidecar_metadata(
+    p5s_path: impl AsRef<Path>,
+    expect: &Pod5Identity,
+) -> Result<Option<SidecarMetadata>> {
+    let p5s_path = p5s_path.as_ref();
+    let file = match File::open(p5s_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::from(e)),
+    };
+    let reader = ArrowFileReader::try_new(file, None).map_err(|e| {
+        Error::Parse(format!(
+            "{} is not a readable .p5s sidecar (legacy .p5i or corrupt?): {e}; \
+             delete it and rebuild with `escpod index` / `escpod annotate`",
+            p5s_path.display()
+        ))
+    })?;
+    let schema = reader.schema();
+    let metadata = schema.metadata();
+
+    // The same version gate `read_sidecar_file` applies, and it must stay the
+    // same. A caller that checks cheaply here and then rewrites the sidecar —
+    // `escpod index` completing a missing cache — would otherwise be told the
+    // file is fine, and only discover on the rewrite that it cannot be loaded,
+    // by which point the rewrite has already replaced annotations that took
+    // hours to compute. The two readers agreeing about "is this loadable" is
+    // what makes check-then-write safe.
+    check_version(metadata, p5s_path)?;
+
+    let provenance = SidecarProvenance {
+        source_name: metadata.get(P5S_SOURCE_NAME_KEY).cloned(),
+        read_count: metadata
+            .get(P5S_READ_COUNT_KEY)
+            .and_then(|s| s.parse().ok()),
+        writer: metadata.get(P5S_WRITER_KEY).cloned(),
+    };
+    let stored_file_id = metadata
+        .get(P5S_FILE_ID_KEY)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| Error::Parse(format!("{} has no valid file id", p5s_path.display())))?;
+    let stored_size: u64 = metadata
+        .get(P5S_POD5_SIZE_KEY)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Parse(format!("{} has no valid pod5 size", p5s_path.display())))?;
+    if stored_file_id != expect.file_id || stored_size != expect.size {
+        let origin = provenance
+            .describe()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        return Err(Error::Parse(format!(
+            "{} does not match this POD5 file (stale or copied from another){}; \
+             rebuild with `escpod index` / `escpod annotate`",
+            p5s_path.display(),
+            origin
+        )));
+    }
+
+    Ok(Some(SidecarMetadata {
+        provenance,
+        signal_batch_rows: metadata
+            .get(P5S_SIGNAL_BATCH_ROWS_KEY)
+            .and_then(|s| decode_batch_rows(s)),
+    }))
+}
+
+/// What [`read_sidecar_metadata`] recovers from a sidecar's schema metadata.
+#[derive(Debug, Clone, Default)]
+pub struct SidecarMetadata {
+    /// What the sidecar says about its own origin.
+    pub provenance: SidecarProvenance,
+    /// Cached per-batch row counts of the POD5's signal table, if recorded.
+    pub signal_batch_rows: Option<Vec<u64>>,
 }
 
 /// Atomically write a sidecar, bound to `identity`. The destination is
 /// either the previous sidecar or the complete new one — never a torn mix.
+///
+/// This overwrites unconditionally. A caller doing a read-modify-write should
+/// prefer [`write_sidecar_file_checked`], which additionally refuses to
+/// discard an update that landed in between.
 pub fn write_sidecar_file(
     p5s_path: impl AsRef<Path>,
     identity: &Pod5Identity,
     sidecar: &Sidecar,
+) -> Result<()> {
+    write_sidecar_file_checked(p5s_path, identity, sidecar, None)
+}
+
+/// [`write_sidecar_file`], refusing the write if the destination changed since
+/// `expect_unchanged` was taken.
+///
+/// The guard exists because a sidecar is not only a cache: a `demux --annotate`
+/// run that took hours leaves its barcode and score columns here and nowhere
+/// else. See [`SidecarStamp`] for the race this closes and the one it does not.
+pub fn write_sidecar_file_checked(
+    p5s_path: impl AsRef<Path>,
+    identity: &Pod5Identity,
+    sidecar: &Sidecar,
+    expect_unchanged: Option<&SidecarStamp>,
 ) -> Result<()> {
     let mut metadata = HashMap::new();
     let version = if sidecar.scores.is_empty() {
@@ -934,6 +1255,14 @@ pub fn write_sidecar_file(
         let json = serde_json::to_string(design)
             .map_err(|e| Error::Parse(format!("design serialization failed: {e}")))?;
         metadata.insert(P5S_DESIGN_KEY.to_string(), json);
+    }
+    // Carried from the struct rather than re-derived, unlike provenance above:
+    // this describes the POD5, not this write, and identity binding already
+    // proves the POD5 is the same one.
+    if let Some(counts) = &sidecar.signal_batch_rows
+        && let Some(encoded) = encode_batch_rows(counts)
+    {
+        metadata.insert(P5S_SIGNAL_BATCH_ROWS_KEY.to_string(), encoded);
     }
 
     let mut fields = vec![
@@ -1015,7 +1344,64 @@ pub fn write_sidecar_file(
 
     let atomic = AtomicFile::new(p5s_path.as_ref())?;
     std::fs::write(atomic.temp_path()?, &buf)?;
+    if let Some(expected) = expect_unchanged {
+        // Last check before the rename. See `SidecarStamp`.
+        expected.verify(p5s_path.as_ref())?;
+    }
     atomic.commit()
+}
+
+/// A cheap fingerprint of a sidecar file, taken when it is read and checked
+/// again immediately before it is overwritten.
+///
+/// The atomic write makes a sidecar update all-or-nothing, which prevents a
+/// *torn* file — but says nothing about a **lost update**. The realistic case
+/// is not corruption, it is two writers: a `demux --annotate` run that takes
+/// hours is still going when someone runs `escpod index` on the same file to
+/// speed it up. Index reads the sidecar as it is now, demux finishes and
+/// writes its barcodes, index finishes and renames over them. Nothing errors,
+/// nothing is corrupt, and hours of classification are gone.
+///
+/// Comparing size and mtime across the read-modify-write closes the window a
+/// caller actually has. It is not a lock and does not pretend to be: two
+/// writers that interleave inside the stat granularity can still race, and the
+/// remedy for that is not to run two writers. What it does guarantee is that
+/// an update which visibly landed in between is never silently discarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl SidecarStamp {
+    /// Fingerprint the sidecar at `p5s_path`, or `None` if it does not exist.
+    ///
+    /// Take this *before* the slow part of a read-modify-write (the index
+    /// scan, the geometry walk), so the window it covers is the whole
+    /// operation rather than its last instant.
+    pub fn of(p5s_path: impl AsRef<Path>) -> Option<Self> {
+        let meta = std::fs::metadata(p5s_path.as_ref()).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+
+    /// Fail if the sidecar no longer matches this fingerprint.
+    fn verify(&self, p5s_path: &Path) -> Result<()> {
+        let now = Self::of(p5s_path);
+        if now.as_ref() == Some(self) {
+            return Ok(());
+        }
+        Err(Error::Parse(format!(
+            "{} changed while it was being updated — another process (a demux \
+             run finishing, or a concurrent `escpod index`) wrote it in the \
+             meantime. Refusing to overwrite, because that write may hold \
+             annotations or scores that exist nowhere else. Re-run this \
+             command.",
+            p5s_path.display()
+        )))
+    }
 }
 
 fn downcast_u32<'a>(batch: &'a RecordBatch, idx: usize, name: &str) -> Result<&'a UInt32Array> {

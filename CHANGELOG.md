@@ -40,6 +40,128 @@
 
 ### Changed
 
+- **The `.p5s` sidecar now caches the POD5 signal table's batch geometry, and a
+  scattered fetch stops paying for it.** Row count is the one field an Arrow IPC
+  footer does not carry — the footer's `Block` records offset, metadata length
+  and body length, and nothing else — so recovering it means reading every
+  record batch's own message header. That is one scattered mmap touch per batch,
+  measured at 15–24 ms *each* cold on BeeGFS, and it is paid on every process
+  start rather than once: a 33 GB file with 8866 signal batches spent 4.95 s
+  there, **78% of a cold 5000-read scattered fetch**, warm or cold alike.
+
+  `escpod index` now walks it once and records the answer in the sidecar under
+  `escapepod:signal_batch_rows`, run-length encoded (a conformant file is one
+  run and a short tail — `"8865x100,1x37"`, about 15 bytes however many batches
+  it has). Measured on real data, footer parse drops from **4.95 s to 4.82 ms**
+  on that file (8866 batches) and from 149 ms to 2.96 ms on a 3.7 GB file with
+  266 batches, with byte-identical results — the same 226,235,036 samples over
+  the same 5000 reads either way. Loading the read index from the sidecar
+  instead of building it improves in the same pass (249 ms → 59 ms).
+
+  **The POD5 is neither modified nor read differently.** The cheap fix would
+  have been to read batch 0 and assume every batch matches — which is what the
+  official `pod5` library and dorado do, and what `Reader::nonuniform_signal_batch`
+  exists to catch them out on. Recording the *measured* counts costs a handful
+  of bytes, is exact for a non-uniform file too, and means escapepod never makes
+  that bet. The cached geometry is then checked rather than believed: it is used
+  only if it has one entry per batch the footer describes, and the first and
+  last batches are read for real and compared (the last is the short one, so a
+  geometry from a file with a different read count disagrees there). Any
+  mismatch logs a warning and falls back to the full walk, so a stale cache
+  costs time and never correctness.
+
+  Adding the key is not a `.p5s` version bump, on the same footing as the
+  provenance keys: it is optional on read, a sidecar written before it existed
+  still loads, and an older escpod ignores it. A sidecar bound to another POD5
+  is rejected by the existing identity check before the geometry is looked at.
+  A sidecar written by an earlier version gains the geometry on its next write
+  of any kind; one that already has it carries it through untouched.
+
+- **Every `.p5s` write records the geometry, and `escpod index` is no longer
+  gated.** As first written, only `Reader::build_and_write_index` recorded it —
+  and that made the cache close to unreachable, for two compounding reasons.
+  `escpod index` is behind `--features experimental`, and **no release binary is
+  built with it**, so nobody on a prebuilt `escpod` could run the command at all;
+  meanwhile `demux --annotate`, which is the documented and default-build route
+  to a sidecar, went through `write_columns` and never measured. The common
+  workflow therefore produced a sidecar with a read index and no geometry, and
+  then re-walked every batch header on each subsequent run.
+
+  Three changes close that. `Reader::write_sidecar` is now the funnel every
+  sidecar write goes through and records the geometry when the sidecar lacks it,
+  so `demux --annotate`, `escpod annotate` and `escpod annotate --design` all
+  produce a complete sidecar and a later path cannot forget. `escpod index` is
+  ungated — it builds caches that are always rebuildable from an untouched POD5,
+  which is a different proposition from `escpod annotate` (still experimental)
+  writing data products that exist nowhere else. And `escpod index` no longer
+  skips a sidecar that has an index but no geometry: its "already indexed" check
+  predated the second cache, so the obvious remedy for a slow file reported
+  success and did nothing. Annotations and scores are preserved by the rebuild,
+  as before.
+
+  A failed re-measure can no longer erase a recorded geometry, either.
+  `Sidecar::set_signal_batch_rows` treated an empty vec as a value, and
+  `Reader::measure_signal_batch_rows` returns an empty vec for every failure it
+  has — no signal table, a slice past EOF, an unparseable footer. So one failed
+  measure during `escpod index --force` would drop a geometry an earlier run had
+  recorded correctly, and silently, since the sidecar stays valid and merely
+  gets slow again. Empty now means "could not measure" and leaves the existing
+  value alone; discarding one requires the new `clear_signal_batch_rows`.
+
+- **A sidecar that will not load is no longer treated as a sidecar worth
+  discarding.** Every write path answered a failed load the same way: `escpod
+  annotate --force`, `demux --annotate` with overwrite, and `write_design` all
+  matched `Err(_) if overwrite => Sidecar::new(scan)`, and
+  `Reader::build_and_write_index` went further still with `Ok(None) | Err(_) =>
+  Sidecar::default()` — no `--force` required. That collapses two situations
+  that are not alike. `--force` means *this sidecar belongs to a POD5 that has
+  since been replaced*, and replacing it loses nothing that applies here. It
+  does not mean *this file is truncated*, or *this file was written by a newer
+  escpod*, where the barcode and score columns a demux run spent hours on are
+  still sitting there intact and the rebuild would overwrite them with an empty
+  column set — quietly, since the result is a perfectly valid sidecar.
+
+  The new `SidecarLoad` / `load_sidecar_for_write` split the cases: `Absent` and
+  `Foreign` may be replaced, `Unreadable` is refused, and `--force` now only
+  licenses the first two. Nothing is lost by refusing — the POD5 is untouched
+  and the sidecar is still on disk, so a version this build cannot read stays
+  readable by the build that can.
+
+  `read_sidecar_metadata` gained the version gate `read_sidecar_file` already
+  had. The two readers disagreeing is what makes check-then-write unsound:
+  `escpod index` uses the cheap metadata read to decide whether a rewrite is
+  needed, so a file the cheap read accepts and the full read rejects gets
+  reported as fine and then fails once the rewrite is already committed to.
+
+- **A concurrent sidecar update is no longer silently discarded.** The atomic
+  write made a `.p5s` update all-or-nothing, which rules out a torn file and
+  says nothing about a second writer. The case that actually happens is not
+  corruption: a `demux --annotate` run that takes hours is still going when
+  someone runs `escpod index` on the same file to make it faster. Index reads
+  the sidecar as it is, demux finishes and writes its barcodes, index finishes
+  and renames over them. Nothing errors, nothing is corrupt, and the
+  classification is gone.
+
+  `SidecarStamp` fingerprints the file (size + mtime) when it is read and
+  re-checks immediately before the rename; `write_sidecar_file_checked` refuses
+  the write if it changed. It is not a lock and does not pretend to be — two
+  writers interleaving inside stat granularity can still race, and the remedy
+  for that is not to run two writers — but an update that visibly landed in
+  between is never thrown away without a word. `write_sidecar_file` keeps its
+  unconditional behaviour for callers that did not read first.
+
+- **`escapepod-pod5` no longer re-parses the signal footer inside every bulk
+  fetch.** `get_signal_bulk_prefix`, `get_compressed_signal_bulk` and
+  `signal_extractor` each called `ArrowIpcFooter::parse` on entry, bypassing the
+  parse the `Reader` already had cached. Also sorts rows within a batch in
+  `extract_signal_rows`, which previously visited them in request order — and a
+  request assembled by iterating a `HashSet<Uuid>`, which is what `reads_by_ids`
+  hands down, has no order at all. Neither change is measurable on the
+  workloads tested (repeat walks are cheap once the region is mapped; a sparse
+  pick lands under one target per batch), and both are kept as strictly less
+  work. The cost they were suspected of is the one the geometry cache above
+  actually removes.
+
 - **BREAKING: `cnn-gpu` and `crf-gpu` are gone; `gpu` is the single GPU Cargo
   feature.** Anyone building with `--features cnn-gpu` or `--features crf-gpu`
   must switch to `--features gpu`, on `escapepod-cli` and `escapepod-demux`

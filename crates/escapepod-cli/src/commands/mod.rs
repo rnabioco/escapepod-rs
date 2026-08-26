@@ -9,7 +9,6 @@ pub mod bam_filter;
 #[cfg(feature = "demux")]
 pub mod demux;
 pub mod filter;
-#[cfg(feature = "experimental")]
 pub mod index;
 pub mod inspect;
 pub mod merge;

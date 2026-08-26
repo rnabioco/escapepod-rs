@@ -34,9 +34,14 @@ pub(crate) fn decode_chunks(chunks: &[RawSignalChunk<'_>], max_samples: usize) -
 /// Holds an immutable reference to the memory-mapped signal table bytes and
 /// a pre-parsed Arrow IPC footer. Because it contains only immutable data,
 /// it is `Send + Sync` and can be shared across rayon threads.
+///
+/// The footer is a `Cow` so the common case borrows the one the `Reader`
+/// already parsed and cached instead of walking every record batch header
+/// again — see `Reader::signal_footer_for_bulk` for why that walk is the
+/// expensive part.
 pub struct SignalExtractor<'a> {
     pub(super) signal_bytes: &'a [u8],
-    pub(super) footer: crate::arrow_ipc::ArrowIpcFooter,
+    pub(super) footer: std::borrow::Cow<'a, crate::arrow_ipc::ArrowIpcFooter>,
 }
 
 impl<'a> SignalExtractor<'a> {

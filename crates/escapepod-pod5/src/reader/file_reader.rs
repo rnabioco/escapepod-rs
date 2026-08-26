@@ -10,6 +10,7 @@ use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, SECTION_MARKER_LENGTH,
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Cursor;
@@ -250,6 +251,13 @@ impl Reader {
     /// row and slice its compressed bytes straight out of the mmap. Returns
     /// `None` when the file has no signal table, the table extends past EOF, or
     /// the footer is empty/unparseable — callers fall back to the Arrow reader.
+    ///
+    /// The per-batch row counts come from the `.p5s` sidecar when it records
+    /// them, which turns the one genuinely expensive part of this parse — a
+    /// scattered read of every batch's message header — into two. See
+    /// [`crate::sidecar::P5S_SIGNAL_BATCH_ROWS_KEY`]; the geometry is spot
+    /// checked against the file before use, so a stale one costs time, never
+    /// correctness.
     fn signal_ipc_footer(&self) -> Option<&ArrowIpcFooter> {
         self.signal_ipc_footer
             .get_or_init(|| {
@@ -257,13 +265,58 @@ impl Reader {
                 let start = embedded.offset as usize;
                 let end = start + embedded.length as usize;
                 let slice = self.mmap.get(start..end)?;
-                let footer = ArrowIpcFooter::parse(slice).ok()?;
+                let known = self.sidecar_signal_batch_rows();
+                let footer = ArrowIpcFooter::parse_with_row_counts(slice, known.as_deref()).ok()?;
                 if footer.record_batches.is_empty() || footer.total_rows == 0 {
                     return None;
                 }
                 Some(footer)
             })
             .as_ref()
+    }
+
+    /// The signal batch geometry recorded by this POD5's `.p5s`, if any.
+    ///
+    /// Reads the sidecar's schema metadata only — no record batch is decoded,
+    /// so this does not pay for the multi-million-row read index just to
+    /// recover a few numbers, and it stays cheap for a reader that will never
+    /// look up a read by id.
+    ///
+    /// Every failure here is `None`: a missing sidecar, one bound to another
+    /// POD5, an unreadable one. This is a cache lookup on a path where the
+    /// answer is always recoverable from the POD5 itself, so it must not be
+    /// the thing that fails an open. The same sidecar being wrong is still a
+    /// loud error on the paths that *depend* on it — [`Self::read_index`]
+    /// keeps that behaviour, and this deliberately does not duplicate it.
+    fn sidecar_signal_batch_rows(&self) -> Option<Vec<u64>> {
+        let p5s_path = self.p5s_path()?;
+        let identity = self.sidecar_identity().ok()?;
+        let meta = crate::sidecar::read_sidecar_metadata(&p5s_path, &identity).ok()??;
+        meta.signal_batch_rows
+    }
+
+    /// The signal footer for a bulk fetch — the cached one wherever there is
+    /// one, rather than a fresh parse per call.
+    ///
+    /// [`ArrowIpcFooter::parse`] is not the cheap tail read its name suggests:
+    /// it calls `parse_batch_row_count` for **every** record batch, which is
+    /// one scattered mmap touch per batch — thousands on a large file, each a
+    /// round trip on a network filesystem. The bulk paths used to re-parse it
+    /// on entry, so a driver that chunks a large id set into N calls paid that
+    /// whole walk N times to rebuild descriptors [`Self::signal_ipc_footer`]
+    /// had already cached. That is the cost that made scattered access over a
+    /// large POD5 so much worse than the bytes it moves would explain.
+    ///
+    /// The owned arm is reached only for the degenerate tables the cache
+    /// deliberately reports as `None` (no batches, no rows, unparseable).
+    /// There the previous behaviour is an empty footer whose every lookup
+    /// misses, which is what each caller's fallback below is written against —
+    /// so it is reproduced rather than turned into an error.
+    fn signal_footer_for_bulk(&self, signal_bytes: &[u8]) -> Result<Cow<'_, ArrowIpcFooter>> {
+        match self.signal_ipc_footer() {
+            Some(footer) => Ok(Cow::Borrowed(footer)),
+            None => Ok(Cow::Owned(ArrowIpcFooter::parse(signal_bytes)?)),
+        }
     }
 
     /// Get the file identifier (UUID).
@@ -652,11 +705,10 @@ impl Reader {
         reads: &[(K, Vec<u64>)],
         max_samples: usize,
     ) -> Result<Vec<(K, Vec<i16>)>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
         use rayon::prelude::*;
 
         let signal_bytes = self.signal_table_bytes()?;
-        let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let signal_footer = self.signal_footer_for_bulk(signal_bytes)?;
 
         // Flatten every read's rows into one list so the extraction is a single
         // batch-grouped, ascending-order sweep (see `get_compressed_signal_bulk`
@@ -720,10 +772,8 @@ impl Reader {
         &self,
         reads: &[(K, Vec<u64>)],
     ) -> Result<Vec<(K, Vec<CompressedSignalChunk>)>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
-
         let signal_bytes = self.signal_table_bytes()?;
-        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let footer = self.signal_footer_for_bulk(signal_bytes)?;
 
         // Flatten to a single row list, keeping a back-reference to which read
         // and which position-within-read each row came from.
@@ -780,10 +830,8 @@ impl Reader {
     /// shared across rayon threads (`Send + Sync`). Each thread can call
     /// `extractor.get_signal(&signal_rows)` independently without contention.
     pub fn signal_extractor(&self) -> Result<SignalExtractor<'_>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
-
         let signal_bytes = self.signal_table_bytes()?;
-        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let footer = self.signal_footer_for_bulk(signal_bytes)?;
 
         Ok(SignalExtractor {
             signal_bytes,
@@ -1187,24 +1235,166 @@ impl Reader {
         Ok(self.read_index.get_or_init(|| index))
     }
 
+    /// Measure the signal table's per-batch row counts by actually reading
+    /// every batch header, ignoring any cached geometry.
+    ///
+    /// This is the expensive walk itself. Only `escpod index` should want it:
+    /// its whole job is to pay a cost once so that later opens do not, and a
+    /// command that *writes* the cache must not seed it from the cache.
+    fn measure_signal_batch_rows(&self) -> Vec<u64> {
+        let Some(embedded) = self.footer.signal_table() else {
+            return Vec::new();
+        };
+        let start = embedded.offset as usize;
+        let end = start + embedded.length as usize;
+        let Some(slice) = self.mmap.get(start..end) else {
+            return Vec::new();
+        };
+        match ArrowIpcFooter::parse_with_row_counts(slice, None) {
+            Ok(footer) => footer.record_batches.iter().map(|b| b.row_count).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Build the read index and write it to the `.p5s` sidecar.
     ///
     /// Annotations in a valid existing sidecar are preserved; a stale or
     /// unreadable sidecar is replaced outright (its contents were bound to
     /// a different file and unusable anyway). This is called by the
     /// `escpod index` CLI command.
+    ///
+    /// Also records the signal table's batch geometry, which is the other
+    /// per-file constant a reader would otherwise rediscover the hard way —
+    /// see [`crate::sidecar::P5S_SIGNAL_BATCH_ROWS_KEY`]. Measured here rather
+    /// than carried over, because this is the command that exists to measure.
     pub fn build_and_write_index<P: AsRef<Path>>(&self, output: P) -> Result<usize> {
+        use crate::sidecar::{SidecarLoad, SidecarStamp, load_sidecar_for_write};
+
+        let identity = self.sidecar_identity()?;
+        // Fingerprint first, so the guard covers the scan and the walk below
+        // rather than just the instant before the rename.
+        let stamp = SidecarStamp::of(output.as_ref());
+
         let index = self.build_read_index_from_scan()?;
         let count = index.len();
-        let identity = self.sidecar_identity()?;
 
-        let mut sidecar = match crate::sidecar::read_sidecar_file(output.as_ref(), &identity) {
-            Ok(Some(existing)) => existing,
-            Ok(None) | Err(_) => crate::sidecar::Sidecar::default(),
+        let started = std::time::Instant::now();
+        let batch_rows = self.measure_signal_batch_rows();
+        tracing::debug!(
+            batches = batch_rows.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "measured signal batch geometry"
+        );
+
+        // Which failures justify starting from an empty sidecar is the whole
+        // question here. `Err(_) => Sidecar::default()` used to answer "all of
+        // them", which quietly turned a transient read error — or a version
+        // this build does not know — into the permanent loss of barcode and
+        // score columns that a demux run spent hours producing. Only an absent
+        // sidecar, or one proven to describe a different POD5, is safe to
+        // replace.
+        let mut sidecar = match load_sidecar_for_write(output.as_ref(), &identity) {
+            SidecarLoad::Loaded(existing) => *existing,
+            SidecarLoad::Absent => crate::sidecar::Sidecar::default(),
+            SidecarLoad::Foreign(e) => {
+                tracing::warn!(
+                    "{e} — rebuilding; any annotations or scores it held described \
+                     another file and are discarded"
+                );
+                crate::sidecar::Sidecar::default()
+            }
+            SidecarLoad::Unreadable(e) => return Err(e),
         };
         sidecar.set_entries(index.entries.clone());
-        crate::sidecar::write_sidecar_file(output.as_ref(), &identity, &sidecar)?;
+        // Empty means the measure failed, and `set_signal_batch_rows` declines
+        // it rather than erasing what a previous run recorded.
+        sidecar.set_signal_batch_rows(batch_rows);
+        crate::sidecar::write_sidecar_file_checked(
+            output.as_ref(),
+            &identity,
+            &sidecar,
+            stamp.as_ref(),
+        )?;
         Ok(count)
+    }
+
+    /// Write `sidecar` next to this POD5, recording the signal batch geometry
+    /// if it does not already carry it.
+    ///
+    /// **The funnel every sidecar write should go through.** The geometry is a
+    /// per-file constant that costs a scattered read of every batch header to
+    /// recover (see [`crate::sidecar::P5S_SIGNAL_BATCH_ROWS_KEY`]), so a
+    /// sidecar that omits it condemns every later open to pay again. It used
+    /// to be recorded only by [`Self::build_and_write_index`], which meant the
+    /// sidecars real workflows actually produce — `demux --annotate`,
+    /// `escpod annotate` — never had it, and re-measured on every run.
+    /// Routing the writes through here is what makes that impossible to
+    /// forget in a path added later.
+    ///
+    /// Costs nothing when the sidecar already carries a geometry: identity
+    /// binding has already proved the POD5 is the same file, so a recorded
+    /// value cannot have gone stale under it. Otherwise this is
+    /// [`Self::signal_batch_row_counts`], which is free if the footer is
+    /// already parsed on this reader and a full walk if it is not.
+    ///
+    /// [`Self::build_and_write_index`] deliberately does **not** use this: it
+    /// is the command whose job is to rebuild the cache, so it re-measures
+    /// even when a value is present.
+    /// `stamp` is the fingerprint the caller took when it *read* the sidecar it
+    /// is now writing back; the write is refused if the file changed since.
+    /// Pass `None` only when writing a sidecar that was not read first.
+    pub fn write_sidecar<P: AsRef<Path>>(
+        &self,
+        output: P,
+        sidecar: &mut crate::sidecar::Sidecar,
+        stamp: Option<&crate::sidecar::SidecarStamp>,
+    ) -> Result<()> {
+        let identity = self.sidecar_identity()?;
+        if sidecar.signal_batch_rows().is_none() {
+            let started = std::time::Instant::now();
+            let batch_rows = self.signal_batch_row_counts();
+            tracing::debug!(
+                batches = batch_rows.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "recording signal batch geometry in a sidecar that lacked it"
+            );
+            sidecar.set_signal_batch_rows(batch_rows);
+        }
+        crate::sidecar::write_sidecar_file_checked(output.as_ref(), &identity, sidecar, stamp)
+    }
+
+    /// Add the signal batch geometry to an existing sidecar, touching nothing
+    /// else.
+    ///
+    /// The safe way to complete a sidecar that has a read index but no
+    /// geometry — which is every sidecar `demux --annotate` wrote before the
+    /// geometry existed. The alternative, [`Self::build_and_write_index`],
+    /// re-scans the reads table and rewrites every column, and a rebuild is a
+    /// bad trade when the only thing missing is a cache: the columns it would
+    /// pass through are barcode assignments and scores that took hours to
+    /// compute and exist nowhere else. This loads, sets one metadata key, and
+    /// writes.
+    ///
+    /// Returns whether anything was written — `false` when the sidecar already
+    /// had a geometry, or when there is no sidecar to complete.
+    pub fn complete_sidecar_geometry<P: AsRef<Path>>(&self, output: P) -> Result<bool> {
+        use crate::sidecar::{SidecarLoad, SidecarStamp, load_sidecar_for_write};
+
+        let identity = self.sidecar_identity()?;
+        let stamp = SidecarStamp::of(output.as_ref());
+        let mut sidecar = match load_sidecar_for_write(output.as_ref(), &identity) {
+            SidecarLoad::Loaded(sc) => *sc,
+            // Nothing to complete, and nothing to lose either way. Building a
+            // sidecar from scratch is `build_and_write_index`'s job, not this
+            // one's — this exists precisely to avoid doing that by accident.
+            SidecarLoad::Absent => return Ok(false),
+            SidecarLoad::Foreign(e) | SidecarLoad::Unreadable(e) => return Err(e),
+        };
+        if sidecar.signal_batch_rows().is_some() {
+            return Ok(false);
+        }
+        self.write_sidecar(output.as_ref(), &mut sidecar, stamp.as_ref())?;
+        Ok(true)
     }
 
     // ------------------------------------------------------------------

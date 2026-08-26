@@ -11,7 +11,7 @@ default build with output formats that are still stabilizing.
 |---------|-------------|---------|
 | [demux](demux.md) | *(default build)* | Barcode demultiplexing — fused pipeline, stepwise subcommands, sidecar output |
 | [annotate](annotate.md) | `--features experimental` | Record per-read annotations (demux barcodes, designs) in the `.p5s` sidecar |
-| `index` | `--features experimental` | Build the `.p5s` sidecar read index for O(log n) read-ID lookup |
+| `index` | *(default build)* | Build the `.p5s` caches — read index for O(log n) read-ID lookup, and the signal batch geometry that saves a scattered read of every signal batch header |
 | [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
 | [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
 
@@ -90,11 +90,13 @@ dependent columns, and writing a derived column directly is refused — the
 design stays the source of truth. See [annotate](annotate.md) for the full
 command reference.
 
-Note the split in feature gates: *writing* sidecars with `escpod index` /
-`escpod annotate` needs `--features experimental`, while everything that
-*consumes* them — `demux --annotate`, `demux split --sidecar`,
-`filter --annotation`, `view`, `inspect summary` — works in the default
-build.
+Note the split in feature gates. `escpod index` and everything that *consumes*
+a sidecar — `demux split --sidecar`, `filter --annotation`, `view`,
+`inspect summary` — work in the default build. So does `demux --annotate`,
+which is the usual way a sidecar comes into existence in the first place.
+Only `escpod annotate` needs `--features experimental`: `index` builds caches
+that can always be rebuilt from the POD5, while `annotate` writes data products
+that exist nowhere else.
 
 This format replaces the earlier `.p5i` index sidecar; delete any `.p5i`
 files and rerun `escpod index`.

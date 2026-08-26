@@ -21,9 +21,15 @@ use crate::types::Uuid;
 pub struct AnnotateOptions {
     /// Annotation (column) name to write.
     pub name: String,
-    /// Replace an existing sidecar even if it is stale or unreadable.
-    /// Without this, a valid sidecar is merged into (other annotations and
-    /// the index are preserved) and an invalid one is an error.
+    /// Replace a sidecar that is bound to a *different* POD5 — one left
+    /// behind by a file that has since been replaced, whose contents describe
+    /// something else. Without this, a valid sidecar is merged into (other
+    /// annotations and the index are preserved) and a stale one is an error.
+    ///
+    /// This is **not** a licence to replace a sidecar that merely failed to
+    /// load. A truncated file, or a version this build does not know, is
+    /// refused either way: the annotations are probably still there, and a
+    /// rebuild would replace them with an empty column set.
     pub overwrite: bool,
 }
 
@@ -147,15 +153,29 @@ pub fn write_columns(
     let p5s_path = sidecar_path(pod5_path);
 
     // Reuse a valid existing sidecar (its index entries are bound to this
-    // exact POD5); otherwise build the index entries by scanning. A stale
-    // or unreadable sidecar is only replaced under `overwrite`.
-    let mut sc = match sidecar::read_sidecar_file(&p5s_path, &identity) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec()),
-        Err(_) if overwrite => {
+    // exact POD5); otherwise build the index entries by scanning.
+    //
+    // `overwrite` licenses replacing a sidecar that will not load — but it was
+    // meant for the *stale* case, a sidecar left behind by a POD5 that has
+    // since been replaced. Extending it to every read failure means a
+    // truncated file or a version this build does not know is answered by
+    // silently discarding barcode and score columns that a demux run spent
+    // hours on. `--force` is a statement about a sidecar that belongs to
+    // another file, not a licence to destroy this one's data on any error.
+    let stamp = sidecar::SidecarStamp::of(&p5s_path);
+    let mut sc = match sidecar::load_sidecar_for_write(&p5s_path, &identity) {
+        sidecar::SidecarLoad::Loaded(existing) => *existing,
+        sidecar::SidecarLoad::Absent => {
             Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec())
         }
-        Err(e) => return Err(e),
+        sidecar::SidecarLoad::Foreign(e) if overwrite => {
+            tracing::warn!(
+                "{e} — replacing; any annotations or scores it held described \
+                 another file and are discarded"
+            );
+            Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec())
+        }
+        sidecar::SidecarLoad::Foreign(e) | sidecar::SidecarLoad::Unreadable(e) => return Err(e),
     };
 
     let mut stats = Vec::with_capacity(columns.len());
@@ -220,7 +240,7 @@ pub fn write_columns(
     if touched_key {
         sc.derive_design_columns()?;
     }
-    sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
+    reader.write_sidecar(&p5s_path, &mut sc, stamp.as_ref())?;
 
     Ok(ColumnsResult {
         total_reads: sc.len(),
@@ -237,9 +257,10 @@ pub struct DesignOptions {
     /// matches an existing annotation is a key; the rest are experimental
     /// variables.
     pub keys: Option<Vec<String>>,
-    /// Replace an existing sidecar even if it is stale or unreadable
-    /// (annotations are lost — a design needs its key annotations, so this
-    /// is mostly useful for recovery).
+    /// Replace a sidecar bound to a *different* POD5 (annotations are lost —
+    /// a design needs its key annotations, so this is mostly useful for
+    /// recovery). As in [`AnnotateOptions::overwrite`], a sidecar that simply
+    /// would not load is refused rather than replaced.
     pub overwrite: bool,
 }
 
@@ -275,13 +296,22 @@ pub fn write_design(
     let identity = reader.sidecar_identity()?;
     let p5s_path = sidecar_path(pod5_path);
 
-    let mut sc = match sidecar::read_sidecar_file(&p5s_path, &identity) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec()),
-        Err(_) if options.overwrite => {
+    // Same classification as `write_columns` — see there for why `overwrite`
+    // may not stand in for "any read failure".
+    let stamp = sidecar::SidecarStamp::of(&p5s_path);
+    let mut sc = match sidecar::load_sidecar_for_write(&p5s_path, &identity) {
+        sidecar::SidecarLoad::Loaded(existing) => *existing,
+        sidecar::SidecarLoad::Absent => {
             Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec())
         }
-        Err(e) => return Err(e),
+        sidecar::SidecarLoad::Foreign(e) if options.overwrite => {
+            tracing::warn!(
+                "{e} — replacing; any annotations or scores it held described \
+                 another file and are discarded"
+            );
+            Sidecar::new(reader.build_read_index_from_scan()?.entries().to_vec())
+        }
+        sidecar::SidecarLoad::Foreign(e) | sidecar::SidecarLoad::Unreadable(e) => return Err(e),
     };
 
     let design = parse_design_csv(design_csv.as_ref(), options.keys.as_deref(), &sc)?;
@@ -290,7 +320,7 @@ pub fn write_design(
 
     sc.set_design(design)?;
     let derived = sc.derive_design_columns()?;
-    sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
+    reader.write_sidecar(&p5s_path, &mut sc, stamp.as_ref())?;
 
     Ok(DesignResult {
         key_columns: result_columns.0,
@@ -310,6 +340,7 @@ pub fn remove_annotation(pod5_path: impl AsRef<Path>, name: &str) -> Result<bool
     let identity = reader.sidecar_identity()?;
     let p5s_path = sidecar_path(pod5_path);
 
+    let stamp = sidecar::SidecarStamp::of(&p5s_path);
     let mut sc = sidecar::read_sidecar_file(&p5s_path, &identity)?
         .ok_or_else(|| Error::Parse(format!("no sidecar at {}", p5s_path.display())))?;
     if let Some(design) = sc.design() {
@@ -327,7 +358,7 @@ pub fn remove_annotation(pod5_path: impl AsRef<Path>, name: &str) -> Result<bool
     }
     let removed = sc.remove_annotation(name);
     if removed {
-        sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
+        reader.write_sidecar(&p5s_path, &mut sc, stamp.as_ref())?;
     }
     Ok(removed)
 }
@@ -340,11 +371,12 @@ pub fn remove_design(pod5_path: impl AsRef<Path>) -> Result<bool> {
     let identity = reader.sidecar_identity()?;
     let p5s_path = sidecar_path(pod5_path);
 
+    let stamp = sidecar::SidecarStamp::of(&p5s_path);
     let mut sc = sidecar::read_sidecar_file(&p5s_path, &identity)?
         .ok_or_else(|| Error::Parse(format!("no sidecar at {}", p5s_path.display())))?;
     let removed = sc.remove_design();
     if removed {
-        sidecar::write_sidecar_file(&p5s_path, &identity, &sc)?;
+        reader.write_sidecar(&p5s_path, &mut sc, stamp.as_ref())?;
     }
     Ok(removed)
 }

@@ -113,7 +113,7 @@ impl BatchBlock {
 }
 
 /// Parsed Arrow IPC footer with batch locations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrowIpcFooter {
     /// Locations of record batches (signal data).
     pub record_batches: Vec<BatchBlock>,
@@ -142,6 +142,29 @@ impl ArrowIpcFooter {
     /// [ARROW1]               6 bytes magic (no padding at end)
     /// ```
     pub fn parse(ipc_bytes: &[u8]) -> Result<Self> {
+        Self::parse_with_row_counts(ipc_bytes, None)
+    }
+
+    /// Like [`Self::parse`], but taking the per-batch row counts if a caller
+    /// already knows them.
+    ///
+    /// Row count is the one field the IPC footer does not carry: the footer's
+    /// `Block` records only offset, metadata length and body length, so
+    /// recovering the count means reading every batch's own message header.
+    /// That is one scattered touch per batch — measured at 15-24 ms each cold
+    /// on BeeGFS, and the single largest removable cost in a scattered fetch.
+    /// `known` short-circuits it; escapepod supplies it from the `.p5s`
+    /// sidecar, which measured the same walk once (see
+    /// `crate::sidecar::P5S_SIGNAL_BATCH_ROWS_KEY`).
+    ///
+    /// **`known` is checked, not believed.** It is used only if it has exactly
+    /// one entry per batch the footer describes, and the first and last
+    /// batches are then read for real and compared. Those two are the ones
+    /// that matter: the last is the short one, so a geometry belonging to a
+    /// file with a different read count disagrees there, and the first pins
+    /// the stride. Any mismatch discards `known` and walks the batches, so a
+    /// stale or corrupt cache costs time and never correctness.
+    pub fn parse_with_row_counts(ipc_bytes: &[u8], known: Option<&[u64]>) -> Result<Self> {
         let len = ipc_bytes.len();
 
         // Need at least magic (8) + footer_len (4) + magic (6) = 18 bytes minimum
@@ -184,11 +207,15 @@ impl ArrowIpcFooter {
         let footer_bytes = slice_at(ipc_bytes, footer_start, footer_len as usize)?;
 
         // Parse the footer FlatBuffer to extract batch blocks
-        Self::parse_footer_flatbuffer(footer_bytes, ipc_bytes)
+        Self::parse_footer_flatbuffer(footer_bytes, ipc_bytes, known)
     }
 
     /// Parse the Footer FlatBuffer to extract record batch locations.
-    fn parse_footer_flatbuffer(footer_bytes: &[u8], full_ipc: &[u8]) -> Result<Self> {
+    fn parse_footer_flatbuffer(
+        footer_bytes: &[u8],
+        full_ipc: &[u8],
+        known: Option<&[u64]>,
+    ) -> Result<Self> {
         // FlatBuffer footer structure (simplified):
         // - Root table offset (4 bytes from start)
         // - Footer table with:
@@ -273,8 +300,13 @@ impl ArrowIpcFooter {
                         // Skip 4 bytes padding
                         let body_length = read_i64_le(footer_bytes, block_pos + 16)?;
 
-                        // Parse row count from the batch message metadata
-                        let row_count = Self::parse_batch_row_count(full_ipc, offset as usize)?;
+                        // Parse row count from the batch message metadata —
+                        // unless a caller supplied it, which is the whole
+                        // point: this read is the scattered one.
+                        let row_count = match known.and_then(|k| k.get(i).copied()) {
+                            Some(rows) => rows,
+                            None => Self::parse_batch_row_count(full_ipc, offset as usize)?,
+                        };
 
                         record_batches.push(BatchBlock {
                             offset,
@@ -284,6 +316,36 @@ impl ArrowIpcFooter {
                         });
                     }
                 }
+            }
+        }
+
+        // Validate a supplied geometry before anything is derived from it, and
+        // fall back to the real walk if it does not hold up. Two reads, not N:
+        // the last batch is the short one, so a geometry from a file with a
+        // different read count disagrees there, and the first pins the stride.
+        if let Some(known) = known {
+            let mut ok = known.len() == record_batches.len();
+            if ok {
+                for idx in [0usize, record_batches.len().saturating_sub(1)] {
+                    let Some(block) = record_batches.get(idx) else {
+                        continue;
+                    };
+                    let actual = Self::parse_batch_row_count(full_ipc, block.offset as usize)?;
+                    if actual != block.row_count {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                tracing::warn!(
+                    cached_batches = known.len(),
+                    actual_batches = record_batches.len(),
+                    "cached signal batch geometry does not match this file; \
+                     ignoring it and reading the batch headers (rebuild with \
+                     `escpod index`)"
+                );
+                return Self::parse_footer_flatbuffer(footer_bytes, full_ipc, None);
             }
         }
 
@@ -527,7 +589,20 @@ impl ArrowIpcFooter {
         let per_batch: Vec<Vec<(usize, RawSignalChunk<'a>)>> = batch_entries
             .into_par_iter()
             .map(
-                |(batch_idx, rows)| -> Result<Vec<(usize, RawSignalChunk<'a>)>> {
+                |(batch_idx, mut rows)| -> Result<Vec<(usize, RawSignalChunk<'a>)>> {
+                    // Visit rows within a batch in ascending order. The
+                    // grouping above only puts the *batches* in file order —
+                    // the rows inside one are still in request order, and a
+                    // request assembled by iterating a `HashSet<Uuid>` (which
+                    // is what `reads_by_ids` and `find_signal_rows_by_ids`
+                    // hand down) is in no order at all. A batch is megabytes
+                    // of contiguous mmap, so hopping around inside it defeats
+                    // kernel readahead for precisely the reason the batch
+                    // grouping exists. The scatter into disjoint `result_idx`
+                    // slots below already decouples output order from visit
+                    // order, so this costs nothing but the sort.
+                    rows.sort_unstable_by_key(|&(_, local_row)| local_row);
+
                     let batch = &self.record_batches[batch_idx];
                     let batch_bytes = ipc_bytes.get(batch.byte_range()).ok_or_else(|| {
                         Error::InvalidArrowIpc("Batch range out of bounds".into())

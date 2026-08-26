@@ -41,7 +41,10 @@ The merge command combines multiple POD5 files into a single file. This is usefu
 - Run info entries are deduplicated by acquisition ID
 - Compressed signal blocks are copied as-is (no recompression)
 - [`.p5s` sidecars](../format/sidecar.md) are per-file and are **not**
-  merged — rerun `escpod index` / `escpod annotate` on the output
+  merged — rerun `escpod index` / `escpod annotate` on the output. Worth doing
+  even if you never look reads up by ID: a merged file has a new signal batch
+  layout, and `escpod index` records it so that every later open skips a
+  scattered read of every batch header
 
 ## Examples
 
