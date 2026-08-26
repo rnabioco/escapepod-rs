@@ -148,11 +148,14 @@ impl Stage {
     }
 
     /// The Cargo feature that compiles this stage's GPU path in.
+    ///
+    /// One feature covers all three, for the same reason [`Self::compiled_in`]
+    /// tests only one: `gpu` is atomic. This stays a per-stage accessor so the
+    /// messages below have a single source of truth for the name, and so a
+    /// future stage whose feature *does* differ has somewhere to say so.
     pub const fn feature(self) -> &'static str {
         match self {
-            Self::CnnDetect => "cnn-gpu",
-            Self::CrfEncoder => "crf-gpu",
-            Self::Dtw => "gpu",
+            Self::CnnDetect | Self::CrfEncoder | Self::Dtw => "gpu",
         }
     }
 
@@ -299,9 +302,10 @@ pub fn place(device: Device, stage: Stage) -> anyhow::Result<Placement> {
                 anyhow::bail!(
                     "--device gpu cannot run {}: this binary was built without the \
                      `{}` Cargo feature, so it contains no GPU code for that stage. \
-                     Rebuild with `--features gpu` (which enables every GPU path), or \
-                     use `--device auto` to run on the CPU instead.",
+                     Rebuild with `--features {}` — one flag covers every GPU path — \
+                     or use `--device auto` to run on the CPU instead.",
                     stage.label(),
+                    stage.feature(),
                     stage.feature(),
                 );
             }
@@ -383,10 +387,11 @@ fn report_cpu(stage: Stage, reason: CpuReason) {
         ),
         CpuReason::NotCompiledIn => tracing::warn!(
             "{} is running on the CPU ({}); this build has no `{}` feature. \
-             Rebuild with `--features gpu` for GPU inference, or pass `--device cpu` \
+             Rebuild with `--features {}` for GPU inference, or pass `--device cpu` \
              to silence this.",
             stage.label(),
             cost,
+            stage.feature(),
             stage.feature(),
         ),
         CpuReason::NoDevice => tracing::warn!(

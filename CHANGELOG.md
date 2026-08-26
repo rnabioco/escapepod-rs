@@ -38,7 +38,22 @@
   Prebuilt binaries are now documented in the README and the installation guide,
   which previously described only `cargo install`.
 
-### Changed
+### Fixed
+
+- **The "rebuild for GPU" hint named a Cargo feature that no longer exists.**
+  #282 folded `cnn-gpu` and `crf-gpu` into the single atomic `gpu` feature and
+  updated `Stage::compiled_in` to match, but `Stage::feature` — the accessor
+  three lines above it that supplies the *name* in every message about a stage
+  — was missed. So the default release binary, which has no GPU code by
+  construction, told anyone running `demux detect --method cnn` that "this build
+  has no `cnn-gpu` feature", pointing them at a flag `cargo` would reject. Both
+  the CPU-fallback warning and the hard `--device gpu` error carried it.
+
+  `feature()` now returns `gpu` for all three stages, and the two messages drop
+  the parenthetical that existed only to explain why the feature they named and
+  the flag they told you to pass were different strings. It stays a per-stage
+  accessor rather than a constant so the messages keep one source of truth and a
+  future stage whose feature genuinely differs has somewhere to say so.
 
 - **The `.p5s` sidecar now caches the POD5 signal table's batch geometry, and a
   scattered fetch stops paying for it.** Row count is the one field an Arrow IPC
