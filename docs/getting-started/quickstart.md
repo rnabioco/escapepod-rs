@@ -89,7 +89,7 @@ escpod inspect summary experiment.pod5            # barcode counts, sidecar stat
 escpod demux split experiment.pod5 --sidecar -d demuxed/   # materialize when needed
 ```
 
-See [demux](../experimental/demux.md) for models, GPU acceleration, and the
+See [demux](../cli/demux.md) for models, GPU acceleration, and the
 stepwise pipeline.
 
 ## Python Quick Start
@@ -180,5 +180,6 @@ Prefer Rust? The same operations are available in the
 
 - [Python API](../python/index.md) - Full Python reading/writing/signal reference
 - [CLI Reference](../cli/index.md) - Full documentation of all commands
-- [Experimental](../experimental/index.md) - Demux, the `.p5s` sidecar, resquiggle
+- [demux](../cli/demux.md) - Barcode demultiplexing, models, GPU acceleration
+- [Experimental](../experimental/index.md) - annotate, resquiggle, repack
 - [File Format](../format/index.md) - Understanding the POD5 format

@@ -55,6 +55,39 @@
   accessor rather than a constant so the messages keep one source of truth and a
   future stage whose feature genuinely differs has somewhere to say so.
 
+### Changed
+
+- **Docs: `demux`, `signal classify` and `index` are documented as shipped
+  commands, not experimental ones.** All three are in the default build —
+  `demux` for several releases, `signal classify` since #206, and `index` as of
+  #283 — but the docs site still filed `demux` under *Experimental* (a section
+  headed "may change without notice"), still told readers `index` needed
+  `--features experimental`, and never mentioned `signal classify` at all: the
+  whole `escapepod-classify` crate had zero hits across `docs/` and the README.
+
+  `demux.md` moves to the CLI reference, `index` and `signal classify` get pages
+  of their own, and *Experimental* is now exactly what its name says —
+  `annotate`, `resquiggle`, `repack`.
+
+  Swept up in the same pass, all of it drift since the last docs audit
+  (2026-08-09):
+
+  - The README's performance table cited numbers matching no run in
+    `benchmarks/README.md`, against a `pod5` two point releases old. Replaced
+    with the recorded 2026-07-26 run, and the "up to 9x" headline — true of a
+    2026-03 measurement — with the 3–5x (bulk) / 20–50x (metadata) the current
+    numbers support.
+  - `--gpu` prose in the README and installation guide, left over from before
+    #281 made it a hidden deprecated alias for `--device gpu`.
+  - `api/index.md` said the workspace has five crates (six), and its `gpu` row
+    read "Implies `gpu` + `gpu`, which remain individually selectable" — a
+    rename artifact from #282 asserting the opposite of what that PR did.
+  - The POD5 version history stopped at "4 | Current version"; escapepod has
+    read V6 and deliberately written V5 since #267. The reads-table field list
+    it sat under omitted every V1–V5 column.
+  - `span_statistics`, `span_statistics_batch` and `AnchoredReads` are exported
+    from the Python module and were undocumented.
+
 - **The `.p5s` sidecar now caches the POD5 signal table's batch geometry, and a
   scattered fetch stops paying for it.** Row count is the one field an Arrow IPC
   footer does not carry — the footer's `Block` records offset, metadata length

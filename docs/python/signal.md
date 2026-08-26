@@ -101,3 +101,94 @@ matched = (norm - shift - drift * np.arange(len(norm))) / scale
     Resquiggle refinement is an evolving, lower-level API — the same one behind
     the experimental [`resquiggle`](../experimental/resquiggle.md) CLI command.
     Signatures here may change.
+
+## Per-span statistics
+
+`span_statistics` summarises a read over a list of `[start, end)` signal
+windows, returning per-span `dwell`, `mean` and `sd` as parallel float32
+arrays. It is the primitive underneath per-base feature extraction, so the
+knobs exist to reproduce a model's feature recipe exactly rather than to be
+tuned by feel.
+
+```python linenums="1"
+dwell, mean, sd = escapepod.span_statistics(
+    norm,                      # float32 signal
+    spans,                     # (n, 2) int array of [start, end) indices
+    mad_floor=None,            # float -> per-read median/MAD normalise first
+    median=False,              # append a 4th array: per-span median
+    range=False,               # append a 5th array: per-span range
+    fill=None,                 # value for an unresolved span (None -> NaN)
+    bounds="skip",             # or "clamp": intersect the span with the signal
+    median_convention="select",  # or "sort", which reproduces numpy.median exactly
+)
+```
+
+A span that does not resolve comes back as `fill` in every output. `median`
+and `range` are off by default because each needs its own pass — a caller
+wanting only `dwell`/`mean`/`sd` should not pay for them.
+
+### Many reads at once
+
+`span_statistics_batch` runs the same computation across a whole batch in
+parallel with the GIL released. The batch is laid out flat so nothing is
+copied:
+
+```python linenums="1"
+dwell, mean, sd = escapepod.span_statistics_batch(
+    signal,          # every read's samples concatenated
+    read_offsets,    # (n_reads + 1,) boundaries into `signal`
+    spans,           # (n_reads * spans_per_read, 2), indices relative to each read
+    mad_floor=None,
+    # same keyword-only knobs as span_statistics
+)
+# each output is (n_reads, spans_per_read)
+```
+
+This is the shape that makes per-read feature extraction worth doing in Rust:
+the work is embarrassingly parallel and entirely numeric, so it scales with
+cores instead of serialising behind the interpreter.
+
+## Anchored reads
+
+`AnchoredReads` walks a POD5 + aligned BAM pair and yields reads anchored on a
+reference motif, mapping reference → query through the CIGAR and query → signal
+through the move table. It is the extraction half of what
+[`escpod signal classify`](../cli/signal-classify.md) does, exposed for corpus
+building.
+
+Two module-level constants describe the vocabulary it emits, and both are
+**ordered** — `coords()` emits an index into them rather than the string, so a
+reader of a saved `npz` needs them to decode its `anchor_source` /
+`mask_source` columns:
+
+```python
+escapepod.ANCHOR_SOURCES  # ("exact", "flank_interp", "backfill")
+escapepod.MASK_SOURCES    # ("exact", "counted", "arm_fallback", "junction_fallback")
+```
+
+They double as a capability marker: a caller that needs the flank-anchored
+junction can test for it directly instead of parsing a version string, which
+can be patched, backported, or built from a dirty tree.
+
+### Batching in storage order
+
+`AnchoredReads.storage_order(read_ids)` reorders ids the way the POD5 stores
+them, dropping any with no signal. `extract` already sorts *within* a batch,
+which does not help a caller that shuffles ids and then slices them into
+batches: every batch then touches every file, so the run gets swept once per
+batch instead of once. On an 8M-read run in 250k batches that is ~32 passes
+over the whole POD5 set — on a network filesystem, the entire cost of
+extraction.
+
+Select randomly, order by storage, *then* batch:
+
+```python linenums="1"
+reads.index_pod5(pod5_paths)
+chosen = random.sample(all_ids, 250_000)
+for batch in chunked(reads.storage_order(chosen), 1000):
+    ...
+```
+
+!!! note "Experimental"
+    `AnchoredReads` tracks the needs of the charging corpus builder and is not
+    yet a stable API.

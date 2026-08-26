@@ -103,12 +103,12 @@ still loads:
 |-----|-------|
 | `escapepod:source_name` | The POD5's base name when the sidecar was written |
 | `escapepod:read_count` | Reads covered by the index |
-| `escapepod:writer` | What wrote it, e.g. `escapepod-pod5 0.12.0` |
+| `escapepod:writer` | What wrote it, e.g. `escapepod-pod5 0.16.1` |
 
 They exist for the moment identity *fails*: without them the error knows only
 that two UUIDs differ, which is exactly when you want a filename. With them it
 reads `… does not match this POD5 file (stale or copied from another) (from
-"old_run.pod5", 50000 reads, written by escapepod-pod5 0.12.0)`. `escpod
+"old_run.pod5", 50000 reads, written by escapepod-pod5 0.16.1)`. `escpod
 inspect summary` shows the same line for a sidecar that loads.
 
 There is no write timestamp: the sidecar file's own mtime already records it.

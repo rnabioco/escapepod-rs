@@ -22,10 +22,12 @@ nav = [
     { "filter" = "cli/filter.md" },
     { "bam-filter" = "cli/bam-filter.md" },
     { "subset" = "cli/subset.md" },
+    { "demux" = "cli/demux.md" },
+    { "signal classify" = "cli/signal-classify.md" },
+    { "index" = "cli/index-command.md" },
   ] },
   { "Experimental" = [
     { "Overview" = "experimental/index.md" },
-    { "demux" = "experimental/demux.md" },
     { "annotate" = "experimental/annotate.md" },
     { "resquiggle" = "experimental/resquiggle.md" },
     { "repack" = "experimental/repack.md" },

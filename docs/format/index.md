@@ -30,22 +30,33 @@ POD5 itself is never modified.
 
 ### Reads Table
 
-One row per read containing:
+One row per read. Columns were added across format versions, so the version a
+file declares tells you which of these to expect:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| read_id | UUID | Unique identifier |
-| channel | u16 | Channel number |
-| well | u8 | Well (1-4) |
-| read_number | u32 | Sequential number |
-| start_sample | u64 | Start position |
-| num_samples | u64 | Signal length |
-| median_before | f32 | Pre-read current |
-| calibration_offset | f32 | ADC offset |
-| calibration_scale | f32 | ADC scale |
-| end_reason | enum | Why read ended |
-| signal | List<u64> | Signal row indices |
-| run_info | u32 | Run info index |
+| Field | Type | Added | Description |
+|-------|------|-------|-------------|
+| read_id | UUID | V0 | Unique identifier |
+| signal | List&lt;u64&gt; | V0 | Signal row indices |
+| read_number | u32 | V0 | Sequential number |
+| start | u64 | V0 | Start sample position |
+| median_before | f32 | V0 | Pre-read current |
+| num_minknow_events | u64 | V1 | Events MinKNOW counted |
+| tracked_scaling_scale / _shift | f32 | V1 | Live scaling estimate |
+| predicted_scaling_scale / _shift | f32 | V1 | Predicted scaling |
+| num_reads_since_mux_change | u32 | V1 | Reads since the last mux change |
+| time_since_mux_change | f32 | V1 | Seconds since the last mux change |
+| num_samples | u64 | V2 | Signal length |
+| channel | u16 (u32 in V6) | V3 | Channel number |
+| well | u8 | V3 | Well (1-4) |
+| pore_type | dict&lt;i16, utf8&gt; | V3 | Pore type |
+| calibration_offset | f32 | V3 | ADC offset |
+| calibration_scale | f32 | V3 | ADC scale |
+| end_reason | dict&lt;i16, utf8&gt; | V3 | Why read ended |
+| end_reason_forced | bool | V3 | Whether the end was forced |
+| run_info | dict&lt;i16, utf8&gt; | V3 | Run info reference |
+| open_pore_level | f32 | V4 | Open-pore current |
+| expected_open_pore_level | f32 | V5 | Expected open-pore current |
+| selected_read_level | f32 | V5 | Selected read level |
 
 ### Signal Table
 
@@ -100,13 +111,23 @@ POD5 uses custom Arrow extension types:
 
 ## Version History
 
-| Version | Changes |
-|---------|---------|
-| 0 | Initial format |
-| 1 | Added open_pore_level field |
-| 2 | Modified signal chunking |
-| 3 | Added predicted_scaling fields |
-| 4 | Current version |
+| Version | Changes | escapepod |
+|---------|---------|-----------|
+| 0 | Initial format: `read_id`, `signal`, `read_number`, `start`, `median_before` | read |
+| 1 | Scaling and mux-change fields, `num_minknow_events` | read |
+| 2 | `num_samples` | read |
+| 3 | `channel`, `well`, `pore_type`, calibration, `end_reason`, `run_info` | read |
+| 4 | `open_pore_level` | read |
+| 5 | `expected_open_pore_level`, `selected_read_level` | read + **written** |
+| 6 | `channel` retyped `uint16` → `uint32` | read |
+
+escapepod reads every version through 6 and deliberately **writes V5**. V6 is
+not an additive change — it retypes an existing column — so a V6 file is not
+merely missing fields to an older reader, it fails to parse. The newest `pod5`
+on PyPI is still 0.3.44, which predates V6 and hard-rejects a `uint32` channel,
+so emitting one today would produce files the rest of the ecosystem cannot
+open. A channel number that does not fit `uint16` is an error rather than a
+silent version bump.
 
 ## Comparison with FAST5
 

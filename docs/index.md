@@ -20,8 +20,9 @@ POD5 is the native file format for Oxford Nanopore sequencing data. It stores:
 
 ## Why escapepod?
 
-- **Fast** — memory-mapped I/O and efficient VBZ compression; up to ~9× faster
-  than the official Python `pod5` tools on large-file operations
+- **Fast** — memory-mapped I/O and efficient VBZ compression; 3–5× faster than
+  the official Python `pod5` tools on bulk file operations, 20–50× on
+  metadata-only commands
 - **Compatible** — reads and writes files interchangeable with ONT tools, and
   the Python API mirrors the official `pod5` package
 - **One engine, three surfaces** — the CLI, Python package, and Rust crates all
@@ -35,6 +36,8 @@ Pick the surface that fits how you work:
 | I want to… | Use | Guide |
 |------------|-----|-------|
 | Explore, filter, merge, and convert files from a shell | the **`escpod`** CLI | [CLI Reference](cli/index.md) |
+| Demultiplex barcodes from the raw signal | `escpod demux` | [demux](cli/demux.md) |
+| Score reads against a model bundle (tRNA charging) | `escpod signal classify` | [signal classify](cli/signal-classify.md) |
 | Read/write POD5 in a Python script or notebook | the **`escapepod`** package | [Python API](python/index.md) |
 | Embed POD5 I/O in a Rust program | the **`escapepod-signal`** crate | [Rust Library](library/index.md) |
 | Understand or implement the on-disk format | — | [File Format](format/index.md) |
@@ -98,7 +101,7 @@ See the [Rust Library](library/index.md) for the full crate API.
 ## Documentation
 
 - [CLI Reference](cli/index.md) — every `escpod` command
-- [Experimental](experimental/index.md) — demux, annotations, the `.p5s` sidecar
+- [Experimental](experimental/index.md) — annotations, resquiggle, repack
 - [Python API](python/index.md) — reading and writing POD5 from Python
 - [Rust Library](library/index.md) — using escapepod in your Rust projects
 - [File Format](format/index.md) — technical details of the POD5 container and sidecar

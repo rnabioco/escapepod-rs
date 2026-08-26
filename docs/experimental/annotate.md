@@ -49,7 +49,7 @@ that annotation; other annotations and the read index are preserved.
 
 If you are running the fused demux pipeline anyway, `escpod demux
 --annotate` writes the sidecar directly and skips the CSV round-trip — see
-[demux](demux.md#sidecar-output).
+[demux](../cli/demux.md#sidecar-output).
 
 ## Experimental designs
 

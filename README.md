@@ -16,12 +16,16 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 
 ## Highlights
 
-- **Fast** - Up to 9x faster than Python pod5 tools on large-file operations
+- **Fast** - 3-5x faster than the Python `pod5` tools moving bulk data, 20-50x
+  on metadata-only commands
 - **Memory efficient** - Memory-mapped I/O for large files
-- **Full featured** - View, inspect, merge, filter, subset
+- **Full featured** - View, inspect, merge, filter, subset, index
 - **BAM integration** - Filter reads by alignment status
 - **Barcode demultiplexing** - `escpod demux` runs DTW-SVM, GBM, or CTC-CRF
   classification end to end, in the default build
+- **Read-level models** - `escpod signal classify` scores reads against a model
+  bundle from POD5 + aligned BAM (tRNA charging today), writing calls onto the
+  BAM
 - **`.p5s` sidecar** - Barcode assignments, experimental designs, and a read
   index live in a small Arrow file *beside* the POD5 — raw sequencer output is
   never modified, and per-barcode subsets are materialized on demand instead
@@ -29,24 +33,31 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **Crash-safe writes** - Output is staged and renamed into place, so an
   interrupted run never leaves a corrupt archive or damages an existing one
 
-Some commands — `repack`, `resquiggle`, `index`, `annotate` — are
-experimental and live behind the `experimental` Cargo feature; GPU
-acceleration for demux is a single opt-in flag (`--features gpu`). See the
-[docs](https://rnabioco.github.io/escapepod-rs/experimental/) for status,
-build instructions, and the details behind the highlights above.
+Three commands — `repack`, `resquiggle`, `annotate` — are experimental and live
+behind the `experimental` Cargo feature; GPU acceleration is a single opt-in
+flag (`--features gpu`), with `--device` choosing per stage at run time. See
+the [docs](https://rnabioco.github.io/escapepod-rs/) for the details behind the
+highlights above.
 
 ## Performance
 
-Numbers are for the I/O-bound operations where runtime is large enough to
-matter; sub-second commands (`inspect`, `view`) are omitted. Measured with
-`benchmarks/benchmark.sh` (hyperfine, 3 runs) versus the official Python `pod5`
-(v0.3.36) on ~500k RNA004 reads (two ~250k-read files).
+Measured with hyperfine against the official Python `pod5` (v0.3.44) on
+1.06 GB / 122,061 RNA004 reads, one full socket (48 logical cores), input on a
+network filesystem and output to node-local disk.
 
 | Command | escapepod | pod5 | Speedup |
 |---------|-----------|------|---------|
-| filter | 361 ms | 3.4 s | **9.3x** |
-| subset | 1.4 s | 5.1 s | **3.6x** |
-| merge | 2.0 s | 6.7 s | **3.3x** |
+| filter (copy all reads) | 1.76 s | 4.99 s | **2.8x** |
+| filter (10% of reads) | 800 ms | 3.76 s | **4.7x** |
+| subset (2 groups) | 1.34 s | 4.87 s | **3.6x** |
+| inspect summary | 36 ms | 1.91 s | **53x** |
+| view (→ /dev/null) | 226 ms | 4.95 s | **22x** |
+
+The metadata ratios are large but the absolute differences are seconds; the
+bulk-data rows are the ones that matter on a real workflow. Both tools spend
+most of a bulk run reading the same input, so the ratio narrows as the input
+grows relative to the output — see [`benchmarks/README.md`](benchmarks/README.md)
+for that caveat, the full history, and how to reproduce.
 
 ## Install
 
@@ -68,17 +79,18 @@ curl -L "https://github.com/rnabioco/escapepod-rs/releases/download/$VER/escpod-
 ./escpod --version
 ```
 
-Take the **musl** build unless you need `--gpu`: it is static, so it runs on
+Take the **musl** build unless you need a GPU: it is static, so it runs on
 any Linux with no library requirements at all. The GPU paths can't be — they
 `dlopen` the CUDA driver and `libonnxruntime` at run time — so they ship only
 in the `-gnu-gpu` artifact, whose extra run-time requirements (CUDA 12,
 cuDNN 9, an onnxruntime pinned to the `ort` crate) are listed in the release
 notes and under
-[GPU acceleration](https://rnabioco.github.io/escapepod-rs/experimental/demux/#gpu-acceleration).
-Without `--gpu` that binary needs none of them.
+[GPU acceleration](https://rnabioco.github.io/escapepod-rs/cli/demux/#gpu-acceleration).
+On a CPU-only box that binary needs none of them — `--device auto` (the
+default) just falls back.
 
-To build instead — the default build ships stable commands plus the full
-demux tree:
+To build instead — the default build ships the stable commands plus the full
+demux tree, `signal classify`, and `index`:
 
 ```bash
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
@@ -87,7 +99,7 @@ cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
 Opt into experimental commands:
 
 ```bash
-# repack, resquiggle, index, annotate
+# repack, resquiggle, annotate
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features experimental
 ```
 
