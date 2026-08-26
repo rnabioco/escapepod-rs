@@ -1,6 +1,6 @@
 //! GPU boundary-CNN inference via onnxruntime (CUDA execution provider).
 //!
-//! Opt-in via the `cnn-gpu` feature. Mirrors [`AdapterCnn`](crate::AdapterCnn)
+//! Opt-in via the `gpu` feature. Mirrors [`AdapterCnn`](crate::AdapterCnn)
 //! but runs the ONNX graph through onnxruntime with the CUDA execution
 //! provider, in batches. Preprocessing (`prep_adapter_signal`) and decoding
 //! (`decode_adapter_end`) are the *same shared helpers* the CPU tract path

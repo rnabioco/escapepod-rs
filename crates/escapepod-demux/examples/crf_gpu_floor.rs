@@ -15,7 +15,7 @@
 //! and only a faster graph or a bigger batch would help.
 //!
 //! ```text
-//! cargo run --release --features crf-gpu --example crf_gpu_floor -- <bundle> [batch] [iters]
+//! cargo run --release --features gpu --example crf_gpu_floor -- <bundle> [batch] [iters]
 //! ```
 //!
 //! Needs a CUDA-enabled `libonnxruntime` on `ORT_DYLIB_PATH` and a visible GPU.

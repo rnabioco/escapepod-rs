@@ -63,11 +63,13 @@ fqxv-align = { git = "https://github.com/rnabioco/fqxv", rev = "a3af3d891f242f15
 # user supplies the model file at runtime (weights are CC BY-NC).
 tract-onnx = { workspace = true, optional = true }
 
-# GPU boundary-CNN inference (opt-in via `cnn-gpu`). onnxruntime via the `ort`
-# crate, CUDA execution provider. `load-dynamic` dlopens onnxruntime at runtime
-# (nothing needed at build time); set `ORT_DYLIB_PATH` to a CUDA-enabled
-# libonnxruntime to run. Architecture-agnostic — same `[B,1,L] -> [B,2,L]`
-# contract as the tract CPU path.
+# GPU boundary-CNN and CTC-CRF-encoder inference (opt-in via `gpu`).
+# onnxruntime via the `ort` crate, CUDA execution provider. `load-dynamic`
+# dlopens onnxruntime at runtime (nothing needed at build time); set
+# `ORT_DYLIB_PATH` to a CUDA-enabled libonnxruntime to run. Both paths are
+# architecture-agnostic — the boundary CNN keeps the same `[B,1,L] -> [B,2,L]`
+# contract as the tract CPU path, the CRF encoder the same time-major
+# `[B,1,chunk] -> [T,B,n_score]`.
 ort = { version = "=2.0.0-rc.13", optional = true, features = [
     "cuda",
     "load-dynamic",
@@ -95,29 +97,38 @@ default = []
 # (escapepod-models' adapter_rna004 TCN, or an ADAPTed BoundariesCNN export —
 # those weights are CC BY-NC 4.0 and must not be bundled). No GPU CNN path.
 cnn-detect = ["dep:tract-onnx"]
-# Batched GPU CNN/TCN adapter detection: runs the same `[B,1,L] -> [B,2,L]`
-# ONNX graph through onnxruntime's CUDA execution provider (`ort`, load-dynamic).
-# Builds on `cnn-detect` for the shared preprocessing/decoding. Needs a
-# CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
-cnn-gpu = ["cnn-detect", "dep:ort", "dep:cudarc"]
 # CTC-CRF barcode basecalling: runs a user-supplied CRF *encoder* ONNX graph
 # (`[B,1,chunk] -> [T,B,n_score]`, time-major) through tract-onnx on the CPU and
 # decodes the lattice natively. Only the encoder needs this feature — the
 # lattice decode in `crf::lattice` has no dependencies and is always compiled,
 # so CI covers the Viterbi without needing a model file.
 crf-decode = ["dep:tract-onnx", "dep:fqxv-align"]
-# CTC-CRF encoder inference on the GPU: same ONNX graph and the same native
-# lattice decode as `crf-decode`, with the LSTM stack running through
-# onnxruntime's CUDA execution provider. The decode deliberately stays on the
-# CPU (see `crf::encoder_gpu`), so the AVX2 kernels matter more here, not less.
-# Needs a CUDA-enabled libonnxruntime + visible GPU at run time, not build time.
-crf-gpu = ["crf-decode", "dep:ort", "dep:cudarc"]
-# Batched GPU DTW for classify and training. Pulls the GPU DTW kernel in
-# from `escapepod-signal`; the CUDA driver + libnvrtc are required at run
-# time, not build time. Also pulls cudarc directly so the post-DTW SVM
-# pipeline (RBF + OvO decision) can launch its own kernels via the shared
-# device handle.
-gpu = ["dep:cudarc", "dep:indicatif", "escapepod-signal/gpu"]
+# Every GPU path this crate has, in one flag. There is deliberately no finer
+# grain: the three legs (CUDA DTW, GPU CNN adapter detection, GPU CTC-CRF
+# encoder) are stages of the same pipeline, and a build with only some of them
+# needs runtime prose explaining which half of `--gpu` is a no-op — logic that
+# only ever described builds nobody produced. This crate has a git dependency
+# (`fqxv-align`) and so cannot be `cargo publish`ed, so there is no external
+# consumer whose dependency graph a coarser flag could bloat.
+#
+# What it pulls: the GPU DTW kernel from `escapepod-signal` plus cudarc directly
+# (the post-DTW SVM pipeline — RBF + OvO decision — launches its own kernels via
+# the shared device handle), and `ort` for the two onnxruntime CUDA paths, which
+# in turn need their CPU counterparts (`cnn-detect`, `crf-decode`) for the shared
+# prep/decode. The CRF lattice decode deliberately stays on the CPU (see
+# `crf::encoder_gpu`), so the AVX2/AVX-512 kernels matter more here, not less.
+#
+# Nothing is required at build time. At run time the DTW leg needs the CUDA
+# driver + libnvrtc, and the onnxruntime legs need a CUDA-enabled
+# libonnxruntime on `ORT_DYLIB_PATH` (`ort` is `load-dynamic`).
+gpu = [
+    "cnn-detect",
+    "crf-decode",
+    "dep:cudarc",
+    "dep:indicatif",
+    "dep:ort",
+    "escapepod-signal/gpu",
+]
 # Train `DtwSvmModel` JSON files from labeled fingerprints (linfa-svm).
 train = ["dep:linfa", "dep:linfa-svm"]
 
@@ -127,12 +138,12 @@ required-features = ["crf-decode"]
 
 [[example]]
 name = "crf_gpu_floor"
-required-features = ["crf-gpu"]
+required-features = ["gpu"]
 
 [[example]]
 name = "cnn_gpu_floor"
-required-features = ["cnn-gpu"]
+required-features = ["gpu"]
 
 [[example]]
 name = "cnn_pad_probe"
-required-features = ["cnn-gpu"]
+required-features = ["gpu"]

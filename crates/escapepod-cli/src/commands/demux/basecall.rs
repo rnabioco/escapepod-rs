@@ -128,7 +128,7 @@ pub struct BasecallArgs {
 
     /// Run encoder inference on the GPU (onnxruntime CUDA execution provider).
     /// The lattice decode stays on the CPU either way.
-    #[cfg(feature = "crf-gpu")]
+    #[cfg(feature = "gpu")]
     #[arg(long)]
     pub gpu: bool,
 
@@ -141,7 +141,7 @@ pub struct BasecallArgs {
 /// cases — see `escapepod_demux::crf::encoder_gpu` for why.
 enum Basecaller {
     Cpu(Box<CrfEncoder>),
-    #[cfg(feature = "crf-gpu")]
+    #[cfg(feature = "gpu")]
     Gpu(Box<escapepod_demux::crf::CrfEncoderGpu>),
 }
 
@@ -149,7 +149,7 @@ impl Basecaller {
     fn metadata(&self) -> &escapepod_demux::crf::CrfMetadata {
         match self {
             Self::Cpu(e) => e.metadata(),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.metadata(),
         }
     }
@@ -157,7 +157,7 @@ impl Basecaller {
     fn set_boundary_margin(&mut self, margin: usize) {
         match self {
             Self::Cpu(e) => e.set_boundary_margin(margin),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.set_boundary_margin(margin),
         }
     }
@@ -165,7 +165,7 @@ impl Basecaller {
     fn set_clamp_max_shift(&mut self, shift: usize) {
         match self {
             Self::Cpu(e) => e.set_clamp_max_shift(shift),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.set_clamp_max_shift(shift),
         }
     }
@@ -173,7 +173,7 @@ impl Basecaller {
     fn layout(&self) -> &escapepod_demux::crf::CrfLayout {
         match self {
             Self::Cpu(e) => e.layout(),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.layout(),
         }
     }
@@ -198,7 +198,7 @@ impl Basecaller {
                         .ok()
                 })
                 .collect()),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(encoder) => Ok(encoder.basecall_batch(prepped)?),
         }
     }
@@ -206,7 +206,7 @@ impl Basecaller {
     fn ref_chains(&self, seqs: &[&[u8]]) -> anyhow::Result<RefChains> {
         Ok(match self {
             Self::Cpu(e) => e.ref_chains(seqs)?,
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(e) => e.ref_chains(seqs)?,
         })
     }
@@ -229,7 +229,7 @@ impl Basecaller {
                         .ok()
                 })
                 .collect()),
-            #[cfg(feature = "crf-gpu")]
+            #[cfg(feature = "gpu")]
             Self::Gpu(encoder) => Ok(encoder.basecall_batch_with_refs(prepped, chains)?),
         }
     }
@@ -477,7 +477,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         style::path(args.model.display())
     );
 
-    #[cfg(feature = "crf-gpu")]
+    #[cfg(feature = "gpu")]
     let encoder = if args.gpu {
         info!(
             "{} GPU (onnxruntime CUDA)",
@@ -490,7 +490,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     } else {
         Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?))
     };
-    #[cfg(not(feature = "crf-gpu"))]
+    #[cfg(not(feature = "gpu"))]
     let encoder = Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?));
     #[allow(unused_mut)]
     let mut encoder = encoder;
@@ -523,9 +523,9 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     // is full of `?`, and a trailing `mem::forget` is skipped on exactly the
     // error paths — where an ordinary failure would then be masked by an
     // exit-134 glibc abort instead of reporting itself.
-    #[cfg(feature = "crf-gpu")]
+    #[cfg(feature = "gpu")]
     let leak_ort = matches!(encoder, Basecaller::Gpu(_));
-    #[cfg(not(feature = "crf-gpu"))]
+    #[cfg(not(feature = "gpu"))]
     let leak_ort = false;
     let encoder = super::run::LeakIf::new(encoder, leak_ort);
 

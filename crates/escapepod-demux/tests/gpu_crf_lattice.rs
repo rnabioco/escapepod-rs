@@ -1,6 +1,6 @@
 //! GPU CTC-CRF lattice decode: parity with bonito and with the CPU reference.
 //!
-//! Gated on `--features crf-gpu`; skips transparently on hosts without a CUDA
+//! Gated on `--features gpu`; skips transparently on hosts without a CUDA
 //! device, like the other GPU tests here.
 //!
 //! The headline test reuses `crf_golden.json` — the fixture produced by running
@@ -8,7 +8,7 @@
 //! checks the GPU decode against bonito directly rather than only against our
 //! CPU port. `crf_golden.rs` documents how that fixture is generated.
 
-#![cfg(feature = "crf-gpu")]
+#![cfg(feature = "gpu")]
 
 use std::path::Path;
 

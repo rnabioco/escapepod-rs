@@ -37,7 +37,7 @@ Key options (see `escpod demux --help` for the full set):
 | `--classifications <FILE>` | Also write a `read_id,barcode,confidence` CSV |
 | `--prefix <STR>` | Split-file prefix (default: `barcode`) |
 | `--method <cnn\|llr>` | Adapter detector (CRF bundles pin their own) |
-| `--gpu` | GPU inference where a GPU feature is compiled in |
+| `--gpu` | GPU inference where the pipeline has a device path (`gpu` build) |
 | `--info` | Describe the model and exit |
 
 ### Sidecar output
@@ -781,8 +781,12 @@ flag then uses whichever fits the model and stage:
 | CTC-CRF encoder | `demux basecall --gpu`, fused `demux --gpu` with a CRF model | The basecall encoder through onnxruntime CUDA, ~4× end-to-end. |
 | DTW classification | `demux classify --gpu`, `demux train-svm --gpu` | Batched DTW distance. **Experimental and usually slower** than a full CPU node — see the warning in [classify](#classify). |
 
-(The granular `cnn-gpu` / `crf-gpu` flags still exist for library consumers
-of `escapepod-demux`; CLI users only need `gpu`.)
+`gpu` is the only GPU flag, in the CLI and in `escapepod-demux` alike. There is
+no way to build half a GPU binary, so there is no combination in which `--gpu`
+silently does nothing for a stage that has a device path.
+
+(`escapepod-signal` keeps its own, narrower `gpu` feature: the cudarc DTW kernel
+without onnxruntime, for a consumer that wants the kernel and not the pipeline.)
 
 ### Getting a GPU-capable binary
 

@@ -252,7 +252,7 @@ jobs:
       - run: cargo check --workspace
 
   features:
-    name: Feature builds (gpu / cnn / crf)
+    name: Feature builds (gpu / models-download)
     runs-on: ubuntu-latest
     timeout-minutes: 35
     # The default jobs never compile the *opt-in* features, so a dependency bump
@@ -272,12 +272,20 @@ jobs:
     # evaluates a clippy lint — so an opt-in feature could carry a clippy error
     # indefinitely while both this job and the `clippy` job (which builds
     # default features only) stayed green. `clippy::large_enum_variant` on the
-    # CLI's `Basecaller` under `crf-gpu` did exactly that.
+    # CLI's `Basecaller` under the GPU CRF encoder did exactly that.
     #
     # `escapepod-cli` is covered as well as the library crates: the CLI is where
     # the feature-gated command wiring lives, and it is a different crate from
     # the one the feature flag names, so checking `escapepod-demux` alone misses
     # it.
+    #
+    # There used to be four more steps here, isolating `cnn-gpu` and `crf-gpu`
+    # in each of escapepod-demux and escapepod-cli. Those features are gone:
+    # `gpu` is now the single GPU flag, so the only builds left to prove are the
+    # ones somebody actually produces, and each of the three steps below is one
+    # of them. Isolation builds were the last stated reason for keeping the
+    # granular flags, and they only ever proved that binaries nobody ships
+    # compile.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -286,18 +294,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: gpu — DTW/SVM CUDA path (cudarc, escapepod-signal)
+      # escapepod-signal's `gpu` is deliberately still its own, narrower feature:
+      # cudarc/NVRTC DTW only, no onnxruntime. It is the one crate here with a
+      # plausible external consumer, so it keeps a flag that does not drag ort in.
+      - name: gpu — DTW CUDA kernel (cudarc, escapepod-signal)
         run: cargo clippy -p escapepod-signal --features gpu
-      - name: gpu — demux batch classify (cudarc, escapepod-demux)
+      - name: gpu — every GPU path (cudarc + ort, escapepod-demux)
         run: cargo clippy -p escapepod-demux --features gpu
-      - name: cnn-gpu — GPU TCN adapter detect (ort + cudarc)
-        run: cargo clippy -p escapepod-demux --features cnn-gpu
-      - name: cnn-gpu — CLI wiring (escapepod-cli)
-        run: cargo clippy -p escapepod-cli --features cnn-gpu
-      - name: crf-gpu — GPU CTC-CRF encoder (ort)
-        run: cargo clippy -p escapepod-demux --features crf-gpu
-      - name: crf-gpu — CLI wiring (escapepod-cli)
-        run: cargo clippy -p escapepod-cli --features crf-gpu
       - name: gpu — CLI union (what `--features gpu` users build)
         run: cargo clippy -p escapepod-cli --features gpu
       - name: models-download — k-mer model prefetch (ureq rustls + sha2)

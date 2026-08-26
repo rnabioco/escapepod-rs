@@ -62,7 +62,7 @@ pub struct DetectArgs {
     /// (CC-BY), or an ADAPTed `BoundariesCNN` exported with
     /// `scripts/export_adapter_cnn_to_onnx.py` (those weights are CC BY-NC 4.0
     /// and not bundled). Runs batched on the CPU by default; pass `--gpu` (with
-    /// a `--features cnn-gpu` build) for onnxruntime CUDA inference.
+    /// a `--features gpu` build) for onnxruntime CUDA inference.
     ///
     /// **No default** — LLR is opt-in, never inferred. It costs 17.2 points of
     /// downstream barcode recall against the same classifier (0.9928 -> 0.8196,
@@ -85,9 +85,9 @@ pub struct DetectArgs {
     pub cnn_model_name: Option<String>,
 
     /// Run `--method cnn` inference on the GPU via onnxruntime CUDA, instead of
-    /// the batched CPU tract path. Requires a `--features cnn-gpu` build and a
+    /// the batched CPU tract path. Requires a `--features gpu` build and a
     /// visible CUDA device + onnxruntime shared library at runtime.
-    #[cfg(feature = "cnn-gpu")]
+    #[cfg(feature = "gpu")]
     #[arg(long, help_heading = "Advanced Options")]
     pub gpu: bool,
 
@@ -170,7 +170,7 @@ fn llr_boundaries(
 ///
 /// `read_decode` and `prep` are summed across the rayon workers that ran them,
 /// so they measure CPU time and can exceed the wall-clock the producer took.
-#[cfg(feature = "cnn-gpu")]
+#[cfg(feature = "gpu")]
 #[derive(Default)]
 struct StageTimes {
     /// Producer: reading the reads table and sorting it, per file. Wall.
@@ -191,11 +191,11 @@ struct StageTimes {
     gpu_infer: Stage,
 }
 
-#[cfg(feature = "cnn-gpu")]
+#[cfg(feature = "gpu")]
 #[derive(Default)]
 struct Stage(std::sync::atomic::AtomicU64);
 
-#[cfg(feature = "cnn-gpu")]
+#[cfg(feature = "gpu")]
 impl Stage {
     /// Add the time since `since` to this stage's total.
     fn add(&self, since: std::time::Instant) {
@@ -212,7 +212,7 @@ impl Stage {
     }
 }
 
-#[cfg(feature = "cnn-gpu")]
+#[cfg(feature = "gpu")]
 impl StageTimes {
     fn report(&self, enabled: bool) {
         if !enabled {
@@ -376,7 +376,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 /// Run the detect subcommand using a boundary-CNN ONNX model (opt-in).
 ///
 /// CPU runs the model one read at a time through tract-onnx; `--gpu` (on a
-/// `cnn-gpu` build) runs it batched through onnxruntime's CUDA execution
+/// `gpu` build) runs it batched through onnxruntime's CUDA execution
 /// provider, which is where the large speedup lives — the TCN is
 /// inference-bound and tract has no efficient batched conv. Works with any
 /// model on the `[B,1,L] -> [B,2,L]` contract — escapepod-models'
@@ -415,9 +415,9 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
 
-    #[cfg(feature = "cnn-gpu")]
+    #[cfg(feature = "gpu")]
     let use_gpu = args.gpu;
-    #[cfg(not(feature = "cnn-gpu"))]
+    #[cfg(not(feature = "gpu"))]
     let use_gpu = false;
 
     // The GPU producer prepares reads through `get_signal_prefix`, so the whole
@@ -498,7 +498,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         // then runs each prepped block batched. CPU producers use the full pool
         // to decode + prep in parallel and feed blocks through a small bounded
         // channel (double-buffered, so the GPU isn't starved).
-        #[cfg(feature = "cnn-gpu")]
+        #[cfg(feature = "gpu")]
         {
             use escapepod_demux::AdapterCnnConfig;
             use escapepod_signal::Reader;
@@ -645,8 +645,8 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             stages.report(profile);
             rows
         }
-        #[cfg(not(feature = "cnn-gpu"))]
-        unreachable!("--gpu is unavailable without the cnn-gpu feature")
+        #[cfg(not(feature = "gpu"))]
+        unreachable!("--gpu is unavailable without the gpu feature")
     } else {
         // CPU: per-read tract. tract has no efficient batched conv (batching it
         // measured *slower*), so the fine-grained per-read parallelism across
