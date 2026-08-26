@@ -38,6 +38,32 @@
   Prebuilt binaries are now documented in the README and the installation guide,
   which previously described only `cargo install`.
 
+### Fixed
+
+- **The pixi `gpu` environment was not actually supplying CUDA to onnxruntime
+  (#278).** `install-ort` fetched `onnxruntime-gpu==1.28.0` from PyPI, whose
+  default build moved to **CUDA 13** — its `libonnxruntime_providers_cuda.so`
+  needs `libcublas.so.13` and `libcudart.so.13`, while
+  `[feature.gpu.dependencies]` pins `cuda-version = "12.*"`. Not one of those
+  sonames could be satisfied from `$CONDA_PREFIX/lib`.
+
+  This never surfaced as an error. Verified on an A30: `--gpu` worked, because
+  `LD_LIBRARY_PATH` fell through to a system `/usr/local/cuda-13.0` that our GPU
+  nodes happen to carry. The conda packages were inert and the whole path rested
+  on a CUDA install we neither chose nor control — which would have failed on any
+  node without one, including anyone using the `-gnu-gpu` release artifact
+  off-cluster.
+
+  `install-ort` now pins `--index-url` to ORT's `onnxruntime-cuda-12` feed, so
+  the wheel matches the environment instead of the host. `libcurand` is also
+  added: the CUDA 12 provider links `libcurand.so.10` and it was missing from the
+  dependency list entirely — on our nodes it, too, was being borrowed from
+  `/usr/local/cuda-13.0`. `cuda-nvrtc` is bounded to `<13` so the GPU DTW path
+  (cudarc, `libnvrtc.so.12`) cannot silently acquire the same problem.
+
+  The general lesson is in issue #278: matching CUDA majors by hand is our bug to
+  stop having, not a thing to document better.
+
 ## 0.16.1 (2026-08-25)
 
 ### Added

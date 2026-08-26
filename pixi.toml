@@ -62,10 +62,25 @@ typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escape
 #     CNN adapter detection (`demux detect --method cnn --gpu`).
 #   * `--features crf-gpu`  — the same onnxruntime CUDA EP for the CTC-CRF
 #     encoder (`demux basecall --gpu`, fused `demux --gpu`).
-# The CUDA 12 runtime libs come from conda-forge; the ort CUDA EP dlopens
-# cublas/cublasLt/cudart/cufft AND cuDNN 9, and without them it fails with
-# `libcublasLt.so.12: cannot open shared object file` and silently falls back
-# to CPU. The one piece conda cannot supply without a workspace-wide
+# The CUDA 12 runtime libs come from conda-forge; the ort CUDA EP links
+# cublas/cublasLt/cudart/cufft/curand and dlopens cuDNN 9, and without them it
+# fails with `libcublasLt.so.12: cannot open shared object file` and silently
+# falls back to CPU.
+#
+# The onnxruntime wheel MUST be the CUDA 12 build, which is why `install-ort`
+# below pins `--index-url` to ORT's `onnxruntime-cuda-12` feed rather than
+# taking PyPI's default. PyPI's `onnxruntime-gpu` moved to **CUDA 13** builds:
+# its `libonnxruntime_providers_cuda.so` needs `libcublas.so.13` /
+# `libcudart.so.13`, which nothing here supplies. That does not fail loudly —
+# on 2026-08-26 the pixi env was fetching the CUDA 13 wheel and `--gpu` still
+# worked on our A30 nodes, because the loader fell through `$CONDA_PREFIX/lib`
+# to a system `/usr/local/cuda-13.0`. The conda packages below were inert and
+# the whole thing rested on a CUDA install we neither chose nor control; it
+# would have broken on any node without one. Diagnose with `ldd` on
+# `.pixi/ort/onnxruntime/capi/libonnxruntime_providers_cuda.so` on a GPU node —
+# the resolved paths say who is really supplying CUDA. See issue #278.
+#
+# The one piece conda cannot supply without a workspace-wide
 # `__cuda` platform re-key is the CUDA-enabled libonnxruntime itself: run
 # `pixi run -e gpu install-ort` ONCE on a networked (login) node to fetch it
 # from the onnxruntime-gpu wheel into `.pixi/ort/` — the activation script
@@ -73,11 +88,12 @@ typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escape
 #   pixi run -e gpu install-ort      # once, networked node; compute nodes can't
 #   pixi run -e gpu <escpod … --gpu> # any GPU node, no env vars needed
 [feature.gpu.dependencies]
-cuda-nvrtc = ">=12"        # GPU DTW (cudarc)
+cuda-nvrtc = ">=12,<13"    # GPU DTW (cudarc): libnvrtc.so.12
 cuda-version = "12.*"
 libcublas = "*"            # ort CUDA EP: libcublas.so.12 + libcublasLt.so.12
 cuda-cudart = "*"          # ort CUDA EP: libcudart.so.12
 libcufft = "*"             # ort CUDA EP: libcufft.so.11
+libcurand = "*"            # ort CUDA EP: libcurand.so.10
 cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9
 
 [feature.gpu.tasks]
@@ -87,7 +103,8 @@ cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9
 # together, deliberately. The wheel is only a container for the .so; nothing
 # is pip-*installed*.
 install-ort = """
-python -m pip download onnxruntime-gpu==1.28.0 --no-deps -d .pixi/ort && \
+python -m pip download onnxruntime-gpu==1.28.0 --no-deps -d .pixi/ort \
+  --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ && \
 python scripts/unpack_ort_gpu.py .pixi/ort
 """
 
