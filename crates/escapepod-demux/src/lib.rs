@@ -71,7 +71,7 @@
 mod classify;
 pub mod crf;
 
-#[cfg(any(feature = "cnn-gpu", feature = "crf-gpu", feature = "gpu"))]
+#[cfg(feature = "gpu")]
 pub mod cuda;
 mod fingerprint;
 mod gbm;
@@ -101,7 +101,7 @@ pub use fingerprint::{
 /// Call once at startup when the GPU was *demanded* rather than preferred (the
 /// CLI's `--device gpu`); see `src/ort_ep.rs` for why this is process-wide state
 /// and not a loader parameter.
-#[cfg(any(feature = "cnn-gpu", feature = "crf-gpu"))]
+#[cfg(feature = "gpu")]
 pub use ort_ep::require_cuda as require_cuda_ep;
 
 // Legacy distance-based classifier.

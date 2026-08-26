@@ -175,6 +175,20 @@
   ordinary session-build error. Under `auto` it still warns and falls back — that
   is what `auto` is for.
 
+- **A GPU CNN detect run where *every* read fails inference is now an error, not
+  a boundaries CSV of `adapter_end=0`.** Found while verifying the above, and it
+  is the same failure the rest of this entry is about wearing a different hat.
+  Registering the CUDA execution provider only appends a factory to the session
+  options — which is exactly the step `error_on_failure` guards — while the
+  libraries the kernels need are dlopened later, inside the first `Conv`. A
+  missing `libcudnn` therefore gets past a satisfied `--device gpu` and fails
+  per node, and the old code warned about the model's `[B,1,L] -> [B,2,L]`
+  contract (the wrong cause), wrote a file that was uniformly zero, and exited 0.
+  It now errors before `File::create`, so nothing is left behind to mistake for a
+  real result, and it names the likely cause. GPU only: on CPU, tract runs one
+  read at a time and an all-fail can legitimately be a property of the input, so
+  that path keeps the warning it has always had.
+
 ### Removed
 
 - **`escpod demux train-svm --gpu`.** The flag never did anything: the

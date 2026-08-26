@@ -795,6 +795,11 @@ One opt-in Cargo feature, `gpu`, enables every GPU path. At run time
   each fail the run with a message naming the cause. This is deliberate: a
   best-effort CUDA registration that quietly commits to the CPU provider is how
   a broken runtime produced correct, slow, accelerated-looking runs for months.
+
+    Registration is not the only way a GPU run can be broken, and the other way
+    is not something `--device` can pre-check: the provider registers fine and
+    then its kernels cannot dlopen cuDNN. `detect --method cnn` catches that
+    downstream — see the troubleshooting table below.
 - **`cpu`** — CPU everywhere, device or no device.
 
 `--gpu` still works as a hidden, deprecated alias for `--device gpu` (it warns,
@@ -910,6 +915,7 @@ RUST_LOG=ort=info escpod demux basecall … 2>&1 | grep CUDAExecutionProvider
 | Symptom | Cause |
 |---------|-------|
 | Warning that the execution provider *"may fall back to CPU"*, run is slow | A CUDA runtime library is missing (typically `libcublasLt.so.12` or `libcudnn.so.9`). Run inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them. Re-run with `--device gpu` to turn the same condition into a hard error. |
+| `detect --method cnn` errors with *"every one of the N read(s) failed CNN inference on the GPU"* | The same missing runtime library, caught rather than written out. Registering the CUDA provider succeeds — it only appends a factory to the session options — and the libraries the kernels need are dlopened later, inside the first `Conv`. Same fix: the pixi `gpu` environment, or `--device cpu`. |
 | Clear startup error: could not load onnxruntime | `ORT_DYLIB_PATH` is unset or points at a CPU-only build of onnxruntime. Inside the pixi `gpu` environment it is set for you. |
 | Process hangs at startup and prints **nothing**, not even a status line | `ORT_DYLIB_PATH` is set but points at a file that does not exist — normally a stale manual override, since the environment's own value is a package path the lockfile guarantees. |
 

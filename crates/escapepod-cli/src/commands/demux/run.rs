@@ -1199,7 +1199,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // ---- Stages A/B: produce classified reads ----
     let produce_result = match &*model {
         ClassifyModel::Svm(svm) => {
-
             // No "the GPU does nothing on this head" warning to emit: `gpu`
             // is atomic, so a build that can place work on a device always
             // carries the batched DTW-SVM classify kernel this arm uses. It

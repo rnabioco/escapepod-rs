@@ -38,7 +38,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Device {
     /// GPU for the stages where it wins, when one is actually usable; CPU
-    /// otherwise. Never an error.
+    /// otherwise. Placing a stage never fails.
     #[default]
     Auto,
     /// CPU everywhere, even with a device visible.
@@ -162,9 +162,9 @@ impl Stage {
     /// the feature has to be able to *say* it lacks the feature.
     pub const fn compiled_in(self) -> bool {
         match self {
-            Self::CnnDetect => cfg!(feature = "cnn-gpu"),
-            Self::CrfEncoder => cfg!(feature = "crf-gpu"),
-            Self::Dtw => cfg!(feature = "gpu"),
+            // One feature now covers all three: `gpu` is atomic, so a
+            // build either has every device path or none of them.
+            Self::CnnDetect | Self::CrfEncoder | Self::Dtw => cfg!(feature = "gpu"),
         }
     }
 
@@ -250,11 +250,11 @@ impl Placement {
 /// [`Stage::compiled_in`] has already said yes, so the two never disagree in a
 /// way anyone sees.
 pub fn cuda_available() -> bool {
-    #[cfg(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu"))]
+    #[cfg(feature = "gpu")]
     {
         escapepod_demux::cuda::device_visible()
     }
-    #[cfg(not(any(feature = "gpu", feature = "cnn-gpu", feature = "crf-gpu")))]
+    #[cfg(not(feature = "gpu"))]
     {
         false
     }
@@ -268,17 +268,29 @@ pub fn cuda_available() -> bool {
 /// best-effort and falls through to the CPU provider, so the run is correct and
 /// silently unaccelerated. `escapepod_demux::require_cuda_ep` flips that to an
 /// error for every session built afterwards.
+///
+/// # What this does not catch, and where that is caught instead
+///
+/// Registering the provider only appends a factory to the session options.
+/// Measured on an A30 with `LD_LIBRARY_PATH` stripped: ort logs `Successfully
+/// registered CUDAExecutionProvider`, the session builds, and then *every* node
+/// fails with `NOT_IMPLEMENTED : cuDNN is unavailable` — the kernels dlopen their
+/// libraries later, inside the first `Conv`, long after this switch has had its
+/// say. Nothing here can pre-check that, so `demux detect --method cnn` catches
+/// it downstream: an all-reads-failed GPU run is an error rather than a
+/// boundaries CSV of `adapter_end=0`.
 fn arm_strict_ep() {
-    #[cfg(any(feature = "cnn-gpu", feature = "crf-gpu"))]
+    #[cfg(feature = "gpu")]
     escapepod_demux::require_cuda_ep();
 }
 
 /// Decide where `stage` runs under `device`.
 ///
-/// Errors only under `--device gpu`, and only for the causes that flag exists to
-/// surface: feature missing, or no device. onnxruntime EP registration failure
+/// Errors only under `--device gpu`, and only for the two causes it can settle
+/// up front: feature missing, or no device. onnxruntime EP registration failure
 /// cannot be detected here — it happens when the session is built — so this arms
 /// the strict-registration switch instead and the error arrives from the loader.
+/// See [`arm_strict_ep`] for the third failure, which neither can reach.
 pub fn place(device: Device, stage: Stage) -> anyhow::Result<Placement> {
     match device {
         Device::Cpu => Ok(Placement::Cpu(CpuReason::Requested)),
@@ -337,8 +349,8 @@ pub fn place_and_report(device: Device, stage: Stage) -> anyhow::Result<Placemen
             );
             // `--device gpu` is the only way DTW reaches the device, and the
             // measurement that keeps it out of `auto` applies just as much when
-            // it is asked for explicitly. Say so once, here, so classify /
-            // train-svm / the fused pipeline cannot drift on the wording.
+            // it is asked for explicitly. Say so once, here, so `demux classify`
+            // and the fused pipeline cannot drift on the wording.
             if stage == Stage::Dtw {
                 tracing::warn!(
                     "GPU DTW is experimental and usually slower than a full CPU node \

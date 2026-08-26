@@ -698,6 +698,39 @@ fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()
 
     progress_bar.finish_with_message("complete");
 
+    // Every read failing on the GPU is not a per-read problem — a batched
+    // onnxruntime call has no per-read reason to fail uniformly — so it means the
+    // device path is broken, and the boundaries CSV about to be written would be
+    // `adapter_end=0` from top to bottom. Downstream reads that file happily; it
+    // is the silent-failure this command's `--device` work exists to remove, so
+    // it is an error, not a warning plus a useless artifact.
+    //
+    // Checked *here*, before `File::create`, so a failed run leaves no output
+    // behind to be mistaken for a real one.
+    //
+    // The likely cause is named because ort cannot name it: registering the CUDA
+    // execution provider only appends a factory to the session options, and
+    // `error_on_failure` catches exactly that step. The runtime libraries the
+    // kernels need are dlopened later, inside the first `Conv`, and a missing
+    // libcudnn surfaces as `NOT_IMPLEMENTED : cuDNN is unavailable` per node with
+    // the session already built and `--device gpu` already satisfied.
+    //
+    // GPU only. On CPU, tract runs one read at a time and an all-fail can
+    // legitimately be a property of the input (every read too short, say), so
+    // that path keeps the warning it has always had.
+    let failures = failed.load(Ordering::Relaxed);
+    if use_gpu && failures > 0 && failures == results.len() {
+        anyhow::bail!(
+            "every one of the {failures} read(s) failed CNN inference on the GPU. \
+             The CUDA execution provider registered, so this is a runtime library \
+             the kernels could not load — typically libcudnn or libcublasLt. Run \
+             inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them \
+             (see docs/experimental/demux.md), or pass `--device cpu`. Re-run with \
+             `RUST_LOG=ort=error` to see onnxruntime's own message. No boundaries \
+             file was written."
+        );
+    }
+
     let output_file = File::create(&args.output)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
     if args.emit_llr_delta {
@@ -739,7 +772,7 @@ fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()
     writer.flush()?;
 
     let too_short = too_short.into_inner();
-    let failed = failed.into_inner();
+    let failed = failures;
     if too_short > 0 {
         warn!("{too_short} read(s) too short for CNN detection — wrote adapter_end=0");
     }
