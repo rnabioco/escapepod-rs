@@ -61,8 +61,9 @@ pub struct DetectArgs {
     /// contract via `--cnn-model` — e.g. escapepod-models' `adapter_rna004`
     /// (CC-BY), or an ADAPTed `BoundariesCNN` exported with
     /// `scripts/export_adapter_cnn_to_onnx.py` (those weights are CC BY-NC 4.0
-    /// and not bundled). Runs batched on the CPU by default; pass `--gpu` (with
-    /// a `--features gpu` build) for onnxruntime CUDA inference.
+    /// and not bundled). Runs batched through onnxruntime CUDA when a GPU is
+    /// available (`--device auto`, the default, on a `--features gpu`
+    /// build); otherwise per-read through tract on the CPU.
     ///
     /// **No default** — LLR is opt-in, never inferred. It costs 17.2 points of
     /// downstream barcode recall against the same classifier (0.9928 -> 0.8196,
@@ -84,12 +85,10 @@ pub struct DetectArgs {
     #[arg(long, value_name = "NAME", help_heading = "Advanced Options")]
     pub cnn_model_name: Option<String>,
 
-    /// Run `--method cnn` inference on the GPU via onnxruntime CUDA, instead of
-    /// the batched CPU tract path. Requires a `--features gpu` build and a
-    /// visible CUDA device + onnxruntime shared library at runtime.
-    #[cfg(feature = "gpu")]
-    #[arg(long, help_heading = "Advanced Options")]
-    pub gpu: bool,
+    /// Where `--method cnn` inference runs (`auto` by default, which prefers
+    /// the GPU here — CNN detection is the path that pays off most).
+    #[command(flatten)]
+    pub device: crate::device::DeviceArgs,
 
     /// Also run the LLR detector and emit its boundaries alongside the CNN's
     /// (`--method cnn` only).
@@ -158,7 +157,7 @@ fn llr_boundaries(
     (start * scale_factor, end * scale_factor)
 }
 
-/// Wall-clock spent in — and waiting between — the `--gpu` pipeline's stages,
+/// Wall-clock spent in — and waiting between — the GPU pipeline's stages,
 /// reported by `--profile`.
 ///
 /// The producer and the GPU consumer run concurrently, so these do not sum to
@@ -250,16 +249,28 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
              escapepod-models#16)."
         );
     };
+    // Resolved once, here, so the `--gpu` deprecation warning is emitted exactly
+    // once no matter which arm runs.
+    let device = args.device.resolve();
     match method.as_str() {
-        "llr" => run_llr(args),
+        "llr" => {
+            crate::device::note_cpu_only(
+                device,
+                "`--method llr`",
+                "the LLR detector is a CPU changepoint search with no GPU path. \
+                 `--method cnn` is the detector that runs on the device.",
+            );
+            run_llr(args)
+        }
         "cnn" => {
             #[cfg(feature = "cnn-detect")]
             {
-                run_cnn(args)
+                run_cnn(args, device)
             }
             #[cfg(not(feature = "cnn-detect"))]
             {
                 let _ = args;
+                let _ = device;
                 anyhow::bail!(
                     "--method cnn requires a build with `--features cnn-detect`. \
                      Rebuild with: cargo build --release -p escapepod-cli \
@@ -375,15 +386,15 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
 
 /// Run the detect subcommand using a boundary-CNN ONNX model (opt-in).
 ///
-/// CPU runs the model one read at a time through tract-onnx; `--gpu` (on a
-/// `gpu` build) runs it batched through onnxruntime's CUDA execution
-/// provider, which is where the large speedup lives — the TCN is
-/// inference-bound and tract has no efficient batched conv. Works with any
-/// model on the `[B,1,L] -> [B,2,L]` contract — escapepod-models'
-/// `adapter_rna004` (CC-BY) or an ADAPTed `BoundariesCNN` export (CC BY-NC; not
-/// bundled). See `scripts/export_adapter_cnn_to_onnx.py`.
+/// CPU runs the model one read at a time through tract-onnx; the GPU placement
+/// (the default under `--device auto` on a `gpu` build) runs it batched
+/// through onnxruntime's CUDA execution provider, which is where the large
+/// speedup lives — the TCN is inference-bound and tract has no efficient batched
+/// conv. Works with any model on the `[B,1,L] -> [B,2,L]` contract —
+/// escapepod-models' `adapter_rna004` (CC-BY) or an ADAPTed `BoundariesCNN`
+/// export (CC BY-NC; not bundled). See `scripts/export_adapter_cnn_to_onnx.py`.
 #[cfg(feature = "cnn-detect")]
-fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
+fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()> {
     use crate::commands::profile::PhaseTimer;
     use escapepod_demux::AdapterCnnError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -415,22 +426,25 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--method cnn requires --cnn-model <FILE>"))?;
 
-    #[cfg(feature = "gpu")]
-    let use_gpu = args.gpu;
-    #[cfg(not(feature = "gpu"))]
-    let use_gpu = false;
-
+    // Decided (and reported) before the model is even opened: the whole point of
+    // the warning is that it beats the 37-minute CPU run rather than trailing it.
+    //
     // The GPU producer prepares reads through `get_signal_prefix`, so the whole
-    // signal an LLR arm would need is never decoded there. Rejecting the
-    // combination is honest; silently running LLR on the prefix would report a
-    // delta that measures truncation instead of detector disagreement.
-    if args.emit_llr_delta && use_gpu {
-        anyhow::bail!(
-            "--emit-llr-delta is not supported with --gpu: the GPU path decodes \
-             only each read's leading samples, and the LLR detector normalizes \
-             over the whole read. Drop --gpu to compare the two detectors."
-        );
-    }
+    // signal an LLR arm would need is never decoded there. Silently running LLR
+    // on the prefix would report a delta that measures truncation instead of
+    // detector disagreement, so the two cannot be combined — but under `auto`
+    // that means CPU detection, not a failed run.
+    let use_gpu = if args.emit_llr_delta {
+        crate::device::place_ruled_out(
+            device,
+            crate::device::Stage::CnnDetect,
+            "`--emit-llr-delta` needs whole-read signal, and the GPU producer decodes \
+             only each read's leading samples",
+        )?
+        .is_gpu()
+    } else {
+        crate::device::place_and_report(device, crate::device::Stage::CnnDetect)?.is_gpu()
+    };
 
     warn!(
         "boundary CNN runs the model you supply via --cnn-model; respect that \
@@ -542,13 +556,15 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
                         st.gpu_infer.add(inferring);
                         pb.inc(meta.len() as u64);
                         for (end, (read_id, num_samples)) in ends.into_iter().zip(meta) {
-                            // `--emit-llr-delta` is rejected with `--gpu` above, so the
-                            // LLR arm is always absent here.
+                            // `--emit-llr-delta` never reaches the GPU path
+                            // (see `place_ruled_out` above), so the LLR arm is
+                            // always absent here.
                             out.push((bnd(read_id, num_samples, end), None));
                         }
                     }
-                    // Keep the ORT session alive past process exit, for the same
-                    // reason `demux --gpu` does — onnxruntime's CUDA provider
+                    // Keep the ORT session alive past process exit, for the
+                    // same reason the fused `demux` GPU path does — onnxruntime's
+                    // CUDA provider
                     // reads freed memory during onnxruntime's own at-exit
                     // teardown, and glibc aborts on it. See the long comment in
                     // `run.rs` and pykeio/ort#609. `release_env_on_exit` only
@@ -646,7 +662,7 @@ fn run_cnn(args: DetectArgs) -> anyhow::Result<()> {
             rows
         }
         #[cfg(not(feature = "gpu"))]
-        unreachable!("--gpu is unavailable without the gpu feature")
+        unreachable!("device placement never returns GPU without the gpu feature")
     } else {
         // CPU: per-read tract. tract has no efficient batched conv (batching it
         // measured *slower*), so the fine-grained per-read parallelism across

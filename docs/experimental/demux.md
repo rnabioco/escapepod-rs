@@ -9,7 +9,8 @@ in the [`.p5s` sidecar](../format/sidecar.md) so nothing needs splitting at
 all.
 
 GPU acceleration and model training are opt-in builds — see
-[GPU acceleration](#gpu-acceleration) below.
+[GPU acceleration](#gpu-acceleration) below. In a GPU-capable build the device
+is used automatically where it wins; `--device` overrides that.
 
 ## Fused pipeline (recommended)
 
@@ -37,7 +38,7 @@ Key options (see `escpod demux --help` for the full set):
 | `--classifications <FILE>` | Also write a `read_id,barcode,confidence` CSV |
 | `--prefix <STR>` | Split-file prefix (default: `barcode`) |
 | `--method <cnn\|llr>` | Adapter detector (CRF bundles pin their own) |
-| `--gpu` | GPU inference where the pipeline has a device path (`gpu` build) |
+| `--device <auto\|cpu\|gpu>` | Where GPU-capable stages run (default `auto`) — see [GPU acceleration](#gpu-acceleration) |
 | `--info` | Describe the model and exit |
 
 ### Sidecar output
@@ -185,7 +186,7 @@ escpod demux detect <FILES>... -o <OUTPUT>
 | `--downscale <N>` | Downscale factor for signal processing (default: 10, WarpDemuX-native; set 1 for full resolution) |
 | `--method <cnn\|llr>` | Boundary detector; `cnn` is what the published models were trained against |
 | `--cnn-model <FILE>` / `--cnn-model-name <NAME>` | Boundary-CNN ONNX (explicit path, or a fetched bundle by name) |
-| `--gpu` | Run CNN detection on the GPU (`gpu` build) |
+| `--device <auto\|cpu\|gpu>` | Where CNN detection runs (default `auto`, which prefers the GPU here) |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -438,18 +439,20 @@ escpod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
 | `--min-ratio <RATIO>` | Top-2 distance-ratio threshold below which a read is confident (default: 0.8) |
 | `--model-name <NAME>` | Use a fetched model bundle by name instead of `--model` |
 | `--probabilities` | Emit per-class probabilities (SVM models) |
-| `--gpu` | GPU DTW batch classify (`gpu` build) |
+| `--device <auto\|cpu\|gpu>` | Where DTW runs. `auto` keeps it on the **CPU** — see the warning below |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
-!!! warning "`--gpu` DTW classify is experimental and usually slower"
-    On a full node the CPU DTW beats the GPU: 113 s on 64 CPU cores vs 132 s
-    with `--gpu` on an A30 (0.85x), plus ~2.2 GB more RSS, on a 1.22M-read
-    DTW-SVM run. An apparent 1.67x speedup vanishes once the CPU is given the
-    whole node instead of 16 of 64 cores. It may still help where cores are
-    scarce relative to the DTW workload, and it does nothing for GBM models.
-    The GPU paths that *do* pay off are CNN adapter detection and the CRF
-    encoder — see [GPU acceleration](#gpu-acceleration).
+!!! warning "GPU DTW classify is experimental and usually slower"
+    This is why `--device auto` leaves DTW on the CPU even with an idle GPU in
+    the node. On a full node the CPU DTW beats the GPU: 113 s on 64 CPU cores
+    vs 132 s on an A30 (0.85x), plus ~2.2 GB more RSS, on a 1.22M-read DTW-SVM
+    run. An apparent 1.67x speedup vanishes once the CPU is given the whole
+    node instead of 16 of 64 cores. It may still help where cores are scarce
+    relative to the DTW workload, which is what `--device gpu` is for; it does
+    nothing for GBM models. The GPU paths that *do* pay off are CNN adapter
+    detection and the CRF encoder — see
+    [GPU acceleration](#gpu-acceleration).
 
 ### Output Format
 
@@ -772,14 +775,48 @@ escpod demux classify fingerprints.csv --model model.json -o classifications.csv
 
 ## GPU acceleration
 
-One opt-in Cargo feature, `gpu`, enables every GPU path; the `--gpu` runtime
-flag then uses whichever fits the model and stage:
+One opt-in Cargo feature, `gpu`, enables every GPU path. At run time
+`--device auto` (the default) decides per stage:
 
-| Stage | Commands | What runs on the GPU |
-|-------|----------|----------------------|
-| CNN adapter detection | `demux detect --method cnn --gpu`, fused `demux --method cnn --gpu` | CNN/TCN inference through onnxruntime CUDA. The GPU path that pays off most — detection is inference-bound, ~7× faster end-to-end on an A30. |
-| CTC-CRF encoder | `demux basecall --gpu`, fused `demux --gpu` with a CRF model | The basecall encoder through onnxruntime CUDA, ~4× end-to-end. |
-| DTW classification | `demux classify --gpu`, `demux train-svm --gpu` | Batched DTW distance. **Experimental and usually slower** than a full CPU node — see the warning in [classify](#classify). |
+| Stage | Runs on the GPU under `auto`? | Why |
+|-------|-------------------------------|-----|
+| CNN adapter detection (`--method cnn`) | **Yes** | Detection is inference-bound and tract has no efficient batched conv. ~7× faster end-to-end on an A30 — the path that pays off most. |
+| CTC-CRF encoder | **Yes** | The encoder is ~91% of that head's CPU cost. ~4× end-to-end. |
+| DTW classification | **No** | The CPU is faster: 113 s on 64 cores vs 132 s on an A30, plus ~2.2 GB more RSS. `--device gpu` opts in anyway; worth it only when cores are scarce. |
+| GBM classification | **No** | No GPU implementation — a 32-core CPU pool beats one GPU stream on the tree walk by roughly 20×. |
+| LLR adapter detection | **No** | No GPU implementation; it is a CPU changepoint search. |
+
+`--device` takes three values:
+
+- **`auto`** (default) — the table above, and only when the relevant Cargo
+  feature is compiled in *and* a CUDA device is visible. Never an error.
+- **`gpu`** — a **requirement**, not a request. A missing feature, an absent
+  device, or an onnxruntime that cannot register its CUDA execution provider
+  each fail the run with a message naming the cause. This is deliberate: a
+  best-effort CUDA registration that quietly commits to the CPU provider is how
+  a broken runtime produced correct, slow, accelerated-looking runs for months.
+- **`cpu`** — CPU everywhere, device or no device.
+
+`--gpu` still works as a hidden, deprecated alias for `--device gpu` (it warns,
+including about the change in meaning); `--cpu` is an alias for `--device cpu`.
+Both conflict with `--device`. `--device` is accepted in **every** build,
+including the release artifacts that contain no GPU code — `--device gpu` there
+tells you the feature is not compiled in rather than failing on an unknown
+argument.
+
+!!! tip "A CPU run that could have been a GPU run says so"
+    Whenever a GPU-capable stage lands on the CPU, escpod logs a warning at
+    startup naming the cost and the cause:
+
+    ```
+    WARN boundary CNN adapter detection is running on the CPU (~7x slower than
+         GPU end-to-end); no CUDA device is visible. Allocate a GPU (SLURM:
+         `--gres=gpu:1`) and check `nvidia-smi`, or pass `--device cpu` to
+         silence this.
+    ```
+
+    The two causes are distinguished — `this build has no cnn-gpu feature`
+    needs a rebuild, `no CUDA device is visible` needs an allocation.
 
 `gpu` is the only GPU flag, in the CLI and in `escapepod-demux` alike. There is
 no way to build half a GPU binary, so there is no combination in which `--gpu`
@@ -803,7 +840,8 @@ model's definition.
 To build it yourself instead, nothing CUDA-related is needed at **build**
 time: the GPU runtimes load with `dlopen` at **run** time, so you can build
 on any machine, and a gpu-built binary still runs fine on CPU-only nodes as
-long as `--gpu` isn't requested:
+long as the GPU is not demanded — `--device auto` falls back on its own, and
+only `--device gpu` insists:
 
 ```bash
 cargo build --release --features gpu -p escapepod-cli
@@ -811,7 +849,7 @@ cargo build --release --features gpu -p escapepod-cli
 
 ### Runtime libraries: the pixi environment
 
-At run time `--gpu` needs a CUDA 12 stack and a CUDA-enabled
+At run time the GPU paths need a CUDA 12 stack and a CUDA-enabled
 `libonnxruntime`. The repository's [pixi](https://pixi.sh) `gpu` environment
 supplies all of it as ordinary conda-forge packages, so `pixi.lock` describes
 every byte of it and there is nothing to fetch by hand:
@@ -821,7 +859,7 @@ every byte of it and there is nothing to fetch by hand:
 pixi run install-gpu
 
 # then, on a node with a visible NVIDIA GPU — no env vars needed
-pixi run -e gpu ./target/release/escpod demux reads.pod5 --model <bundle> --gpu --annotate
+pixi run -e gpu ./target/release/escpod demux reads.pod5 --model <bundle> --annotate
 ```
 
 Use the `install-gpu` task rather than `pixi install -e gpu`. The `gpu`
@@ -856,20 +894,22 @@ INFO Detecting adapter boundaries using boundary CNN (GPU)
 INFO Encoder runs on: GPU (onnxruntime CUDA)
 ```
 
-Those lines say what was *requested*; onnxruntime failures that demote the
-work to CPU surface as **warnings** (visible by default), so a warning-free
-run on a GPU node is a healthy one. For positive confirmation that the CUDA
-execution provider loaded, raise the dependency log level — escpod pins
-third-party logs at `warn` unless `RUST_LOG` overrides it:
+Those lines say what was *placed*, and any stage that ends up on the CPU when
+it could have been on the device says so as a **warning** (visible by default),
+so a warning-free run on a GPU node is a healthy one. Under `--device gpu` an
+onnxruntime that cannot register its CUDA provider is a hard error rather than
+a demotion. For positive confirmation that the CUDA execution provider loaded,
+raise the dependency log level — escpod pins third-party logs at `warn` unless
+`RUST_LOG` overrides it:
 
 ```bash
-RUST_LOG=ort=info escpod demux basecall --gpu … 2>&1 | grep CUDAExecutionProvider
+RUST_LOG=ort=info escpod demux basecall … 2>&1 | grep CUDAExecutionProvider
 # INFO [ort::ep] Successfully registered `CUDAExecutionProvider`
 ```
 
 | Symptom | Cause |
 |---------|-------|
-| Warning that the execution provider *"may fall back to CPU"*, run is slow | A CUDA runtime library is missing (typically `libcublasLt.so.12` or `libcudnn.so.9`). Run inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them. |
+| Warning that the execution provider *"may fall back to CPU"*, run is slow | A CUDA runtime library is missing (typically `libcublasLt.so.12` or `libcudnn.so.9`). Run inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them. Re-run with `--device gpu` to turn the same condition into a hard error. |
 | Clear startup error: could not load onnxruntime | `ORT_DYLIB_PATH` is unset or points at a CPU-only build of onnxruntime. Inside the pixi `gpu` environment it is set for you. |
 | Process hangs at startup and prints **nothing**, not even a status line | `ORT_DYLIB_PATH` is set but points at a file that does not exist — normally a stale manual override, since the environment's own value is a package path the lockfile guarantees. |
 

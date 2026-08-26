@@ -9,6 +9,7 @@ use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
 mod commands;
+mod device;
 mod progress;
 mod style;
 #[cfg(test)]
@@ -1232,5 +1233,59 @@ mod tests {
     #[test]
     fn signal_requires_a_subcommand() {
         assert!(Cli::try_parse_from(["escpod", "signal"]).is_err());
+    }
+
+    /// clap's own consistency check over the whole command tree.
+    ///
+    /// Load-bearing for `--device`: [`crate::device::DeviceArgs`] is
+    /// `#[command(flatten)]`ed into several subcommands and its
+    /// `conflicts_with_all` names sibling argument IDs. A flatten that lands
+    /// somewhere those IDs do not exist is a clap **runtime panic**, not a
+    /// compile error, so nothing else in the suite would catch it.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    /// `--device` and its two aliases are mutually exclusive, and `auto` is the
+    /// default when none of them is given.
+    #[test]
+    fn device_aliases_conflict_with_device() {
+        let base = [
+            "escpod", "demux", "detect", "x.pod5", "-o", "b.csv", "--method", "llr",
+        ];
+        for extra in [
+            ["--device", "cpu", "--gpu"].as_slice(),
+            ["--device", "gpu", "--cpu"].as_slice(),
+            ["--gpu", "--cpu"].as_slice(),
+        ] {
+            let argv: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "expected a conflict for {extra:?}"
+            );
+        }
+        // And the plain form parses, on the fused pipeline as well as a
+        // subcommand — `demux`'s `args_conflicts_with_subcommands` makes those
+        // two different parses of the same flattened struct.
+        assert!(
+            Cli::try_parse_from(base.iter().copied().chain(["--device", "gpu"])).is_ok(),
+            "`--device gpu` should parse on `demux detect`"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "escpod",
+                "demux",
+                "reads.pod5",
+                "--model",
+                "m.json",
+                "--annotate",
+                "--device",
+                "cpu",
+            ])
+            .is_ok(),
+            "`--device cpu` should parse on the fused pipeline"
+        );
     }
 }

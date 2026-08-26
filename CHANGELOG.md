@@ -120,6 +120,74 @@
   showed `pixi run -e gpu cargo nextest run …`, but `cargo-nextest` is in the
   `dev` feature only, so that command could never have run. It is `-e dev-gpu`.
 
+### Changed
+
+- **`--device auto|cpu|gpu` replaces the `--gpu` boolean (#270, #278).** The old
+  flag failed in both directions at once, and the second one is what makes this
+  worth doing rather than a rename.
+
+  *Silent CPU.* GPU was opt-in, and the flag only **existed** when the matching
+  Cargo feature was compiled in. Forget it — or run a release binary that has no
+  GPU code at all — and you got the CPU path with nothing said. Boundary-CNN
+  detection is ~7x slower there; a downstream consumer measured **37 minutes** on
+  one flowcell before working out why.
+
+  *Silent GPU fallback.* `--gpu` was a *request*. onnxruntime registers its CUDA
+  execution provider best-effort and commits to the CPU provider when it cannot,
+  so a broken runtime — a CUDA 13 `libonnxruntime` against a CUDA 12 library set,
+  which only ever "worked" because the GPU nodes happen to carry a system
+  `/usr/local/cuda-13.0` — produced a correct, slow run that looked accelerated.
+
+  What is new:
+
+  - `--device auto` (the default) puts a stage on the GPU only where the GPU
+    actually wins, and only when the relevant feature is compiled in *and* a CUDA
+    device is visible. **DTW classification stays on the CPU under `auto`**, on
+    purpose: the CPU is faster for it (113 s on 64 cores against 132 s on an A30
+    for 1.22M reads, plus ~2.2 GB more RSS). CNN/TCN adapter detection (~7x) and
+    the CTC-CRF encoder (~4x) are the two that go to the device.
+  - `--device gpu` is a **requirement**. A missing Cargo feature, an absent
+    device, or an onnxruntime that cannot register its CUDA execution provider
+    each fail the run with a message naming the cause, instead of falling back.
+    It is also how you opt DTW onto the GPU, which is worth doing only when CPU
+    cores are scarce; the "experimental and usually slower" warning still fires.
+  - `--device cpu` forces CPU everywhere, device or no device.
+  - `--gpu` survives as a hidden, deprecated alias for `--device gpu` (it warns,
+    including about the change in meaning), and `--cpu` is a new alias for
+    `--device cpu`. Both conflict with `--device`.
+  - **`--device` exists in every build**, including the musl release artifacts
+    that contain no GPU code. `--device gpu` there explains that the feature is
+    not compiled in rather than dying on an unknown argument.
+
+- **A GPU-capable stage that runs on the CPU now says so, at startup.** This is
+  the higher-value half of the change: it is what would have told the consumer
+  above at second one rather than after 37 minutes. The line names the cost
+  (`~7x slower than GPU end-to-end`) and distinguishes the two causes, because
+  they need different fixes — `this build has no cnn-gpu feature` versus
+  `no CUDA device is visible`. It is emitted from code that is compiled in every
+  build; feature detection uses `cfg!(…)`, never `#[cfg(…)]`, so a binary
+  without the feature can still explain that it lacks it.
+
+- **onnxruntime CUDA registration failure is fatal under `--device gpu`.**
+  Centralised in `escapepod-demux`'s `ort_ep`, the one module that knows how
+  `ort` spells CUDA: `--device gpu` arms `error_on_failure()` on the EP dispatch
+  once, before any session is built, so registration failure surfaces as an
+  ordinary session-build error. Under `auto` it still warns and falls back — that
+  is what `auto` is for.
+
+### Removed
+
+- **`escpod demux train-svm --gpu`.** The flag never did anything: the
+  `train_svm_gpu` it called was byte-identical to the CPU `train_svm` (both
+  forward straight to `fit_from_labels`), because the distance matrix it used to
+  compute on the device fed only a kernel matrix the current label-only fit
+  discards. The command already warned the flag had no effect and then called it
+  anyway. It is removed rather than renamed to `--device gpu`, since a device
+  flag on a command with one implementation is the same lie in newer syntax —
+  `train-svm` is now honestly CPU-only and takes no `--device` at all. The
+  `escapepod_demux::train_svm_gpu` library entry point is gone with it;
+  `compute_distance_matrix_gpu`/`_with_ctx` (which do real device work) stay.
+
 ## 0.16.1 (2026-08-25)
 
 ### Added

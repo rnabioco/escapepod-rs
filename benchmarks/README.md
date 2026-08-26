@@ -28,7 +28,7 @@ Note the diagnostic value of the two models: swapping GBM for DTW-SVM used to
 cost *nothing* in wall time (151.0 → 147.5 s) despite ~6× the CPU, proving
 classification was entirely hidden. After the fix the same swap costs ~50 s —
 classify is now on the critical path, which is what makes the classifier
-optimizations and `--gpu` worth anything.
+optimizations and GPU DTW worth anything.
 
 ### Reader tuning
 
@@ -84,15 +84,19 @@ Same input and binary, run on a `gpu` node (64 cores, A30) so CPU and GPU share
 hardware. **Allocate the whole node**: the CPU core count dominates this
 comparison, and starving it produces a misleading GPU win.
 
-| DTW-SVM, A30 node | CPU | `--gpu` | |
+| DTW-SVM, A30 node | `--device cpu` | `--device gpu` | |
 |---|---:|---:|---:|
 | `-c 64` (full node) | **113.0 s** | 132.4 s | GPU **0.85×** — slower |
 | `-c 16` | 206.4 s | 123.5 s | GPU 1.67× — an artifact of CPU starvation |
 
 At 64 cores the CPU DTW (lane-parallel AVX2, see `DTW_LANES`) beats the A30, and
-`--gpu` also costs ~2.2 GB extra RSS. The GPU path is worth reaching for only
+the GPU also costs ~2.2 GB extra RSS. The GPU path is worth reaching for only
 when cores are scarce relative to the DTW workload — e.g. a shared node where
 you can get a GPU but not a full socket.
+
+**This is the measurement behind the DTW carve-out in `--device auto`**: `auto`
+leaves DTW on the CPU even with an idle GPU in the node, and `--device gpu` is
+how you override that. See `crate::device::Stage::auto_prefers_gpu`.
 
 ### Would a GPU path help GBM models? No.
 
@@ -206,7 +210,7 @@ same `-j 16`.
 | Tool | Stages | Time | Speedup |
 |---|---|---:|---:|
 | `escpod` (CPU) | detect + fingerprint `--warpdemux-compat` + classify `--svm-model` | **3.43 s** | **5.5×** |
-| `escpod` (GPU, `--gpu`) | same + batched GPU DTW | 3.33 s | 5.7× |
+| `escpod` (GPU, `--device gpu`) | same + batched GPU DTW | 3.33 s | 5.7× |
 | `warpdemux demux -m WDX4_rna004_v1_0` | full pipeline | 19.02 s | 1× |
 
 GPU is within noise of CPU at this input size — with 4000 reads × 851
@@ -249,7 +253,7 @@ Subtlety that bit once: `dtaidistance`'s penalty is expressed in
 costs, so each warp step adds **`penalty²`** (verified directly:
 `dtaidistance.dtw.distance([0,0,0],[0], penalty=0.1) == sqrt(2·0.1²)`).
 Adding the raw `penalty` over-penalizes 10× and *regresses* parity to
-~80 %. The GPU kernel applies the identical `penalty²` so `--gpu`
+~80 %. The GPU kernel applies the identical `penalty²` so GPU
 classify matches CPU (test: `gpu_svm_batch::parity_svm_classify_batch_penalty`).
 
 The remaining Layer-A 0.37 % are all low-confidence near-ties
@@ -277,7 +281,7 @@ pixi run -e warpdemux-bench install-warpdemux
 srun -p rna -A rbi -c 32 cargo build --release \
     -p escapepod-cli --features "demux train"
 
-# GPU build (adds --gpu variant)
+# GPU build (adds the `--device gpu` variant)
 pixi install -e gpu
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     pixi run -e gpu cargo build --release \
@@ -313,7 +317,7 @@ model/boundary-bound, not affected by the device.
 
 | Script | Purpose |
 |---|---|
-| `benchmark_demux.sh` | Single cell: detect+fingerprint+classify vs WarpDemuX. Flags: `--model NAME`, `--gpu`, `--out-dir DIR`, `--emit-tsv FILE`. |
+| `benchmark_demux.sh` | Single cell: detect+fingerprint+classify vs WarpDemuX. Flags: `--model NAME`, `--gpu` (the script's own flag; it passes `--device gpu` to escpod, and `--device cpu` for the CPU arm), `--out-dir DIR`, `--emit-tsv FILE`. |
 | `make_demux_inputs.sh` | Builds reproducible size tiers (4k/25k/100k reads) from a real run via `escpod filter`; the bundled 4000-read file is always the smallest tier. |
 | `benchmark_demux_matrix.sh` | Sweeps {models} × {tiers} × {cpu,gpu}, one srun per device, → `matrix.tsv` + `matrix.md` (speed + agreement per cell). |
 | `benchmark_demux_parity.sh` | The stage-isolation ladder above. `--dump-mismatches` writes a per-read CSV for root-causing. Needs the CNN ONNX for the B-cnn layer. |

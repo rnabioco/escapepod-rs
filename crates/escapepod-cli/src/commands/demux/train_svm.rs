@@ -57,8 +57,8 @@ pub struct TrainSvmArgs {
 
     /// Randomly subsample each barcode class down to at most N fingerprints
     /// before training. Required for large datasets since the all-pairs DTW
-    /// distance matrix is O(N^2) memory (easily overflows GPU VRAM). Sampling
-    /// is balanced (same cap per class) and deterministic under `--seed`.
+    /// distance matrix is O(N^2) memory. Sampling is balanced (same cap per
+    /// class) and deterministic under `--seed`.
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub max_per_class: Option<usize>,
 
@@ -71,29 +71,9 @@ pub struct TrainSvmArgs {
     )]
     pub seed: u64,
 
-    /// Run the DTW distance matrix on the GPU (requires `--features gpu`).
-    #[cfg(feature = "gpu")]
-    #[arg(long, help_heading = "Advanced Options")]
-    pub gpu: bool,
-
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
     pub profile: bool,
-}
-
-/// Whether the user requested the GPU path. Expands to `false` in builds
-/// compiled without the `gpu` feature.
-#[inline]
-fn gpu_requested(args: &TrainSvmArgs) -> bool {
-    #[cfg(feature = "gpu")]
-    {
-        args.gpu
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        let _ = args;
-        false
-    }
 }
 
 /// Run the train-svm subcommand.
@@ -157,29 +137,23 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
     // The fit is currently label-only: the all-pairs DTW distance matrix and
     // the RBF kernel matrix built from it are not consumed by the model that
     // gets written (see the cost note on `escapepod_demux::train_svm`), so they
-    // are no longer computed. Say so rather than letting the flags that feed
+    // are no longer computed. Say so rather than letting the flag that feeds
     // them look effective.
-    if args.window.is_some() || gpu_requested(&args) {
+    if args.window.is_some() {
         warn!(
-            "--window/--gpu configure the all-pairs DTW distance matrix, which the current \
-             SVM fit does not consume; they affect only the values recorded in the model \
+            "--window configures the all-pairs DTW distance matrix, which the current \
+             SVM fit does not consume; it affects only the value recorded in the model \
              metadata. Classification honours the recorded window."
         );
     }
 
-    let model = if gpu_requested(&args) {
-        #[cfg(feature = "gpu")]
-        {
-            use escapepod_demux::train_svm_gpu;
-            train_svm_gpu(fingerprints, labels, &config)?
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
-        }
-    } else {
-        train_svm(fingerprints, labels, &config)?
-    };
+    // No device selection here, and deliberately none: this command has no GPU
+    // path to choose. `--gpu` used to exist and called a `train_svm_gpu` that
+    // was byte-identical to the CPU `train_svm` — both forward straight to
+    // `fit_from_labels` — so the flag never moved any work to a device. It is
+    // gone rather than renamed to `--device gpu`, because a device flag on a
+    // command with one implementation is the same lie in newer syntax.
+    let model = train_svm(fingerprints, labels, &config)?;
 
     // Save the model
     model.save(&args.output)?;

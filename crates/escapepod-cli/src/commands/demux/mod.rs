@@ -111,15 +111,16 @@ touches the network, so a missing model fails fast instead of hanging.
 Examples:
   escpod demux basecall in.pod5 --boundaries bnd.csv --model crf_export/ \
       --barcodes refs.csv -o classifications.csv
-  escpod demux basecall *.pod5 --boundaries bnd.csv --model crf_export/ -o seqs.csv --gpu
+  escpod demux basecall *.pod5 --boundaries bnd.csv --model crf_export/ -o seqs.csv
 
 With --barcodes (a `name,sequence` CSV) each read is assigned to its closest
 reference by edit distance and the output feeds `escpod demux split` directly.
 Without it, only decoded sequences are emitted. Confidence is the edit-distance
 margin to the second-best reference.
 
---gpu needs the `gpu` feature (onnxruntime + CUDA); the lattice decode stays
-on the CPU regardless.
+The encoder runs on the GPU by default (--device auto) when built with
+`gpu` (onnxruntime + CUDA) and a device is visible; --device gpu demands it
+and --device cpu forbids it. The lattice decode is the encoder's own business.
 ")]
     Basecall(BasecallArgs),
 
