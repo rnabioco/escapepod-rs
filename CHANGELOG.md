@@ -38,6 +38,56 @@
   Prebuilt binaries are now documented in the README and the installation guide,
   which previously described only `cargo install`.
 
+### Changed
+
+- **The pixi `gpu` environment now supplies CUDA itself, instead of borrowing
+  the host's (#278).** `install-ort` pip-downloaded `onnxruntime-gpu` into
+  `.pixi/ort/`, which was the only input to the GPU environment that `pixi.lock`
+  did not describe — no version record, no checksum, re-fetched per clone. That
+  is where a silent bug lived: PyPI's default build moved to **CUDA 13** while
+  `[feature.gpu.dependencies]` pinned CUDA 12, so not one of the provider's
+  sonames could be satisfied from `$CONDA_PREFIX/lib`.
+
+  It never failed. Verified on an A30: `--gpu` worked, because the loader fell
+  through to a system `/usr/local/cuda-13.0` our GPU nodes happen to carry. The
+  conda packages were inert and the whole path rested on a CUDA install we
+  neither chose nor control — which would have broken on any node without one.
+
+  `libonnxruntime` is now an ordinary conda-forge package
+  (`onnxruntime-cpp`, build-pinned to `*cuda129`), so the lockfile describes it
+  like everything else. Deleted along the way: the `install-ort` task,
+  `scripts/unpack_ort_gpu.py`, `scripts/gpu_env_activation.sh`, the `.pixi/ort`
+  directory, and the "fetch this once on a networked node" step. Setup is
+  `pixi run install-gpu`. `ORT_DYLIB_PATH` is now a static path the lock
+  guarantees exists, so the script that used to export it *only if the file was
+  there* — guarding a dangling value that hangs escpod silently at startup — has
+  nothing left to guard.
+
+  The CUDA-major mismatch is now a **solve error rather than prose**: the `gpu`
+  environment targets a `linux-64-cuda` platform (`cuda = "12"`), which excludes
+  the `_cuda130` build. This needs pixi ≥ 0.77, whose named platform variants
+  scope `__cuda` to one feature; on 0.76 the only available spelling re-keyed the
+  workspace's single platform and dragged every environment onto it, which is why
+  the wheel was fetched out of band until now.
+
+  Two things worth knowing. The explicit `libcublas` / `cuda-cudart` / `cudnn`
+  pins are **not** redundant and were not removed: `onnxruntime-cpp`
+  under-declares its dependencies, so dropping them puts the provider back to
+  failing-as-a-slowdown. `libcufft` and `libcurand` *are* gone — this build,
+  unlike the wheel, references neither. And `pixi install -e gpu` no longer works
+  on a GPU-less login node, which on a cluster is where you install; the
+  `install-gpu` task exists so that is one obvious command rather than a solver
+  error about virtual packages.
+
+  Non-GPU environments are byte-identical after the change; only `gpu` and
+  `dev-gpu` move.
+
+### Fixed
+
+- **`CLAUDE.md` pointed GPU tests at an environment with no test runner.** It
+  showed `pixi run -e gpu cargo nextest run …`, but `cargo-nextest` is in the
+  `dev` feature only, so that command could never have run. It is `-e dev-gpu`.
+
 ## 0.16.1 (2026-08-25)
 
 ### Added

@@ -805,27 +805,29 @@ long as `--gpu` isn't requested:
 cargo build --release --features gpu -p escapepod-cli
 ```
 
-### Runtime libraries: the pixi environment (easiest)
+### Runtime libraries: the pixi environment
 
-At run time `--gpu` needs two things, and the repository's
-[pixi](https://pixi.sh) `gpu` environment supplies both:
-
-1. **The CUDA 12 runtime libraries** — `libcublas`/`libcublasLt`,
-   `libcudart`, `libcufft`, cuDNN 9 (for the onnxruntime CUDA execution
-   provider) and `libnvrtc` (for the DTW kernels), from conda-forge.
-2. **A CUDA-enabled `libonnxruntime`** for the CNN/CRF paths — fetched once
-   by the `install-ort` task into `.pixi/ort/` (extracted from the
-   `onnxruntime-gpu` wheel; nothing is pip-installed), version-pinned to
-   match the `ort` crate the binary was built with.
+At run time `--gpu` needs a CUDA 12 stack and a CUDA-enabled
+`libonnxruntime`. The repository's [pixi](https://pixi.sh) `gpu` environment
+supplies all of it as ordinary conda-forge packages, so `pixi.lock` describes
+every byte of it and there is nothing to fetch by hand:
 
 ```bash
-# once, on a machine with network access (on clusters: the login node —
-# this also creates the environment on first use)
-pixi run -e gpu install-ort
+# once, on a machine with network access (on clusters: the login node)
+pixi run install-gpu
 
 # then, on a node with a visible NVIDIA GPU — no env vars needed
 pixi run -e gpu ./target/release/escpod demux reads.pod5 --model <bundle> --gpu --annotate
 ```
+
+Use the `install-gpu` task rather than `pixi install -e gpu`. The `gpu`
+environment targets a platform with the `__cuda` virtual package asserted —
+that is what lets conda-forge's CUDA builds resolve — and a login node with no
+GPU cannot satisfy it, so the plain command fails with a solver error about
+missing virtual packages. The task supplies the install-time probe. Nothing is
+faked: the resolve is already committed in `pixi.lock`, and the packages
+installed are the ones it names. On a GPU node `pixi install -e gpu` works
+directly.
 
 Activating the environment (`pixi run -e gpu …` or `pixi shell -e gpu`) sets
 `LD_LIBRARY_PATH` and `ORT_DYLIB_PATH` automatically. The only system
@@ -833,6 +835,13 @@ requirement on the node itself is an NVIDIA driver new enough for CUDA 12.2
 (≥ 535) — the DTW kernels target that driver API. This works the same for the
 released `-gnu-gpu` binary as for a local build; point the command at wherever
 you unpacked it.
+
+!!! tip "Checking who is really supplying CUDA"
+    `ldd $CONDA_PREFIX/lib/libonnxruntime_providers_cuda.so` on a GPU node
+    should resolve every CUDA library *inside* the environment. Anything
+    coming from a system path such as `/usr/local/cuda-13.0` means the
+    environment is not the thing carrying the work, which is a bug worth
+    reporting — it is how a CUDA major mismatch hid here for months.
 
 ### Verifying the GPU is actually in use
 
@@ -857,8 +866,8 @@ RUST_LOG=ort=info escpod demux basecall --gpu … 2>&1 | grep CUDAExecutionProvi
 | Symptom | Cause |
 |---------|-------|
 | Warning that the execution provider *"may fall back to CPU"*, run is slow | A CUDA runtime library is missing (typically `libcublasLt.so.12` or `libcudnn.so.9`). Run inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them. |
-| Clear startup error: could not load onnxruntime | `ORT_DYLIB_PATH` is unset (e.g. `install-ort` was never run) or points at a CPU-only build of onnxruntime. |
-| Process hangs at startup and prints **nothing**, not even a status line | `ORT_DYLIB_PATH` is set but points at a file that does not exist. The pixi activation only sets it when the library is present, so this normally means a stale manual override. |
+| Clear startup error: could not load onnxruntime | `ORT_DYLIB_PATH` is unset or points at a CPU-only build of onnxruntime. Inside the pixi `gpu` environment it is set for you. |
+| Process hangs at startup and prints **nothing**, not even a status line | `ORT_DYLIB_PATH` is set but points at a file that does not exist — normally a stale manual override, since the environment's own value is a package path the lockfile guarantees. |
 
 !!! tip "On a cluster, redirect output to a file"
     When running under a scheduler, don't pipe the job's output through
@@ -873,20 +882,20 @@ Reproduce what the environment provides:
   `libcublasLt.so.12`, `libcudart.so.12`, `libcufft.so.11`,
   `libcudnn.so.9`, and `libnvrtc.so.12` for the DTW kernels.
 - For the CNN/CRF paths, set `ORT_DYLIB_PATH` to a **CUDA-enabled**
-  `libonnxruntime`, e.g. extracted from the `onnxruntime-gpu` wheel
-  (`onnxruntime/capi/libonnxruntime.so.<version>`). The onnxruntime version
-  must be compatible with the `ort` crate the binary was built with —
-  current pins: onnxruntime 1.28.0 with `ort` 2.0.0-rc.13.
+  `libonnxruntime`, and keep the provider libraries
+  (`libonnxruntime_providers_cuda.so`) beside it — onnxruntime loads them from
+  the same directory. The onnxruntime version must be compatible with the `ort`
+  crate the binary was built with; current pins are onnxruntime 1.28 with `ort`
+  2.0.0-rc.13, and the build must be a CUDA **12** one to match the libraries
+  above.
 
 ### HPC notes
 
-- Anything that downloads (`pixi run -e gpu install-ort`, and the pixi
-  environment creation it triggers) must run on a **networked** node —
-  compute nodes typically cannot reach the internet. Neither step needs a
-  GPU, so the login node is fine.
-- Both the environment (`.pixi/envs/gpu`) and the onnxruntime download
-  (`.pixi/ort`) live inside the project directory. On a shared filesystem
-  the GPU nodes see them with no further staging.
+- `pixi run install-gpu` must run on a **networked** node — compute nodes
+  typically cannot reach the internet. It does not need a GPU (that is the
+  whole reason the task exists), so the login node is the right place.
+- The environment (`.pixi/envs/gpu`) lives inside the project directory. On a
+  shared filesystem the GPU nodes see it with no further staging.
 - Model files are also fetched explicitly, never at run time — see
   `escpod demux models fetch` above.
 

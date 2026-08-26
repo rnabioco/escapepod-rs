@@ -1,6 +1,22 @@
 [workspace]
 name = "escapepod-rs"
 channels = ["conda-forge", "bioconda"]
+# Two platforms for one machine type. `linux-64-cuda` is the same linux-64 with
+# `__cuda` asserted, which is what conda-forge's CUDA builds require in order to
+# solve at all. Only the `gpu` feature targets it (see `[feature.gpu]`); every
+# other environment carries the empty `cpu` feature below to stay pinned to
+# plain linux-64, so a developer without a GPU never has to satisfy `__cuda` and
+# their lock entries never move. Needs pixi >= 0.77 for the named-variant
+# syntax — on 0.76 the only spelling available re-keyed the workspace's single
+# platform and dragged every environment onto it, which is why this repository
+# fetched an onnxruntime wheel out of band until 2026-08-26.
+platforms = ["linux-64", { name = "linux-64-cuda", platform = "linux-64", cuda = "12" }]
+
+# Deliberately empty. Its only job is to pin an environment to plain `linux-64`
+# rather than letting it inherit both workspace platforms — which the implicit
+# `default` environment would otherwise do, so `default` is spelled out in
+# `[environments]` below purely to carry this.
+[feature.cpu]
 platforms = ["linux-64"]
 
 [dependencies]
@@ -33,6 +49,21 @@ tar -xz -C $DORADO_DIR
 """
 install-pod5 = "pip install 'pod5>=0.3.36,<0.4'"
 
+# Create the `gpu` environment from a machine that has no GPU — which on a
+# cluster is the normal case, because the login node is the one with network
+# access and the GPU nodes are the ones with `__cuda`.
+#
+# Plain `pixi install -e gpu` fails there, and fails ugly: the `gpu` environment
+# targets the `linux-64-cuda` platform, whose `__cuda` virtual package a GPU-less
+# machine cannot provide, so the solver reports missing virtual packages. The
+# resolve itself is already done and committed in pixi.lock; the only thing
+# absent is the install-time probe, which is exactly what CONDA_OVERRIDE_CUDA
+# supplies. Nothing is being faked about the solution — the packages installed
+# are the ones the lockfile already names.
+#
+# On a GPU node this is unnecessary and `pixi install -e gpu` works directly.
+install-gpu = "CONDA_OVERRIDE_CUDA=12 pixi install -e gpu"
+
 # Python bindings test feature
 [feature.python-test.dependencies]
 python = ">=3.10"
@@ -55,61 +86,64 @@ typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escape
   "build-python",
 ] }
 
-# GPU (CUDA) feature. Covers the runtime needs of all three GPU cargo
-# features, all `load-dynamic`/dlopen (nothing needed at build time):
+# GPU (CUDA) feature. Covers the runtime needs of every GPU cargo feature —
+# all of them `load-dynamic`/dlopen, so nothing here is needed at build time:
 #   * `--features gpu`      — cudarc dlopens libnvrtc for the GPU DTW kernels.
 #   * `--features cnn-gpu`  — onnxruntime CUDA execution provider for batched
 #     CNN adapter detection (`demux detect --method cnn --gpu`).
 #   * `--features crf-gpu`  — the same onnxruntime CUDA EP for the CTC-CRF
 #     encoder (`demux basecall --gpu`, fused `demux --gpu`).
-# The CUDA 12 runtime libs come from conda-forge; the ort CUDA EP dlopens
-# cublas/cublasLt/cudart/cufft AND cuDNN 9, and without them it fails with
-# `libcublasLt.so.12: cannot open shared object file` and silently falls back
-# to CPU. The one piece conda cannot supply without a workspace-wide
-# `__cuda` platform re-key is the CUDA-enabled libonnxruntime itself: run
-# `pixi run -e gpu install-ort` ONCE on a networked (login) node to fetch it
-# from the onnxruntime-gpu wheel into `.pixi/ort/` — the activation script
-# then finds it there. Setup, in full:
-#   pixi run -e gpu install-ort      # once, networked node; compute nodes can't
-#   pixi run -e gpu <escpod … --gpu> # any GPU node, no env vars needed
-[feature.gpu.dependencies]
-cuda-nvrtc = ">=12"        # GPU DTW (cudarc)
-cuda-version = "12.*"
-libcublas = "*"            # ort CUDA EP: libcublas.so.12 + libcublasLt.so.12
-cuda-cudart = "*"          # ort CUDA EP: libcudart.so.12
-libcufft = "*"             # ort CUDA EP: libcufft.so.11
-cudnn = ">=9,<10"          # ort CUDA EP: libcudnn.so.9
+#
+# Everything comes from conda-forge and is described by pixi.lock, including
+# libonnxruntime. `pixi install -e gpu` is the whole setup; there is no fetch
+# step, no unpack script, and no out-of-band directory.
+#
+# That last part is the point. Until 2026-08-26 the CUDA-enabled libonnxruntime
+# was pip-downloaded into `.pixi/ort/` by an `install-ort` task, because
+# conda-forge's CUDA builds depend on the `__cuda` virtual package and pixi 0.76
+# could not scope that to one feature. `.pixi/ort` was then the only input to
+# this environment that the lockfile did not describe — no version record, no
+# checksum, re-fetched per clone — and that is exactly where a silent bug lived:
+# PyPI's `onnxruntime-gpu` moved to CUDA 13 builds while the pins here said
+# CUDA 12, and `--gpu` kept working only because our GPU nodes happen to carry a
+# system `/usr/local/cuda-13.0` for the loader to fall through to. See #278.
+#
+# Pinning the `*cuda129` build makes that class of mismatch a solve error rather
+# than prose: `cuda = "12"` on the platform excludes the `_cuda130` build.
+#
+# The explicit CUDA library pins below are NOT redundant. `onnxruntime-cpp`
+# under-declares: its `libonnxruntime_providers_cuda.so` links libcudart.so.12,
+# libcublas.so.12 and libcublasLt.so.12 and dlopens libcudnn.so.9, while the
+# package depends only on `__cuda`, `cuda-version` and libgcc/libstdcxx. Drop
+# them and the provider fails to load — which onnxruntime reports by falling
+# back to CPU, i.e. as a slowdown rather than an error. Verified by `objdump -p`
+# on the shipped .so; libcufft and libcurand are deliberately absent because
+# this build, unlike the PyPI wheel, references neither.
+[feature.gpu]
+platforms = ["linux-64-cuda"]
 
-[feature.gpu.tasks]
-# Fetch the CUDA-enabled libonnxruntime that `ort` (load-dynamic) dlopens at
-# run time. Pinned: 1.28.0 is verified against the workspace's ort
-# 2.0.0-rc.13 pin (see crates/escapepod-demux/Cargo.toml) — bump the two
-# together, deliberately. The wheel is only a container for the .so; nothing
-# is pip-*installed*.
-install-ort = """
-python -m pip download onnxruntime-gpu==1.28.0 --no-deps -d .pixi/ort && \
-python scripts/unpack_ort_gpu.py .pixi/ort
-"""
+[feature.gpu.dependencies]
+cuda-version = "12.*"
+cuda-nvrtc = ">=12,<13"    # GPU DTW (cudarc): libnvrtc.so.12
+libcublas = "*"            # ort CUDA EP links libcublas.so.12 + libcublasLt.so.12
+cuda-cudart = "*"          # ort CUDA EP links libcudart.so.12
+cudnn = ">=9,<10"          # ort CUDA EP dlopens libcudnn.so.9
+# The CUDA-enabled libonnxruntime that `ort` (load-dynamic) dlopens. Version is
+# pinned against the workspace's ort 2.0.0-rc.13 (crates/escapepod-demux/
+# Cargo.toml) — bump the two together, deliberately. The `*cuda129` build
+# selector is what keeps this on CUDA 12; there is a `_cuda130` build too.
+onnxruntime-cpp = { version = "1.28.*", build = "*cuda129" }
 
 # LD_LIBRARY_PATH makes `$CONDA_PREFIX/lib` visible to the dlopen paths above
-# (cudarc's libnvrtc and ort's CUDA EP deps) — the conda-forge CUDA packages
-# ship no activation hook that sets this. The script exports ORT_DYLIB_PATH
-# only when `.pixi/ort/` actually holds the library (see install-ort above):
-# a dangling ORT_DYLIB_PATH makes the ort features hang silently at startup,
-# whereas unset fails fast with a clear error. An ORT_DYLIB_PATH you export
-# yourself wins over the script.
+# (cudarc's libnvrtc, and the CUDA EP's cuDNN) — the conda-forge CUDA packages
+# ship no activation hook that sets it. ORT_DYLIB_PATH can be a plain static
+# path now that the library is an ordinary package: the lock guarantees the file
+# exists in the environment, so the old "export it only if the file is there"
+# script — which existed because a dangling ORT_DYLIB_PATH hangs escpod silently
+# at startup — has nothing left to guard against.
 [feature.gpu.activation]
-env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
-scripts = ["scripts/gpu_env_activation.sh"]
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH", ORT_DYLIB_PATH = "$CONDA_PREFIX/lib/libonnxruntime.so" }
 
-# WarpDemuX benchmark feature. Neither `warpdemux` nor `adapted` is on
-# PyPI, so we pip-install them editable from the cloned repos under
-# `ext/`. Build deps (numpy, cython) come from conda-forge to work
-# around ADAPTed's missing `[build-system]` block; runtime deps are
-# pre-resolved via conda-forge where possible to keep pip lightweight.
-# Run `pixi run -e warpdemux-bench install-warpdemux` once after cloning
-# the submodules to bootstrap; the benchmark script then invokes
-# `pixi run -e warpdemux-bench …` for the Python tools.
 [feature.warpdemux-bench.dependencies]
 # Pinned to 3.12: ADAPTed's `@dataclass` patterns with mutable defaults
 # break on Python 3.13's stricter checks.
@@ -190,11 +224,27 @@ test-doc = "cargo test --doc"
 check = "cargo check"
 clippy = "cargo clippy --workspace --all-targets"
 
+# Every non-GPU environment carries the empty `cpu` feature, which pins it to
+# plain `linux-64`. Without it an environment inherits both workspace platforms
+# and would need `__cuda` on machines that have no GPU. `default` is spelled out
+# for exactly that reason and no other.
+#
+# The GPU environments deliberately leave the `default` solve group. Measured
+# both ways: the resulting lock is identical, because a solve group cannot span
+# platforms — pixi resolves `linux-64-cuda` separately whatever the group says.
+# Keeping the annotation would have implied a coupling that does not exist.
+#
+# The practical consequence is that the GPU environments resolve independently
+# and so sit slightly ahead of the shared group (24 version bumps at the time of
+# the split, and openblas instead of mkl). That is inherent to the platform
+# split, not to the group, and it is contained: these two environments exist to
+# run GPU tests and benches, and no non-GPU environment moved at all.
 [environments]
-python-test = { features = ["python-test"], solve-group = "default" }
-docs = { features = ["docs"], solve-group = "default" }
-gpu = { features = ["gpu"], solve-group = "default" }
-warpdemux-bench = { features = ["warpdemux-bench"], solve-group = "default" }
-dev = { features = ["dev"], solve-group = "default" }
+default = { features = ["cpu"] }
+python-test = { features = ["python-test", "cpu"], solve-group = "default" }
+docs = { features = ["docs", "cpu"], solve-group = "default" }
+gpu = { features = ["gpu"] }
+warpdemux-bench = { features = ["warpdemux-bench", "cpu"], solve-group = "default" }
+dev = { features = ["dev", "cpu"], solve-group = "default" }
 # dev + gpu combo for GPU work that still wants mold linking.
-dev-gpu = { features = ["dev", "gpu"], solve-group = "default" }
+dev-gpu = { features = ["dev", "gpu"] }
