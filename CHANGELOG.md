@@ -40,6 +40,56 @@
 
 ### Changed
 
+- **The `.p5s` sidecar now caches the POD5 signal table's batch geometry, and a
+  scattered fetch stops paying for it.** Row count is the one field an Arrow IPC
+  footer does not carry — the footer's `Block` records offset, metadata length
+  and body length, and nothing else — so recovering it means reading every
+  record batch's own message header. That is one scattered mmap touch per batch,
+  measured at 15–24 ms *each* cold on BeeGFS, and it is paid on every process
+  start rather than once: a 33 GB file with 8866 signal batches spent 4.95 s
+  there, **78% of a cold 5000-read scattered fetch**, warm or cold alike.
+
+  `escpod index` now walks it once and records the answer in the sidecar under
+  `escapepod:signal_batch_rows`, run-length encoded (a conformant file is one
+  run and a short tail — `"8865x100,1x37"`, about 15 bytes however many batches
+  it has). Measured on real data, footer parse drops from **4.95 s to 4.82 ms**
+  on that file (8866 batches) and from 149 ms to 2.96 ms on a 3.7 GB file with
+  266 batches, with byte-identical results — the same 226,235,036 samples over
+  the same 5000 reads either way. Loading the read index from the sidecar
+  instead of building it improves in the same pass (249 ms → 59 ms).
+
+  **The POD5 is neither modified nor read differently.** The cheap fix would
+  have been to read batch 0 and assume every batch matches — which is what the
+  official `pod5` library and dorado do, and what `Reader::nonuniform_signal_batch`
+  exists to catch them out on. Recording the *measured* counts costs a handful
+  of bytes, is exact for a non-uniform file too, and means escapepod never makes
+  that bet. The cached geometry is then checked rather than believed: it is used
+  only if it has one entry per batch the footer describes, and the first and
+  last batches are read for real and compared (the last is the short one, so a
+  geometry from a file with a different read count disagrees there). Any
+  mismatch logs a warning and falls back to the full walk, so a stale cache
+  costs time and never correctness.
+
+  Adding the key is not a `.p5s` version bump, on the same footing as the
+  provenance keys: it is optional on read, a sidecar written before it existed
+  still loads, and an older escpod ignores it. A sidecar bound to another POD5
+  is rejected by the existing identity check before the geometry is looked at.
+  Sidecars written by earlier versions simply do not have it until the next
+  `escpod index`; `escpod annotate` preserves one that is already there rather
+  than dropping it.
+
+- **`escapepod-pod5` no longer re-parses the signal footer inside every bulk
+  fetch.** `get_signal_bulk_prefix`, `get_compressed_signal_bulk` and
+  `signal_extractor` each called `ArrowIpcFooter::parse` on entry, bypassing the
+  parse the `Reader` already had cached. Also sorts rows within a batch in
+  `extract_signal_rows`, which previously visited them in request order — and a
+  request assembled by iterating a `HashSet<Uuid>`, which is what `reads_by_ids`
+  hands down, has no order at all. Neither change is measurable on the
+  workloads tested (repeat walks are cheap once the region is mapped; a sparse
+  pick lands under one target per batch), and both are kept as strictly less
+  work. The cost they were suspected of is the one the geometry cache above
+  actually removes.
+
 - **BREAKING: `cnn-gpu` and `crf-gpu` are gone; `gpu` is the single GPU Cargo
   feature.** Anyone building with `--features cnn-gpu` or `--features crf-gpu`
   must switch to `--features gpu`, on `escapepod-cli` and `escapepod-demux`

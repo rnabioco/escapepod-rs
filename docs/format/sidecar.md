@@ -59,6 +59,9 @@ The Arrow schema metadata binds the sidecar to exactly one POD5:
 | `escapepod:file_identifier` | The POD5 footer's `file_identifier` UUID |
 | `escapepod:pod5_size` | The POD5's byte size at write time |
 
+Identity is checked before *anything* in the sidecar is used, including the
+[signal batch geometry](#signal-batch-geometry).
+
 Readers validate both identity keys from the IPC footer *before decoding any
 record batch*. A sidecar copied next to the wrong file, or left behind after
 its POD5 was replaced, therefore fails loudly ("does not match this POD5
@@ -109,6 +112,64 @@ reads `… does not match this POD5 file (stale or copied from another) (from
 inspect summary` shows the same line for a sidecar that loads.
 
 There is no write timestamp: the sidecar file's own mtime already records it.
+
+## Signal batch geometry
+
+One further optional key caches a property of the POD5 rather than of the
+reads:
+
+| Key | Value |
+|-----|-------|
+| `escapepod:signal_batch_rows` | Per-batch row counts of the POD5's **signal** table, run-length encoded |
+
+The encoding is `<runs>x<rows>` terms separated by commas. A conformant POD5
+has one run and a short tail, so 8866 batches encode as `8865x100,1x37` —
+about fifteen bytes however many batches the file has. A non-uniform file is
+recorded as it is, one term per run, rather than rejected.
+
+### Why this is worth caching
+
+Row count is the one field an Arrow IPC footer does not carry: a footer `Block`
+records a batch's offset, metadata length and body length and nothing else. So
+recovering the counts means reading every batch's own message header — one
+scattered touch per batch, which on a network filesystem measured 15–24 ms
+*each* when cold. It is also paid on every process start, not once: a 33 GB
+file with 8866 signal batches spent 4.95 s there, 78% of a cold 5000-read
+scattered fetch. With the geometry cached that becomes 4.82 ms.
+
+`escpod index` walks the batches once and records the result. `escpod annotate`
+preserves an existing value rather than dropping it, since annotating describes
+reads and has no bearing on the signal table.
+
+### Checked, not believed
+
+The obvious cheaper trick is to read batch 0 and assume every other batch
+matches. That is what the official `pod5` library and dorado do, and it is
+exactly what escapepod's `nonuniform_signal_batch` diagnostic exists to catch
+them out on. Recording measured counts costs a handful of bytes and is exact
+for a non-uniform file too, so escapepod does not have to make that bet.
+
+A reader that finds the key still verifies it before using it:
+
+1. it must have exactly one entry per batch the footer describes; and
+2. the **first and last** batches are read for real and compared. The last is
+   the short one, so a geometry belonging to a file with a different read count
+   disagrees there; the first pins the stride.
+
+Any mismatch logs a warning and falls back to reading every header, so a stale
+or corrupt cache costs time and never correctness. A sidecar bound to a
+different POD5 is rejected by the [identity binding](#identity-binding) before
+the geometry is consulted at all.
+
+The two failure modes are deliberately different. The geometry degrades quietly
+to the slow path because the answer is always recoverable from the POD5 itself;
+the **read index** in the same file fails loudly on a stale sidecar, because
+its answer is not recoverable and stepping over it would turn a stale index
+into a slow wrong answer rather than a fast error.
+
+Like the provenance keys, this one is optional on read, so adding it is not a
+version bump: a sidecar written before it existed still loads, and an older
+escpod ignores it.
 
 ## The experimental design
 

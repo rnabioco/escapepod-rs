@@ -104,6 +104,103 @@ pub const P5S_READ_COUNT_KEY: &str = "escapepod:read_count";
 /// Schema-metadata key recording what wrote the sidecar.
 pub const P5S_WRITER_KEY: &str = "escapepod:writer";
 
+// ---------------------------------------------------------------------------
+// Signal batch geometry — a cache for the POD5's own layout
+// ---------------------------------------------------------------------------
+
+/// Schema-metadata key holding the signal table's per-batch row counts,
+/// run-length encoded (see [`encode_batch_rows`]).
+///
+/// This is the row count of every record batch in the POD5's *signal* table,
+/// which is the one part of that table's Arrow IPC footer that the footer
+/// itself does not carry. Recovering it means reading each batch's message
+/// header — one scattered touch per batch, and on a network filesystem that
+/// measured 15-24 ms *each* cold, 27-39% of a cold scattered fetch and a flat
+/// ~5 s per process on a 33 GB file with 8866 batches. It is also pure
+/// function of a file that never changes, so paying for it more than once is
+/// waste. `escpod index` walks it once and records the answer here.
+///
+/// Two things it deliberately is **not**:
+///
+/// * It is not an *assumption* about the stride. The obvious cheap fix is to
+///   read batch 0, assume every batch matches, and derive the rest — which the
+///   official `pod5` library and dorado do, and which `Reader::nonuniform_signal_batch`
+///   exists to catch them out on. Storing the measured counts costs a few
+///   bytes and is exact for a non-uniform file too, so escapepod does not have
+///   to make that bet at all.
+/// * It is not a change to POD5. The sidecar caches what the POD5 already
+///   says; the POD5 is never read differently because of it, and never
+///   written. A reader that finds this key still spot-checks it against the
+///   file (see `ArrowIpcFooter::parse_with_row_counts`) and falls back to the
+///   full walk if it does not fit.
+///
+/// Optional on read, like the provenance keys and for the same reason: a
+/// sidecar written before it existed still loads, and an older escpod ignores
+/// it. Adding it is therefore not a version bump.
+pub const P5S_SIGNAL_BATCH_ROWS_KEY: &str = "escapepod:signal_batch_rows";
+
+/// Cap on the encoded geometry, so a pathological file cannot bloat a sidecar.
+///
+/// Only a file whose batch row counts genuinely alternate reaches this — a
+/// uniform file encodes to about 15 bytes however many batches it has. Past
+/// the cap the key is simply omitted and readers walk the footer as before.
+const MAX_ENCODED_BATCH_ROWS: usize = 1 << 20;
+
+/// Run-length encode per-batch row counts as `"<runs>x<rows>,…"`.
+///
+/// A conformant POD5 has one run: every batch but the last holds exactly the
+/// writer's `signal_batch_size`, so 8866 batches encode as `"8865x100,1x37"`.
+/// A non-uniform file degrades gracefully to one term per run rather than
+/// being rejected — the point is to record what is there, not to insist on
+/// what should be.
+pub fn encode_batch_rows(counts: &[u64]) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut run_value = counts[0];
+    let mut run_len = 0u64;
+    for &c in counts {
+        if c == run_value {
+            run_len += 1;
+        } else {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(&format!("{run_len}x{run_value}"));
+            run_value = c;
+            run_len = 1;
+        }
+        if out.len() > MAX_ENCODED_BATCH_ROWS {
+            return None;
+        }
+    }
+    if !out.is_empty() {
+        out.push(',');
+    }
+    out.push_str(&format!("{run_len}x{run_value}"));
+    (out.len() <= MAX_ENCODED_BATCH_ROWS).then_some(out)
+}
+
+/// Decode [`encode_batch_rows`]. `None` on anything malformed — the geometry
+/// is a cache, so a value that does not parse means "walk the footer", never
+/// an error that fails the open.
+pub fn decode_batch_rows(s: &str) -> Option<Vec<u64>> {
+    let mut out = Vec::new();
+    for term in s.split(',') {
+        let (n, value) = term.split_once('x')?;
+        let n: u64 = n.parse().ok()?;
+        let value: u64 = value.parse().ok()?;
+        // A run of zero batches is meaningless, and an enormous one is a
+        // malformed value trying to make us allocate.
+        if n == 0 || out.len() as u64 + n > u32::MAX as u64 {
+            return None;
+        }
+        out.extend(std::iter::repeat_n(value, n as usize));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// What a sidecar says about its own origin.
 ///
 /// Every field is optional: sidecars written before these keys existed carry
@@ -464,6 +561,14 @@ pub struct Sidecar {
     /// What the file said about its own origin. Read-only: rewriting a sidecar
     /// re-stamps this from the file being written, never from here.
     provenance: SidecarProvenance,
+    /// Cached per-batch row counts of the POD5's signal table, if recorded.
+    ///
+    /// Unlike [`Self::provenance`] this **is** carried through a
+    /// read-modify-write: it describes the POD5, which identity binding
+    /// already proves has not changed, so an `annotate` that does not look at
+    /// the signal table has no reason to discard it. Only `escpod index`
+    /// re-measures it.
+    signal_batch_rows: Option<Vec<u64>>,
 }
 
 impl Sidecar {
@@ -485,7 +590,25 @@ impl Sidecar {
             scores: Vec::new(),
             design: None,
             provenance: SidecarProvenance::default(),
+            signal_batch_rows: None,
         }
+    }
+
+    /// The cached signal-table batch row counts, if this sidecar records them.
+    ///
+    /// See [`P5S_SIGNAL_BATCH_ROWS_KEY`] for why they are worth caching and
+    /// what they are not.
+    pub fn signal_batch_rows(&self) -> Option<&[u64]> {
+        self.signal_batch_rows.as_deref()
+    }
+
+    /// Record the signal-table batch row counts, as measured from the POD5.
+    ///
+    /// Only a caller that has actually walked the signal footer should call
+    /// this — the value is trusted (subject to the reader's spot check) on
+    /// every later open, so a guess here is worse than nothing.
+    pub fn set_signal_batch_rows(&mut self, counts: Vec<u64>) {
+        self.signal_batch_rows = (!counts.is_empty()).then_some(counts);
     }
 
     /// The read-index entries, sorted by UUID.
@@ -887,7 +1010,88 @@ pub fn read_sidecar_file(
         design.validate()?;
         sidecar.design = Some(design);
     }
+    // A geometry that will not parse is dropped, not fatal: it is a cache of
+    // something the POD5 still holds, so the cost of ignoring it is a slower
+    // open rather than a wrong answer.
+    sidecar.signal_batch_rows = metadata
+        .get(P5S_SIGNAL_BATCH_ROWS_KEY)
+        .and_then(|s| decode_batch_rows(s));
     Ok(Some(sidecar))
+}
+
+/// The parts of a sidecar that live in its schema metadata, read **without
+/// decoding any record batch**.
+///
+/// [`read_sidecar_file`] materialises every column, which for a multi-million
+/// read index is far more work than a caller that only wants the signal
+/// geometry should pay. Arrow's file reader loads the footer eagerly and the
+/// batches lazily, so this is a footer read and nothing more.
+///
+/// Identity is validated exactly as in [`read_sidecar_file`] — a sidecar bound
+/// to another POD5 is an error here too, never a silent `None`.
+pub fn read_sidecar_metadata(
+    p5s_path: impl AsRef<Path>,
+    expect: &Pod5Identity,
+) -> Result<Option<SidecarMetadata>> {
+    let p5s_path = p5s_path.as_ref();
+    let file = match File::open(p5s_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::from(e)),
+    };
+    let reader = ArrowFileReader::try_new(file, None).map_err(|e| {
+        Error::Parse(format!(
+            "{} is not a readable .p5s sidecar (legacy .p5i or corrupt?): {e}; \
+             delete it and rebuild with `escpod index` / `escpod annotate`",
+            p5s_path.display()
+        ))
+    })?;
+    let schema = reader.schema();
+    let metadata = schema.metadata();
+
+    let provenance = SidecarProvenance {
+        source_name: metadata.get(P5S_SOURCE_NAME_KEY).cloned(),
+        read_count: metadata
+            .get(P5S_READ_COUNT_KEY)
+            .and_then(|s| s.parse().ok()),
+        writer: metadata.get(P5S_WRITER_KEY).cloned(),
+    };
+    let stored_file_id = metadata
+        .get(P5S_FILE_ID_KEY)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| Error::Parse(format!("{} has no valid file id", p5s_path.display())))?;
+    let stored_size: u64 = metadata
+        .get(P5S_POD5_SIZE_KEY)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Parse(format!("{} has no valid pod5 size", p5s_path.display())))?;
+    if stored_file_id != expect.file_id || stored_size != expect.size {
+        let origin = provenance
+            .describe()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        return Err(Error::Parse(format!(
+            "{} does not match this POD5 file (stale or copied from another){}; \
+             rebuild with `escpod index` / `escpod annotate`",
+            p5s_path.display(),
+            origin
+        )));
+    }
+
+    Ok(Some(SidecarMetadata {
+        provenance,
+        signal_batch_rows: metadata
+            .get(P5S_SIGNAL_BATCH_ROWS_KEY)
+            .and_then(|s| decode_batch_rows(s)),
+    }))
+}
+
+/// What [`read_sidecar_metadata`] recovers from a sidecar's schema metadata.
+#[derive(Debug, Clone, Default)]
+pub struct SidecarMetadata {
+    /// What the sidecar says about its own origin.
+    pub provenance: SidecarProvenance,
+    /// Cached per-batch row counts of the POD5's signal table, if recorded.
+    pub signal_batch_rows: Option<Vec<u64>>,
 }
 
 /// Atomically write a sidecar, bound to `identity`. The destination is
@@ -934,6 +1138,14 @@ pub fn write_sidecar_file(
         let json = serde_json::to_string(design)
             .map_err(|e| Error::Parse(format!("design serialization failed: {e}")))?;
         metadata.insert(P5S_DESIGN_KEY.to_string(), json);
+    }
+    // Carried from the struct rather than re-derived, unlike provenance above:
+    // this describes the POD5, not this write, and identity binding already
+    // proves the POD5 is the same one.
+    if let Some(counts) = &sidecar.signal_batch_rows
+        && let Some(encoded) = encode_batch_rows(counts)
+    {
+        metadata.insert(P5S_SIGNAL_BATCH_ROWS_KEY.to_string(), encoded);
     }
 
     let mut fields = vec![

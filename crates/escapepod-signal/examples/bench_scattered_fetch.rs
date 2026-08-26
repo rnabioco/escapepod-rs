@@ -145,7 +145,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // not always land on the same arm.
     let all_ids: Vec<Uuid> = index.uuids().collect();
     let targets = select_targets(&all_ids, &cfg);
-    let ids: Vec<Uuid> = targets.iter().copied().collect();
+    // Sorted before splitting: iterating the `HashSet` puts a different set of
+    // ids in each half on every run, which makes two runs of the same seed
+    // incomparable — and silently so, since only the reported sample counts
+    // move. Sorting by UUID keeps the request unordered with respect to the
+    // *file* (a UUID sort is unrelated to file order), which is the property
+    // being modelled, while making the split reproducible.
+    let mut ids: Vec<Uuid> = targets.iter().copied().collect();
+    ids.sort_unstable_by_key(|u| *u.as_bytes());
     let (set_a, set_b) = ids.split_at(ids.len() / 2);
     let set_a: HashSet<Uuid> = set_a.iter().copied().collect();
     let n = targets.len();
@@ -178,6 +185,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         one_shot.t_signal,
         one_shot.samples as f64 / 1e6,
         (one_shot.samples * 2) as f64 / 1e6 / one_shot.t_signal.as_secs_f64().max(1e-9),
+    );
+
+    // Both halves together, so a run can be checked against another
+    // configuration of the same seed — notably with and without a `.p5s`,
+    // which must not change a single sample.
+    println!(
+        "\n  checksum: {} reads, {} signal rows, {} samples total",
+        one_shot.n_reads + chunked.phase.n_reads,
+        one_shot.n_signal_rows + chunked.phase.n_signal_rows,
+        one_shot.samples + chunked.phase.samples,
     );
 
     println!(
