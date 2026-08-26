@@ -168,12 +168,12 @@ models-download = ["experimental", "model-fetch"]
 demux-models = ["demux"]
 # The one GPU switch, and the only one: every GPU path in one flag — CUDA DTW
 # (cudarc/NVRTC), GPU CNN adapter detection, and the GPU CTC-CRF encoder
-# (both onnxruntime CUDA). `--gpu` at runtime then uses whichever path fits
-# the model and stage. Nothing is needed at build time; at run time the DTW
-# path needs the CUDA driver + libnvrtc, and the onnxruntime paths need a
-# CUDA-enabled libonnxruntime on ORT_DYLIB_PATH (ort is `load-dynamic`, so a
-# gpu-built binary runs fine on CPU-only boxes as long as --gpu isn't asked
-# for).
+# (both onnxruntime CUDA). `--device` at runtime then decides per stage, and
+# `auto` picks the ones that actually win. Nothing is needed at build time; at
+# run time the DTW path needs the CUDA driver + libnvrtc, and the onnxruntime
+# paths need a CUDA-enabled libonnxruntime on ORT_DYLIB_PATH (ort is
+# `load-dynamic`, so a gpu-built binary runs fine on CPU-only boxes —
+# `--device auto` falls back on its own, only `--device gpu` insists).
 #
 # There used to be granular `cnn-gpu` / `crf-gpu` flags underneath this one,
 # justified as serving library consumers and CI isolation builds. Neither
@@ -181,8 +181,8 @@ demux-models = ["demux"]
 # crate cannot be `cargo publish`ed and have no external consumers to serve,
 # and the isolation builds only ever proved that partial-GPU binaries compile —
 # binaries nobody ships, whose sole cost was the runtime prose in
-# `commands/demux/run.rs` explaining which half of `--gpu` was a silent no-op.
-# Folding them in deletes that explaining. `escapepod-signal/gpu` stays
+# `commands/demux/run.rs` explaining which half of a GPU request was a silent
+# no-op. Folding them in deletes that explaining. `escapepod-signal/gpu` stays
 # separate on purpose: it is cudarc-only (no onnxruntime), genuinely narrower,
 # and that crate has no git dependency blocking publication.
 #

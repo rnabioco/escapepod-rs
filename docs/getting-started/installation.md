@@ -84,7 +84,7 @@ features:
 |---------|-------------------|
 | `experimental` | `repack`, `resquiggle`, `index`, `annotate` |
 | `train` | adds `demux train-svm` (SVM training via linfa) |
-| `gpu` | every `--gpu` path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify (CUDA libraries at run time only) |
+| `gpu` | every GPU path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify; selected at run time with `--device` (default `auto`), CUDA libraries at run time only |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 
 Note the sidecar asymmetry: *writing* `.p5s` sidecars (`index`, `annotate`)

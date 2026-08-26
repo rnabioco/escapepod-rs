@@ -112,7 +112,7 @@ Demux has two opt-in features layered on top:
 
 | Feature | Enables |
 |---------|---------|
-| `--features gpu` | Every `--gpu` path: CNN adapter detection, the CTC-CRF encoder, and DTW classify. CUDA libraries at run time only — see [GPU acceleration](demux.md#gpu-acceleration) |
+| `--features gpu` | Every GPU path: CNN adapter detection, the CTC-CRF encoder, and DTW classify. Selected at run time with `--device` (default `auto`); CUDA libraries at run time only — see [GPU acceleration](demux.md#gpu-acceleration) |
 | `--features train` | SVM model training via `linfa-svm` (`escpod demux train-svm`) |
 
 Both imply `demux`, so `cargo build --features gpu` is enough. CPU CNN/TCN

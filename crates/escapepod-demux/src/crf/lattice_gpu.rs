@@ -69,9 +69,12 @@ impl ScoreOrder {
 /// under SLURM `--gres=gpu:1` it is 1 no matter how many cards the node holds,
 /// which is what makes multi-device placement safe to enable by default. Ordinals
 /// `0..count` index the same devices onnxruntime's `device_id` does.
-pub fn visible_device_count() -> Option<usize> {
-    CudaContext::device_count().ok().map(|n| n.max(0) as usize)
-}
+///
+/// Kept as a re-export rather than a second implementation: `--device auto` asks
+/// the same question from [`crate::cuda`] before any CRF code is reachable, and
+/// two probes that could disagree about how many GPUs exist is not a thing worth
+/// owning.
+pub use crate::cuda::visible_device_count;
 
 /// A CUDA device with the lattice kernels loaded.
 ///

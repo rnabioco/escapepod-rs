@@ -188,22 +188,6 @@ pub fn train_svm(
     fit_from_labels(fingerprints, labels, config)
 }
 
-/// GPU variant of [`train_svm`].
-///
-/// Same dead-work caveat as [`train_svm`]: the distance matrix this used to
-/// compute on the device fed only the discarded kernel matrix, so the GPU pass
-/// is skipped and this is now identical to the CPU path. Kept as a distinct
-/// entry point so the `--gpu` flag keeps working and so a real fit can wire the
-/// device matrix back in.
-#[cfg(feature = "gpu")]
-pub fn train_svm_gpu(
-    fingerprints: Vec<Vec<f64>>,
-    labels: Vec<i32>,
-    config: &TrainConfig,
-) -> Result<DtwSvmModel, anyhow::Error> {
-    fit_from_labels(fingerprints, labels, config)
-}
-
 /// Back half of training given a precomputed DTW distance matrix.
 ///
 /// The matrix is currently only shape-checked, not used — see the cost note on
@@ -343,7 +327,7 @@ fn train_binary_svm(
 /// kernel-weighted voting fallback (`use_kernel_weighted: true`). Proper
 /// dual-coefficient extraction from linfa-svm requires either vendoring the
 /// SMO solver or a Cholesky factorization of each kernel submatrix; see
-/// `TODO(svm-real-fit)` in `train_svm_gpu` for the tracking note. The old
+/// `TODO(svm-real-fit)` in `fit_from_labels` for the tracking note. The old
 /// implementation here called `Svm::params().gaussian_kernel(1.0).fit(...)`
 /// which re-applied RBF on top of the already-RBF-transformed kernel matrix
 /// (meaningless) and then threw the solver's output away; removed because

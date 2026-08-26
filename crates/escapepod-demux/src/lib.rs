@@ -71,6 +71,8 @@
 mod classify;
 pub mod crf;
 
+#[cfg(feature = "gpu")]
+pub mod cuda;
 mod fingerprint;
 mod gbm;
 mod model;
@@ -92,6 +94,15 @@ pub use fingerprint::{
     BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
     compute_std_dev_fingerprint, extract_fingerprint_from_signal,
 };
+
+/// Make onnxruntime CUDA execution-provider registration fatal for every session
+/// built after this call, instead of silently falling back to the CPU provider.
+///
+/// Call once at startup when the GPU was *demanded* rather than preferred (the
+/// CLI's `--device gpu`); see `src/ort_ep.rs` for why this is process-wide state
+/// and not a loader parameter.
+#[cfg(feature = "gpu")]
+pub use ort_ep::require_cuda as require_cuda_ep;
 
 // Legacy distance-based classifier.
 pub use classify::{ClassificationResult, classify_from_distances, classify_read};

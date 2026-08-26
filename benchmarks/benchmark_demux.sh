@@ -37,7 +37,8 @@
 #              escpod:   detect -> fingerprint --warpdemux-compat -> classify --svm-model
 #              WarpDemuX: `warpdemux demux -m WDX4_rna004_v1_0`
 #            Reports total wall-clock; with --gpu, adds a third escpod variant
-#            that passes `--gpu` to classify.
+#            that passes `--device gpu` to classify. (The CPU arm passes
+#            `--device cpu`, since escpod's default is now `--device auto`.)
 #   Bench 3  Classification agreement:
 #            Reuses Bench 2's outputs; runs `scripts/compare_demux_results.py`
 #            on escpod vs WarpDemuX predictions to report per-barcode F1,
@@ -199,7 +200,10 @@ run_escpod_pipeline() {
     echo "$(echo "$t1 - $t0" | bc)"
 }
 
-ESCPOD_CPU_TIME=$(run_escpod_pipeline "CPU" "$OUTPUT_DIR/escpod_cpu" "" | tail -1)
+# `--device cpu` explicitly, not just "no GPU flag": the default is now
+# `--device auto`, so on a node that has a visible GPU the CPU arm would
+# otherwise quietly borrow it and the two arms would measure the same thing.
+ESCPOD_CPU_TIME=$(run_escpod_pipeline "CPU" "$OUTPUT_DIR/escpod_cpu" "--device cpu" | tail -1)
 echo "    escpod CPU total:  ${ESCPOD_CPU_TIME}s"
 
 if [ $USE_GPU -eq 1 ]; then
@@ -211,7 +215,7 @@ if [ $USE_GPU -eq 1 ]; then
         exit 1
     fi
     export LD_LIBRARY_PATH="$GPU_ENV_LIB:${LD_LIBRARY_PATH:-}"
-    ESCPOD_GPU_TIME=$(run_escpod_pipeline "GPU" "$OUTPUT_DIR/escpod_gpu" "--gpu" | tail -1)
+    ESCPOD_GPU_TIME=$(run_escpod_pipeline "GPU" "$OUTPUT_DIR/escpod_gpu" "--device gpu" | tail -1)
     echo "    escpod GPU total:  ${ESCPOD_GPU_TIME}s"
 fi
 

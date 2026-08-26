@@ -7,7 +7,7 @@
 //! Pipeline (all stages overlap):
 //!   A. rayon pool decodes + detects + fingerprints reads in parallel (per
 //!      Arrow batch, bounded memory).
-//!   B. classify — CPU per-read (in stage A), or, with `--gpu`, a dedicated GPU
+//!   B. classify — CPU per-read (in stage A), or, on the GPU, a dedicated GPU
 //!      thread that is continuously fed fingerprint blocks through a bounded
 //!      channel (double-buffered, so the GPU isn't idle between batches).
 //!   C. one writer thread **per barcode** does the serial block-copy for that
@@ -94,7 +94,7 @@ pub struct RunArgs {
     /// for precision (#241). This computes what the lattice actually thought,
     /// which is continuous, and adds it to `--classifications`.
     ///
-    /// Costs +3.6% on this pipeline; with `--gpu` more, because the
+    /// Costs +3.6% on this pipeline; on the GPU more, because the
     /// constrained scan reads the raw scores and so brings the decode back to
     /// the host while the encoder stays on the device.
     #[cfg(feature = "crf-decode")]
@@ -243,24 +243,26 @@ pub struct RunArgs {
     )]
     pub downscale: usize,
 
-    /// [experimental] Use the GPU where this pipeline supports it (needs a
-    /// `--features gpu` build): CTC-CRF encoder inference, batched DTW-SVM
-    /// classify, and/or batched CNN adapter detection with `--method cnn`. CPU
-    /// prep stays parallel and feeds the GPU; CPU falls back automatically for
-    /// stages without a GPU path (e.g. GBM classify).
+    /// Where this pipeline's GPU-capable stages run — `auto` (default), `cpu`,
+    /// or `gpu`. CPU prep stays parallel and feeds the device either way.
     ///
-    /// With a CRF bundle this is the case that pays off most: the encoder is
-    /// ~91% of that head's CPU cost (13.9 ms/read against a 1.19 ms AVX-512
-    /// lattice decode), so leaving it on the CPU leaves the device idle even
-    /// with `--method cnn` doing detection there.
+    /// Under `auto` the two stages that measurably win go to the GPU when one is
+    /// usable: CNN adapter detection with `--method cnn` (~7x) and
+    /// CTC-CRF encoder inference (~4x). With a CRF bundle the encoder
+    /// is the case that pays off most — it is ~91% of that head's CPU cost
+    /// (13.9 ms/read against a 1.19 ms AVX-512 lattice decode), so leaving it on
+    /// the CPU leaves the device idle even with `--method cnn` detecting there.
     ///
-    /// GPU DTW classify is NOT recommended on a full node — the CPU DTW is
-    /// faster there (measured 113 s CPU on 64 cores vs 132 s with `--gpu` on an
-    /// A30, plus ~2.2 GB more RSS). It may help when cores are scarce. GPU CNN
-    /// detection (`--method cnn --gpu`) is the case that does pay off.
-    #[cfg(feature = "gpu")]
-    #[arg(long, help_heading = "Advanced Options")]
-    pub gpu: bool,
+    /// DTW-SVM classify stays on the **CPU** under `auto` because the CPU
+    /// is faster: 113 s on 64 cores vs 132 s on an A30 for 1.22M reads, plus
+    /// ~2.2 GB more RSS. `--device gpu` opts into it anyway, which is worth doing
+    /// only when cores are scarce. GBM classify has no GPU path at all.
+    ///
+    /// `--device gpu` is a requirement: a missing Cargo feature, an absent
+    /// device, or an onnxruntime that cannot register its CUDA execution
+    /// provider all fail the run instead of falling back silently.
+    #[command(flatten)]
+    pub device: crate::device::DeviceArgs,
 
     /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
@@ -491,6 +493,22 @@ impl Detector {
             Detector::Cnn(c) => Some(c.config().max_obs_trace),
             #[cfg(feature = "gpu")]
             Detector::CnnGpu(g) => Some(g.config().max_obs_trace),
+        }
+    }
+
+    /// Whether this detector holds an onnxruntime CUDA session.
+    ///
+    /// Answerable in every build, unlike `matches!(self, Detector::CnnGpu(_))`,
+    /// whose variant does not exist without `gpu` — which is why the
+    /// `LeakIf` predicate calls this instead of pattern-matching.
+    fn on_gpu(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            matches!(self, Detector::CnnGpu(_))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
         }
     }
 }
@@ -795,6 +813,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     if args.input.is_empty() {
         anyhow::bail!("no input POD5 file(s) given");
     }
+    // Resolved once, before anything is loaded: the deprecated `--gpu` alias
+    // warns exactly once, and every stage below asks the same question of the
+    // same answer.
+    let device = args.device.resolve();
     let output_dir = match args.output_dir.clone() {
         Some(dir) => Some(dir),
         None if args.annotate => None, // sidecar-only: no split outputs
@@ -816,15 +838,25 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     #[cfg(feature = "crf-decode")]
     let crf_dir_for_pin = crf_dir.clone();
 
+    // Whether the CRF head put its encoder on the device. Only the CRF arm can
+    // set it, and only one arm runs, so it is written at most once — but it has
+    // to outlive the `match` because `LeakIf` below needs to know whether any
+    // ORT session exists.
+    #[cfg_attr(not(feature = "crf-decode"), allow(unused_mut, unused_variables))]
+    let mut crf_encoder_on_gpu = false;
+
     let model = match crf_dir {
         #[cfg(feature = "crf-decode")]
         Some(dir) => {
-            // The encoder is ~91% of this head's CPU cost, so `--gpu` moves it
-            // to the device; the lattice decode stays on the CPU regardless.
-            // `--threads` bounds onnxruntime's intra-op pool, which is otherwise
-            // spawned `available_parallelism()` wide on top of rayon's.
+            // The encoder is ~91% of this head's CPU cost, which is why `auto`
+            // sends it to the device; the lattice decode's own placement is the
+            // encoder's business. `--threads` bounds onnxruntime's intra-op pool,
+            // which is otherwise spawned `available_parallelism()` wide on top of
+            // rayon's.
+            crf_encoder_on_gpu =
+                crate::device::place_and_report(device, crate::device::Stage::CrfEncoder)?.is_gpu();
             #[cfg(feature = "gpu")]
-            let encoder = if args.gpu {
+            let encoder = if crf_encoder_on_gpu {
                 // Must match `produce_gpu_crf`'s placement: this instance becomes
                 // worker 0, so it has to land on the first *encoder* device — GPU 1
                 // when detection has GPU 0 to itself.
@@ -872,7 +904,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
                 CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
             };
             #[cfg(not(feature = "gpu"))]
-            let encoder = CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?));
+            let encoder = {
+                // Unreachable — placement returns CPU under `auto` and errors
+                // under `--device gpu` when `gpu` is absent — but read, so
+                // the binding is live in this build too.
+                debug_assert!(!crf_encoder_on_gpu);
+                CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
+            };
             #[allow(unused_mut)]
             let mut encoder = encoder;
             if let Some(margin) = args.boundary_margin {
@@ -998,7 +1036,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     #[cfg(not(feature = "crf-decode"))]
     let boundary_pin: Option<BoundaryPin> = None;
 
-    let detector = build_detector(&args, boundary_pin)?;
+    let detector = build_detector(&args, boundary_pin, device)?;
 
     // Neutralise onnxruntime's at-exit CUDA teardown *here*, at construction,
     // rather than at the end of a successful run.
@@ -1019,12 +1057,40 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // case that most needs a readable error, and it was the one case the
     // mitigation missed. `LeakIf` fires on every path, and only when a GPU path
     // actually built ORT sessions.
-    #[cfg(feature = "gpu")]
-    let leak_ort = args.gpu;
-    #[cfg(not(feature = "gpu"))]
-    let leak_ort = false;
+    //
+    // Scoped to the paths that actually build an ORT session: GPU CNN detection
+    // and the GPU CRF encoder. The GPU DTW path is cudarc/NVRTC and has no
+    // onnxruntime environment to keep alive, so it does not qualify — the old
+    // `args.gpu` predicate leaked on its behalf for nothing.
+    let leak_ort = detector.on_gpu() || crf_encoder_on_gpu;
     let model = LeakIf::new(model, leak_ort);
     let detector = LeakIf::new(detector, leak_ort);
+
+    // Classify-head placement, decided here rather than inside the dispatch far
+    // below, because a `--device gpu` failure has to surface before any writer
+    // thread is spawned: a `?` down there would leave them detached.
+    //
+    // The CRF head is absent on purpose. Its encoder was placed when it was
+    // loaded — an ORT session cannot be moved to another device after the fact —
+    // so the dispatch reads that decision off the `CrfEncoderAny` variant and
+    // this only echoes it.
+    let classify_on_gpu = match &*model {
+        ClassifyModel::Svm(_) => {
+            crate::device::place_and_report(device, crate::device::Stage::Dtw)?.is_gpu()
+        }
+        ClassifyModel::Gbm(_) => {
+            crate::device::note_cpu_only(
+                device,
+                "GBM classification",
+                "the tree walk is CPU-only and expected to stay that way — a 32-core \
+                 CPU pool beats a single GPU stream on it by roughly 20x. Adapter \
+                 detection with `--method cnn` still runs on the device.",
+            );
+            false
+        }
+        #[cfg(feature = "crf-decode")]
+        ClassifyModel::Crf(_) => crf_encoder_on_gpu,
+    };
 
     let fp = FpParams::default();
 
@@ -1133,14 +1199,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     // ---- Stages A/B: produce classified reads ----
     let produce_result = match &*model {
         ClassifyModel::Svm(svm) => {
-            // No "`--gpu` does nothing on this head" warning to emit: the flag
-            // only exists when `gpu` is compiled in, and `gpu` is atomic, so it
-            // always carries the batched DTW-SVM classify kernel this arm uses.
-            // (It used to be reachable on a `cnn-gpu`/`crf-gpu`-only build,
-            // which no longer exists.)
+            // No "the GPU does nothing on this head" warning to emit: `gpu`
+            // is atomic, so a build that can place work on a device always
+            // carries the batched DTW-SVM classify kernel this arm uses. It
+            // used to be reachable on a `cnn-gpu`/`crf-gpu`-only build, which
+            // no longer exists.
             #[cfg(feature = "gpu")]
             {
-                if args.gpu {
+                if classify_on_gpu {
                     produce_gpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
                 } else {
                     produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
@@ -1148,34 +1214,26 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "gpu"))]
             {
+                // Placement already refused `--device gpu` on this build and
+                // returned CPU under `auto`; asserting it here is what keeps the
+                // two arms from drifting.
+                debug_assert!(!classify_on_gpu);
                 produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
             }
         }
         ClassifyModel::Gbm(gbm) => {
-            // GBM classify is CPU-only; with `--method cnn` the GPU still
-            // accelerates adapter detection, so only warn when `--gpu` can do
-            // nothing at all (CPU classify + CPU detect). The method is now the
-            // only thing left to test: `gpu` is atomic, so a binary that accepts
-            // `--gpu` always has the GPU CNN detector compiled in.
-            #[cfg(feature = "gpu")]
-            if args.gpu && args.method.as_deref() != Some("cnn") {
-                tracing::warn!(
-                    "--gpu has no effect here: GBM classify is CPU-only and \
-                     `--method {}` detection is not running on the GPU (use \
-                     `--method cnn` for GPU adapter detection).",
-                    args.method.as_deref().unwrap_or("<from model>")
-                );
-            }
+            // CPU-only head; the `--device gpu` note was emitted with the other
+            // placements, before the writer threads existed.
             produce_cpu_gbm(&args, &detector, gbm, fp, &routers, class_tx.as_ref(), &pb)
         }
         #[cfg(feature = "crf-decode")]
         ClassifyModel::Crf(head) => {
-            // No "`--gpu` leaves the encoder on the CPU" warning either. That
-            // warned about a build with a GPU feature but not the CRF one, where
-            // `--gpu` silently left ~91% of this head's cost on tract; `gpu` is
-            // atomic now, so `--gpu` always moves the encoder to the device.
-            // Whether the device is usable is a *runtime* question, and the
-            // encoder loader below reports its own fallbacks.
+            // No "the encoder stayed on the CPU anyway" warning either. That
+            // warned about a build with a GPU feature but not the CRF one,
+            // where a GPU request silently left ~91% of this head's cost on
+            // tract; `gpu` is atomic now, so placement moves the encoder
+            // whenever it says GPU. Whether the device is usable is a *runtime*
+            // question, and the encoder loader reports its own fallbacks.
             match &head.encoder {
                 #[cfg(feature = "gpu")]
                 CrfEncoderAny::Gpu(enc) => {
@@ -2708,7 +2766,11 @@ struct BoundaryPin {
     sha256: Option<String>,
 }
 
-fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<Detector> {
+fn build_detector(
+    args: &RunArgs,
+    pin: Option<BoundaryPin>,
+    device: crate::device::Device,
+) -> anyhow::Result<Detector> {
     let (pinned_method, pinned_onnx, pinned_input, pinned_sha) = match pin {
         Some(p) => (Some(p.method), p.onnx, p.input, p.sha256),
         None => (None, None, None, None),
@@ -2732,14 +2794,30 @@ fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<De
         ),
     };
     match method {
-        "llr" => Ok(Detector::Llr {
-            min_adapter: args.min_adapter,
-            border_trim: args.border_trim,
-            downscale: args.downscale.max(1),
-        }),
+        "llr" => {
+            // Not a placement: LLR is a CPU changepoint search with no device
+            // path, so there is nothing for `place` to decide.
+            crate::device::note_cpu_only(
+                device,
+                "`--method llr`",
+                "the LLR detector has no GPU path. `--method cnn` is the detector \
+                 that runs on the device, and it is also the one the shipped barcode \
+                 models were measured against.",
+            );
+            Ok(Detector::Llr {
+                min_adapter: args.min_adapter,
+                border_trim: args.border_trim,
+                downscale: args.downscale.max(1),
+            })
+        }
         "cnn" => {
             #[cfg(feature = "cnn-detect")]
             {
+                // Decided before the ONNX file is opened so the CPU-cost warning
+                // lands at second one, not after a 37-minute run (#270).
+                let on_gpu =
+                    crate::device::place_and_report(device, crate::device::Stage::CnnDetect)?
+                        .is_gpu();
                 let path = args
                     .cnn_model
                     .as_ref()
@@ -2780,15 +2858,18 @@ fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<De
                     }
                     _ => escapepod_demux::AdapterCnnConfig::default(),
                 };
-                // `--gpu` with `--method cnn` runs detection on the GPU (one
-                // batched onnxruntime call per block) when built with `gpu`.
+                // GPU detection is one batched onnxruntime call per block.
                 #[cfg(feature = "gpu")]
-                if args.gpu {
+                if on_gpu {
                     return Ok(Detector::CnnGpu(Box::new(
                         escapepod_demux::AdapterCnnGpu::load_with_config(path, config)
                             .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
                     )));
                 }
+                // True only on the branch above, which returned. Reading it
+                // here keeps the binding live in a `cnn-detect`-without-`gpu`
+                // build and states the invariant in one place.
+                debug_assert!(!on_gpu, "GPU detection reached the CPU loader");
                 Ok(Detector::Cnn(Box::new(
                     escapepod_demux::AdapterCnn::load_with_config(path, config)
                         .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?,
@@ -2796,7 +2877,7 @@ fn build_detector(args: &RunArgs, pin: Option<BoundaryPin>) -> anyhow::Result<De
             }
             #[cfg(not(feature = "cnn-detect"))]
             {
-                let _ = (pinned_onnx, pinned_input, pinned_sha);
+                let _ = (pinned_onnx, pinned_input, pinned_sha, device);
                 anyhow::bail!("--method cnn requires a build with `--features cnn-detect`")
             }
         }

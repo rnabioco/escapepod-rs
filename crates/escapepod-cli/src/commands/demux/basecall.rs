@@ -77,7 +77,7 @@ pub struct BasecallArgs {
     /// the lattice prefers something else; `crf_best` names what that is.
     ///
     /// Measured at +7.6% on this command over 20k RNA004 reads. Off by default
-    /// anyway: the columns are an output change, and with `--gpu` it costs more
+    /// anyway: the columns are an output change, and on the GPU it costs more
     /// than that — the constrained scan needs the raw scores, so the decode
     /// comes back to the host while the encoder stays on the device.
     #[arg(long, requires = "barcodes")]
@@ -126,11 +126,11 @@ pub struct BasecallArgs {
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub clamp_max_shift: Option<usize>,
 
-    /// Run encoder inference on the GPU (onnxruntime CUDA execution provider).
-    /// The lattice decode stays on the CPU either way.
-    #[cfg(feature = "gpu")]
-    #[arg(long)]
-    pub gpu: bool,
+    /// Where encoder inference runs. `auto` (the default) prefers the GPU —
+    /// the encoder is ~91% of this command's CPU cost. The lattice decode's own
+    /// placement is the encoder's business either way.
+    #[command(flatten)]
+    pub device: crate::device::DeviceArgs,
 
     /// Number of threads for parallel processing
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
@@ -477,8 +477,14 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         style::path(args.model.display())
     );
 
+    // Placed (and reported) before the bundle is opened, so a CPU encoder
+    // announces its ~4x cost at second one rather than after the run.
+    let use_gpu =
+        crate::device::place_and_report(args.device.resolve(), crate::device::Stage::CrfEncoder)?
+            .is_gpu();
+
     #[cfg(feature = "gpu")]
-    let encoder = if args.gpu {
+    let encoder = if use_gpu {
         info!(
             "{} GPU (onnxruntime CUDA)",
             style::label("Encoder runs on:")
@@ -491,7 +497,13 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?))
     };
     #[cfg(not(feature = "gpu"))]
-    let encoder = Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?));
+    let encoder = {
+        // `use_gpu` cannot be true here — `place_and_report` errors under
+        // `--device gpu` and returns CPU under `auto` when `gpu` is absent —
+        // but it is still read so the binding is not dead in this build.
+        debug_assert!(!use_gpu);
+        Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?))
+    };
     #[allow(unused_mut)]
     let mut encoder = encoder;
     if let Some(margin) = args.boundary_margin {
@@ -624,8 +636,8 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     // The read itself is unchanged — still one sequential sweep, for the reason
     // in `produce_blocks` — but it now runs on its own thread, because the two
     // stages alternating in lockstep is what starves the encoder. Measured on a
-    // 136 GB / 20-file input (A30, `--gpu`): 62% mean GPU utilisation with 20% of
-    // samples below 5%, the dead windows being the reader stalled in a page fault
+    // 136 GB / 20-file input (A30, GPU encoder): 62% mean GPU utilisation with
+    // 20% of samples below 5%, the dead windows being the reader stalled in a page fault
     // at ~2.4 MB/s while the device had nothing queued.
     //
     // Depth 2 is the whole buffer: one block in flight, one being built, so the

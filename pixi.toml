@@ -91,8 +91,9 @@ typecheck-python = { cmd = "ty check tests/python crates/escapepod-python/escape
 # nothing here is needed at build time:
 #   * cudarc dlopens libnvrtc for the GPU DTW kernels (classify, train).
 #   * onnxruntime's CUDA execution provider runs batched CNN adapter detection
-#     (`demux detect --method cnn --gpu`) and the CTC-CRF encoder
-#     (`demux basecall --gpu`, fused `demux --gpu`).
+#     (`demux detect --method cnn`) and the CTC-CRF encoder
+#     (`demux basecall`, fused `demux`) — `--device auto` places both on
+#     the GPU when one is visible.
 #
 # Everything comes from conda-forge and is described by pixi.lock, including
 # libonnxruntime. `pixi install -e gpu` is the whole setup; there is no fetch

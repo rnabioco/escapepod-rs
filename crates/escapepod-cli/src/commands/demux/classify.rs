@@ -106,33 +106,29 @@ pub struct ClassifyArgs {
     #[arg(long, help_heading = "Advanced Options")]
     pub probabilities: bool,
 
-    /// Run DTW on the GPU (requires build with `--features gpu` and a CUDA device).
+    /// Where DTW runs. `auto` (the default) keeps it on the CPU, which is
+    /// faster on a full node; `--device gpu` opts into the batched CUDA DTW.
     ///
     /// Applies to all three classification modes: `--reference`, `--model`, and
     /// `--svm-model`. Only the DTW distance step moves to GPU; SVM kernel /
-    /// decision / probability math stays on CPU.
-    #[cfg(feature = "gpu")]
-    #[arg(long, help_heading = "Advanced Options")]
-    pub gpu: bool,
+    /// decision / probability math stays on CPU. GBM models are CPU-only
+    /// entirely.
+    #[command(flatten)]
+    pub device: crate::device::DeviceArgs,
 
     /// Print per-phase timing breakdown after completion
     #[arg(long)]
     pub profile: bool,
 }
 
-/// Whether the user requested the GPU path. Expands to `false` in builds
-/// compiled without the `gpu` feature.
+/// Whether DTW runs on the GPU for this invocation.
+///
+/// Always `false` under `--device auto` — see `crate::device::Stage::auto_prefers_gpu`
+/// for the measurement behind that. Errors under `--device gpu` when the `gpu`
+/// feature is missing or no CUDA device is visible.
 #[inline]
-fn gpu_requested(args: &ClassifyArgs) -> bool {
-    #[cfg(feature = "gpu")]
-    {
-        args.gpu
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        let _ = args;
-        false
-    }
+fn dtw_on_gpu(device: crate::device::Device) -> anyhow::Result<bool> {
+    Ok(crate::device::place_and_report(device, crate::device::Stage::Dtw)?.is_gpu())
 }
 
 /// Classification result for output.
@@ -187,14 +183,18 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         _ => {}
     }
 
+    // Resolved once, before the model is parsed, so `--gpu`'s deprecation
+    // warning is emitted exactly once whichever head runs.
+    let device = args.device.resolve();
+
     let result = if let Some(model_path) = args.model.take() {
         match load_any_model(&model_path)? {
-            AnyModel::Svm(model) => run_with_svm_model(args, model_path, model),
-            AnyModel::WarpDemux(_) => run_with_model(args, model_path),
-            AnyModel::Gbm(model) => run_with_gbm_model(args, model_path, model),
+            AnyModel::Svm(model) => run_with_svm_model(args, model_path, model, device),
+            AnyModel::WarpDemux(_) => run_with_model(args, model_path, device),
+            AnyModel::Gbm(model) => run_with_gbm_model(args, model_path, model, device),
         }
     } else if let Some(reference_path) = args.reference.take() {
-        run_with_csv(args, reference_path)
+        run_with_csv(args, reference_path, device)
     } else {
         unreachable!()
     };
@@ -211,6 +211,7 @@ fn run_with_svm_model(
     args: ClassifyArgs,
     svm_model_path: PathBuf,
     model: DtwSvmModel,
+    device: crate::device::Device,
 ) -> anyhow::Result<()> {
     info!("{} reads using SVM model", style::action("Classifying"));
     info!(
@@ -260,7 +261,7 @@ fn run_with_svm_model(
     // per-read probability vectors once they're serialized (saving ~8 · k ·
     // N_reads bytes of peak heap, which for a 1M-read classify with k=20
     // barcodes is ~160 MB that never gets buffered).
-    let (confident_count, total_count) = if gpu_requested(&args) {
+    let (confident_count, total_count) = if dtw_on_gpu(device)? {
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::{DEFAULT_GPU_CHUNK_CELLS, classify_with_svm_batch_gpu_with_ctx};
@@ -299,7 +300,7 @@ fn run_with_svm_model(
         }
         #[cfg(not(feature = "gpu"))]
         {
-            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+            unreachable!("device placement never returns GPU without the `gpu` feature")
         }
     } else {
         info!("{} reads with SVM...", style::action("Classifying"));
@@ -367,6 +368,7 @@ fn run_with_gbm_model(
     args: ClassifyArgs,
     gbm_model_path: PathBuf,
     model: GbmModel,
+    device: crate::device::Device,
 ) -> anyhow::Result<()> {
     println!("{} reads using GBM model", style::action("Classifying"));
     println!(
@@ -395,12 +397,14 @@ fn run_with_gbm_model(
         style::count(model.n_iterations())
     );
 
-    if gpu_requested(&args) {
-        eprintln!(
-            "{} GBM inference is CPU-only; ignoring --gpu.",
-            style::label("warning:"),
-        );
-    }
+    // Not routed through `crate::device::place`: GBM has no GPU implementation,
+    // so this is not a placement decision that could have gone the other way.
+    crate::device::note_cpu_only(
+        device,
+        "GBM classification",
+        "the tree walk is CPU-only, and is expected to stay that way — a 32-core \
+         CPU pool beats a single GPU stream on it by roughly 20x.",
+    );
 
     let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
@@ -517,7 +521,11 @@ fn run_with_gbm_model(
 }
 
 /// Run classification using a trained WarpDemuX model.
-fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()> {
+fn run_with_model(
+    args: ClassifyArgs,
+    model_path: PathBuf,
+    device: crate::device::Device,
+) -> anyhow::Result<()> {
     use escapepod_demux::{classify_read, load_model};
 
     info!(
@@ -569,7 +577,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
     // Classify each query (GPU if requested, else parallel CPU). Streams
     // results through a bounded mpsc channel to a dedicated writer thread;
     // classification workers don't buffer a full `Vec<ClassifyResult>`.
-    let (confident_count, total_count) = if gpu_requested(&args) {
+    let (confident_count, total_count) = if dtw_on_gpu(device)? {
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::classify_reads_gpu;
@@ -596,7 +604,7 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
         }
         #[cfg(not(feature = "gpu"))]
         {
-            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+            unreachable!("device placement never returns GPU without the `gpu` feature")
         }
     } else {
         info!("{} reads...", style::action("Classifying"));
@@ -640,7 +648,11 @@ fn run_with_model(args: ClassifyArgs, model_path: PathBuf) -> anyhow::Result<()>
 }
 
 /// Run classification using CSV reference fingerprints.
-fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<()> {
+fn run_with_csv(
+    args: ClassifyArgs,
+    reference_path: PathBuf,
+    device: crate::device::Device,
+) -> anyhow::Result<()> {
     info!(
         "{} reads by barcode using DTW",
         style::action("Classifying")
@@ -700,7 +712,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         .map(|fp| fp.values.as_slice())
         .collect();
 
-    let distances = if gpu_requested(&args) {
+    let distances = if dtw_on_gpu(device)? {
         #[cfg(feature = "gpu")]
         {
             use escapepod_signal::dtw::dtw_distance_matrix_gpu;
@@ -710,7 +722,7 @@ fn run_with_csv(args: ClassifyArgs, reference_path: PathBuf) -> anyhow::Result<(
         }
         #[cfg(not(feature = "gpu"))]
         {
-            unreachable!("--gpu flag is only defined when the `gpu` feature is enabled")
+            unreachable!("device placement never returns GPU without the `gpu` feature")
         }
     } else {
         info!("{} DTW distances...", style::action("Computing"));
