@@ -10,6 +10,7 @@ use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, SECTION_MARKER_LENGTH,
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Cursor;
@@ -264,6 +265,30 @@ impl Reader {
                 Some(footer)
             })
             .as_ref()
+    }
+
+    /// The signal footer for a bulk fetch — the cached one wherever there is
+    /// one, rather than a fresh parse per call.
+    ///
+    /// [`ArrowIpcFooter::parse`] is not the cheap tail read its name suggests:
+    /// it calls `parse_batch_row_count` for **every** record batch, which is
+    /// one scattered mmap touch per batch — thousands on a large file, each a
+    /// round trip on a network filesystem. The bulk paths used to re-parse it
+    /// on entry, so a driver that chunks a large id set into N calls paid that
+    /// whole walk N times to rebuild descriptors [`Self::signal_ipc_footer`]
+    /// had already cached. That is the cost that made scattered access over a
+    /// large POD5 so much worse than the bytes it moves would explain.
+    ///
+    /// The owned arm is reached only for the degenerate tables the cache
+    /// deliberately reports as `None` (no batches, no rows, unparseable).
+    /// There the previous behaviour is an empty footer whose every lookup
+    /// misses, which is what each caller's fallback below is written against —
+    /// so it is reproduced rather than turned into an error.
+    fn signal_footer_for_bulk(&self, signal_bytes: &[u8]) -> Result<Cow<'_, ArrowIpcFooter>> {
+        match self.signal_ipc_footer() {
+            Some(footer) => Ok(Cow::Borrowed(footer)),
+            None => Ok(Cow::Owned(ArrowIpcFooter::parse(signal_bytes)?)),
+        }
     }
 
     /// Get the file identifier (UUID).
@@ -652,11 +677,10 @@ impl Reader {
         reads: &[(K, Vec<u64>)],
         max_samples: usize,
     ) -> Result<Vec<(K, Vec<i16>)>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
         use rayon::prelude::*;
 
         let signal_bytes = self.signal_table_bytes()?;
-        let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let signal_footer = self.signal_footer_for_bulk(signal_bytes)?;
 
         // Flatten every read's rows into one list so the extraction is a single
         // batch-grouped, ascending-order sweep (see `get_compressed_signal_bulk`
@@ -720,10 +744,8 @@ impl Reader {
         &self,
         reads: &[(K, Vec<u64>)],
     ) -> Result<Vec<(K, Vec<CompressedSignalChunk>)>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
-
         let signal_bytes = self.signal_table_bytes()?;
-        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let footer = self.signal_footer_for_bulk(signal_bytes)?;
 
         // Flatten to a single row list, keeping a back-reference to which read
         // and which position-within-read each row came from.
@@ -780,10 +802,8 @@ impl Reader {
     /// shared across rayon threads (`Send + Sync`). Each thread can call
     /// `extractor.get_signal(&signal_rows)` independently without contention.
     pub fn signal_extractor(&self) -> Result<SignalExtractor<'_>> {
-        use crate::arrow_ipc::ArrowIpcFooter;
-
         let signal_bytes = self.signal_table_bytes()?;
-        let footer = ArrowIpcFooter::parse(signal_bytes)?;
+        let footer = self.signal_footer_for_bulk(signal_bytes)?;
 
         Ok(SignalExtractor {
             signal_bytes,

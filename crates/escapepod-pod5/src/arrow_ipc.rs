@@ -113,7 +113,7 @@ impl BatchBlock {
 }
 
 /// Parsed Arrow IPC footer with batch locations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrowIpcFooter {
     /// Locations of record batches (signal data).
     pub record_batches: Vec<BatchBlock>,
@@ -527,7 +527,20 @@ impl ArrowIpcFooter {
         let per_batch: Vec<Vec<(usize, RawSignalChunk<'a>)>> = batch_entries
             .into_par_iter()
             .map(
-                |(batch_idx, rows)| -> Result<Vec<(usize, RawSignalChunk<'a>)>> {
+                |(batch_idx, mut rows)| -> Result<Vec<(usize, RawSignalChunk<'a>)>> {
+                    // Visit rows within a batch in ascending order. The
+                    // grouping above only puts the *batches* in file order —
+                    // the rows inside one are still in request order, and a
+                    // request assembled by iterating a `HashSet<Uuid>` (which
+                    // is what `reads_by_ids` and `find_signal_rows_by_ids`
+                    // hand down) is in no order at all. A batch is megabytes
+                    // of contiguous mmap, so hopping around inside it defeats
+                    // kernel readahead for precisely the reason the batch
+                    // grouping exists. The scatter into disjoint `result_idx`
+                    // slots below already decouples output order from visit
+                    // order, so this costs nothing but the sort.
+                    rows.sort_unstable_by_key(|&(_, local_row)| local_row);
+
                     let batch = &self.record_batches[batch_idx];
                     let batch_bytes = ipc_bytes.get(batch.byte_range()).ok_or_else(|| {
                         Error::InvalidArrowIpc("Batch range out of bounds".into())
