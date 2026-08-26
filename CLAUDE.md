@@ -19,23 +19,24 @@ cargo build --release
 # Build with training support (enables SVM model training)
 cargo build --release --features train
 
-# Build with GPU-accelerated DTW (experimental, opt-in; needs the CUDA
-# driver + libnvrtc at runtime — no nvcc required at build time).
-# The pixi `gpu` env provides libnvrtc via conda-forge's cuda-nvrtc package
-# and sets LD_LIBRARY_PATH automatically:
-pixi run -e gpu cargo build --release --features gpu -p escapepod-cli
+# Build with GPU support (opt-in). NOTHING CUDA is needed at build time —
+# cudarc and ort both dlopen at run time — so this is a plain cargo build and
+# needs no GPU env:
+cargo build --release --features gpu -p escapepod-cli
 
-# The onnxruntime-CUDA features (cnn-gpu, crf-gpu) additionally need a
-# CUDA-enabled libonnxruntime at RUN time. One-time setup on a networked
-# (login) node — fetches it into .pixi/ort/, after which the gpu env's
-# activation script sets ORT_DYLIB_PATH automatically (only when the file
-# exists; a dangling ORT_DYLIB_PATH hangs silently at startup):
-pixi run -e gpu install-ort
+# Create the `gpu` runtime environment ONCE, on a networked node. Everything it
+# needs (CUDA 12 libs, cuDNN, and libonnxruntime itself) is an ordinary
+# conda-forge package described by pixi.lock; there is no fetch step and no
+# out-of-band directory. Use the task rather than `pixi install -e gpu`: the
+# environment targets a `__cuda` platform that a login node cannot satisfy, and
+# the task supplies the install-time probe (see pixi.toml for why that is sound):
+pixi run install-gpu
 # Full runtime story + verification: docs/experimental/demux.md ("GPU acceleration")
 
-# Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`):
+# Test / bench on a GPU node (SLURM account `gpu_rbi`, partition `gpu`).
+# Note `-e dev-gpu`, not `-e gpu`: cargo-nextest lives in the `dev` feature.
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
-    pixi run -e gpu cargo nextest run --features gpu -p escapepod-signal --test gpu_dtw
+    pixi run -e dev-gpu cargo nextest run --features gpu -p escapepod-signal --test gpu_dtw
 srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
     pixi run -e gpu cargo bench --features gpu --bench hot_paths_gpu
 
