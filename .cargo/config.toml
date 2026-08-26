@@ -8,9 +8,13 @@
 # rna. Hot kernels that want AVX-512 should use `#[target_feature]` +
 # runtime `is_x86_feature_detected!` dispatch, not a global baseline bump.
 #
-# Only applies to the x86_64 GNU target. CI release binaries target musl
-# with their own RUSTFLAGS (see .github/workflows/release.yml); aarch64
-# and macOS are unaffected. Python wheels built by developers via
+# Only applies to the x86_64 GNU target, and only where nothing else sets
+# RUSTFLAGS — an environment RUSTFLAGS replaces this wholesale rather than
+# adding to it. Every release artifact does set its own (see
+# .github/workflows/release.yml): the musl builds because they target musl,
+# and the `-gnu-gpu` build because it shares this triple but must pin its
+# baseline explicitly rather than inherit a file documented as local policy.
+# aarch64 and macOS are unaffected. Python wheels built by developers via
 # maturin/pip pick this up, which is fine since v3 is portable across
 # any x86_64 CPU since ~2013.
 #
