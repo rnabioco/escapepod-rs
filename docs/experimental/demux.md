@@ -805,15 +805,10 @@ long as `--gpu` isn't requested:
 cargo build --release --features gpu -p escapepod-cli
 ```
 
-### Runtime libraries: the pixi environment (from a checkout)
+### Runtime libraries: the pixi environment (easiest)
 
 At run time `--gpu` needs two things, and the repository's
-[pixi](https://pixi.sh) `gpu` environment supplies both. This path needs a
-checkout of this repository — the `gpu` environment, the `install-ort` task
-and the activation script all live in it — but *not* a build: the released
-`-gnu-gpu` binary runs inside the environment just as well as a local one. If
-you would rather not clone, see [without a checkout](#runtime-libraries-without-a-checkout)
-below.
+[pixi](https://pixi.sh) `gpu` environment supplies both:
 
 1. **The CUDA 12 runtime libraries** — `libcublas`/`libcublasLt`,
    `libcudart`, `libcufft`, cuDNN 9 (for the onnxruntime CUDA execution
@@ -838,66 +833,6 @@ requirement on the node itself is an NVIDIA driver new enough for CUDA 12.2
 (≥ 535) — the DTW kernels target that driver API. This works the same for the
 released `-gnu-gpu` binary as for a local build; point the command at wherever
 you unpacked it.
-
-### Runtime libraries without a checkout
-
-If you downloaded `escpod-<ver>-x86_64-unknown-linux-gnu-gpu.tar.gz` and have
-no reason to clone the repository, the same two pieces fit in a standalone
-pixi manifest. Drop this in an empty directory as `pixi.toml`:
-
-```toml
-[workspace]
-name = "escpod-gpu-runtime"
-channels = ["conda-forge"]
-platforms = ["linux-64"]
-
-[dependencies]
-# CUDA 12 runtime for the onnxruntime CUDA execution provider …
-cuda-version = "12.*"
-cuda-cudart = "*"          # libcudart.so.12
-libcublas = "*"            # libcublas.so.12 + libcublasLt.so.12
-libcufft = "*"             # libcufft.so.11
-cudnn = ">=9,<10"          # libcudnn.so.9
-# … and NVRTC for the GPU DTW kernels, which cudarc compiles at run time.
-cuda-nvrtc = ">=12"        # libnvrtc.so.12
-# Only used to fetch the onnxruntime wheel below; nothing is pip-installed.
-python = "3.12.*"
-pip = "*"
-
-# conda-forge's CUDA packages ship no activation hook, so make $CONDA_PREFIX/lib
-# visible to the dlopen paths (ort's CUDA EP and cudarc's libnvrtc).
-[activation.env]
-LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-
-# The wheel is only a container for the CUDA-enabled libonnxruntime that ort
-# (load-dynamic) dlopens; nothing is installed into any Python environment.
-[tasks]
-install-ort = """
-python -m pip download onnxruntime-gpu==1.28.0 --no-deps -d ort &&
-python -c "import glob, zipfile; zipfile.ZipFile(sorted(glob.glob('ort/onnxruntime_gpu-*.whl'))[-1]).extractall('ort')" &&
-ls ort/onnxruntime/capi/libonnxruntime.so.*
-"""
-```
-
-Then, once on a networked machine (no GPU needed) and after that on any GPU
-node:
-
-```bash
-pixi run install-ort
-# ort/onnxruntime/capi/libonnxruntime.so.1.28.0
-
-export ORT_DYLIB_PATH="$PWD/ort/onnxruntime/capi/libonnxruntime.so.1.28.0"
-pixi run /path/to/escpod demux reads.pod5 --model <bundle> --gpu --annotate
-```
-
-Point `ORT_DYLIB_PATH` at the library **where it was unpacked** — onnxruntime
-loads `libonnxruntime_providers_cuda.so` from the same directory, so copying
-the one `.so` somewhere tidier costs you the CUDA execution provider and
-demotes the run to CPU.
-
-Unlike the repository environment, this manifest sets `ORT_DYLIB_PATH` nowhere:
-a dangling value makes the ort paths hang silently at startup, whereas leaving
-it unset until the library exists fails fast with an error that names the fix.
 
 ### Verifying the GPU is actually in use
 

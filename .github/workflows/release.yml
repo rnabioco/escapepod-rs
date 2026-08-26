@@ -265,27 +265,16 @@ jobs:
 
           ### What `…-linux-gnu-gpu` needs at run time
 
-          Only when `--gpu` is actually requested. Without it this binary needs
-          nothing beyond glibc and behaves exactly like the musl one.
+          Only when `--gpu` is actually requested — otherwise it behaves
+          exactly like the musl one. It expects a **CUDA 12** runtime and
+          cuDNN 9, with an NVIDIA driver ≥ 535 (the DTW kernels target the
+          CUDA 12.2 driver API), and a CUDA-enabled `libonnxruntime` matching
+          the `ort` 2.0.0-rc.13 it links.
 
-          - The **CUDA 12** runtime on `LD_LIBRARY_PATH`: `libcublas.so.12`,
-            `libcublasLt.so.12`, `libcudart.so.12`, `libcufft.so.11`,
-            `libcudnn.so.9` (cuDNN 9), plus `libnvrtc.so.12` for the DTW
-            kernels — with an NVIDIA driver ≥ 535, since the DTW path targets
-            the CUDA 12.2 driver API.
-          - `ORT_DYLIB_PATH` pointing at a **CUDA 12** build of **onnxruntime
-            1.28.x** — the version pinned against this binary's `ort`
-            2.0.0-rc.13 — for CNN adapter detection and the CTC-CRF encoder.
-
-          An onnxruntime built for a different CUDA major than the runtime
-          libraries above still loads and then falls back to CPU with a
-          warning, rather than failing: a `--gpu` run that is merely slow is
-          worth reading the warnings of.
-
-          The repository's pixi `gpu` environment supplies all of this. See
-          [GPU acceleration](https://rnabioco.github.io/escapepod-rs/experimental/demux/#gpu-acceleration)
-          for a from-scratch setup and for how to confirm the CUDA execution
-          provider actually loaded.
+          Rather than assembling that by hand, see
+          [GPU acceleration](https://rnabioco.github.io/escapepod-rs/experimental/demux/#gpu-acceleration),
+          which covers the pixi environment that supplies it and how to
+          confirm the CUDA execution provider actually loaded.
           EOF
 
       - name: Create Release

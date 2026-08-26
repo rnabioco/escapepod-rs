@@ -43,28 +43,12 @@ adapter detection and the CTC-CRF encoder) — so it ships in the one
 dynamically linked artifact, `x86_64-unknown-linux-gnu-gpu`. It is built
 against glibc 2.28, which covers RHEL/Rocky/Alma 8+ and Ubuntu 20.04+.
 
-Requesting `--gpu` with that binary needs, at run time:
-
-- The **CUDA 12** runtime on `LD_LIBRARY_PATH` — `libcublas.so.12`,
-  `libcublasLt.so.12`, `libcudart.so.12`, `libcufft.so.11`, `libcudnn.so.9`,
-  and `libnvrtc.so.12` for the DTW kernels — with an NVIDIA driver ≥ 535
-  (the DTW path targets the CUDA 12.2 driver API).
-- `ORT_DYLIB_PATH` pointing at a **CUDA 12** build of **onnxruntime 1.28.x**,
-  the version pinned against the `ort` 2.0.0-rc.13 the binary links.
-
-An onnxruntime built for a different CUDA major than the runtime libraries
-still loads, and then falls back to CPU rather than failing — so a `--gpu` run
-that is merely slow is worth reading the warnings of.
-
-You do not have to assemble any of that by hand. Both live in one pixi
-environment: from a checkout, [the repository's `gpu` environment
-](../experimental/demux.md#runtime-libraries-the-pixi-environment-from-a-checkout);
-with only the downloaded binary, a [standalone manifest
-](../experimental/demux.md#runtime-libraries-without-a-checkout) you can copy
-into an empty directory. Both fetch the onnxruntime once on a networked
-machine, which matters on clusters where compute nodes cannot reach the
-internet. See also [verifying the GPU is actually in
-use](../experimental/demux.md#verifying-the-gpu-is-actually-in-use).
+Requesting `--gpu` with that binary needs a **CUDA 12** runtime and cuDNN 9 at
+run time, with an NVIDIA driver ≥ 535 (the DTW kernels target the CUDA 12.2
+driver API). Don't assemble that by hand — [GPU
+acceleration](../experimental/demux.md#gpu-acceleration) covers the pixi
+environment that supplies it and how to confirm the CUDA execution provider
+actually loaded.
 
 Without `--gpu`, this artifact needs none of it and behaves exactly like the
 musl one.

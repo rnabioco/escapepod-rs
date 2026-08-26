@@ -36,13 +36,7 @@
   mismatch demotes the work to CPU with a warning rather than failing outright.
 
   Prebuilt binaries are now documented in the README and the installation guide,
-  which previously described only `cargo install`. So is a way to get the GPU
-  runtime libraries *without* a checkout: the repository's pixi `gpu`
-  environment — its `install-ort` task, its activation script, its `.pixi/ort`
-  — only exists inside a clone, which is precisely what someone downloading a
-  binary is trying to avoid, so the docs now also carry a standalone pixi
-  manifest that supplies the same CUDA 12 stack and onnxruntime in an empty
-  directory.
+  which previously described only `cargo install`.
 
 ## 0.16.1 (2026-08-25)
 
