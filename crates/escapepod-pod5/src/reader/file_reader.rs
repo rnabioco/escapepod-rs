@@ -1268,9 +1268,15 @@ impl Reader {
     /// see [`crate::sidecar::P5S_SIGNAL_BATCH_ROWS_KEY`]. Measured here rather
     /// than carried over, because this is the command that exists to measure.
     pub fn build_and_write_index<P: AsRef<Path>>(&self, output: P) -> Result<usize> {
+        use crate::sidecar::{SidecarLoad, SidecarStamp, load_sidecar_for_write};
+
+        let identity = self.sidecar_identity()?;
+        // Fingerprint first, so the guard covers the scan and the walk below
+        // rather than just the instant before the rename.
+        let stamp = SidecarStamp::of(output.as_ref());
+
         let index = self.build_read_index_from_scan()?;
         let count = index.len();
-        let identity = self.sidecar_identity()?;
 
         let started = std::time::Instant::now();
         let batch_rows = self.measure_signal_batch_rows();
@@ -1280,14 +1286,115 @@ impl Reader {
             "measured signal batch geometry"
         );
 
-        let mut sidecar = match crate::sidecar::read_sidecar_file(output.as_ref(), &identity) {
-            Ok(Some(existing)) => existing,
-            Ok(None) | Err(_) => crate::sidecar::Sidecar::default(),
+        // Which failures justify starting from an empty sidecar is the whole
+        // question here. `Err(_) => Sidecar::default()` used to answer "all of
+        // them", which quietly turned a transient read error — or a version
+        // this build does not know — into the permanent loss of barcode and
+        // score columns that a demux run spent hours producing. Only an absent
+        // sidecar, or one proven to describe a different POD5, is safe to
+        // replace.
+        let mut sidecar = match load_sidecar_for_write(output.as_ref(), &identity) {
+            SidecarLoad::Loaded(existing) => *existing,
+            SidecarLoad::Absent => crate::sidecar::Sidecar::default(),
+            SidecarLoad::Foreign(e) => {
+                tracing::warn!(
+                    "{e} — rebuilding; any annotations or scores it held described \
+                     another file and are discarded"
+                );
+                crate::sidecar::Sidecar::default()
+            }
+            SidecarLoad::Unreadable(e) => return Err(e),
         };
         sidecar.set_entries(index.entries.clone());
+        // Empty means the measure failed, and `set_signal_batch_rows` declines
+        // it rather than erasing what a previous run recorded.
         sidecar.set_signal_batch_rows(batch_rows);
-        crate::sidecar::write_sidecar_file(output.as_ref(), &identity, &sidecar)?;
+        crate::sidecar::write_sidecar_file_checked(
+            output.as_ref(),
+            &identity,
+            &sidecar,
+            stamp.as_ref(),
+        )?;
         Ok(count)
+    }
+
+    /// Write `sidecar` next to this POD5, recording the signal batch geometry
+    /// if it does not already carry it.
+    ///
+    /// **The funnel every sidecar write should go through.** The geometry is a
+    /// per-file constant that costs a scattered read of every batch header to
+    /// recover (see [`crate::sidecar::P5S_SIGNAL_BATCH_ROWS_KEY`]), so a
+    /// sidecar that omits it condemns every later open to pay again. It used
+    /// to be recorded only by [`Self::build_and_write_index`], which meant the
+    /// sidecars real workflows actually produce — `demux --annotate`,
+    /// `escpod annotate` — never had it, and re-measured on every run.
+    /// Routing the writes through here is what makes that impossible to
+    /// forget in a path added later.
+    ///
+    /// Costs nothing when the sidecar already carries a geometry: identity
+    /// binding has already proved the POD5 is the same file, so a recorded
+    /// value cannot have gone stale under it. Otherwise this is
+    /// [`Self::signal_batch_row_counts`], which is free if the footer is
+    /// already parsed on this reader and a full walk if it is not.
+    ///
+    /// [`Self::build_and_write_index`] deliberately does **not** use this: it
+    /// is the command whose job is to rebuild the cache, so it re-measures
+    /// even when a value is present.
+    /// `stamp` is the fingerprint the caller took when it *read* the sidecar it
+    /// is now writing back; the write is refused if the file changed since.
+    /// Pass `None` only when writing a sidecar that was not read first.
+    pub fn write_sidecar<P: AsRef<Path>>(
+        &self,
+        output: P,
+        sidecar: &mut crate::sidecar::Sidecar,
+        stamp: Option<&crate::sidecar::SidecarStamp>,
+    ) -> Result<()> {
+        let identity = self.sidecar_identity()?;
+        if sidecar.signal_batch_rows().is_none() {
+            let started = std::time::Instant::now();
+            let batch_rows = self.signal_batch_row_counts();
+            tracing::debug!(
+                batches = batch_rows.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "recording signal batch geometry in a sidecar that lacked it"
+            );
+            sidecar.set_signal_batch_rows(batch_rows);
+        }
+        crate::sidecar::write_sidecar_file_checked(output.as_ref(), &identity, sidecar, stamp)
+    }
+
+    /// Add the signal batch geometry to an existing sidecar, touching nothing
+    /// else.
+    ///
+    /// The safe way to complete a sidecar that has a read index but no
+    /// geometry — which is every sidecar `demux --annotate` wrote before the
+    /// geometry existed. The alternative, [`Self::build_and_write_index`],
+    /// re-scans the reads table and rewrites every column, and a rebuild is a
+    /// bad trade when the only thing missing is a cache: the columns it would
+    /// pass through are barcode assignments and scores that took hours to
+    /// compute and exist nowhere else. This loads, sets one metadata key, and
+    /// writes.
+    ///
+    /// Returns whether anything was written — `false` when the sidecar already
+    /// had a geometry, or when there is no sidecar to complete.
+    pub fn complete_sidecar_geometry<P: AsRef<Path>>(&self, output: P) -> Result<bool> {
+        use crate::sidecar::{SidecarLoad, SidecarStamp, load_sidecar_for_write};
+
+        let identity = self.sidecar_identity()?;
+        let stamp = SidecarStamp::of(output.as_ref());
+        let mut sidecar = match load_sidecar_for_write(output.as_ref(), &identity) {
+            SidecarLoad::Loaded(sc) => *sc,
+            // Nothing to complete, and nothing to lose either way. Building a
+            // sidecar from scratch is `build_and_write_index`'s job, not this
+            // one's — this exists precisely to avoid doing that by accident.
+            SidecarLoad::Absent => return Ok(false),
+            SidecarLoad::Foreign(e) | SidecarLoad::Unreadable(e) => return Err(e),
+        };
+        if sidecar.signal_batch_rows().is_some() {
+            return Ok(false);
+        }
+        self.write_sidecar(output.as_ref(), &mut sidecar, stamp.as_ref())?;
+        Ok(true)
     }
 
     // ------------------------------------------------------------------

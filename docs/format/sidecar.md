@@ -137,9 +137,21 @@ scattered touch per batch, which on a network filesystem measured 15–24 ms
 file with 8866 signal batches spent 4.95 s there, 78% of a cold 5000-read
 scattered fetch. With the geometry cached that becomes 4.82 ms.
 
-`escpod index` walks the batches once and records the result. `escpod annotate`
-preserves an existing value rather than dropping it, since annotating describes
-reads and has no bearing on the signal table.
+**Every** sidecar write records it when it is not already there — `escpod index`,
+`escpod annotate`, `demux --annotate` alike — so a sidecar cannot end up
+carrying a read index and nothing else. A write that finds a value already
+present carries it through untouched rather than re-measuring: identity binding
+has already proved the POD5 is the same file, so a recorded geometry cannot have
+gone stale under it.
+
+`escpod index` is the exception, and deliberately: it re-measures even when a
+value is present, because rebuilding the cache is the job it exists to do. It
+also refuses to skip a sidecar that has an index but no geometry — otherwise the
+obvious remedy for a slow file would report "already indexed" and do nothing.
+
+An empty measurement means "could not measure", never "no batches", and leaves
+any recorded value alone. Nothing is lost by declining to record: the POD5 still
+holds the answer.
 
 ### Checked, not believed
 

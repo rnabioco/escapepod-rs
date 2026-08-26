@@ -31,7 +31,7 @@ escpod annotate --remove-design <FILES>...     # remove the design + derived col
 | `--list` | Print each file's sidecar contents: index size, annotations with label/read counts, design |
 | `--remove <NAME>` | Remove an annotation (design key/value columns are refused — update or remove the design instead) |
 | `--remove-design` | Remove the design and its derived columns |
-| `--force` | Replace a stale or unreadable sidecar instead of erroring |
+| `--force` | Replace a sidecar bound to a *different* POD5 instead of erroring |
 | `-t, --threads <N>` | Threads for parallel processing across files |
 
 ## Annotations
@@ -94,5 +94,9 @@ Python: `Reader.annotation()`, `Reader.annotation_names()`,
 - "Stripping" an annotation is editing or deleting the sidecar; the POD5 is
   untouched throughout.
 - A sidecar is bound to its POD5 by file identifier and size; a stale or
-  misplaced one fails loudly. `--force` replaces it.
+  misplaced one fails loudly. `--force` replaces it — but only it. A sidecar
+  that belongs to this POD5 and merely could not be read (truncated, or written
+  by a newer escpod) is refused with or without `--force`, because its barcode
+  and score columns exist nowhere else and a rebuild would replace them with an
+  empty column set.
 - Format details: [The `.p5s` Sidecar](../format/sidecar.md).

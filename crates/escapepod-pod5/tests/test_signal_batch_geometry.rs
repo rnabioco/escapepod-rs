@@ -185,6 +185,182 @@ fn geometry_survives_an_annotation_write() {
 }
 
 // ---------------------------------------------------------------------------
+// Every write path records it — the gap that made the cache near-unreachable
+// ---------------------------------------------------------------------------
+
+/// Label the first five reads, the cheapest way to exercise `write_columns`
+/// (which `write_annotation` delegates to, and which `demux --annotate` calls).
+fn annotate_a_few(path: &std::path::Path, ids: &[Uuid], label: &str) {
+    use escapepod_pod5::operations::{AnnotateOptions, write_annotation};
+    let assignments = ids
+        .iter()
+        .take(5)
+        .map(|id| (*id, label.to_string()))
+        .collect();
+    write_annotation(path, &assignments, &AnnotateOptions::default()).unwrap();
+}
+
+#[test]
+fn annotating_a_file_with_no_sidecar_records_the_geometry() {
+    // The workflow that actually produces sidecars in the wild:
+    // `demux --annotate` / `escpod annotate -a`, on a file nobody indexed.
+    // Before this was wired up, the sidecar such a run created had a read
+    // index and no geometry, so every later open re-walked the batch headers
+    // — and the obvious remedy, `escpod index`, skipped the file as "already
+    // indexed".
+    let (_tmp, path, ids) = fixture();
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+    assert!(
+        !sidecar_path(&path).exists(),
+        "fixture must start with none"
+    );
+
+    annotate_a_few(&path, &ids, "BC01");
+
+    let meta = read_sidecar_metadata(sidecar_path(&path), &identity(&path))
+        .unwrap()
+        .expect("annotating must create a sidecar");
+    assert_eq!(
+        meta.signal_batch_rows.as_deref(),
+        Some(truth.as_slice()),
+        "a sidecar created by annotation must carry the geometry too"
+    );
+}
+
+#[test]
+fn writing_a_design_records_the_geometry() {
+    use escapepod_pod5::operations::{DesignOptions, write_design};
+
+    let (tmp, path, ids) = fixture();
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+    annotate_a_few(&path, &ids, "BC01");
+
+    let csv = tmp.path().join("design.csv");
+    std::fs::write(&csv, "barcode,condition\nBC01,treated\n").unwrap();
+    write_design(&path, &csv, &DesignOptions::default()).unwrap();
+
+    let meta = read_sidecar_metadata(sidecar_path(&path), &identity(&path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.signal_batch_rows.as_deref(), Some(truth.as_slice()));
+}
+
+#[test]
+fn a_sidecar_written_without_geometry_is_backfilled_by_the_next_write() {
+    use escapepod_pod5::operations::read_annotation;
+
+    let (_tmp, path, ids) = fixture();
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+
+    // What an older escpod left behind: index, no geometry.
+    let id = identity(&path);
+    let entries = Reader::open(&path)
+        .unwrap()
+        .read_index()
+        .unwrap()
+        .entries()
+        .to_vec();
+    let legacy = escapepod_pod5::sidecar::Sidecar::new(entries);
+    write_sidecar_file(sidecar_path(&path), &id, &legacy).unwrap();
+    assert!(
+        read_sidecar_metadata(sidecar_path(&path), &id)
+            .unwrap()
+            .unwrap()
+            .signal_batch_rows
+            .is_none(),
+        "precondition: the legacy sidecar must have no geometry"
+    );
+
+    annotate_a_few(&path, &ids, "BC02");
+
+    assert_eq!(
+        read_sidecar_metadata(sidecar_path(&path), &id)
+            .unwrap()
+            .unwrap()
+            .signal_batch_rows
+            .as_deref(),
+        Some(truth.as_slice()),
+        "an existing sidecar missing the geometry must gain it on the next write"
+    );
+    assert_eq!(
+        read_annotation(&path, Some("barcode")).unwrap().len(),
+        5,
+        "and the annotation that triggered the backfill must survive it"
+    );
+}
+
+#[test]
+fn index_then_demux_reuses_the_geometry_and_keeps_it() {
+    use escapepod_pod5::operations::read_annotation;
+
+    // The sequence the whole design is for: pre-warm with `escpod index`, then
+    // run the pipeline. The geometry must be reused (not re-measured into
+    // something different) and must survive the annotation write, while the
+    // annotation lands.
+    let (_tmp, path, ids) = fixture();
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+    Reader::open(&path)
+        .unwrap()
+        .build_and_write_index(sidecar_path(&path))
+        .unwrap();
+
+    // Reuse: a fresh reader resolves the footer through the sidecar and lands
+    // on exactly the counts the walk produced.
+    assert_eq!(
+        Reader::open(&path).unwrap().signal_batch_row_counts(),
+        truth
+    );
+
+    annotate_a_few(&path, &ids, "BC03");
+
+    let meta = read_sidecar_metadata(sidecar_path(&path), &identity(&path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        meta.signal_batch_rows.as_deref(),
+        Some(truth.as_slice()),
+        "the pipeline must update the sidecar, not trade its caches away"
+    );
+    assert_eq!(read_annotation(&path, Some("barcode")).unwrap().len(), 5);
+    assert_eq!(
+        Reader::open(&path).unwrap().read_index().unwrap().len(),
+        N_READS,
+        "and the read index must still be there"
+    );
+}
+
+#[test]
+fn a_failed_measure_does_not_erase_a_recorded_geometry() {
+    // `Reader::measure_signal_batch_rows` returns an empty vec for every
+    // failure it has, so an empty value means "could not measure", never
+    // "there are no batches". Treating it as a value let one failed re-measure
+    // silently drop a geometry an earlier run recorded correctly — silently,
+    // because the sidecar stays valid and merely gets slow again.
+    let (_tmp, path, _ids) = fixture();
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+    Reader::open(&path)
+        .unwrap()
+        .build_and_write_index(sidecar_path(&path))
+        .unwrap();
+
+    let id = identity(&path);
+    let mut sc = read_sidecar_file(sidecar_path(&path), &id)
+        .unwrap()
+        .unwrap();
+    assert!(sc.signal_batch_rows().is_some(), "precondition");
+    sc.set_signal_batch_rows(Vec::new());
+    assert_eq!(
+        sc.signal_batch_rows(),
+        Some(truth.as_slice()),
+        "an empty measurement must leave the recorded geometry alone"
+    );
+
+    // Discarding it is still possible, but only by saying so.
+    sc.clear_signal_batch_rows();
+    assert!(sc.signal_batch_rows().is_none());
+}
+
+// ---------------------------------------------------------------------------
 // The rejection path — the reason this cache is safe to have
 // ---------------------------------------------------------------------------
 
@@ -282,4 +458,117 @@ fn a_geometry_bound_to_another_pod5_is_never_used() {
     // With the foreign sidecar gone, A reads exactly as it did before.
     std::fs::remove_file(sidecar_path(&path_a)).unwrap();
     assert_eq!(all_signal(&path_a, &ids_a), expected_a);
+}
+
+// ---------------------------------------------------------------------------
+// Completing a sidecar in place — what the ungated `escpod index` does to the
+// sidecar every pre-geometry `demux --annotate` left behind.
+// ---------------------------------------------------------------------------
+
+/// Build the sidecar an older escpod would have written: a correct read index,
+/// annotations, and no geometry.
+fn legacy_sidecar_with_annotation(path: &std::path::Path, ids: &[Uuid]) {
+    use escapepod_pod5::operations::{AnnotateOptions, write_annotation};
+
+    let assignments = ids
+        .iter()
+        .take(5)
+        .map(|id| (*id, "BC01".to_string()))
+        .collect();
+    write_annotation(path, &assignments, &AnnotateOptions::default()).unwrap();
+
+    // Strip the geometry the write just recorded, leaving the rest as-is.
+    let id = identity(path);
+    let mut sc = read_sidecar_file(sidecar_path(path), &id).unwrap().unwrap();
+    sc.clear_signal_batch_rows();
+    write_sidecar_file(sidecar_path(path), &id, &sc).unwrap();
+    assert!(
+        read_sidecar_metadata(sidecar_path(path), &id)
+            .unwrap()
+            .unwrap()
+            .signal_batch_rows
+            .is_none(),
+        "precondition: the legacy sidecar must have no geometry"
+    );
+}
+
+#[test]
+fn completing_a_sidecar_adds_the_geometry_and_keeps_everything_else() {
+    use escapepod_pod5::operations::read_annotation;
+
+    // The reason this exists instead of just calling `build_and_write_index`:
+    // a rebuild re-scans the reads table and rewrites every column, and the
+    // columns it would carry through are barcode assignments that took hours to
+    // compute. Adding one metadata key cannot lose them.
+    let (_tmp, path, ids) = fixture();
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+    legacy_sidecar_with_annotation(&path, &ids);
+
+    let index_before = Reader::open(&path).unwrap().read_index().unwrap().len();
+
+    assert!(
+        Reader::open(&path)
+            .unwrap()
+            .complete_sidecar_geometry(sidecar_path(&path))
+            .unwrap(),
+        "a sidecar missing the geometry must be reported as completed"
+    );
+
+    let id = identity(&path);
+    assert_eq!(
+        read_sidecar_metadata(sidecar_path(&path), &id)
+            .unwrap()
+            .unwrap()
+            .signal_batch_rows
+            .as_deref(),
+        Some(truth.as_slice()),
+        "and must now carry the measured geometry"
+    );
+    assert_eq!(
+        read_annotation(&path, Some("barcode")).unwrap().len(),
+        5,
+        "the annotation must survive completion untouched"
+    );
+    assert_eq!(
+        Reader::open(&path).unwrap().read_index().unwrap().len(),
+        index_before,
+        "and so must the read index"
+    );
+}
+
+#[test]
+fn completing_is_a_no_op_when_there_is_nothing_to_complete() {
+    let (_tmp, path, _ids) = fixture();
+
+    // No sidecar at all: this is not the command that creates one, and saying
+    // so beats quietly building one behind the caller's back.
+    assert!(!sidecar_path(&path).exists());
+    assert!(
+        !Reader::open(&path)
+            .unwrap()
+            .complete_sidecar_geometry(sidecar_path(&path))
+            .unwrap()
+    );
+    assert!(
+        !sidecar_path(&path).exists(),
+        "completing must not conjure a sidecar"
+    );
+
+    // Already complete: nothing to do, and the file must not be rewritten.
+    Reader::open(&path)
+        .unwrap()
+        .build_and_write_index(sidecar_path(&path))
+        .unwrap();
+    let before = std::fs::read(sidecar_path(&path)).unwrap();
+    assert!(
+        !Reader::open(&path)
+            .unwrap()
+            .complete_sidecar_geometry(sidecar_path(&path))
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read(sidecar_path(&path)).unwrap(),
+        before,
+        "a sidecar that already has the geometry must be left byte-identical"
+    );
 }

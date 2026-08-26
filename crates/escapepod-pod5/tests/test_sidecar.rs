@@ -1060,3 +1060,297 @@ fn a_sidecar_without_provenance_keys_still_loads() {
     assert_eq!(sidecar.provenance().describe(), None);
     assert_eq!(read_annotation(&path, Some("barcode")).unwrap().len(), 5);
 }
+
+// ---------------------------------------------------------------------------
+// Write safety: which failures license replacing a sidecar, and which do not.
+//
+// A sidecar mixes a rebuildable cache (read index, signal batch geometry) with
+// data products that exist nowhere else — the barcode and score columns a
+// demux run spent hours producing. So classifying a load failure is not
+// bookkeeping: it decides whether the next write is repair or destruction.
+// Only "no sidecar" and "this sidecar describes a different POD5" are safe to
+// replace. Every other failure must stop the write, because the annotations
+// are probably still sitting there intact.
+// ---------------------------------------------------------------------------
+
+/// Rewrite the sidecar at `p5s` with `version` in its schema metadata, leaving
+/// every column intact.
+///
+/// Models the sidecar written by a *future* escpod: structurally sound,
+/// genuinely bound to this POD5, and not loadable by this build. That
+/// combination is the point — it is a failure that is neither absent nor
+/// foreign, so it is the one a caller is most tempted to answer by starting
+/// over, and the one where starting over costs the most.
+fn forge_version(p5s: &std::path::Path, version: &str) {
+    use escapepod_pod5::sidecar::P5S_VERSION_KEY;
+
+    let (schema, batches) = {
+        let f = std::fs::File::open(p5s).unwrap();
+        let mut r = arrow::ipc::reader::FileReader::try_new(f, None).unwrap();
+        let schema = r.schema();
+        let batches: Vec<_> = r.by_ref().map(|b| b.unwrap()).collect();
+        let mut md = schema.metadata().clone();
+        md.insert(P5S_VERSION_KEY.to_string(), version.to_string());
+        let forged = std::sync::Arc::new(
+            arrow::datatypes::Schema::new(schema.fields().clone()).with_metadata(md),
+        );
+        (forged, batches)
+    };
+    let f = std::fs::File::create(p5s).unwrap();
+    let mut w = arrow::ipc::writer::FileWriter::try_new(f, &schema).unwrap();
+    for b in &batches {
+        w.write(b).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+#[test]
+fn an_unreadable_sidecar_is_never_replaced_even_under_overwrite() {
+    // `overwrite` was meant for the *stale* case — a sidecar left behind by a
+    // POD5 that has since been replaced, whose contents describe another file.
+    // Letting it stand in for "any read failure" meant a version this build
+    // does not know was answered by silently discarding annotations that are
+    // still perfectly intact on disk.
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    forge_version(&p5s, "99");
+    let forged = std::fs::read(&p5s).unwrap();
+
+    let err = write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("99"),
+        "must name the version it refused: {err}"
+    );
+
+    // The fix: `overwrite` does not license this. Before it, this call
+    // succeeded and returned a sidecar with no `barcode` column at all.
+    let err = write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions {
+            overwrite: true,
+            ..AnnotateOptions::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("99"),
+        "overwrite must not turn an unreadable sidecar into a fresh one: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&p5s).unwrap(),
+        forged,
+        "a refused write must leave the sidecar byte-identical"
+    );
+}
+
+#[test]
+fn a_design_write_also_refuses_an_unreadable_sidecar() {
+    // `write_design` carried its own copy of the same match, so it needed its
+    // own fix and needs its own test.
+    let (tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    forge_version(&p5s, "99");
+    let forged = std::fs::read(&p5s).unwrap();
+
+    let csv = tmp.path().join("design.csv");
+    std::fs::write(&csv, "barcode,condition\nBC01,treated\n").unwrap();
+    let err = write_design(
+        &path,
+        &csv,
+        &DesignOptions {
+            overwrite: true,
+            ..DesignOptions::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("99"), "design write must refuse too: {err}");
+    assert_eq!(std::fs::read(&p5s).unwrap(), forged);
+}
+
+#[test]
+fn index_rebuild_refuses_an_unreadable_sidecar_rather_than_starting_empty() {
+    // `build_and_write_index` used to answer every load failure with
+    // `Sidecar::default()`, which is the same loss by a different route: the
+    // rebuild would write a correct index and drop the annotation columns it
+    // was supposed to carry through.
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    forge_version(&p5s, "99");
+    let forged = std::fs::read(&p5s).unwrap();
+
+    let err = Reader::open(&path)
+        .unwrap()
+        .build_and_write_index(&p5s)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("99"),
+        "index rebuild must refuse, not start from an empty sidecar: {err}"
+    );
+    assert_eq!(std::fs::read(&p5s).unwrap(), forged);
+}
+
+#[test]
+fn both_sidecar_readers_apply_the_same_version_gate() {
+    // `escpod index` decides whether to rewrite a sidecar by reading its
+    // metadata, then rewrites it through the full reader. If the cheap check
+    // accepts a file the full read would reject, check-then-write is unsound:
+    // the command is told the file is fine, and only finds out otherwise once
+    // the rewrite is already underway.
+    use escapepod_pod5::sidecar::{read_sidecar_file, read_sidecar_metadata};
+
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    let identity = Reader::open(&path).unwrap().sidecar_identity().unwrap();
+
+    // Both accept what this build writes.
+    assert!(read_sidecar_file(&p5s, &identity).unwrap().is_some());
+    assert!(read_sidecar_metadata(&p5s, &identity).unwrap().is_some());
+
+    forge_version(&p5s, "99");
+
+    let full = read_sidecar_file(&p5s, &identity).unwrap_err().to_string();
+    let meta = read_sidecar_metadata(&p5s, &identity)
+        .unwrap_err()
+        .to_string();
+    assert!(full.contains("99"), "full read must reject: {full}");
+    assert!(
+        meta.contains("99"),
+        "metadata read must reject the same file: {meta}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lost updates: the atomic write makes a sidecar update all-or-nothing, which
+// prevents a *torn* file and says nothing about a second writer. The realistic
+// case is not corruption — it is a long `demux --annotate` still running when
+// someone runs `escpod index` on the same file to speed it up.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_write_that_would_discard_a_concurrent_update_is_refused() {
+    use escapepod_pod5::sidecar::{
+        SidecarStamp, read_sidecar_file, write_sidecar_file, write_sidecar_file_checked,
+    };
+
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    let identity = Reader::open(&path).unwrap().sidecar_identity().unwrap();
+
+    // Writer A reads the sidecar and fingerprints it, then goes away to do
+    // something slow.
+    let stamp = SidecarStamp::of(&p5s).expect("sidecar exists");
+    let stale = read_sidecar_file(&p5s, &identity).unwrap().unwrap();
+
+    // Writer B finishes first and lands a second column.
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions {
+            name: "batch".to_string(),
+            ..AnnotateOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(read_annotation(&path, Some("batch")).unwrap().len(), 5);
+
+    // Writer A now tries to write back what it read. It must be refused.
+    let err = write_sidecar_file_checked(&p5s, &identity, &stale, Some(&stamp))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("changed while it was being updated"),
+        "stamp guard did not fire: {err}"
+    );
+    assert_eq!(
+        read_annotation(&path, Some("batch")).unwrap().len(),
+        5,
+        "the refused write must leave writer B's column alone"
+    );
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        2,
+        "a refused write must not leave a stray temp file behind"
+    );
+
+    // And this is what the guard is for: the unchecked path does exactly what
+    // the refusal prevents — writer B's column is gone, with no error.
+    write_sidecar_file(&p5s, &identity, &stale).unwrap();
+    assert!(
+        read_annotation(&path, Some("batch")).is_err(),
+        "unchecked write is expected to lose the concurrent column"
+    );
+}
+
+#[test]
+fn an_untouched_sidecar_passes_the_stamp_check() {
+    // The positive control: the guard must not refuse the ordinary
+    // read-modify-write it sits in the middle of.
+    use escapepod_pod5::sidecar::{SidecarStamp, read_sidecar_file, write_sidecar_file_checked};
+
+    let (_tmp, path, ids, _) = fixture();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    let p5s = sidecar_path(&path);
+    let identity = Reader::open(&path).unwrap().sidecar_identity().unwrap();
+    let stamp = SidecarStamp::of(&p5s).unwrap();
+    let sc = read_sidecar_file(&p5s, &identity).unwrap().unwrap();
+
+    write_sidecar_file_checked(&p5s, &identity, &sc, Some(&stamp)).unwrap();
+    assert_eq!(read_annotation(&path, Some("barcode")).unwrap().len(), 5);
+
+    // A sidecar that does not exist yet stamps as `None`, which is the "not
+    // read first" case and must not be mistaken for a guard failure.
+    let fresh = tempfile::TempDir::new().unwrap();
+    assert!(SidecarStamp::of(fresh.path().join("absent.p5s")).is_none());
+}
