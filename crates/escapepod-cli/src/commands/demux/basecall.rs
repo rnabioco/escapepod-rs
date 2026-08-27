@@ -28,7 +28,7 @@ use escapepod_demux::crf::{
 };
 use escapepod_signal::{Reader, ReadsBatchView};
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::utils::{decode_chunks_to, parse_boundaries_csv};
 use crate::progress::create_progress_bar;
@@ -363,6 +363,52 @@ fn write_row(
 /// and the prepped windows, in the same order and the same length.
 type Block = (Vec<uuid::Uuid>, Vec<usize>, Vec<Option<Vec<f32>>>);
 
+/// Batches read ahead of the encoder (`ESCAPEPOD_BASECALL_READAHEAD`).
+///
+/// **Deeper was measured and does not help.** A block here is a whole Arrow
+/// batch — ~9,900 reads, ~118 MB of windows, ~1.2 s of encoder work — so depth
+/// 16 looks like it should absorb ~19 s of reader stall, which is the scale of
+/// the stalls a cold network filesystem produces. It does not pay off.
+///
+/// Warm (one 3.0 GB POD5, two rounds, depth order reversed in the second):
+/// 30.7-31.2 s at every depth from 2 to 16, GPU mean flat at 62-64%. The trace
+/// says why — the encoder waited 1.4 s on the reader all run, so the buffer was
+/// never the constraint and deepening it only let the reader idle further ahead.
+///
+/// Cold is the regime that motivated the question (the encoder waits 145-179 s
+/// there), and it still does not help. A 2x2 over {compgpu01, compgpu03} x
+/// {depth 2, depth 16}, each run reading a file that node had never touched:
+///
+/// | node | depth 2 | depth 16 |
+/// |---|---|---|
+/// | compgpu01 | 268.4 s | 294.9 s |
+/// | compgpu03 | 120.4 s | 131.9 s |
+///
+/// Depth 16 was *slower* on both nodes; the 2.2x spread is the node, not the
+/// depth. Reading depth-2-vs-16 off a single pair of runs would have shown a
+/// spurious 2.03x — run the control before believing an I/O-adjacent sweep here.
+/// Costs ~1.4 GB of resident memory at depth 16 for nothing.
+const DEFAULT_READAHEAD: usize = 2;
+
+/// How many prepped batches may sit between the reader and the encoder.
+///
+/// Kept as a knob because the sweep above is one workload on one filesystem,
+/// not because a bigger number is expected to win. Run with `-v` first: the
+/// logged waits say which side is starving, and if the encoder is not waiting
+/// on the reader, no depth will change anything.
+fn readahead_blocks() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ESCAPEPOD_BASECALL_READAHEAD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_READAHEAD)
+            .min(64)
+    })
+}
+
 /// The reader half of the pipeline: one sequential sweep of the inputs, prepping
 /// each Arrow batch and handing it off.
 ///
@@ -370,12 +416,15 @@ type Block = (Vec<uuid::Uuid>, Vec<usize>, Vec<Option<Vec<f32>>>);
 /// workers collapses throughput on a network filesystem (#72), which is why this
 /// has the same shape as `fingerprint`. Only the *handoff* is concurrent, so the
 /// encoder can run batch N while this reads batch N+1.
+/// Returns the time spent parked on a full channel — i.e. how long the reader
+/// was ahead and waiting for the encoder to catch up.
 fn produce_blocks(
     inputs: &[PathBuf],
     boundaries: &std::collections::HashMap<uuid::Uuid, escapepod_demux::ReadBoundaries>,
     meta: &escapepod_demux::crf::CrfMetadata,
     tx: &std::sync::mpsc::SyncSender<Block>,
-) {
+) -> std::time::Duration {
+    let mut blocked = std::time::Duration::ZERO;
     for path in inputs {
         let Ok(reader) = Reader::open(path) else {
             warn!("skipping unreadable file {}", path.display());
@@ -457,11 +506,15 @@ fn produce_blocks(
                 ends.push(adapter_end);
                 windows.push(window);
             }
-            if tx.send((ids, ends, windows)).is_err() {
-                return; // consumer stopped early; its error surfaces at the join
+            let parked = std::time::Instant::now();
+            let sent = tx.send((ids, ends, windows));
+            blocked += parked.elapsed();
+            if sent.is_err() {
+                return blocked; // consumer stopped early; its error surfaces at the join
             }
         }
     }
+    blocked
 }
 
 pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
@@ -644,11 +697,19 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     // extra memory is bounded by a single batch of windows. The CPU encoder gets
     // the same overlap — it wants it for the same reason, and splitting the paths
     // would mean two copies of this loop.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Block>(2);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Block>(readahead_blocks());
     let inputs = &args.input;
     let bounds = &boundaries;
     std::thread::scope(|scope| -> anyhow::Result<()> {
-        scope.spawn(move || produce_blocks(inputs, bounds, meta, &tx));
+        let reader = scope.spawn(move || produce_blocks(inputs, bounds, meta, &tx));
+
+        // Which side waits is the whole question when tuning the read-ahead, and
+        // it is not guessable: encoder-waiting means the reader cannot keep up
+        // (a deeper buffer only helps if the stalls are bursty), reader-waiting
+        // means the buffer is already deep enough and the encoder is the floor.
+        // Timed as loop-total minus work, so `rx` still moves into the loop.
+        let loop_start = std::time::Instant::now();
+        let mut working = std::time::Duration::ZERO;
 
         // Encode, match and write on this thread: `out`/`written` stay plain
         // locals, and blocks arrive in sweep order, so the output is unchanged.
@@ -660,6 +721,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         // and a failed write would deadlock the join against a producer parked
         // on a full channel — turning an I/O error into a hang.
         for (ids, ends, windows) in rx {
+            let batch_start = std::time::Instant::now();
             let n = ids.len();
             // Two shapes of the same call: with `--ref-scores` the decode also
             // returns the panel scores, so the reference scan runs inside it
@@ -709,7 +771,16 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             }
             written += decoded.len();
             progress.inc(n as u64);
+            working += batch_start.elapsed();
         }
+        let waiting_on_reader = loop_start.elapsed().saturating_sub(working);
+        let waiting_on_encoder = reader.join().unwrap_or_default();
+        debug!(
+            "read-ahead {}: encoder waited {:.1}s on the reader, reader waited {:.1}s on the encoder",
+            readahead_blocks(),
+            waiting_on_reader.as_secs_f64(),
+            waiting_on_encoder.as_secs_f64(),
+        );
         Ok(())
     })?;
     out.flush()?;
