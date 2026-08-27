@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Build / Tooling
+
+- **PyPI can no longer publish a version whose binaries failed to build.**
+  This is the second half of the v0.17.0 failure, and the part that made it
+  unrecoverable. `publish-pypi` needed only `[wheels, sdist]`, so it was
+  independent of the CLI builds by design — the stated intent being that a
+  wheel failure should never block the GitHub Release. Run in the other
+  direction that same independence meant the GPU binary could fail, the
+  `release` job be skipped, and PyPI publish regardless. 0.17.0 is therefore
+  installable with `pip` but has no GitHub Release and no binaries, and since
+  PyPI refuses re-uploads, that half cannot be withdrawn or corrected — only
+  superseded.
+
+  The rule now is that **the irreversible step goes last**: `publish-pypi`
+  waits on `release`, which waits on `build`, `build-gpu`, `wheels` and
+  `sdist`. A GitHub Release can be deleted and re-created and the workflow
+  re-run; a PyPI upload cannot, so it happens only once everything that could
+  still fail already has not. Under this graph v0.17.0 would have published
+  nothing at all, which is the correct outcome.
+
+  Making `release` wait on the wheels fixes a second, quieter bug. The wheels
+  and sdist are attached to the GitHub Release as assets, but the job
+  downloads artifacts with no pattern — so the asset list was decided by a
+  race, and a wheel job slower than the binaries would have been silently
+  omitted. It never happened, which is exactly why it was worth closing.
+  `SHA256SUMS.txt` now covers the wheels as well, which it never did.
+
+  `skip-existing` is set on the publish step. With PyPI last, re-running a run
+  that failed *after* publishing would otherwise die on a duplicate upload
+  with the GitHub Release still broken — the re-run needs to be able to reach
+  the thing that failed.
+
 ### Fixed
 
 - **The v0.17.0 GPU release artifact failed to build, and no GitHub Release
