@@ -134,4 +134,4 @@ pub use train::*;
 pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError, PreppedWindow};
 
 #[cfg(feature = "gpu")]
-pub use adapter_cnn_gpu::AdapterCnnGpu;
+pub use adapter_cnn_gpu::{AdapterCnnGpu, AdapterCnnGpuPool};
