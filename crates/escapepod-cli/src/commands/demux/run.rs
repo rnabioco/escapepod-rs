@@ -354,7 +354,8 @@ impl Default for FpParams {
 /// Adapter detector — LLR (always available), CPU CNN (`cnn-detect`), or
 /// batched GPU CNN (`gpu`). The fused pipeline always detects through
 /// [`Detector::detect_batch`] so the GPU variant runs as one onnxruntime call
-/// per block instead of per read.
+/// per block instead of per read — or, with more than one device, one call per
+/// device per block.
 enum Detector {
     Llr {
         min_adapter: usize,
@@ -363,8 +364,12 @@ enum Detector {
     },
     #[cfg(feature = "cnn-detect")]
     Cnn(Box<escapepod_demux::AdapterCnn>),
+    /// A pool rather than a single session even on one device, where it is
+    /// exactly the single session: `drive_blocks` calls `process_block`
+    /// serially, so one `AdapterCnnGpu` behind its mutex can only ever have one
+    /// device busy however many cards the node holds.
     #[cfg(feature = "gpu")]
-    CnnGpu(Box<escapepod_demux::AdapterCnnGpu>),
+    CnnGpu(Box<escapepod_demux::AdapterCnnGpuPool>),
 }
 
 /// Per-worker scratch for the LLR detect prep (normalize + downscale).
@@ -858,13 +863,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
             #[cfg(feature = "gpu")]
             let encoder = if crf_encoder_on_gpu {
                 // Must match `produce_gpu_crf`'s placement: this instance becomes
-                // worker 0, so it has to land on the first *encoder* device — GPU 1
-                // when detection has GPU 0 to itself.
-                let enc_device = crf_encoder_devices(
-                    escapepod_demux::crf::lattice_gpu::visible_device_count()
-                        .unwrap_or(1)
-                        .max(1),
-                )[0];
+                // worker 0, so it has to land on the same first encoder device
+                // that pool will assume it is on.
+                let enc_device = crf_encoder_devices(visible_devices())[0];
                 let enc = CrfEncoderGpu::load_bundle_on_device(&dir, args.threads, enc_device)?;
                 if enc.gpu_decode_active() {
                     info!(
@@ -1953,23 +1954,63 @@ fn crf_gpu_block() -> usize {
     })
 }
 
-/// The CUDA ordinals the CRF encoder pool may use.
+/// Parse an explicit CUDA ordinal list from `var`, e.g. `"0,2,3"`.
 ///
-/// With one visible device everything shares it. With more, **device 0 is
-/// reserved for adapter detection** and the encoders take the rest.
+/// The escape hatch for both device policies below, and the instrument the
+/// measurements in their doc comments were taken with — an A/B across device
+/// counts is otherwise a rebuild or a `CUDA_VISIBLE_DEVICES` dance that also
+/// renumbers the cards. Out-of-range and unparseable entries are dropped with a
+/// warning rather than failing the run: a stale `ESCAPEPOD_*_DEVICES` in a job
+/// script should cost a line of output, not a flowcell.
+#[cfg(feature = "gpu")]
+fn device_list_override(var: &str, visible: usize) -> Option<Vec<i32>> {
+    parse_device_list(var, &std::env::var(var).ok()?, visible)
+}
+
+/// [`device_list_override`] with the environment already read, so the parsing
+/// rules can be tested without a process-global.
+#[cfg(feature = "gpu")]
+fn parse_device_list(var: &str, raw: &str, visible: usize) -> Option<Vec<i32>> {
+    let mut out = Vec::new();
+    for tok in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        match tok.parse::<i32>() {
+            Ok(d) if d >= 0 && (d as usize) < visible => out.push(d),
+            _ => tracing::warn!(
+                "{var}: ignoring `{tok}` — not a visible CUDA ordinal (0..{visible})"
+            ),
+        }
+    }
+    // Sorted and deduped because the ordinals become session placements, and
+    // `enc_devices[0]` is load-bearing: `run` loads worker 0's encoder from the
+    // same list and both must name the same card.
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        tracing::warn!("{var} named no visible CUDA device; using the default placement");
+        return None;
+    }
+    Some(out)
+}
+
+/// The CUDA ordinals the CRF encoder pool may use
+/// (`ESCAPEPOD_CRF_GPU_DEVICES`).
 ///
-/// # This reservation is now mis-tuned — measured, unfixed
+/// **Every visible device**, and detection shares them — see
+/// [`cnn_detect_devices`]. There is no role partition.
 ///
-/// It was justified by detect and the encoder costing about the same device time
-/// (5.4 s vs 6.4 s over 40 k reads): if two roles are comparable, sharing a card
-/// makes the pipeline's ceiling their sum and separating them makes it the
-/// larger of the two. #187 destroyed that premise. Matching the model's training
-/// convention cut detect's device time ~20x (401 s -> 20.2 s over 1 M reads)
-/// while the encoder stayed put, so the roles now cost ~19 s against ~170 s —
-/// and reserving a whole card for 10% of the work costs more than the contention
-/// it avoids. At exactly two devices it is pathological: the encoder pool does
-/// not grow at all, so the second GPU only offloads detection. Measured on 1 M
-/// reads, interleaved, 2 reps each:
+/// # What this replaced, and why
+///
+/// Device 0 used to be *reserved* for adapter detection, with the encoders
+/// taking the rest. That was justified by the two roles costing about the same
+/// device time (5.4 s vs 6.4 s over 40 k reads): if two roles are comparable,
+/// sharing a card makes the pipeline's ceiling their sum and separating them
+/// makes it the larger of the two. #187 destroyed that premise. Matching the
+/// model's training convention cut detect's device time ~20x (401 s -> 20.2 s
+/// over 1 M reads) while the encoder stayed put, so the roles came to cost ~19 s
+/// against ~170 s — and reserving a whole card for 10% of the work cost more
+/// than the contention it avoided. At exactly two devices it was pathological:
+/// the encoder pool did not grow at all, so the second GPU only offloaded
+/// detection. Measured on 1 M reads, interleaved, 2 reps each:
 ///
 /// ```text
 /// GPUs   encoder pool          wall     vs 1 GPU
@@ -1978,23 +2019,79 @@ fn crf_gpu_block() -> usize {
 ///   4    6 workers on [1,2,3]  43.7 s    2.46x
 /// ```
 ///
-/// The likely fix is to encode on *every* visible device and let detection share
-/// device 0 — workers pull from one channel rather than being handed a
-/// partition, so whichever device is slowed by carrying detection simply takes
-/// fewer blocks, with nothing to balance explicitly. It is **not** applied here
-/// because it is unmeasured, and the four-device column is the reason for
-/// caution: at 4 GPUs the producer is already the constraint (busy 71%, workers
-/// blocked on `recv` 38.6 s), and that producer *is* detection. Adding encoder
-/// work to device 0 could slow the stage that is already the ceiling and regress
-/// the case that currently scales, to fix the case that does not. Measure both
-/// columns before changing it.
+/// # Why it is safe to fold the roles together now
+///
+/// The objection on record was that at 4 GPUs the *producer* was already the
+/// constraint (busy 71%, workers blocked on `recv` 38.6 s) and that producer is
+/// detection, so adding encoder work to device 0 could regress the column that
+/// scaled in order to fix the one that did not. That objection is answered by
+/// detection no longer being pinned to a single card: [`cnn_detect_devices`]
+/// spreads it over the same set, so the stage that was the ceiling gets N-way
+/// device parallelism in the same change that gives the encoders device 0. The
+/// two halves are why this is one commit and not two.
+///
+/// Nothing here is a partition: encoder workers pull blocks from one channel and
+/// detect ranges come off one stack, so a device made slower by its share of the
+/// other role simply takes less of both. And at one device the arrangement is
+/// unchanged — detect and 2 encoder workers on GPU 0 is exactly what has always
+/// run, and what `DEVICE_ROW_BUDGET` was tuned against; more cards now replicate
+/// that arrangement rather than inventing a second one.
+///
+/// # Measured
+///
+/// 150 k RNA004 reads, nbc16 CRF bundle, 4x A30, 32 cores, warm page cache,
+/// arms interleaved, median of 3. Both policies from the same binary via the
+/// env overrides above, so only the placement differs. `pipeline` is the fused
+/// loop's own wall from `ESCAPEPOD_CRF_GPU_TRACE=1`; `total` adds model load and
+/// session construction.
+///
+/// ```text
+/// arm           total  vs 1 GPU   pipeline  vs 1 GPU
+/// 1 GPU        17.41s     1.00x     14.70s     1.00x
+/// 2 GPU old    18.26s     0.95x     15.00s     0.98x   <- the second card LOSES
+/// 2 GPU new    14.34s     1.21x     10.60s     1.39x
+/// 4 GPU old    15.22s     1.14x     10.30s     1.43x
+/// 4 GPU new    13.53s     1.29x      8.30s     1.77x
+/// ```
+///
+/// The old policy's two-device case is worse than one device here, against 1.11x
+/// when it was last measured on 1 M reads — reserving a card for detection costs
+/// more the smaller the run, because detection is the cheaper role and the
+/// reserved card sits idle through most of it.
+///
+/// Two honest limits on these numbers. First, the ceiling at this input size is
+/// **CPU-side**: at 4 GPUs the encoder workers are busy 20% of their wall and
+/// the producer 27%, so what remains is signal decode and prep, and raising
+/// `ESCAPEPOD_DEMUX_FILLERS` (2 -> 4 -> 8 -> 16) moves nothing. More cards past
+/// two mostly buy headroom for a machine with more cores, not throughput here.
+/// Second, this is a 150 k-read run where session construction is a visible
+/// fraction of wall; the pipeline column is the one that scales with input size.
 #[cfg(feature = "gpu")]
 fn crf_encoder_devices(visible: usize) -> Vec<i32> {
-    if visible > 1 {
-        (1..visible as i32).collect()
-    } else {
-        vec![0]
-    }
+    let visible = visible.max(1);
+    device_list_override("ESCAPEPOD_CRF_GPU_DEVICES", visible)
+        .unwrap_or_else(|| (0..visible as i32).collect())
+}
+
+/// The CUDA ordinals the boundary-CNN detector pool may use
+/// (`ESCAPEPOD_CNN_GPU_DEVICES`). Every visible device, for the reasons in
+/// [`crf_encoder_devices`].
+#[cfg(feature = "gpu")]
+pub(super) fn cnn_detect_devices(visible: usize) -> Vec<i32> {
+    let visible = visible.max(1);
+    device_list_override("ESCAPEPOD_CNN_GPU_DEVICES", visible)
+        .unwrap_or_else(|| (0..visible as i32).collect())
+}
+
+/// Visible CUDA devices, floored at 1.
+///
+/// Visible, so `CUDA_VISIBLE_DEVICES` already applies: under SLURM
+/// `--gres=gpu:1` this is 1 and every pool below collapses to one device.
+#[cfg(feature = "gpu")]
+pub(super) fn visible_devices() -> usize {
+    escapepod_demux::crf::lattice_gpu::visible_device_count()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Encoder workers, and how they are spread over the visible devices
@@ -2136,25 +2233,40 @@ fn produce_gpu_crf(
     let meta = encoder.metadata();
     let gpu_block = crf_gpu_block();
 
-    // Visible, so `CUDA_VISIBLE_DEVICES` already applies: under SLURM
-    // `--gres=gpu:1` this is 1 and the pool collapses to same-device workers.
-    let devices = escapepod_demux::crf::lattice_gpu::visible_device_count()
-        .unwrap_or(1)
-        .max(1);
+    let devices = visible_devices();
     let enc_devices = crf_encoder_devices(devices);
     let workers = crf_gpu_workers(enc_devices.len());
     // Worker 0 reuses the encoder already loaded for its metadata, which `run`
     // placed on `enc_devices[0]`; the rest get their own session, round-robin
     // over the encoder devices.
-    let extra: Vec<CrfEncoderGpu> = (1..workers)
-        .map(|w| {
-            CrfEncoderGpu::load_bundle_on_device(
-                bundle,
-                args.threads,
-                enc_devices[w % enc_devices.len()],
-            )
-        })
-        .collect::<Result<_, _>>()?;
+    //
+    // Loaded concurrently, for the reason spelled out on `AdapterCnnGpuPool`:
+    // each session pays seconds of CUDA/cuDNN initialisation, and a 4-device
+    // pool runs 8 of them. Serially that cost was larger than the throughput the
+    // extra cards bought over a 150 k-read run — start-up 2.8 s -> 6.3 s against
+    // a pipeline that improved 15.7 s -> 9.0 s.
+    let extra: Vec<CrfEncoderGpu> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..workers)
+            .map(|w| {
+                let device = enc_devices[w % enc_devices.len()];
+                scope.spawn(move || {
+                    CrfEncoderGpu::load_bundle_on_device(bundle, args.threads, device)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(escapepod_demux::crf::CrfError::Load(
+                        "CRF encoder loader thread panicked".to_string(),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .collect::<Result<_, _>>()?;
     // Every worker sharing a device allocates its LSTM activations from that
     // device's VRAM, so they must split its row budget rather than each take a
     // full one. Without this, `ESCAPEPOD_CRF_GPU_WORKERS=4` on a single 24 GB
@@ -2172,7 +2284,7 @@ fn produce_gpu_crf(
             enc_devices,
             style::count(encoder.batch_rows()),
             if devices > 1 {
-                "; adapter detection has GPU 0 to itself"
+                "; adapter detection shares the same devices"
             } else {
                 ""
             }
@@ -2861,9 +2973,24 @@ fn build_detector(
                 // GPU detection is one batched onnxruntime call per block.
                 #[cfg(feature = "gpu")]
                 if on_gpu {
+                    // One session per visible device, sharing them with the CRF
+                    // encoder pool — see `cnn_detect_devices`. At one device this
+                    // is the single session it has always been, bit-for-bit.
+                    let det_devices = cnn_detect_devices(visible_devices());
+                    if det_devices.len() > 1 {
+                        info!(
+                            "{} boundary CNN on GPU {:?}",
+                            style::label("Device:"),
+                            det_devices
+                        );
+                    }
                     return Ok(Detector::CnnGpu(Box::new(
-                        escapepod_demux::AdapterCnnGpu::load_with_config(path, config)
-                            .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
+                        escapepod_demux::AdapterCnnGpuPool::load_on_devices(
+                            path,
+                            config,
+                            &det_devices,
+                        )
+                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
                     )));
                 }
                 // True only on the branch above, which returned. Reading it
@@ -2965,20 +3092,51 @@ fn print_summary(summary: &DemuxSummary) {
 
 #[cfg(all(test, feature = "gpu"))]
 mod gpu_placement_tests {
-    use super::{crf_encoder_devices, crf_gpu_workers};
+    use super::{cnn_detect_devices, crf_encoder_devices, crf_gpu_workers, parse_device_list};
 
-    /// Pins today's placement, including the part that is known mis-tuned: at
-    /// two devices the encoder pool is `[1]` alone, which is why the second GPU
-    /// measures 1.11x rather than ~2x. Written so that changing the policy has
-    /// to change this test deliberately rather than silently.
+    /// Both roles take every visible device; there is no reservation. The
+    /// previous policy gave detection GPU 0 to itself, which left the encoder
+    /// pool at `[1]` on a two-GPU node and measured 1.11x for the second card.
+    /// Written so that changing the policy back has to change this test
+    /// deliberately rather than silently.
     #[test]
-    fn device_zero_is_reserved_for_detection_above_one_device() {
-        assert_eq!(crf_encoder_devices(1), vec![0]);
-        assert_eq!(crf_encoder_devices(2), vec![1]);
-        assert_eq!(crf_encoder_devices(4), vec![1, 2, 3]);
+    fn both_roles_take_every_visible_device() {
+        for visible in [1usize, 2, 4] {
+            let expected: Vec<i32> = (0..visible as i32).collect();
+            assert_eq!(crf_encoder_devices(visible), expected);
+            assert_eq!(cnn_detect_devices(visible), expected);
+        }
         // A zero count can only come from a failed probe; never hand back an
-        // empty pool, since the caller indexes into it.
+        // empty pool, since both callers index into it.
         assert_eq!(crf_encoder_devices(0), vec![0]);
+        assert_eq!(cnn_detect_devices(0), vec![0]);
+    }
+
+    /// Worker 0's encoder is loaded in `run` from `crf_encoder_devices(..)[0]`
+    /// and `produce_gpu_crf` then assumes it is on that card. A policy whose
+    /// first element moved would put the session on one device and its row
+    /// budget on another's accounting.
+    #[test]
+    fn the_first_encoder_device_is_stable() {
+        for visible in [1usize, 2, 4] {
+            assert_eq!(crf_encoder_devices(visible)[0], 0);
+        }
+    }
+
+    /// The escape hatch parses, sorts, dedupes, and refuses to widen the pool
+    /// past what is visible — an ordinal the driver cannot resolve would fail
+    /// the session build several seconds into the run instead.
+    #[test]
+    fn device_list_override_is_clamped_to_visible() {
+        let p = |raw, visible| parse_device_list("TEST_DEVICES", raw, visible);
+        assert_eq!(p("2,0", 4), Some(vec![0, 2]));
+        assert_eq!(p(" 1 , 1 , 3 ", 4), Some(vec![1, 3]));
+        // Out of range, negative and unparseable entries are dropped, not fatal.
+        assert_eq!(p("0,9,-1,x", 4), Some(vec![0]));
+        // Nothing usable falls back to the default placement rather than
+        // returning an empty pool the caller would index into.
+        assert_eq!(p("9,x", 4), None);
+        assert_eq!(p("", 4), None);
     }
 
     /// The pool must divide evenly over the devices it is spread across, or the

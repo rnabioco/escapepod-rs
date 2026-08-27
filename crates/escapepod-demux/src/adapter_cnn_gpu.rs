@@ -344,3 +344,386 @@ fn is_out_of_memory(e: &AdapterCnnError) -> bool {
     matches!(e, AdapterCnnError::Run(m)
         if m.contains("Failed to allocate") || m.contains("out of memory") || m.contains("CUDA_ERROR_OUT_OF_MEMORY"))
 }
+
+/// Sub-batches to aim for per device when splitting one length-group across a
+/// pool.
+///
+/// Enough that a device which finishes early can take more work, few enough that
+/// the per-call overhead the element budget exists to amortise is not paid over
+/// and over. Four is deliberately modest: the reason a device runs slow here is
+/// that it is *also* carrying encoder workers (see the fused pipeline's device
+/// policy), which slows it by a fraction rather than stalling it, so the queue
+/// only has to absorb a skew of that size.
+const RANGES_PER_DEVICE: usize = 4;
+
+/// Split a length-group of `group_len` reads into the `[lo, hi)` sub-batches a
+/// pool of `n_dev` devices will draw from.
+///
+/// `start_rows` is the single-device chunk size — the element budget's answer.
+/// Above one device it is capped so the stack holds [`RANGES_PER_DEVICE`] chunks
+/// per device, because that budget alone leaves too few: at the rna004 geometry
+/// a 24 GB card takes ~42 k rows of length 1500 against a 65 k-read block, so a
+/// four-device pool would find two chunks and idle half its cards.
+///
+/// **`n_dev == 1` is exempt from the cap**, and that is the whole of the
+/// bit-identity guarantee on [`AdapterCnnGpuPool`]: a one-device pool must batch
+/// exactly the way no pool at all does. The caller short-circuits before
+/// reaching here in that case, so this branch is belt and braces — but the
+/// guarantee belongs in the function that decides the batching, not only in the
+/// caller that currently happens to skip it.
+///
+/// Pure, and separated from the device loop so the covering properties below can
+/// be tested on a machine with no GPU in it.
+fn split_ranges(group_len: usize, start_rows: usize, n_dev: usize) -> Vec<(usize, usize)> {
+    let start_rows = start_rows.max(1);
+    let rows = if n_dev <= 1 {
+        start_rows
+    } else {
+        start_rows.min(group_len.div_ceil(n_dev * RANGES_PER_DEVICE).max(1))
+    };
+    (0..group_len)
+        .step_by(rows)
+        .map(|lo| (lo, (lo + rows).min(group_len)))
+        .collect()
+}
+
+/// One boundary-CNN session per CUDA device, fed from a single work queue.
+///
+/// # Why a pool rather than one session used harder
+///
+/// [`AdapterCnnGpu`] holds its `Session` behind a `Mutex`, so however many
+/// threads call it the device work serialises — right with one card, a hard
+/// ceiling with four. onnxruntime binds a session to one device at creation, so
+/// a second device means a second session, and the graph is small enough
+/// (~21 MB of weights) that holding one per card is not the constraint.
+///
+/// # The queue is shared on purpose
+///
+/// Devices pull ranges from one stack rather than being handed a partition. That
+/// matters because the pipeline using this deliberately co-locates encoder
+/// workers on the same cards: a device carrying more encode work simply takes
+/// fewer detect ranges, with nothing to balance explicitly. A static split would
+/// leave the busiest card holding the tail — the same argument the CRF encoder
+/// pool makes for pulling from one channel.
+///
+/// # Sessions load concurrently, because the serial cost was measured
+///
+/// Each `commit_from_file` pays CUDA/cuDNN initialisation — seconds, not
+/// milliseconds. Loading a four-device pool one card at a time was the largest
+/// single cost this type added: over 150 k reads on 4x A30 the *pipeline* ran
+/// 15.7 s -> 9.0 s (1.74x) while total wall only moved 18.5 s -> 15.3 s (1.21x),
+/// because start-up had grown 2.8 s -> 6.3 s. More than half the win was going
+/// into sequential session construction. Devices initialise independently, so
+/// this is one `thread::scope` and the cost collapses to the slowest card's.
+///
+/// # Results across device counts: measured identical, not guaranteed identical
+///
+/// A pool splits a group into more, smaller onnxruntime calls than one device
+/// would, and cuDNN picks its convolution algorithm from the batch shape, so
+/// this had every reason to perturb a few boundaries — reordering reads on this
+/// same path, which likewise repacks the batches, moved **7 of 503,076**. It
+/// does not. Measured on 150 k reads of RNA004 through `demux detect --method
+/// cnn`, 1 vs 2 vs 4 A30s: **0 of 150,000 boundaries differ**, and the fused
+/// pipeline's barcode assignments agree on 150,001 of 150,001 rows. Each device
+/// count also reproduces itself run to run.
+///
+/// Treat that as an observation about this model at these shapes, not a promise.
+/// The two things that *are* structural:
+///
+/// * **A one-device pool is bit-identical to no pool at all.**
+///   [`Self::detect_prepped`] delegates straight to
+///   [`AdapterCnnGpu::detect_prepped`] and never re-chunks — see
+///   [`split_ranges`] — so the overwhelmingly common case, and every regression
+///   baseline taken on it, is untouched by this type existing.
+/// * Reproducibility across counts rests on homogeneous cards. Which device
+///   draws which range is a race, so it holds only because identical cards
+///   running identical cuDNN pick identical kernels for identical shapes. A
+///   mixed-model node (an A30 beside an L40) forfeits it, and so might a model
+///   whose shapes land on a more batch-sensitive kernel.
+pub struct AdapterCnnGpuPool {
+    devices: Vec<AdapterCnnGpu>,
+}
+
+impl AdapterCnnGpuPool {
+    /// Load one session per CUDA ordinal in `devices`, all at once.
+    ///
+    /// Ordinals index the *visible* devices, so they already honour
+    /// `CUDA_VISIBLE_DEVICES`: under SLURM `--gres=gpu:1` the only valid list is
+    /// `[0]` and the pool collapses onto the single-device path.
+    ///
+    /// One device is loaded inline rather than through the scope, so the common
+    /// case adds no thread and no behaviour to explain.
+    pub fn load_on_devices(
+        path: impl AsRef<Path>,
+        config: AdapterCnnConfig,
+        devices: &[i32],
+    ) -> Result<Self, AdapterCnnError> {
+        let Some((&first, rest)) = devices.split_first() else {
+            return Err(AdapterCnnError::Load(
+                "boundary-CNN pool needs at least one CUDA device".to_string(),
+            ));
+        };
+        let path = path.as_ref();
+        if rest.is_empty() {
+            return Ok(Self {
+                devices: vec![AdapterCnnGpu::load_with_config_on_device(
+                    path, config, first,
+                )?],
+            });
+        }
+        let loaded: Vec<Result<AdapterCnnGpu, AdapterCnnError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = devices
+                .iter()
+                .map(|&d| {
+                    scope.spawn(move || AdapterCnnGpu::load_with_config_on_device(path, config, d))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(AdapterCnnError::Load(
+                            "boundary-CNN session loader thread panicked".to_string(),
+                        ))
+                    })
+                })
+                .collect()
+        });
+        // Collected after the join rather than with `?` inside it, so a failure
+        // on one card still lets every other loader finish and release its
+        // context instead of being torn down mid-`cuInit`.
+        Ok(Self {
+            devices: loaded.into_iter().collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    /// Load one session on CUDA device 0 — the pool spelling of
+    /// [`AdapterCnnGpu::load_with_config`].
+    pub fn load_with_config(
+        path: impl AsRef<Path>,
+        config: AdapterCnnConfig,
+    ) -> Result<Self, AdapterCnnError> {
+        Self::load_on_devices(path, config, &[0])
+    }
+
+    /// How many devices this pool spans.
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Preprocessing config in effect. Every session was loaded with the same
+    /// one, so device 0's answer is the pool's.
+    pub fn config(&self) -> AdapterCnnConfig {
+        self.devices[0].config()
+    }
+
+    /// Batched adapter-end detection from raw signals, prepping on the calling
+    /// thread. Mirrors [`AdapterCnnGpu::detect_adapter_end_batch`].
+    pub fn detect_adapter_end_batch(
+        &self,
+        signals: &[&[f32]],
+    ) -> Vec<Result<usize, AdapterCnnError>> {
+        let cfg = self.config();
+        let prepped: Vec<Option<PreppedWindow>> = signals
+            .iter()
+            .map(|&s| prep_adapter_signal(s, &cfg))
+            .collect();
+        // Re-stamp too-short errors with the real input length, exactly as the
+        // single-device path does — `detect_prepped` only ever sees `None`.
+        let mut out = self.detect_prepped(&prepped);
+        for (i, r) in out.iter_mut().enumerate() {
+            if matches!(r, Err(AdapterCnnError::SignalTooShort { .. })) {
+                *r = Err(AdapterCnnError::SignalTooShort {
+                    len: signals[i].len(),
+                    required: cfg.min_obs_adapter + cfg.downscale_factor,
+                });
+            }
+        }
+        out
+    }
+
+    /// Batched detection over already-prepped signals (`None` = too short),
+    /// spread across every device in the pool.
+    ///
+    /// With one device this *is* [`AdapterCnnGpu::detect_prepped`] — same call,
+    /// same batching, same bits.
+    pub fn detect_prepped(
+        &self,
+        prepped: &[Option<PreppedWindow>],
+    ) -> Vec<Result<usize, AdapterCnnError>> {
+        if self.devices.len() == 1 {
+            return self.devices[0].detect_prepped(prepped);
+        }
+        let valid_idx: Vec<usize> = (0..prepped.len())
+            .filter(|&i| prepped[i].is_some())
+            .collect();
+        let mut out: Vec<Result<usize, AdapterCnnError>> = (0..prepped.len())
+            .map(|_| {
+                Err(AdapterCnnError::SignalTooShort {
+                    len: 0,
+                    required: 0,
+                })
+            })
+            .collect();
+        self.run_grouped_pooled(prepped, &valid_idx, &mut out);
+        out
+    }
+
+    /// [`AdapterCnnGpu::run_grouped`]'s work stack, drained by every device at
+    /// once instead of by one.
+    ///
+    /// The OOM halve-and-retry carries over unchanged, including its
+    /// bit-exactness argument: splitting a range neither pads nor reorders, and
+    /// the batch axis is independent. One difference is worth stating — a device
+    /// that finds the stack empty stops, so when a *later* OOM pushes halves
+    /// back, the device that hit it finishes them alone. That degrades a rare
+    /// recovery path to single-device speed rather than spin-waiting every other
+    /// card on work that will usually never arrive.
+    fn run_grouped_pooled(
+        &self,
+        prepped: &[Option<PreppedWindow>],
+        valid_idx: &[usize],
+        out: &mut [Result<usize, AdapterCnnError>],
+    ) {
+        let n_dev = self.devices.len();
+        let out = Mutex::new(out);
+        for (len, group) in group_by_len(prepped, valid_idx) {
+            // The single-device chunk size is the starting point, then capped so
+            // there is work for every device to draw several times over. Without
+            // the cap a full block is ~2 chunks at the rna004 geometry (a 24 GB
+            // card takes ~42 k rows of length 1500, against a 65 k-read block),
+            // so two of four devices would sit idle.
+            let start_rows = (self.devices[0].batch_elems / len.max(1)).max(1);
+            let ranges: Mutex<Vec<(usize, usize)>> =
+                Mutex::new(split_ranges(group.len(), start_rows, n_dev));
+            let (ranges, out, group) = (&ranges, &out, &group);
+            std::thread::scope(|scope| {
+                for dev in &self.devices {
+                    scope.spawn(move || {
+                        loop {
+                            let next = ranges.lock().expect("cnn pool range stack poisoned").pop();
+                            let Some((lo, hi)) = next else { break };
+                            let sub = &group[lo..hi];
+                            match dev.run_one(prepped, sub, len) {
+                                // Same halve-and-retry as `run_grouped`; the
+                                // halves go back on the shared stack, so any
+                                // device still drawing can pick them up.
+                                Err(e) if hi - lo > 1 && is_out_of_memory(&e) => {
+                                    let mid = lo + (hi - lo) / 2;
+                                    let mut r =
+                                        ranges.lock().expect("cnn pool range stack poisoned");
+                                    r.push((mid, hi));
+                                    r.push((lo, mid));
+                                }
+                                // Success or a terminal error. The lock is held
+                                // only for the scatter, never across a device
+                                // call, so it is uncontended in practice.
+                                result => {
+                                    let mut o = out.lock().expect("cnn pool output mutex poisoned");
+                                    scatter_group(&mut o, sub, result);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every read lands in exactly one sub-batch, and the sub-batches are in
+    /// ascending order with no gap. Detection scatters by original index, so a
+    /// gap is a read silently left at its `SignalTooShort` default and an
+    /// overlap is two devices racing to write the same slot.
+    fn assert_covers(ranges: &[(usize, usize)], group_len: usize) {
+        let mut sorted = ranges.to_vec();
+        sorted.sort_unstable();
+        let mut next = 0;
+        for &(lo, hi) in &sorted {
+            assert_eq!(lo, next, "gap or overlap at {lo} in {sorted:?}");
+            assert!(lo < hi, "empty range {lo}..{hi}");
+            next = hi;
+        }
+        assert_eq!(next, group_len, "ranges stop short of the group");
+    }
+
+    #[test]
+    fn ranges_cover_the_group_exactly() {
+        for &group_len in &[1usize, 7, 4096, 65_536, 65_537] {
+            for &n_dev in &[1usize, 2, 3, 4, 8] {
+                for &start_rows in &[1usize, 512, 42_666, 1_000_000] {
+                    let r = split_ranges(group_len, start_rows, n_dev);
+                    assert_covers(&r, group_len);
+                }
+            }
+        }
+    }
+
+    /// The pool must not hand a device *fewer* rows per call than the element
+    /// budget already refused — splitting is for balance, never for growing the
+    /// batch past what VRAM was sized for.
+    #[test]
+    fn never_exceeds_the_element_budget() {
+        for &n_dev in &[1usize, 2, 4, 8] {
+            for &start_rows in &[1usize, 64, 512, 42_666] {
+                for &(lo, hi) in &split_ranges(65_536, start_rows, n_dev) {
+                    assert!(hi - lo <= start_rows.max(1), "{lo}..{hi} > {start_rows}");
+                }
+            }
+        }
+    }
+
+    /// The balance property this cap exists for: with a realistic block and
+    /// element budget, every device gets several chunks rather than two of four
+    /// finding the stack empty — and one device still batches exactly the way
+    /// the un-pooled path does.
+    #[test]
+    fn a_full_block_gives_every_device_work() {
+        // 65 k-read block, ~42 k rows per call on a 24 GB A30 at length 1500.
+        const GROUP: usize = 65_536;
+        const START_ROWS: usize = 42_666;
+        // One device: the element budget alone, uncapped — the two chunks
+        // `run_grouped` would make.
+        assert_eq!(
+            split_ranges(GROUP, START_ROWS, 1),
+            vec![(0, START_ROWS), (START_ROWS, GROUP)]
+        );
+        for &n_dev in &[2usize, 4] {
+            let r = split_ranges(GROUP, START_ROWS, n_dev);
+            assert!(
+                r.len() >= n_dev * RANGES_PER_DEVICE - 1,
+                "{n_dev} devices got only {} chunks",
+                r.len()
+            );
+        }
+    }
+
+    /// A group smaller than the device count still runs — every read is covered,
+    /// and the devices that find nothing simply stop.
+    #[test]
+    fn tiny_groups_do_not_produce_empty_ranges() {
+        let r = split_ranges(3, 42_666, 8);
+        assert_covers(&r, 3);
+        assert_eq!(r.len(), 3);
+    }
+
+    /// A pool needs at least one device; asking for none is a caller bug that
+    /// must not reach `self.devices[0]`.
+    #[test]
+    fn empty_device_list_is_rejected() {
+        // `unwrap_err` is out — a pool holds `Session`s and so is not `Debug`.
+        let Err(err) =
+            AdapterCnnGpuPool::load_on_devices("/nonexistent.onnx", Default::default(), &[])
+        else {
+            panic!("an empty device list must not produce a pool");
+        };
+        assert!(
+            matches!(&err, AdapterCnnError::Load(m) if m.contains("at least one CUDA device")),
+            "{err}"
+        );
+    }
+}

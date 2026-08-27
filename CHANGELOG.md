@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### Performance
+
+- **Multi-GPU demux: boundary-CNN detection runs on every visible device, and
+  the encoder pool no longer surrenders a card to it.** Two changes that only
+  work together.
+
+  Detection held one onnxruntime session behind a mutex, so a node with four
+  A30s ran it on one of them however many threads called in. It is now a pool
+  of one session per visible device drawing sub-batches from a shared work
+  queue — used by both `escpod demux --method cnn` and `escpod demux detect
+  --method cnn`. In exchange, the CRF encoder pool stops reserving GPU 0 for
+  detection and spreads over every device as well; both roles now share all
+  cards and self-balance, because encoder workers pull blocks from one channel
+  and detect ranges come off one stack.
+
+  The reservation had been mis-tuned since #187 cut detection's device time
+  ~20x, and at exactly two GPUs it was pathological — the encoder pool did not
+  grow at all, so the second card only offloaded detection. Measured on 150 k
+  RNA004 reads, 4x A30, 32 cores, interleaved arms, median of 3 (pipeline =
+  the fused loop's own wall, excluding model load and session construction):
+
+  | arm | total | vs 1 GPU | pipeline | vs 1 GPU |
+  |---|---|---|---|---|
+  | 1 GPU | 17.41s | 1.00x | 14.70s | 1.00x |
+  | 2 GPU, old policy | 18.26s | 0.95x | 15.00s | 0.98x |
+  | 2 GPU, new policy | 14.34s | **1.21x** | 10.60s | **1.39x** |
+  | 4 GPU, old policy | 15.22s | 1.14x | 10.30s | 1.43x |
+  | 4 GPU, new policy | 13.53s | **1.29x** | 8.30s | **1.77x** |
+
+  The second GPU used to make the run *slower*; it now makes it faster.
+
+  Sessions across devices also load concurrently rather than one at a time.
+  This is not a micro-optimisation: a 4-device run builds 12 CUDA sessions, and
+  serially that cost more than the extra cards returned — start-up 2.8s -> 6.3s
+  against a pipeline improving 15.7s -> 9.0s.
+
+  Output is unchanged. 1 vs 2 vs 4 GPUs produce **0 of 150,000 differing
+  adapter boundaries** and identical barcode assignments on all 150,001 rows,
+  and a one-device pool takes the un-pooled code path unmodified. Under SLURM
+  `--gres=gpu:1` everything collapses to the single-device arrangement that has
+  always run.
+
+  Both placements have an escape hatch for A/B measurement without a rebuild:
+  `ESCAPEPOD_CNN_GPU_DEVICES` and `ESCAPEPOD_CRF_GPU_DEVICES` take a CUDA
+  ordinal list (e.g. `0,2,3`); the old policy is `ESCAPEPOD_CNN_GPU_DEVICES=0`
+  with `ESCAPEPOD_CRF_GPU_DEVICES=1,2,3`.
+
+  Note the ceiling at this input size is CPU-side, not GPU: at 4 GPUs the
+  encoder workers are busy 20% of their wall and the producer 27%, and varying
+  `ESCAPEPOD_DEMUX_FILLERS` from 2 to 16 changes nothing. Past two cards this
+  mostly buys headroom for a machine with more cores.
+
 ## 0.17.1 (2026-08-26)
 
 Recovers the v0.17.0 release. 0.17.0's GPU artifact failed to build, which

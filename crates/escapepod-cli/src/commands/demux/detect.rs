@@ -536,14 +536,33 @@ fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()
             let st = &stages;
             let rows = std::thread::scope(|scope| -> anyhow::Result<Vec<DetectRow>> {
                 let gpu_handle = scope.spawn(move || -> anyhow::Result<Vec<DetectRow>> {
-                    // The session pins its own onnxruntime thread pool to one
+                    // Each session pins its own onnxruntime thread pool to one
                     // non-spinning thread — see `AdapterCnnGpu`. Left at ORT's
                     // default it is `available_parallelism()` wide, spawned
                     // alongside rayon's, so `--threads` would not bound the
                     // process (#155, GPU half) and the pool would take a third
-                    // of the CPU from the producers (#239).
-                    let gpu = escapepod_demux::AdapterCnnGpu::load(&model_path)
-                        .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
+                    // of the CPU from the producers (#239). That bound is per
+                    // session, so it holds as the device pool grows.
+                    //
+                    // One session per visible device. Loading them here rather
+                    // than on the main thread is what it always was — the point
+                    // of this thread is to overlap CUDA/cuDNN init with the
+                    // producers' first decodes, and an N-device pool has N times
+                    // as much of it to hide.
+                    let devices = super::run::cnn_detect_devices(super::run::visible_devices());
+                    if devices.len() > 1 {
+                        tracing::info!(
+                            "{} boundary CNN on GPU {:?}",
+                            crate::style::label("Device:"),
+                            devices
+                        );
+                    }
+                    let gpu = escapepod_demux::AdapterCnnGpuPool::load_on_devices(
+                        &model_path,
+                        escapepod_demux::AdapterCnnConfig::default(),
+                        &devices,
+                    )
+                    .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?;
                     let mut out = Vec::new();
                     loop {
                         let waited = std::time::Instant::now();
