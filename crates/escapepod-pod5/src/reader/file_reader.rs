@@ -217,6 +217,20 @@ impl Reader {
         // mapping streams near raw bandwidth. It is a hint (ignored where
         // unsupported); single-read random access pays only a negligible
         // over-readahead cost.
+        //
+        // `MADV_WILLNEED` over the whole signal table on top of this was
+        // measured and does NOT help — do not re-propose it without new
+        // evidence. It is the obvious next step, since Sequential only widens
+        // the readahead window while the leading edge stays a synchronous
+        // fault, which is what a cold `demux basecall` stalls on (encoder idle
+        // 52-66% of samples, waiting 88-152 s on the reader). Cold 2x2 over two
+        // gpu nodes, throughput normalised by file size, each run reading a
+        // file that node had never touched: on the encoder-bound node it was
+        // exactly neutral (76.1 vs 76.2 MiB/s), and on the I/O-bound node two
+        // replicate pairs disagreed in *direction* (+11%, then -34%) against a
+        // same-setting run-to-run spread of 40.5-53.9 MiB/s. The variance is
+        // the node, not the advice: that node ran at half the other's
+        // throughput for identical work at every setting.
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
 
