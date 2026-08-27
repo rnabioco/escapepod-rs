@@ -193,7 +193,13 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build, build-gpu]
+    # Everything, not just the binaries. Two reasons, and the second is the
+    # one that bit: the wheels are attached to the Release as assets, so
+    # without this the asset list is a race — `download-artifact` takes
+    # whatever happens to be finished, and a slow wheel job would silently
+    # ship a Release missing it. And this job is now the gate PyPI waits
+    # behind, so it has to represent the whole release, not half of it.
+    needs: [build, build-gpu, wheels, sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Only this job needs write — it creates the GitHub Release.
@@ -212,7 +218,10 @@ jobs:
         run: |
           set -euo pipefail
           cd artifacts
-          sha256sum escpod-* > SHA256SUMS.txt
+          # `escpod-*` is the CLI binaries, `escapepod-*` the wheels + sdist.
+          # Named rather than `*`: the redirection creates SHA256SUMS.txt before
+          # the glob expands, so `*` would checksum the file being written.
+          sha256sum escpod-* escapepod-* > SHA256SUMS.txt
 
       - name: Extract changelog for this version
         id: changelog
@@ -285,9 +294,20 @@ jobs:
             artifacts/*
 
   # ---------------------------------------------------------------------------
-  # Python wheels → PyPI. Independent of the CLI `release` job above so a wheel
-  # failure never blocks the GitHub Release (and vice versa). One abi3 wheel per
-  # platform (pyo3 `abi3-py39`), covering CPython 3.9+.
+  # Python wheels → PyPI. One abi3 wheel per platform (pyo3 `abi3-py39`),
+  # covering CPython 3.9+.
+  #
+  # These jobs used to be independent of the CLI `release` job, so that a wheel
+  # failure could not block the GitHub Release. v0.17.0 showed the cost of that
+  # independence running the other way: the GPU binary failed to build, the
+  # `release` job was skipped, and PyPI published anyway — leaving a version
+  # installable with `pip` that had no GitHub Release and no binaries. PyPI
+  # refuses re-uploads, so that half could not be withdrawn or corrected.
+  #
+  # The ordering rule now is that the irreversible step goes last: `publish-pypi`
+  # waits on `release`, which waits on every build. A GitHub Release can be
+  # deleted and re-created and the workflow re-run; a PyPI upload cannot, so it
+  # happens only once everything that could still fail already has not.
   # ---------------------------------------------------------------------------
   wheels:
     name: Wheel ${{ matrix.target }} (${{ matrix.manylinux }})
@@ -355,7 +375,8 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [wheels, sdist]
+    # `release` transitively covers wheels + sdist, and adds the binaries.
+    needs: [release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Trusted Publishing (OIDC) — no API token. Requires a PyPI publisher
@@ -371,7 +392,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # `skip-existing` is for re-runs, not for tolerating mistakes. PyPI is
+      # now the last job, so re-running a run that failed after it published
+      # would otherwise die on a duplicate upload — with the GitHub Release
+      # still unfixed. A version already on PyPI is passed over instead.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
