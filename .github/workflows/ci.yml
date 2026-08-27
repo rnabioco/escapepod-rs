@@ -305,3 +305,26 @@ jobs:
         run: cargo clippy -p escapepod-cli --features gpu
       - name: models-download — k-mer model prefetch (ureq rustls + sha2)
         run: cargo clippy -p escapepod-cli --features models-download
+
+      # Every TLS user in the graph is meant to be rustls: the musl release is
+      # statically linked and the GPU release artifact builds in a
+      # `manylinux_2_28` container, neither of which has an OpenSSL to find.
+      # The clippy steps above cannot catch a regression here, because this
+      # runner *does* have libssl-dev — `ort`'s default `download-binaries`
+      # pulled in native-tls + openssl-sys, went green here, and failed the
+      # v0.17.0 GPU release build instead. Checked over `--target all -e all`
+      # so a target-specific or build-dependency edge counts too.
+      - name: no openssl in the dependency graph
+        run: |
+          set -euo pipefail
+          for feat in gpu models-download; do
+            if cargo tree -i openssl-sys -p escapepod-cli \
+                 --features "$feat" --target all -e all >/dev/null 2>&1; then
+              echo "::error::openssl-sys reachable with --features $feat; \
+          every TLS path must be rustls (musl + manylinux builds have no OpenSSL)"
+              cargo tree -i openssl-sys -p escapepod-cli \
+                --features "$feat" --target all -e all || true
+              exit 1
+            fi
+          done
+          echo "openssl-sys absent under both feature sets"
