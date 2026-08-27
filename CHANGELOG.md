@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0 (2026-08-26)
+
 ### Added
 
 - **A GPU-enabled Linux release artifact (#270).** Every release from v0.10.0
@@ -37,23 +39,6 @@
 
   Prebuilt binaries are now documented in the README and the installation guide,
   which previously described only `cargo install`.
-
-### Fixed
-
-- **The "rebuild for GPU" hint named a Cargo feature that no longer exists.**
-  #282 folded `cnn-gpu` and `crf-gpu` into the single atomic `gpu` feature and
-  updated `Stage::compiled_in` to match, but `Stage::feature` — the accessor
-  three lines above it that supplies the *name* in every message about a stage
-  — was missed. So the default release binary, which has no GPU code by
-  construction, told anyone running `demux detect --method cnn` that "this build
-  has no `cnn-gpu` feature", pointing them at a flag `cargo` would reject. Both
-  the CPU-fallback warning and the hard `--device gpu` error carried it.
-
-  `feature()` now returns `gpu` for all three stages, and the two messages drop
-  the parenthetical that existed only to explain why the feature they named and
-  the flag they told you to pass were different strings. It stays a per-stage
-  accessor rather than a constant so the messages keep one source of truth and a
-  future stage whose feature genuinely differs has somewhere to say so.
 
 ### Changed
 
@@ -284,14 +269,6 @@
   Non-GPU environments are byte-identical after the change; only `gpu` and
   `dev-gpu` move.
 
-### Fixed
-
-- **`CLAUDE.md` pointed GPU tests at an environment with no test runner.** It
-  showed `pixi run -e gpu cargo nextest run …`, but `cargo-nextest` is in the
-  `dev` feature only, so that command could never have run. It is `-e dev-gpu`.
-
-### Changed
-
 - **`--device auto|cpu|gpu` replaces the `--gpu` boolean (#270, #278).** The old
   flag failed in both directions at once, and the second one is what makes this
   worth doing rather than a rename.
@@ -358,6 +335,27 @@
   real result, and it names the likely cause. GPU only: on CPU, tract runs one
   read at a time and an all-fail can legitimately be a property of the input, so
   that path keeps the warning it has always had.
+
+### Fixed
+
+- **The "rebuild for GPU" hint named a Cargo feature that no longer exists.**
+  #282 folded `cnn-gpu` and `crf-gpu` into the single atomic `gpu` feature and
+  updated `Stage::compiled_in` to match, but `Stage::feature` — the accessor
+  three lines above it that supplies the *name* in every message about a stage
+  — was missed. So the default release binary, which has no GPU code by
+  construction, told anyone running `demux detect --method cnn` that "this build
+  has no `cnn-gpu` feature", pointing them at a flag `cargo` would reject. Both
+  the CPU-fallback warning and the hard `--device gpu` error carried it.
+
+  `feature()` now returns `gpu` for all three stages, and the two messages drop
+  the parenthetical that existed only to explain why the feature they named and
+  the flag they told you to pass were different strings. It stays a per-stage
+  accessor rather than a constant so the messages keep one source of truth and a
+  future stage whose feature genuinely differs has somewhere to say so.
+
+- **`CLAUDE.md` pointed GPU tests at an environment with no test runner.** It
+  showed `pixi run -e gpu cargo nextest run …`, but `cargo-nextest` is in the
+  `dev` feature only, so that command could never have run. It is `-e dev-gpu`.
 
 ### Removed
 
