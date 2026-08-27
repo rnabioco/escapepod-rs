@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.17.1 (2026-08-26)
+
+Recovers the v0.17.0 release. 0.17.0's GPU artifact failed to build, which
+skipped the `Create Release` job — so 0.17.0 reached PyPI but has no GitHub
+Release and no binaries. PyPI does not allow re-uploading a version, so
+v0.17.0 is superseded rather than corrected: **0.17.1 is the first 0.17.x
+with downloadable binaries**, and carries the same changes as 0.17.0 plus
+the two fixes below. The `v0.17.0` tag was deliberately not moved, so it
+still points at exactly what PyPI was built from.
+
 ### Build / Tooling
 
 - **PyPI can no longer publish a version whose binaries failed to build.**
