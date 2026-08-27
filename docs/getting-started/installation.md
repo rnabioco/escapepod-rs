@@ -14,7 +14,7 @@ Only to build from source:
 Every tagged version publishes `escpod` binaries on the
 [releases page](https://github.com/rnabioco/escapepod-rs/releases):
 
-| Artifact | Linkage | `--gpu` |
+| Artifact | Linkage | GPU paths |
 |----------|---------|---------|
 | `escpod-<ver>-x86_64-unknown-linux-musl.tar.gz` | static (musl) | no |
 | `escpod-<ver>-aarch64-unknown-linux-musl.tar.gz` | static (musl) | no |
@@ -43,15 +43,18 @@ adapter detection and the CTC-CRF encoder) — so it ships in the one
 dynamically linked artifact, `x86_64-unknown-linux-gnu-gpu`. It is built
 against glibc 2.28, which covers RHEL/Rocky/Alma 8+ and Ubuntu 20.04+.
 
-Requesting `--gpu` with that binary needs a **CUDA 12** runtime and cuDNN 9 at
-run time, with an NVIDIA driver ≥ 535 (the DTW kernels target the CUDA 12.2
-driver API). Don't assemble that by hand — [GPU
-acceleration](../experimental/demux.md#gpu-acceleration) covers the pixi
+Actually reaching the device with that binary needs a **CUDA 12** runtime and
+cuDNN 9 at run time, with an NVIDIA driver ≥ 535 (the DTW kernels target the
+CUDA 12.2 driver API). Don't assemble that by hand — [GPU
+acceleration](../cli/demux.md#gpu-acceleration) covers the pixi
 environment that supplies it and how to confirm the CUDA execution provider
 actually loaded.
 
-Without `--gpu`, this artifact needs none of it and behaves exactly like the
-musl one.
+Placement is a run-time choice: `--device auto` (the default) uses the device
+for the stages where it wins and falls back silently otherwise, `--device gpu`
+demands it and errors instead of falling back, and `--device cpu` forces CPU.
+So on a CPU-only box this artifact needs none of the above and behaves exactly
+like the musl one.
 
 ### From Source
 
@@ -74,27 +77,29 @@ sudo cp target/release/escpod /usr/local/bin/
 ### Optional features
 
 The default build ships the stable CLI surface (summary, view, inspect,
-merge, filter, bam-filter, subset) **plus the full demux tree** — fused
-`demux`, `detect`, `fingerprint`, `classify`, `basecall`, `split`,
+merge, filter, bam-filter, subset, `index`) **plus the full demux tree** —
+fused `demux`, `detect`, `fingerprint`, `classify`, `basecall`, `split`,
 `models`, `train` — with CNN adapter detection, CRF basecalling, and model
-fetching included. Extra commands and accelerators live behind Cargo
-features:
+fetching included, **and `signal classify`**, the read-level model runner
+(tRNA charging), with both bundle scorers. Extra commands and accelerators
+live behind Cargo features:
 
 | Feature | Commands unlocked |
 |---------|-------------------|
-| `experimental` | `repack`, `resquiggle`, `index`, `annotate` |
+| `experimental` | `repack`, `resquiggle`, `annotate` |
 | `train` | adds `demux train-svm` (SVM training via linfa) |
 | `gpu` | every GPU path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify; selected at run time with `--device` (default `auto`), CUDA libraries at run time only |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 
-Note the sidecar asymmetry: *writing* `.p5s` sidecars (`index`, `annotate`)
-needs `--features experimental`, but consuming them (`demux --annotate`,
-`demux split --sidecar`, `filter --annotation`, `view`, `inspect`) works in
-the default build.
+Note the sidecar asymmetry: `escpod index` builds caches that can always be
+rebuilt from the POD5, so it is in the default build; `escpod annotate` writes
+data products that exist nowhere else, so it needs `--features experimental`.
+*Consuming* a sidecar (`demux --annotate`, `demux split --sidecar`,
+`filter --annotation`, `view`, `inspect`) is default-build throughout.
 
 `gpu` needs CUDA libraries at run time only; the repository's pixi `gpu`
 environment provides all of them — see
-[GPU acceleration](../experimental/demux.md#gpu-acceleration). Building for
+[GPU acceleration](../cli/demux.md#gpu-acceleration). Building for
 `gpu` is optional: the `x86_64-unknown-linux-gnu-gpu` release artifact above
 already carries it.
 

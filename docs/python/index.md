@@ -62,7 +62,8 @@ print(escapepod.__version__)
 | [`Writer`](writing.md) | Create new POD5 files |
 | [`ReadData`](reading.md#the-readdata-object) | A single read's metadata |
 | [`RunInfo`](writing.md#run-info) / `create_run_info` | Acquisition/run metadata |
-| [Signal processing](signal.md) | `normalize_signal`, `mad_normalize`, `refine_signal_map`, `KmerTable` |
+| [Signal processing](signal.md) | `normalize_signal`, `mad_normalize`, `refine_signal_map`, `KmerTable`, `span_statistics` / `span_statistics_batch` |
+| [Anchored reads](signal.md#anchored-reads) | `AnchoredReads` — POD5 + aligned BAM walked with reference→query→signal mapping, for corpus building |
 | [Sidecar annotations](reading.md#sidecar-annotations) | `Reader.annotation()` / `annotation_names()` / `design()` — demux barcodes and experimental designs from the `.p5s` sidecar |
 | `Pod5Error` | Raised on malformed/invalid POD5 data |
 

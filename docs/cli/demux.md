@@ -820,8 +820,8 @@ argument.
          silence this.
     ```
 
-    The two causes are distinguished — `this build has no cnn-gpu feature`
-    needs a rebuild, `no CUDA device is visible` needs an allocation.
+    The two causes are distinguished — `this build has no gpu feature` needs a
+    rebuild, `no CUDA device is visible` needs an allocation.
 
 `gpu` is the only GPU flag, in the CLI and in `escapepod-demux` alike. There is
 no way to build half a GPU binary, so there is no combination in which `--gpu`

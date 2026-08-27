@@ -725,7 +725,7 @@ fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()
              The CUDA execution provider registered, so this is a runtime library \
              the kernels could not load — typically libcudnn or libcublasLt. Run \
              inside the pixi `gpu` environment so `LD_LIBRARY_PATH` includes them \
-             (see docs/experimental/demux.md), or pass `--device cpu`. Re-run with \
+             (see docs/cli/demux.md), or pass `--device cpu`. Re-run with \
              `RUST_LOG=ort=error` to see onnxruntime's own message. No boundaries \
              file was written."
         );

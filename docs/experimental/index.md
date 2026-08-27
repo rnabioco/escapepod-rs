@@ -1,19 +1,19 @@
 # Experimental
 
 Tools in this section are functional but not yet stable — APIs, flags, and
-output formats may change between releases. Most live behind the
-`experimental` Cargo feature; `demux` is the exception, shipping in the
-default build with output formats that are still stabilizing.
+output formats may change between releases. All of them live behind the
+`experimental` Cargo feature.
 
 ## Commands
 
-| Command | Feature flag | Purpose |
-|---------|-------------|---------|
-| [demux](demux.md) | *(default build)* | Barcode demultiplexing — fused pipeline, stepwise subcommands, sidecar output |
-| [annotate](annotate.md) | `--features experimental` | Record per-read annotations (demux barcodes, designs) in the `.p5s` sidecar |
-| `index` | *(default build)* | Build the `.p5s` caches — read index for O(log n) read-ID lookup, and the signal batch geometry that saves a scattered read of every signal batch header |
-| [resquiggle](resquiggle.md) | `--features experimental` | Refine signal-to-base mapping using banded DP |
-| [repack](repack.md) | `--features experimental` | Re-pack POD5 files with current compression settings |
+| Command | Purpose |
+|---------|---------|
+| [annotate](annotate.md) | Record per-read annotations (demux barcodes, designs) in the `.p5s` sidecar |
+| [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP |
+| [repack](repack.md) | Re-pack POD5 files with current compression settings |
+
+`demux`, `signal classify` and `index` ship in the default build and are
+documented in the [CLI Reference](../cli/index.md).
 
 ## The `.p5s` sidecar
 
@@ -90,9 +90,10 @@ dependent columns, and writing a derived column directly is refused — the
 design stays the source of truth. See [annotate](annotate.md) for the full
 command reference.
 
-Note the split in feature gates. `escpod index` and everything that *consumes*
-a sidecar — `demux split --sidecar`, `filter --annotation`, `view`,
-`inspect summary` — work in the default build. So does `demux --annotate`,
+Note the split in feature gates. [`escpod index`](../cli/index-command.md) and
+everything that *consumes* a sidecar — `demux split --sidecar`,
+`filter --annotation`, `view`, `inspect summary` — work in the default build.
+So does [`demux --annotate`](../cli/demux.md#sidecar-output),
 which is the usual way a sidecar comes into existence in the first place.
 Only `escpod annotate` needs `--features experimental`: `index` builds caches
 that can always be rebuilt from the POD5, while `annotate` writes data products
@@ -103,23 +104,16 @@ files and rerun `escpod index`.
 
 ## Building
 
-Enable one or more features at build time:
+One feature covers everything in this section:
 
 ```bash
-# repack, resquiggle, index, annotate
+# repack, resquiggle, annotate
 cargo build --release --features experimental
 ```
 
-Demux has two opt-in features layered on top:
-
-| Feature | Enables |
-|---------|---------|
-| `--features gpu` | Every GPU path: CNN adapter detection, the CTC-CRF encoder, and DTW classify. Selected at run time with `--device` (default `auto`); CUDA libraries at run time only — see [GPU acceleration](demux.md#gpu-acceleration) |
-| `--features train` | SVM model training via `linfa-svm` (`escpod demux train-svm`) |
-
-Both imply `demux`, so `cargo build --features gpu` is enough. CPU CNN/TCN
-adapter detection (`--method cnn`, what the published barcode models expect)
-needs no flag — it ships in the default build.
+Demux's own opt-in features (`gpu`, `train`) are not part of it — see
+[GPU acceleration](../cli/demux.md#gpu-acceleration) and the feature table
+under [Installation](../getting-started/installation.md#optional-features).
 
 ## Stability
 

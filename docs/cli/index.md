@@ -21,9 +21,11 @@ These commands are in the default build — no extra Cargo features required.
 | [filter](filter.md) | Extract reads by ID list, criteria, or sidecar annotation |
 | [bam-filter](bam-filter.md) | Filter reads based on paired BAM file |
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
-| [demux](../experimental/demux.md) | Barcode demultiplexing (in the default build; output formats still stabilizing) |
+| [demux](demux.md) | Barcode demultiplexing — DTW-SVM, GBM, or CTC-CRF, end to end |
+| [index](index-command.md) | Build the `.p5s` sidecar caches (read index + signal batch geometry) |
+| [signal classify](signal-classify.md) | Read-level classification against a model bundle (tRNA charging) |
 
-Additional commands — `repack`, `resquiggle`, `index`, and
+Additional commands — `repack`, `resquiggle`, and
 [`annotate`](../experimental/annotate.md) — need `--features experimental`;
 see the [Experimental](../experimental/index.md) section.
 
