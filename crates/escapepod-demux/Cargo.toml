@@ -70,10 +70,19 @@ tract-onnx = { workspace = true, optional = true }
 # architecture-agnostic — the boundary CNN keeps the same `[B,1,L] -> [B,2,L]`
 # contract as the tract CPU path, the CRF encoder the same time-major
 # `[B,1,chunk] -> [T,B,n_score]`.
-ort = { version = "=2.0.0-rc.13", optional = true, features = [
+# `default-features = false` is load-bearing, not tidying: ort's default set
+# includes `download-binaries`, which drags in ureq + native-tls + openssl-sys.
+# Under `load-dynamic` nothing is ever downloaded or linked at build time, so
+# that TLS stack is dead weight in the graph — and it broke the GPU release
+# artifact, which builds in a `manylinux_2_28` container with no openssl-devel.
+# `std`/`ndarray`/`tracing`/`api-27` are the defaults we do use, restated.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+    "api-27",
     "cuda",
     "load-dynamic",
     "ndarray",
+    "std",
+    "tracing",
 ] }
 
 # CUDA driver bindings for the on-device SVM pipeline (RBF + OvO

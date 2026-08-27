@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The v0.17.0 GPU release artifact failed to build, and no GitHub Release
+  was published.** `ort` was declared without `default-features = false`, so
+  its default `download-binaries` came along and dragged in `ureq` with
+  `native-tls`, and therefore `openssl-sys`. Under `load-dynamic` — which is
+  how this crate uses `ort`, and the reason nothing CUDA is needed at build
+  time — that machinery never downloads or links anything, so the whole TLS
+  stack was dead weight in the graph. It became fatal in #277's new artifact
+  job, which builds in a `manylinux_2_28` container carrying no
+  `openssl-devel`: `openssl-sys`'s build script failed, and since `release`
+  needs `build-gpu`, the GitHub Release for v0.17.0 was skipped entirely.
+  (The wheels were unaffected and 0.17.0 is on PyPI.)
+
+  `ort` now takes `default-features = false` and restates the four defaults
+  actually used (`std`, `ndarray`, `tracing`, `api-27`) alongside `cuda` and
+  `load-dynamic`. `api-27` is kept explicitly rather than dropped, so the
+  required onnxruntime API version is unchanged. This removes 19 packages
+  from `Cargo.lock` — `openssl*`, `native-tls`, `schannel`,
+  `security-framework`, and the rest of that subtree — with no additions and
+  no version changes, and no code change of any kind.
+
+  **CI could not have caught this**, which is the more interesting half. The
+  `gpu` feature *is* built on every PR, but on `ubuntu-latest`, which has
+  `libssl-dev` — so `openssl-sys` compiled happily there and the break
+  surfaced only in the release container, on a tag, after PyPI had already
+  published. The feature-builds job now asserts `openssl-sys` is unreachable
+  under both `gpu` and `models-download`, over `--target all -e all` so a
+  target-specific or build-dependency edge counts too. Every TLS user in this
+  workspace is meant to be rustls: the musl artifacts are statically linked
+  and the GPU artifact builds in manylinux, and neither has an OpenSSL to
+  find.
+
 ## 0.17.0 (2026-08-26)
 
 ### Added
