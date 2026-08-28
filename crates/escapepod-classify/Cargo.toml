@@ -20,7 +20,7 @@ escapepod-signal = { workspace = true }
 # cl-tagged output BAM stays in the CLI.
 noodles-bam = "0.94"
 noodles-bgzf = "0.51"
-noodles-sam = "0.89"
+noodles-sam = "0.90"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
