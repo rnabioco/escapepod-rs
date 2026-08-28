@@ -42,7 +42,7 @@ indicatif = { workspace = true, optional = true }
 # Reset SIGPIPE to default so `escpod view … | head` exits quietly (Unix only)
 libc = { version = "0.2", optional = true }
 # BAM file support
-noodles-bam = { version = "0.94", optional = true }
+noodles-bam = { version = "0.95", optional = true }
 noodles-bgzf = { version = "0.51", optional = true }
 noodles-core = { version = "0.20", optional = true }
 noodles-csi = { version = "0.60", optional = true }
