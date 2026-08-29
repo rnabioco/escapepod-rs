@@ -111,8 +111,8 @@ pub fn run(
     // Use the core library's optimized filter
     let options = FilterOptions {
         signal_batch_size: 1_000,
-        read_batch_size: 10_000,
         durability,
+        ..Default::default()
     };
 
     timer.phase("Filter & write");

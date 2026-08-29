@@ -34,8 +34,8 @@ pub fn run(
 
     let options = MergeOptions {
         duplicate_ok,
-        read_batch_size: 100_000,
         durability,
+        ..Default::default()
     };
 
     // Create progress bar

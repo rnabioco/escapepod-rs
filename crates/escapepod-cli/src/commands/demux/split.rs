@@ -188,8 +188,8 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     // barcode's writer, rather than re-scanning every input once per barcode.
     let options = FilterOptions {
         signal_batch_size: 1_000,
-        read_batch_size: 10_000,
         durability: Durability::default(),
+        ..Default::default()
     };
     // `SubsetOutcome` already sorts both lists by group name, so the report
     // order is deterministic even though groups are written in parallel.

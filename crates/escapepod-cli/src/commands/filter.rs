@@ -226,8 +226,10 @@ pub fn run(
     // Use the core library's parallel filter
     let options = FilterOptions {
         signal_batch_size: 1_000,
-        read_batch_size: 10_000,
         durability,
+        // `read_batch_size` is deliberately left at the library default, so
+        // the reads-table geometry has one definition rather than six.
+        ..Default::default()
     };
 
     timer.phase("Filter & write");

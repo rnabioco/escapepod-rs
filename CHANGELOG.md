@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The reads table is written in batches again, instead of one batch per file**
+  (#297). `filter`, `merge`, `subset` and `split` build the reads table with
+  `build_reads_table{,_remapped}` rather than `Writer`, and those wrote the
+  whole table as a single Arrow record batch however large it was — so
+  `read_batch_size` on `FilterOptions`/`MergeOptions`/`SubsetOptions` was
+  declared, defaulted, and never read. `escpod filter` asking for 10,000 rows
+  per batch wrote 40,000 reads as **one**.
+
+  Measured, for scale: MinKNOW writes ~10,000 reads per batch (1,575,748 in
+  158) and the pod5 Python package exactly 1,000 (17,919,658 in 17,920).
+  Neither writes a whole file as one batch.
+
+  It is not cosmetic for anything that reads escpod's output back. `demux`
+  shards its reader threads by batch index and only emits a block at a batch
+  boundary, so a single-batch file is read by exactly one thread whatever
+  `ESCAPEPOD_DEMUX_FILLERS` says, and nothing reaches the GPU until the entire
+  file has been decoded. On a 100k-read escpod-written file that was 11.2 s of
+  a 19 s stage with the card idle, and it made every tuning knob look flat.
+  Fixing it took that stage to 11.3 s with the first block arriving in 0.3 s
+  and GPU utilisation going from 22-30% to ~60%.
+
+  Every default is now 1,000, and the five CLI sites that overrode it (merge at
+  100,000, the rest at 10,000) inherit it, so the geometry has one definition.
+  Note this never affected MinKNOW input, which was already many-batched:
+  measured on a real 1.3M-read run, GPU utilisation is ~94% and the first block
+  arrives in 0.4 s both before and after.
+
 ### Performance
 
 - **`--ref-scores` runs its reference scan on the GPU instead of on the host**
