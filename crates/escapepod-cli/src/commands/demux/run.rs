@@ -863,8 +863,8 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             #[cfg(feature = "gpu")]
             let encoder = if crf_encoder_on_gpu {
                 // Must match `produce_gpu_crf`'s placement: this instance becomes
-                // worker 0, so it has to land on the first *encoder* device —
-                // GPU 0, which detection also shares.
+                // worker 0, so it has to land on the first *encoder* device — GPU 1
+                // when detection has GPU 0 to itself.
                 let enc_device = crf_encoder_devices(
                     escapepod_demux::crf::lattice_gpu::visible_device_count()
                         .unwrap_or(1)
@@ -1955,47 +1955,58 @@ fn crf_gpu_block() -> usize {
     })
 }
 
-/// The CUDA ordinals the CRF encoder pool may use: **every visible device**.
+/// The CUDA ordinals the CRF encoder pool may use.
 ///
-/// Detection shares device 0 rather than owning it. The encoder workers all pull
-/// from one channel, so the device carrying detection simply takes fewer blocks
-/// than the others — the balance is a consequence of the queue, not something
-/// anyone has to compute.
+/// With one visible device everything shares it. With more, **device 0 is
+/// reserved for adapter detection** and the encoders take the rest.
 ///
-/// # Why device 0 used to be reserved, and why it no longer is
+/// # The obvious fix was tried and measured worse — do not re-apply it blind
 ///
 /// The reservation was justified by detect and the encoder costing about the
 /// same device time (5.4 s vs 6.4 s over 40 k reads): if two roles are
 /// comparable, sharing a card makes the pipeline's ceiling their sum and
-/// separating them makes it the larger of the two. #187 destroyed that premise.
-/// Matching the model's training convention cut detect's device time ~20x
-/// (401 s -> 20.2 s over 1 M reads) while the encoder stayed put, so the roles
-/// now cost ~19 s against ~170 s. Reserving a whole card for 10% of the work
-/// costs more than the contention it avoids, and at exactly two devices it was
-/// pathological — the encoder pool did not grow at all, so the second GPU only
-/// offloaded detection:
+/// separating them makes it the larger of the two. #187 destroyed that premise
+/// — matching the model's training convention cut detect's device time ~20x
+/// (401 s -> 20.2 s over 1 M reads) while the encoder stayed put — and this
+/// comment used to argue from that for encoding on every device, letting
+/// detection share device 0. The historical table it argued from (1 M reads):
 ///
 /// ```text
-/// GPUs   encoder pool (before)   wall     vs 1 GPU
-///   1    2 workers on [0]       107.5 s     --
-///   2    2 workers on [1]        96.5 s    1.11x   <- barely worth the card
-///   4    6 workers on [1,2,3]    43.7 s    2.46x
+/// GPUs   encoder pool          wall     vs 1 GPU
+///   1    2 workers on [0]     107.5 s     --
+///   2    2 workers on [1]      96.5 s    1.11x    <- the whole argument
+///   4    6 workers on [1,2,3]  43.7 s    2.46x
 /// ```
 ///
-/// The 2-GPU row is the whole argument: a card bought 1.11x because nothing
-/// extra was encoding on it. Under this function the pool is `2 * visible`
-/// workers over all visible devices, so two GPUs get four workers.
+/// It was applied and measured (#297; A30 x4, 100 k reads, `--ref-scores`,
+/// arms interleaved in one allocation, 4 reps each):
 ///
-/// The caution this replaces was that at 4 GPUs the producer is already the
-/// constraint and that producer *is* detection, so giving device 0 encoder work
-/// might slow the stage that is already the ceiling. Measured since (#297, one
-/// A30, 100 k reads): detection is **1.5 s of device time in a 33 s run**, ~5%,
-/// against an encoder pool that leaves its device 26% busy. There is ample room
-/// on device 0, and the 4-GPU column is the one that must not regress — see the
-/// before/after table on the PR.
+/// ```text
+/// GPUs   reserve device 0   encode everywhere
+///   2      30.0 +- 2.9 s      28.9 +- 1.3 s     within noise
+///   4      27.9 +- 0.6 s      29.5 +- 1.1 s     reservation faster, ~5.6%
+/// ```
+///
+/// So the 4-GPU column regressed — exactly the risk this comment named — and
+/// the 2-GPU row that motivated the change did not reproduce at all. Per-card
+/// utilisation says why: device 0 runs 5-6% busy with the reservation and
+/// 9-10% without, i.e. the encoder work lands on the card already carrying
+/// detection, and detection is the producer.
+///
+/// **What this did not settle.** At 100 k reads with the scan on the device,
+/// nothing is GPU-bound — cards sit at 5-22% and CPU at ~140%, and four
+/// devices buy ~1.13x over one. A placement change cannot show its benefit in
+/// a regime where GPU capacity is not the constraint, and the 1.11x/2.46x
+/// table above came from a 1 M-read run. Re-testing this needs that workload,
+/// not this one. The pipeline being overlap-bound rather than throughput-bound
+/// is #297 proper, and is the thing worth fixing first.
 #[cfg(feature = "gpu")]
 fn crf_encoder_devices(visible: usize) -> Vec<i32> {
-    (0..visible.max(1) as i32).collect()
+    if visible > 1 {
+        (1..visible as i32).collect()
+    } else {
+        vec![0]
+    }
 }
 
 /// Encoder workers, and how they are spread over the visible devices
@@ -2206,7 +2217,7 @@ fn produce_gpu_crf(
             enc_devices,
             style::count(encoder.batch_rows()),
             if devices > 1 {
-                "; adapter detection shares GPU 0"
+                "; adapter detection has GPU 0 to itself"
             } else {
                 ""
             }
@@ -3071,20 +3082,19 @@ fn print_summary(summary: &DemuxSummary) {
 mod gpu_placement_tests {
     use super::{crf_encoder_devices, crf_gpu_workers};
 
-    /// The encoder pool spans every visible device; detection shares device 0.
+    /// Pins today's placement, including the part that looks mis-tuned: at two
+    /// devices the encoder pool is `[1]` alone. Written so that changing the
+    /// policy has to change this test deliberately rather than silently.
     ///
-    /// This replaces a test that deliberately pinned the opposite — device 0
-    /// reserved for detection — so that changing the policy could not happen
-    /// silently. It is changed on purpose: reserving a card for a stage that
-    /// measures 1.5 s of device time in a 33 s run bought 1.11x at two devices,
-    /// because the encoder pool did not grow with the card (#297).
+    /// It has been changed deliberately once, to encode on every device, and
+    /// reverted: that measured ~5.6% slower at 4 GPUs and no better at 2
+    /// (#297). See `crf_encoder_devices` for the table and for what the
+    /// measurement could not settle.
     #[test]
-    fn every_visible_device_encodes() {
+    fn device_zero_is_reserved_for_detection_above_one_device() {
         assert_eq!(crf_encoder_devices(1), vec![0]);
-        // The row that mattered: a second GPU now adds encoder capacity rather
-        // than only offloading detection.
-        assert_eq!(crf_encoder_devices(2), vec![0, 1]);
-        assert_eq!(crf_encoder_devices(4), vec![0, 1, 2, 3]);
+        assert_eq!(crf_encoder_devices(2), vec![1]);
+        assert_eq!(crf_encoder_devices(4), vec![1, 2, 3]);
         // A zero count can only come from a failed probe; never hand back an
         // empty pool, since the caller indexes into it.
         assert_eq!(crf_encoder_devices(0), vec![0]);
