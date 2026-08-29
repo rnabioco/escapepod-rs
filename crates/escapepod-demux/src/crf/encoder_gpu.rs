@@ -100,7 +100,7 @@ use ort::value::Tensor;
 use rayon::prelude::*;
 
 use super::encoder::{CrfError, CrfMetadata};
-use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs};
+use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs_strided};
 use super::refchain::{RefChains, ScoredDecode};
 
 /// Rows one device may have in flight across *all* encoders sharing it.
@@ -119,6 +119,24 @@ pub const DEVICE_ROW_BUDGET: usize = 1024;
 /// otherwise. Two is what the fused pipeline runs, and assuming it keeps the
 /// out-of-the-box batch at the 512 rows every caller used before the budget
 /// existed.
+///
+/// # Two is measured, not assumed — do not "simplify" it to one
+///
+/// Total worker-seconds inside encode+decode grow linearly with the worker
+/// count at flat wall (2/4/6/8 workers on one A30: 28.2 / 28.2 / 26.1 / 31.0 s),
+/// which reads like pure contention and suggests the second worker is
+/// overhead. It is not. Against one worker on the same card, interleaved, the
+/// fused pipeline over 100 k reads (#297):
+///
+/// ```text
+/// workers=1   41.9 s / 48.3 s   GPU 19% / 17%
+/// workers=2   35.3 s / 40.0 s   GPU 25% / 21%
+/// ```
+///
+/// The second worker is worth ~16% and lifts device utilisation, because what
+/// it overlaps is the *other* worker's per-call setup rather than adding
+/// parallel device compute. Past two the row budget splits faster than the
+/// overlap pays for itself, which is the flat sweep above.
 pub const DEFAULT_WORKERS_PER_DEVICE: usize = 2;
 
 /// Reads per onnxruntime call before splitting, for one encoder that shares its
@@ -783,38 +801,33 @@ impl CrfEncoderGpu {
         self.run_raw(rows, |data, t_len, batch, n_score| {
             (0..batch)
                 .into_par_iter()
-                .map_init(
-                    || {
-                        (
-                            CrfScratch::new(),
-                            Vec::<f32>::with_capacity(t_len * n_score),
-                        )
-                    },
-                    |(scratch, buf), b| {
-                        buf.clear();
-                        for t in 0..t_len {
-                            let off = (t * batch + b) * n_score;
-                            buf.extend_from_slice(&data[off..off + n_score]);
-                        }
-                        let mut ref_logp = Vec::with_capacity(chains.len());
-                        let sequence = decode_with_refs(
-                            &self.layout,
-                            &self.alphabet,
-                            buf.as_slice(),
-                            t_len,
-                            scratch,
-                            backend,
-                            chains,
-                            &mut ref_logp,
-                        )
-                        .map_err(|e| CrfError::Decode(e.to_string()))?;
-                        Ok(ScoredDecode {
-                            sequence,
-                            ref_logp,
-                            mean_logpost: scratch.path_score() / t_len.max(1) as f32,
-                        })
-                    },
-                )
+                .map_init(CrfScratch::new, |scratch, b| {
+                    // Decode straight out of the time-major buffer. Read `b`'s
+                    // rows live at `(t * batch + b) * n_score` and are each
+                    // contiguous, so the decode only needs the stride between
+                    // them — it copies every row into its own scratch anyway.
+                    // Gathering them into a private buffer first cost 1.5 MB
+                    // read plus 1.5 MB written per read, ~1.5 GB per 512-read
+                    // call, to change a stride and nothing else (#297).
+                    let mut ref_logp = Vec::with_capacity(chains.len());
+                    let sequence = decode_with_refs_strided(
+                        &self.layout,
+                        &self.alphabet,
+                        &data[b * n_score..],
+                        t_len,
+                        batch * n_score,
+                        scratch,
+                        backend,
+                        chains,
+                        &mut ref_logp,
+                    )
+                    .map_err(|e| CrfError::Decode(e.to_string()))?;
+                    Ok(ScoredDecode {
+                        sequence,
+                        ref_logp,
+                        mean_logpost: scratch.path_score() / t_len.max(1) as f32,
+                    })
+                })
                 .collect()
         })
     }

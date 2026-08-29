@@ -50,6 +50,7 @@ mod lattice_gpu_kernel;
 
 pub use lattice::{
     Backend, CrfDecodeError, CrfLayout, CrfScratch, decode, decode_with, decode_with_refs,
+    decode_with_refs_strided,
 };
 pub use refchain::{RefChainError, RefChains, ScoredDecode};
 

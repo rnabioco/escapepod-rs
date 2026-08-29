@@ -577,7 +577,16 @@ pub fn decode_with(
     scratch: &mut CrfScratch,
     backend: Backend,
 ) -> Result<String, CrfDecodeError> {
-    decode_inner(layout, alphabet, scores, t_len, scratch, backend, None)
+    decode_inner(
+        layout,
+        alphabet,
+        scores,
+        t_len,
+        layout.n_score,
+        scratch,
+        backend,
+        None,
+    )
 }
 
 /// [`decode_with`], additionally scoring every reference in `chains` against
@@ -607,11 +616,46 @@ pub fn decode_with_refs(
     chains: &RefChains,
     out: &mut Vec<f32>,
 ) -> Result<String, CrfDecodeError> {
+    decode_with_refs_strided(
+        layout,
+        alphabet,
+        scores,
+        t_len,
+        layout.n_score,
+        scratch,
+        backend,
+        chains,
+        out,
+    )
+}
+
+/// [`decode_with_refs`] over a strided view of one read inside a batched,
+/// time-major score buffer.
+///
+/// `scores` starts at that read's first row and `row_stride` is the distance to
+/// the next timestep's row — `batch * n_score` for the encoder's
+/// `[t, batch, n_score]` output. Every row is contiguous either way, so this is
+/// the same decode; what it avoids is gathering the read's rows into a private
+/// buffer first, which for the RNA004 geometry is 1.5 MB copied in and out per
+/// read purely to change a stride (#297).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_with_refs_strided(
+    layout: &CrfLayout,
+    alphabet: &[u8],
+    scores: &[f32],
+    t_len: usize,
+    row_stride: usize,
+    scratch: &mut CrfScratch,
+    backend: Backend,
+    chains: &RefChains,
+    out: &mut Vec<f32>,
+) -> Result<String, CrfDecodeError> {
     let seq = decode_inner(
         layout,
         alphabet,
         scores,
         t_len,
+        row_stride,
         scratch,
         backend,
         Some((chains, out)),
@@ -625,11 +669,13 @@ pub fn decode_with_refs(
     Ok(seq)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_inner(
     layout: &CrfLayout,
     alphabet: &[u8],
     scores: &[f32],
     t_len: usize,
+    row_stride: usize,
     scratch: &mut CrfScratch,
     backend: Backend,
     refs: Option<(&RefChains, &mut Vec<f32>)>,
@@ -640,8 +686,30 @@ fn decode_inner(
             expected: layout.n_edges,
         });
     }
-    let expected = t_len * layout.n_score;
-    if scores.len() != expected {
+    // `row_stride` is the distance between consecutive timesteps' rows. It is
+    // `n_score` for a packed buffer, and `batch * n_score` for one read inside
+    // the encoder's time-major `[t, batch, n_score]` output — where each row is
+    // still contiguous, only further apart. Reading those rows in place is what
+    // lets the GPU scoring path skip gathering a private 1.5 MB copy per read
+    // before decoding it (#297).
+    if row_stride < layout.n_score {
+        return Err(CrfDecodeError::ScoreLen {
+            got: row_stride,
+            expected: layout.n_score,
+        });
+    }
+    // Packed buffers keep the exact-length check: there, a length that is not
+    // `t_len * n_score` means the caller and the decode disagree about `t_len`,
+    // which is worth refusing. A strided view cannot be checked that way — it
+    // is a window into a batch, so it runs past its own last row into the next
+    // read's — so it gets the weaker "the last row is complete" bound.
+    let expected = t_len.saturating_sub(1) * row_stride + layout.n_score;
+    let bad_len = if row_stride == layout.n_score {
+        scores.len() != expected
+    } else {
+        scores.len() < expected
+    };
+    if bad_len {
         return Err(CrfDecodeError::ScoreLen {
             got: scores.len(),
             expected,
@@ -650,10 +718,11 @@ fn decode_inner(
     scratch.reserve(layout, t_len);
 
     for t in 0..t_len {
+        let src = t * row_stride;
         let (lo, hi) = (t * layout.n_score, (t + 1) * layout.n_score);
         transpose_dispatch(
             layout,
-            &scores[lo..hi],
+            &scores[src..src + layout.n_score],
             &mut scratch.scores[lo..hi],
             backend,
         );
