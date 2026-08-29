@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.2 (2026-08-29)
+
 ### Fixed
 
 - **Every command that takes POD5 input accepts a directory, and refuses a
