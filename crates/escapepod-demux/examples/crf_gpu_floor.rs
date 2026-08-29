@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     let batch: usize = args.next().map_or(Ok(512), |s| s.parse())?;
     let iters: usize = args.next().map_or(Ok(20), |s| s.parse())?;
 
-    let encoder = CrfEncoderGpu::load_bundle(&bundle, Some(16))?;
+    let encoder = CrfEncoderGpu::load_bundle(&bundle)?;
     let meta = encoder.metadata();
     let chunk = meta.signal.chunk;
     let t_len = meta.t_len();

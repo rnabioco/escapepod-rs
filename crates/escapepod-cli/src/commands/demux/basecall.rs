@@ -494,7 +494,6 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
         );
         Basecaller::Gpu(Box::new(escapepod_demux::crf::CrfEncoderGpu::load_bundle(
             &args.model,
-            args.threads,
         )?))
     } else {
         Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?))

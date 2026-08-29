@@ -855,9 +855,9 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
         Some(dir) => {
             // The encoder is ~91% of this head's CPU cost, which is why `auto`
             // sends it to the device; the lattice decode's own placement is the
-            // encoder's business. `--threads` bounds onnxruntime's intra-op pool,
-            // which is otherwise spawned `available_parallelism()` wide on top of
-            // rayon's.
+            // encoder's business. The session's own intra-op pool is fixed at one
+            // non-spinning thread inside the loader — it used to take `--threads`,
+            // which multiplied by the worker count and starved the prep feeding it.
             crf_encoder_on_gpu =
                 crate::device::place_and_report(device, crate::device::Stage::CrfEncoder)?.is_gpu();
             #[cfg(feature = "gpu")]
@@ -870,7 +870,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                         .unwrap_or(1)
                         .max(1),
                 )[0];
-                let enc = CrfEncoderGpu::load_bundle_on_device(&dir, args.threads, enc_device)?;
+                let enc = CrfEncoderGpu::load_bundle_on_device(&dir, enc_device)?;
                 if enc.gpu_decode_active() {
                     info!(
                         "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
@@ -1306,9 +1306,11 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // tracking. Runs after produce_result? so a failed run writes nothing.
     if args.annotate {
         let collected = assignments.unwrap_or_default();
-        // Kept for the barcode summary below, which counts labels rather than
-        // reading them back off the sidecar.
-        let assignments = collected.barcode.clone();
+        // Tallied for the barcode summary below, which counts labels rather
+        // than reading them back off the sidecar. A tally and not a copy of the
+        // map: at one entry per read, cloning it to count sixteen labels was
+        // the largest single allocation the run made.
+        let label_counts = collected.label_counts();
         let columns = collected.into_columns();
         for path in &args.input {
             // One read-modify-write for all five columns: five separate ones
@@ -1341,12 +1343,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
         // Sidecar-only runs have no writer threads; fill the summary from
         // the assignment map so the barcode table still prints.
         if summary.per_barcode.is_empty() {
-            let mut counts: HashMap<&String, usize> = HashMap::new();
-            for barcode in assignments.values() {
-                *counts.entry(barcode).or_default() += 1;
-            }
-            summary.per_barcode = counts.into_iter().map(|(bc, n)| (bc.clone(), n)).collect();
-            summary.per_barcode.sort();
+            summary.per_barcode = label_counts;
         }
     }
 
@@ -2152,13 +2149,7 @@ fn produce_gpu_crf(
     // placed on `enc_devices[0]`; the rest get their own session, round-robin
     // over the encoder devices.
     let extra: Vec<CrfEncoderGpu> = (1..workers)
-        .map(|w| {
-            CrfEncoderGpu::load_bundle_on_device(
-                bundle,
-                args.threads,
-                enc_devices[w % enc_devices.len()],
-            )
-        })
+        .map(|w| CrfEncoderGpu::load_bundle_on_device(bundle, enc_devices[w % enc_devices.len()]))
         .collect::<Result<_, _>>()?;
     // Every worker sharing a device allocates its LSTM activations from that
     // device's VRAM, so they must split its row budget rather than each take a
@@ -2602,7 +2593,17 @@ fn writer_thread(
 /// keep them (#241).
 #[derive(Default)]
 struct Collected {
-    barcode: HashMap<Uuid, String>,
+    /// Distinct barcode labels, indexed by the codes in `barcode`.
+    labels: Vec<String>,
+    /// Reverse of `labels`, for interning.
+    label_ids: HashMap<String, u32>,
+    /// Per read, an index into `labels` — never the label itself. This map
+    /// lives for the whole run (sidecars are written once every input has been
+    /// classified), so a `String` per read to say `nbc07` is one 32-byte heap
+    /// chunk per read for one of sixteen values: ~4 GB at 57 M reads, which is
+    /// most of a demux job's non-reclaimable memory. Same reasoning as
+    /// [`CollectedScores::best`], which has always done this.
+    barcode: HashMap<Uuid, u32>,
     /// Only populated under `--ref-scores`.
     crf: Option<CollectedScores>,
 }
@@ -2620,21 +2621,59 @@ struct CollectedScores {
 }
 
 impl Collected {
+    /// Intern a barcode label, returning its code.
+    fn intern(&mut self, label: String) -> u32 {
+        if let Some(&id) = self.label_ids.get(&label) {
+            return id;
+        }
+        let id = self.labels.len() as u32;
+        self.labels.push(label.clone());
+        self.label_ids.insert(label, id);
+        id
+    }
+
+    /// How many reads each label got, as `(label, count)`.
+    ///
+    /// The sidecar-only summary needs this and nothing else from the map, so it
+    /// is tallied over the codes rather than by cloning the map — which at one
+    /// entry per read was the single largest allocation in the run.
+    fn label_counts(&self) -> Vec<(String, usize)> {
+        let mut counts = vec![0usize; self.labels.len()];
+        for &code in self.barcode.values() {
+            counts[code as usize] += 1;
+        }
+        let mut out: Vec<(String, usize)> = self
+            .labels
+            .iter()
+            .cloned()
+            .zip(counts)
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        out.sort();
+        out
+    }
+
     /// The sidecar columns this run produced, in write order.
+    ///
+    /// Both label columns hand over codes plus a dictionary rather than a
+    /// `String` per read: materializing them here would put back, all at once
+    /// and for every column simultaneously, exactly the allocation the codes
+    /// exist to avoid.
     fn into_columns(self) -> Vec<ColumnWrite> {
         let mut out = vec![ColumnWrite {
             name: "barcode".to_string(),
-            values: ColumnValues::Labels(self.barcode),
+            values: ColumnValues::LabelCodes {
+                dictionary: self.labels,
+                codes: self.barcode,
+            },
         }];
         let Some(crf) = self.crf else { return out };
         out.push(ColumnWrite {
             name: "crf_best".to_string(),
-            values: ColumnValues::Labels(
-                crf.best
-                    .into_iter()
-                    .filter_map(|(id, i)| crf.names.get(i as usize).map(|n| (id, n.clone())))
-                    .collect(),
-            ),
+            values: ColumnValues::LabelCodes {
+                dictionary: crf.names,
+                codes: crf.best,
+            },
         });
         for (name, values) in [
             ("crf_logp", crf.logp),
@@ -2727,7 +2766,8 @@ fn spawn_class_writer(
                 }
             }
             if let Some(out) = &mut collected {
-                out.barcode.insert(read_id, barcode);
+                let code = out.intern(barcode);
+                out.barcode.insert(read_id, code);
                 // Recorded for gated reads too, matching the CSV: a sidecar
                 // that says `unclassified` should still say what it was
                 // rejected for.
@@ -3011,7 +3051,59 @@ mod gpu_placement_tests {
 
 #[cfg(all(test, feature = "crf-decode"))]
 mod tests {
-    use super::crf_bundle_dir;
+    use super::{Collected, ColumnValues, crf_bundle_dir};
+    use uuid::Uuid;
+
+    /// The sidecar-only barcode summary used to be built by cloning the whole
+    /// per-read map and counting its values — one entry per read, to report a
+    /// number per label. `label_counts` tallies the codes instead, and has to
+    /// agree with what that clone-and-count produced: same pairs, same order
+    /// (sorted), and labels nothing was assigned to left out.
+    #[test]
+    fn label_counts_match_counting_the_labels() {
+        let mut c = Collected::default();
+        let mut expected: std::collections::HashMap<String, usize> = Default::default();
+        for (i, label) in ["nbc02", "nbc01", "nbc02", "unclassified", "nbc02"]
+            .into_iter()
+            .enumerate()
+        {
+            let code = c.intern(label.to_string());
+            c.barcode.insert(Uuid::from_u128(i as u128), code);
+            *expected.entry(label.to_string()).or_default() += 1;
+        }
+        // A label that was interned but that no read ended up with — the code
+        // path exists because `intern` runs before the insert can fail a gate.
+        c.intern("nbc09".to_string());
+
+        let mut want: Vec<(String, usize)> = expected.into_iter().collect();
+        want.sort();
+        assert_eq!(c.label_counts(), want);
+        assert_eq!(c.labels.len(), 4, "nbc09 is interned but uncounted");
+    }
+
+    /// Interning is what keeps one `String` per read out of the map; the same
+    /// label twice must reuse its code, and the dictionary handed to the
+    /// sidecar must resolve every code back to the label it came from.
+    #[test]
+    fn interning_reuses_codes_and_round_trips_through_columns() {
+        let mut c = Collected::default();
+        let a = c.intern("nbc01".to_string());
+        let b = c.intern("nbc02".to_string());
+        assert_eq!(c.intern("nbc01".to_string()), a, "same label, same code");
+        assert_ne!(a, b);
+
+        let ids: Vec<Uuid> = (0..2).map(Uuid::from_u128).collect();
+        c.barcode.insert(ids[0], a);
+        c.barcode.insert(ids[1], b);
+
+        let columns = c.into_columns();
+        assert_eq!(columns[0].name, "barcode");
+        let ColumnValues::LabelCodes { dictionary, codes } = &columns[0].values else {
+            panic!("barcode column must hand over codes, not materialized labels");
+        };
+        assert_eq!(dictionary[codes[&ids[0]] as usize], "nbc01");
+        assert_eq!(dictionary[codes[&ids[1]] as usize], "nbc02");
+    }
 
     /// `--model` sniffing must not depend on the extension or the file name
     /// alone: a CRF bundle is identified by its sidecar's `format` key, so a
