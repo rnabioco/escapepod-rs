@@ -863,8 +863,8 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             #[cfg(feature = "gpu")]
             let encoder = if crf_encoder_on_gpu {
                 // Must match `produce_gpu_crf`'s placement: this instance becomes
-                // worker 0, so it has to land on the first *encoder* device — GPU 1
-                // when detection has GPU 0 to itself.
+                // worker 0, so it has to land on the first *encoder* device —
+                // GPU 0, which detection also shares.
                 let enc_device = crf_encoder_devices(
                     escapepod_demux::crf::lattice_gpu::visible_device_count()
                         .unwrap_or(1)
@@ -1955,48 +1955,47 @@ fn crf_gpu_block() -> usize {
     })
 }
 
-/// The CUDA ordinals the CRF encoder pool may use.
+/// The CUDA ordinals the CRF encoder pool may use: **every visible device**.
 ///
-/// With one visible device everything shares it. With more, **device 0 is
-/// reserved for adapter detection** and the encoders take the rest.
+/// Detection shares device 0 rather than owning it. The encoder workers all pull
+/// from one channel, so the device carrying detection simply takes fewer blocks
+/// than the others — the balance is a consequence of the queue, not something
+/// anyone has to compute.
 ///
-/// # This reservation is now mis-tuned — measured, unfixed
+/// # Why device 0 used to be reserved, and why it no longer is
 ///
-/// It was justified by detect and the encoder costing about the same device time
-/// (5.4 s vs 6.4 s over 40 k reads): if two roles are comparable, sharing a card
-/// makes the pipeline's ceiling their sum and separating them makes it the
-/// larger of the two. #187 destroyed that premise. Matching the model's training
-/// convention cut detect's device time ~20x (401 s -> 20.2 s over 1 M reads)
-/// while the encoder stayed put, so the roles now cost ~19 s against ~170 s —
-/// and reserving a whole card for 10% of the work costs more than the contention
-/// it avoids. At exactly two devices it is pathological: the encoder pool does
-/// not grow at all, so the second GPU only offloads detection. Measured on 1 M
-/// reads, interleaved, 2 reps each:
+/// The reservation was justified by detect and the encoder costing about the
+/// same device time (5.4 s vs 6.4 s over 40 k reads): if two roles are
+/// comparable, sharing a card makes the pipeline's ceiling their sum and
+/// separating them makes it the larger of the two. #187 destroyed that premise.
+/// Matching the model's training convention cut detect's device time ~20x
+/// (401 s -> 20.2 s over 1 M reads) while the encoder stayed put, so the roles
+/// now cost ~19 s against ~170 s. Reserving a whole card for 10% of the work
+/// costs more than the contention it avoids, and at exactly two devices it was
+/// pathological — the encoder pool did not grow at all, so the second GPU only
+/// offloaded detection:
 ///
 /// ```text
-/// GPUs   encoder pool          wall     vs 1 GPU
-///   1    2 workers on [0]     107.5 s     --
-///   2    2 workers on [1]      96.5 s    1.11x    <- barely worth the card
-///   4    6 workers on [1,2,3]  43.7 s    2.46x
+/// GPUs   encoder pool (before)   wall     vs 1 GPU
+///   1    2 workers on [0]       107.5 s     --
+///   2    2 workers on [1]        96.5 s    1.11x   <- barely worth the card
+///   4    6 workers on [1,2,3]    43.7 s    2.46x
 /// ```
 ///
-/// The likely fix is to encode on *every* visible device and let detection share
-/// device 0 — workers pull from one channel rather than being handed a
-/// partition, so whichever device is slowed by carrying detection simply takes
-/// fewer blocks, with nothing to balance explicitly. It is **not** applied here
-/// because it is unmeasured, and the four-device column is the reason for
-/// caution: at 4 GPUs the producer is already the constraint (busy 71%, workers
-/// blocked on `recv` 38.6 s), and that producer *is* detection. Adding encoder
-/// work to device 0 could slow the stage that is already the ceiling and regress
-/// the case that currently scales, to fix the case that does not. Measure both
-/// columns before changing it.
+/// The 2-GPU row is the whole argument: a card bought 1.11x because nothing
+/// extra was encoding on it. Under this function the pool is `2 * visible`
+/// workers over all visible devices, so two GPUs get four workers.
+///
+/// The caution this replaces was that at 4 GPUs the producer is already the
+/// constraint and that producer *is* detection, so giving device 0 encoder work
+/// might slow the stage that is already the ceiling. Measured since (#297, one
+/// A30, 100 k reads): detection is **1.5 s of device time in a 33 s run**, ~5%,
+/// against an encoder pool that leaves its device 26% busy. There is ample room
+/// on device 0, and the 4-GPU column is the one that must not regress — see the
+/// before/after table on the PR.
 #[cfg(feature = "gpu")]
 fn crf_encoder_devices(visible: usize) -> Vec<i32> {
-    if visible > 1 {
-        (1..visible as i32).collect()
-    } else {
-        vec![0]
-    }
+    (0..visible.max(1) as i32).collect()
 }
 
 /// Encoder workers, and how they are spread over the visible devices
@@ -2059,6 +2058,16 @@ struct GpuTrace {
     detect_infer_ms: std::sync::atomic::AtomicU64,
     /// Producer: window standardisation across rayon.
     prep_ms: std::sync::atomic::AtomicU64,
+    /// Producer blocked waiting for the *reader* to hand it a block — the
+    /// fillers are behind, or the producer's own blocking send stopped it
+    /// draining them.
+    ///
+    /// Measured as the gap between leaving `process_block` and being called
+    /// again, which needs no change to `drive_blocks`: that gap is exactly the
+    /// consumer loop's `recv`. Without it the trace accounted for only 15 s of
+    /// a 33 s producer wall, and the missing 18 s is what every "which stage is
+    /// slow" answer here turns on (#297).
+    read_blocked_ms: std::sync::atomic::AtomicU64,
     /// Producer blocked handing a sub-block over — the encoders are behind.
     send_blocked_ms: std::sync::atomic::AtomicU64,
     /// Worker blocked waiting for a sub-block — the producer is behind.
@@ -2092,11 +2101,12 @@ impl GpuTrace {
         info!("{}", style::label("GPU CRF stage trace (thread-seconds):"));
         info!(
             "  producer   detect {:>7.1}s (host {:>6.1}s + device {:>6.1}s)  \
-             prep {:>5.1}s  BLOCKED on send {:>6.1}s",
+             prep {:>5.1}s  BLOCKED on read {:>6.1}s  on send {:>6.1}s",
             g(&self.detect_ms),
             g(&self.detect_prep_ms),
             g(&self.detect_infer_ms),
             g(&self.prep_ms),
+            g(&self.read_blocked_ms),
             g(&self.send_blocked_ms)
         );
         info!(
@@ -2168,7 +2178,7 @@ fn produce_gpu_crf(
             enc_devices,
             style::count(encoder.batch_rows()),
             if devices > 1 {
-                "; adapter detection has GPU 0 to itself"
+                "; adapter detection shares GPU 0"
             } else {
                 ""
             }
@@ -2275,12 +2285,18 @@ fn produce_gpu_crf(
         // feeding and let the join below report why rather than masking it with
         // a channel error.
         let mut hung_up = false;
+        // The gap between leaving this closure and re-entering it is the
+        // consumer loop's `recv` — i.e. the producer waiting on the readers.
+        let mut left_at: Option<std::time::Instant> = None;
         let drive = drive_blocks(
             &args.input,
             detector.signal_decode_bound(),
             |sigs, items| {
                 if hung_up {
                     return;
+                }
+                if tracing_on && let Some(t) = left_at {
+                    GpuTrace::add(&trace.read_blocked_ms, t);
                 }
                 // Detect over the whole block (one batched GPU CNN call), then
                 // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
@@ -2329,6 +2345,9 @@ fn produce_gpu_crf(
                         hung_up = true;
                         return;
                     }
+                }
+                if tracing_on {
+                    left_at = Some(std::time::Instant::now());
                 }
             },
         );
@@ -3012,15 +3031,20 @@ fn print_summary(summary: &DemuxSummary) {
 mod gpu_placement_tests {
     use super::{crf_encoder_devices, crf_gpu_workers};
 
-    /// Pins today's placement, including the part that is known mis-tuned: at
-    /// two devices the encoder pool is `[1]` alone, which is why the second GPU
-    /// measures 1.11x rather than ~2x. Written so that changing the policy has
-    /// to change this test deliberately rather than silently.
+    /// The encoder pool spans every visible device; detection shares device 0.
+    ///
+    /// This replaces a test that deliberately pinned the opposite — device 0
+    /// reserved for detection — so that changing the policy could not happen
+    /// silently. It is changed on purpose: reserving a card for a stage that
+    /// measures 1.5 s of device time in a 33 s run bought 1.11x at two devices,
+    /// because the encoder pool did not grow with the card (#297).
     #[test]
-    fn device_zero_is_reserved_for_detection_above_one_device() {
+    fn every_visible_device_encodes() {
         assert_eq!(crf_encoder_devices(1), vec![0]);
-        assert_eq!(crf_encoder_devices(2), vec![1]);
-        assert_eq!(crf_encoder_devices(4), vec![1, 2, 3]);
+        // The row that mattered: a second GPU now adds encoder capacity rather
+        // than only offloading detection.
+        assert_eq!(crf_encoder_devices(2), vec![0, 1]);
+        assert_eq!(crf_encoder_devices(4), vec![0, 1, 2, 3]);
         // A zero count can only come from a failed probe; never hand back an
         // empty pool, since the caller indexes into it.
         assert_eq!(crf_encoder_devices(0), vec![0]);
