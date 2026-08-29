@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Performance
+
+- **`--ref-scores` runs its reference scan on the GPU instead of on the host**
+  (#297). The flag that gates production demuxing was the one configuration
+  with no GPU decode path: `try_run_and_decode_with_refs` always copied the
+  whole score tensor back and ran the CPU lattice decode, where the plain path
+  decodes on the device and never copies at all. Over the isolated CRF stage on
+  100k reads that was 19.7 s at 656% CPU against 12.4 s at 114% without the
+  flag — +57% wall for five and a half extra cores, with the card idle.
+
+  The constrained scan is now a CUDA kernel (the one #241 left unwritten): one
+  block per read, a grid-stride loop over chain cells, both alpha buffers
+  double-buffered in shared memory, and `logZ_full` reduced on the device so
+  only `n_refs` floats per read come back rather than a strided gather over a
+  157 MB alpha buffer. It runs between the two decode passes by necessity, not
+  by choice — it needs the raw scores that pass 1 overwrites in place.
+
+  End to end on one A30 over 100k reads, arms interleaved in one allocation:
+  **38.7 s → 31.5 s wall (1.23x), and 5.9 cores → 1.3 cores.** Barcode calls are
+  identical for all 100,654 reads; `crf_logp`, `crf_margin` and `mean_logpost`
+  agree to 2e-4, which is the output's own print precision.
+
+  Note this does **not** close #297. GPU utilisation is unchanged at ~22%, so
+  removing 4.5 cores of host work from the critical path bought only 20% wall.
+  That is evidence for the issue's "overlap-bound, not throughput-bound"
+  framing: the pipeline is waiting on something structural, not on compute.
+
+  A panel that does not fit the kernel's shared memory, or whose fan-in exceeds
+  the fixed accumulator, falls back to the CPU scan — slower, never wrong.
+
 ## 0.17.2 (2026-08-29)
 
 ### Fixed

@@ -298,6 +298,59 @@ pub struct RefChains {
     head_score: Vec<u32>,
 }
 
+/// [`RefChains`]'s tables, re-expressed for the GPU scan kernel.
+///
+/// Two things change. The score indices move from the CPU scan's *transposed*
+/// `edge * n_states + dest` into the encoder's native `dest * n_edges + edge`,
+/// because the device kernels deliberately never build a transposed copy (see
+/// `lattice_gpu_kernel`'s module note). And the fan-in-1 fast path is dropped:
+/// the kernel walks the CSR uniformly for every cell, since a warp gains
+/// nothing from the partition the SIMD kernels need and loses the branch.
+#[cfg(feature = "gpu")]
+pub(super) struct GpuTables {
+    pub n_cells: usize,
+    pub n_start: usize,
+    pub stay: Vec<u32>,
+    pub move_off: Vec<u32>,
+    pub move_src: Vec<u32>,
+    pub move_score: Vec<u32>,
+    pub finals: Vec<u32>,
+}
+
+#[cfg(feature = "gpu")]
+impl RefChains {
+    /// Number of references scored, i.e. the width of one read's `ref_logp`.
+    pub(super) fn n_refs(&self) -> usize {
+        self.finals.len()
+    }
+
+    /// What identifies this panel for a device-side cache: the chain geometry
+    /// plus every reference's terminal cell. Two panels agreeing on all of it
+    /// have the same chains, because a differing reference ends somewhere else.
+    pub(super) fn fingerprint_parts(&self) -> (usize, usize, usize, &[u32]) {
+        (self.n_cells, self.n_start, self.n_tail, &self.finals)
+    }
+
+    /// The scan tables in the encoder's native score order.
+    pub(super) fn gpu_tables(&self, layout: &CrfLayout) -> GpuTables {
+        // transposed `edge * n_states + dest` -> native `dest * n_edges + edge`
+        let native = |ti: u32| -> u32 {
+            let ti = ti as usize;
+            let (edge, dest) = (ti / layout.n_states, ti % layout.n_states);
+            (dest * layout.n_edges + edge) as u32
+        };
+        GpuTables {
+            n_cells: self.n_cells,
+            n_start: self.n_start,
+            stay: self.stay.iter().copied().map(native).collect(),
+            move_off: self.move_off.clone(),
+            move_src: self.move_src.clone(),
+            move_score: self.move_score.iter().copied().map(native).collect(),
+            finals: self.finals.clone(),
+        }
+    }
+}
+
 impl RefChains {
     /// Build the chains for `seqs` — the sequences the model **emits**, i.e.
     /// what a bundle's `barcodes[].sequence` holds.
