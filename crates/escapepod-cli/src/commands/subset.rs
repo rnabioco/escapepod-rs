@@ -1,15 +1,15 @@
 //! Subset command implementation.
 //!
 //! Splits reads into multiple output files based on a CSV mapping, in a single
-//! pass over the input (see `subset_file`): the input is scanned once and each
-//! read routed to its group's writer, rather than re-scanning the whole input
-//! once per output group.
+//! pass over the input (see `subset_files`): each input is scanned once and
+//! every read routed to its group's writer, rather than re-scanning the whole
+//! input once per output group.
 
 use crate::commands::profile::PhaseTimer;
 use crate::style;
-use crate::util::check_output_not_input;
+use crate::util::{check_output_not_input, resolve_pod5_inputs};
 use escapepod_signal::Durability;
-use escapepod_signal::operations::{FilterOptions, parse_csv_mapping, subset_file};
+use escapepod_signal::operations::{FilterOptions, parse_csv_mapping, subset_files};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::info;
@@ -23,6 +23,13 @@ pub fn run(
     durability: Durability,
 ) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
+
+    // A directory expands to the POD5 files under it, as everywhere else in
+    // escpod. `subset_files` assembles each group from every input that
+    // contributed to it, so a group whose reads span several files of a run
+    // comes out as one output rather than needing a `merge` afterwards.
+    let inputs = resolve_pod5_inputs(&input)?;
+
     timer.phase("Parse CSV mapping");
 
     // Parse the CSV mapping file
@@ -47,9 +54,8 @@ pub fn run(
     // Ensure output directory exists
     std::fs::create_dir_all(&output_dir)?;
 
-    // A group name can collide with the input file when the output directory
+    // A group name can collide with an input file when the output directory
     // is the input's own directory, which would replace the source mid-run.
-    let inputs = vec![input.clone()];
     for output_name in &unique_outputs {
         let output_path = output_dir.join(output_name);
         check_output_not_input(&output_path, &inputs)?;
@@ -68,11 +74,11 @@ pub fn run(
     };
 
     timer.phase("Split (single pass)");
-    // One pass over the input: scan the reads table once, partition by group,
-    // then write every group's file in parallel against the shared mmap.
+    // One pass over each input: scan its reads table once, partition by group,
+    // then write every group's file in parallel against the shared mmaps.
     // `SubsetOutcome` already sorts both lists by group name, so the report
     // order is deterministic even though groups are written in parallel.
-    let results = subset_file(&input, &mapping, &output_dir, options)?;
+    let results = subset_files(&inputs, &mapping, &output_dir, options)?;
 
     // Each failed group produced no file at all; name them rather than
     // reporting a partial subset as if it were complete.

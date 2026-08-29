@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Every command that takes POD5 input accepts a directory, and refuses a
+  path that does not exist** (#293). `escpod demux basecall <run>/pod5` logged
+  one WARN, wrote a header-only CSV and **exited 0** — a result nothing
+  downstream can tell from a run where no read passed. In the report that
+  found this, the empty table became a per-barcode share over zero rows and
+  reported `0.00x enrichment`, which is a *meaningful value* in that analysis:
+  a failed run rendered as a clean negative result, caught only by noticing it
+  finished in 85 s.
+
+  `demux fingerprint` had the same failure one stage earlier (and without even
+  the warning), and `demux detect`, `demux split`, the fused `demux` pipeline
+  and `subset` died on a directory with a bare `No such device (os error 19)`
+  from the mmap. None of the six called `resolve_pod5_inputs`, which
+  `merge`/`view`/`index`/`annotate`/`repack`/`filter`/`resquiggle`/`signal
+  classify` have always used; they all do now, so a directory expands to the
+  `*.pod5` under it, a missing path is `Path does not exist:`, and an empty
+  directory is `No POD5 files found in directory:`. No `-r` flag: escpod's
+  directory expansion is recursive everywhere already, and one command
+  needing an opt-in would be the odd one out.
+
+  `subset` gains multi-input support as a consequence, via the `subset_files`
+  that `demux split` already used: a group whose reads span several files of a
+  run comes out as one output rather than needing a `merge` afterwards.
+
+  A POD5 that fails to open or decode *after* that validation is now fatal in
+  `demux fingerprint` and `demux basecall` rather than skipped. Those paths
+  swallowed a truncated or corrupt file and wrote a short table with a zero
+  exit; `demux detect` has always propagated the same three errors, and the
+  point of #293 is that the stages of one pipeline should not disagree about
+  what counts as a failure.
+
 ## 0.17.1 (2026-08-26)
 
 Recovers the v0.17.0 release. 0.17.0's GPU artifact failed to build, which

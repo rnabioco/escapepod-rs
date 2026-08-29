@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// Arguments for the split subcommand.
 #[derive(Debug, clap::Args)]
 pub struct SplitArgs {
-    /// Input POD5 file(s)
+    /// Input POD5 file(s) or directory
     #[arg(required = true, value_name = "FILES")]
     pub input: Vec<PathBuf>,
 

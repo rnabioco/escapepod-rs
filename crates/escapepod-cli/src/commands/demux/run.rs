@@ -46,8 +46,9 @@ const UNCLASSIFIED: &str = "unclassified";
 /// Arguments for the fused demux pipeline.
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    /// Input POD5 file(s). (Required for the fused pipeline; validated at
-    /// runtime so the advanced subcommands aren't forced to provide it.)
+    /// Input POD5 file(s) or directory. (Required for the fused pipeline;
+    /// validated at runtime so the advanced subcommands aren't forced to
+    /// provide it.)
     #[arg(value_name = "FILES")]
     pub input: Vec<PathBuf>,
 
@@ -791,7 +792,7 @@ pub(super) fn crf_bundle_dir(path: &Path) -> Option<PathBuf> {
         .then_some(dir)
 }
 
-pub fn run(args: RunArgs) -> anyhow::Result<()> {
+pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     use crate::commands::profile::PhaseTimer;
     let mut timer = PhaseTimer::new();
     timer.phase("Fused demux");
@@ -813,6 +814,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     if args.input.is_empty() {
         anyhow::bail!("no input POD5 file(s) given");
     }
+    // Expand directories and reject paths that do not exist, the same way the
+    // advanced subcommands do (see `super::run`). Deliberately after `--info`,
+    // which describes a model and is given no POD5 at all.
+    args.input = crate::util::collect_pod5_inputs(&args.input)?;
     // Resolved once, before anything is loaded: the deprecated `--gpu` alias
     // warns exactly once, and every stage below asks the same question of the
     // same answer.

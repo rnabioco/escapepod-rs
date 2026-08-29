@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// Arguments for the detect subcommand.
 #[derive(Debug, clap::Args)]
 pub struct DetectArgs {
-    /// Input POD5 file(s)
+    /// Input POD5 file(s) or directory
     #[arg(required = true, value_name = "FILES")]
     pub input: Vec<PathBuf>,
 
