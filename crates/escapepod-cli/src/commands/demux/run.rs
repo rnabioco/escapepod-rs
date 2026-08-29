@@ -2070,6 +2070,16 @@ struct GpuTrace {
     read_blocked_ms: std::sync::atomic::AtomicU64,
     /// Producer blocked handing a sub-block over — the encoders are behind.
     send_blocked_ms: std::sync::atomic::AtomicU64,
+    /// Producer: the whole closure, so the accounting can be *checked* rather
+    /// than assumed. With `read_blocked_ms` this must cover the producer's
+    /// entire wall; anything missing is work no counter names, which is exactly
+    /// how 21 s of a 37.8 s wall stayed invisible (#297).
+    closure_ms: std::sync::atomic::AtomicU64,
+    /// Producer: assembling one sub-block out of the block's rows.
+    chunk_ms: std::sync::atomic::AtomicU64,
+    /// Producer: splitting items out of the chunk, which also drops that
+    /// sub-block's decoded signal — ~128 MB per block, freed on this thread.
+    drop_ms: std::sync::atomic::AtomicU64,
     /// Worker blocked waiting for a sub-block — the producer is behind.
     recv_blocked_ms: std::sync::atomic::AtomicU64,
     /// Worker: onnxruntime encode plus the lattice decode.
@@ -2116,6 +2126,24 @@ impl GpuTrace {
             g(&self.match_ms),
             g(&self.route_ms),
             g(&self.recv_blocked_ms)
+        );
+        // Closure + read wait must cover the producer's wall. Whatever the
+        // named stages do not add up to inside the closure is work no counter
+        // describes, and printing the residual is what makes that visible
+        // rather than something the reader has to notice by subtracting.
+        let named = g(&self.detect_ms)
+            + g(&self.prep_ms)
+            + g(&self.send_blocked_ms)
+            + g(&self.chunk_ms)
+            + g(&self.drop_ms);
+        info!(
+            "  producer   chunk {:>6.1}s  drop {:>6.1}s  |  closure {:>6.1}s  \
+             named {:>6.1}s  UNACCOUNTED {:>6.1}s",
+            g(&self.chunk_ms),
+            g(&self.drop_ms),
+            g(&self.closure_ms),
+            named,
+            g(&self.closure_ms) - named,
         );
         let wall_s = wall.as_secs_f64();
         info!(
@@ -2298,6 +2326,7 @@ fn produce_gpu_crf(
                 if tracing_on && let Some(t) = left_at {
                     GpuTrace::add(&trace.read_blocked_ms, t);
                 }
+                let t_closure = std::time::Instant::now();
                 // Detect over the whole block (one batched GPU CNN call), then
                 // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
                 let t_det = std::time::Instant::now();
@@ -2310,7 +2339,11 @@ fn produce_gpu_crf(
                 }
                 let mut rows = sigs.into_iter().zip(bounds).zip(items);
                 loop {
+                    let t_chunk = std::time::Instant::now();
                     let chunk: Vec<_> = rows.by_ref().take(gpu_block).collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.chunk_ms, t_chunk);
+                    }
                     if chunk.is_empty() {
                         break;
                     }
@@ -2332,9 +2365,15 @@ fn produce_gpu_crf(
                             .then_some(w)
                         })
                         .collect();
-                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
                     if tracing_on {
                         GpuTrace::add(&trace.prep_ms, t_prep);
+                    }
+                    // Also frees this sub-block's decoded signal, on this
+                    // thread, while the encoders wait behind it.
+                    let t_drop = std::time::Instant::now();
+                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.drop_ms, t_drop);
                     }
                     let t_send = std::time::Instant::now();
                     let sent = block_tx.send((windows, items));
@@ -2347,6 +2386,7 @@ fn produce_gpu_crf(
                     }
                 }
                 if tracing_on {
+                    GpuTrace::add(&trace.closure_ms, t_closure);
                     left_at = Some(std::time::Instant::now());
                 }
             },
