@@ -147,7 +147,7 @@ Examples:
   escpod view input.pod5 --separator ','      Use comma separator
 ")]
     View {
-        /// Input POD5 file
+        /// Input POD5 file or directory
         input: PathBuf,
 
         /// Fields to include (comma-separated)
@@ -195,7 +195,7 @@ Examples:
   escpod merge *.pod5 -o out.pod5 --duplicate-ok
 ")]
     Merge {
-        /// Input POD5 files
+        /// Input POD5 files and/or directories
         #[arg(required = true, value_name = "FILES")]
         inputs: Vec<PathBuf>,
 
@@ -339,7 +339,7 @@ Examples:
   escpod repack *.pod5 -o repacked/ --force
 ")]
     Repack {
-        /// Input POD5 files
+        /// Input POD5 files and/or directories
         #[arg(required = true, value_name = "FILES")]
         inputs: Vec<PathBuf>,
 
@@ -378,7 +378,7 @@ The CSV file should have columns: read_id,output
 Each unique 'output' value creates a separate POD5 file.
 ")]
     Subset {
-        /// Input POD5 file
+        /// Input POD5 file or directory
         input: PathBuf,
 
         /// CSV file with read_id,output columns

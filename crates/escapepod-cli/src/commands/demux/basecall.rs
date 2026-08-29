@@ -37,7 +37,7 @@ use crate::style;
 /// Arguments for the basecall subcommand.
 #[derive(Debug, clap::Args)]
 pub struct BasecallArgs {
-    /// Input POD5 file(s)
+    /// Input POD5 file(s) or directory
     #[arg(required = true, value_name = "FILES")]
     pub input: Vec<PathBuf>,
 
@@ -370,25 +370,27 @@ type Block = (Vec<uuid::Uuid>, Vec<usize>, Vec<Option<Vec<f32>>>);
 /// workers collapses throughput on a network filesystem (#72), which is why this
 /// has the same shape as `fingerprint`. Only the *handoff* is concurrent, so the
 /// encoder can run batch N while this reads batch N+1.
+///
+/// Every failure here is fatal rather than skipped. Inputs are already resolved
+/// to existing `.pod5` files (see `super::run`), so an open that fails means a
+/// truncated or corrupt file, and a batch that fails to decode drops ~1000 reads
+/// — either way the old warn-and-continue wrote a short, or header-only,
+/// classifications CSV and exited 0, which is indistinguishable downstream from
+/// a run where no read passed the gates (escapepod-rs#293).
 fn produce_blocks(
     inputs: &[PathBuf],
     boundaries: &std::collections::HashMap<uuid::Uuid, escapepod_demux::ReadBoundaries>,
     meta: &escapepod_demux::crf::CrfMetadata,
     tx: &std::sync::mpsc::SyncSender<Block>,
-) {
+) -> anyhow::Result<()> {
     for path in inputs {
-        let Ok(reader) = Reader::open(path) else {
-            warn!("skipping unreadable file {}", path.display());
-            continue;
-        };
-        let Ok(batches) = reader.read_batches() else {
-            continue;
-        };
+        let reader = Reader::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let batches = reader
+            .read_batches()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         for batch_result in batches {
-            let Ok(batch) = batch_result else { continue };
-            let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                continue;
-            };
+            let batch = batch_result?;
+            let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<_> = (0..view.num_rows())
                 .filter_map(|row| view.read(row).ok())
                 .filter(|r| !r.signal_rows.is_empty() && boundaries.contains_key(&r.read_id))
@@ -402,9 +404,7 @@ fn produce_blocks(
                 .enumerate()
                 .map(|(i, r)| (i, r.signal_rows.clone()))
                 .collect();
-            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
-                continue;
-            };
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
             // Signal decompression, calibration and standardisation are all
             // CPU work and independent per read, so they fan out here; the
@@ -458,10 +458,13 @@ fn produce_blocks(
                 windows.push(window);
             }
             if tx.send((ids, ends, windows)).is_err() {
-                return; // consumer stopped early; its error surfaces at the join
+                // Consumer stopped early; its own error is the one worth
+                // reporting, so end quietly and let that one surface.
+                return Ok(());
             }
         }
     }
+    Ok(())
 }
 
 pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
@@ -648,7 +651,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     let inputs = &args.input;
     let bounds = &boundaries;
     std::thread::scope(|scope| -> anyhow::Result<()> {
-        scope.spawn(move || produce_blocks(inputs, bounds, meta, &tx));
+        let producer = scope.spawn(move || produce_blocks(inputs, bounds, meta, &tx));
 
         // Encode, match and write on this thread: `out`/`written` stay plain
         // locals, and blocks arrive in sweep order, so the output is unchanged.
@@ -710,6 +713,16 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             written += decoded.len();
             progress.inc(n as u64);
         }
+
+        // The loop above ends only once every sender is gone, i.e. the producer
+        // has returned, so this join cannot block. It is what turns an
+        // unreadable input into a non-zero exit instead of a short CSV. On the
+        // error path a `?` above skips it and the scope joins implicitly,
+        // discarding the producer's (secondary) error — the write or encode
+        // failure is the one worth reporting.
+        producer
+            .join()
+            .map_err(|e| anyhow::anyhow!("demux reader thread panicked: {e:?}"))??;
         Ok(())
     })?;
     out.flush()?;

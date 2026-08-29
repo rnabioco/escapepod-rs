@@ -23,7 +23,7 @@ use tracing::info;
 /// Arguments for the fingerprint subcommand.
 #[derive(Debug, clap::Args)]
 pub struct FingerprintArgs {
-    /// Input POD5 file(s)
+    /// Input POD5 file(s) or directory
     #[arg(required = true, value_name = "FILES")]
     pub input: Vec<PathBuf>,
 
@@ -199,18 +199,25 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
     // a network filesystem against 288 MB/s for one sequential sweep.
     let mut fingerprints: Vec<ReadFingerprint> = Vec::new();
 
+    // An input that cannot be opened is fatal, not skipped. Every path here has
+    // already been resolved to an existing `.pod5` (see `super::run`), so a
+    // failure at this point means a truncated or corrupt file — and skipping it
+    // used to write a short, or entirely header-only, fingerprint CSV with a
+    // zero exit status, which nothing downstream can tell from a run where no
+    // read had a usable adapter (escapepod-rs#293).
     for path in &args.input {
-        let Ok(reader) = Reader::open(path) else {
-            continue;
-        };
-        let Ok(batches) = reader.read_batches() else {
-            continue;
-        };
+        let reader = Reader::open(path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", style::path(path.display())))?;
+        let batches = reader
+            .read_batches()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", style::path(path.display())))?;
         for batch_result in batches {
-            let Ok(batch) = batch_result else { continue };
-            let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                continue;
-            };
+            // Same reasoning as the open above, one level down: a batch that
+            // fails to decode drops ~1000 reads from the output, and doing that
+            // silently is what `demux detect` already refuses to do
+            // (`process_reads_par` propagates all three of these).
+            let batch = batch_result?;
+            let view = ReadsBatchView::new(&batch, false)?;
             // Metadata-only pre-filter: boundaries + non-empty signal_rows.
             // Columns are resolved once per batch, not once per read.
             let reads: Vec<_> = (0..view.num_rows())
@@ -226,9 +233,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                 .enumerate()
                 .map(|(i, r)| (i, r.signal_rows.clone()))
                 .collect();
-            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
-                continue;
-            };
+            let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
             let batch_fps: Vec<ReadFingerprint> = bulk
                 .par_iter()

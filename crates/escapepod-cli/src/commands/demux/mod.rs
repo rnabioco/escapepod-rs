@@ -183,20 +183,45 @@ pub fn requested_threads(args: &DemuxArgs) -> Option<usize> {
 }
 
 /// Run the demux command.
+///
+/// POD5 inputs are resolved here, once, for every subcommand that takes them:
+/// a directory expands to the `*.pod5` files under it and a path that does not
+/// exist is an error, exactly as `merge`/`view`/`index` have always behaved
+/// (`crate::util::collect_pod5_inputs`). Doing it at the dispatch point rather
+/// than in each `run` keeps the four stages from drifting apart again — before
+/// this, `detect` and `split` died on a directory with a bare `ENODEV` from the
+/// mmap while `fingerprint` and `basecall` skipped it and wrote a header-only
+/// CSV with a zero exit status (escapepod-rs#293).
 pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
+    use crate::util::collect_pod5_inputs;
+
     let Some(command) = args.command else {
-        // No subcommand → the fused streaming pipeline.
+        // No subcommand → the fused streaming pipeline. Its inputs are resolved
+        // inside `run::run`, not here: `--info` describes a model and takes no
+        // POD5 at all, so resolution has to happen after that early return.
         return run::run(args.run);
     };
     match command {
-        DemuxCommand::Detect(detect_args) => detect::run(detect_args),
-        DemuxCommand::Fingerprint(fingerprint_args) => fingerprint::run(fingerprint_args),
+        DemuxCommand::Detect(mut detect_args) => {
+            detect_args.input = collect_pod5_inputs(&detect_args.input)?;
+            detect::run(detect_args)
+        }
+        DemuxCommand::Fingerprint(mut fingerprint_args) => {
+            fingerprint_args.input = collect_pod5_inputs(&fingerprint_args.input)?;
+            fingerprint::run(fingerprint_args)
+        }
         #[cfg(feature = "demux-models")]
         DemuxCommand::Models { command } => models::run(command),
         #[cfg(feature = "crf-decode")]
-        DemuxCommand::Basecall(basecall_args) => basecall::run(basecall_args),
+        DemuxCommand::Basecall(mut basecall_args) => {
+            basecall_args.input = collect_pod5_inputs(&basecall_args.input)?;
+            basecall::run(basecall_args)
+        }
         DemuxCommand::Classify(classify_args) => classify::run(classify_args),
-        DemuxCommand::Split(split_args) => split::run(split_args),
+        DemuxCommand::Split(mut split_args) => {
+            split_args.input = collect_pod5_inputs(&split_args.input)?;
+            split::run(split_args)
+        }
         DemuxCommand::Train(train_args) => train::run(train_args),
         #[cfg(feature = "train")]
         DemuxCommand::TrainSvm(train_svm_args) => train_svm::run(train_svm_args),
