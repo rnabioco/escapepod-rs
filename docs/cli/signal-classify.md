@@ -104,12 +104,16 @@ warning).
 Two things follow from that:
 
 - **It needs a separate build.** `--features classify-waveform`, and a
-  `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time. Unlike every other ONNX
-  graph escpod runs, this one cannot go through the statically linked tract —
-  it is a PyTorch *dynamo* export whose `adaptive_avg_pool1d` becomes a
-  `Shape`/`Gather`/`GatherND`/`Transpose` chain tract's shape inference cannot
-  close. A default build refuses such a bundle by name, with that hint, rather
-  than failing at the first read.
+  `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time — so a stock release
+  binary, which is static musl and cannot dlopen anything, cannot run one.
+  Unlike every other ONNX graph escpod runs, this one cannot go through the
+  statically linked tract: it is a PyTorch *dynamo* export of
+  `nn.MultiheadAttention`, whose mask handling becomes an
+  `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain that tract's
+  shape inference cannot close. A default build refuses such a bundle by name,
+  with that hint, rather than failing at the first read. This is expected to be
+  temporary — the fix is a re-export, tracked as
+  rnabioco/escapepod-models#96.
 - **Its shipped Platt calibration is carried, not applied.** The operating
   point beside it is stated on the uncalibrated probability the graph emits, so
   calibrating would move the scale out from under the very threshold that ships

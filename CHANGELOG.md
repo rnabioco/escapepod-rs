@@ -48,14 +48,27 @@
 
   Behind a **separate `classify-waveform` feature**, and deliberately not in
   the default build. Unlike every other ONNX graph `escpod` runs, this one
-  cannot go through tract: it is a dynamo export whose `adaptive_avg_pool1d`
-  becomes a `Shape`/`Gather`/`GatherND`/`Transpose` chain that tract 0.23's
-  shape inference cannot close (measured five ways, all failing during
-  analysis). So it runs through onnxruntime via `ort`, which — being
-  `load-dynamic` — needs a `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time.
-  A build without the feature refuses such a bundle *by name* with that hint,
+  cannot go through tract — not for want of an op, but because tract 0.23's
+  *shape inference* cannot close a **dynamo** export of
+  `nn.MultiheadAttention`: an `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/
+  `Where` chain whose every input is a constant initializer. Measured five
+  ways, and neither onnx-simplifier (which folds away every `Shape` node) nor
+  onnxruntime's own optimiser makes it loadable, so it cannot be papered over
+  at load time the way `fnn::hoist_conv_padding` papers over padded
+  convolutions. So it runs through onnxruntime via `ort`, which — being
+  `load-dynamic` — needs a `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time,
+  and therefore cannot work in the static musl release artifacts at all. A
+  build without the feature refuses such a bundle *by name* with that hint,
   rather than shipping a binary whose charging command dlopen-fails on the
   first read.
+
+  This makes the `ort` path a **bridge, not a destination**. The fix belongs in
+  the export, and is the one this model family already needed once —
+  escapepod-models retracted "tract cannot run `Resize`" in July after finding
+  the same shape-inference cause, an export fix costing one line and no
+  retrain, and a 6x tract speedup for free. Tracked as
+  rnabioco/escapepod-models#96; a tract-loadable re-export would delete this
+  dependency.
 
   The bundle's shipped Platt calibration is **carried, not applied**: the
   operating point beside it is stated on the uncalibrated probability the graph

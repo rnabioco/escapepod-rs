@@ -2,16 +2,13 @@
 
 //! The windowed variant's ONNX graph, through onnxruntime.
 //!
-//! # Why not tract
+//! # Why not tract — and why this is a bridge, not a destination
 //!
 //! Every other ONNX graph `escpod` runs goes through tract, which is statically
-//! linked and needs nothing at run time. This one cannot: it was exported by
-//! PyTorch's **dynamo** exporter (the legacy TorchScript path fails on its
-//! `adaptive_avg_pool1d`), and dynamo spells that pooling as a `Shape` →
-//! `Gather` → `GatherND` → `Transpose` chain over a symbolic batch axis.
-//! tract 0.23's shape inference cannot close it. Measured on
-//! `charging_tcn_rna004@v0.1.0`, five ways, all of which parse the 669 nodes
-//! and then fail during analysis:
+//! linked and needs nothing at run time. This one cannot, and the reason is
+//! worth stating precisely: **tract runs these ops fine; its shape inference
+//! cannot close this export.** Measured on `charging_tcn_rna004@v0.1.0`, five
+//! ways, all of which parse the graph and then fail during analysis:
 //!
 //! ```text
 //! inputs pinned to batch 1        node_conv1d       Sym(batch) vs Val(1)
@@ -20,6 +17,20 @@
 //! symbolic dims rewritten to 1    node_GatherND_329 Val(64) vs Val(1)
 //! nothing pinned at all           node_GatherND_329 Sym(batch) vs Val(1)
 //! ```
+//!
+//! The offending subgraph is `Unsqueeze` -> `Transpose` -> `GatherND` ->
+//! `Transpose` -> `Where`: `nn.MultiheadAttention`'s mask handling, as the
+//! **dynamo** exporter lowers it. Every input to it is a constant initializer
+//! (a `(1,1,11,37,2)` index tensor, an `(11,37)` bool mask), so the pattern is
+//! entirely static and tract still cannot close it. It is *not*
+//! `adaptive_avg_pool1d`, which rnabioco/escapepod-rs#306 named as the suspect
+//! -- those layers are in the model config and are not what tract dies on.
+//!
+//! Neither standard rewrite helps, so this cannot be papered over at load time
+//! the way [`crate::fnn`]'s `hoist_conv_padding` papers over padded
+//! convolutions: onnx-simplifier folds away every `Shape` node (479 -> 428
+//! nodes) and tract fails at the same `GatherND`; onnxruntime's own optimiser
+//! keeps it and adds hardware-specific fusions.
 //!
 //! So this path uses `ort` (onnxruntime), exactly as `escapepod-demux`'s CRF
 //! encoder does, and carries the same runtime cost: `ort` is built
@@ -30,7 +41,17 @@
 //! That cost is why it is a separate feature (`waveform-onnx`) rather than part
 //! of `classify`: a build without it refuses such a bundle *by name*, with the
 //! rebuild hint, instead of shipping a binary whose charging command fails at
-//! the first read with a dlopen error.
+//! the first read with a dlopen error. It also means a *released* `escpod`
+//! cannot run such a bundle at all -- the shipped artifacts are static musl,
+//! which cannot dlopen anything.
+//!
+//! Which is why this module is a bridge. The fix belongs in the export, and is
+//! the fix this model family already needed once: `escapepod-models` retracted
+//! "tract cannot run `Resize`" on 2026-07-27 after finding the failure was
+//! shape inference over a runtime-computed shape, that our export was the
+//! cause, and that one line fixed it with no retrain (and a 6x speedup in
+//! tract). A re-export without dynamo's MHA lowering would let this file and
+//! the `ort` dependency go away -- rnabioco/escapepod-models#96.
 //!
 //! # What is checked, and what is trusted
 //!
