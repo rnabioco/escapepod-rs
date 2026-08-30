@@ -1542,14 +1542,90 @@ fn drive_blocks(
 /// and so may have been partly cached; the cold case is **not** independently
 /// validated. `ESCAPEPOD_DEMUX_FILLERS=1` restores the strict single-stream
 /// behavior if concurrent streams turn out to hurt on a cold mount.
-/// Thread-seconds the reader shards spend decoding, and blocked handing a
-/// block to the producer.
+/// This thread's CPU time in nanoseconds, or 0 where the platform has no such
+/// clock.
 ///
-/// Statics rather than a field on `GpuTrace`, because `fill_shard` is shared by
-/// all four producers and only one of them owns a trace. The cost is one
-/// `Instant` and one `fetch_add` per block, against a block that carries ~128 MB
-/// of signal.
-static FILL_DECODE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `CLOCK_THREAD_CPUTIME_ID` is the *busy* clock: it does not advance while the
+/// thread is blocked on a page fault, a channel, or a rayon join. Unlike
+/// `CLOCK_MONOTONIC` it is not served out of the vDSO, so every call is a real
+/// syscall (~0.2-0.5 us) — cheap once per Arrow batch, not cheap once per read,
+/// which is why the per-read sampling sits behind [`fill_trace`].
+#[cfg(unix)]
+fn thread_cpu_ns() -> u64 {
+    // SAFETY: `timespec` is a plain integer struct, so an all-zero value is a
+    // valid one, and `ts` is live and writable for the whole call.
+    // `CLOCK_THREAD_CPUTIME_ID` exists on every platform this builds for
+    // (Linux, macOS >= 10.12); a failure yields 0, which reads as "no time
+    // passed" rather than as a confidently wrong number.
+    //
+    // Zeroed rather than a field literal: `timespec` carries padding fields on
+    // some targets (32-bit musl with a 64-bit `time_t`), where naming only
+    // `tv_sec`/`tv_nsec` fails to compile. CI cross-checks aarch64 but not
+    // those, so the literal would break on a target nothing here builds today.
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) != 0 {
+            return 0;
+        }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+}
+
+/// No thread CPU clock here: [`FILL_DECODE_CPU_NS`] stays at zero and the trace
+/// reports 0.0s, rather than a wall-time number wearing a CPU-time label.
+#[cfg(not(unix))]
+fn thread_cpu_ns() -> u64 {
+    0
+}
+
+/// Whether to sample per-read thread CPU time inside the decode closure.
+///
+/// The sampling has to happen *inside* the closure, not around the `par_iter`:
+/// decode runs on the global rayon pool, so the calling shard only ever
+/// performs whatever share of it the pool hands back, and timing the shard
+/// would measure one thread's slice of an N-thread stage. That makes it two
+/// syscalls per read — a few percent of a ~10-50 us decode — which is cheap
+/// enough to have and not cheap enough to pay for on every run.
+///
+/// Shares `ESCAPEPOD_CRF_GPU_TRACE` with `GpuTrace::enabled`, the only reader of
+/// these counters, but is not feature-gated: `fill_shard` compiles into every
+/// build, `gpu` or not.
+fn fill_trace() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ESCAPEPOD_CRF_GPU_TRACE").as_deref() == Ok("1"))
+}
+
+/// What the reader shards spend decoding, and how long they sit blocked handing
+/// a block to the producer.
+///
+/// Statics rather than fields on `GpuTrace`, because `fill_shard` is shared by
+/// all four producers and only one of them owns a trace.
+///
+/// # Three counters, two clocks, on purpose
+///
+/// [`FILL_DECODE_CPU_NS`] is **busy** time: `CLOCK_THREAD_CPUTIME_ID` summed
+/// over the rayon workers that actually ran `decode_chunks_to`. It is the only
+/// one of the three that answers "what does decompression cost", because it
+/// does not advance while a thread is blocked — and how much this stage blocks
+/// is a function of how many threads it was handed, not of how much work it
+/// has. A wall reading of a stage measures its current thread assignment as
+/// much as its work (DS2's *observed* versus *true* rate), which is how a
+/// counter reports 45 s for a decode that was 12 s of CPU and 33 s of waiting
+/// on its peers.
+///
+/// [`FILL_DECODE_WALL_US`] is the shard's own wall clock over the same region,
+/// kept because it answers a different question: how much of a *reader shard's*
+/// life goes into read+decode at all. The two are **not** comparable by
+/// subtraction — one is summed over the rayon pool, the other over
+/// `filler_threads()` shards, and either can be the larger — so the report
+/// prints both and never a difference.
+///
+/// [`FILL_SEND_US`] stays wall time and always will: it measures a shard parked
+/// on a full channel, which is precisely what a CPU clock is defined not to
+/// count. Its busy-time reading would be zero on every run.
+static FILL_DECODE_CPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FILL_DECODE_WALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FILL_SEND_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn fill_shard(
@@ -1562,6 +1638,10 @@ fn fill_shard(
     let mut sigs: Vec<Option<Vec<i16>>> = Vec::new();
     let mut items: Vec<BlockItem> = Vec::new();
     let mut block_bytes = 0usize;
+    // Read once per shard rather than per read: the closure below runs ~1e6
+    // times and this is a `OnceLock` load either way, but hoisting keeps the
+    // hot path a captured `bool`.
+    let trace = fill_trace();
 
     for path in input {
         let reader = Reader::open(path)?;
@@ -1585,7 +1665,22 @@ fn fill_shard(
             let bulk = reader.get_compressed_signal_bulk(&keyed)?;
             let decoded: Vec<Option<Vec<i16>>> = bulk
                 .par_iter()
-                .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
+                .map(|(_, chunks)| {
+                    if !trace {
+                        return super::utils::decode_chunks_to(chunks, decode_to);
+                    }
+                    let t0 = thread_cpu_ns();
+                    let out = super::utils::decode_chunks_to(chunks, decode_to);
+                    // Accumulate nanoseconds, not microseconds: one read decodes
+                    // in ~10-50 us, so a per-read `/ 1000` would truncate a few
+                    // percent off every sample and bias the total low. u64 ns
+                    // does not wrap this side of a few centuries.
+                    FILL_DECODE_CPU_NS.fetch_add(
+                        thread_cpu_ns().saturating_sub(t0),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    out
+                })
                 .collect();
 
             let mut reads_opt: Vec<Option<ReadData>> = reads.into_iter().map(Some).collect();
@@ -1596,7 +1691,7 @@ fn fill_shard(
                 sigs.push(sig);
                 items.push((read, chunks, run_infos.clone()));
             }
-            FILL_DECODE_US.fetch_add(
+            FILL_DECODE_WALL_US.fetch_add(
                 t_dec.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -2201,11 +2296,16 @@ impl GpuTrace {
             pw - acct - first,
         );
         let fg = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1_000_000.0;
+        // Busy time first, because that is the number describing the work; the
+        // shard wall beside it describes the assignment. They are printed side
+        // by side and never subtracted — see `FILL_DECODE_CPU_NS`.
         info!(
-            "  readers    decode {:>6.1}s  BLOCKED handing over {:>6.1}s  ({} shard(s))",
-            fg(&FILL_DECODE_US),
-            fg(&FILL_SEND_US),
+            "  readers    decode {:>6.1}s cpu (rayon pool)  |  {} shard(s): {:>6.1}s wall in \
+             read+decode, BLOCKED handing over {:>6.1}s",
+            FILL_DECODE_CPU_NS.load(Relaxed) as f64 / 1_000_000_000.0,
             filler_threads(),
+            fg(&FILL_DECODE_WALL_US),
+            fg(&FILL_SEND_US),
         );
         let wall_s = wall.as_secs_f64();
         info!(
