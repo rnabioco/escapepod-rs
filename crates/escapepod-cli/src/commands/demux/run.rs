@@ -456,8 +456,10 @@ impl Detector {
                 })
                 .collect();
             if let Some((prep_ms, _)) = split {
+                // Microseconds: these are read back through `GpuTrace`'s
+                // accumulator, which counts them.
                 prep_ms.fetch_add(
-                    t_prep.elapsed().as_millis() as u64,
+                    t_prep.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
@@ -469,7 +471,7 @@ impl Detector {
                 .collect();
             if let Some((_, infer_ms)) = split {
                 infer_ms.fetch_add(
-                    t_infer.elapsed().as_millis() as u64,
+                    t_infer.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
@@ -1540,6 +1542,16 @@ fn drive_blocks(
 /// and so may have been partly cached; the cold case is **not** independently
 /// validated. `ESCAPEPOD_DEMUX_FILLERS=1` restores the strict single-stream
 /// behavior if concurrent streams turn out to hurt on a cold mount.
+/// Thread-seconds the reader shards spend decoding, and blocked handing a
+/// block to the producer.
+///
+/// Statics rather than a field on `GpuTrace`, because `fill_shard` is shared by
+/// all four producers and only one of them owns a trace. The cost is one
+/// `Instant` and one `fetch_add` per block, against a block that carries ~128 MB
+/// of signal.
+static FILL_DECODE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FILL_SEND_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn fill_shard(
     input: &[std::path::PathBuf],
     decode_to: Option<usize>,
@@ -1554,11 +1566,9 @@ fn fill_shard(
     for path in input {
         let reader = Reader::open(path)?;
         let run_infos = Arc::new(reader.run_infos().to_vec());
-        for (bi, batch) in reader.read_batches()?.enumerate() {
-            if bi % shards != shard {
-                continue;
-            }
+        for batch in reader.read_batches_strided(shard, shards)? {
             let batch = batch?;
+            let t_dec = std::time::Instant::now();
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<ReadData> = (0..view.num_rows())
                 .filter_map(|row| view.read(row).ok())
@@ -1586,15 +1596,22 @@ fn fill_shard(
                 sigs.push(sig);
                 items.push((read, chunks, run_infos.clone()));
             }
+            FILL_DECODE_US.fetch_add(
+                t_dec.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             if sigs.len() >= DETECT_WINDOW || block_bytes >= BLOCK_TARGET_BYTES {
                 block_bytes = 0;
                 // A send error means the consumer is gone (it returned early or
                 // panicked); stop filling rather than block.
-                if tx
-                    .send((std::mem::take(&mut sigs), std::mem::take(&mut items)))
-                    .is_err()
-                {
+                let t_send = std::time::Instant::now();
+                let sent = tx.send((std::mem::take(&mut sigs), std::mem::take(&mut items)));
+                FILL_SEND_US.fetch_add(
+                    t_send.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if sent.is_err() {
                     return Ok(());
                 }
             }
@@ -2091,6 +2108,23 @@ struct GpuTrace {
     /// Producer: splitting items out of the chunk, which also drops that
     /// sub-block's decoded signal — ~128 MB per block, freed on this thread.
     drop_ms: std::sync::atomic::AtomicU64,
+    /// Producer: from the start of `drive_blocks` until the *first* block
+    /// arrives — reader startup plus however long one block takes to form.
+    ///
+    /// `read_blocked_ms` cannot see this: it measures the gap between leaving
+    /// the closure and re-entering it, and before the first call there is no
+    /// previous departure to measure from. The tail after the last block is the
+    /// same blind spot at the other end, and is `OFF-COUNTER` minus this.
+    first_block_ms: std::sync::atomic::AtomicU64,
+    /// The producer thread's entire life, from before `drive_blocks` to after
+    /// it returns.
+    ///
+    /// The check the other producer counters could not perform: `closure` plus
+    /// `read_blocked` must equal this, and if it does not, the missing time is
+    /// on the producer thread with no counter naming it. Comparing them against
+    /// the *stage* wall instead cannot tell "the producer was idle" from "the
+    /// producer had already exited" (#297).
+    producer_wall_ms: std::sync::atomic::AtomicU64,
     /// Worker blocked waiting for a sub-block — the producer is behind.
     recv_blocked_ms: std::sync::atomic::AtomicU64,
     /// Worker: onnxruntime encode plus the lattice decode.
@@ -2109,16 +2143,20 @@ impl GpuTrace {
 
     /// Add `t`'s elapsed millis to `field`, but only when tracing is on — the
     /// `Instant::now()` calls are cheap next to a block but not free.
+    /// Accumulate in **microseconds**, not milliseconds: `chunk` and `drop`
+    /// run ~100 times each at well under 1 ms, and `as_millis()` truncated
+    /// every one of them to zero. A stage that is invisible is indistinguishable
+    /// from a stage that is free.
     fn add(field: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
         field.fetch_add(
-            t.elapsed().as_millis() as u64,
+            t.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
 
     fn report(&self, wall: std::time::Duration, workers: usize) {
         use std::sync::atomic::Ordering::Relaxed;
-        let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1000.0;
+        let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1_000_000.0;
         info!("{}", style::label("GPU CRF stage trace (thread-seconds):"));
         info!(
             "  producer   detect {:>7.1}s (host {:>6.1}s + device {:>6.1}s)  \
@@ -2155,6 +2193,28 @@ impl GpuTrace {
             g(&self.closure_ms),
             named,
             g(&self.closure_ms) - named,
+        );
+        // The producer's own wall, which is the only denominator that can say
+        // whether it was idle or already finished. `closure + read_blocked`
+        // must equal it; the remainder is unnamed work on that thread.
+        let pw = g(&self.producer_wall_ms);
+        let acct = g(&self.closure_ms) + g(&self.read_blocked_ms);
+        let first = g(&self.first_block_ms);
+        info!(
+            "  producer   wall {:>6.1}s  |  closure+read {:>6.1}s  \
+             OFF-COUNTER {:>6.1}s  (first block {:>5.1}s + tail {:>5.1}s)",
+            pw,
+            acct,
+            pw - acct,
+            first,
+            pw - acct - first,
+        );
+        let fg = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1_000_000.0;
+        info!(
+            "  readers    decode {:>6.1}s  BLOCKED handing over {:>6.1}s  ({} shard(s))",
+            fg(&FILL_DECODE_US),
+            fg(&FILL_SEND_US),
+            filler_threads(),
         );
         let wall_s = wall.as_secs_f64();
         info!(
@@ -2327,6 +2387,7 @@ fn produce_gpu_crf(
         // The gap between leaving this closure and re-entering it is the
         // consumer loop's `recv` — i.e. the producer waiting on the readers.
         let mut left_at: Option<std::time::Instant> = None;
+        let t_producer = std::time::Instant::now();
         let drive = drive_blocks(
             &args.input,
             detector.signal_decode_bound(),
@@ -2334,8 +2395,12 @@ fn produce_gpu_crf(
                 if hung_up {
                     return;
                 }
-                if tracing_on && let Some(t) = left_at {
-                    GpuTrace::add(&trace.read_blocked_ms, t);
+                if tracing_on {
+                    match left_at {
+                        Some(t) => GpuTrace::add(&trace.read_blocked_ms, t),
+                        // First call: time since `drive_blocks` was entered.
+                        None => GpuTrace::add(&trace.first_block_ms, t_producer),
+                    }
                 }
                 let t_closure = std::time::Instant::now();
                 // Detect over the whole block (one batched GPU CNN call), then
@@ -2402,6 +2467,9 @@ fn produce_gpu_crf(
                 }
             },
         );
+        if tracing_on {
+            GpuTrace::add(&trace.producer_wall_ms, t_producer);
+        }
 
         drop(block_tx);
         // An encoder's error is the root cause when the channel hung up, so
@@ -2621,16 +2689,18 @@ fn writer_thread(
         let w = match writer.as_mut() {
             Some(w) => w,
             None => {
-                // Match `filter`/`repack` rather than taking the writer's
-                // conservative 100/1000 defaults. At 100 the writer flushes a
-                // signal batch every 100 reads, rebuilding the Arrow schema and
-                // emitting an IPC message + footer entry each time — and every
-                // downstream reader then pays per-batch parse cost over that
-                // many batches for the life of the file.
+                // Raise only the *signal* batch size. At the writer's default
+                // of 100 it flushes a signal batch every 100 reads, rebuilding
+                // the Arrow schema and emitting an IPC message + footer entry
+                // each time, which every downstream reader then pays for.
+                //
+                // The *reads* batch size stays at the library default of
+                // 1,000, because demux shards its readers by batch index: a
+                // split output with few batches is one this very pipeline
+                // cannot parallelise when it reads it back (#297).
                 let opts = WriterOptions {
                     predefined_dictionaries: Some(predefined.clone()),
                     signal_batch_size: 1_000,
-                    read_batch_size: 10_000,
                     ..Default::default()
                 };
                 writer = Some(Writer::create(path, opts)?);

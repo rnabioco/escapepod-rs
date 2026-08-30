@@ -21,7 +21,7 @@
 
 mod common;
 
-use escapepod_pod5::{Reader, Writer, WriterOptions};
+use escapepod_pod5::{Reader, Uuid, Writer, WriterOptions};
 use tempfile::TempDir;
 
 use common::{make_read, make_run_info, synth_signal};
@@ -125,3 +125,72 @@ fn merge_splits_the_reads_table_into_batches() {
     );
 }
 
+/// Striding must partition the table: every read exactly once across the
+/// shards, in a shard-local ascending order.
+///
+/// The loop this replaced decoded every batch in every shard and discarded the
+/// ones it did not own, so a bug here would previously have been masked by the
+/// discard rather than surfacing as a missing read.
+#[test]
+fn strided_batches_partition_the_reads_table() {
+    use std::collections::HashSet;
+
+    let tmp = TempDir::new().unwrap();
+    let path = source(&tmp, "src.pod5");
+    let reader = Reader::open(&path).unwrap();
+    let total = reader.read_batch_count().unwrap();
+    assert!(total > 1, "fixture must have several batches, got {total}");
+
+    let all: Vec<Uuid> = reader
+        .reads()
+        .unwrap()
+        .map(|r| r.unwrap().read_id)
+        .collect();
+    assert_eq!(all.len(), N_READS);
+
+    for shards in [1usize, 2, 3, 5, 16, 64] {
+        let mut seen: Vec<Uuid> = Vec::new();
+        let mut batches_seen = 0usize;
+        for shard in 0..shards {
+            let mut prev: Option<u32> = None;
+            for batch in reader.read_batches_strided(shard, shards).unwrap() {
+                let batch = batch.unwrap();
+                batches_seen += 1;
+                let view = escapepod_pod5::ReadsBatchView::new(&batch, false).unwrap();
+                for row in 0..view.num_rows() {
+                    let read = view.read(row).unwrap();
+                    // Ascending within a shard: `set_index` must not rewind.
+                    if let Some(p) = prev {
+                        assert!(
+                            read.read_number > p,
+                            "shard {shard}/{shards} went backwards: {} after {p}",
+                            read.read_number
+                        );
+                    }
+                    prev = Some(read.read_number);
+                    seen.push(read.read_id);
+                }
+            }
+        }
+        assert_eq!(
+            batches_seen, total,
+            "shards={shards} visited {batches_seen} batches, expected {total}"
+        );
+        assert_eq!(
+            seen.len(),
+            N_READS,
+            "shards={shards} yielded {} reads, expected {N_READS}",
+            seen.len()
+        );
+        assert_eq!(
+            seen.iter().copied().collect::<HashSet<_>>().len(),
+            N_READS,
+            "shards={shards} yielded a duplicate read"
+        );
+        assert_eq!(
+            seen.iter().copied().collect::<HashSet<_>>(),
+            all.iter().copied().collect::<HashSet<_>>(),
+            "shards={shards} did not cover exactly the source reads"
+        );
+    }
+}
