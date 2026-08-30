@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`signal classify` no longer aborts when a tRNA body happens to contain the
+  junction motif** (#298). The CCA|adapter junction was located by requiring
+  `CCAGGC` to occur exactly once per reference record, and that check ran
+  *before* the common-arm check that actually identifies the junction. But the
+  motif is just CCA plus the adapter's opening bases, and a 6-mer collides over
+  ~75 nt of tRNA body in ~1.5% of records -- 4 of 282 in hg38, 51 of 3315 in
+  danRer11. One such record aborted the entire run for that sample, and
+  dropping the offenders is not neutral: 48 of danRer11's 51 are Glu, so it
+  would remove most of one amino-acid family from a charging analysis.
+  Candidates are now filtered by the arm first and uniqueness required of what
+  survives, which resolves every record of both references to exactly one
+  junction at the correct position. Two genuinely broken cases -- no arm-backed
+  match, and several -- now report distinctly instead of being conflated with
+  this benign one.
+
 ## 0.18.0 (2026-08-29)
 
 ### Fixed

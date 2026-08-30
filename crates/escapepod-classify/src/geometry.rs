@@ -122,14 +122,42 @@ pub fn junction_positions_with_anchors(
     }
     let mut ref_ctx: Vec<Option<String>> = Vec::new();
     for (name, seq) in seqs {
-        let n = seq.matches(motif).count();
-        if n != 1 {
-            bail!("{}: expected exactly 1 {}, found {}", name, motif, n);
-        }
-        let j = seq.find(motif).unwrap() + motif_offset;
-        if seq.len() < j + common_arm.len() || &seq[j..j + common_arm.len()] != common_arm {
-            bail!("{}: common arm mismatch at {}", name, j);
-        }
+        // The motif alone does not identify the junction. It is CCA plus the
+        // opening bases of the 3' adapter, so a tRNA body can carry it by
+        // chance -- ~1.5% of records in both hg38 (4/282) and danRer11
+        // (51/3315), which is just the rate a 6-mer collides over ~75 nt of
+        // body. Requiring uniqueness here turned that coincidence into a hard
+        // failure of the entire run, and dropping the offending records is not
+        // neutral: 48 of danRer11's 51 are Glu, so it would remove most of one
+        // amino-acid family from a charging analysis.
+        //
+        // What actually makes the junction unique is the common arm that must
+        // follow it; an internal match is in the body and has no arm after it.
+        // So filter on the arm FIRST and require uniqueness of what survives.
+        let candidates: Vec<usize> = seq
+            .match_indices(motif)
+            .map(|(i, _)| i + motif_offset)
+            .filter(|&j| {
+                seq.len() >= j + common_arm.len() && &seq[j..j + common_arm.len()] == common_arm
+            })
+            .collect();
+        let j = match candidates.as_slice() {
+            [only] => *only,
+            [] => bail!(
+                "{}: no {} followed by the common arm {} -- the record does not \
+                 end in CCA + adapter",
+                name,
+                motif,
+                common_arm
+            ),
+            many => bail!(
+                "{}: {} occurrences of {} are followed by the common arm; the \
+                 junction cannot be placed",
+                name,
+                many.len(),
+                motif
+            ),
+        };
         let anchor_at = |off: i64| -> Option<usize> {
             let p = j as i64 + off;
             if p >= 0 && (p as usize) < seq.len() {
@@ -213,6 +241,21 @@ mod tests {
         let two = format!(">r1\nCCA{ARM}AACCA{ARM}\n");
         let f = write_fasta(&two);
         assert!(junction_positions(f.path(), "CCAGGC", 3, ARM).is_err());
+    }
+
+    /// A tRNA body can carry the junction motif by chance: it is CCA plus the
+    /// adapter's opening bases, and a 6-mer collides over ~75 nt of body in
+    /// ~1.5% of records (4/282 in hg38, 51/3315 in danRer11). Such a record is
+    /// perfectly well formed -- the motif simply is not, on its own, the
+    /// junction. The common arm that must follow it is.
+    #[test]
+    fn test_internal_motif_is_not_the_junction() {
+        let body = format!("{}CCAGGCAAAA{}", "ACGT".repeat(10), "ACGT".repeat(5));
+        let fa = format!(">r1\n{body}CCA{ARM}TTTTT\n");
+        let f = write_fasta(&fa);
+        let geo = junction_positions(f.path(), "CCAGGC", 3, ARM).unwrap();
+        // The junction is the arm-backed match, not the first one in the body.
+        assert_eq!(geo["r1"].junction, body.len() + 3);
     }
 
     #[test]
