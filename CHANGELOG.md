@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18.1 (2026-08-29)
+
 ### Fixed
 
 - **`signal classify` no longer aborts when a tRNA body happens to contain the
