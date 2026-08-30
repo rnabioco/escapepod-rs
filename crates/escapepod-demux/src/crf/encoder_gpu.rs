@@ -187,15 +187,13 @@ pub struct CrfEncoderGpu {
 impl CrfEncoderGpu {
     /// Load an export directory containing `metadata.json` and its ONNX graph.
     ///
-    /// `intra_threads` bounds onnxruntime's intra-op pool. Prefer passing it
-    /// from the CLI: ORT's default pool is `available_parallelism()` wide and is
-    /// spawned *on top of* rayon's, which puts total process threads back out of
-    /// `--threads`' reach.
-    pub fn load_bundle(
-        dir: impl AsRef<Path>,
-        intra_threads: Option<usize>,
-    ) -> Result<Self, CrfError> {
-        Self::load_bundle_on_device(dir, intra_threads, 0)
+    /// The session's intra-op pool is fixed at one non-spinning thread — see
+    /// [`load_on_device`](Self::load_on_device). It used to be a parameter
+    /// threaded down from the CLI's `--threads`, which is the opposite of what
+    /// helps: the work is on the device, and a wide pool only takes cores from
+    /// the prep that feeds it.
+    pub fn load_bundle(dir: impl AsRef<Path>) -> Result<Self, CrfError> {
+        Self::load_bundle_on_device(dir, 0)
     }
 
     /// [`load_bundle`](Self::load_bundle) pinned to a CUDA device ordinal.
@@ -205,44 +203,55 @@ impl CrfEncoderGpu {
     /// overlaps another's device work, or spread across several. The session and
     /// its lattice context both land on `device`, so a worker never moves scores
     /// between devices.
-    pub fn load_bundle_on_device(
-        dir: impl AsRef<Path>,
-        intra_threads: Option<usize>,
-        device: i32,
-    ) -> Result<Self, CrfError> {
+    pub fn load_bundle_on_device(dir: impl AsRef<Path>, device: i32) -> Result<Self, CrfError> {
         let dir = dir.as_ref();
         let meta = CrfMetadata::load(dir.join("metadata.json"))?;
         let onnx = dir.join(&meta.onnx);
-        Self::load_on_device(onnx, meta, intra_threads, device)
+        Self::load_on_device(onnx, meta, device)
     }
 
     /// Load an ONNX graph with an already-parsed sidecar.
-    pub fn load(
-        onnx: impl AsRef<Path>,
-        meta: CrfMetadata,
-        intra_threads: Option<usize>,
-    ) -> Result<Self, CrfError> {
-        Self::load_on_device(onnx, meta, intra_threads, 0)
+    pub fn load(onnx: impl AsRef<Path>, meta: CrfMetadata) -> Result<Self, CrfError> {
+        Self::load_on_device(onnx, meta, 0)
     }
 
     /// [`load`](Self::load) pinned to a CUDA device ordinal.
     pub fn load_on_device(
         onnx: impl AsRef<Path>,
         meta: CrfMetadata,
-        intra_threads: Option<usize>,
         device: i32,
     ) -> Result<Self, CrfError> {
         let layout = meta.layout()?;
         let alphabet = meta.alphabet_bytes();
 
-        let mut builder = Session::builder().map_err(|e| CrfError::Load(e.to_string()))?;
-        if let Some(n) = intra_threads {
-            builder = builder
-                .with_intra_threads(n.max(1))
-                .map_err(|e| CrfError::Load(e.to_string()))?
-                .with_inter_threads(1)
-                .map_err(|e| CrfError::Load(e.to_string()))?;
-        }
+        // One non-spinning intra-op thread, exactly as `AdapterCnnGpu::load`
+        // does and for the same measured reason (#239/#240) — that fix landed
+        // on the CNN session and was never carried to this one.
+        //
+        // The graph runs on the device, so the intra-op pool has almost nothing
+        // to compute; left at its default it is `available_parallelism()` wide
+        // *and spinning*, on top of rayon's pool. This path made that worse than
+        // the CNN one ever was: the pool width came from the CLI's `--threads`,
+        // and the fused pipeline builds one session per encoder worker, so
+        // `--threads 32` with 2 workers meant 64 spinning threads on a 32-core
+        // allocation — cores the decode and prep feeding this encoder needed,
+        // which is how a GPU ends up underfed by its own inference sessions.
+        // Scaling `--threads` up scaled the spin up with it.
+        //
+        // #240's numbers, measured on the CNN session (warm, three interleaved
+        // reps): 16 threads spinning 7.34 s, 1 thread spinning 7.42 s, 16
+        // without spinning 7.37 s, **1 without spinning 6.93 s** at 274% CPU
+        // against 340%. Both settings are needed; neither works alone.
+        let builder = Session::builder()
+            .map_err(|e| CrfError::Load(e.to_string()))?
+            .with_intra_threads(1)
+            .map_err(|e| CrfError::Load(e.to_string()))?
+            // Only meaningful under parallel execution mode, which we don't
+            // enable; set it anyway so the bound holds if that ever changes.
+            .with_inter_threads(1)
+            .map_err(|e| CrfError::Load(e.to_string()))?
+            .with_intra_op_spinning(false)
+            .map_err(|e| CrfError::Load(e.to_string()))?;
         let session = builder
             .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
             .map_err(|e| CrfError::Load(e.to_string()))?

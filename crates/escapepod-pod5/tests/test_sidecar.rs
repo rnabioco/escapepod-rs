@@ -1354,3 +1354,113 @@ fn an_untouched_sidecar_passes_the_stamp_check() {
     let fresh = tempfile::TempDir::new().unwrap();
     assert!(SidecarStamp::of(fresh.path().join("absent.p5s")).is_none());
 }
+
+/// `LabelCodes` is `Labels` with the strings interned by the caller, and it has
+/// to be indistinguishable on disk — the variant exists so a demultiplexing run
+/// need not hold one `String` per read for one of sixteen values, not to write a
+/// different file. A divergence would surface as a `barcode` column that reads
+/// differently depending on which caller wrote it, which no reader checks for.
+#[test]
+fn label_codes_writes_the_same_sidecar_as_labels() {
+    // One POD5, byte-copied: the fixture mints fresh read ids on every call, so
+    // two separate fixtures would differ for an uninteresting reason. The copy
+    // keeps the file *name* and changes only the directory — the sidecar embeds
+    // `escapepod:source_name`, so a renamed copy would differ there and defeat
+    // the byte comparison below for a reason that has nothing to do with labels.
+    let (_tmp, path_a, ids_a, _) = fixture();
+    let dir_b = path_a.parent().unwrap().join("b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let path_b = dir_b.join(path_a.file_name().unwrap());
+    std::fs::copy(&path_a, &path_b).unwrap();
+
+    // The interned form of exactly the same mapping. The dictionary is
+    // deliberately not in first-seen order and carries an entry no read uses,
+    // so an implementation that ignored `codes` and re-derived the labels from
+    // the dictionary alone would fail here.
+    let labels = make_assignments(&ids_a, 10);
+    let dictionary = vec![
+        "BC99-unused".to_string(),
+        "BC02".to_string(),
+        "BC01".to_string(),
+    ];
+    let codes: HashMap<Uuid, u32> = labels
+        .iter()
+        .map(|(id, label)| {
+            (
+                *id,
+                dictionary.iter().position(|d| d == label).unwrap() as u32,
+            )
+        })
+        .collect();
+
+    let write = |path: &std::path::Path, values: ColumnValues| {
+        write_columns(
+            path,
+            &[ColumnWrite {
+                name: "barcode".into(),
+                values,
+            }],
+            false,
+        )
+        .unwrap()
+    };
+    let plain = write(&path_a, ColumnValues::Labels(labels));
+    let coded = write(&path_b, ColumnValues::LabelCodes { dictionary, codes });
+
+    assert_eq!(plain.columns[0].assigned, coded.columns[0].assigned);
+    assert_eq!(plain.columns[0].labels, coded.columns[0].labels);
+    assert_eq!(
+        coded.columns[0].labels, 2,
+        "the unused entry is not a label"
+    );
+
+    let from_labels = read_annotation(&path_a, Some("barcode")).unwrap();
+    let from_codes = read_annotation(&path_b, Some("barcode")).unwrap();
+    assert_eq!(from_labels.len(), from_codes.len());
+    for id in ids_a.iter().take(10) {
+        assert_eq!(
+            from_labels.get(id),
+            from_codes.get(id),
+            "read {id} disagrees between Labels and LabelCodes"
+        );
+    }
+    // And the sidecars are byte-identical, not merely equivalent on read-back.
+    assert_eq!(
+        std::fs::read(sidecar_path(&path_a)).unwrap(),
+        std::fs::read(sidecar_path(&path_b)).unwrap()
+    );
+}
+
+/// A code with no dictionary entry is dropped, the way an empty label is:
+/// absence is how an unassigned read is spelled, and inventing a label for an
+/// out-of-range code would put a wrong barcode on a read.
+#[test]
+fn label_codes_drops_unknown_and_empty_codes() {
+    let (_tmp, path, ids, _) = fixture();
+    let dictionary = vec!["BC01".to_string(), String::new()];
+    let codes: HashMap<Uuid, u32> = [
+        (ids[0], 0), // BC01
+        (ids[1], 1), // empty label -> dropped
+        (ids[2], 7), // out of range -> dropped
+        (ids[3], 0), // BC01
+    ]
+    .into_iter()
+    .collect();
+
+    let result = write_columns(
+        &path,
+        &[ColumnWrite {
+            name: "barcode".into(),
+            values: ColumnValues::LabelCodes { dictionary, codes },
+        }],
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(result.columns[0].assigned, 2);
+    assert_eq!(result.columns[0].labels, 1);
+    let back = read_annotation(&path, Some("barcode")).unwrap();
+    assert_eq!(back.get(&ids[0]), Some("BC01"));
+    assert_eq!(back.get(&ids[1]), None, "empty label must be absent");
+    assert_eq!(back.get(&ids[2]), None, "unknown code must be absent");
+}

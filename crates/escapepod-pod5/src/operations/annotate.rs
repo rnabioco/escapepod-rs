@@ -102,6 +102,24 @@ pub enum ColumnValues {
     /// Dictionary-encoded utf8 labels. Empty labels are dropped — an
     /// unassigned read is represented by absence.
     Labels(HashMap<Uuid, String>),
+    /// The same column, supplied already interned: `codes` maps a read to an
+    /// index into `dictionary`, and a code with no entry in `dictionary` is
+    /// dropped like an empty label.
+    ///
+    /// Identical on disk to [`Labels`](Self::Labels) — the section is
+    /// dictionary-encoded either way — and it exists for the caller's memory,
+    /// not the file's. A demultiplexing run holds one entry per read until every
+    /// input's sidecar is written, and a `String` per read to say `nbc07` is a
+    /// 32-byte heap chunk plus a 24-byte struct for one of sixteen values: about
+    /// 4 GB at 57 M reads, against 1.1 GB of `u32` codes and a dictionary that
+    /// fits in a cache line's worth of pointers. Build the codes and hand them
+    /// over; do not materialize the strings to call `Labels`.
+    LabelCodes {
+        /// Distinct labels, indexed by code.
+        dictionary: Vec<String>,
+        /// Per-read index into `dictionary`.
+        codes: HashMap<Uuid, u32>,
+    },
     /// `Float32` scores. `NaN` is refused rather than dropped, because unlike
     /// an empty label it is a value someone may have meant.
     Scores(HashMap<Uuid, f32>),
@@ -201,6 +219,23 @@ pub fn write_columns(
                             .get(&uuid)
                             .filter(|label| !label.is_empty())
                             .map(|label| (uuid, label.as_str()))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: annotation.len(),
+                    labels: annotation.labels().len(),
+                };
+                sc.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::LabelCodes { dictionary, codes } => {
+                let annotation = AnnotationSection::from_pairs(
+                    &column.name,
+                    sc.entries().iter().filter_map(|&(uuid_bytes, _, _)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        let label = dictionary.get(*codes.get(&uuid)? as usize)?;
+                        (!label.is_empty()).then_some((uuid, label.as_str()))
                     }),
                 )?;
                 let stat = ColumnStat {
