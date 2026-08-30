@@ -456,8 +456,10 @@ impl Detector {
                 })
                 .collect();
             if let Some((prep_ms, _)) = split {
+                // Microseconds: these are read back through `GpuTrace`'s
+                // accumulator, which counts them.
                 prep_ms.fetch_add(
-                    t_prep.elapsed().as_millis() as u64,
+                    t_prep.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
@@ -469,7 +471,7 @@ impl Detector {
                 .collect();
             if let Some((_, infer_ms)) = split {
                 infer_ms.fetch_add(
-                    t_infer.elapsed().as_millis() as u64,
+                    t_infer.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
@@ -863,8 +865,8 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             #[cfg(feature = "gpu")]
             let encoder = if crf_encoder_on_gpu {
                 // Must match `produce_gpu_crf`'s placement: this instance becomes
-                // worker 0, so it has to land on the first *encoder* device — GPU 1
-                // when detection has GPU 0 to itself.
+                // worker 0, so it has to land on the first *encoder* device —
+                // GPU 0, which detection also shares.
                 let enc_device = crf_encoder_devices(
                     escapepod_demux::crf::lattice_gpu::visible_device_count()
                         .unwrap_or(1)
@@ -1540,6 +1542,16 @@ fn drive_blocks(
 /// and so may have been partly cached; the cold case is **not** independently
 /// validated. `ESCAPEPOD_DEMUX_FILLERS=1` restores the strict single-stream
 /// behavior if concurrent streams turn out to hurt on a cold mount.
+/// Thread-seconds the reader shards spend decoding, and blocked handing a
+/// block to the producer.
+///
+/// Statics rather than a field on `GpuTrace`, because `fill_shard` is shared by
+/// all four producers and only one of them owns a trace. The cost is one
+/// `Instant` and one `fetch_add` per block, against a block that carries ~128 MB
+/// of signal.
+static FILL_DECODE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FILL_SEND_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn fill_shard(
     input: &[std::path::PathBuf],
     decode_to: Option<usize>,
@@ -1554,11 +1566,9 @@ fn fill_shard(
     for path in input {
         let reader = Reader::open(path)?;
         let run_infos = Arc::new(reader.run_infos().to_vec());
-        for (bi, batch) in reader.read_batches()?.enumerate() {
-            if bi % shards != shard {
-                continue;
-            }
+        for batch in reader.read_batches_strided(shard, shards)? {
             let batch = batch?;
+            let t_dec = std::time::Instant::now();
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<ReadData> = (0..view.num_rows())
                 .filter_map(|row| view.read(row).ok())
@@ -1586,15 +1596,22 @@ fn fill_shard(
                 sigs.push(sig);
                 items.push((read, chunks, run_infos.clone()));
             }
+            FILL_DECODE_US.fetch_add(
+                t_dec.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             if sigs.len() >= DETECT_WINDOW || block_bytes >= BLOCK_TARGET_BYTES {
                 block_bytes = 0;
                 // A send error means the consumer is gone (it returned early or
                 // panicked); stop filling rather than block.
-                if tx
-                    .send((std::mem::take(&mut sigs), std::mem::take(&mut items)))
-                    .is_err()
-                {
+                let t_send = std::time::Instant::now();
+                let sent = tx.send((std::mem::take(&mut sigs), std::mem::take(&mut items)));
+                FILL_SEND_US.fetch_add(
+                    t_send.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if sent.is_err() {
                     return Ok(());
                 }
             }
@@ -1955,48 +1972,49 @@ fn crf_gpu_block() -> usize {
     })
 }
 
-/// The CUDA ordinals the CRF encoder pool may use.
+/// The CUDA ordinals the CRF encoder pool may use: **every visible device**.
 ///
-/// With one visible device everything shares it. With more, **device 0 is
-/// reserved for adapter detection** and the encoders take the rest.
+/// Detection shares device 0 rather than owning it. The encoder workers all
+/// pull from one channel, so the device carrying detection simply takes fewer
+/// blocks than the others — the balance is a consequence of the queue, not
+/// something anyone computes.
 ///
-/// # This reservation is now mis-tuned — measured, unfixed
+/// # Measured on real input, after a wrong answer from a synthetic one
 ///
-/// It was justified by detect and the encoder costing about the same device time
-/// (5.4 s vs 6.4 s over 40 k reads): if two roles are comparable, sharing a card
-/// makes the pipeline's ceiling their sum and separating them makes it the
-/// larger of the two. #187 destroyed that premise. Matching the model's training
-/// convention cut detect's device time ~20x (401 s -> 20.2 s over 1 M reads)
-/// while the encoder stayed put, so the roles now cost ~19 s against ~170 s —
-/// and reserving a whole card for 10% of the work costs more than the contention
-/// it avoids. At exactly two devices it is pathological: the encoder pool does
-/// not grow at all, so the second GPU only offloads detection. Measured on 1 M
-/// reads, interleaved, 2 reps each:
+/// Reserving device 0 for adapter detection was justified when detect and the
+/// encoder cost about the same device time. #187 ended that: matching the
+/// model's training convention cut detect ~20x while the encoder stayed put,
+/// so the reservation now hands a whole card to ~5% of the work.
+///
+/// A real 1.3M-read MinKNOW run, arms interleaved in one allocation, 2 reps
+/// (#297):
 ///
 /// ```text
-/// GPUs   encoder pool          wall     vs 1 GPU
-///   1    2 workers on [0]     107.5 s     --
-///   2    2 workers on [1]      96.5 s    1.11x    <- barely worth the card
-///   4    6 workers on [1,2,3]  43.7 s    2.46x
+/// GPUs   reserve device 0            encode everywhere           vs 1 GPU
+///   1    162.5 s  (gpu0 88%)         same policy                 --
+///   2    136.6 s  (12% / 93%)         80.8 s  (88% / 88%)        1.19x -> 2.01x
+///   4     56.7 s  (27% / 75%)         55.3 s  (72% / 58-66%)     2.86x -> 2.94x
 /// ```
 ///
-/// The likely fix is to encode on *every* visible device and let detection share
-/// device 0 — workers pull from one channel rather than being handed a
-/// partition, so whichever device is slowed by carrying detection simply takes
-/// fewer blocks, with nothing to balance explicitly. It is **not** applied here
-/// because it is unmeasured, and the four-device column is the reason for
-/// caution: at 4 GPUs the producer is already the constraint (busy 71%, workers
-/// blocked on `recv` 38.6 s), and that producer *is* detection. Adding encoder
-/// work to device 0 could slow the stage that is already the ceiling and regress
-/// the case that currently scales, to fix the case that does not. Measure both
-/// columns before changing it.
+/// The utilisation column is the argument: reserved, device 0 sits at 12% busy
+/// on two cards and 27% on four, while the single encoder device pins at 93%.
+/// Sharing it takes two GPUs from 1.19x to **2.01x** — near-linear — and is a
+/// wash at four, where the pool was already wide enough.
+///
+/// # Why this was reverted once, and what that should teach the next reader
+///
+/// An earlier A/B measured the opposite (~5.6% *worse* at 4 GPUs) and this
+/// change was reverted on it. That run used a synthetic 100k-read file which
+/// — because escpod wrote reads tables as a single record batch — was read by
+/// one thread and left the cards 5-10% busy. **GPU placement cannot be
+/// measured in a regime where the GPUs are idle**, and the idle cards were
+/// visible in that run's own output.
+///
+/// So: check that the resource you are tuning is actually the constraint
+/// before believing an A/B about it.
 #[cfg(feature = "gpu")]
 fn crf_encoder_devices(visible: usize) -> Vec<i32> {
-    if visible > 1 {
-        (1..visible as i32).collect()
-    } else {
-        vec![0]
-    }
+    (0..visible.max(1) as i32).collect()
 }
 
 /// Encoder workers, and how they are spread over the visible devices
@@ -2059,8 +2077,45 @@ struct GpuTrace {
     detect_infer_ms: std::sync::atomic::AtomicU64,
     /// Producer: window standardisation across rayon.
     prep_ms: std::sync::atomic::AtomicU64,
+    /// Producer blocked waiting for the *reader* to hand it a block — the
+    /// fillers are behind, or the producer's own blocking send stopped it
+    /// draining them.
+    ///
+    /// Measured as the gap between leaving `process_block` and being called
+    /// again, which needs no change to `drive_blocks`: that gap is exactly the
+    /// consumer loop's `recv`. Without it the trace accounted for only 15 s of
+    /// a 33 s producer wall, and the missing 18 s is what every "which stage is
+    /// slow" answer here turns on (#297).
+    read_blocked_ms: std::sync::atomic::AtomicU64,
     /// Producer blocked handing a sub-block over — the encoders are behind.
     send_blocked_ms: std::sync::atomic::AtomicU64,
+    /// Producer: the whole closure, so the accounting can be *checked* rather
+    /// than assumed. With `read_blocked_ms` this must cover the producer's
+    /// entire wall; anything missing is work no counter names, which is exactly
+    /// how 21 s of a 37.8 s wall stayed invisible (#297).
+    closure_ms: std::sync::atomic::AtomicU64,
+    /// Producer: assembling one sub-block out of the block's rows.
+    chunk_ms: std::sync::atomic::AtomicU64,
+    /// Producer: splitting items out of the chunk, which also drops that
+    /// sub-block's decoded signal — ~128 MB per block, freed on this thread.
+    drop_ms: std::sync::atomic::AtomicU64,
+    /// Producer: from the start of `drive_blocks` until the *first* block
+    /// arrives — reader startup plus however long one block takes to form.
+    ///
+    /// `read_blocked_ms` cannot see this: it measures the gap between leaving
+    /// the closure and re-entering it, and before the first call there is no
+    /// previous departure to measure from. The tail after the last block is the
+    /// same blind spot at the other end, and is `OFF-COUNTER` minus this.
+    first_block_ms: std::sync::atomic::AtomicU64,
+    /// The producer thread's entire life, from before `drive_blocks` to after
+    /// it returns.
+    ///
+    /// The check the other producer counters could not perform: `closure` plus
+    /// `read_blocked` must equal this, and if it does not, the missing time is
+    /// on the producer thread with no counter naming it. Comparing them against
+    /// the *stage* wall instead cannot tell "the producer was idle" from "the
+    /// producer had already exited" (#297).
+    producer_wall_ms: std::sync::atomic::AtomicU64,
     /// Worker blocked waiting for a sub-block — the producer is behind.
     recv_blocked_ms: std::sync::atomic::AtomicU64,
     /// Worker: onnxruntime encode plus the lattice decode.
@@ -2079,24 +2134,29 @@ impl GpuTrace {
 
     /// Add `t`'s elapsed millis to `field`, but only when tracing is on — the
     /// `Instant::now()` calls are cheap next to a block but not free.
+    /// Accumulate in **microseconds**, not milliseconds: `chunk` and `drop`
+    /// run ~100 times each at well under 1 ms, and `as_millis()` truncated
+    /// every one of them to zero. A stage that is invisible is indistinguishable
+    /// from a stage that is free.
     fn add(field: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
         field.fetch_add(
-            t.elapsed().as_millis() as u64,
+            t.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
 
     fn report(&self, wall: std::time::Duration, workers: usize) {
         use std::sync::atomic::Ordering::Relaxed;
-        let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1000.0;
+        let g = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1_000_000.0;
         info!("{}", style::label("GPU CRF stage trace (thread-seconds):"));
         info!(
             "  producer   detect {:>7.1}s (host {:>6.1}s + device {:>6.1}s)  \
-             prep {:>5.1}s  BLOCKED on send {:>6.1}s",
+             prep {:>5.1}s  BLOCKED on read {:>6.1}s  on send {:>6.1}s",
             g(&self.detect_ms),
             g(&self.detect_prep_ms),
             g(&self.detect_infer_ms),
             g(&self.prep_ms),
+            g(&self.read_blocked_ms),
             g(&self.send_blocked_ms)
         );
         info!(
@@ -2106,6 +2166,46 @@ impl GpuTrace {
             g(&self.match_ms),
             g(&self.route_ms),
             g(&self.recv_blocked_ms)
+        );
+        // Closure + read wait must cover the producer's wall. Whatever the
+        // named stages do not add up to inside the closure is work no counter
+        // describes, and printing the residual is what makes that visible
+        // rather than something the reader has to notice by subtracting.
+        let named = g(&self.detect_ms)
+            + g(&self.prep_ms)
+            + g(&self.send_blocked_ms)
+            + g(&self.chunk_ms)
+            + g(&self.drop_ms);
+        info!(
+            "  producer   chunk {:>6.1}s  drop {:>6.1}s  |  closure {:>6.1}s  \
+             named {:>6.1}s  UNACCOUNTED {:>6.1}s",
+            g(&self.chunk_ms),
+            g(&self.drop_ms),
+            g(&self.closure_ms),
+            named,
+            g(&self.closure_ms) - named,
+        );
+        // The producer's own wall, which is the only denominator that can say
+        // whether it was idle or already finished. `closure + read_blocked`
+        // must equal it; the remainder is unnamed work on that thread.
+        let pw = g(&self.producer_wall_ms);
+        let acct = g(&self.closure_ms) + g(&self.read_blocked_ms);
+        let first = g(&self.first_block_ms);
+        info!(
+            "  producer   wall {:>6.1}s  |  closure+read {:>6.1}s  \
+             OFF-COUNTER {:>6.1}s  (first block {:>5.1}s + tail {:>5.1}s)",
+            pw,
+            acct,
+            pw - acct,
+            first,
+            pw - acct - first,
+        );
+        let fg = |f: &std::sync::atomic::AtomicU64| f.load(Relaxed) as f64 / 1_000_000.0;
+        info!(
+            "  readers    decode {:>6.1}s  BLOCKED handing over {:>6.1}s  ({} shard(s))",
+            fg(&FILL_DECODE_US),
+            fg(&FILL_SEND_US),
+            filler_threads(),
         );
         let wall_s = wall.as_secs_f64();
         info!(
@@ -2168,7 +2268,7 @@ fn produce_gpu_crf(
             enc_devices,
             style::count(encoder.batch_rows()),
             if devices > 1 {
-                "; adapter detection has GPU 0 to itself"
+                "; adapter detection shares GPU 0"
             } else {
                 ""
             }
@@ -2275,6 +2375,10 @@ fn produce_gpu_crf(
         // feeding and let the join below report why rather than masking it with
         // a channel error.
         let mut hung_up = false;
+        // The gap between leaving this closure and re-entering it is the
+        // consumer loop's `recv` — i.e. the producer waiting on the readers.
+        let mut left_at: Option<std::time::Instant> = None;
+        let t_producer = std::time::Instant::now();
         let drive = drive_blocks(
             &args.input,
             detector.signal_decode_bound(),
@@ -2282,6 +2386,14 @@ fn produce_gpu_crf(
                 if hung_up {
                     return;
                 }
+                if tracing_on {
+                    match left_at {
+                        Some(t) => GpuTrace::add(&trace.read_blocked_ms, t),
+                        // First call: time since `drive_blocks` was entered.
+                        None => GpuTrace::add(&trace.first_block_ms, t_producer),
+                    }
+                }
+                let t_closure = std::time::Instant::now();
                 // Detect over the whole block (one batched GPU CNN call), then
                 // hand the encoder bounded sub-blocks — see `CRF_GPU_BLOCK`.
                 let t_det = std::time::Instant::now();
@@ -2294,7 +2406,11 @@ fn produce_gpu_crf(
                 }
                 let mut rows = sigs.into_iter().zip(bounds).zip(items);
                 loop {
+                    let t_chunk = std::time::Instant::now();
                     let chunk: Vec<_> = rows.by_ref().take(gpu_block).collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.chunk_ms, t_chunk);
+                    }
                     if chunk.is_empty() {
                         break;
                     }
@@ -2316,9 +2432,15 @@ fn produce_gpu_crf(
                             .then_some(w)
                         })
                         .collect();
-                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
                     if tracing_on {
                         GpuTrace::add(&trace.prep_ms, t_prep);
+                    }
+                    // Also frees this sub-block's decoded signal, on this
+                    // thread, while the encoders wait behind it.
+                    let t_drop = std::time::Instant::now();
+                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
+                    if tracing_on {
+                        GpuTrace::add(&trace.drop_ms, t_drop);
                     }
                     let t_send = std::time::Instant::now();
                     let sent = block_tx.send((windows, items));
@@ -2330,8 +2452,15 @@ fn produce_gpu_crf(
                         return;
                     }
                 }
+                if tracing_on {
+                    GpuTrace::add(&trace.closure_ms, t_closure);
+                    left_at = Some(std::time::Instant::now());
+                }
             },
         );
+        if tracing_on {
+            GpuTrace::add(&trace.producer_wall_ms, t_producer);
+        }
 
         drop(block_tx);
         // An encoder's error is the root cause when the channel hung up, so
@@ -2551,16 +2680,18 @@ fn writer_thread(
         let w = match writer.as_mut() {
             Some(w) => w,
             None => {
-                // Match `filter`/`repack` rather than taking the writer's
-                // conservative 100/1000 defaults. At 100 the writer flushes a
-                // signal batch every 100 reads, rebuilding the Arrow schema and
-                // emitting an IPC message + footer entry each time — and every
-                // downstream reader then pays per-batch parse cost over that
-                // many batches for the life of the file.
+                // Raise only the *signal* batch size. At the writer's default
+                // of 100 it flushes a signal batch every 100 reads, rebuilding
+                // the Arrow schema and emitting an IPC message + footer entry
+                // each time, which every downstream reader then pays for.
+                //
+                // The *reads* batch size stays at the library default of
+                // 1,000, because demux shards its readers by batch index: a
+                // split output with few batches is one this very pipeline
+                // cannot parallelise when it reads it back (#297).
                 let opts = WriterOptions {
                     predefined_dictionaries: Some(predefined.clone()),
                     signal_batch_size: 1_000,
-                    read_batch_size: 10_000,
                     ..Default::default()
                 };
                 writer = Some(Writer::create(path, opts)?);
@@ -3012,15 +3143,21 @@ fn print_summary(summary: &DemuxSummary) {
 mod gpu_placement_tests {
     use super::{crf_encoder_devices, crf_gpu_workers};
 
-    /// Pins today's placement, including the part that is known mis-tuned: at
-    /// two devices the encoder pool is `[1]` alone, which is why the second GPU
-    /// measures 1.11x rather than ~2x. Written so that changing the policy has
-    /// to change this test deliberately rather than silently.
+    /// The encoder pool spans every visible device; detection shares device 0.
+    ///
+    /// This replaces a test that pinned the opposite, so the policy could not
+    /// change silently. It has now changed twice: to this, then back, then to
+    /// this again. The middle step was reverted on an A/B run against a file
+    /// that left the GPUs 5-10% busy, which cannot measure GPU placement at
+    /// all. On real input the reservation leaves device 0 at 12% busy and
+    /// costs 1.69x at two cards (#297) — see `crf_encoder_devices`.
     #[test]
-    fn device_zero_is_reserved_for_detection_above_one_device() {
+    fn every_visible_device_encodes() {
         assert_eq!(crf_encoder_devices(1), vec![0]);
-        assert_eq!(crf_encoder_devices(2), vec![1]);
-        assert_eq!(crf_encoder_devices(4), vec![1, 2, 3]);
+        // The row that mattered: a second GPU adds encoder capacity rather
+        // than only offloading detection.
+        assert_eq!(crf_encoder_devices(2), vec![0, 1]);
+        assert_eq!(crf_encoder_devices(4), vec![0, 1, 2, 3]);
         // A zero count can only come from a failed probe; never hand back an
         // empty pool, since the caller indexes into it.
         assert_eq!(crf_encoder_devices(0), vec![0]);

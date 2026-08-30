@@ -475,6 +475,43 @@ impl Reader {
         Ok(reader.map(|r| r.map_err(Error::from)))
     }
 
+    /// The reads-table batches whose index is `offset` mod `stride`, and only
+    /// those.
+    ///
+    /// The obvious spelling — `read_batches().enumerate()` with a `continue` on
+    /// the ones that are not ours — is not equivalent. `enumerate` has already
+    /// pulled from the iterator by the time the test runs, and Arrow's
+    /// `next()` *decodes* the batch, so every shard paid to decode the whole
+    /// reads table and threw away all but its share. That table carries the
+    /// `signal` row-index list column, whose eager decode is the same cost
+    /// [`Self::reads_dictionaries`] exists to avoid.
+    ///
+    /// Seeking instead makes N readers cost one table decode between them
+    /// rather than N, so the shard count is free to be tuned on its I/O
+    /// behaviour alone (#297).
+    pub fn read_batches_strided(
+        &self,
+        offset: usize,
+        stride: usize,
+    ) -> Result<impl Iterator<Item = Result<RecordBatch>> + '_> {
+        let embedded = self
+            .footer
+            .reads_table()
+            .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
+        let mut reader = self.create_arrow_reader(embedded)?;
+        let total = reader.num_batches();
+        let stride = stride.max(1);
+        Ok((offset..total).step_by(stride).map(move |i| {
+            reader.set_index(i).map_err(Error::from)?;
+            match reader.next() {
+                Some(batch) => batch.map_err(Error::from),
+                // `set_index` bounds-checks against the same `total`, so this
+                // is unreachable rather than a case worth a fallback.
+                None => Err(Error::MissingField(format!("reads batch {i}"))),
+            }
+        }))
+    }
+
     /// Distinct `pore_type` and end_reason dictionary labels for the reads
     /// table. Truly O(dict): a POD5 reads table is a single Arrow IPC stream
     /// with one shared dictionary per dictionary-encoded column (no IPC

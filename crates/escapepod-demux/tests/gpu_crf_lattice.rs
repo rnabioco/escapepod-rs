@@ -299,3 +299,100 @@ fn gpu_agrees_with_cpu_over_a_wide_batch() {
         assert_eq!(got[b], want, "read {b} differs from scalar CPU");
     }
 }
+
+/// The device reference scan must agree with the CPU scan it replaces.
+///
+/// This is the test that matters for #297: `--ref-scores` used to force the
+/// whole decode onto the host, and the kernel exists to stop that. It changes
+/// where `log P(reference | signal)` is computed, so the only thing standing
+/// between "faster" and "confidently wrong barcodes" is this comparison.
+///
+/// Tolerance rather than equality, for the reason the module note already
+/// gives: the device reassociates reductions exactly as the AVX kernels do, so
+/// the contract is agreement, not bit-identity. The sequences must match
+/// exactly — that contract *is* bit-level.
+#[test]
+fn ref_scan_matches_cpu() {
+    use escapepod_demux::crf::{RefChains, decode_with_refs};
+
+    let fixture = golden();
+    let layout = golden_layout(&fixture);
+    let Some(ctx) = try_context(layout) else {
+        return;
+    };
+    let alphabet: Vec<u8> = fixture["seqdist"]["alphabet"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().as_bytes()[0])
+        .collect();
+
+    let f = &fixture["formula"];
+    let t_len = f["T"].as_u64().unwrap() as usize;
+    let n_reads = f["N"].as_u64().unwrap() as usize;
+
+    let refs = ["ACGTACGTACGT", "TTTTGGGGCCCC", "GATTACAGATTACA"];
+    let seqs: Vec<&[u8]> = refs.iter().map(|s| s.as_bytes()).collect();
+    let chains = RefChains::build(&layout, &alphabet, &seqs).unwrap();
+    let tables = ctx
+        .upload_ref_chains(&chains)
+        .expect("panel fits the scan kernel");
+    assert_eq!(tables.n_refs(), refs.len());
+
+    // One interleaved time-major batch, the encoder's own layout, so a stride
+    // or indexing error reads a neighbour rather than running off the end.
+    let packed: Vec<Vec<f32>> = (0..n_reads).map(|n| synthesize(f, n)).collect();
+    let mut batched = Vec::with_capacity(t_len * n_reads * layout.n_score);
+    for t in 0..t_len {
+        for read in &packed {
+            batched.extend_from_slice(&read[t * layout.n_score..(t + 1) * layout.n_score]);
+        }
+    }
+
+    let (mut got_logp, mut got_mean) = (Vec::new(), Vec::new());
+    let got_seqs = ctx
+        .decode_time_major_with_refs(
+            &batched,
+            t_len,
+            &alphabet,
+            &tables,
+            &mut got_logp,
+            &mut got_mean,
+        )
+        .expect("device scan");
+    assert_eq!(got_seqs.len(), n_reads);
+    assert_eq!(got_logp.len(), n_reads * refs.len());
+    assert_eq!(got_mean.len(), n_reads);
+
+    let backend = Backend::best_for(&layout);
+    let mut scratch = CrfScratch::new();
+    for n in 0..n_reads {
+        let mut want_logp = Vec::new();
+        let want_seq = decode_with_refs(
+            &layout,
+            &alphabet,
+            &packed[n],
+            t_len,
+            &mut scratch,
+            backend,
+            &chains,
+            &mut want_logp,
+        )
+        .unwrap();
+        let want_mean = scratch.path_score() / t_len as f32;
+
+        assert_eq!(got_seqs[n], want_seq, "read {n}: sequence differs");
+        for (r, want) in want_logp.iter().enumerate() {
+            let got = got_logp[n * refs.len() + r];
+            assert!(
+                (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                "read {n} ref {r}: log P {got} vs {want}"
+            );
+        }
+        assert!(
+            (got_mean[n] - want_mean).abs() <= 1e-3 * want_mean.abs().max(1.0),
+            "read {n}: mean_logpost {} vs {want_mean}",
+            got_mean[n]
+        );
+    }
+}

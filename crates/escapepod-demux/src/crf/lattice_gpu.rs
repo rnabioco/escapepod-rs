@@ -23,6 +23,7 @@ use cudarc::nvrtc::compile_ptx;
 use super::encoder::CrfError;
 use super::lattice::CrfLayout;
 use super::lattice_gpu_kernel as k;
+use super::refchain::RefChains;
 
 /// Threads per block for every kernel here.
 ///
@@ -36,6 +37,52 @@ const THREADS: usize = 256;
 /// Widest `n_edges` the kernels size their per-thread accumulators for
 /// (`CRF_MAX_EDGES`).
 const MAX_EDGES: usize = 8;
+
+/// Shared memory the reference scan will ask a block for.
+///
+/// It holds both of one read's chain-alpha buffers, so a panel fits when
+/// `2 * n_cells * 4` bytes do. 48 KB is the per-block default every CUDA
+/// architecture since Maxwell provides without an opt-in, which covers ~6 k
+/// cells against the shipped 16-plex's 961. A wider panel is refused at upload
+/// and keeps the CPU scan rather than raising the limit and depending on a
+/// device attribute at launch.
+const MAX_SHARED_BYTES: usize = 48 * 1024;
+
+/// A reference panel's scan tables, resident on the device.
+///
+/// Uploaded once per panel by [`CrfLatticeGpu::upload_ref_chains`] and reused
+/// for every batch; the panel does not change within a run.
+pub struct RefScanDev {
+    n_cells: usize,
+    n_start: usize,
+    n_refs: usize,
+    stay: cudarc::driver::CudaSlice<u32>,
+    move_off: cudarc::driver::CudaSlice<u32>,
+    move_src: cudarc::driver::CudaSlice<u32>,
+    move_score: cudarc::driver::CudaSlice<u32>,
+    finals: cudarc::driver::CudaSlice<u32>,
+}
+
+impl RefScanDev {
+    /// References scored per read — the width of one read's `ref_logp`.
+    pub fn n_refs(&self) -> usize {
+        self.n_refs
+    }
+}
+
+/// What a scoring decode reads and writes, beyond the sequences.
+///
+/// Grouped rather than passed as three parameters because the two outputs are
+/// only ever filled together, and only when `tables` is present: a decode
+/// either scores references or it does not.
+struct ScanArgs<'a> {
+    tables: &'a RefScanDev,
+    /// `batch * n_refs` values of `log P(reference | signal)`.
+    ref_logp: &'a mut Vec<f32>,
+    /// One mean per-timestep log-posterior per read, matching
+    /// `CrfScratch::path_score() / t_len` on the CPU path.
+    mean_logpost: &'a mut Vec<f32>,
+}
 
 /// How a score buffer packs its `(read, timestep)` rows.
 ///
@@ -234,6 +281,144 @@ impl CrfLatticeGpu {
         }
     }
 
+    /// Upload a panel's scan tables once, for reuse across every batch.
+    ///
+    /// They are a property of the reference panel, not of a batch — a few
+    /// hundred kilobytes that would otherwise be re-uploaded per call.
+    ///
+    /// Fails, rather than mis-launching, when the panel's two alpha buffers
+    /// would not fit in shared memory. The caller keeps the CPU scan for that
+    /// case, so a wide panel is slower and never wrong.
+    pub fn upload_ref_chains(&self, chains: &RefChains) -> Result<RefScanDev, CrfError> {
+        let t = chains.gpu_tables(&self.layout);
+        // The kernel accumulates a cell's terms in a fixed `float[CRF_MAX_EDGES]`,
+        // so an over-wide fan-in would smash its own stack rather than fail. The
+        // `n_edges` check in `new` already implies this bound (a move's source
+        // drops one of `n_base` bases, so fan-in <= n_edges - 1), but that
+        // coupling lives two types away from the array it protects.
+        let fan = t
+            .move_off
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .max()
+            .unwrap_or(0) as usize;
+        if fan + 1 > MAX_EDGES {
+            return Err(CrfError::Load(format!(
+                "reference chains have fan-in {fan}, over the {} the GPU scan accumulates",
+                MAX_EDGES - 1
+            )));
+        }
+        let need = t.n_cells * 2 * 4;
+        if need > MAX_SHARED_BYTES {
+            return Err(CrfError::Load(format!(
+                "reference panel needs {need} bytes of shared memory for the GPU scan \
+                 ({} cells), over the {MAX_SHARED_BYTES} this path allocates; the CPU \
+                 scan handles it",
+                t.n_cells
+            )));
+        }
+        let dev = |e: cudarc::driver::DriverError| CrfError::Load(e.to_string());
+        Ok(RefScanDev {
+            n_cells: t.n_cells,
+            n_start: t.n_start,
+            n_refs: chains.n_refs(),
+            stay: self.stream.clone_htod(&t.stay).map_err(dev)?,
+            move_off: self.stream.clone_htod(&t.move_off).map_err(dev)?,
+            move_src: self.stream.clone_htod(&t.move_src).map_err(dev)?,
+            move_score: self.stream.clone_htod(&t.move_score).map_err(dev)?,
+            finals: self.stream.clone_htod(&t.finals).map_err(dev)?,
+        })
+    }
+
+    /// [`decode_device_time_major`](Self::decode_device_time_major), also
+    /// scoring every reference against the same lattice.
+    ///
+    /// This is what keeps `--ref-scores` on the device. Without it that flag
+    /// copies the whole score tensor to the host and runs the CPU decode, which
+    /// measured +57% wall and +5.5 cores while the card idled (#297).
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`decode_device_time_major`](Self::decode_device_time_major).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn decode_device_time_major_with_refs(
+        &self,
+        scores_dev: u64,
+        batch: usize,
+        t_len: usize,
+        alphabet: &[u8],
+        tables: &RefScanDev,
+        ref_logp: &mut Vec<f32>,
+        mean_logpost: &mut Vec<f32>,
+    ) -> Result<Vec<String>, CrfError> {
+        if alphabet.len() != self.layout.n_edges {
+            return Err(CrfError::Decode(format!(
+                "alphabet has {} symbols, expected {}",
+                alphabet.len(),
+                self.layout.n_edges
+            )));
+        }
+        ref_logp.clear();
+        mean_logpost.clear();
+        if batch == 0 || t_len == 0 {
+            return Ok(Vec::new());
+        }
+        self.launch(
+            Scores::Device(scores_dev),
+            batch,
+            t_len,
+            alphabet,
+            ScoreOrder::TimeMajor,
+            Some(ScanArgs {
+                tables,
+                ref_logp,
+                mean_logpost,
+            }),
+        )
+    }
+
+    /// [`decode_time_major`](Self::decode_time_major) with the reference scan,
+    /// for scores still on the host.
+    pub fn decode_time_major_with_refs(
+        &self,
+        scores: &[f32],
+        t_len: usize,
+        alphabet: &[u8],
+        tables: &RefScanDev,
+        ref_logp: &mut Vec<f32>,
+        mean_logpost: &mut Vec<f32>,
+    ) -> Result<Vec<String>, CrfError> {
+        let per_read = t_len * self.layout.n_score;
+        if per_read == 0 || !scores.len().is_multiple_of(per_read) {
+            return Err(CrfError::Decode(format!(
+                "score buffer is {} floats, not a multiple of t_len * n_score = {per_read}",
+                scores.len()
+            )));
+        }
+        ref_logp.clear();
+        mean_logpost.clear();
+        let batch = scores.len() / per_read;
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let mut work = self
+            .stream
+            .clone_htod(scores)
+            .map_err(|e| CrfError::Decode(e.to_string()))?;
+        self.launch(
+            Scores::Owned(&mut work),
+            batch,
+            t_len,
+            alphabet,
+            ScoreOrder::TimeMajor,
+            Some(ScanArgs {
+                tables,
+                ref_logp,
+                mean_logpost,
+            }),
+        )
+    }
+
     /// Decode scores that are **already on the device**, in onnxruntime's
     /// time-major `[t_len][batch][n_score]` order.
     ///
@@ -276,6 +461,7 @@ impl CrfLatticeGpu {
             t_len,
             alphabet,
             ScoreOrder::TimeMajor,
+            None,
         )
     }
 
@@ -295,7 +481,14 @@ impl CrfLatticeGpu {
             .stream
             .clone_htod(scores)
             .map_err(|e| CrfError::Decode(e.to_string()))?;
-        self.launch(Scores::Owned(&mut work), batch, t_len, alphabet, order)
+        self.launch(
+            Scores::Owned(&mut work),
+            batch,
+            t_len,
+            alphabet,
+            order,
+            None,
+        )
     }
 
     /// The kernel sequence, plus the guarantee that nothing is still running
@@ -320,8 +513,9 @@ impl CrfLatticeGpu {
         t_len: usize,
         alphabet: &[u8],
         order: ScoreOrder,
+        scan: Option<ScanArgs<'_>>,
     ) -> Result<Vec<String>, CrfError> {
-        let out = self.launch_kernels(scores, batch, t_len, alphabet, order);
+        let out = self.launch_kernels(scores, batch, t_len, alphabet, order, scan);
         if out.is_err() {
             let _ = self.stream.synchronize();
         }
@@ -329,6 +523,7 @@ impl CrfLatticeGpu {
     }
 
     /// The kernel sequence, over scores that are on the device either way.
+    #[allow(clippy::too_many_arguments)]
     fn launch_kernels(
         &self,
         scores: Scores<'_>,
@@ -336,6 +531,7 @@ impl CrfLatticeGpu {
         t_len: usize,
         alphabet: &[u8],
         order: ScoreOrder,
+        mut scan: Option<ScanArgs<'_>>,
     ) -> Result<Vec<String>, CrfError> {
         let CrfLayout {
             n_states,
@@ -352,6 +548,13 @@ impl CrfLatticeGpu {
         let mut alpha = self.stream.alloc_zeros::<f32>(lattice).map_err(dev)?;
         let mut beta = self.stream.alloc_zeros::<f32>(lattice).map_err(dev)?;
         let mut path = self.stream.alloc_zeros::<u8>(batch * t_len).map_err(dev)?;
+        // Only the scoring path reports `mean_logpost`, so only it pays for the
+        // buffer; the kernel takes a null pointer otherwise.
+        let null_dev: u64 = 0;
+        let mut score_buf = match &scan {
+            Some(_) => Some(self.stream.alloc_zeros::<f32>(batch * t_len).map_err(dev)?),
+            None => None,
+        };
 
         let (t_i, ns_i, ne_i, nb_i, g_i) = (
             t_len as i32,
@@ -390,6 +593,24 @@ impl CrfLatticeGpu {
             st_i,
             k::SEMIRING_LOG,
         )?;
+        // ---- The constrained reference scan, if asked for ----
+        //
+        // Here and nowhere else: it reads the *raw* scores, and the posterior
+        // kernel below overwrites them in place. Same constraint, same slot, as
+        // the CPU path's own scan.
+        if let Some(args) = &mut scan {
+            self.ref_scan(
+                &scores,
+                args.tables,
+                &alpha,
+                batch,
+                t_len,
+                sb_i,
+                st_i,
+                args.ref_logp,
+            )?;
+        }
+
         {
             let floor = super::lattice::POSTERIOR_FLOOR;
             let f = self.func(k::POSTERIOR_KERNEL_NAME)?;
@@ -427,10 +648,12 @@ impl CrfLatticeGpu {
             let f = self.func(k::VITERBI_KERNEL_NAME)?;
             let mut b = self.stream.launch_builder(&f);
             push_scores(&mut b, &scores);
-            b.arg(&alpha)
-                .arg(&beta)
-                .arg(&mut path)
-                .arg(&t_i)
+            b.arg(&alpha).arg(&beta).arg(&mut path);
+            match &mut score_buf {
+                Some(buf) => b.arg(buf),
+                None => b.arg(&null_dev),
+            };
+            b.arg(&t_i)
                 .arg(&ns_i)
                 .arg(&ne_i)
                 .arg(&nb_i)
@@ -442,6 +665,18 @@ impl CrfLatticeGpu {
 
         self.stream.synchronize().map_err(dev)?;
         let host_path = self.stream.clone_dtoh(&path).map_err(dev)?;
+
+        // `path_score` per read: the max over timesteps, matching
+        // `CrfScratch::path_score`. `batch * t_len` floats is 614 KB at batch
+        // 512 — a thousandth of the score tensor this path exists not to copy.
+        if let (Some(buf), Some(out)) = (&score_buf, &mut scan) {
+            let raw = self.stream.clone_dtoh(buf).map_err(dev)?;
+            out.mean_logpost.clear();
+            out.mean_logpost.extend(raw.chunks(t_len).map(|c| {
+                let best = c.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                best / (t_len.max(1) as f32)
+            }));
+        }
 
         Ok(host_path
             .chunks(t_len)
@@ -455,6 +690,79 @@ impl CrfLatticeGpu {
                 s
             })
             .collect())
+    }
+
+    /// Launch the constrained scan and bring back `log P(reference | signal)`.
+    ///
+    /// Normalisation by `logZ_full` happens inside the kernel, so the only
+    /// thing crossing PCIe is `batch * n_refs` floats — **32 KB at batch 512
+    /// and a 16-plex**, against the 786 MB of raw scores the host scan needs.
+    /// Doing it on the host instead would mean gathering `alpha`'s last row per
+    /// read, which is a strided read over a 157 MB buffer: larger than the
+    /// transfer this path exists to remove.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_scan(
+        &self,
+        scores: &Scores<'_>,
+        tables: &RefScanDev,
+        alpha: &cudarc::driver::CudaSlice<f32>,
+        batch: usize,
+        t_len: usize,
+        sb: i32,
+        st: i32,
+        out: &mut Vec<f32>,
+    ) -> Result<(), CrfError> {
+        let dev = |e: cudarc::driver::DriverError| CrfError::Decode(e.to_string());
+        let n_states = self.layout.n_states;
+        let n_refs = tables.n_refs;
+
+        let mut logp = self
+            .stream
+            .alloc_zeros::<f32>(batch * n_refs)
+            .map_err(dev)?;
+
+        // One block per read, both alpha buffers on chip. A grid-stride loop
+        // over cells means the block width does not have to reach `n_cells`.
+        let threads = tables.n_cells.min(THREADS) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (batch as u32, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: (tables.n_cells * 2 * 4) as u32,
+        };
+        let (t_i, nsc_i, nsg_i, nc_i, nst_i, nr_i) = (
+            t_len as i32,
+            self.layout.n_score as i32,
+            n_states as i32,
+            tables.n_cells as i32,
+            tables.n_start as i32,
+            n_refs as i32,
+        );
+        {
+            let f = self.func(k::REFSCAN_KERNEL_NAME)?;
+            let mut b = self.stream.launch_builder(&f);
+            push_scores(&mut b, scores);
+            b.arg(alpha)
+                .arg(&tables.stay)
+                .arg(&tables.move_off)
+                .arg(&tables.move_src)
+                .arg(&tables.move_score)
+                .arg(&tables.finals)
+                .arg(&mut logp)
+                .arg(&t_i)
+                .arg(&nsc_i)
+                .arg(&nsg_i)
+                .arg(&nc_i)
+                .arg(&nst_i)
+                .arg(&nr_i)
+                .arg(&sb)
+                .arg(&st);
+            unsafe { b.launch(cfg) }.map_err(dev)?;
+        }
+
+        // Only the normalised scores come back: batch * n_refs floats.
+        self.stream.synchronize().map_err(dev)?;
+        *out = self.stream.clone_dtoh(&logp).map_err(dev)?;
+        Ok(())
     }
 
     /// The fused forward+backward launch: one grid, `blockIdx.y` picking the

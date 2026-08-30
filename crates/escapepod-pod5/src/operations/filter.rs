@@ -115,7 +115,7 @@ impl Default for FilterOptions {
     fn default() -> Self {
         Self {
             signal_batch_size: 1_000,
-            read_batch_size: 10_000,
+            read_batch_size: 1_000,
             durability: Durability::default(),
         }
     }
@@ -443,7 +443,12 @@ fn assemble_output(
         }
     }
 
-    let reads_table_bytes = build_reads_table_remapped(&flat_reads, &all_run_infos, &schema_meta)?;
+    let reads_table_bytes = build_reads_table_remapped(
+        &flat_reads,
+        &all_run_infos,
+        &schema_meta,
+        options.read_batch_size as usize,
+    )?;
 
     // Free the borrow refs before the (large) reads_table_bytes buffer
     // hits the writer, so peak RSS is dominated by the IPC-encoded form

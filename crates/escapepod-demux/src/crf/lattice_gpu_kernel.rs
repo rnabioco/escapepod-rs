@@ -50,6 +50,7 @@
 pub const SWEEP_KERNEL_NAME: &str = "crf_sweep_kernel";
 pub const POSTERIOR_KERNEL_NAME: &str = "crf_posterior_kernel";
 pub const VITERBI_KERNEL_NAME: &str = "crf_viterbi_kernel";
+pub const REFSCAN_KERNEL_NAME: &str = "crf_refscan_kernel";
 
 /// Semiring selector shared with the host side.
 pub const SEMIRING_LOG: i32 = 0;
@@ -263,6 +264,7 @@ void crf_viterbi_kernel(
     const float* __restrict__ alpha,
     const float* __restrict__ beta,
     unsigned char* __restrict__ path,
+    float*         __restrict__ path_score,
     int t_len, int n_states, int n_edges, int n_base, int group,
     int stride_b, int stride_t)
 {
@@ -311,6 +313,134 @@ void crf_viterbi_kernel(
         // fixes (see CrfLayout::emitted_base).
         path[(long long)b * t_len + t] =
             (edge == 0) ? (unsigned char)0 : (unsigned char)(1 + (dest % n_base));
+        // The winning edge score is the best path's total, identical at every
+        // timestep in exact arithmetic. `CrfScratch::path_score` takes the max
+        // over t rather than trusting one, so float noise cannot make it depend
+        // on which timestep was read; the host does that reduction over this.
+        // `path_score` is null when the caller does not want it.
+        if (path_score != 0) path_score[(long long)b * t_len + t] = rval[0];
+    }
+}
+
+// -------------------------------------------------------------------------
+// Constrained reference scan: log P(reference | signal) for every reference,
+// from the *raw* scores, on the device.
+//
+// This is `RefChains::forward` with the batch axis added, and it exists so
+// `--ref-scores` stops dragging the whole decode back to the host. Without it
+// the scoring path copies the entire score tensor out (1.5 MB per read) and
+// runs the CPU lattice decode, which is why that flag measured +57% wall and
+// +5.5 cores while the device idled (#297).
+//
+// Placement is forced: the scan needs the raw scores, and `crf_posterior_kernel`
+// overwrites them in place with the pass-1 log-posteriors. It runs between the
+// two, exactly where the CPU path runs it and for the same reason.
+//
+// One block per read, a grid-stride loop over cells, and both alpha buffers in
+// shared memory. Cells are only ~1 k floats, so double-buffering them costs
+// ~8 KB of shared and the whole t-sweep stays on chip; the host falls back to
+// the CPU scan when they would not fit. A single __syncthreads() per timestep
+// is enough because reads and writes go to *different* buffers within a step —
+// unlike `crf_sweep_kernel`, which overwrites the row it reads.
+//
+// Indices arrive in the encoder's native `dest * n_edges + edge` order. The CPU
+// scan's are into its transposed row instead; the host converts on upload,
+// because this kernel deliberately never builds a transposed copy (see the
+// module note).
+//
+// `logsumexp` is transcribed term for term from the scalar reference, down to
+// seeding the sum at 1.0 and skipping the max's own index: the output is a
+// continuous score a user thresholds with `--min-crf-margin`, not an argmax, so
+// it is worth staying as close to the reference as the reassociation allows.
+// -------------------------------------------------------------------------
+extern "C" __global__
+void crf_refscan_kernel(
+    const float*        __restrict__ scores,
+    const float*        __restrict__ alpha,
+    const unsigned int* __restrict__ stay,
+    const unsigned int* __restrict__ move_off,
+    const unsigned int* __restrict__ move_src,
+    const unsigned int* __restrict__ move_score,
+    const unsigned int* __restrict__ finals,
+    float*              __restrict__ out,
+    int t_len, int n_score, int n_states, int n_cells, int n_start, int n_refs,
+    int stride_b, int stride_t)
+{
+    extern __shared__ float sh[];
+    float* cur  = sh;
+    float* next = sh + n_cells;
+
+    int b = blockIdx.x;
+    long long row_b = (long long)b * stride_b;
+
+    // Chain position 0 is every legal start; everything else is unreachable
+    // until a move gets there.
+    for (int c = threadIdx.x; c < n_cells; c += blockDim.x) {
+        cur[c] = (c < n_start) ? 0.0f : -CRF_INF;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < t_len; ++t) {
+        const float* row = scores + (row_b + (long long)t * stride_t) * n_score;
+        for (int c = threadIdx.x; c < n_cells; c += blockDim.x) {
+            float terms[CRF_MAX_EDGES];
+            int n = 0;
+            terms[n++] = cur[c] + row[stay[c]];
+            unsigned int lo = move_off[c];
+            unsigned int hi = move_off[c + 1];
+            for (unsigned int i = lo; i < hi; ++i) {
+                terms[n++] = cur[move_src[i]] + row[move_score[i]];
+            }
+
+            // logsumexp, transcribed from the scalar reference: first strict
+            // max wins, sum starts at 1.0 for that term, the rest are shifted.
+            float m = -CRF_INF;
+            int at = 0;
+            for (int j = 0; j < n; ++j) {
+                if (terms[j] > m) { m = terms[j]; at = j; }
+            }
+            if (!crf_finite(m)) {
+                next[c] = m;
+                continue;
+            }
+            float sum = 1.0f;
+            for (int j = 0; j < n; ++j) {
+                if (j != at) sum += expf(terms[j] - m);
+            }
+            next[c] = m + logf(sum);
+        }
+        __syncthreads();
+        float* tmp = cur; cur = next; next = tmp;
+    }
+
+    // logZ_full, normalising the chain's raw finals into log P(ref | signal).
+    //
+    // Computed here rather than on the host so nothing but `n_refs` floats per
+    // read leaves the device: `alpha`'s last row alone would be a strided
+    // gather over 157 MB at batch 512, which is the transfer this whole path
+    // exists to remove. One thread does it because it is 256 values once per
+    // read against 300 * n_cells inside the loop, and a sequential reduction is
+    // what `Semiring::Log::reduce` does — max, then sum every term including
+    // the max's own.
+    __shared__ float logz;
+    if (threadIdx.x == 0) {
+        const float* a = alpha + ((long long)b * (t_len + 1) + t_len) * n_states;
+        float m = -CRF_INF;
+        for (int i = 0; i < n_states; ++i) {
+            if (a[i] > m) m = a[i];
+        }
+        if (!crf_finite(m)) {
+            logz = m;
+        } else {
+            float sum = 0.0f;
+            for (int i = 0; i < n_states; ++i) sum += expf(a[i] - m);
+            logz = m + logf(sum);
+        }
+    }
+    __syncthreads();
+
+    for (int r = threadIdx.x; r < n_refs; r += blockDim.x) {
+        out[(long long)b * n_refs + r] = cur[finals[r]] - logz;
     }
 }
 "#;

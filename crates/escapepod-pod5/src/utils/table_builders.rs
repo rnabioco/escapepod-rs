@@ -432,6 +432,7 @@ pub(crate) fn build_reads_table(
     reads: &[(ReadData, Vec<u64>)],
     run_infos: &[RunInfoData],
     meta: &SchemaMetadata,
+    rows_per_batch: usize,
 ) -> Result<Vec<u8>> {
     let schema = Arc::new(meta.apply(reads_schema()));
 
@@ -618,7 +619,7 @@ pub(crate) fn build_reads_table(
     let mut buffer = Vec::new();
     {
         let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
-        writer.write(&batch)?;
+        write_reads_in_batches(&mut writer, &batch, rows_per_batch)?;
         writer.finish()?;
     }
 
@@ -627,8 +628,9 @@ pub(crate) fn build_reads_table(
 
 /// Lazy-remap reads-table builder for `filter`.
 ///
-/// Mirrors `build_reads_table` (single record batch, parallel partition
-/// build, dictionary collection across the whole input) but consumes
+/// Mirrors `build_reads_table` (parallel partition build, dictionary
+/// collection across the whole input, then `rows_per_batch` record batches on
+/// the way out) but consumes
 /// `FlatReadRef`s — borrowed source `ReadData`s plus the per-read
 /// signal-row prefix-sum offset and a borrow of the source's run-info
 /// table — so the caller never has to materialize a `Vec<ProcessedRead>`.
@@ -645,6 +647,7 @@ pub(crate) fn build_reads_table_remapped(
     flat: &[crate::utils::pod5_assembler::FlatReadRef<'_>],
     all_run_infos: &[RunInfoData],
     meta: &SchemaMetadata,
+    rows_per_batch: usize,
 ) -> Result<Vec<u8>> {
     let schema = Arc::new(meta.apply(reads_schema()));
 
@@ -818,11 +821,47 @@ pub(crate) fn build_reads_table_remapped(
     let mut buffer = Vec::new();
     {
         let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
-        writer.write(&batch)?;
+        write_reads_in_batches(&mut writer, &batch, rows_per_batch)?;
         writer.finish()?;
     }
 
     Ok(buffer)
+}
+
+/// Write `batch` as a sequence of record batches of at most `rows` rows each.
+///
+/// Real POD5 files are written in batches of this order: measured, MinKNOW
+/// uses ~10,000 reads per batch (1,575,748 in 158) and the pod5 Python package
+/// uses exactly 1,000 (17,919,658 in 17,920). Consumers assume that shape —
+/// `demux`'s reader shards work by batch index and only emits a block at a
+/// batch boundary, so a table written as *one* batch, whatever its size, is
+/// read by a single thread and hands nothing downstream until the whole file
+/// has been decoded (#297).
+///
+/// The default follows the Python package rather than MinKNOW: 1,000 keeps
+/// enough batches to shard on small outputs, where 10,000 would leave a
+/// 40,000-read filter result with four.
+///
+/// `RecordBatch::slice` is zero-copy — it adjusts array offsets — so splitting
+/// here is cheaper than the concatenation that produced `batch` in the first
+/// place. Dictionary columns share one dictionary across the batches, which is
+/// what the IPC writer already does for `Writer`'s output.
+fn write_reads_in_batches<W: std::io::Write>(
+    writer: &mut ArrowFileWriter<W>,
+    batch: &RecordBatch,
+    rows: usize,
+) -> Result<()> {
+    // A zero would loop forever; the callers' options are `u32` and a 0 there
+    // means "unset" rather than "one batch per zero rows".
+    let rows = rows.max(1);
+    let total = batch.num_rows();
+    let mut offset = 0;
+    while offset < total {
+        let len = rows.min(total - offset);
+        writer.write(&batch.slice(offset, len))?;
+        offset += len;
+    }
+    Ok(())
 }
 
 /// Build POD5 FlatBuffer footer using the generated FlatBuffer types.

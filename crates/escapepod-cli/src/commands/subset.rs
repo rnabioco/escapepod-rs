@@ -69,7 +69,7 @@ pub fn run(
 
     let options = FilterOptions {
         signal_batch_size: 1_000,
-        read_batch_size: 10_000,
+        read_batch_size: 1_000,
         durability,
     };
 

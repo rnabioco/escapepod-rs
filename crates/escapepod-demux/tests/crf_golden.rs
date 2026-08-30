@@ -184,3 +184,87 @@ fn fixture_was_cross_checked_against_decode_batch() {
         );
     }
 }
+
+/// Decoding a read out of a batched, time-major buffer must equal decoding the
+/// same read from its own packed one.
+///
+/// The GPU scoring path takes the strided route: the encoder's output is
+/// `[t, batch, n_score]`, every row is contiguous, and only the distance
+/// between timesteps differs. It used to gather each read's rows into a private
+/// buffer first — 1.5 MB copied in and out per read, purely to change a stride
+/// (#297). Nothing about the decode changed, so a divergence here would be a
+/// stride computed wrong, which produces a *plausible* sequence off another
+/// read's data rather than an error.
+///
+/// Built as a real interleaved batch so a wrong stride reads a neighbour's
+/// scores instead of running off the end.
+#[test]
+fn strided_decode_matches_packed() {
+    use escapepod_demux::crf::{RefChains, decode_with_refs, decode_with_refs_strided};
+
+    let fixture = golden();
+    let layout = layout_from(&fixture);
+    let alphabet: Vec<u8> = fixture["seqdist"]["alphabet"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().as_bytes()[0])
+        .collect();
+    let f = &fixture["formula"];
+    let t_len = f["T"].as_u64().unwrap() as usize;
+    let n_reads = f["N"].as_u64().unwrap() as usize;
+    assert!(n_reads > 1, "a single-read batch cannot catch a bad stride");
+
+    let packed: Vec<Vec<f32>> = (0..n_reads).map(|n| synthesize(f, n)).collect();
+
+    // Interleave into `[t, batch, n_score]`, the encoder's own layout.
+    let mut batched = Vec::with_capacity(t_len * n_reads * layout.n_score);
+    for t in 0..t_len {
+        for read in &packed {
+            batched.extend_from_slice(&read[t * layout.n_score..(t + 1) * layout.n_score]);
+        }
+    }
+
+    // Reference panel: any sequences will do, the point is that `ref_logp`
+    // agrees, and it is a per-timestep scan over exactly the scores in question.
+    let refs = ["ACGTACGTACGT", "TTTTGGGGCCCC", "GATTACAGATTACA"];
+    let chains = RefChains::build(&layout, &alphabet, &refs.map(|s| s.as_bytes())).unwrap();
+
+    for backend in Backend::all_supported(&layout) {
+        let mut scratch = CrfScratch::new();
+        for n in 0..n_reads {
+            let mut want_logp = Vec::new();
+            let want = decode_with_refs(
+                &layout,
+                &alphabet,
+                &packed[n],
+                t_len,
+                &mut scratch,
+                backend,
+                &chains,
+                &mut want_logp,
+            )
+            .unwrap();
+
+            let mut got_logp = Vec::new();
+            let got = decode_with_refs_strided(
+                &layout,
+                &alphabet,
+                &batched[n * layout.n_score..],
+                t_len,
+                n_reads * layout.n_score,
+                &mut scratch,
+                backend,
+                &chains,
+                &mut got_logp,
+            )
+            .unwrap();
+
+            assert_eq!(got, want, "read {n}, backend {backend:?}: sequence differs");
+            assert_eq!(
+                got_logp, want_logp,
+                "read {n}, backend {backend:?}: ref_logp differs"
+            );
+        }
+    }
+}

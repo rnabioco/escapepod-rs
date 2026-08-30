@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The reads table is written in batches again, instead of one batch per file**
+  (#297). `filter`, `merge`, `subset` and `split` build the reads table with
+  `build_reads_table{,_remapped}` rather than `Writer`, and those wrote the
+  whole table as a single Arrow record batch however large it was — so
+  `read_batch_size` on `FilterOptions`/`MergeOptions`/`SubsetOptions` was
+  declared, defaulted, and never read. `escpod filter` asking for 10,000 rows
+  per batch wrote 40,000 reads as **one**.
+
+  Measured, for scale: MinKNOW writes ~10,000 reads per batch (1,575,748 in
+  158) and the pod5 Python package exactly 1,000 (17,919,658 in 17,920).
+  Neither writes a whole file as one batch.
+
+  It is not cosmetic for anything that reads escpod's output back. `demux`
+  shards its reader threads by batch index and only emits a block at a batch
+  boundary, so a single-batch file is read by exactly one thread whatever
+  `ESCAPEPOD_DEMUX_FILLERS` says, and nothing reaches the GPU until the entire
+  file has been decoded. On a 100k-read escpod-written file that was 11.2 s of
+  a 19 s stage with the card idle, and it made every tuning knob look flat.
+  Fixing it took that stage to 11.3 s with the first block arriving in 0.3 s
+  and GPU utilisation going from 22-30% to ~60%.
+
+  Every default is now 1,000, and the five CLI sites that overrode it (merge at
+  100,000, the rest at 10,000) inherit it, so the geometry has one definition.
+  Note this never affected MinKNOW input, which was already many-batched:
+  measured on a real 1.3M-read run, GPU utilisation is ~94% and the first block
+  arrives in 0.4 s both before and after.
+
+### Performance
+
+- **The CRF encoder pool uses every visible GPU instead of reserving one for
+  adapter detection** (#297). Detection is ~5% of device time since #187, so
+  holding a whole card for it left that card 12% busy on two GPUs and 27% on
+  four while the lone encoder device pinned at 93%. Measured on a real 1.3M-read
+  run, interleaved, 2 reps:
+
+  ```text
+  GPUs   reserve device 0            encode everywhere        vs 1 GPU
+    1    162.5 s  (gpu0 88%)         same policy              --
+    2    136.6 s  (12% / 93%)         80.8 s  (88% / 88%)     1.19x -> 2.01x
+    4     56.7 s  (27% / 75%)         55.3 s  (72% / 58-66%)  2.86x -> 2.94x
+  ```
+
+  Two GPUs go from 1.19x to **2.01x**. Four are a wash — the pool was already
+  wide enough there.
+
+- **`--ref-scores` runs its reference scan on the GPU instead of on the host**
+  (#297). The flag that gates production demuxing was the one configuration
+  with no GPU decode path: `try_run_and_decode_with_refs` always copied the
+  whole score tensor back and ran the CPU lattice decode, where the plain path
+  decodes on the device and never copies at all. Over the isolated CRF stage on
+  100k reads that was 19.7 s at 656% CPU against 12.4 s at 114% without the
+  flag — +57% wall for five and a half extra cores, with the card idle.
+
+  The constrained scan is now a CUDA kernel (the one #241 left unwritten): one
+  block per read, a grid-stride loop over chain cells, both alpha buffers
+  double-buffered in shared memory, and `logZ_full` reduced on the device so
+  only `n_refs` floats per read come back rather than a strided gather over a
+  157 MB alpha buffer. It runs between the two decode passes by necessity, not
+  by choice — it needs the raw scores that pass 1 overwrites in place.
+
+  End to end on one A30 over 100k reads, arms interleaved in one allocation:
+  **38.7 s → 31.5 s wall (1.23x), and 5.9 cores → 1.3 cores.** Barcode calls are
+  identical for all 100,654 reads; `crf_logp`, `crf_margin` and `mean_logpost`
+  agree to 2e-4, which is the output's own print precision.
+
+  Note this does **not** close #297. GPU utilisation is unchanged at ~22%, so
+  removing 4.5 cores of host work from the critical path bought only 20% wall.
+  That is evidence for the issue's "overlap-bound, not throughput-bound"
+  framing: the pipeline is waiting on something structural, not on compute.
+
+  A panel that does not fit the kernel's shared memory, or whose fan-in exceeds
+  the fixed accumulator, falls back to the CPU scan — slower, never wrong.
+
 ## 0.17.2 (2026-08-29)
 
 ### Fixed

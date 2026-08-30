@@ -93,15 +93,31 @@
 //! size triggers a ~15 s engine rebuild.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
 
 use super::encoder::{CrfError, CrfMetadata};
-use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs};
+use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs_strided};
 use super::refchain::{RefChains, ScoredDecode};
+
+/// A cheap identity for a reference panel, so the device scan tables can be
+/// cached without assuming the caller never changes panels.
+///
+/// Built from the chain geometry and every reference's terminal cell — a panel
+/// that differs in any reference differs in a final, since that is the cell its
+/// last base lands on. Reused tables for the wrong panel would score reads
+/// confidently against references they were never compared to, which nothing
+/// downstream could detect, so this errs toward rebuilding.
+#[cfg(feature = "gpu")]
+fn panel_fingerprint(chains: &RefChains) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    chains.fingerprint_parts().hash(&mut h);
+    h.finish()
+}
 
 /// Rows one device may have in flight across *all* encoders sharing it.
 ///
@@ -119,6 +135,24 @@ pub const DEVICE_ROW_BUDGET: usize = 1024;
 /// otherwise. Two is what the fused pipeline runs, and assuming it keeps the
 /// out-of-the-box batch at the 512 rows every caller used before the budget
 /// existed.
+///
+/// # Two is measured, not assumed — do not "simplify" it to one
+///
+/// Total worker-seconds inside encode+decode grow linearly with the worker
+/// count at flat wall (2/4/6/8 workers on one A30: 28.2 / 28.2 / 26.1 / 31.0 s),
+/// which reads like pure contention and suggests the second worker is
+/// overhead. It is not. Against one worker on the same card, interleaved, the
+/// fused pipeline over 100 k reads (#297):
+///
+/// ```text
+/// workers=1   41.9 s / 48.3 s   GPU 19% / 17%
+/// workers=2   35.3 s / 40.0 s   GPU 25% / 21%
+/// ```
+///
+/// The second worker is worth ~16% and lifts device utilisation, because what
+/// it overlaps is the *other* worker's per-call setup rather than adding
+/// parallel device compute. Past two the row budget splits faster than the
+/// overlap pays for itself, which is the flat sweep above.
 pub const DEFAULT_WORKERS_PER_DEVICE: usize = 2;
 
 /// Reads per onnxruntime call before splitting, for one encoder that shares its
@@ -163,6 +197,20 @@ pub struct CrfEncoderGpu {
     /// host cost, so which one is running is worth reporting rather than
     /// discovering from a benchmark.
     lattice: Option<super::lattice_gpu::CrfLatticeGpu>,
+    /// The reference panel's scan tables, resident on the device, with the
+    /// fingerprint of the panel they were built from.
+    ///
+    /// A run scores one panel, so this is uploaded on the first scoring batch
+    /// and reused. It is keyed rather than assumed: a caller that switches
+    /// panels mid-encoder gets a rebuild instead of another panel's chains,
+    /// which would score confidently against the wrong references. `None` after
+    /// an attempt means the panel does not fit the kernel and the CPU scan runs.
+    ///
+    /// `Arc` so the guard is released before the encode rather than held across
+    /// it. Each worker owns its own encoder today, so the lock is uncontended
+    /// either way — but a shared encoder would then serialize every worker on a
+    /// multi-second GPU call, and nothing in the type would say so.
+    ref_scan: Mutex<Option<(u64, Arc<super::lattice_gpu::RefScanDev>)>>,
     /// Why [`Self::lattice`] is `None`, when it is.
     decode_fallback: Option<String>,
     /// The graph's output name, resolved once so the IoBinding does not have to
@@ -307,6 +355,7 @@ impl CrfEncoderGpu {
                 DEFAULT_WORKERS_PER_DEVICE,
             )),
             lattice,
+            ref_scan: Mutex::new(None),
             decode_fallback,
             output_name,
             device,
@@ -405,7 +454,7 @@ impl CrfEncoderGpu {
         };
         let probe = vec![0f32; self.meta.signal.chunk];
         let rows: Vec<&[f32]> = vec![probe.as_slice()];
-        if let Err(e) = self.run_zero_copy(&rows, lattice) {
+        if let Err(e) = self.run_zero_copy(&rows, lattice, None) {
             self.zero_copy = false;
             self.zero_copy_fallback = Some(e.to_string());
         }
@@ -534,7 +583,7 @@ impl CrfEncoderGpu {
         // axis nor the per-timestep [dest][edge] order.
         if let Some(lattice) = &self.lattice {
             if self.zero_copy {
-                return self.run_zero_copy(rows, lattice);
+                return self.run_zero_copy(rows, lattice, None);
             }
             return self.run_raw(rows, |data, t_len, _batch, _n_score| {
                 lattice.decode_time_major(data, t_len, &self.alphabet)
@@ -587,6 +636,11 @@ impl CrfEncoderGpu {
         &self,
         rows: &[&[f32]],
         lattice: &super::lattice_gpu::CrfLatticeGpu,
+        scan: Option<(
+            &super::lattice_gpu::RefScanDev,
+            &mut Vec<f32>,
+            &mut Vec<f32>,
+        )>,
     ) -> Result<Vec<String>, CrfError> {
         use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
         use ort::value::{DynTensorValueType, ValueType};
@@ -679,7 +733,22 @@ impl CrfEncoderGpu {
         // else aliases it while the session lock is held. The decode overwrites
         // it in place with the log-posteriors, which is sound because we are its
         // only reader and onnxruntime fully rewrites the buffer on the next run.
-        unsafe { lattice.decode_device_time_major(ptr, batch, t_len, &self.alphabet) }
+        match scan {
+            // SAFETY: as above. The scan reads the same buffer before pass 1
+            // overwrites it and introduces no aliasing of its own.
+            Some((tables, logp, mean)) => unsafe {
+                lattice.decode_device_time_major_with_refs(
+                    ptr,
+                    batch,
+                    t_len,
+                    &self.alphabet,
+                    tables,
+                    logp,
+                    mean,
+                )
+            },
+            None => unsafe { lattice.decode_device_time_major(ptr, batch, t_len, &self.alphabet) },
+        }
     }
 
     /// Encode one batch on the device and decode it on the CPU, halving and
@@ -721,12 +790,15 @@ impl CrfEncoderGpu {
     /// [`Self::basecall_batch`], additionally scoring every reference in
     /// `chains` against each read (`log P(reference | signal)`).
     ///
-    /// The encoder still runs on the device — it is 91% of the pipeline — but
-    /// the decode comes back to the host even when a CUDA lattice is
-    /// available, because the constrained scan reads the raw scores and only
-    /// the host decode has them. Scoring on the device is a separate kernel and
-    /// a separate change (#241); this keeps the expensive half accelerated
-    /// rather than making `--gpu` and reference scoring mutually exclusive.
+    /// Fully on the device when a CUDA lattice is available: the scan is its
+    /// own kernel, running between the two decode passes because it needs the
+    /// raw scores that pass 1 overwrites (#241). Only `n_refs` floats per read
+    /// come back.
+    ///
+    /// It falls back to the host decode when the panel does not fit the
+    /// kernel's shared memory, and on a CPU-lattice build. That path copies
+    /// the whole score tensor out and cost +57% wall and +5.5 cores when it
+    /// was the only path there was (#297) — worth avoiding, still correct.
     pub fn basecall_batch_with_refs(
         &self,
         prepped: &[Option<Vec<f32>>],
@@ -780,41 +852,95 @@ impl CrfEncoderGpu {
         backend: Backend,
         chains: &RefChains,
     ) -> Result<Vec<ScoredDecode>, CrfError> {
+        // The device path, when there is one. Without it `--ref-scores` copies
+        // the whole score tensor to the host and runs the CPU decode: measured
+        // at +57% wall and +5.5 cores with the card idle (#297). With it, only
+        // `batch * n_refs` floats plus one path score per read come back.
+        if let Some(lattice) = &self.lattice {
+            let tables = {
+                let mut cache = self
+                    .ref_scan
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let want = panel_fingerprint(chains);
+                if cache.as_ref().is_none_or(|(fp, _)| *fp != want) {
+                    // A panel too wide for the kernel's shared memory fails
+                    // here, which is not fatal — it means the CPU scan below.
+                    *cache = lattice
+                        .upload_ref_chains(chains)
+                        .ok()
+                        .map(|t| (want, Arc::new(t)));
+                }
+                cache.as_ref().map(|(_, t)| Arc::clone(t))
+            };
+            if let Some(tables) = tables {
+                let tables = tables.as_ref();
+                let (mut logp, mut mean) = (Vec::new(), Vec::new());
+                let seqs = if self.zero_copy {
+                    self.run_zero_copy(rows, lattice, Some((tables, &mut logp, &mut mean)))?
+                } else {
+                    self.run_raw(rows, |data, t_len, _batch, _n_score| {
+                        lattice.decode_time_major_with_refs(
+                            data,
+                            t_len,
+                            &self.alphabet,
+                            tables,
+                            &mut logp,
+                            &mut mean,
+                        )
+                    })?
+                };
+                let n_refs = tables.n_refs();
+                let bad = |what: &str| CrfError::Decode(format!("reference scan returned {what}"));
+                return seqs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(b, sequence)| {
+                        Ok(ScoredDecode {
+                            sequence,
+                            ref_logp: logp
+                                .get(b * n_refs..(b + 1) * n_refs)
+                                .ok_or_else(|| bad("fewer score rows than reads"))?
+                                .to_vec(),
+                            mean_logpost: *mean
+                                .get(b)
+                                .ok_or_else(|| bad("fewer path scores than reads"))?,
+                        })
+                    })
+                    .collect();
+            }
+        }
+
         self.run_raw(rows, |data, t_len, batch, n_score| {
             (0..batch)
                 .into_par_iter()
-                .map_init(
-                    || {
-                        (
-                            CrfScratch::new(),
-                            Vec::<f32>::with_capacity(t_len * n_score),
-                        )
-                    },
-                    |(scratch, buf), b| {
-                        buf.clear();
-                        for t in 0..t_len {
-                            let off = (t * batch + b) * n_score;
-                            buf.extend_from_slice(&data[off..off + n_score]);
-                        }
-                        let mut ref_logp = Vec::with_capacity(chains.len());
-                        let sequence = decode_with_refs(
-                            &self.layout,
-                            &self.alphabet,
-                            buf.as_slice(),
-                            t_len,
-                            scratch,
-                            backend,
-                            chains,
-                            &mut ref_logp,
-                        )
-                        .map_err(|e| CrfError::Decode(e.to_string()))?;
-                        Ok(ScoredDecode {
-                            sequence,
-                            ref_logp,
-                            mean_logpost: scratch.path_score() / t_len.max(1) as f32,
-                        })
-                    },
-                )
+                .map_init(CrfScratch::new, |scratch, b| {
+                    // Decode straight out of the time-major buffer. Read `b`'s
+                    // rows live at `(t * batch + b) * n_score` and are each
+                    // contiguous, so the decode only needs the stride between
+                    // them — it copies every row into its own scratch anyway.
+                    // Gathering them into a private buffer first cost 1.5 MB
+                    // read plus 1.5 MB written per read, ~1.5 GB per 512-read
+                    // call, to change a stride and nothing else (#297).
+                    let mut ref_logp = Vec::with_capacity(chains.len());
+                    let sequence = decode_with_refs_strided(
+                        &self.layout,
+                        &self.alphabet,
+                        &data[b * n_score..],
+                        t_len,
+                        batch * n_score,
+                        scratch,
+                        backend,
+                        chains,
+                        &mut ref_logp,
+                    )
+                    .map_err(|e| CrfError::Decode(e.to_string()))?;
+                    Ok(ScoredDecode {
+                        sequence,
+                        ref_logp,
+                        mean_logpost: scratch.path_score() / t_len.max(1) as f32,
+                    })
+                })
                 .collect()
         })
     }

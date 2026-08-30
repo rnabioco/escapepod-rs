@@ -26,7 +26,7 @@ impl Default for RepackOptions {
     fn default() -> Self {
         Self {
             signal_batch_size: 1_000,
-            read_batch_size: 10_000,
+            read_batch_size: 1_000,
             force: false,
             durability: Durability::default(),
         }
@@ -194,7 +194,7 @@ mod tests {
     fn test_repack_options_default() {
         let options = RepackOptions::default();
         assert_eq!(options.signal_batch_size, 1_000);
-        assert_eq!(options.read_batch_size, 10_000);
+        assert_eq!(options.read_batch_size, 1_000);
         assert!(!options.force);
     }
 }

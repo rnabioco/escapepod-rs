@@ -37,7 +37,7 @@ impl Default for MergeOptions {
     fn default() -> Self {
         Self {
             duplicate_ok: false,
-            read_batch_size: 100_000,
+            read_batch_size: 1_000,
             durability: Durability::default(),
         }
     }
@@ -379,7 +379,12 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     // Build the reads-table Arrow IPC bytes (single batch from the
     // already-materialized `processed_reads`), then write the post-signal
     // sections.
-    let reads_table_bytes = build_reads_table(&processed_reads, &all_run_infos, &schema_meta)?;
+    let reads_table_bytes = build_reads_table(
+        &processed_reads,
+        &all_run_infos,
+        &schema_meta,
+        options.read_batch_size as usize,
+    )?;
     write_post_signal_sections(
         &mut file,
         &section_marker,
