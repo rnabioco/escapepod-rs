@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18.0 (2026-08-29)
+
 ### Fixed
 
 - **The reads table is written in batches again, instead of one batch per file**
@@ -31,7 +33,28 @@
   measured on a real 1.3M-read run, GPU utilisation is ~94% and the first block
   arrives in 0.4 s both before and after.
 
+### Build / Tooling
+
+- **The noodles crates are bumped as a set** (#302): `noodles-bam` 0.94 -> 0.95,
+  `noodles-sam` 0.89 -> 0.90, `noodles-csi` 0.60 -> 0.61. They share types across
+  their own version boundary, so Dependabot's one-PR-per-crate bumps could not
+  compile individually (`E0308` in `escapepod-signal`, which uses bam and sam
+  together). No source changes were needed.
+
 ### Performance
+
+- **The CRF encoder's onnxruntime sessions no longer spin** (#296). Each
+  encoder worker built its CUDA session with an intra-op pool `--threads` wide
+  and spinning enabled, so `--threads 32` with two workers put 64 spinning
+  intra-op threads on a 32-core allocation — for a graph that runs on the
+  device and gives that pool almost nothing to compute. This is the same defect
+  #240 fixed for the adapter-CNN session, which never reached this one.
+  Measured on an A30 (`demux basecall`, 40k reads, interleaved): process CPU
+  858% -> 733%, `perf` samples in `libonnxruntime.so` 15.6% -> below the 1%
+  report floor, output byte-identical.
+
+- **`demux --annotate` interns its barcode labels** (#296), writing the sidecar
+  from a dictionary plus per-read codes rather than a string per read.
 
 - **The CRF encoder pool uses every visible GPU instead of reserving one for
   adapter detection** (#297). Detection is ~5% of device time since #187, so
