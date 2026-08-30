@@ -33,6 +33,22 @@
 
 ### Performance
 
+- **The CRF encoder pool uses every visible GPU instead of reserving one for
+  adapter detection** (#297). Detection is ~5% of device time since #187, so
+  holding a whole card for it left that card 12% busy on two GPUs and 27% on
+  four while the lone encoder device pinned at 93%. Measured on a real 1.3M-read
+  run, interleaved, 2 reps:
+
+  ```text
+  GPUs   reserve device 0            encode everywhere        vs 1 GPU
+    1    162.5 s  (gpu0 88%)         same policy              --
+    2    136.6 s  (12% / 93%)         80.8 s  (88% / 88%)     1.19x -> 2.01x
+    4     56.7 s  (27% / 75%)         55.3 s  (72% / 58-66%)  2.86x -> 2.94x
+  ```
+
+  Two GPUs go from 1.19x to **2.01x**. Four are a wash — the pool was already
+  wide enough there.
+
 - **`--ref-scores` runs its reference scan on the GPU instead of on the host**
   (#297). The flag that gates production demuxing was the one configuration
   with no GPU decode path: `try_run_and_decode_with_refs` always copied the
