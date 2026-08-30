@@ -230,7 +230,7 @@ are compared against WarpDemuX's own predictions.
 
 | Layer | boundaries / fingerprints | overall | conf ≥ 0.5 |
 |---|---|---:|---:|
-| A — WDX bounds + WDX fpts → `escpod classify` | WDX / WDX | **99.63 %** | **100.00 %** |
+| A — WDX bounds + WDX fpts → `escpod demux classify` | WDX / WDX | **99.63 %** | **100.00 %** |
 | B-bounds — WDX bounds + escpod fpt | WDX / escpod | 99.61 % | 100.00 % |
 | B-cnn — escpod CNN detect (`--method cnn`) | escpod / escpod | **99.26 %** | 100.00 % |
 | B-llr — escpod LLR detect (default) | escpod / escpod | 94.14 % | 96.34 % |
@@ -240,7 +240,7 @@ are compared against WarpDemuX's own predictions.
 #### The DTW warping-penalty fix (97.1 % → 99.6 % ceiling)
 
 Earlier the Layer-A ceiling sat at **97.14 %** — even with identical WDX
-boundaries *and* fingerprints, `escpod classify` disagreed ~2.9 %. The
+boundaries *and* fingerprints, `escpod demux classify` disagreed ~2.9 %. The
 root cause was the DTW distance: WarpDemuX models carry a
 `dtaidistance` warping **`penalty`** (`WDX4` = 0.1) added to the two
 non-diagonal (expansion / compression) DP transitions, and escpod

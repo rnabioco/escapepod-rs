@@ -2,7 +2,7 @@
 
 //! Basecaller BAM tag decoding shared by signal-anchored commands.
 //!
-//! `escpod signal classify` and `escpod resquiggle` both start from dorado's
+//! `escpod classify` and `escpod resquiggle` both start from dorado's
 //! move-table tags (`mv`, plus the `ns`/`ts`/`sp` signal-trim integers);
 //! decoding them lives here so the two cannot drift. What each command
 //! builds *on top* differs deliberately and stays with the command: classify

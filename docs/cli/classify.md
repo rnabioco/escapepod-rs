@@ -1,4 +1,4 @@
-# escpod signal classify
+# escpod classify
 
 Read-level classification against a model bundle, from POD5 signal plus an
 aligned BAM. Today that means the **tRNA charging (aminoacylation)**
@@ -6,23 +6,26 @@ classifier: for each read it asks whether the tRNA was charged, and writes the
 probability onto the BAM.
 
 ```bash
-escpod signal classify reads.pod5 -b aln.bam -r ref.fa -m bundle/ -o out.bam
+escpod classify reads.pod5 -b aln.bam -r ref.fa -m bundle/ -o out.bam
 ```
 
 Ships in the default build — no extra Cargo feature.
 
-!!! note "`escpod signal`, not `escpod classify`"
-    `escpod demux classify` assigns a barcode from a DTW/GBM fingerprint. This
-    asks an entirely different question of an entirely different input. The two
-    used to sit one keystroke apart as `escpod demux classify` and a bare
-    top-level `escpod classify`, which is a trap for anyone reading a shell
-    history. The old spelling still works as a hidden deprecated alias that
-    warns and forwards here, so 0.10.0-era scripts keep running.
+!!! note "Not `escpod demux classify`"
+    `escpod demux classify` is a demux stage: it assigns a barcode from a
+    DTW/GBM adapter fingerprint CSV. This command asks an entirely different
+    question of an entirely different input (a POD5 and an aligned BAM).
+
+    Between 0.11.0 and 0.18.1 this command was spelled `escpod signal
+    classify`, grouped under a `signal` namespace to keep the two apart. Every
+    other tool here is one word, so the group has been retired; `escpod signal
+    classify` still works as a hidden deprecated alias that warns and forwards
+    here.
 
 ## Usage
 
 ```bash
-escpod signal classify [OPTIONS] -b <BAM> -r <FASTA> -m <BUNDLE> -o <BAM> <POD5>
+escpod classify [OPTIONS] -b <BAM> -r <FASTA> -m <BUNDLE> -o <BAM> <POD5>
 ```
 
 ## Arguments

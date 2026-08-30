@@ -12,7 +12,7 @@ output formats may change between releases. All of them live behind the
 | [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP |
 | [repack](repack.md) | Re-pack POD5 files with current compression settings |
 
-`demux`, `signal classify` and `index` ship in the default build and are
+`demux`, `classify` and `index` ship in the default build and are
 documented in the [CLI Reference](../cli/index.md).
 
 ## The `.p5s` sidecar

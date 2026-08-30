@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert WarpDemuX barcode fingerprints (.npz) to escpod classify CSV.
+"""Convert WarpDemuX barcode fingerprints (.npz) to escpod demux classify CSV.
 
 WarpDemuX writes per-shard fingerprint files ``barcode_fpts_*.npz`` containing:
     - ``read_ids``: object array of UUID strings, shape (N,)

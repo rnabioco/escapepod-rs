@@ -153,7 +153,7 @@ cores instead of serialising behind the interpreter.
 `AnchoredReads` walks a POD5 + aligned BAM pair and yields reads anchored on a
 reference motif, mapping reference → query through the CIGAR and query → signal
 through the move table. It is the extraction half of what
-[`escpod signal classify`](../cli/signal-classify.md) does, exposed for corpus
+[`escpod classify`](../cli/classify.md) does, exposed for corpus
 building.
 
 Two module-level constants describe the vocabulary it emits, and both are

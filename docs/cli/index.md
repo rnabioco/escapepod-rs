@@ -23,7 +23,7 @@ These commands are in the default build — no extra Cargo features required.
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
 | [demux](demux.md) | Barcode demultiplexing — DTW-SVM, GBM, or CTC-CRF, end to end |
 | [index](index-command.md) | Build the `.p5s` sidecar caches (read index + signal batch geometry) |
-| [signal classify](signal-classify.md) | Read-level classification against a model bundle (tRNA charging) |
+| [classify](classify.md) | Read-level classification against a model bundle (tRNA charging) |
 
 Additional commands — `repack`, `resquiggle`, and
 [`annotate`](../experimental/annotate.md) — need `--features experimental`;
