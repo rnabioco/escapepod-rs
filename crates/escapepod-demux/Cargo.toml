@@ -156,3 +156,14 @@ required-features = ["gpu"]
 [[example]]
 name = "cnn_pad_probe"
 required-features = ["gpu"]
+
+# Does tract load a given ONNX graph? A scratch probe kept because it is the
+# evidence behind a load-bearing decision: five configurations of
+# `charging_tcn_rna004@v0.1.0` (a PyTorch *dynamo* export) all parse and then
+# fail tract's shape analysis, which is why
+# `escapepod_classify::waveform_net` runs onnxruntime instead. Lives here
+# rather than in escapepod-classify so that a broken in-progress crate cannot
+# block the measurement.
+[[example]]
+name = "tract_dynamo_probe"
+required-features = ["cnn-detect"]

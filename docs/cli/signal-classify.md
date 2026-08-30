@@ -87,10 +87,40 @@ The network is what escapepod-models ships, and it is the better model:
 **0.727 of reads callable at 99% precision, against the GBM's 0.449** on a
 held-out flowcell.
 
+### A third variant: the signal window
+
+`waveform_model` reads a **signal window** rather than a column vector: the
+normalised current and its k-mer residual, the sequence k-mer context scattered
+along the signal axis, and 12 per-base dwell/level rows — three tensors, one
+BCE logit out.
+
+It is a second pipeline over the same two files, not a second scorer on the
+first one. The base-to-signal map is walked through the CIGAR into *reference*
+coordinates, the anchor is the motif **+2** rather than +3, the spans are
+refined by a banded DP before any feature is taken, and the signal frame comes
+from the bundle instead of a vote (so `--orientation` is ignored, with a
+warning).
+
+Two things follow from that:
+
+- **It needs a separate build.** `--features classify-waveform`, and a
+  `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time. Unlike every other ONNX
+  graph escpod runs, this one cannot go through the statically linked tract —
+  it is a PyTorch *dynamo* export whose `adaptive_avg_pool1d` becomes a
+  `Shape`/`Gather`/`GatherND`/`Transpose` chain tract's shape inference cannot
+  close. A default build refuses such a bundle by name, with that hint, rather
+  than failing at the first read.
+- **Its shipped Platt calibration is carried, not applied.** The operating
+  point beside it is stated on the uncalibrated probability the graph emits, so
+  calibrating would move the scale out from under the very threshold that ships
+  with the model. escpod says so at load; a caller who wants calibrated
+  probabilities must re-derive the threshold too.
+
 ## How a read is anchored
 
 1. Locate the CCA–aa junction in **reference** coordinates (the `CCAGGC` motif,
-   +3).
+   +3; the windowed variant anchors at +2, one base earlier, and says so in its
+   own metadata).
 2. Map reference → query through the CIGAR.
 3. Map query → signal through the move table, Remora convention
    (`move_pos * stride + ts`).

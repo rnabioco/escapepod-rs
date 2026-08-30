@@ -66,7 +66,7 @@ fn run(bundle_dir: &Path) -> (usize, u64) {
     let scan = scan_bam(
         &fixtures().join("trna_mappings_padded.bam"),
         &geometry,
-        &bundle.offsets,
+        &bundle.feature_space().unwrap().offsets,
         1,
     )
     .unwrap();

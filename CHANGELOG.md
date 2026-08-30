@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+### Added
+
+- **`escpod signal classify` runs a `waveform_model` charging bundle** (#306).
+  A third bundle variant, beside `gbm` and `feature_model`: it reads a *signal
+  window* rather than a column vector — normalised current plus its k-mer
+  residual, the sequence k-mer context scattered along the signal axis, and 12
+  per-base dwell/level rows — and emits a single BCE logit. On the feature
+  network's own training rows and test reads it is worth +0.0050 AUROC
+  (n=1,387,667; 3 seeds x 2 geometries, 6/6 positive, paired sd 0.00008), and
+  0.988 recall against 0.960 at the fnn's own FPR.
+
+  The **chunk assembly moved down into `escapepod-signal`**
+  (`escapepod_signal::chunk`) rather than being written a third time here. It
+  was already implemented twice — leech's Python dataset and leech-core's Rust
+  pipeline — and the failure mode is on the record: `escapepod-classify`
+  reproduced a superseded feature definition for two months and its counted
+  golden missed it, because all 19 fixture reads took the other branch. The
+  module is generic in the way that matters: the anchor is a base index, the
+  window is `(left, right)` samples, and **the channels are a list the caller
+  supplies**, so two models that read the same twelve rows in a different order
+  are two `Vec`s rather than two code paths.
+
+  Nothing about those rows is hard-coded here. The bundle ships
+  `waveform_model.channels.{signal,features}.order` — asked of the corpus
+  builder at build time rather than transcribed — and the runtime resolves it,
+  refusing a name it cannot compute or a length that disagrees with the count
+  beside it. This is the one rule no shape check can catch: permute the rows
+  and the tensor still has exactly the dimensions the graph wants, every read
+  still scores, and the answers are wrong.
+
+  Two further rules are cross-checked rather than assumed, because each fails
+  silently. `preprocessing.motif`/`motif_offset` must agree with the `anchor`
+  block — this variant anchors at motif **+2**, one base earlier than the
+  feature-grid variants' +3, and inheriting the other offset places every
+  window off-anchor and validates cleanly. And the graph's single logit is the
+  logit of whichever class the bundle *names*: leech assigned its class
+  integers at merge time and gave `charged` 0, so `P(charged)` is
+  `1 - sigmoid(logit)` here, and reading it the obvious way inverts every call
+  without erroring.
+
+  The refinement refusal at load is narrowed rather than removed: the column
+  variants still cannot reproduce a banded-DP pass, and are still refused for
+  it; the windowed variant reproduces it from its declared parameters.
+
+  Behind a **separate `classify-waveform` feature**, and deliberately not in
+  the default build. Unlike every other ONNX graph `escpod` runs, this one
+  cannot go through tract: it is a dynamo export whose `adaptive_avg_pool1d`
+  becomes a `Shape`/`Gather`/`GatherND`/`Transpose` chain that tract 0.23's
+  shape inference cannot close (measured five ways, all failing during
+  analysis). So it runs through onnxruntime via `ort`, which — being
+  `load-dynamic` — needs a `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time.
+  A build without the feature refuses such a bundle *by name* with that hint,
+  rather than shipping a binary whose charging command dlopen-fails on the
+  first read.
+
+  The bundle's shipped Platt calibration is **carried, not applied**: the
+  operating point beside it is stated on the uncalibrated probability the graph
+  emits, so calibrating silently would move the scale out from under the very
+  threshold it ships with. `escpod` says so at load.
+
+### Changed
+
+- `ChargingBundle`'s `offsets`/`columns`/`span_mode` moved behind
+  `feature_space()`, and `recipe()`/`select_columns()` are now fallible. A
+  windowed bundle has no columns at all, and three fields that would have to be
+  empty for it cannot distinguish "no feature space" from "a feature space with
+  nothing in it".
+
 ## 0.18.1 (2026-08-29)
 
 ### Fixed

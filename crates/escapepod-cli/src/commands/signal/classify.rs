@@ -33,10 +33,14 @@ use sam::alignment::record_buf::data::field::Value;
 use sam::header::record::value::map::{Map, Program, program::tag as pg_tag};
 
 use escapepod_classify::anchor::SkipReason;
+use escapepod_classify::pipeline::{ClassifyStats, ReadCall};
 use escapepod_classify::{
     ChargingBundle, Orientation, Pod5Index, cl_from_probability, classify_reads,
     junction_positions, resolve_orientation, scan_bam,
 };
+// Only `run_waveform` reads these, and it is gated on the runtime being linked.
+#[cfg(feature = "classify-waveform")]
+use escapepod_classify::{reference_sequences, waveform};
 
 use crate::progress::create_spinner;
 use crate::style;
@@ -104,6 +108,105 @@ fn parse_orientation(s: &str) -> Result<OrientationArg, String> {
     }
 }
 
+/// One line describing what the loaded bundle's model reads.
+///
+/// The two input spaces have nothing in common to summarise — one is a column
+/// vector over base offsets, the other three tensors over a signal window — so
+/// this says which, rather than forcing both into one sentence's fields.
+fn input_summary(bundle: &ChargingBundle) -> String {
+    if let Some(w) = &bundle.waveform {
+        let sig = w.tensor_shape(escapepod_classify::WaveformTensor::Signal);
+        let seq = w.tensor_shape(escapepod_classify::WaveformTensor::Sequence);
+        let feat = w.tensor_shape(escapepod_classify::WaveformTensor::Features);
+        format!(
+            "a [{}, {}] signal window + [{}, {}] sequence + [{}, {}] per-base features \
+             ({} offsets from the anchor{})",
+            sig[0],
+            sig[1],
+            seq[0],
+            seq[1],
+            feat[0],
+            feat[1],
+            feat[1],
+            if w.refine.is_some() {
+                ", map refined"
+            } else {
+                ""
+            },
+        )
+    } else if let Some(f) = &bundle.features {
+        format!(
+            "{} features over offsets {}..{}",
+            f.columns.len(),
+            f.offsets.first().copied().unwrap_or(0),
+            f.offsets.last().copied().unwrap_or(0),
+        )
+    } else {
+        "an input space this build cannot describe".to_string()
+    }
+}
+
+/// The windowed variant's scan → index → classify, in place of the column
+/// path's. Returns what [`finish`] reports on.
+#[cfg(feature = "classify-waveform")]
+fn run_waveform(
+    args: &ClassifyArgs,
+    bundle: &ChargingBundle,
+    geometry: &HashMap<String, escapepod_classify::RefGeometry>,
+) -> anyhow::Result<(Vec<ReadCall>, ClassifyStats, u64)> {
+    if args.orientation != OrientationArg::Auto {
+        // Not silently ignored: the flag exists to override a *vote*, and this
+        // variant does not vote — its frame is the one the model was trained
+        // in, declared in the bundle. Honouring the flag would mirror every
+        // window away from the model.
+        warn!(
+            "--orientation is ignored for this bundle: the windowed variant takes its \
+             signal frame from the model's own `reverse_signal`, not from a vote"
+        );
+    }
+    // The window is cut over the *reference*, and the map is refined against
+    // the expected levels of those bases, so this path needs the sequences and
+    // not only the junction coordinates.
+    let references = reference_sequences(&args.reference)?;
+
+    let spinner = create_spinner("scanning BAM")?;
+    let scan = waveform::scan_bam(
+        &args.bam,
+        geometry,
+        bundle.anchor.motif_offset,
+        args.min_mapq,
+    )?;
+    spinner.finish_with_message(format!(
+        "{} BAM records scanned, {} reads anchored",
+        style::count(scan.records_scanned as usize),
+        style::count(scan.anchored.len())
+    ));
+    info!(
+        "{} records scanned; {} unique anchored reads",
+        scan.records_scanned,
+        scan.anchored.len()
+    );
+    for (reason, n) in &scan.skips {
+        info!("  skipped ({}): {}", skip_label(*reason), n);
+    }
+    if scan.anchored.is_empty() {
+        bail!("no reads could be anchored; nothing to classify");
+    }
+
+    let pod5_files = resolve_pod5_inputs(&args.input)?;
+    let wanted: HashSet<uuid::Uuid> = scan.anchored.keys().copied().collect();
+    let pod5 = Pod5Index::build(&pod5_files, &wanted)?;
+    info!(
+        "{} of {} anchored reads have signal in {} POD5 file(s)",
+        pod5.reads().len(),
+        scan.anchored.len(),
+        pod5.n_files()
+    );
+
+    let (calls, stats) = waveform::classify_reads(bundle, &scan.anchored, &references, &pod5)?;
+    Ok((calls, stats, scan.records_scanned))
+}
+
 fn skip_label(reason: SkipReason) -> &'static str {
     match reason {
         SkipReason::Filtered => "unmapped/filtered",
@@ -120,19 +223,17 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     // --- Bundle ---------------------------------------------------------
     let bundle = ChargingBundle::load(&args.model)?;
     info!(
-        "model {}{} [{}]: {} features over offsets {}..{}, classes [{}, {}]",
+        "model {}{} [{}]: {}, classes [{}, {}]",
         bundle.model_id,
         bundle
             .model_version
             .as_deref()
             .map(|v| format!(" v{v}"))
             .unwrap_or_default(),
-        // Which of the two scorers the directory holds. Both read the same
-        // features, so nothing else in this line distinguishes them.
+        // Which scorer the directory holds, and what it reads. The two input
+        // spaces are different enough that one line cannot describe both.
         bundle.scorer.kind(),
-        bundle.columns.len(),
-        bundle.offsets.first().copied().unwrap_or(0),
-        bundle.offsets.last().copied().unwrap_or(0),
+        input_summary(&bundle),
         bundle.classes[0],
         bundle.classes[1],
     );
@@ -151,6 +252,16 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
             "bundle carries no operating point; downstream thresholds are the \
              caller's responsibility (do not assume the legacy 200)"
         ),
+    }
+    if bundle.calibration.is_some() {
+        // Carried, never applied. Saying so matters because the operating
+        // point above is stated on the *uncalibrated* probability the graph
+        // emits, so silently calibrating would move the scale out from under
+        // the very threshold printed beside it.
+        info!(
+            "bundle ships a Platt calibration of the raw logit; it is NOT applied — the \
+             operating point above is stated on the uncalibrated probability"
+        );
     }
     match &bundle.abstain {
         Some(ab) => info!("abstain rule: {} — those reads get no call", ab.rule),
@@ -174,9 +285,22 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         bundle.anchor.motif_offset,
     );
 
+    // Without the runtime linked there is no windowed bundle to reach this
+    // point: `ChargingBundle::load` refuses one by name, with the rebuild hint.
+    #[cfg(feature = "classify-waveform")]
+    if bundle.waveform.is_some() {
+        let (calls, stats, records) = run_waveform(&args, &bundle, &geometry)?;
+        return finish(&args, &bundle, calls, stats, records);
+    }
+
     // --- Pass 1: scan the BAM, anchor reads, vote on orientation ---------
     let spinner = create_spinner("scanning BAM")?;
-    let scan = scan_bam(&args.bam, &geometry, &bundle.offsets, args.min_mapq)?;
+    let scan = scan_bam(
+        &args.bam,
+        &geometry,
+        &bundle.feature_space()?.offsets,
+        args.min_mapq,
+    )?;
     spinner.finish_with_message(format!(
         "{} BAM records scanned, {} reads anchored",
         style::count(scan.records_scanned as usize),
@@ -227,6 +351,20 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     );
 
     let (calls, stats) = classify_reads(&bundle, &scan.anchored, &pod5, orientation)?;
+    finish(&args, &bundle, calls, stats, scan.records_scanned)
+}
+
+/// Report, write the TSV, and write the `cl`-tagged BAM.
+///
+/// Shared by both input spaces: what a bundle reads changes how a read is
+/// scored, not what a call is or where it is written.
+fn finish(
+    args: &ClassifyArgs,
+    bundle: &ChargingBundle,
+    calls: Vec<ReadCall>,
+    stats: ClassifyStats,
+    records_scanned: u64,
+) -> anyhow::Result<()> {
     if stats.no_signal > 0 {
         warn!(
             "{} anchored reads had no fetchable signal (dorado read splitting \
@@ -238,6 +376,13 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         warn!(
             "{} reads skipped: signal length != ns tag (split or trimmed reads)",
             stats.ns_mismatch
+        );
+    }
+    if stats.no_chunk > 0 {
+        warn!(
+            "{} reads yielded no window at the anchor (the alignment does not reach it, \
+             or its map covers no signal)",
+            stats.no_chunk
         );
     }
     // The no-call rate is reported at info level rather than buried, because
@@ -361,7 +506,7 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     info!(
         "wrote {}: {} records, {} tagged with cl",
         args.output.display(),
-        scan.records_scanned,
+        records_scanned,
         tagged
     );
 

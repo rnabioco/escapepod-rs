@@ -34,6 +34,22 @@ tracing = { workspace = true }
 # links tract through escapepod-demux's `cnn-detect`, so turning this on adds
 # no third-party crate to the binary — only this crate's own edge to it.
 tract-onnx = { workspace = true, optional = true }
+# onnxruntime for the windowed variant of a charging bundle (`waveform_model`).
+# NOT interchangeable with tract: that graph comes out of PyTorch's dynamo
+# exporter and tract 0.23 cannot close its shape inference (see
+# `waveform_net`), so this is the runtime or there is no runtime.
+# `load-dynamic` dlopens onnxruntime at run time — nothing at build time — and
+# `default-features = false` drops `download-binaries`, which would otherwise
+# drag ureq + native-tls + openssl-sys into a build that never downloads
+# anything. The exact-version pin matches escapepod-demux's, so one lockfile
+# entry serves both.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+    "api-27",
+    "load-dynamic",
+    "ndarray",
+    "std",
+    "tracing",
+] }
 uuid = { workspace = true }
 
 [dev-dependencies]
@@ -45,6 +61,12 @@ tempfile = "3"
 name = "verify_feature_model"
 required-features = ["fnn-onnx"]
 
+# The windowed variant's counterpart: checks the graph and the tensor assembly
+# separately, against the corpus the model was trained on.
+[[example]]
+name = "verify_waveform_model"
+required-features = ["waveform-onnx"]
+
 [features]
 default = []
 # Load and score the `feature_model` (per-base-feature ONNX) variant of a
@@ -52,3 +74,8 @@ default = []
 # rebuild hint — never silently mis-scored, and never confused with the
 # raw-signal CNN variant, which this crate does not implement at all.
 fnn-onnx = ["dep:tract-onnx"]
+# Load and score the windowed raw-signal (`waveform_model`) variant. Separate
+# from `fnn-onnx` because it is not free the way that one is: it links `ort`
+# and needs a `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time. Without it
+# such a bundle is refused at load with that rebuild hint, never mis-scored.
+waveform-onnx = ["dep:ort"]

@@ -194,6 +194,19 @@ impl Pod5Index {
     }
 }
 
+/// Extract one read's raw ADC samples, uncalibrated.
+///
+/// What a median/MAD-normalising model wants. The calibration is affine and
+/// positive, so the normalisation divides it straight back out — running it
+/// first would buy nothing and cost a rounding difference against the corpus
+/// builder, which reads the POD5 integers.
+pub fn signal_adc(
+    info: &Pod5ReadInfo,
+    extractors: &[escapepod_signal::SignalExtractor<'_>],
+) -> Result<Vec<i16>> {
+    Ok(extractors[info.reader_idx].get_signal(&info.signal_rows)?)
+}
+
 /// Extract one read's calibrated picoamp signal:
 /// `pA = (adc + offset) * scale`, in `f32`.
 pub fn signal_pa(
@@ -297,6 +310,16 @@ pub enum NoCallReason {
     /// Signal length disagreed with the `ns` tag, so the move-table frame
     /// would put every span in the wrong place.
     NsMismatch,
+    /// The windowed variant could not cut a chunk at the anchor: the read's
+    /// alignment does not reach it, or the map it resolves to covers no
+    /// signal.
+    ///
+    /// Distinct from [`Self::Abstained`] carrying the same condition. When the
+    /// bundle *declares* `no chunk, no call` this is a refusal it asked for and
+    /// is reported as such; when it declares nothing, it is simply a read this
+    /// runtime could not score, and conflating the two would report an abstain
+    /// rate for a bundle that never named one.
+    NoChunk,
 }
 
 impl NoCallReason {
@@ -304,6 +327,7 @@ impl NoCallReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Abstained(AbstainRule::NoAlignedArm) => "no_aligned_arm",
+            Self::Abstained(AbstainRule::NoChunk) | Self::NoChunk => "no_chunk",
             Self::NoSignal => "no_signal",
             Self::NsMismatch => "ns_mismatch",
         }
@@ -337,6 +361,9 @@ pub struct ClassifyStats {
     /// fraction computed from the calls — arm resolvability is correlated with
     /// the label, so a fraction over called reads alone is biased.
     pub abstained: u64,
+    /// The windowed variant could not cut a chunk, and the bundle named no
+    /// rule that says so — see [`NoCallReason::NoChunk`].
+    pub no_chunk: u64,
 }
 
 /// The bundle's scorer, made ready to run: `P(classes[1])` from the flat
@@ -352,12 +379,20 @@ enum Scorer<'a> {
 }
 
 impl Scorer<'_> {
-    fn new(bundle: &ChargingBundle) -> Scorer<'_> {
-        match &bundle.scorer {
+    fn new(bundle: &ChargingBundle) -> Result<Scorer<'_>> {
+        Ok(match &bundle.scorer {
             ChargingScorer::Gbm(g) => Scorer::Gbm(GbmPredictor::new(g)),
             #[cfg(feature = "fnn-onnx")]
             ChargingScorer::FeatureNn(net) => Scorer::FeatureNn(net),
-        }
+            // The windowed variant has its own scan and its own assembly; it
+            // does not reach this pipeline. Naming it here rather than
+            // wildcarding is what makes a future variant a compile error.
+            #[cfg(feature = "waveform-onnx")]
+            ChargingScorer::Waveform(_) => anyhow::bail!(
+                "this bundle scores a signal window; use `waveform::classify_reads`, \
+                 which anchors in reference coordinates and assembles its own tensors"
+            ),
+        })
     }
 
     fn p_positive(&self, features: &[f64]) -> Result<f64> {
@@ -408,8 +443,8 @@ pub fn classify_reads(
     orientation: Orientation,
 ) -> Result<(Vec<ReadCall>, ClassifyStats)> {
     let extractors = pod5.extractors()?;
-    let predictor = Scorer::new(bundle);
-    let recipe = bundle.recipe();
+    let predictor = Scorer::new(bundle)?;
+    let recipe = bundle.recipe()?;
     let reads: Vec<&AnchoredRead> = anchored.values().collect();
 
     enum Outcome {
@@ -441,7 +476,7 @@ pub fn classify_reads(
                 return Ok(no_call(read, NoCallReason::Abstained(rule)));
             }
             let grid = feature_grid_at(&recipe, read, &coords, &sig_pa);
-            let features = bundle.select_columns(&grid);
+            let features = bundle.select_columns(&grid)?;
             let p = predictor.p_positive(&features)?;
             Ok(Outcome::Call(ReadCall {
                 read_id: read.read_id,
@@ -461,6 +496,7 @@ pub fn classify_reads(
                 match n.reason {
                     NoCallReason::NoSignal => stats.no_signal += 1,
                     NoCallReason::NsMismatch => stats.ns_mismatch += 1,
+                    NoCallReason::NoChunk => stats.no_chunk += 1,
                     NoCallReason::Abstained(_) => stats.abstained += 1,
                 }
                 stats.no_calls.push(n);

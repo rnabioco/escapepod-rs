@@ -727,6 +727,7 @@ mod tests {
 
     fn geom(left: Option<usize>, right: Option<usize>) -> RefGeometry {
         RefGeometry {
+            motif_start: 97,
             junction: 100,
             cca_a: 99,
             divergent: 117,

@@ -83,6 +83,14 @@ demux = ["dep:escapepod-demux"]
 # 0.449 on a held-out flowcell. A binary that cannot load it would leave the
 # only supported bundle unusable.
 classify = ["dep:escapepod-classify", "escapepod-classify/fnn-onnx"]
+# The windowed raw-signal variant of a charging bundle (`waveform_model`).
+# Deliberately NOT in `classify`, unlike `fnn-onnx`: its graph runs through
+# onnxruntime rather than tract (tract cannot load a dynamo export — see
+# `escapepod_classify::waveform_net`), so a build with it needs a
+# libonnxruntime on ORT_DYLIB_PATH at run time. Shipping that in the default
+# binary would make every `escpod signal classify` depend on a library nobody
+# asked for; without it, such a bundle is refused at load with a rebuild hint.
+classify-waveform = ["classify", "escapepod-classify/waveform-onnx"]
 
 # The `escpod` binary and everything it links. Implies the `signal`, `demux`
 # and `cnn-detect` layers. `demux` is in the default build because it pulls in

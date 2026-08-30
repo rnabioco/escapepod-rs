@@ -23,6 +23,7 @@
 //! ```
 
 // Signal-processing modules live in this crate.
+pub mod chunk;
 pub mod dtw;
 pub mod features;
 pub mod mapping;

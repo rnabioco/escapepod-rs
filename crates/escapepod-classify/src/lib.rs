@@ -59,6 +59,10 @@ pub mod fnn;
 pub mod geometry;
 pub mod pipeline;
 pub mod recipe;
+/// The windowed raw-signal variant of a charging bundle.
+pub mod waveform;
+#[cfg(feature = "waveform-onnx")]
+pub mod waveform_net;
 pub mod window;
 
 pub use anchor::{
@@ -66,11 +70,14 @@ pub use anchor::{
     resolve_orientation,
 };
 pub use anchor::{JunctionCoords, SkipReason, finalize, query_positions, scan_record};
-pub use bundle::{Abstain, AbstainRule, ChargingBundle, ChargingScorer, OperatingPoint};
+pub use bundle::{
+    Abstain, AbstainRule, Calibration, ChargingBundle, ChargingScorer, FeatureSpace,
+    OperatingPoint, WaveformSpec, WaveformTensor,
+};
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
 #[cfg(feature = "fnn-onnx")]
 pub use fnn::FeatureNet;
-pub use geometry::{RefGeometry, junction_positions};
+pub use geometry::{RefGeometry, arm_offset, junction_positions, reference_sequences};
 pub use pipeline::{
     BamScan, ClassifyStats, Pod5Index, ReadCall, abstained_by, classify_reads, feature_grid,
     feature_grid_at, scan_bam, signal_pa,
