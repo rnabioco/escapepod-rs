@@ -99,6 +99,19 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --profile ci
+      # `experimental` gates whole commands — `annotate`, `resquiggle`,
+      # `repack` — and therefore any test of them, so the run above compiles
+      # those tests out and reports green without having run them. Cheap to add
+      # here and nowhere else: the feature resolves to `classify`, which the
+      # default `cli` feature already enables, so this recompiles
+      # escapepod-cli alone rather than rebuilding the dependency graph the way
+      # a separate job would.
+      #
+      # Deliberately not `--profile ci`: that profile writes `junit.xml` to a
+      # fixed path, and a second run of it would overwrite the workspace
+      # report before the upload step below collects it.
+      - name: Test (escapepod-cli + experimental)
+        run: cargo nextest run -p escapepod-cli --features experimental
       # Doctests live here rather than in a job of their own. nextest does not
       # run them, but `cargo test --doc` needs the same toolchain, profile and
       # unit graph that nextest has just built — as a separate job it rebuilt
