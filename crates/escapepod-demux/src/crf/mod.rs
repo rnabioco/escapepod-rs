@@ -58,7 +58,9 @@ pub use refchain::{RefChainError, RefChains, ScoredDecode};
 pub use barcode::{BarcodeError, BarcodeMatch, BarcodeRefs};
 
 #[cfg(feature = "crf-decode")]
-pub use encoder::{BarcodeEntry, BoundarySpec, CrfEncoder, CrfError, CrfMetadata, ModelIdent};
+pub use encoder::{
+    Anchor, BarcodeEntry, BoundarySpec, CrfEncoder, CrfError, CrfMetadata, ModelIdent,
+};
 
 /// The input tensor a bundle's pinned boundary CNN consumes
 /// (`boundary.input` in the sidecar; escapepod-models writes it from the same
