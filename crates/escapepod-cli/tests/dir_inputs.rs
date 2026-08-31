@@ -313,4 +313,18 @@ fn annotate_on_a_directory_writes_one_collection_sidecar() {
         stdout.contains("BC01"),
         "view did not resolve the collection:\n{stdout}"
     );
+
+    // `--list` has to account for the members, not disown them. A file whose
+    // labels live in the collection is *covered*; printing "no sidecar" under
+    // the collection that holds them says the opposite of what is true.
+    let out = assert_ok(&["annotate", "--list", ws.dir()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("reads indexed across 1 files"),
+        "--list did not report the collection:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("covered by") && !stdout.contains("no sidecar"),
+        "--list must call a member covered, not unannotated:\n{stdout}"
+    );
 }

@@ -63,9 +63,15 @@ pub fn run(cmd: AnnotateCmd) -> anyhow::Result<()> {
 /// preceded by the collection sidecar of any directory that has one.
 fn run_list(files: &[PathBuf], dirs: &[PathBuf]) -> anyhow::Result<()> {
     use escapepod_signal::pod5::sidecar::{
-        collection_sidecar_path, read_collection_file, read_sidecar_file, sidecar_path,
+        Pod5Identity, collection_sidecar_path, read_collection_file, read_sidecar_file,
+        sidecar_path,
     };
 
+    // Which POD5s a listed collection already accounts for, by identity. A
+    // member with no sidecar of its own is *covered*, not unannotated, and
+    // reporting "no sidecar" for each of fifty of them — directly under the
+    // collection that holds their labels — says the opposite of what is true.
+    let mut covered: Vec<(Pod5Identity, PathBuf)> = Vec::new();
     for dir in dirs {
         let p5s_path = collection_sidecar_path(dir);
         match read_collection_file(&p5s_path) {
@@ -87,6 +93,12 @@ fn run_list(files: &[PathBuf], dirs: &[PathBuf]) -> anyhow::Result<()> {
                 for score in collection.scores() {
                     println!("  {}: {} reads scored", score.name(), score.len());
                 }
+                covered.extend(
+                    collection
+                        .members()
+                        .iter()
+                        .map(|m| (m.identity(), p5s_path.clone())),
+                );
             }
             // Nothing there is the ordinary case for a directory that has
             // never been demultiplexed — not worth a line of output.
@@ -98,10 +110,18 @@ fn run_list(files: &[PathBuf], dirs: &[PathBuf]) -> anyhow::Result<()> {
     for pod5_path in files {
         let p5s_path = sidecar_path(pod5_path);
         let reader = escapepod_signal::Reader::open(pod5_path)?;
-        let sidecar = match read_sidecar_file(&p5s_path, &reader.sidecar_identity()?) {
+        let identity = reader.sidecar_identity()?;
+        let sidecar = match read_sidecar_file(&p5s_path, &identity) {
             Ok(Some(s)) => s,
             Ok(None) => {
-                println!("{}: no sidecar", pod5_path.display());
+                match covered.iter().find(|(id, _)| *id == identity) {
+                    Some((_, collection)) => println!(
+                        "{}: covered by {}",
+                        pod5_path.display(),
+                        collection.display()
+                    ),
+                    None => println!("{}: no sidecar", pod5_path.display()),
+                }
                 continue;
             }
             Err(e) => {
