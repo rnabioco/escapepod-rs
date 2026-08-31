@@ -160,11 +160,12 @@ required-features = ["gpu"]
 # Does tract load a given ONNX graph? Kept because it is the evidence behind a
 # load-bearing decision, twice over: five configurations of
 # `charging_tcn_rna004@v0.1.0` (a PyTorch *dynamo* export) all parse and then
-# fail tract's shape analysis, and the same probe is what showed the
-# `@v0.1.1` re-export parses, optimizes and runs — which is why
-# `escapepod_classify::waveform_net` is tract and not onnxruntime. Lives here
-# rather than in escapepod-classify so that a broken in-progress crate cannot
-# block the measurement.
+# fail tract's shape analysis, and the same probe is what showed the `@v0.1.1`
+# re-export parses, optimizes and runs — which is why
+# `escapepod_classify::waveform_net` is tract and not onnxruntime. It is also
+# what settles WHICH layer is at fault, a question two repos got wrong from the
+# op name alone. Lives here rather than in escapepod-classify so that a broken
+# in-progress crate cannot block the measurement.
 [[example]]
 name = "tract_dynamo_probe"
 required-features = ["cnn-detect"]

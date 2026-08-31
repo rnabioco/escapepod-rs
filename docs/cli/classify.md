@@ -109,13 +109,14 @@ Two things follow from that:
 - **The bundle version decides whether it loads at all.** It goes through the
   statically linked tract like every other ONNX graph escpod runs, so a stock
   release binary can run one — but only since `charging_tcn_rna004@v0.1.1`.
-  The first export, `@v0.1.0`, was a PyTorch *dynamo* export of
-  `nn.MultiheadAttention` whose mask handling becomes an
-  `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain that tract's
-  shape inference cannot close, and no graph rewrite fixed it. The fix was the
-  re-export (rnabioco/escapepod-models#96, and #97's build-time gate so a graph
-  the shipped runtime cannot load never registers). Loading `@v0.1.0` fails at
-  `into_optimized` with tract's own analysis error, naming the file.
+  The first export, `@v0.1.0`, defeated tract's shape inference two ways at
+  once — a `value_info` entry per intermediate carrying the batch axis as a
+  *symbol*, so pinning the batch failed at the first convolution; and
+  `adaptive_avg_pool1d(390 → 11)` open-coded into a rank-8 `GatherND` — and no
+  graph rewrite fixed either. The fix was the re-export
+  (rnabioco/escapepod-models#96, and #97's build-time gate so a graph the
+  shipped runtime cannot load never registers again). Loading `@v0.1.0` fails
+  at `into_optimized` with tract's own analysis error, naming the file.
 - **Its shipped Platt calibration is carried, not applied.** The operating
   point beside it is stated on the uncalibrated probability the graph emits, so
   calibrating would move the scale out from under the very threshold that ships

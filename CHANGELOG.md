@@ -53,26 +53,46 @@
   has hit it.
 
   The first export, `@v0.1.0`, could not go through tract at all: not for want
-  of an op, but because tract 0.23's *shape inference* cannot close a **dynamo**
-  export of `nn.MultiheadAttention` — an
-  `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain whose every input
-  is a constant initializer. Measured five ways, and neither onnx-simplifier
-  (which folds away every `Shape` node) nor onnxruntime's own optimiser makes it
-  loadable, so it could not be papered over at load time the way
-  `fnn::hoist_conv_padding` papers over padded convolutions. This ran through
-  onnxruntime via `ort` for exactly as long as that was true — which, `ort`
-  being `load-dynamic`, meant a `libonnxruntime.so` on `ORT_DYLIB_PATH` and no
-  way to run such a bundle from a static-musl release at all.
+  of an op, but because tract 0.23's *shape inference* cannot close it. Measured
+  five ways, and the failures fall into **two independent causes**, either of
+  which alone is enough:
+
+  - dynamo writes a `value_info` entry for all 667 intermediates with the batch
+    axis as the *symbol* `batch`. A consumer that pins the batch — which every
+    ONNX loader here does — cannot unify that, and tract dies at the **first
+    convolution** with `Sym(batch) vs Val(1)`. Every other graph `escpod` loads
+    carries zero `value_info`; the legacy TorchScript exporter never wrote any.
+  - `adaptive_avg_pool1d(390 -> 11)`, which dynamo open-codes into a rank-8
+    `GatherND` because the output size does not divide the input.
+
+  It is **not** `nn.MultiheadAttention`, which this changelog, the module doc
+  and escapepod-models#96 all named until somebody read the graph. The
+  offending `GatherND` consumes `relu_17`, the last block of `signal_tcn`; its
+  `(11, 37)` bool mask is a bin mask and its `(11,)` divisor is
+  `[36, 36, 37, 36, 37, …]`, that pool's bin widths. `cross_attn` exports as
+  plain `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`, with no mask and no gather.
+  #306's original suspect was right and its retraction was not.
+
+  Neither onnx-simplifier (which folds away every `Shape` node) nor
+  onnxruntime's own optimiser makes it loadable, so it could not be papered over
+  at load time the way `fnn::hoist_conv_padding` papers over padded
+  convolutions. This ran through onnxruntime via `ort` for exactly as long as
+  that was true — which, `ort` being `load-dynamic`, meant a `libonnxruntime.so`
+  on `ORT_DYLIB_PATH` and no way to run such a bundle from a static-musl release
+  at all.
 
   The fix belonged in the export, and is the one this family already needed once:
   escapepod-models retracted "tract cannot run `Resize`" in July after finding
   the same shape-inference cause, an export fix costing one line and no retrain,
-  and a 6x tract speedup for free. `@v0.1.1` is that re-export — same weights,
-  no retrain, no `GatherND` — and with it go the `ort` dependency, the
+  and a 6x tract speedup for free. `@v0.1.1` is that re-export (leech 0.10.0) —
+  the pool written as one `MatMul` against a constant segment-mean matrix,
+  `value_info` stripped, same weights, no retrain, evaluation bit-identical,
+  479 -> 319 nodes and `GatherND` 2 -> 0. With it go the `ort` dependency, the
   `classify-waveform` feature, and the per-rayon-worker session pool that `ort`
-  needed because `Session::run` takes `&mut self`. Re-measured with
-  `escapepod-demux/examples/tract_dynamo_probe.rs`, which is kept so the claim
-  can be re-run against a later tract or a later export:
+  needed because `Session::run` takes `&mut self`. Re-measured from this side
+  with `escapepod-demux/examples/tract_dynamo_probe.rs`, kept so the claim can
+  be re-run against a later tract or a later export (its counts are tract's own
+  after parsing, hence larger than the ONNX node counts):
 
   ```text
   v0.1.0   669 nodes   analysis fails at node_GatherND_329 / node_index
@@ -82,7 +102,10 @@
   So an unloadable graph is now a *bundle* problem with a named fix and a
   build-time gate on it (escapepod-models#96 and #97), rather than a runtime
   gap: `@v0.1.0` fails at load with tract's own analysis error and the file
-  named.
+  named. The lesson generalises, and is why that gate exists: onnxruntime loaded
+  the broken graph perfectly, so the export's own torch round-trip was green
+  throughout. "It exports and agrees with torch" is a weaker claim than "a
+  runtime can load it".
 
   The swap is not free and the cost is worth stating: on the same harness and
   the same 256 chunks, tract is **6.27 ms/chunk against onnxruntime's 4.4**,

@@ -7,12 +7,9 @@
 //! This runs through tract, statically linked, like every other ONNX graph
 //! `escpod` loads — but only because the model was re-exported. The first
 //! shipped export could not go through tract at all, and the reason is worth
-//! keeping: **tract runs these ops fine; its shape inference could not close
-//! that export.** `charging_tcn_rna004@v0.1.0` is a PyTorch *dynamo* export,
-//! and dynamo lowers `nn.MultiheadAttention`'s mask handling to an
-//! `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain whose every
-//! input is a constant initializer. Measured five ways, all of which parse the
-//! graph and then fail during analysis:
+//! keeping precisely: **tract runs these ops fine; its shape inference could
+//! not close that export.** Measured on `charging_tcn_rna004@v0.1.0`, five
+//! ways, all of which parse the graph and then fail during analysis:
 //!
 //! ```text
 //! inputs pinned to batch 1        node_conv1d       Sym(batch) vs Val(1)
@@ -22,30 +19,56 @@
 //! nothing pinned at all           node_GatherND_329 Sym(batch) vs Val(1)
 //! ```
 //!
+//! That is **two independent causes**, which is why the first row fails
+//! somewhere else than the last two, and why fixing either alone leaves the
+//! graph unloadable:
+//!
+//! 1. dynamo writes a `value_info` entry for all 667 intermediates with the
+//!    batch axis as the *symbol* `batch`. A consumer that pins the batch — as
+//!    this loader and [`crate::fnn`] both do — cannot unify that, and tract
+//!    dies at the **first convolution**, nowhere near anything interesting.
+//!    Every other graph `escpod` loads carries zero `value_info`, because the
+//!    legacy TorchScript exporter never wrote any.
+//! 2. `adaptive_avg_pool1d(390 -> 11)`, which dynamo open-codes into a rank-8
+//!    `GatherND` because the output size does not divide the input.
+//!
+//! **Not** `nn.MultiheadAttention`, which earlier revisions of this module and
+//! of rnabioco/escapepod-models#96 both named. Reading the graph settles it:
+//! the offending `GatherND` consumes `relu_17`, the last block of `signal_tcn`;
+//! its `(11, 37)` bool mask is a bin mask and its `(11,)` divisor is
+//! `[36, 36, 37, 36, 37, …]`, the bin widths of that pool. `cross_attn` exports
+//! as plain `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`, with no mask and no
+//! gather. rnabioco/escapepod-rs#306's original suspect was right and its
+//! retraction was not.
+//!
 //! Neither standard rewrite helped, so it could not be papered over at load
 //! time the way [`crate::fnn`]'s `hoist_conv_padding` papers over padded
 //! convolutions: onnx-simplifier folds away every `Shape` node (479 -> 428
 //! nodes) and tract fails at the same `GatherND`; onnxruntime's own optimiser
 //! keeps it and adds hardware-specific fusions. The fix had to be, and was,
-//! the export — rnabioco/escapepod-models#96, the second time this model
-//! family hit tract shape inference and the second time the export was the
-//! cause.
+//! the export — the third time in this model family that tract shape inference
+//! turned out to be an export bug, after the retracted `Resize` gotcha.
 //!
-//! `charging_tcn_rna004@v0.1.1` is that re-export: same weights, no retrain,
-//! and no `GatherND` at all. Re-measured with
-//! `escapepod-demux/examples/tract_dynamo_probe.rs`, which is kept precisely
-//! so this claim can be re-run:
+//! `charging_tcn_rna004@v0.1.1` is that re-export (leech 0.10.0,
+//! rnabioco/leech#233): the pool written as one `MatMul` against a constant
+//! segment-mean matrix, and `value_info` stripped. Same weights, no retrain,
+//! evaluation bit-identical — 479 -> 319 ONNX nodes, `GatherND` 2 -> 0.
+//! Re-measured here with `escapepod-demux/examples/tract_dynamo_probe.rs`,
+//! which is kept precisely so this claim can be re-run (its counts are tract's
+//! own, after parsing, so they are larger than the ONNX node counts above):
 //!
 //! ```text
 //! v0.1.0   669 nodes   analysis fails at node_GatherND_329 / node_index
 //! v0.1.1   471 nodes   optimized to 655, runs, output [1, 1]
 //! ```
 //!
-//! So an unloadable bundle is now a *bundle* problem with a named fix, not a
-//! runtime gap: escapepod-models refuses to register a graph the shipped
-//! runtime cannot load (escapepod-models#97), and tract's own analysis error
-//! is the most informative thing this loader could say about one that slips
-//! through anyway.
+//! **The lesson worth carrying**, and the reason escapepod-models now gates
+//! `ship` on it: onnxruntime loaded the broken graph perfectly, so the export's
+//! own torch round-trip was green throughout. "It exports and agrees with
+//! torch" is a weaker claim than "a runtime can load it". So an unloadable
+//! bundle is now a *bundle* problem with a build-time gate on it
+//! (escapepod-models#97), and tract's own analysis error is the most
+//! informative thing this loader could say about one that slips through anyway.
 //!
 //! # What this buys, and why there is no feature flag
 //!
@@ -101,6 +124,11 @@ use crate::bundle::{WaveformSpec, WaveformTensor};
 /// pins it: classification fans out across reads with rayon, so a batch axis
 /// would buy nothing and cost a re-optimisation per batch size. The plan is
 /// immutable, so the handle is `Sync` and one instance serves every worker.
+///
+/// That is a choice, not a limit — escapepod-models ran the re-export through
+/// tract at batch 1 *and* batch 32 (max |dlogit| vs torch 5.72e-06 over 256
+/// real chunks, 0 decision disagreements), so a batched path is open if the
+/// per-chunk cost ever justifies one.
 pub struct WaveformNet {
     plan: Arc<TypedRunnableModel>,
     /// Which assembled tensor feeds each graph input, in the graph's own input
@@ -217,10 +245,7 @@ impl WaveformNet {
             .into_runnable()
             .map_err(|e| anyhow!("cannot plan the waveform model {}: {e}", path.display()))?;
 
-        let net = Self {
-            plan,
-            inputs,
-        };
+        let net = Self { plan, inputs };
         net.probe(spec)?;
         Ok(net)
     }

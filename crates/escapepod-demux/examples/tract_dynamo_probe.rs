@@ -2,24 +2,36 @@
 //!
 //! Written for escapepod-rs#306, where the answer decided a runtime, and then
 //! decided it again. The leech waveform TCN shipped first as
-//! `charging_tcn_rna004@v0.1.0`, a PyTorch *dynamo* export whose
-//! `nn.MultiheadAttention` mask handling dynamo lowers to an
-//! `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain; tract 0.23
-//! parses the whole graph and then fails shape analysis in every configuration
-//! below. That is what rnabioco/escapepod-models#96 asked to fix in the
-//! export rather than work around in the consumer.
+//! `charging_tcn_rna004@v0.1.0`, a PyTorch *dynamo* export that tract 0.23
+//! parses whole and then fails shape analysis on, in every configuration
+//! below. Two independent causes, and fixing either alone leaves it unloadable:
+//! `value_info` written for all 667 intermediates with the batch axis as the
+//! symbol `batch` (so a consumer that pins the batch dies at the first
+//! convolution), and `adaptive_avg_pool1d(390 -> 11)` open-coded into a rank-8
+//! `GatherND` because the output size does not divide the input.
 //!
-//! `@v0.1.1` is that re-export, and this probe is how it was checked:
+//! Not `nn.MultiheadAttention`, which escapepod-models#96 and escapepod-rs's
+//! `waveform_net.rs` both named before anyone read the graph: the `GatherND`
+//! consumes the last block of `signal_tcn` and carries that pool's bin mask and
+//! bin widths, while `cross_attn` exports as plain
+//! `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`.
+//!
+//! `@v0.1.1` (leech 0.10.0) is the re-export that fixes both, and this probe is
+//! how it was checked from this side:
 //!
 //! ```text
 //! v0.1.0   669 nodes   FAILED at node_GatherND_329 / node_index, all 3 modes
 //! v0.1.1   471 nodes   optimized to 655, ran, output [1, 1], all 3 modes
 //! ```
 //!
+//! (Counts are tract's after parsing, so larger than the 479 -> 319 the ONNX
+//! graph itself reports.)
+//!
 //! So `escapepod_classify::waveform_net` is plain tract, and a bundle tract
 //! cannot load is now a bundle-side problem with a build-time gate on it
-//! (escapepod-models#97). Kept so both halves of that can be re-run against a
-//! later tract or a later export. Takes any `.onnx` path.
+//! (escapepod-models#97, `scripts/release/check_onnx_loadable.py`, which gates
+//! against exactly the load path used here). Kept so both halves can be re-run
+//! against a later tract or a later export. Takes any `.onnx` path.
 use tract_onnx::prelude::*;
 
 /// Replace every symbolic dimension with a concrete 1, everywhere the proto
