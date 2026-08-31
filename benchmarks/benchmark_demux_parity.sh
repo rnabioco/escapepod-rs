@@ -6,12 +6,12 @@
 # time, so the agreement drop between adjacent layers attributes the gap to a
 # specific stage:
 #
-#   Layer A        WDX boundaries + WDX fingerprints  -> escpod classify
+#   Layer A        WDX boundaries + WDX fingerprints  -> escpod demux classify
 #                  (isolates DTW + RBF + Platt + OvO; this is the ceiling)
-#   Layer B-bounds WDX boundaries + escpod fingerprint -> escpod classify
+#   Layer B-bounds WDX boundaries + escpod fingerprint -> escpod demux classify
 #                  (adds escpod fingerprint extraction)
-#   Layer B-cnn    escpod CNN detect  + escpod fingerprint -> escpod classify
-#   Layer B-llr    escpod LLR detect  + escpod fingerprint -> escpod classify
+#   Layer B-cnn    escpod CNN detect  + escpod fingerprint -> escpod demux classify
+#   Layer B-llr    escpod LLR detect  + escpod fingerprint -> escpod demux classify
 #                  (the full default path)
 #
 # All layers classify with the SAME converted WarpDemuX SVM model, and are

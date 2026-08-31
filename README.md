@@ -23,7 +23,7 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **BAM integration** - Filter reads by alignment status
 - **Barcode demultiplexing** - `escpod demux` runs DTW-SVM, GBM, or CTC-CRF
   classification end to end, in the default build
-- **Read-level models** - `escpod signal classify` scores reads against a model
+- **Read-level models** - `escpod classify` scores reads against a model
   bundle from POD5 + aligned BAM (tRNA charging today), writing calls onto the
   BAM
 - **`.p5s` sidecar** - Barcode assignments, experimental designs, and a read
@@ -90,7 +90,7 @@ On a CPU-only box that binary needs none of them — `--device auto` (the
 default) just falls back.
 
 To build instead — the default build ships the stable commands plus the full
-demux tree, `signal classify`, and `index`:
+demux tree, `classify`, and `index`:
 
 ```bash
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli

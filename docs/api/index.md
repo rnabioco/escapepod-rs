@@ -20,7 +20,7 @@ The workspace is split into six crates:
 | `escapepod-pod5` | POD5 format I/O (reader, writer, VBZ, footer, block-level merge/filter/subset) |
 | `escapepod-signal` | Signal algorithms (DTW, resquiggle, segmentation, k-mer primitives); **re-exports the full `escapepod-pod5` surface** |
 | `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing (DTW + SVM classifier, CTC-CRF basecalling, optional CNN adapter detection and GPU acceleration) |
-| `escapepod-classify` | Read-level classification against model bundles — the tRNA charging classifier behind `escpod signal classify` |
+| `escapepod-classify` | Read-level classification against model bundles — the tRNA charging classifier behind `escpod classify` |
 | `escapepod-cli` | The `escpod` CLI binary (default `cli` feature) plus an optional umbrella library (imported as `escapepod_cli`) re-exporting the layers below |
 | `escapepod-python` | pyo3 bindings |
 
@@ -56,7 +56,7 @@ The bundle carries the whole feature recipe — feature order and offsets, the k
 
 ### escapepod-cli
 
-The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `index`, the `demux` tree, and `signal classify`. `repack`, `resquiggle`, and `annotate` live behind the `experimental` feature — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `index`, the `demux` tree, and `classify`. `repack`, `resquiggle`, and `annotate` live behind the `experimental` feature — see below.
 
 ## Quick Reference
 
@@ -128,7 +128,7 @@ match result {
 | `pod5` / `signal` / `demux` | Library re-exports of each layer (for `default-features = false` consumers) |
 | `experimental` | Implies `classify`; unlocks `repack`, `resquiggle`, `annotate` |
 | `demux` | The `demux` subcommand tree (fused pipeline, detect / fingerprint / classify / basecall / split / models / train) — *implied by `cli`* |
-| `classify` | `escpod signal classify` (tRNA charging) via `escapepod-classify`, with `fnn-onnx` on — *implied by `cli`* |
+| `classify` | `escpod classify` (tRNA charging) via `escapepod-classify`, with `fnn-onnx` on — *implied by `cli`* |
 | `crf-decode` | CTC-CRF barcode basecalling (`demux basecall`) — *implied by `cli`* |
 | `demux-models` / `model-fetch` | Model-bundle registry and `demux models fetch` — *implied by `cli`* |
 | `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |

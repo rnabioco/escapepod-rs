@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Changed
+
+- **`escpod signal classify` is `escpod classify` again.** The command moved
+  under a `signal` group in 0.11.0 so the *word* `classify` could not be
+  confused with `escpod demux classify`, which assigns a barcode from a DTW/GBM
+  adapter fingerprint. That traded a small ambiguity for a bigger irregularity:
+  every other tool in this binary is a single word, so the only read-level
+  model runner became the one command you had to know a namespace to find — and
+  the namespace held exactly one subcommand. The two were never actually
+  ambiguous in use, either: `demux classify` is a stage of the demux workflow
+  that consumes a fingerprint CSV, while this takes a POD5 and an aligned BAM
+  and writes `cl` onto the BAM.
+
+  `escpod signal classify` keeps working: like the top-level spelling it
+  replaced, it is now the hidden deprecated alias, warning
+  ``warn: `escpod signal classify` is deprecated; use `escpod classify`.`` and
+  forwarding to the same runner. The end-to-end test that pinned the previous
+  alias is pointed the other way, so the two invocations still have to produce
+  byte-identical calls rather than merely both exiting zero.
+
+  The `cl` encoding, flags, output and bundle contract are unchanged. The only
+  other user-visible difference is the `@PG` record on the output BAM, which
+  now records `escpod classify --model …` as the command line.
+
 ## 0.18.1 (2026-08-29)
 
 ### Fixed

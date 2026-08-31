@@ -37,7 +37,7 @@ Pick the surface that fits how you work:
 |------------|-----|-------|
 | Explore, filter, merge, and convert files from a shell | the **`escpod`** CLI | [CLI Reference](cli/index.md) |
 | Demultiplex barcodes from the raw signal | `escpod demux` | [demux](cli/demux.md) |
-| Score reads against a model bundle (tRNA charging) | `escpod signal classify` | [signal classify](cli/signal-classify.md) |
+| Score reads against a model bundle (tRNA charging) | `escpod classify` | [classify](cli/classify.md) |
 | Read/write POD5 in a Python script or notebook | the **`escapepod`** package | [Python API](python/index.md) |
 | Embed POD5 I/O in a Rust program | the **`escapepod-signal`** crate | [Rust Library](library/index.md) |
 | Understand or implement the on-disk format | — | [File Format](format/index.md) |
