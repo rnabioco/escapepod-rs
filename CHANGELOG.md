@@ -43,10 +43,27 @@
     different detector means a different `adapter_end` and a different amount
     of signal decoded per read. Compared on method, weights (by sha256, so two
     bundles shipping their own byte-identical copy agree) and input geometry.
-  - **Multi-axis runs encode on the CPU for now.** The GPU encoder pool routes
-    each read from inside its own worker threads, so a worker holding one
-    axis's answer has nowhere to put it while another axis is still running.
-    Adapter detection is shared and still uses the device.
+  The GPU path runs several axes too. Each encoder worker holds one session
+  per axis and runs its sub-block through all of them, and the pool is divided
+  by the axis count so the number of live ORT sessions per device is exactly
+  what a single-axis run uses — `DEVICE_ROW_BUDGET` is per device, and four
+  unshared workers on one 24 GB A30 previously exhausted it and killed the run.
+
+  Measured on an A30, 40 k reads, ldx+fdx, warm cache, arms interleaved (never
+  ascending — page-cache warming has faked a 1.5× here before), two reps:
+  fused **14.6 s** against 8.4 s + 8.4 s = 16.8 s for the two separate runs, so
+  **1.15×**. That is the shape to expect and not a disappointment: the shared
+  prefix is ~2.2 s of a ~8.4 s run and the encoders are the rest, so fusing
+  saves the prefix once rather than halving anything. It should matter more on
+  a cold BeeGFS mount, where the POD5 sweep is a much larger share — not
+  measured.
+
+  Parity is exact where it must be. On 5,000 reads the fused GPU run's `ldx`
+  and `fdx` columns are **byte-identical, read for read, to the two single-axis
+  GPU runs**; fusing changes neither axis. Fused CPU output is likewise
+  identical to the two separate CPU runs. CPU against GPU differs on 3 reads in
+  5,000 (99.94%), which is this pipeline's existing tract-versus-onnxruntime
+  variance and is present with or without fusing.
 
   A single-model run is unchanged in every respect: the sidecar column is still
   `barcode`, the classifications CSV header is still

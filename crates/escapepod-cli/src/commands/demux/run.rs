@@ -1059,18 +1059,6 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // warns exactly once, and every stage below asks the same question of the
     // same answer.
     let device = args.device.resolve();
-    if specs.len() > 1 {
-        // Said once, and phrased as what it is: a property of running several
-        // axes, not a device request the caller made. Going through
-        // `place_and_report` per head would claim the caller asked for CPU.
-        crate::device::note_cpu_only(
-            device,
-            "multi-axis CRF encoding",
-            "the GPU encoder pool routes each read from inside its own worker threads, so \
-             a worker holding one axis's answer has nowhere to put it while another axis \
-             is still running. Adapter detection is shared and still runs on the device.",
-        );
-    }
     let output_dir = match args.output_dir.clone() {
         Some(dir) => Some(dir),
         None if args.annotate => None, // sidecar-only: no split outputs
@@ -1128,24 +1116,14 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                 // loader below needs. With one head the two coincide, which is why
                 // they used to be one variable.
                 //
-                // A multi-axis run pins the encoders to the CPU. The GPU encoder
-                // pool routes each read from inside its own worker threads, so a
-                // worker holding one axis's answer has nowhere to put it while the
-                // other axis is still running; giving each head its own pool and
-                // joining their results is a larger change than this one.
-                // The multi-axis case reports its placement once, before the
-                // loop, via `note_cpu_only`. Going through `place_and_report`
-                // here would attribute the choice to a `--device cpu` the
-                // caller never passed, and repeat it per head.
-                let this_on_gpu = if specs.len() > 1 {
-                    crate::device::place(
-                        crate::device::Device::Cpu,
-                        crate::device::Stage::CrfEncoder,
-                    )?
-                    .is_gpu()
-                } else {
+                // Reported for the first head only: the answer is the same for
+                // every head in a run, and repeating it once per axis says
+                // nothing new.
+                let this_on_gpu = if heads.is_empty() {
                     crate::device::place_and_report(device, crate::device::Stage::CrfEncoder)?
                         .is_gpu()
+                } else {
+                    crate::device::place(device, crate::device::Stage::CrfEncoder)?.is_gpu()
                 };
                 crf_encoder_on_gpu |= this_on_gpu;
                 #[cfg(feature = "gpu")]
@@ -1590,15 +1568,52 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                     _ => unreachable!("multi-axis runs are CRF-only"),
                 })
                 .collect();
-            produce_cpu_crf_multi(
-                &args,
-                &detector,
-                &crf_heads,
-                needs_full_read,
-                &routers,
-                class_tx.as_ref(),
-                &pb,
-            )
+            // Placement is uniform across heads — one `--device` per run, and
+            // an ORT session cannot move after load — so the first head decides
+            // which pool the whole run uses.
+            #[cfg(feature = "gpu")]
+            let gpu_encoders: Option<Vec<&CrfEncoderGpu>> = crf_heads
+                .iter()
+                .map(|h| match &h.encoder {
+                    CrfEncoderAny::Gpu(e) => Some(e.as_ref()),
+                    CrfEncoderAny::Cpu(_) => None,
+                })
+                .collect();
+            #[cfg(not(feature = "gpu"))]
+            let gpu_encoders: Option<Vec<()>> = None;
+
+            match gpu_encoders {
+                #[cfg(feature = "gpu")]
+                Some(encs) => {
+                    let bundles: Vec<&Path> = heads
+                        .iter()
+                        .map(|h| {
+                            h.bundle_dir.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("CRF head without a bundle directory")
+                            })
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    produce_gpu_crf(
+                        &args,
+                        &detector,
+                        &crf_heads,
+                        &encs,
+                        &bundles,
+                        &routers,
+                        class_tx.as_ref(),
+                        &pb,
+                    )
+                }
+                _ => produce_cpu_crf_multi(
+                    &args,
+                    &detector,
+                    &crf_heads,
+                    needs_full_read,
+                    &routers,
+                    class_tx.as_ref(),
+                    &pb,
+                ),
+            }
         }
         #[cfg(not(feature = "crf-decode"))]
         {
@@ -1656,9 +1671,9 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                         produce_gpu_crf(
                             &args,
                             &detector,
-                            head,
-                            enc,
-                            bundle,
+                            &[head],
+                            &[enc.as_ref()],
+                            &[bundle],
                             &routers,
                             class_tx.as_ref(),
                             &pb,
@@ -2872,23 +2887,28 @@ impl GpuTrace {
 }
 
 // One over clippy's limit: the sibling producers take the same seven, and this
-// one additionally needs the bundle directory to load its extra workers.
+// one additionally needs the bundle directories to load its extra workers.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "gpu")]
 fn produce_gpu_crf(
     args: &RunArgs,
     detector: &Detector,
-    head: &CrfHead,
-    encoder: &CrfEncoderGpu,
-    bundle: &Path,
+    heads: &[&CrfHead],
+    encoders: &[&CrfEncoderGpu],
+    bundles: &[&Path],
     routers: &Routers,
     class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
-    /// Prepped windows (`None` = no usable window) aligned with their reads.
-    type Block = (Vec<Option<Vec<f32>>>, Vec<BlockItem>);
+    /// Prepped windows per head (`None` = no usable window for that head),
+    /// each inner vector aligned with `items`.
+    ///
+    /// Per head and not per read, because the heads disagree about the window:
+    /// `signal.chunk` and the standardisation constants are both per bundle, so
+    /// there is no shared tensor to hand the device.
+    type Block = (Vec<Vec<Option<Vec<f32>>>>, Vec<BlockItem>);
 
-    let meta = encoder.metadata();
+    let n_heads = heads.len();
     let gpu_block = crf_gpu_block();
 
     // Visible, so `CUDA_VISIBLE_DEVICES` already applies: under SLURM
@@ -2897,29 +2917,69 @@ fn produce_gpu_crf(
         .unwrap_or(1)
         .max(1);
     let enc_devices = crf_encoder_devices(devices);
-    let workers = crf_gpu_workers(enc_devices.len());
-    // Worker 0 reuses the encoder already loaded for its metadata, which `run`
-    // placed on `enc_devices[0]`; the rest get their own session, round-robin
-    // over the encoder devices.
-    let extra: Vec<CrfEncoderGpu> = (1..workers)
-        .map(|w| CrfEncoderGpu::load_bundle_on_device(bundle, enc_devices[w % enc_devices.len()]))
+    // Each worker holds one session **per head** and runs its sub-block through
+    // all of them, so the pool is divided by the head count to keep the number
+    // of live sessions per device exactly what one axis uses.
+    //
+    // That budget is the constraint, not the thread count. `DEVICE_ROW_BUDGET`
+    // is per *device*: every session on a card allocates its LSTM activations
+    // from the same VRAM, and four unshared workers on one 24 GB A30 exhausted
+    // it and killed the run. Two axes at the old worker count would be the same
+    // mistake with a different cause.
+    //
+    // # Why this default and not the faster one
+    //
+    // It is not the fastest setting measured. On one A30, 40 k reads, ldx+fdx,
+    // warm, two reps (`ESCAPEPOD_CRF_GPU_WORKERS` divided by the head count, so
+    // these are 1, 2 and 4 workers each holding 2 sessions):
+    //
+    // ```text
+    //   2 sessions/device (this default)   14.7s  14.6s
+    //   4 sessions/device                  13.9s  14.0s   <- best, ~5%
+    //   8 sessions/device                  15.8s  15.2s
+    // ```
+    //
+    // A shallow U, and 4 does not OOM because `share_device_with` divides the
+    // row budget correctly — the documented failure was four sessions each
+    // taking a *full* budget. But 5% on one card, one file and a warm cache is
+    // exactly the evidence #301 flags as too thin to move a default on, and
+    // each extra session is another BFC arena whose high-water never comes back
+    // (see `ort_ep`, and the 4.88 M-read run it wedged). So the default cannot
+    // exhaust a card that a single-axis run survives, and the knob is there for
+    // anyone who measures their own.
+    let workers = (crf_gpu_workers(enc_devices.len()) / n_heads).max(1);
+    // Worker 0 reuses the encoders already loaded for their metadata, which
+    // `run` placed on `enc_devices[0]`; the rest get their own session per
+    // head, round-robin over the encoder devices.
+    let extra: Vec<Vec<CrfEncoderGpu>> = (1..workers)
+        .map(|w| {
+            bundles
+                .iter()
+                .map(|b| {
+                    CrfEncoderGpu::load_bundle_on_device(b, enc_devices[w % enc_devices.len()])
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
         .collect::<Result<_, _>>()?;
-    // Every worker sharing a device allocates its LSTM activations from that
-    // device's VRAM, so they must split its row budget rather than each take a
-    // full one. Without this, `ESCAPEPOD_CRF_GPU_WORKERS=4` on a single 24 GB
-    // A30 exhausted the card and killed the run.
-    let per_device = workers.div_ceil(enc_devices.len());
-    encoder.share_device_with(per_device);
-    for e in &extra {
+    // Counted across heads, not per head: a worker's sessions all sit on the
+    // same card at the same time.
+    let per_device = (workers * n_heads).div_ceil(enc_devices.len());
+    for e in encoders {
         e.share_device_with(per_device);
     }
-    if workers > 1 || devices > 1 {
+    for w in &extra {
+        for e in w {
+            e.share_device_with(per_device);
+        }
+    }
+    if workers > 1 || devices > 1 || n_heads > 1 {
         info!(
-            "{} {} worker(s) on GPU {:?}, {} reads/call{}",
+            "{} {} worker(s) x {} axis/axes on GPU {:?}, {} reads/call{}",
             style::label("CRF encoder:"),
             style::count(workers),
+            style::count(n_heads),
             enc_devices,
-            style::count(encoder.batch_rows()),
+            style::count(encoders[0].batch_rows()),
             if devices > 1 {
                 "; adapter detection shares GPU 0"
             } else {
@@ -2941,7 +3001,11 @@ fn produce_gpu_crf(
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let mut gpus = Vec::with_capacity(workers);
         for w in 0..workers {
-            let enc: &CrfEncoderGpu = if w == 0 { encoder } else { &extra[w - 1] };
+            // One session per head. Worker 0 borrows the ones `run` loaded.
+            let encs: Vec<&CrfEncoderGpu> = match w {
+                0 => encoders.to_vec(),
+                _ => extra[w - 1].iter().collect(),
+            };
             let rx = Arc::clone(&block_rx);
             gpus.push(scope.spawn(move || -> anyhow::Result<()> {
                 loop {
@@ -2954,63 +3018,90 @@ fn produce_gpu_crf(
                     if tracing_on {
                         GpuTrace::add(&trace.recv_blocked_ms, t_wait);
                     }
-                    let Ok((windows, items)) = next else { break };
+                    let Ok((per_head_windows, items)) = next else {
+                        break;
+                    };
 
-                    // Encodes on the device, then fans the lattice decode back
-                    // out across rayon. `None` windows never reach the device
-                    // and come back `None`, so this stays aligned with `items`.
-                    let t_enc = std::time::Instant::now();
-                    let scored = match &head.chains {
-                        Some(chains) => Some(
-                            enc.basecall_batch_with_refs(&windows, chains)
-                                .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?,
-                        ),
-                        None => None,
-                    };
-                    let seqs = match &scored {
-                        Some(_) => None,
-                        None => Some(
-                            enc.basecall_batch(&windows)
-                                .map_err(|e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"))?,
-                        ),
-                    };
-                    if tracing_on {
-                        GpuTrace::add(&trace.encode_decode_ms, t_enc);
-                    }
-                    // 96 references x one wavefront alignment each is small next
-                    // to the decode, but it is still per-read work worth fanning
-                    // out.
-                    let t_match = std::time::Instant::now();
-                    let calls: Vec<Call> = match (&scored, &seqs) {
-                        (Some(scored), _) => scored
-                            .par_iter()
-                            .map(|s| {
-                                s.as_ref().map_or_else(Call::unclassified, |s| {
-                                    call_barcode_scored(head, s)
+                    // `calls[head][read]`, assembled into per-read `Calls`
+                    // below. Transposing here rather than in the router keeps
+                    // each head's batch contiguous for the device.
+                    let mut per_head_calls: Vec<Vec<Call>> = Vec::with_capacity(n_heads);
+                    for ((head, enc), windows) in heads.iter().zip(&encs).zip(&per_head_windows) {
+                        // Encodes on the device, then fans the lattice decode
+                        // back out across rayon. `None` windows never reach the
+                        // device and come back `None`, so this stays aligned
+                        // with `items`.
+                        let t_enc = std::time::Instant::now();
+                        let scored = match &head.chains {
+                            Some(chains) => {
+                                Some(enc.basecall_batch_with_refs(windows, chains).map_err(
+                                    |e| anyhow::anyhow!("GPU encoder (worker {w}): {e}"),
+                                )?)
+                            }
+                            None => None,
+                        };
+                        let seqs =
+                            match &scored {
+                                Some(_) => None,
+                                None => Some(enc.basecall_batch(windows).map_err(|e| {
+                                    anyhow::anyhow!("GPU encoder (worker {w}): {e}")
+                                })?),
+                            };
+                        if tracing_on {
+                            GpuTrace::add(&trace.encode_decode_ms, t_enc);
+                        }
+                        // 96 references x one wavefront alignment each is small
+                        // next to the decode, but it is still per-read work
+                        // worth fanning out.
+                        let t_match = std::time::Instant::now();
+                        per_head_calls.push(match (&scored, &seqs) {
+                            (Some(scored), _) => scored
+                                .par_iter()
+                                .map(|s| {
+                                    s.as_ref().map_or_else(Call::unclassified, |s| {
+                                        call_barcode_scored(head, s)
+                                    })
                                 })
-                            })
-                            .collect(),
-                        (None, Some(seqs)) => seqs
-                            .par_iter()
-                            .map(|seq| {
-                                seq.as_deref()
-                                    .and_then(|s| call_barcode(head, s))
-                                    .map_or_else(Call::unclassified, |(b, c)| Call::scoreless(b, c))
-                            })
-                            .collect(),
-                        (None, None) => unreachable!("one of the two arms always ran"),
-                    };
-                    if tracing_on {
-                        GpuTrace::add(&trace.match_ms, t_match);
+                                .collect(),
+                            (None, Some(seqs)) => seqs
+                                .par_iter()
+                                .map(|seq| {
+                                    seq.as_deref()
+                                        .and_then(|s| call_barcode(head, s))
+                                        .map_or_else(Call::unclassified, |(b, c)| {
+                                            Call::scoreless(b, c)
+                                        })
+                                })
+                                .collect(),
+                            (None, None) => unreachable!("one of the two arms always ran"),
+                        });
+                        if tracing_on {
+                            GpuTrace::add(&trace.match_ms, t_match);
+                        }
                     }
+
                     let n = items.len() as u64;
                     let t_route = std::time::Instant::now();
-                    for ((read, chunks, run_infos), call) in items.into_iter().zip(calls) {
+                    for (i, (read, chunks, run_infos)) in items.into_iter().enumerate() {
+                        // `Calls::One` for a single axis so that path keeps the
+                        // allocation profile it had before axes existed.
+                        let calls = match n_heads {
+                            1 => Calls::One(std::mem::replace(
+                                &mut per_head_calls[0][i],
+                                Call::unclassified(),
+                            )),
+                            _ => Calls::Many(
+                                per_head_calls
+                                    .iter_mut()
+                                    .map(|c| std::mem::replace(&mut c[i], Call::unclassified()))
+                                    .collect(),
+                            ),
+                        };
                         route(
                             routers,
                             class_tx,
                             read.for_writing(read.run_info_index),
-                            Calls::One(call),
+                            calls,
                             chunks,
                             run_infos,
                         );
@@ -3034,7 +3125,10 @@ fn produce_gpu_crf(
         let t_producer = std::time::Instant::now();
         let drive = drive_blocks(
             &args.input,
-            decode_bound(detector, encoder.metadata().needs_full_read()),
+            decode_bound(
+                detector,
+                heads.iter().any(|h| h.encoder.metadata().needs_full_read()),
+            ),
             |sigs, items| {
                 if hung_up {
                     return;
@@ -3068,21 +3162,31 @@ fn produce_gpu_crf(
                         break;
                     }
                     let t_prep = std::time::Instant::now();
-                    let windows: Vec<Option<Vec<f32>>> = chunk
-                        .par_iter()
-                        .map(|((signal, (_s, adapter_end)), (read, _, _))| {
-                            let adc = signal.as_ref()?;
-                            let mut w = Vec::new();
-                            // Same conversion as the CPU path: only the `chunk`
-                            // samples ending at `adapter_end` are calibrated.
-                            meta.prep_adc_into(
-                                adc,
-                                *adapter_end,
-                                read.calibration_offset,
-                                read.calibration_scale,
-                                &mut w,
-                            )
-                            .then_some(w)
+                    // One window set per head: `signal.chunk` and the
+                    // standardisation constants are per bundle, so there is no
+                    // shared tensor and each head gets its own pass.
+                    let windows: Vec<Vec<Option<Vec<f32>>>> = heads
+                        .iter()
+                        .map(|head| {
+                            let meta = head.encoder.metadata();
+                            chunk
+                                .par_iter()
+                                .map(|((signal, (_s, adapter_end)), (read, _, _))| {
+                                    let adc = signal.as_ref()?;
+                                    let mut w = Vec::new();
+                                    // Same conversion as the CPU path: only the
+                                    // `chunk` samples ending at the anchor are
+                                    // calibrated.
+                                    meta.prep_adc_into(
+                                        adc,
+                                        *adapter_end,
+                                        read.calibration_offset,
+                                        read.calibration_scale,
+                                        &mut w,
+                                    )
+                                    .then_some(w)
+                                })
+                                .collect()
                         })
                         .collect();
                     if tracing_on {
