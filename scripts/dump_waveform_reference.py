@@ -35,6 +35,14 @@ Writes beside ``--out``:
     <out>.sequence.f32  [n, R, L] row-major f32
     <out>.features.f32  [n, F, W] row-major f32
     <out>.logit.f32     [n] f32
+    <out>.focus.i64     [n] i64 -- the sample the window was centred on
+    <out>.dwell.f32     [n, W] f32 -- per-base dwells over the feature window
+
+The last two are diagnostics, not model inputs. They separate *where* the
+window was cut from *what* was in it: if the focus sample and the dwells agree
+but the tensors do not, the map is right and the values are wrong; if the focus
+disagrees, everything downstream of it is displaced and the tensors will differ
+in a way that looks like noise.
 
 Usage::
 
@@ -116,6 +124,8 @@ def main() -> None:
 
     read_ids = [str(x) for x in z["read_ids"][:n]]
     base_indices = [int(x) for x in z["base_indices"][:n]]
+    focus = np.asarray(z["focus_signal_pos"][:n], dtype=np.int64)
+    dwells = z["dwells_flat"].reshape(-1, feat_w)[:n].astype(np.float32)
 
     # Two layouts exist: the per-class files store each per-chunk array with
     # its own trailing axes, the merged file flattens them. Reshaping to the
@@ -169,6 +179,8 @@ def main() -> None:
     seq_t.tofile(f"{out}.sequence.f32")
     feat_t.tofile(f"{out}.features.f32")
     logits.tofile(f"{out}.logit.f32")
+    focus.tofile(f"{out}.focus.i64")
+    dwells.tofile(f"{out}.dwell.f32")
     Path(f"{out}.json").write_text(
         json.dumps(
             {
