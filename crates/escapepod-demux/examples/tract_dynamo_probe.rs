@@ -2,12 +2,22 @@
 //!
 //! Written for escapepod-rs#306, where the answer decided a runtime: the leech
 //! waveform TCN (`charging_tcn_rna004@v0.1.0`) is a PyTorch *dynamo* export,
-//! and dynamo lowers its `nn.MultiheadAttention` mask handling to an
+//! and dynamo lowers `adaptive_avg_pool1d` with an output size that does not
+//! divide the input (390 -> 11 here) into an
 //! `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain. tract 0.23
 //! parses the whole graph and then fails shape analysis in every configuration
 //! below, which is why `escapepod_classify::waveform_net` runs onnxruntime
 //! instead — and why rnabioco/escapepod-models#96 asks for a re-export rather
 //! than treating that as permanent.
+//!
+//! An earlier revision of this file blamed `nn.MultiheadAttention`'s mask
+//! handling, which in fact exports as plain `MatMul`/`Softmax`/`MatMul`. The
+//! giveaway is the constants: an `(11, 37)` index grid and mask are the pool's
+//! output width and its widest bin (390 -> 11 gives bins of 36 or 37), not
+//! anything an attention mask is shaped by. See rnabioco/leech#233, which
+//! fixed it upstream, and note there were two causes — the pool, and the
+//! symbolic `value_info` that makes the `pinned` row below fail at the first
+//! convolution.
 //!
 //! Kept because "we tried and it did not work" is worth being able to re-run
 //! against a later tract. Takes any `.onnx` path.
