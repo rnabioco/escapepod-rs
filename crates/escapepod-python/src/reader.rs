@@ -375,10 +375,8 @@ impl PyReader {
     fn annotation_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let path = self.path.clone();
         py.detach(|| {
-            let identity = self.inner.sidecar_identity().map_err(to_py_err)?;
-            let p5s = escapepod_signal::pod5::sidecar::sidecar_path(&path);
-            let sidecar = escapepod_signal::pod5::sidecar::read_sidecar_file(&p5s, &identity)
-                .map_err(to_py_err)?;
+            let sidecar =
+                escapepod_signal::operations::read_sidecar_for(&path).map_err(to_py_err)?;
             Ok(sidecar
                 .map(|s| {
                     s.annotation_names()
@@ -398,10 +396,8 @@ impl PyReader {
     fn score_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let path = self.path.clone();
         py.detach(|| {
-            let identity = self.inner.sidecar_identity().map_err(to_py_err)?;
-            let p5s = escapepod_signal::pod5::sidecar::sidecar_path(&path);
-            let sidecar = escapepod_signal::pod5::sidecar::read_sidecar_file(&p5s, &identity)
-                .map_err(to_py_err)?;
+            let sidecar =
+                escapepod_signal::operations::read_sidecar_for(&path).map_err(to_py_err)?;
             Ok(sidecar
                 .map(|s| s.score_names().into_iter().map(str::to_string).collect())
                 .unwrap_or_default())

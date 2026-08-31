@@ -267,3 +267,50 @@ fn an_empty_directory_is_fatal() {
         "unexpected error for an empty directory:\n{stderr}"
     );
 }
+
+/// A directory gets **one** sidecar, and every consumer still finds a read's
+/// labels through the POD5 it asks about.
+///
+/// This is the whole point of the collection shape: the answer a run produced
+/// is one result, so it lands in one file rather than being copied into every
+/// member. `view --include` going through `operations::read_columns` is what
+/// says the copies are not needed — nothing downstream has to learn that a
+/// collection exists.
+#[cfg(feature = "experimental")]
+#[test]
+fn annotate_on_a_directory_writes_one_collection_sidecar() {
+    let ws = Workspace::new();
+    let boundaries = ws.boundaries();
+    let csv = ws.out("assign.csv");
+    std::fs::write(&csv, mapping_from(&boundaries, "barcode", "BC01")).unwrap();
+
+    assert_ok(&["annotate", ws.dir(), "-a", csv.to_str().unwrap()]);
+
+    let collection = ws.dir.with_extension("p5s");
+    assert!(
+        collection.exists(),
+        "no collection sidecar at {}",
+        collection.display()
+    );
+    let strays: Vec<PathBuf> = std::fs::read_dir(&ws.dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "p5s"))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "a directory input must not also write per-file sidecars: {strays:?}"
+    );
+
+    let out = assert_ok(&[
+        "view",
+        ws.dir.join("reads.pod5").to_str().unwrap(),
+        "--include",
+        "barcode",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BC01"),
+        "view did not resolve the collection:\n{stdout}"
+    );
+}

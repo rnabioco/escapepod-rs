@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::reader::Reader;
 use crate::sidecar::{
-    self, AnnotationSection, DEFAULT_ANNOTATION_NAME, Design, ScoreSection, Sidecar, sidecar_path,
+    self, AnnotationSection, CollectionSidecar, DEFAULT_ANNOTATION_NAME, Design, ScoreSection,
+    Sidecar, SidecarMember, sidecar_path,
 };
 use crate::types::Uuid;
 
@@ -532,6 +533,119 @@ impl SidecarColumn {
     }
 }
 
+/// The sidecar data describing one POD5, and the file(s) it came from.
+struct Resolved {
+    sidecar: Sidecar,
+    /// What an error should name — a caller told "no column 'barcode' in X"
+    /// needs X to be every place that was actually looked at.
+    source: String,
+}
+
+/// Find the sidecar data describing `pod5_path`, in both of the places it can
+/// live: the file's own `.p5s`, and the collection `.p5s` beside the directory
+/// the file sits in.
+///
+/// A POD5 in a demultiplexed directory has its labels in the collection and
+/// nothing but an index — or nothing at all — of its own, because a run's
+/// barcodes are one result and writing them into fifty files as well as the
+/// collection would be fifty copies to keep in step. Every reader below goes
+/// through here so that `escpod view`, `filter --annotation`, `demux split
+/// --sidecar` and the Python `Reader` need not know which shape produced the
+/// answer.
+///
+/// The two are **merged**, per column, with the file's own sidecar winning:
+/// it is bound to this exact POD5 by `file_identifier` + size, which is the
+/// stronger claim. Merging rather than choosing is what lets `escpod index`'s
+/// index-only sidecar sit next to an annotated collection without either one
+/// hiding the other.
+fn resolve_sidecar(pod5_path: &Path) -> Result<Resolved> {
+    let describe = || {
+        let own = sidecar_path(pod5_path);
+        match pod5_path.parent().map(sidecar::collection_sidecar_path) {
+            Some(c) => format!("{} or {}", own.display(), c.display()),
+            None => own.display().to_string(),
+        }
+    };
+    resolve_sidecar_opt(pod5_path)?.ok_or_else(|| {
+        Error::Parse(format!(
+            "no sidecar at {}; create one with `escpod annotate`",
+            describe()
+        ))
+    })
+}
+
+/// The sidecar data describing `pod5_path`, or `None` if neither shape holds
+/// any.
+///
+/// For a caller that is *listing* what is there — the Python `Reader`'s
+/// `annotation_names()` and `score_names()`, `escpod inspect summary` — where
+/// "no sidecar" is an ordinary answer rather than a failure.
+pub fn read_sidecar_for(pod5_path: impl AsRef<Path>) -> Result<Option<Sidecar>> {
+    Ok(resolve_sidecar_opt(pod5_path.as_ref())?.map(|r| r.sidecar))
+}
+
+fn resolve_sidecar_opt(pod5_path: &Path) -> Result<Option<Resolved>> {
+    let reader = Reader::open(pod5_path)?;
+    let identity = reader.sidecar_identity()?;
+    let p5s_path = sidecar_path(pod5_path);
+    let own = sidecar::read_sidecar_file(&p5s_path, &identity)?;
+
+    let collection_path = pod5_path.parent().map(sidecar::collection_sidecar_path);
+    let from_collection = collection_path.as_deref().and_then(|path| {
+        match sidecar::read_collection_file(path) {
+            Ok(Some(collection)) => collection.view_for(&identity),
+            Ok(None) => None,
+            // A collection that will not parse is not fatal here. It is one of
+            // two candidate sources, and the POD5's own sidecar may well answer
+            // the question; if neither does, the error below names both paths
+            // and the operator has what they need. Failing the whole read
+            // instead would let one damaged collection break `escpod view` for
+            // every file in the directory.
+            Err(e) => {
+                tracing::debug!("{}: {e}", path.display());
+                None
+            }
+        }
+    });
+
+    Ok(match (own, from_collection) {
+        (Some(mut own), Some(view)) => {
+            for annotation in view.annotations() {
+                if own.annotation(annotation.name()).is_none()
+                    && own.score(annotation.name()).is_none()
+                {
+                    own.set_annotation(annotation.clone());
+                }
+            }
+            for score in view.scores() {
+                if own.annotation(score.name()).is_none() && own.score(score.name()).is_none() {
+                    own.set_score(score.clone());
+                }
+            }
+            let source = match collection_path.as_deref() {
+                Some(c) => format!("{} or {}", p5s_path.display(), c.display()),
+                None => p5s_path.display().to_string(),
+            };
+            Some(Resolved {
+                sidecar: own,
+                source,
+            })
+        }
+        (Some(own), None) => Some(Resolved {
+            sidecar: own,
+            source: p5s_path.display().to_string(),
+        }),
+        (None, Some(view)) => Some(Resolved {
+            sidecar: view,
+            source: collection_path.as_deref().map_or_else(
+                || p5s_path.display().to_string(),
+                |c| c.display().to_string(),
+            ),
+        }),
+        (None, None) => None,
+    })
+}
+
 /// Read several named columns from the sidecar in one pass, whichever kind each
 /// one is.
 ///
@@ -552,17 +666,10 @@ pub fn read_columns(
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let pod5_path = pod5_path.as_ref();
-    let reader = Reader::open(pod5_path)?;
-    let identity = reader.sidecar_identity()?;
-    let p5s_path = sidecar_path(pod5_path);
-
-    let sc = sidecar::read_sidecar_file(&p5s_path, &identity)?.ok_or_else(|| {
-        Error::Parse(format!(
-            "no sidecar at {}; create one with `escpod annotate`",
-            p5s_path.display()
-        ))
-    })?;
+    let Resolved {
+        sidecar: sc,
+        source,
+    } = resolve_sidecar(pod5_path.as_ref())?;
 
     names
         .iter()
@@ -578,8 +685,7 @@ pub fn read_columns(
             available.extend(sc.score_names());
             available.sort_unstable();
             Err(Error::Parse(format!(
-                "no column '{name}' in {} (available: {})",
-                p5s_path.display(),
+                "no column '{name}' in {source} (available: {})",
                 join_or_none(&available)
             )))
         })
@@ -593,30 +699,21 @@ pub fn read_columns(
 /// useful default and guessing between `crf_logp` and `crf_margin` would be
 /// worse than asking.
 pub fn read_score(pod5_path: impl AsRef<Path>, name: &str) -> Result<ScoreSection> {
-    let pod5_path = pod5_path.as_ref();
-    let reader = Reader::open(pod5_path)?;
-    let identity = reader.sidecar_identity()?;
-    let p5s_path = sidecar_path(pod5_path);
-
-    let sc = sidecar::read_sidecar_file(&p5s_path, &identity)?.ok_or_else(|| {
-        Error::Parse(format!(
-            "no sidecar at {}; create one with `escpod annotate`",
-            p5s_path.display()
-        ))
-    })?;
+    let Resolved {
+        sidecar: sc,
+        source,
+    } = resolve_sidecar(pod5_path.as_ref())?;
 
     sc.score(name).cloned().ok_or_else(|| {
         // A name that is present as a label column is the likely mistake, so
         // say that rather than only listing what is available.
         if sc.annotation(name).is_some() {
             return Error::Parse(format!(
-                "'{name}' in {} is a label column, not a score column",
-                p5s_path.display()
+                "'{name}' in {source} is a label column, not a score column"
             ));
         }
         Error::Parse(format!(
-            "no score column '{name}' in {} (available: {})",
-            p5s_path.display(),
+            "no score column '{name}' in {source} (available: {})",
             join_or_none(&sc.score_names())
         ))
     })
@@ -631,35 +728,25 @@ pub fn read_annotation(
     pod5_path: impl AsRef<Path>,
     name: Option<&str>,
 ) -> Result<AnnotationSection> {
-    let pod5_path = pod5_path.as_ref();
-    let reader = Reader::open(pod5_path)?;
-    let identity = reader.sidecar_identity()?;
-    let p5s_path = sidecar_path(pod5_path);
-
-    let sc = sidecar::read_sidecar_file(&p5s_path, &identity)?.ok_or_else(|| {
-        Error::Parse(format!(
-            "no sidecar at {}; create one with `escpod annotate`",
-            p5s_path.display()
-        ))
-    })?;
+    let Resolved {
+        sidecar: sc,
+        source,
+    } = resolve_sidecar(pod5_path.as_ref())?;
 
     match name {
         Some(n) => sc.annotation(n).cloned().ok_or_else(|| {
             Error::Parse(format!(
-                "no annotation '{n}' in {} (available: {})",
-                p5s_path.display(),
+                "no annotation '{n}' in {source} (available: {})",
                 join_or_none(&sc.annotation_names())
             ))
         }),
         None => match sc.annotations() {
             [] => Err(Error::Parse(format!(
-                "{} has no annotations (index only)",
-                p5s_path.display()
+                "{source} has no annotations (index only)"
             ))),
             [single] => Ok(single.clone()),
             many => Err(Error::Parse(format!(
-                "{} has multiple annotations ({}); specify one by name",
-                p5s_path.display(),
+                "{source} has multiple annotations ({}); specify one by name",
                 many.iter()
                     .map(AnnotationSection::name)
                     .collect::<Vec<_>>()
@@ -675,4 +762,183 @@ fn join_or_none(names: &[&str]) -> String {
     } else {
         names.join(", ")
     }
+}
+
+/// Outcome of [`write_collection_columns`].
+#[derive(Debug, Clone)]
+pub struct CollectionResult {
+    /// POD5 files covered.
+    pub members: usize,
+    /// Reads indexed across every member.
+    pub total_reads: usize,
+    /// Per column, in the order given.
+    pub columns: Vec<ColumnStat>,
+    /// Annotation columns of both kinds in the collection after the write.
+    pub columns_in_sidecar: usize,
+    /// Where the collection sidecar was written.
+    pub sidecar_path: PathBuf,
+}
+
+/// Write several columns into a **collection** `.p5s` — one sidecar covering
+/// every POD5 in `members`, rather than one per file.
+///
+/// The collection counterpart of [`write_columns`], and deliberately not a
+/// replacement for it: a per-file sidecar also caches the read index and the
+/// signal batch geometry `Reader::open` uses, both of which are properties of
+/// one POD5. `demux --annotate` writes the per-file sidecars first and then
+/// this, so the members' own indexes are already on disk and assembling the
+/// collection costs a projected read per file rather than a reads-table scan.
+///
+/// Each mapping is intersected with the reads actually present, exactly as
+/// [`write_columns`] does — one global assignment map serves every member with
+/// no provenance tracking, because read UUIDs are unique across files.
+///
+/// `overwrite` licenses replacing an existing file at `collection_path` that
+/// cannot be read as a collection. As in [`write_columns`], it is a statement
+/// about a file that does not belong here — a per-file sidecar, or a version
+/// this build does not know — and not a licence to discard a readable
+/// collection's other columns, which are merged into either way.
+pub fn write_collection_columns(
+    collection_path: impl AsRef<Path>,
+    members: &[PathBuf],
+    columns: &[ColumnWrite],
+    overwrite: bool,
+) -> Result<CollectionResult> {
+    let collection_path = collection_path.as_ref();
+    let stamp = sidecar::SidecarStamp::of(collection_path);
+
+    // The directory the collection covers: `collection_sidecar_path` only ever
+    // appends `.p5s`, so stripping it back off is exact. Member names are
+    // recorded relative to it, which is what lets the whole directory move.
+    let base: Option<PathBuf> = collection_path
+        .to_str()
+        .and_then(|s| s.strip_suffix(".p5s"))
+        .map(PathBuf::from);
+
+    let mut existing = match sidecar::read_collection_file(collection_path) {
+        Ok(Some(cs)) => cs,
+        Ok(None) => CollectionSidecar::default(),
+        Err(e) if overwrite => {
+            tracing::warn!("{e} — replacing; any annotations or scores it held are discarded");
+            CollectionSidecar::default()
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut member_table = Vec::with_capacity(members.len());
+    let mut entries: Vec<([u8; 16], u32, u32, u32)> = Vec::new();
+    for (i, path) in members.iter().enumerate() {
+        let reader = Reader::open(path)?;
+        let identity = reader.sidecar_identity()?;
+        let member_p5s = sidecar::sidecar_path(path);
+
+        // The member's own sidecar, if it has a usable one — that is the whole
+        // read index, already built. A sidecar that will not load here is not
+        // fatal and not repaired: it is a cache of something the POD5 still
+        // holds, so fall back to the scan and leave whatever is there alone.
+        let member_entries = match sidecar::read_sidecar_entries(&member_p5s, &identity) {
+            Ok(Some(e)) => e,
+            Ok(None) => reader.build_read_index_from_scan()?.entries().to_vec(),
+            Err(e) => {
+                tracing::debug!(
+                    "{}: {e} — scanning the reads table for this member instead",
+                    member_p5s.display()
+                );
+                reader.build_read_index_from_scan()?.entries().to_vec()
+            }
+        };
+
+        let name = base
+            .as_deref()
+            .and_then(|b| path.strip_prefix(b).ok())
+            .or_else(|| path.file_name().map(Path::new))
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .into_owned();
+        member_table.push(SidecarMember {
+            name,
+            file_id: identity.file_id,
+            size: identity.size,
+            reads: member_entries.len() as u64,
+        });
+
+        let member_idx = i as u32;
+        entries.reserve(member_entries.len());
+        entries.extend(
+            member_entries
+                .into_iter()
+                .map(|(id, batch, row)| (id, member_idx, batch, row)),
+        );
+    }
+
+    existing.set_index(member_table, entries);
+
+    let mut stats = Vec::with_capacity(columns.len());
+    for column in columns {
+        let stat = match &column.values {
+            ColumnValues::Labels(assignments) => {
+                let annotation = AnnotationSection::from_pairs(
+                    &column.name,
+                    existing.entries().iter().filter_map(|&(uuid_bytes, ..)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        assignments
+                            .get(&uuid)
+                            .filter(|label| !label.is_empty())
+                            .map(|label| (uuid, label.as_str()))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: annotation.len(),
+                    labels: annotation.labels().len(),
+                };
+                existing.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::LabelCodes { dictionary, codes } => {
+                let annotation = AnnotationSection::from_pairs(
+                    &column.name,
+                    existing.entries().iter().filter_map(|&(uuid_bytes, ..)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        let label = dictionary.get(*codes.get(&uuid)? as usize)?;
+                        (!label.is_empty()).then_some((uuid, label.as_str()))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: annotation.len(),
+                    labels: annotation.labels().len(),
+                };
+                existing.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::Scores(values) => {
+                let score = ScoreSection::from_pairs(
+                    &column.name,
+                    existing.entries().iter().filter_map(|&(uuid_bytes, ..)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        values.get(&uuid).map(|&v| (uuid, v))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: score.len(),
+                    labels: 0,
+                };
+                existing.set_score(score);
+                stat
+            }
+        };
+        stats.push(stat);
+    }
+
+    sidecar::write_collection_file_checked(collection_path, &existing, stamp.as_ref())?;
+
+    Ok(CollectionResult {
+        members: existing.members().len(),
+        total_reads: existing.len(),
+        columns: stats,
+        columns_in_sidecar: existing.annotations().len() + existing.scores().len(),
+        sidecar_path: collection_path.to_path_buf(),
+    })
 }

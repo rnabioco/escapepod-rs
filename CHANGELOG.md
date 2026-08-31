@@ -71,7 +71,51 @@
   Only a multi-axis run prefixes its columns (`ldx`, `ldx_confidence`,
   `ldx_crf_margin`, …).
 
+- **One `.p5s` for a whole directory.** A run that produced fifty POD5s
+  produced one set of barcode calls, not fifty — so `escpod annotate` and
+  `escpod demux --annotate` now write a single **collection** sidecar when
+  they are pointed at a directory: `run1/pod5/` gets `run1/pod5.p5s`. It is
+  the same Arrow table as a per-file sidecar with one extra index column
+  (`member_idx`) and a member table in the schema metadata under
+  `escapepod:members`, so pyarrow reads the whole run in one call with no
+  join:
+
+  ```python
+  import pyarrow.ipc as ipc
+  table = ipc.open_file("run1/pod5.p5s").read_all()
+  ```
+
+  Read UUIDs are unique across files, which is what lets one set of columns
+  cover every member. The path rule is unchanged — append `.p5s` to the path
+  you named — so a collection sits *beside* the directory and can never
+  collide with a member's own `*.pod5.p5s` inside it. Declared as
+  `escapepod:p5s_version` `3`; an escpod that predates it refuses the file by
+  name ("is a collection sidecar covering a directory of POD5 files") rather
+  than reporting a version number or a missing column.
+
+  A collection is bound to N files, so the file-level identity gate moves down
+  a level: a POD5 gets rows from a collection only when its footer UUID *and*
+  byte size match a member entry. A file that appeared in the directory after
+  the collection was written is told it has no sidecar rather than inheriting
+  a neighbour's labels.
+
+  Nothing downstream had to learn the new shape. `view --include`, `filter
+  --annotation`, `demux split --sidecar` and the Python `Reader` all ask a
+  POD5 for its columns, and that lookup now consults the file's own `.p5s`
+  first and then the collection beside its directory, merging the two per
+  column with the file's own sidecar winning — so an index-only sidecar from
+  `escpod index` coexists with an annotated collection and neither hides the
+  other.
+
 ### Changed
+
+- **A directory argument to `annotate` / `demux --annotate` no longer also
+  writes per-file sidecars.** The labels go to the directory's collection and
+  nowhere else; writing them into every member as well would be fifty copies
+  of one result to keep in step. Naming files individually is unchanged — with
+  no directory there is nothing for a collection to sit beside, so each file
+  gets its own sidecar as before. Per-file *index* and signal-geometry caches
+  remain `escpod index`'s job, and the two shapes coexist.
 
 - **`escpod signal classify` is `escpod classify` again.** The command moved
   under a `signal` group in 0.11.0 so the *word* `classify` could not be
