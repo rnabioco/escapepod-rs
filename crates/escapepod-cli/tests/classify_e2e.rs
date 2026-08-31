@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! End-to-end `escpod signal classify`: fixture POD5 + BAM + bundle in,
+//! End-to-end `escpod classify`: fixture POD5 + BAM + bundle in,
 //! `cl`-tagged BAM and TSV out, compared against the reference
 //! implementation's golden calls (`escapepod-classify/tests/fixtures/`,
 //! generated from `escapepod_models.charging`).
@@ -61,7 +61,7 @@ fn classify_end_to_end_matches_golden() {
     let out_bam = out_dir.path().join("out.bam");
     let out_tsv = out_dir.path().join("calls.tsv");
 
-    run_classifier(&["signal", "classify"], &out_bam, &out_tsv);
+    run_classifier(&["classify"], &out_bam, &out_tsv);
 
     // --- TSV vs golden ----------------------------------------------------
     let tsv = std::fs::read_to_string(&out_tsv).unwrap();
@@ -168,30 +168,31 @@ fn classify_end_to_end_matches_golden() {
     );
 }
 
-/// `escpod classify` was the shipped spelling in 0.10.0 and still appears in
-/// pipeline scripts, so it must keep working — producing the *same* calls, not
-/// merely exiting zero — while telling the user where the command moved to.
+/// `escpod signal classify` was the shipped spelling from 0.11.0 and still
+/// appears in pipeline scripts, so it must keep working — producing the *same*
+/// calls, not merely exiting zero — while telling the user where the command
+/// moved to.
 #[test]
-fn deprecated_top_level_classify_alias_warns_and_forwards() {
+fn deprecated_signal_classify_alias_warns_and_forwards() {
     let out_dir = tempfile::tempdir().unwrap();
-    let (grouped_bam, grouped_tsv) = (out_dir.path().join("g.bam"), out_dir.path().join("g.tsv"));
+    let (plain_bam, plain_tsv) = (out_dir.path().join("g.bam"), out_dir.path().join("g.tsv"));
     let (alias_bam, alias_tsv) = (out_dir.path().join("a.bam"), out_dir.path().join("a.tsv"));
 
-    let grouped_err = run_classifier(&["signal", "classify"], &grouped_bam, &grouped_tsv);
-    let alias_err = run_classifier(&["classify"], &alias_bam, &alias_tsv);
+    let plain_err = run_classifier(&["classify"], &plain_bam, &plain_tsv);
+    let alias_err = run_classifier(&["signal", "classify"], &alias_bam, &alias_tsv);
 
     assert_eq!(
-        std::fs::read_to_string(&grouped_tsv).unwrap(),
+        std::fs::read_to_string(&plain_tsv).unwrap(),
         std::fs::read_to_string(&alias_tsv).unwrap(),
         "the alias must forward to the same runner, not a divergent copy"
     );
     assert!(
-        alias_err.contains("`escpod classify` is deprecated")
-            && alias_err.contains("escpod signal classify"),
+        alias_err.contains("`escpod signal classify` is deprecated")
+            && alias_err.contains("use `escpod classify`"),
         "the alias should name its replacement:\n{alias_err}"
     );
     assert!(
-        !grouped_err.contains("deprecated"),
-        "the current spelling must not warn:\n{grouped_err}"
+        !plain_err.contains("deprecated"),
+        "the current spelling must not warn:\n{plain_err}"
     );
 }

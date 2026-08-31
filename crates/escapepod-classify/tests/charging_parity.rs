@@ -8,7 +8,7 @@
 //!
 //! The scan → index → classify orchestration under test is
 //! [`escapepod_classify::pipeline`] — the same code the
-//! `escpod signal classify` command runs, so the golden pins the shipped
+//! `escpod classify` command runs, so the golden pins the shipped
 //! path, not a test replica.
 //!
 //! Contract: the anchoring chain (spans, orientation, mask boundary, NaN

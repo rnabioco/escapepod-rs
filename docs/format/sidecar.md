@@ -5,6 +5,10 @@ The `.p5s` sidecar is escapepod's companion file for per-read metadata:
 annotations (e.g. demux barcode assignments), and optionally an
 experimental-design table. The POD5 file itself is never modified.
 
+A whole directory gets one too — `pod5/` gets one `pod5.p5s` covering every
+file beneath it, so a fifty-file run leaves one annotated result rather than
+fifty. See [One sidecar for a directory](#one-sidecar-for-a-directory).
+
 This page is the on-disk specification. For how to *use* sidecars, see the
 [experimental overview](../experimental/index.md#the-p5s-sidecar).
 
@@ -205,6 +209,75 @@ Python API) read plain columns and never implement the join. The design is
 the source of truth: writing a derived column directly is refused, and
 rewriting a key annotation re-derives its dependents.
 
+## One sidecar for a directory
+
+A run that produced fifty POD5s produced **one** set of barcode calls, not
+fifty. So pointing `annotate` or `demux --annotate` at a directory writes a
+single **collection** sidecar beside it, and no per-file sidecars at all:
+
+```text
+run1/pod5/          →   run1/pod5.p5s
+```
+
+That is the same rule as a per-file sidecar — append `.p5s` to the path you
+named — which is also why a collection can never collide with a member's own
+sidecar: those end in `.pod5.p5s` and live *inside* the directory.
+
+The table is the same as above with one extra index column:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `read_id` | `FixedSizeBinary(16)` | Read UUID |
+| `member_idx` | `UInt32` | Which POD5 holds it — an index into the member table |
+| `batch_idx`, `row_idx` | `UInt32` | Where in that POD5's reads table |
+| *(one per annotation / score)* | as above | one column per name, covering every member |
+
+Read UUIDs are unique across files, so a single set of columns describes the
+whole directory with no join. The version is `3`, and the two identity keys are
+replaced by a member table under `escapepod:members`:
+
+```json
+[{"name": "reads_0.pod5", "file_id": "8f14e45f-…", "size": 1048576, "reads": 4000}]
+```
+
+`name` is relative to the directory the collection covers, so moving the
+directory and its sidecar together keeps them paired.
+
+### Identity, one level down
+
+A collection is bound to N files, so there is no single `file_identifier` for
+the file-level gate to check. The check moves down instead: a POD5 gets rows
+from a collection only if its footer UUID **and** byte size match a member
+entry. A file that appeared in the directory after the collection was written
+matches no member, and is told it has no sidecar rather than quietly
+inheriting a neighbour's labels.
+
+### Reading one
+
+Nothing downstream has to know which shape holds the answer. `view --include`,
+`filter --annotation`, `demux split --sidecar` and the Python `Reader` all ask
+a POD5 for its columns, and escapepod looks in both places: the file's own
+`.p5s` first, then the collection beside its directory. The two are **merged**
+per column with the file's own sidecar winning, so an index-only sidecar left
+by `escpod index` sits happily beside an annotated collection and neither hides
+the other.
+
+For pyarrow, one file is the whole point:
+
+```python
+import pyarrow.ipc as ipc
+table = ipc.open_file("run1/pod5.p5s").read_all()
+```
+
+### What a collection does not carry
+
+- **No signal batch geometry.** That describes one POD5's signal table and
+  belongs in that file's own sidecar; `escpod index` is what measures it. Run
+  `escpod index <dir>` if you want the per-file index and geometry caches as
+  well — the two shapes coexist.
+- **No experimental design.** `escpod annotate --design` targets member
+  sidecars, where the derived columns it materializes belong.
+
 ## Write semantics
 
 Sidecar writes are atomic — the new file is staged beside the destination
@@ -216,5 +289,8 @@ matters because the file mixes a rebuildable cache (the index) with data
 products that exist nowhere else once the CSV that produced them is deleted
 (the annotations).
 
-Column names `read_id`, `batch_idx`, and `row_idx` are reserved; everything
-else in the schema is treated as an annotation.
+Column names `read_id`, `batch_idx`, `row_idx` and `member_idx` are reserved;
+everything else in the schema is treated as an annotation. `member_idx` is only
+written by a collection, but it is reserved in both shapes — an annotation
+named for it would otherwise become unreadable the moment its file joined a
+collection.

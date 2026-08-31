@@ -102,8 +102,8 @@ fn feature_tensor_matches_reference_bit_for_bit() {
     );
 }
 
-/// End to end through the real pipeline: the same code `escpod signal
-/// classify` runs, against a bundle whose scorer is the network.
+/// End to end through the real pipeline: the same code `escpod classify`
+/// runs, against a bundle whose scorer is the network.
 #[test]
 fn fnn_bundle_classifies_like_the_reference() {
     let bundle = ChargingBundle::load(&fixtures().join("bundle_fnn")).unwrap();

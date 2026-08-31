@@ -4,7 +4,7 @@
 
 ### Added
 
-- **`escpod signal classify` runs a `waveform_model` charging bundle** (#306).
+- **`escpod classify` runs a `waveform_model` charging bundle** (#306).
   A third bundle variant, beside `gbm` and `feature_model`: it reads a *signal
   window* rather than a column vector — normalised current plus its k-mer
   residual, the sequence k-mer context scattered along the signal axis, and 12
@@ -75,6 +75,109 @@
   emits, so calibrating silently would move the scale out from under the very
   threshold it ships with. `escpod` says so at load.
 
+- **`demux --model` is repeatable, so several barcode axes are called in one
+  pass over the POD5.** A dual-indexed library carries a 3' index and a 5' one;
+  reading them with two runs decompresses every read twice.
+
+  ```bash
+  escpod demux reads.pod5 --model ldx=ldx32/ --model fdx=fdx4/ --annotate
+  escpod annotate --design samplesheet.csv reads.pod5   # ldx,fdx -> library,condition
+  ```
+
+  With more than one model each is given as `NAME=PATH`, and `NAME` is that
+  axis's sidecar annotation column — which is exactly what `annotate --design`
+  keys a multi-column samplesheet on, a sidecar feature that until now nothing
+  could produce in one command. The name is the operator's, not the bundle's:
+  it names the axis in *your* experimental design, and the same model can serve
+  different axes in different runs. `NAME=PATH` is resolved against the
+  filesystem first, so a bundle directory that itself contains `=` is not
+  misread.
+
+  What is shared is the expensive prefix — one POD5 sweep, one VBZ decode, one
+  adapter detection — and not the encoders, which are per-model and are most of
+  the cost. Expect meaningfully less than two separate runs, not close to one.
+  Measured on 5,000 FDX Run1 reads, the fused `ldx`+`fdx` run is byte-identical
+  to the two separate runs, read for read, on both axes.
+
+  Constraints, each an error rather than a surprise:
+
+  - **Several models require `--annotate`/`--classifications`, not `-d`.**
+    Writing one POD5 per barcode is single-axis; split afterwards with
+    `demux split --sidecar --annotation ldx`.
+  - **Only CRF bundles combine.** The fingerprint heads (DTW-SVM, GBM) do not
+    declare their own segmentation geometry — it is a compiled-in default
+    shared by every such model — so a second one would silently be
+    fingerprinted with the first one's parameters. Checked before any model is
+    opened, so the refusal costs no ONNX load.
+  - **Every axis that needs a boundary detector must pin the same one.**
+    Detection runs once per block and its answer goes to every head; a
+    different detector means a different `adapter_end` and a different amount
+    of signal decoded per read. Compared on method, weights (by sha256, so two
+    bundles shipping their own byte-identical copy agree) and input geometry.
+  The GPU path runs several axes too. Each encoder worker holds one session
+  per axis and runs its sub-block through all of them, and the pool is divided
+  by the axis count so the number of live ORT sessions per device is exactly
+  what a single-axis run uses — `DEVICE_ROW_BUDGET` is per device, and four
+  unshared workers on one 24 GB A30 previously exhausted it and killed the run.
+
+  Measured on an A30, 40 k reads, ldx+fdx, warm cache, arms interleaved (never
+  ascending — page-cache warming has faked a 1.5× here before), two reps:
+  fused **14.6 s** against 8.4 s + 8.4 s = 16.8 s for the two separate runs, so
+  **1.15×**. That is the shape to expect and not a disappointment: the shared
+  prefix is ~2.2 s of a ~8.4 s run and the encoders are the rest, so fusing
+  saves the prefix once rather than halving anything. It should matter more on
+  a cold BeeGFS mount, where the POD5 sweep is a much larger share — not
+  measured.
+
+  Parity is exact where it must be. On 5,000 reads the fused GPU run's `ldx`
+  and `fdx` columns are **byte-identical, read for read, to the two single-axis
+  GPU runs**; fusing changes neither axis. Fused CPU output is likewise
+  identical to the two separate CPU runs. CPU against GPU differs on 3 reads in
+  5,000 (99.94%), which is this pipeline's existing tract-versus-onnxruntime
+  variance and is present with or without fusing.
+
+  A single-model run is unchanged in every respect: the sidecar column is still
+  `barcode`, the classifications CSV header is still
+  `read_id,barcode,confidence[,crf_*]`, and the per-read output is byte-identical.
+  Only a multi-axis run prefixes its columns (`ldx`, `ldx_confidence`,
+  `ldx_crf_margin`, …).
+
+- **One `.p5s` for a whole directory.** A run that produced fifty POD5s
+  produced one set of barcode calls, not fifty — so `escpod annotate` and
+  `escpod demux --annotate` now write a single **collection** sidecar when
+  they are pointed at a directory: `run1/pod5/` gets `run1/pod5.p5s`. It is
+  the same Arrow table as a per-file sidecar with one extra index column
+  (`member_idx`) and a member table in the schema metadata under
+  `escapepod:members`, so pyarrow reads the whole run in one call with no
+  join:
+
+  ```python
+  import pyarrow.ipc as ipc
+  table = ipc.open_file("run1/pod5.p5s").read_all()
+  ```
+
+  Read UUIDs are unique across files, which is what lets one set of columns
+  cover every member. The path rule is unchanged — append `.p5s` to the path
+  you named — so a collection sits *beside* the directory and can never
+  collide with a member's own `*.pod5.p5s` inside it. Declared as
+  `escapepod:p5s_version` `3`; an escpod that predates it refuses the file by
+  name ("is a collection sidecar covering a directory of POD5 files") rather
+  than reporting a version number or a missing column.
+
+  A collection is bound to N files, so the file-level identity gate moves down
+  a level: a POD5 gets rows from a collection only when its footer UUID *and*
+  byte size match a member entry. A file that appeared in the directory after
+  the collection was written is told it has no sidecar rather than inheriting
+  a neighbour's labels.
+
+  Nothing downstream had to learn the new shape. `view --include`, `filter
+  --annotation`, `demux split --sidecar` and the Python `Reader` all ask a
+  POD5 for its columns, and that lookup now consults the file's own `.p5s`
+  first and then the collection beside its directory, merging the two per
+  column with the file's own sidecar winning — so an index-only sidecar from
+  `escpod index` coexists with an annotated collection and neither hides the
+  other.
+
 ### Changed
 
 - `ChargingBundle`'s `offsets`/`columns`/`span_mode` moved behind
@@ -82,6 +185,115 @@
   windowed bundle has no columns at all, and three fields that would have to be
   empty for it cannot distinguish "no feature space" from "a feature space with
   nothing in it".
+
+- **A directory argument to `annotate` / `demux --annotate` no longer also
+  writes per-file sidecars.** The labels go to the directory's collection and
+  nowhere else; writing them into every member as well would be fifty copies
+  of one result to keep in step. Naming files individually is unchanged — with
+  no directory there is nothing for a collection to sit beside, so each file
+  gets its own sidecar as before. Per-file *index* and signal-geometry caches
+  remain `escpod index`'s job, and the two shapes coexist.
+
+- **`escpod signal classify` is `escpod classify` again.** The command moved
+  under a `signal` group in 0.11.0 so the *word* `classify` could not be
+  confused with `escpod demux classify`, which assigns a barcode from a DTW/GBM
+  adapter fingerprint. That traded a small ambiguity for a bigger irregularity:
+  every other tool in this binary is a single word, so the only read-level
+  model runner became the one command you had to know a namespace to find — and
+  the namespace held exactly one subcommand. The two were never actually
+  ambiguous in use, either: `demux classify` is a stage of the demux workflow
+  that consumes a fingerprint CSV, while this takes a POD5 and an aligned BAM
+  and writes `cl` onto the BAM.
+
+  `escpod signal classify` keeps working: like the top-level spelling it
+  replaced, it is now the hidden deprecated alias, warning
+  ``warn: `escpod signal classify` is deprecated; use `escpod classify`.`` and
+  forwarding to the same runner. The end-to-end test that pinned the previous
+  alias is pointed the other way, so the two invocations still have to produce
+  byte-identical calls rather than merely both exiting zero.
+
+  The `cl` encoding, flags, output and bundle contract are unchanged. The only
+  other user-visible difference is the `@PG` record on the output BAM, which
+  now records `escpod classify --model …` as the command line.
+
+- **The demux summary no longer claims to have written files it did not.** A
+  sidecar-only run now ends `N reads across M label(s)` rather than `M barcode
+  file(s)`, and a multi-axis run reports `N reads x A axes` instead of a total
+  that counts every read once per axis.
+
+### Fixed
+
+- **A CRF bundle's `signal.anchor` is read instead of dropped, so a read-end
+  model is no longer windowed onto the 3' adapter.** `SignalSpec` parsed only
+  `chunk` and `stride`, and carried no `deny_unknown_fields` — so
+  `"anchor": "read_end"` and `"window": "[read_end - chunk, read_end]"`, both
+  shipped in `barcode_crf_fdx4_rna004@v0.1.1`, were discarded at parse time and
+  the window was taken as `[adapter_end - chunk, adapter_end]`.
+
+  This matters because the two anchors sit at opposite ends of the molecule.
+  RNA004 translocates 3'->5', so a 3'-adapter index (`ldx`, `nbc`) is found by
+  windowing back from the boundary detector's `adapter_end`, while a 5' index
+  (`fdx`) goes through the pore last and its adapter is simply where the signal
+  stops. Running the second against the first decodes the far end of the read
+  and returns exactly the output shape it should — a confident wrong answer, no
+  error, nothing downstream that can detect it. It is the consumer-side half of
+  the defect escapepod-models#100 fixed at the source.
+
+  Measured, because "runs and is wrong" needs a number. Every molecule in the
+  FDX Run1 pool carries **both** a 5' fdx index and a 3' ldx index, and ldx code
+  is nested inside fdx library (escapepod-models `config/fdx4_libraries.yaml`),
+  so the shipped `barcode_crf_ldx32_rna004` call is an independent per-read
+  truth label — different adapter, different end of the molecule, different
+  model. Over 5,000 reads (4,113 with an in-pool ldx call), the same fdx4
+  weights on the same reads:
+
+  | window | agrees with ldx truth | precision when called | unclassified |
+  |---|---:|---:|---:|
+  | `[read_end - 3500, read_end]` (fixed) | **92.3%** | 92.4% | 2 |
+  | `[adapter_end - 3500, adapter_end]` (before) | 20.4% | 25.9% | 865 |
+
+  Four codes, so 20.4% is chance. The fixed path lands on the bundle's own
+  published numbers (`balanced_recall@0.97` 0.918, `balanced_precision@0.97`
+  0.944); the old one called 79% of reads anyway, at a **median edit-distance
+  margin of 16** — the panel's maximum — so no per-read confidence field
+  distinguishes the two. The two windows agree on 18.4% of reads, and the
+  damage is not uniform noise: fdx03 collapsed from 950 reads to 21, which in
+  an experiment deletes a library rather than degrading it.
+
+  There was a second, independent instance of the same bug: a CNN detector's
+  `signal_decode_bound` truncates each read to its leading `max_obs_trace`
+  (16 000) samples, so "the read end" would have been sample 16 000 rather than
+  the read's last sample even with the window fixed. A read-end head now
+  overrides that bound and decodes the whole read.
+
+  Bundles that omit `anchor` are unchanged: absent means `adapter_end`, which is
+  what every bundle predating the key was built with.
+
+  Three refusals come with it, because each of these ran and was silently wrong
+  rather than erroring:
+
+  - an unknown key under `signal`, or an unknown `anchor` value. That block is
+    a set of rules the model was built with, so one this runtime does not
+    implement is refused rather than ignored — the doctrine already applied to
+    the charging bundle. The top level stays open for provenance.
+  - a `signal.window` string that contradicts `signal.anchor`. The prose and
+    the machine-readable key describe one rule; when they disagree escpod
+    refuses instead of picking a side. This is `fdx4@v0.1.0` exactly.
+  - a read-end bundle that also pins a boundary detector under `boundary`.
+    escpod honours that block at runtime (it refuses `--method llr` against a
+    `cnn` pin), so believing it would window the wrong end. Provenance belongs
+    under `built_beside`, which is ignored.
+
+  `--method`, `--cnn-model`, `--boundary-margin` and `--clamp-max-shift` are
+  likewise refused against a read-end bundle rather than accepted and ignored;
+  a read-end run builds no detector at all.
+
+  `demux basecall` had the same truncation defect independently — it decodes an
+  `adapter_end`-sized prefix per read — and now decodes the whole read for a
+  read-end bundle, using the boundaries CSV only to select which reads to
+  basecall. `demux --info` no longer describes an `adapter_end` window, a
+  boundary margin or a window clamp for a model that has none, and no longer
+  prints a suggested command line containing the `--method` it would refuse.
 
 ## 0.18.1 (2026-08-29)
 

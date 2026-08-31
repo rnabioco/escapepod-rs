@@ -252,12 +252,36 @@ pub const P5S_VERSION: &str = "1";
 /// while a version bump on every write would have made older escpods reject
 /// barcode-only sidecars they can read perfectly well.
 pub const P5S_VERSION_SCORES: &str = "2";
+
+/// Sidecar format version for a **collection** sidecar: one `.p5s` covering
+/// every POD5 under a directory instead of a single file.
+///
+/// Unlike [`P5S_VERSION_SCORES`], this one is not content-gated on a column
+/// type — it marks a different *shape*. A collection has no single POD5 to
+/// bind to, so it carries a member table ([`P5S_MEMBERS_KEY`]) in place of
+/// [`P5S_FILE_ID_KEY`]/[`P5S_POD5_SIZE_KEY`] and one extra index column
+/// (`member_idx`). An escpod that predates it must not try to read that as a
+/// per-file sidecar, and the version is what stops it.
+pub const P5S_VERSION_COLLECTION: &str = "3";
+
+/// Schema-metadata key holding a collection sidecar's member table (JSON).
+///
+/// Its presence — not the version alone — is what makes a file a collection,
+/// so the two readers can tell each other's files apart and say so, rather
+/// than failing on a missing column further in.
+pub const P5S_MEMBERS_KEY: &str = "escapepod:members";
 /// Default annotation column name (what `escpod annotate` writes).
 pub const DEFAULT_ANNOTATION_NAME: &str = "barcode";
 
 /// Column names reserved for the read index; everything else is an
 /// annotation.
-pub const RESERVED_COLUMNS: [&str; 3] = ["read_id", "batch_idx", "row_idx"];
+///
+/// `member_idx` is only ever *written* by a collection sidecar, but it is
+/// reserved in both shapes: the naming rules for an annotation should not
+/// depend on which shape it happens to land in, and a per-file annotation
+/// called `member_idx` would become unreadable the moment its file joined a
+/// collection.
+pub const RESERVED_COLUMNS: [&str; 4] = ["read_id", "batch_idx", "row_idx", "member_idx"];
 
 /// Sidecar path for a POD5 file: `.p5s` appended to the full filename
 /// (`reads.pod5` → `reads.pod5.p5s`), mirroring the samtools convention
@@ -267,6 +291,13 @@ pub fn sidecar_path(pod5_path: impl AsRef<Path>) -> PathBuf {
     s.push(".p5s");
     PathBuf::from(s)
 }
+
+/// One row of a per-file sidecar's read index: `(read UUID bytes, batch, row)`.
+pub type IndexEntry = ([u8; 16], u32, u32);
+
+/// One row of a collection sidecar's read index: `(read UUID bytes, member,
+/// batch, row)`, where `member` indexes [`CollectionSidecar::members`].
+pub type CollectionEntry = ([u8; 16], u32, u32, u32);
 
 /// The POD5 identity a sidecar is bound to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,7 +582,7 @@ impl Design {
 #[derive(Debug, Clone, Default)]
 pub struct Sidecar {
     /// (uuid bytes, batch, row), sorted by UUID — one entry per read.
-    entries: Vec<([u8; 16], u32, u32)>,
+    entries: Vec<IndexEntry>,
     /// Name-sorted annotations; entries are subsets of `entries`.
     annotations: Vec<AnnotationSection>,
     /// Name-sorted numeric columns; entries are subsets of `entries`.
@@ -582,7 +613,7 @@ impl Sidecar {
 
     /// Build a sidecar from the read index entries (one per read in the
     /// POD5, any order).
-    pub fn new(mut entries: Vec<([u8; 16], u32, u32)>) -> Self {
+    pub fn new(mut entries: Vec<IndexEntry>) -> Self {
         entries.sort_unstable_by_key(|e| e.0);
         Self {
             entries,
@@ -634,7 +665,7 @@ impl Sidecar {
     }
 
     /// The read-index entries, sorted by UUID.
-    pub fn entries(&self) -> &[([u8; 16], u32, u32)] {
+    pub fn entries(&self) -> &[IndexEntry] {
         &self.entries
     }
 
@@ -718,7 +749,7 @@ impl Sidecar {
     }
 
     /// Replace the read-index entries (one per read, any order).
-    pub fn set_entries(&mut self, mut entries: Vec<([u8; 16], u32, u32)>) {
+    pub fn set_entries(&mut self, mut entries: Vec<IndexEntry>) {
         entries.sort_unstable_by_key(|e| e.0);
         self.entries = entries;
     }
@@ -835,6 +866,16 @@ impl Sidecar {
 /// [`read_sidecar_metadata`] so the two can never disagree about whether a
 /// sidecar is loadable.
 fn check_version(metadata: &HashMap<String, String>, p5s_path: &Path) -> Result<()> {
+    // Checked before the version, so the message names the shape rather than a
+    // number. A collection genuinely is a `.p5s` this build reads — just not
+    // through this reader — and "version 3 unsupported" would say the opposite.
+    if metadata.contains_key(P5S_MEMBERS_KEY) {
+        return Err(Error::Parse(format!(
+            "{} is a collection sidecar covering a directory of POD5 files, \
+             not a per-file sidecar; read it with `escpod annotate --list <dir>`",
+            p5s_path.display()
+        )));
+    }
     match metadata.get(P5S_VERSION_KEY).map(String::as_str) {
         Some(P5S_VERSION | P5S_VERSION_SCORES) => Ok(()),
         Some(other) => Err(Error::Parse(format!(
@@ -846,6 +887,49 @@ fn check_version(metadata: &HashMap<String, String>, p5s_path: &Path) -> Result<
             p5s_path.display()
         ))),
     }
+}
+
+/// The `.p5s` identity gate, shared by every per-file reader so none of them
+/// can drift on what "belongs to this POD5" means — or on the message it
+/// produces, which is the one place [`SidecarProvenance`] earns its keep.
+///
+/// Returns the provenance it had to read anyway, so a caller that wants it
+/// does not parse the same three keys a second time.
+fn check_identity(
+    metadata: &HashMap<String, String>,
+    p5s_path: &Path,
+    expect: &Pod5Identity,
+) -> Result<SidecarProvenance> {
+    // Read before the gate, not after: by the time the mismatch is known we
+    // have already returned.
+    let provenance = SidecarProvenance {
+        source_name: metadata.get(P5S_SOURCE_NAME_KEY).cloned(),
+        read_count: metadata
+            .get(P5S_READ_COUNT_KEY)
+            .and_then(|s| s.parse().ok()),
+        writer: metadata.get(P5S_WRITER_KEY).cloned(),
+    };
+    let stored_file_id = metadata
+        .get(P5S_FILE_ID_KEY)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| Error::Parse(format!("{} has no valid file id", p5s_path.display())))?;
+    let stored_size: u64 = metadata
+        .get(P5S_POD5_SIZE_KEY)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Parse(format!("{} has no valid pod5 size", p5s_path.display())))?;
+    if stored_file_id != expect.file_id || stored_size != expect.size {
+        let origin = provenance
+            .describe()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        return Err(Error::Parse(format!(
+            "{} does not match this POD5 file (stale or copied from another){}; \
+             rebuild with `escpod index` / `escpod annotate`",
+            p5s_path.display(),
+            origin
+        )));
+    }
+    Ok(provenance)
 }
 
 /// Why a sidecar could not be loaded — the distinction that decides whether
@@ -940,36 +1024,7 @@ pub fn read_sidecar_file(
     let metadata = schema.metadata();
 
     check_version(metadata, p5s_path)?;
-    // Read before the gate, not after: the mismatch message is the one place
-    // provenance earns its keep, and by then we have already returned.
-    let provenance = SidecarProvenance {
-        source_name: metadata.get(P5S_SOURCE_NAME_KEY).cloned(),
-        read_count: metadata
-            .get(P5S_READ_COUNT_KEY)
-            .and_then(|s| s.parse().ok()),
-        writer: metadata.get(P5S_WRITER_KEY).cloned(),
-    };
-
-    let stored_file_id = metadata
-        .get(P5S_FILE_ID_KEY)
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| Error::Parse(format!("{} has no valid file id", p5s_path.display())))?;
-    let stored_size: u64 = metadata
-        .get(P5S_POD5_SIZE_KEY)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| Error::Parse(format!("{} has no valid pod5 size", p5s_path.display())))?;
-    if stored_file_id != expect.file_id || stored_size != expect.size {
-        let origin = provenance
-            .describe()
-            .map(|d| format!(" ({d})"))
-            .unwrap_or_default();
-        return Err(Error::Parse(format!(
-            "{} does not match this POD5 file (stale or copied from another){}; \
-             rebuild with `escpod index` / `escpod annotate`",
-            p5s_path.display(),
-            origin
-        )));
-    }
+    let provenance = check_identity(metadata, p5s_path, expect)?;
 
     let read_id_idx = schema.index_of("read_id")?;
     let batch_idx_idx = schema.index_of("batch_idx")?;
@@ -995,7 +1050,7 @@ pub fn read_sidecar_file(
         }
     }
 
-    let mut entries: Vec<([u8; 16], u32, u32)> = Vec::new();
+    let mut entries: Vec<IndexEntry> = Vec::new();
     let mut annotation_pairs: HashMap<String, Vec<(Uuid, String)>> = annotation_columns
         .iter()
         .map(|(_, name)| (name.clone(), Vec::new()))
@@ -1147,33 +1202,7 @@ pub fn read_sidecar_metadata(
     // what makes check-then-write safe.
     check_version(metadata, p5s_path)?;
 
-    let provenance = SidecarProvenance {
-        source_name: metadata.get(P5S_SOURCE_NAME_KEY).cloned(),
-        read_count: metadata
-            .get(P5S_READ_COUNT_KEY)
-            .and_then(|s| s.parse().ok()),
-        writer: metadata.get(P5S_WRITER_KEY).cloned(),
-    };
-    let stored_file_id = metadata
-        .get(P5S_FILE_ID_KEY)
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| Error::Parse(format!("{} has no valid file id", p5s_path.display())))?;
-    let stored_size: u64 = metadata
-        .get(P5S_POD5_SIZE_KEY)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| Error::Parse(format!("{} has no valid pod5 size", p5s_path.display())))?;
-    if stored_file_id != expect.file_id || stored_size != expect.size {
-        let origin = provenance
-            .describe()
-            .map(|d| format!(" ({d})"))
-            .unwrap_or_default();
-        return Err(Error::Parse(format!(
-            "{} does not match this POD5 file (stale or copied from another){}; \
-             rebuild with `escpod index` / `escpod annotate`",
-            p5s_path.display(),
-            origin
-        )));
-    }
+    let provenance = check_identity(metadata, p5s_path, expect)?;
 
     Ok(Some(SidecarMetadata {
         provenance,
@@ -1276,22 +1305,7 @@ pub fn write_sidecar_file_checked(
         Field::new("batch_idx", DataType::UInt32, false),
         Field::new("row_idx", DataType::UInt32, false),
     ];
-    for annotation in &sidecar.annotations {
-        fields.push(Field::new(
-            annotation.name(),
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            true,
-        ));
-    }
-    for score in &sidecar.scores {
-        if sidecar.annotations.iter().any(|a| a.name == score.name) {
-            return Err(Error::Parse(format!(
-                "'{}' is both a label and a score column; a name is one column",
-                score.name
-            )));
-        }
-        fields.push(Field::new(score.name(), DataType::Float32, true));
-    }
+    fields.extend(value_fields(&sidecar.annotations, &sidecar.scores)?);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
 
     let n = sidecar.entries.len();
@@ -1308,28 +1322,12 @@ pub fn write_sidecar_file_checked(
             sidecar.entries.iter().map(|&(_, _, row)| row),
         )),
     ];
-    for annotation in &sidecar.annotations {
-        let mut keys = Int32Builder::with_capacity(n);
-        for (uuid_bytes, _, _) in &sidecar.entries {
-            match annotation.label_idx(uuid_bytes) {
-                Some(idx) => keys.append_value(i32::from(idx)),
-                None => keys.append_null(),
-            }
-        }
-        let values = Arc::new(StringArray::from_iter_values(annotation.labels().iter()));
-        let dict = DictionaryArray::<Int32Type>::try_new(keys.finish(), values)?;
-        columns.push(Arc::new(dict));
-    }
-    for score in &sidecar.scores {
-        // Null, not a sentinel, for a read this column has no value for —
-        // every f32 is a possible score.
-        columns.push(Arc::new(Float32Array::from_iter(
-            sidecar
-                .entries
-                .iter()
-                .map(|(uuid_bytes, _, _)| score.value_of(uuid_bytes)),
-        )));
-    }
+    columns.extend(build_value_columns(
+        n,
+        || sidecar.entries.iter().map(|(uuid_bytes, _, _)| uuid_bytes),
+        &sidecar.annotations,
+        &sidecar.scores,
+    )?);
     let batch = RecordBatch::try_new(schema.clone(), columns)?;
 
     let options = IpcWriteOptions::default()
@@ -1410,4 +1408,755 @@ fn downcast_u32<'a>(batch: &'a RecordBatch, idx: usize, name: &str) -> Result<&'
         .as_any()
         .downcast_ref::<UInt32Array>()
         .ok_or_else(|| Error::Parse(format!(".p5s column '{name}' is not u32")))
+}
+
+// ---------------------------------------------------------------------------
+// Value columns, shared by both sidecar shapes
+// ---------------------------------------------------------------------------
+
+/// The `Field`s for a sidecar's annotation and score columns, in the order
+/// [`build_value_columns`] produces them.
+///
+/// Shared by the per-file and collection writers so the two cannot drift on
+/// what a column of each kind looks like — nor on the rule that a name is one
+/// column, which is enforced here rather than separately in each.
+fn value_fields(annotations: &[AnnotationSection], scores: &[ScoreSection]) -> Result<Vec<Field>> {
+    let mut fields = Vec::with_capacity(annotations.len() + scores.len());
+    for annotation in annotations {
+        fields.push(Field::new(
+            annotation.name(),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ));
+    }
+    for score in scores {
+        if annotations.iter().any(|a| a.name == score.name) {
+            return Err(Error::Parse(format!(
+                "'{}' is both a label and a score column; a name is one column",
+                score.name
+            )));
+        }
+        fields.push(Field::new(score.name(), DataType::Float32, true));
+    }
+    Ok(fields)
+}
+
+/// The value columns themselves, aligned to [`value_fields`].
+///
+/// `ids` yields the row keys and is called once per column rather than
+/// materialised into a slice: a collection over fifty files indexes tens of
+/// millions of reads, and copying their UUIDs out to hand this a `&[[u8; 16]]`
+/// would cost more than every column it builds.
+fn build_value_columns<'a, F, I>(
+    n: usize,
+    ids: F,
+    annotations: &[AnnotationSection],
+    scores: &[ScoreSection],
+) -> Result<Vec<ArrayRef>>
+where
+    F: Fn() -> I,
+    I: Iterator<Item = &'a [u8; 16]>,
+{
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(annotations.len() + scores.len());
+    for annotation in annotations {
+        let mut keys = Int32Builder::with_capacity(n);
+        for uuid_bytes in ids() {
+            match annotation.label_idx(uuid_bytes) {
+                Some(idx) => keys.append_value(i32::from(idx)),
+                None => keys.append_null(),
+            }
+        }
+        let values = Arc::new(StringArray::from_iter_values(annotation.labels().iter()));
+        let dict = DictionaryArray::<Int32Type>::try_new(keys.finish(), values)?;
+        columns.push(Arc::new(dict));
+    }
+    for score in scores {
+        // Null, not a sentinel, for a read this column has no value for —
+        // every f32 is a possible score.
+        columns.push(Arc::new(Float32Array::from_iter(
+            ids().map(|uuid_bytes| score.value_of(uuid_bytes)),
+        )));
+    }
+    Ok(columns)
+}
+
+// ---------------------------------------------------------------------------
+// Collection sidecars
+// ---------------------------------------------------------------------------
+
+/// Collection-sidecar path for a directory of POD5 files: `.p5s` appended to
+/// the directory's own path (`run1/pod5` → `run1/pod5.p5s`), so it sits
+/// *beside* the directory rather than among the files it describes.
+///
+/// The same rule as [`sidecar_path`] — append `.p5s` to the path you name —
+/// which is also why a directory's collection can never collide with a
+/// member's own sidecar: those always end in `.pod5.p5s`, inside.
+///
+/// Two normalisations, both so the destination depends on the directory and
+/// not on how it was typed:
+///
+/// * a trailing separator is dropped first, since appending to `pod5/` would
+///   otherwise produce the hidden file `pod5/.p5s` *inside* the directory;
+/// * a path with no file name at all (`.`, `..`, `/`) is canonicalised first,
+///   because `.` + `.p5s` is the file `..p5s`, which is nobody's intent.
+pub fn collection_sidecar_path(dir: impl AsRef<Path>) -> PathBuf {
+    let dir = dir.as_ref();
+    let normalized: PathBuf = dir.components().collect();
+    let base = if normalized.file_name().is_some() {
+        normalized
+    } else {
+        dir.canonicalize().unwrap_or(normalized)
+    };
+    sidecar_path(base)
+}
+
+/// One POD5 covered by a [`CollectionSidecar`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarMember {
+    /// The POD5's path relative to the directory the collection covers, so a
+    /// collection survives that directory being moved or renamed. Falls back
+    /// to the bare file name for a member that lies outside it.
+    pub name: String,
+    /// The POD5's footer `file_identifier`.
+    pub file_id: Uuid,
+    /// The POD5's byte size when the collection was written.
+    pub size: u64,
+    /// How many of this member's reads the collection indexes.
+    pub reads: u64,
+}
+
+impl SidecarMember {
+    /// The identity a per-file reader checks this member against.
+    pub fn identity(&self) -> Pod5Identity {
+        Pod5Identity {
+            file_id: self.file_id,
+            size: self.size,
+        }
+    }
+}
+
+/// Serialisation shape for [`SidecarMember`].
+///
+/// A mirror rather than a derive on the type itself because `uuid` is built
+/// here without its `serde` feature, and turning that on for one JSON blob
+/// would change a workspace-wide dependency.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MemberJson {
+    name: String,
+    file_id: String,
+    size: u64,
+    reads: u64,
+}
+
+/// One `.p5s` covering every POD5 in a directory.
+///
+/// Same file format, same annotation and score columns, same Arrow-readable
+/// layout — what differs is what a row is bound to. A per-file [`Sidecar`]
+/// locates a read by `(batch_idx, row_idx)` in the single POD5 named in its
+/// schema metadata; a collection adds `member_idx` and carries a member table
+/// ([`P5S_MEMBERS_KEY`]) naming the file each locator is into.
+///
+/// It exists because a fifty-file run produced fifty sidecars, and the
+/// annotations in them — a demux run's barcodes and scores — are one result,
+/// not fifty. Read UUIDs are globally unique, so a single set of columns
+/// covers every member with no join.
+///
+/// It **complements** the per-file sidecars rather than replacing them: those
+/// also cache the read index and the signal batch geometry that
+/// `Reader::open` uses, both of which are per-POD5 by nature. `demux
+/// --annotate` writes both.
+///
+/// Two things a collection deliberately does not carry:
+///
+/// * an experimental design — `escpod annotate --design` targets member
+///   sidecars, where the derived columns it materialises belong;
+/// * a signal batch geometry — that is a property of one POD5's signal table,
+///   and belongs in that file's own sidecar.
+#[derive(Debug, Clone, Default)]
+pub struct CollectionSidecar {
+    /// The POD5 files covered, in the order `member_idx` indexes.
+    members: Vec<SidecarMember>,
+    /// (uuid bytes, member, batch, row), sorted by UUID.
+    entries: Vec<CollectionEntry>,
+    /// Name-sorted annotations; entries are subsets of `entries`.
+    annotations: Vec<AnnotationSection>,
+    /// Name-sorted numeric columns; entries are subsets of `entries`.
+    scores: Vec<ScoreSection>,
+}
+
+impl CollectionSidecar {
+    /// Build a collection from its members and their read index entries (any
+    /// order; `member` indexes into `members`).
+    ///
+    /// Entries naming a member that does not exist are dropped rather than
+    /// rejected — a caller assembling this from N files should not be able to
+    /// write a locator that points nowhere. Duplicate UUIDs keep the first
+    /// occurrence in member order, which is what a file listed twice produces.
+    pub fn new(members: Vec<SidecarMember>, mut entries: Vec<CollectionEntry>) -> Self {
+        let n_members = members.len() as u32;
+        entries.retain(|&(_, member, _, _)| member < n_members);
+        entries.sort_unstable_by_key(|e| (e.0, e.1));
+        entries.dedup_by_key(|e| e.0);
+        Self {
+            members,
+            entries,
+            annotations: Vec::new(),
+            scores: Vec::new(),
+        }
+    }
+
+    /// The POD5 files covered, in `member_idx` order.
+    pub fn members(&self) -> &[SidecarMember] {
+        &self.members
+    }
+
+    /// The index entries `(uuid, member_idx, batch_idx, row_idx)`, sorted by
+    /// UUID.
+    pub fn entries(&self) -> &[CollectionEntry] {
+        &self.entries
+    }
+
+    /// Total reads indexed across every member.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the collection indexes no reads.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Locate a read: which member holds it, and where in that member's reads
+    /// table.
+    pub fn locate(&self, uuid: &Uuid) -> Option<(&SidecarMember, u32, u32)> {
+        let i = self
+            .entries
+            .binary_search_by_key(uuid.as_bytes(), |&(k, _, _, _)| k)
+            .ok()?;
+        let (_, member, batch, row) = self.entries[i];
+        Some((self.members.get(member as usize)?, batch, row))
+    }
+
+    /// The annotation with the given name, if present.
+    pub fn annotation(&self, name: &str) -> Option<&AnnotationSection> {
+        self.annotations.iter().find(|a| a.name == name)
+    }
+
+    /// All annotations, in name order.
+    pub fn annotations(&self) -> &[AnnotationSection] {
+        &self.annotations
+    }
+
+    /// Replace (or add) an annotation, keyed by its name. Displaces a score
+    /// column of the same name — see [`Sidecar::set_annotation`].
+    pub fn set_annotation(&mut self, annotation: AnnotationSection) {
+        self.scores.retain(|s| s.name != annotation.name);
+        match self
+            .annotations
+            .iter_mut()
+            .find(|a| a.name == annotation.name)
+        {
+            Some(slot) => *slot = annotation,
+            None => self.annotations.push(annotation),
+        }
+        self.annotations.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// Remove an annotation by name; returns whether it was present.
+    pub fn remove_annotation(&mut self, name: &str) -> bool {
+        let before = self.annotations.len();
+        self.annotations.retain(|a| a.name != name);
+        self.annotations.len() != before
+    }
+
+    /// The score column with the given name, if present.
+    pub fn score(&self, name: &str) -> Option<&ScoreSection> {
+        self.scores.iter().find(|s| s.name == name)
+    }
+
+    /// All score columns, in name order.
+    pub fn scores(&self) -> &[ScoreSection] {
+        &self.scores
+    }
+
+    /// Replace (or add) a score column, keyed by its name. Displaces a
+    /// same-named annotation — see [`Self::set_annotation`].
+    pub fn set_score(&mut self, score: ScoreSection) {
+        self.annotations.retain(|a| a.name != score.name);
+        match self.scores.iter_mut().find(|s| s.name == score.name) {
+            Some(slot) => *slot = score,
+            None => self.scores.push(score),
+        }
+        self.scores.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// Remove a score column by name; returns whether it was present.
+    pub fn remove_score(&mut self, name: &str) -> bool {
+        let before = self.scores.len();
+        self.scores.retain(|s| s.name != name);
+        self.scores.len() != before
+    }
+
+    /// Replace the members and index entries, keeping the annotation and score
+    /// columns.
+    ///
+    /// This is a re-annotation of the same directory: the file set is
+    /// authoritative and the columns are data. A column keeps only the reads
+    /// still indexed — [`build_value_columns`] looks every row up by UUID, so
+    /// a read that left the collection simply stops appearing.
+    pub fn set_index(&mut self, members: Vec<SidecarMember>, entries: Vec<CollectionEntry>) {
+        let rebuilt = Self::new(members, entries);
+        self.members = rebuilt.members;
+        self.entries = rebuilt.entries;
+    }
+
+    /// The member matching `identity`, if this collection covers it.
+    ///
+    /// Identity, not name: a collection is *found* by where it sits, but the
+    /// question a caller has is "do this file's reads appear in here", which
+    /// the recorded `file_id` + `size` answer and a path never could.
+    pub fn member_of(&self, identity: &Pod5Identity) -> Option<(u32, &SidecarMember)> {
+        self.members
+            .iter()
+            .position(|m| m.identity() == *identity)
+            .map(|i| (i as u32, &self.members[i]))
+    }
+
+    /// Project the collection down to one member: the per-file [`Sidecar`]
+    /// that POD5 would have had if the run had written one.
+    ///
+    /// This is what lets every existing consumer — `demux split --sidecar`,
+    /// `filter --annotation`, `view --include`, the Python `Reader` — read a
+    /// collection without knowing one exists. They ask a POD5 for its columns;
+    /// whether the answer came from a file of its own or from the directory's
+    /// collection is a question about storage, not about the read.
+    ///
+    /// `None` when no member matches `identity`, and that **is** the identity
+    /// gate. A collection has no file-level binding to check — it is bound to
+    /// N files, not one — so the check moves down a level: a member whose
+    /// `file_id` and `size` do not match the POD5 in hand is not that file,
+    /// and none of its rows are ever returned for it.
+    pub fn view_for(&self, identity: &Pod5Identity) -> Option<Sidecar> {
+        let (member_idx, _) = self.member_of(identity)?;
+        let entries: Vec<IndexEntry> = self
+            .entries
+            .iter()
+            .filter(|&&(_, m, _, _)| m == member_idx)
+            .map(|&(id, _, batch, row)| (id, batch, row))
+            .collect();
+
+        let mut view = Sidecar::new(entries);
+        // Each column is restricted to this member's reads rather than carried
+        // across whole: one that still named every read in the directory would
+        // make `escpod view` on a single POD5 report labels for reads that file
+        // does not hold.
+        for annotation in &self.annotations {
+            let pairs: Vec<(Uuid, &str)> = view
+                .entries()
+                .iter()
+                .filter_map(|&(id, _, _)| {
+                    let uuid = Uuid::from_bytes(id);
+                    annotation.get(&uuid).map(|label| (uuid, label))
+                })
+                .collect();
+            // Name and labels both came out of a sidecar that already parsed,
+            // so a failure here would be a bug in `from_pairs` rather than
+            // anything about the file; dropping the column beats panicking.
+            if let Ok(section) = AnnotationSection::from_pairs(annotation.name(), pairs) {
+                view.set_annotation(section);
+            }
+        }
+        for score in &self.scores {
+            let pairs: Vec<(Uuid, f32)> = view
+                .entries()
+                .iter()
+                .filter_map(|&(id, _, _)| {
+                    let uuid = Uuid::from_bytes(id);
+                    score.get(&uuid).map(|v| (uuid, v))
+                })
+                .collect();
+            if let Ok(section) = ScoreSection::from_pairs(score.name(), pairs) {
+                view.set_score(section);
+            }
+        }
+        Some(view)
+    }
+}
+
+/// Read the collection sidecar at `p5s_path`. `Ok(None)` when none exists.
+///
+/// There is no identity argument: a collection is bound to N POD5 files, and
+/// each member carries its own [`Pod5Identity`] for a caller that opens it to
+/// check ([`SidecarMember::identity`]). Verifying all of them here would mean
+/// stat-ing and opening every member just to read one column.
+pub fn read_collection_file(p5s_path: impl AsRef<Path>) -> Result<Option<CollectionSidecar>> {
+    let p5s_path = p5s_path.as_ref();
+    let file = match File::open(p5s_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::from(e)),
+    };
+    let reader = ArrowFileReader::try_new(file, None).map_err(|e| {
+        Error::Parse(format!(
+            "{} is not a readable .p5s sidecar: {e}",
+            p5s_path.display()
+        ))
+    })?;
+    let schema = reader.schema();
+    let metadata = schema.metadata();
+
+    // The mirror of `check_version`'s collection guard: each reader names the
+    // other's file rather than reporting a missing column or a bad version.
+    let Some(members_json) = metadata.get(P5S_MEMBERS_KEY) else {
+        return Err(Error::Parse(format!(
+            "{} is a per-file sidecar for a single POD5, not a collection",
+            p5s_path.display()
+        )));
+    };
+    match metadata.get(P5S_VERSION_KEY).map(String::as_str) {
+        Some(P5S_VERSION_COLLECTION) => {}
+        Some(other) => {
+            return Err(Error::Parse(format!(
+                ".p5s collection version {other} unsupported \
+                 (this escpod reads {P5S_VERSION_COLLECTION})"
+            )));
+        }
+        None => {
+            return Err(Error::Parse(format!(
+                "{} has no {P5S_VERSION_KEY} metadata; not an escapepod sidecar",
+                p5s_path.display()
+            )));
+        }
+    }
+
+    let members: Vec<SidecarMember> = serde_json::from_str::<Vec<MemberJson>>(members_json)
+        .map_err(|e| {
+            Error::Parse(format!(
+                "{}: unreadable member table: {e}",
+                p5s_path.display()
+            ))
+        })?
+        .into_iter()
+        .map(|m| {
+            let file_id = Uuid::parse_str(&m.file_id).map_err(|e| {
+                Error::Parse(format!(
+                    "{}: member '{}' has an invalid file id: {e}",
+                    p5s_path.display(),
+                    m.name
+                ))
+            })?;
+            Ok(SidecarMember {
+                name: m.name,
+                file_id,
+                size: m.size,
+                reads: m.reads,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let read_id_idx = schema.index_of("read_id")?;
+    let member_idx_idx = schema.index_of("member_idx")?;
+    let batch_idx_idx = schema.index_of("batch_idx")?;
+    let row_idx_idx = schema.index_of("row_idx")?;
+    let mut annotation_columns: Vec<(usize, String)> = Vec::new();
+    let mut score_columns: Vec<(usize, String)> = Vec::new();
+    for (i, f) in schema.fields().iter().enumerate() {
+        if RESERVED_COLUMNS.contains(&f.name().as_str()) {
+            continue;
+        }
+        match f.data_type() {
+            DataType::Dictionary(_, _) => annotation_columns.push((i, f.name().clone())),
+            DataType::Float32 => score_columns.push((i, f.name().clone())),
+            other => {
+                return Err(Error::Parse(format!(
+                    ".p5s column '{}' is {other}; expected a dictionary-encoded \
+                     utf8 label column or a float32 score column",
+                    f.name()
+                )));
+            }
+        }
+    }
+
+    let mut entries: Vec<CollectionEntry> = Vec::new();
+    let mut annotation_pairs: HashMap<String, Vec<(Uuid, String)>> = annotation_columns
+        .iter()
+        .map(|(_, name)| (name.clone(), Vec::new()))
+        .collect();
+    let mut score_pairs: HashMap<String, Vec<(Uuid, f32)>> = score_columns
+        .iter()
+        .map(|(_, name)| (name.clone(), Vec::new()))
+        .collect();
+
+    for batch in reader {
+        let batch = batch.map_err(|e| Error::Parse(format!("corrupt .p5s: {e}")))?;
+        let ids = batch
+            .column(read_id_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .ok_or_else(|| {
+                Error::Parse(".p5s read_id column is not FixedSizeBinary(16)".to_string())
+            })?;
+        let members_col = downcast_u32(&batch, member_idx_idx, "member_idx")?;
+        let batches = downcast_u32(&batch, batch_idx_idx, "batch_idx")?;
+        let rows = downcast_u32(&batch, row_idx_idx, "row_idx")?;
+
+        let base = entries.len();
+        entries.reserve(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(ids.value(i));
+            entries.push((key, members_col.value(i), batches.value(i), rows.value(i)));
+        }
+
+        for (idx, name) in &annotation_columns {
+            let dict = batch
+                .column(*idx)
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .ok_or_else(|| {
+                    Error::Parse(format!(
+                        ".p5s column '{name}' is not dictionary-encoded utf8"
+                    ))
+                })?;
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::Parse(format!(
+                        ".p5s column '{name}' has non-utf8 dictionary values"
+                    ))
+                })?;
+            let out = annotation_pairs.get_mut(name).expect("column registered");
+            for i in 0..batch.num_rows() {
+                if dict.is_null(i) {
+                    continue;
+                }
+                let key = dict.keys().value(i) as usize;
+                out.push((
+                    Uuid::from_bytes(entries[base + i].0),
+                    values.value(key).to_string(),
+                ));
+            }
+        }
+        for (idx, name) in &score_columns {
+            let values = batch
+                .column(*idx)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::Parse(format!(".p5s column '{name}' is not float32")))?;
+            let out = score_pairs.get_mut(name).expect("column registered");
+            for i in 0..batch.num_rows() {
+                if values.is_null(i) {
+                    continue;
+                }
+                out.push((Uuid::from_bytes(entries[base + i].0), values.value(i)));
+            }
+        }
+    }
+
+    let mut sidecar = CollectionSidecar::new(members, entries);
+    for (_, name) in &annotation_columns {
+        let pairs = annotation_pairs.remove(name).expect("column registered");
+        sidecar.set_annotation(AnnotationSection::from_pairs(
+            name,
+            pairs.iter().map(|(id, label)| (*id, label.as_str())),
+        )?);
+    }
+    for (_, name) in &score_columns {
+        let pairs = score_pairs.remove(name).expect("column registered");
+        sidecar.set_score(ScoreSection::from_pairs(name, pairs)?);
+    }
+    Ok(Some(sidecar))
+}
+
+/// Atomically write a collection sidecar. The destination is either the
+/// previous file or the complete new one — never a torn mix.
+pub fn write_collection_file(
+    p5s_path: impl AsRef<Path>,
+    sidecar: &CollectionSidecar,
+) -> Result<()> {
+    write_collection_file_checked(p5s_path, sidecar, None)
+}
+
+/// [`write_collection_file`], refusing the write if the destination changed
+/// since `expect_unchanged` was taken. See [`SidecarStamp`].
+pub fn write_collection_file_checked(
+    p5s_path: impl AsRef<Path>,
+    sidecar: &CollectionSidecar,
+    expect_unchanged: Option<&SidecarStamp>,
+) -> Result<()> {
+    let members: Vec<MemberJson> = sidecar
+        .members
+        .iter()
+        .map(|m| MemberJson {
+            name: m.name.clone(),
+            file_id: m.file_id.to_string(),
+            size: m.size,
+            reads: m.reads,
+        })
+        .collect();
+    let members_json = serde_json::to_string(&members)
+        .map_err(|e| Error::Parse(format!("member table serialization failed: {e}")))?;
+
+    let mut metadata = HashMap::new();
+    // Not content-gated the way `P5S_VERSION_SCORES` is: the member table is a
+    // different shape, not a column type, so every collection declares 3.
+    metadata.insert(
+        P5S_VERSION_KEY.to_string(),
+        P5S_VERSION_COLLECTION.to_string(),
+    );
+    metadata.insert(P5S_MEMBERS_KEY.to_string(), members_json);
+    if let Some(source) = p5s_path
+        .as_ref()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".p5s"))
+    {
+        metadata.insert(P5S_SOURCE_NAME_KEY.to_string(), source.to_string());
+    }
+    metadata.insert(
+        P5S_READ_COUNT_KEY.to_string(),
+        sidecar.entries.len().to_string(),
+    );
+    metadata.insert(
+        P5S_WRITER_KEY.to_string(),
+        concat!("escapepod-pod5 ", env!("CARGO_PKG_VERSION")).to_string(),
+    );
+
+    let mut fields = vec![
+        Field::new("read_id", DataType::FixedSizeBinary(16), false).with_metadata(HashMap::from([
+            (
+                "ARROW:extension:name".to_string(),
+                "minknow.uuid".to_string(),
+            ),
+        ])),
+        Field::new("member_idx", DataType::UInt32, false),
+        Field::new("batch_idx", DataType::UInt32, false),
+        Field::new("row_idx", DataType::UInt32, false),
+    ];
+    fields.extend(value_fields(&sidecar.annotations, &sidecar.scores)?);
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+
+    let n = sidecar.entries.len();
+    let mut id_builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+    for (uuid_bytes, _, _, _) in &sidecar.entries {
+        id_builder.append_value(uuid_bytes).map_err(Error::Arrow)?;
+    }
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(id_builder.finish()),
+        Arc::new(UInt32Array::from_iter_values(
+            sidecar.entries.iter().map(|&(_, member, _, _)| member),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            sidecar.entries.iter().map(|&(_, _, batch, _)| batch),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            sidecar.entries.iter().map(|&(_, _, _, row)| row),
+        )),
+    ];
+    columns.extend(build_value_columns(
+        n,
+        || {
+            sidecar
+                .entries
+                .iter()
+                .map(|(uuid_bytes, _, _, _)| uuid_bytes)
+        },
+        &sidecar.annotations,
+        &sidecar.scores,
+    )?);
+    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+
+    let options = IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::ZSTD))
+        .map_err(Error::Arrow)?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = ArrowFileWriter::try_new_with_options(&mut buf, &schema, options)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+
+    let atomic = AtomicFile::new(p5s_path.as_ref())?;
+    std::fs::write(atomic.temp_path()?, &buf)?;
+    if let Some(expected) = expect_unchanged {
+        expected.verify(p5s_path.as_ref())?;
+    }
+    atomic.commit()
+}
+
+/// Read **only** the index columns of a per-file sidecar, validating identity
+/// and version exactly as [`read_sidecar_file`] does.
+///
+/// The same answer as `read_sidecar_file(..).entries()`, without decoding the
+/// annotation columns — which for an annotated sidecar is most of the work and
+/// all of the allocation: a label column materialises one `String` per read on
+/// the way in, and a demux run leaves five columns behind. Every caller that
+/// wants a read index and nothing else (`Reader::read_index`, assembling a
+/// [`CollectionSidecar`] out of N members) was paying for columns it discarded.
+///
+/// Arrow's IPC file reader takes the projection up front and decompresses only
+/// the buffers it is asked for, so this is genuinely less work rather than the
+/// same work filtered afterwards.
+pub fn read_sidecar_entries(
+    p5s_path: impl AsRef<Path>,
+    expect: &Pod5Identity,
+) -> Result<Option<Vec<IndexEntry>>> {
+    let p5s_path = p5s_path.as_ref();
+    let file = match File::open(p5s_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::from(e)),
+    };
+    let probe = ArrowFileReader::try_new(file, None).map_err(|e| {
+        Error::Parse(format!(
+            "{} is not a readable .p5s sidecar (legacy .p5i or corrupt?): {e}; \
+             delete it and rebuild with `escpod index` / `escpod annotate`",
+            p5s_path.display()
+        ))
+    })?;
+    let schema = probe.schema();
+    check_version(schema.metadata(), p5s_path)?;
+    check_identity(schema.metadata(), p5s_path, expect)?;
+
+    let projection = vec![
+        schema.index_of("read_id")?,
+        schema.index_of("batch_idx")?,
+        schema.index_of("row_idx")?,
+    ];
+    drop(probe);
+
+    let file = File::open(p5s_path)?;
+    let reader = ArrowFileReader::try_new(file, Some(projection))
+        .map_err(|e| Error::Parse(format!("corrupt .p5s: {e}")))?;
+    // Positions in the *projected* schema, which need not be 0/1/2 — arrow is
+    // free to return the selected fields in original-schema order, and looking
+    // them up again costs nothing next to being silently wrong about it.
+    let projected = reader.schema();
+    let read_id_idx = projected.index_of("read_id")?;
+    let batch_idx_idx = projected.index_of("batch_idx")?;
+    let row_idx_idx = projected.index_of("row_idx")?;
+
+    let mut entries: Vec<IndexEntry> = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| Error::Parse(format!("corrupt .p5s: {e}")))?;
+        let ids = batch
+            .column(read_id_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .ok_or_else(|| {
+                Error::Parse(".p5s read_id column is not FixedSizeBinary(16)".to_string())
+            })?;
+        let batches = downcast_u32(&batch, batch_idx_idx, "batch_idx")?;
+        let rows = downcast_u32(&batch, row_idx_idx, "row_idx")?;
+        entries.reserve(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(ids.value(i));
+            entries.push((key, batches.value(i), rows.value(i)));
+        }
+    }
+    entries.sort_unstable_by_key(|e| e.0);
+    Ok(Some(entries))
 }

@@ -111,38 +111,54 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
     }
 
     heading("Signal geometry");
+    let anchor = meta.signal.anchor();
+    let end = match anchor {
+        escapepod_demux::crf::Anchor::AdapterEnd => "adapter_end",
+        escapepod_demux::crf::Anchor::ReadEnd => "read_end",
+    };
     field(
         "window",
         format!(
-            "[adapter_end - {}, adapter_end]  ({} samples)",
+            "[{end} - {}, {end}]  ({} samples)",
             meta.signal.chunk, meta.signal.chunk
         ),
     );
     field("stride", meta.signal.stride);
     field("timesteps", meta.signal.chunk / meta.signal.stride);
-    // Both of these decide whether a read is decoded at all, so a bundle that
-    // sets them is materially different to run and `--info` is where you look
-    // before trusting a model.
-    field(
-        "min adapter_end",
-        format!(
-            "{}  (chunk + margin {})",
-            meta.min_adapter_end(),
-            meta.boundary_margin()
-        ),
-    );
-    field(
-        "window clamp",
-        match meta.clamp_max_shift() {
-            0 => "off — a read whose adapter ends before chunk is refused".to_string(),
-            n => format!(
-                "adapter_end down to {} decodes from [0, {}] (max shift {})",
-                meta.signal.chunk.saturating_sub(n),
-                meta.signal.chunk,
-                n
+    // The margin and the clamp both decide whether a read is decoded at all, so
+    // a bundle that sets them is materially different to run and `--info` is
+    // where you look before trusting a model. Neither exists without a
+    // detector, and printing "min adapter_end" for a model that consumes no
+    // adapter_end is how `--info` would repeat the very confusion this anchor
+    // was added to end.
+    if meta.needs_boundary() {
+        field(
+            "min adapter_end",
+            format!(
+                "{}  (chunk + margin {})",
+                meta.min_adapter_end(),
+                meta.boundary_margin()
             ),
-        },
-    );
+        );
+        field(
+            "window clamp",
+            match meta.clamp_max_shift() {
+                0 => "off — a read whose adapter ends before chunk is refused".to_string(),
+                n => format!(
+                    "adapter_end down to {} decodes from [0, {}] (max shift {})",
+                    meta.signal.chunk.saturating_sub(n),
+                    meta.signal.chunk,
+                    n
+                ),
+            },
+        );
+    } else {
+        field(
+            "boundary detector",
+            "none — the window is anchored on the read end, so a read is refused \
+             only if it is shorter than chunk",
+        );
+    }
     field(
         "standardisation",
         format!(
@@ -235,6 +251,12 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
             }
             field("pinned", "yes — this model was calibrated against it");
         }
+        // Two different "no boundary block": one means the operator has to
+        // choose a detector, the other means there is nothing to choose.
+        None if !meta.needs_boundary() => field(
+            "pinned",
+            "n/a — this model consumes no boundary detector (--method is refused)",
+        ),
         None => field("pinned", "no — you must pass --method"),
     }
 
@@ -274,7 +296,9 @@ fn crf_info(dir: &Path) -> anyhow::Result<()> {
 
     heading("Run it");
     let needs_barcodes = meta.barcodes.is_none();
-    let needs_method = meta.boundary.is_none();
+    // A read-end model needs no detector and *refuses* `--method`, so printing
+    // it here would hand back a command line that errors.
+    let needs_method = meta.needs_boundary() && meta.boundary.is_none();
     let mut cmd = format!("  escpod demux <in.pod5> --model {} -d out/", dir.display());
     if needs_barcodes {
         cmd.push_str(" \\\n      --barcodes <refs.csv>");

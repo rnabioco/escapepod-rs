@@ -1204,15 +1204,16 @@ impl Reader {
             Some(p) => p,
             None => return Ok(None),
         };
-        let sidecar = match crate::sidecar::read_sidecar_file(&p5s_path, &self.sidecar_identity()?)?
-        {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+        // Entries only. The full reader would also materialise every
+        // annotation column — one `String` per read per label column — which
+        // an index lookup never looks at.
+        let entries =
+            match crate::sidecar::read_sidecar_entries(&p5s_path, &self.sidecar_identity()?)? {
+                Some(e) => e,
+                None => return Ok(None),
+            };
         // Sidecar entries are already UUID-sorted.
-        Ok(Some(ReadIndex {
-            entries: sidecar.entries().to_vec(),
-        }))
+        Ok(Some(ReadIndex { entries }))
     }
 
     /// The read index **if it is already resident**, without building one.

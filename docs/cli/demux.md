@@ -32,7 +32,7 @@ Key options (see `escpod demux --help` for the full set):
 
 | Option | Description |
 |--------|-------------|
-| `--model <PATH>` | Model: DTW-SVM / GBM JSON, or a CTC-CRF bundle directory |
+| `--model [NAME=]<PATH>` | Model: DTW-SVM / GBM JSON, or a CTC-CRF bundle directory. Repeatable — see [Several barcode axes](#several-barcode-axes-in-one-pass) |
 | `-d, --output-dir <DIR>` | Write per-barcode POD5 files (optional with `--annotate`) |
 | `--annotate` | Record assignments in each input's `.p5s` sidecar |
 | `--classifications <FILE>` | Also write a `read_id,barcode,confidence` CSV |
@@ -52,6 +52,71 @@ subsets later, on demand:
 escpod demux split reads.pod5 --sidecar -d out/                    # all barcodes
 escpod filter reads.pod5 --annotation barcode=nbc05 -o nbc05.pod5  # one group
 ```
+
+Pointed at a **directory**, `--annotate` writes one
+[collection sidecar](../format/sidecar.md#one-sidecar-for-a-directory) beside
+it rather than one per file — a fifty-file run leaves `pod5.p5s` and nothing
+else, and every command above still resolves a read's barcode through the POD5
+it names:
+
+```bash
+escpod demux run1/pod5/ --model <bundle> --annotate   # writes run1/pod5.p5s
+python -c "import pyarrow.ipc as i; print(i.open_file('run1/pod5.p5s').read_all())"
+```
+
+### Several barcode axes in one pass
+
+A dual-indexed library carries more than one barcode — say a 3′ adapter
+index and a 5′ one. `--model` is repeatable, so both are called in a single
+pass over the POD5 instead of decompressing every read twice:
+
+```bash
+escpod demux reads.pod5 \
+    --model ldx=<ldx bundle> \
+    --model fdx=<fdx bundle> \
+    --annotate
+```
+
+With more than one model each is given as `NAME=PATH`. `NAME` is that axis's
+sidecar annotation column, and it is **yours, not the bundle's** — it names
+the axis in your experimental design, and the same model can serve different
+axes in different runs. Those column names are exactly what
+[`annotate --design`](../experimental/annotate.md#experimental-designs) keys a
+multi-column samplesheet on:
+
+```bash
+cat samplesheet.csv
+# ldx,fdx,library,condition
+# ldx01,fdx01,A,plain_adapter
+# ldx04,fdx02,B,plain_adapter
+escpod annotate --design samplesheet.csv reads.pod5
+escpod view reads.pod5 --include read_id,ldx,fdx,library,condition
+```
+
+What is shared is the expensive prefix — one POD5 sweep, one signal decode,
+one adapter detection — and not the encoders, which are per-model and are
+most of the cost. Measured on an A30 at 40 k reads, a fused `ldx`+`fdx` run
+takes 14.6 s against 16.8 s for the two runs separately (1.15×); the win
+should be larger on a cold network filesystem, where reading the POD5 is a
+bigger share. Both axes' calls are identical to what the separate runs
+produce.
+
+Four rules, each an error rather than a surprise:
+
+- **Several models need `--annotate` / `--classifications`, not `-d`.**
+  Writing one POD5 per barcode is single-axis. Split afterwards on whichever
+  axis you want: `escpod demux split reads.pod5 --sidecar --annotation ldx`.
+- **Only CTC-CRF bundles combine.** The fingerprint heads (DTW-SVM, GBM)
+  share one compiled-in segmentation geometry, so a second one would
+  silently be fingerprinted with the first one's parameters.
+- **Every axis that needs a boundary detector must pin the same one.**
+  Detection runs once and its answer goes to every axis.
+- **Names must be unique**, and cannot be `read_id`, `batch_idx`, `row_idx`
+  or `unclassified`.
+
+A single-model run is unchanged: the sidecar column is still `barcode` and
+the classifications CSV is still `read_id,barcode,confidence`. Only a
+multi-axis run prefixes its columns (`ldx`, `ldx_confidence`, …).
 
 The stepwise subcommands below remain available for running stages
 individually or inspecting intermediates.

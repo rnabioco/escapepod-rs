@@ -80,7 +80,7 @@ The default build ships the stable CLI surface (summary, view, inspect,
 merge, filter, bam-filter, subset, `index`) **plus the full demux tree** —
 fused `demux`, `detect`, `fingerprint`, `classify`, `basecall`, `split`,
 `models`, `train` — with CNN adapter detection, CRF basecalling, and model
-fetching included, **and `signal classify`**, the read-level model runner
+fetching included, **and `classify`**, the read-level model runner
 (tRNA charging), with both bundle scorers. Extra commands and accelerators
 live behind Cargo features:
 
