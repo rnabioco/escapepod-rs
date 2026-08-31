@@ -53,6 +53,17 @@ escpod demux split reads.pod5 --sidecar -d out/                    # all barcode
 escpod filter reads.pod5 --annotation barcode=nbc05 -o nbc05.pod5  # one group
 ```
 
+Pointed at a **directory**, `--annotate` writes one
+[collection sidecar](../format/sidecar.md#one-sidecar-for-a-directory) beside
+it rather than one per file — a fifty-file run leaves `pod5.p5s` and nothing
+else, and every command above still resolves a read's barcode through the POD5
+it names:
+
+```bash
+escpod demux run1/pod5/ --model <bundle> --annotate   # writes run1/pod5.p5s
+python -c "import pyarrow.ipc as i; print(i.open_file('run1/pod5.p5s').read_all())"
+```
+
 ### Several barcode axes in one pass
 
 A dual-indexed library carries more than one barcode — say a 3′ adapter

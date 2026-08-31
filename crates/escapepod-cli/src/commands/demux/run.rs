@@ -14,7 +14,7 @@
 //!      barcode — writes parallelize across barcodes instead of one global
 //!      writer being the bottleneck.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
@@ -1051,6 +1051,11 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     if args.input.is_empty() {
         anyhow::bail!("no input POD5 file(s) given");
     }
+    // Which arguments were *directories*, captured before expansion flattens
+    // them away. With --annotate each one also gets a collection sidecar
+    // covering every POD5 beneath it — the answer to a fifty-file run leaving
+    // fifty sidecars behind when the barcodes in them are one result.
+    let input_dirs: Vec<PathBuf> = args.input.iter().filter(|p| p.is_dir()).cloned().collect();
     // Expand directories and reject paths that do not exist, the same way the
     // advanced subcommands do (see `super::run`). Deliberately after `--info`,
     // which describes a model and is given no POD5 at all.
@@ -1752,7 +1757,49 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                 .collect(),
         };
         let columns = collected.into_columns();
-        for path in &args.input {
+        // One collection sidecar per directory argument — the answer to a
+        // fifty-file run leaving fifty sidecars behind when the barcodes in
+        // them are one result. Written first, so that a run which fails
+        // partway has written the whole result or none of it rather than a
+        // scattering of per-file columns.
+        let mut covered: HashSet<&Path> = HashSet::new();
+        for dir in &input_dirs {
+            let members: Vec<PathBuf> = args
+                .input
+                .iter()
+                .filter(|p| p.starts_with(dir))
+                .cloned()
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let path = escapepod_signal::pod5::sidecar::collection_sidecar_path(dir);
+            let result = escapepod_signal::operations::write_collection_columns(
+                &path, &members, &columns, false,
+            )
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            covered.extend(
+                args.input
+                    .iter()
+                    .filter(|p| p.starts_with(dir))
+                    .map(|p| p.as_path()),
+            );
+            let barcode = result.columns.first();
+            info!(
+                "{} {} — {} of {} reads assigned across {} labels, {} files in one sidecar",
+                style::action("wrote"),
+                style::path(result.sidecar_path.display()),
+                style::count(barcode.map_or(0, |c| c.assigned)),
+                style::count(result.total_reads),
+                style::count(barcode.map_or(0, |c| c.labels)),
+                style::count(result.members),
+            );
+        }
+        // Whatever was named as a file rather than reached through a directory
+        // still gets a sidecar of its own: there is no collection for it to
+        // belong to, and inventing one beside an arbitrary path would put a
+        // file somewhere the caller never pointed at.
+        for path in args.input.iter().filter(|p| !covered.contains(p.as_path())) {
             // One read-modify-write for all five columns: five separate ones
             // would rewrite the sidecar five times and leave four intermediate
             // states on disk describing a run that never happened.

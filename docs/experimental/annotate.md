@@ -47,6 +47,29 @@ directory of per-flowcell files. Unassigned reads are simply absent from the
 annotation (no sentinel label). Writing the same `--name` again replaces
 that annotation; other annotations and the read index are preserved.
 
+### A directory gets one sidecar
+
+Naming a **directory** writes a single
+[collection sidecar](../format/sidecar.md#one-sidecar-for-a-directory) beside
+it, covering every POD5 beneath — and no per-file sidecars:
+
+```bash
+escpod annotate -a demux.csv run1/pod5/        # writes run1/pod5.p5s, and nothing else
+```
+
+The run's labels are one result, so they live in one file rather than being
+copied into fifty. Reading is unaffected: `view --include`, `filter
+--annotation`, `demux split --sidecar` and the Python API all resolve a POD5's
+columns from the collection beside its directory when the file has no sidecar
+of its own.
+
+Naming files individually keeps the per-file behaviour — there is no directory
+for a collection to sit beside:
+
+```bash
+escpod annotate -a demux.csv run1/pod5/*.pod5  # writes one .p5s per file
+```
+
 If you are running the fused demux pipeline anyway, `escpod demux
 --annotate` writes the sidecar directly and skips the CSV round-trip — see
 [demux](../cli/demux.md#sidecar-output).
