@@ -19,12 +19,40 @@
 //! ```
 //!
 //! The offending subgraph is `Unsqueeze` -> `Transpose` -> `GatherND` ->
-//! `Transpose` -> `Where`: `nn.MultiheadAttention`'s mask handling, as the
-//! **dynamo** exporter lowers it. Every input to it is a constant initializer
-//! (a `(1,1,11,37,2)` index tensor, an `(11,37)` bool mask), so the pattern is
-//! entirely static and tract still cannot close it. It is *not*
-//! `adaptive_avg_pool1d`, which rnabioco/escapepod-rs#306 named as the suspect
-//! -- those layers are in the model config and are not what tract dies on.
+//! `Transpose` -> `Where`, and it **is** `adaptive_avg_pool1d`, as the
+//! **dynamo** exporter lowers an output size that does not divide the input.
+//! Every input to it is a constant initializer (a `(1,1,11,37,2)` index
+//! tensor, an `(11,37)` bool mask), so the pattern is entirely static and
+//! tract still cannot close it.
+//!
+//! Those two constants are what identify it, and they are worth reading
+//! closely, because this file previously blamed `nn.MultiheadAttention`'s mask
+//! handling and explicitly ruled the pool out. `charging_tcn_rna004` pools 390
+//! down to 11. PyTorch's bin rule is `[floor(j*L/K), ceil((j+1)*L/K))`, which
+//! for 390 -> 11 gives eleven bins of width 36 or 37 -- so a gather that
+//! evaluates every bin at once needs an `(11, 37)` index grid and an `(11, 37)`
+//! mask marking the slot the 36-wide bins do not use. That is exactly the pair
+//! above. An attention mask is shaped by sequence length and head count and
+//! would never be `11 x 37`; 11 and 37 are the pool's output width and its
+//! widest bin. `nn.MultiheadAttention` in fact exports as plain
+//! `MatMul`/`Softmax`/`MatMul`.
+//!
+//! The trap is that a non-dividing adaptive pool does not lower to *any* ONNX
+//! pooling op, so grepping the graph for one finds nothing and the ragged-bin
+//! gather looks like it must have come from somewhere else. The layers named
+//! in the model config are real and they are what tract dies on -- they just
+//! do not appear under a pooling name. rnabioco/escapepod-rs#306 had it right.
+//!
+//! Diagnosed and fixed upstream in rnabioco/leech#233. There were **two**
+//! independent causes, and the table above shows both: the pool, and the
+//! `value_info` dynamo writes for every intermediate carrying the batch axis
+//! as the symbol `batch` (which is the `node_conv1d` row -- a consumer that
+//! pins the batch cannot unify against a symbol, so it fails at the *first*
+//! convolution before ever reaching the gather). leech 0.10.0 emits the pool
+//! as a single matmul against a constant segment-mean matrix and strips
+//! `value_info` on every export. Neither is visible to a round-trip check
+//! against onnxruntime, which loads the old graph happily -- which is why this
+//! surfaced here, at integration, rather than at build time.
 //!
 //! Neither standard rewrite helps, so this cannot be papered over at load time
 //! the way [`crate::fnn`]'s `hoist_conv_padding` papers over padded
@@ -50,8 +78,17 @@
 //! "tract cannot run `Resize`" on 2026-07-27 after finding the failure was
 //! shape inference over a runtime-computed shape, that our export was the
 //! cause, and that one line fixed it with no retrain (and a 6x speedup in
-//! tract). A re-export without dynamo's MHA lowering would let this file and
-//! the `ort` dependency go away -- rnabioco/escapepod-models#96.
+//! tract). This is the same shape of mistake and the same shape of fix: a
+//! re-export from leech >= 0.10.0, same weights and no retrain, would let this
+//! file and the `ort` dependency go away -- rnabioco/escapepod-models#96.
+//!
+//! Measured there on the shipped `TCNDwellResidualLN` weights: 479 -> 319
+//! nodes, `GatherND` 2 -> 0, `Gather` 76 -> 0, and tract loads, optimizes and
+//! runs the result at batch 1 and 32, within 5.72e-06 of torch over 256 real
+//! chunks with no decision disagreements. So the bridge can be removed once
+//! `charging_tcn_rna004` is re-exported and shipped; what is *not* yet
+//! verified is a released `escpod` running such a bundle end to end, since
+//! 0.18.1 has no waveform bundle variant.
 //!
 //! # What is checked, and what is trusted
 //!

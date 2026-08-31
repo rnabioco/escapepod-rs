@@ -49,10 +49,11 @@
   Behind a **separate `classify-waveform` feature**, and deliberately not in
   the default build. Unlike every other ONNX graph `escpod` runs, this one
   cannot go through tract — not for want of an op, but because tract 0.23's
-  *shape inference* cannot close a **dynamo** export of
-  `nn.MultiheadAttention`: an `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/
-  `Where` chain whose every input is a constant initializer. Measured five
-  ways, and neither onnx-simplifier (which folds away every `Shape` node) nor
+  *shape inference* cannot close how the **dynamo** exporter lowers
+  `adaptive_avg_pool1d` when the output size does not divide the input: an
+  `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain whose every
+  input is a constant initializer. Measured five ways, and neither
+  onnx-simplifier (which folds away every `Shape` node) nor
   onnxruntime's own optimiser makes it loadable, so it cannot be papered over
   at load time the way `fnn::hoist_conv_padding` papers over padded
   convolutions. So it runs through onnxruntime via `ort`, which — being
