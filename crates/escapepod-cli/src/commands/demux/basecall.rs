@@ -427,12 +427,18 @@ fn produce_blocks(
                         // to `[0, chunk]`, so the prefix has to reach `chunk` or
                         // the read arrives one sample short of its own window and
                         // is refused for a reason that looks like geometry.
-                        let need = if meta.clamp_max_shift() > 0 {
-                            adapter_end.max(meta.signal.chunk)
+                        //
+                        // A read-end model wants the *suffix* instead, and any
+                        // prefix bound would relocate the end it anchors on — so
+                        // it gets the whole read and ignores `adapter_end`.
+                        let need = if meta.needs_full_read() {
+                            None
+                        } else if meta.clamp_max_shift() > 0 {
+                            Some(adapter_end.max(meta.signal.chunk))
                         } else {
-                            adapter_end
+                            Some(adapter_end)
                         };
-                        let adc = decode_chunks_to(chunks, Some(need))?;
+                        let adc = decode_chunks_to(chunks, need)?;
                         let mut w = Vec::new();
                         meta.prep_adc_into(
                             &adc,
@@ -508,6 +514,28 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
     };
     #[allow(unused_mut)]
     let mut encoder = encoder;
+    // Same rule as the fused path: neither knob means anything without a
+    // detector, so refuse rather than report a bound that never runs.
+    if !encoder.metadata().needs_boundary() {
+        for (flag, given) in [
+            ("--boundary-margin", args.boundary_margin.is_some()),
+            ("--clamp-max-shift", args.clamp_max_shift.is_some()),
+        ] {
+            if given {
+                anyhow::bail!(
+                    "{flag} is not applicable: this model anchors its window on the read \
+                     end, so no boundary margin or window shift is involved."
+                );
+            }
+        }
+        // The CSV still selects which reads to basecall; only its `adapter_end`
+        // column goes unused. Say so, because the command is named for it.
+        info!(
+            "{} anchored on the read end — the boundaries CSV selects reads, and its \
+             adapter_end column is not read",
+            style::label("Window:")
+        );
+    }
     if let Some(margin) = args.boundary_margin {
         let was = encoder.metadata().min_adapter_end();
         encoder.set_boundary_margin(margin);

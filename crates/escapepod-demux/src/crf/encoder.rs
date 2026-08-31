@@ -69,6 +69,21 @@ pub enum CrfError {
         batch: usize,
         n_score: usize,
     },
+    #[error(
+        "signal.window says {window:?} but signal.anchor says {anchor:?}. These describe the \
+         same rule and one of them is wrong; fix the export rather than guessing which."
+    )]
+    AnchorDisagreesWithWindow {
+        window: String,
+        anchor: &'static str,
+    },
+    #[error(
+        "this bundle anchors its window on the read end but declares boundary.method \
+         {method:?}. A read-end model consumes no boundary detector, and a bundle that pins \
+         one will be run against a detector's adapter_end -- the far end of the molecule. \
+         Record the detector under `built_beside` if it is provenance."
+    )]
+    BoundaryPinnedOnReadEnd { method: String },
     #[error("lattice geometry {n_base}^{state_len} is not representable")]
     BadGeometry { n_base: usize, state_len: usize },
     #[error("alphabet has {got} symbols, expected {expected} (blank plus one per base)")]
@@ -81,8 +96,14 @@ pub enum CrfError {
 
 /// The `metadata.json` sidecar that travels with a CRF encoder export.
 ///
-/// Unknown fields are ignored on purpose: the sidecar also carries provenance
-/// and human-facing notes that a consumer has no business depending on.
+/// Unknown fields are ignored **at this level** on purpose: the sidecar also
+/// carries provenance and human-facing notes that a consumer has no business
+/// depending on, and `built_beside` (a detector recorded for history, not
+/// pinned) is exactly that.
+///
+/// Blocks that carry *rules* are closed instead — see [`SignalSpec`]. The
+/// distinction is which way the failure goes: an ignored provenance key costs
+/// nothing, while an ignored rule produces a confident wrong answer.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CrfMetadata {
     /// Filename of the ONNX graph, relative to the sidecar.
@@ -219,12 +240,78 @@ pub struct Standardisation {
     pub stdev: f32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// What the model's `chunk`-sample window is measured back from.
+///
+/// Not a cosmetic distinction: the two anchors sit at opposite ends of the
+/// molecule. RNA004 translocates 3'->5', so a 3'-adapter barcode is found by
+/// windowing back from the boundary detector's `adapter_end`, while a 5' index
+/// goes through the pore *last* and its adapter is simply where the signal
+/// stops. Reading a `read_end` model at `adapter_end` decodes the far end of
+/// the molecule and returns exactly the output shape it should.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Anchor {
+    /// `[adapter_end - chunk, adapter_end]`, off the boundary detector.
+    AdapterEnd,
+    /// `[len - chunk, len]`, off the read's last sample. Consumes no detector.
+    ReadEnd,
+}
+
+impl Anchor {
+    /// The token this anchor is spelled with in a `signal.window` string.
+    const fn token(self) -> &'static str {
+        match self {
+            Anchor::AdapterEnd => "adapter_end",
+            Anchor::ReadEnd => "read_end",
+        }
+    }
+}
+
+/// Where the model's input window sits and how wide it is.
+///
+/// `deny_unknown_fields`, unlike [`CrfMetadata`] itself. Every key in this
+/// block is a *rule the model was built with*, so accepting one this runtime
+/// does not implement is how a read gets a confident wrong answer rather than
+/// an error — the doctrine already written down for the charging bundle
+/// (`escapepod-classify::bundle`). It is not hypothetical: every shipped
+/// bundle declares `window`, `barcode_crf_fdx4_rna004@v0.1.1` declares
+/// `anchor`, and both were being dropped here — which windowed a 5'-index
+/// model onto the 3' adapter.
+///
+/// The cost is deliberate: a bundle from a newer builder fails to load rather
+/// than loading with its new rule silently ignored. Provenance keys have no
+/// business in this block; they belong at the top level, which stays open.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignalSpec {
     /// Samples fed to the encoder per read.
     pub chunk: usize,
     /// Samples per output timestep.
     pub stride: usize,
+    /// What the window is measured back from, as the bundle spells it.
+    ///
+    /// Read it through [`Self::anchor`], never directly: absent means
+    /// [`Anchor::AdapterEnd`] (every bundle predating this key was built that
+    /// way and means exactly that), and a caller that matches on the `Option`
+    /// itself is one `None` arm away from reinstating the bug this key exists
+    /// to fix. Hence the name — there is no `.anchor` field to misread.
+    #[serde(default, rename = "anchor")]
+    pub declared_anchor: Option<Anchor>,
+    /// The window in the exporter's own words, e.g.
+    /// `"[read_end - chunk, read_end]"`. Documentation, not the contract —
+    /// [`Self::anchor`] is — but it is cross-checked against the anchor at
+    /// load, because the one time these disagreed the prose was right and the
+    /// machine-readable half was wrong.
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+impl SignalSpec {
+    /// The anchor in effect: what the bundle declares, else
+    /// [`Anchor::AdapterEnd`].
+    pub fn anchor(&self) -> Anchor {
+        self.declared_anchor.unwrap_or(Anchor::AdapterEnd)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,10 +330,59 @@ impl CrfMetadata {
             path: path.to_path_buf(),
             source,
         })?;
-        serde_json::from_str(&raw).map_err(|source| CrfError::MetadataParse {
+        let meta: Self = serde_json::from_str(&raw).map_err(|source| CrfError::MetadataParse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        meta.validate()?;
+        Ok(meta)
+    }
+
+    /// Cross-checks between blocks that parse fine on their own.
+    ///
+    /// `deny_unknown_fields` on [`SignalSpec`] catches a rule this runtime does
+    /// not implement; this catches two the runtime *does* implement and that
+    /// contradict each other. Both are the same defect seen from different
+    /// sides — a bundle asserting a window it does not have — and both were
+    /// live in `barcode_crf_fdx4_rna004@v0.1.0`.
+    pub fn validate(&self) -> Result<(), CrfError> {
+        let anchor = self.signal.anchor();
+        if let Some(window) = &self.signal.window {
+            let other = match anchor {
+                Anchor::AdapterEnd => Anchor::ReadEnd,
+                Anchor::ReadEnd => Anchor::AdapterEnd,
+            };
+            // Neither token is a substring of the other, so "names mine and not
+            // the other one" is decidable by two `contains`.
+            if !window.contains(anchor.token()) || window.contains(other.token()) {
+                return Err(CrfError::AnchorDisagreesWithWindow {
+                    window: window.clone(),
+                    anchor: anchor.token(),
+                });
+            }
+        }
+        if anchor == Anchor::ReadEnd
+            && let Some(b) = &self.boundary
+        {
+            return Err(CrfError::BoundaryPinnedOnReadEnd {
+                method: b.method.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether this model's window is placed by a boundary detector.
+    ///
+    /// A run whose every head answers `false` needs no detector at all, and
+    /// must not be given one: a detector's `signal_decode_bound` truncates each
+    /// read to its own leading window, which moves where "the read end" is.
+    pub fn needs_boundary(&self) -> bool {
+        self.signal.anchor() == Anchor::AdapterEnd
+    }
+
+    /// Whether this model needs the read decoded to its last sample.
+    pub fn needs_full_read(&self) -> bool {
+        self.signal.anchor() == Anchor::ReadEnd
     }
 
     /// Blank-first alphabet as single bytes, e.g. `b"NACGT"`.
@@ -289,9 +425,10 @@ impl CrfMetadata {
 
     /// Slice and standardise the model input for one read.
     ///
-    /// The window is `[adapter_end - chunk, adapter_end]` of **raw calibrated
-    /// pA** — not ADC counts, not MAD-normalised signal — matching
-    /// `extract_chunks.py`. Returns `None` when the read cannot supply a full
+    /// The window is [`Self::window`] of **raw calibrated pA** — not ADC
+    /// counts, not MAD-normalised signal — matching `extract_chunks.py`. Under
+    /// [`Anchor::ReadEnd`] `adapter_end` is ignored and `signal_pa` must run to
+    /// the read's last sample. Returns `None` when the read cannot supply a full
     /// window, which is also how `adapter_end == 0` (the boundary detector's
     /// overloaded "no adapter" / "too short" / "inference failed" sentinel)
     /// ends up unclassified rather than guessed at.
@@ -305,7 +442,25 @@ impl CrfMetadata {
     /// The `chunk`-sample window to decode, or `None` if the read cannot supply
     /// one.
     ///
-    /// Normally `[adapter_end - chunk, adapter_end]`. When `adapter_end < chunk`
+    /// Which end it is measured from is the bundle's [`Anchor`]. Under
+    /// [`Anchor::ReadEnd`] this is `[len - chunk, len]` and `adapter_end` is
+    /// ignored entirely — there is no detector, so there is no margin to clear
+    /// and no shift to clamp, and the only way to fail is a read shorter than
+    /// the window. `len` must therefore be the read's *full* length; see
+    /// [`Self::needs_full_read`].
+    fn window(&self, adapter_end: usize, len: usize) -> Option<(usize, usize)> {
+        match self.signal.anchor() {
+            Anchor::AdapterEnd => self.window_from_adapter_end(adapter_end, len),
+            // `checked_sub` rather than a `len >= chunk` guard with
+            // `then_some`, which evaluates the subtraction eagerly and
+            // underflows on exactly the short read the guard exists to reject.
+            Anchor::ReadEnd => len.checked_sub(self.signal.chunk).map(|lo| (lo, len)),
+        }
+    }
+
+    /// [`Self::window`] under [`Anchor::AdapterEnd`].
+    ///
+    /// `[adapter_end - chunk, adapter_end]`. When `adapter_end < chunk`
     /// no such window exists — the read starts mid-adapter, so the signal simply
     /// runs out — and the read is refused, unless clamping is enabled. Clamping
     /// substitutes `[0, chunk]`: the same width, anchored at the read start,
@@ -316,7 +471,7 @@ impl CrfMetadata {
     /// is still called for 98.6% at shift 0 and 93.5% at shift 500. Quality does
     /// decay with the shift, which is why the allowance is a bound and not a
     /// bool — see [`CrfMetadata::clamp_max_shift`].
-    fn window(&self, adapter_end: usize, len: usize) -> Option<(usize, usize)> {
+    fn window_from_adapter_end(&self, adapter_end: usize, len: usize) -> Option<(usize, usize)> {
         let chunk = self.signal.chunk;
         if adapter_end > len {
             return None;
@@ -480,6 +635,10 @@ impl CrfEncoder {
 
     /// Load an ONNX graph with an already-parsed sidecar.
     pub fn load(onnx: impl AsRef<Path>, meta: CrfMetadata) -> Result<Self, CrfError> {
+        // Re-run for a caller that built the sidecar by hand rather than
+        // through `CrfMetadata::load`; it is a handful of string compares once
+        // per process, and skipping it is how the check gets bypassed.
+        meta.validate()?;
         let layout = meta.layout()?;
         let alphabet = meta.alphabet_bytes();
 
@@ -949,5 +1108,186 @@ mod tests {
         let mut m = meta();
         m.crf.alphabet.pop();
         assert!(matches!(m.layout(), Err(CrfError::BadAlphabet { .. })));
+    }
+
+    /// A `signal` block with the shape `barcode_crf_fdx4_rna004@v0.1.1` ships.
+    fn read_end_meta() -> CrfMetadata {
+        serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 69.535726, "stdev": 16.106312},
+              "signal": {"chunk": 3500, "stride": 10,
+                         "window": "[read_end - chunk, read_end]",
+                         "anchor": "read_end"},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]},
+              "built_beside": {"model_id": "adapter_rna004@v1.1.0", "role": "none"}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// The window is `[len - chunk, len]` and `adapter_end` is ignored — which
+    /// is the whole point, since a read-end model runs with no detector and
+    /// therefore only ever sees the `(0, 0)` sentinel.
+    #[test]
+    fn read_end_windows_back_from_the_last_sample() {
+        let m = read_end_meta();
+        assert_eq!(m.signal.anchor(), Anchor::ReadEnd);
+        assert!(!m.needs_boundary());
+        assert!(m.needs_full_read());
+
+        assert_eq!(m.window(0, 9_000), Some((5_500, 9_000)), "sentinel ignored");
+        assert_eq!(
+            m.window(4_242, 9_000),
+            Some((5_500, 9_000)),
+            "any adapter_end gives the same window"
+        );
+        assert_eq!(m.window(0, 3_500), Some((0, 3_500)), "exactly a window");
+        assert_eq!(m.window(0, 3_499), None, "read shorter than chunk");
+
+        // Neither knob applies, so neither can rescue or refuse a read: the
+        // margin would otherwise gate everything below chunk + 200.
+        let mut m = m;
+        m.set_boundary_margin(5_000);
+        m.set_clamp_max_shift(5_000);
+        assert_eq!(m.window(0, 3_600), Some((100, 3_600)), "margin is inert");
+    }
+
+    /// `prep` reads the tail, so it must be handed the read's *full* signal —
+    /// truncating it does not shorten the window, it relocates it.
+    #[test]
+    fn read_end_prep_takes_the_tail() {
+        let m = read_end_meta();
+        let signal: Vec<f32> = (0..5_000).map(|i| i as f32).collect();
+        let got = m.prep(&signal, 0).unwrap();
+        assert_eq!(got.len(), 3_500);
+        let want = (1_500.0 - m.standardisation.mean) / m.standardisation.stdev;
+        assert!((got[0] - want).abs() < 1e-3, "got {} want {want}", got[0]);
+        let want_last = (4_999.0 - m.standardisation.mean) / m.standardisation.stdev;
+        assert!((got[3_499] - want_last).abs() < 1e-3);
+    }
+
+    /// The default is `adapter_end`, because every bundle predating the key was
+    /// built that way. Silence must not become a second meaning.
+    #[test]
+    fn absent_anchor_means_adapter_end() {
+        let m = meta();
+        assert_eq!(m.signal.anchor(), Anchor::AdapterEnd);
+        assert!(m.needs_boundary());
+        assert!(!m.needs_full_read());
+        assert_eq!(m.window(4_000, 9_000), Some((2_000, 4_000)));
+    }
+
+    /// `deny_unknown_fields` on `signal` only. A rule this runtime does not
+    /// implement must fail the load rather than be dropped — but the top level
+    /// still carries provenance nobody should depend on, and that stays open.
+    #[test]
+    fn unknown_keys_are_refused_in_signal_and_ignored_above_it() {
+        let with_rule = serde_json::from_str::<CrfMetadata>(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 2000, "stride": 10, "detrend": "median"},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]}
+            }"#,
+        );
+        assert!(
+            with_rule.is_err(),
+            "an unimplemented signal rule must refuse"
+        );
+
+        // A spelling this runtime does not know is a value, not a key, and
+        // serde refuses it for the same reason.
+        let bad_anchor = serde_json::from_str::<CrfMetadata>(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 2000, "stride": 10, "anchor": "poly_a_start"},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]}
+            }"#,
+        );
+        assert!(bad_anchor.is_err(), "an unknown anchor must refuse");
+
+        // Provenance above `signal` is still free-form.
+        assert!(meta().signal.window.is_none());
+
+        // Closing this block is only safe because it is closed over the key set
+        // the fleet actually ships. As of this change every published CRF
+        // bundle declares `chunk`/`stride`/`window`, and fdx4@v0.1.1 adds
+        // `anchor`; both shapes must load, or `deny_unknown_fields` grounds
+        // every model rather than the one bad export it is aimed at.
+        for signal in [
+            r#"{"chunk": 3000, "stride": 10,
+                "window": "[adapter_end - chunk, adapter_end]"}"#,
+            r#"{"chunk": 3500, "stride": 10, "anchor": "read_end",
+                "window": "[read_end - chunk, read_end]"}"#,
+        ] {
+            let json = format!(
+                r#"{{"standardisation": {{"mean": 1.0, "stdev": 1.0}},
+                     "signal": {signal},
+                     "crf": {{"state_len": 4, "n_base": 4,
+                              "alphabet": ["N", "A", "C", "G", "T"]}}}}"#
+            );
+            let m: CrfMetadata = serde_json::from_str(&json).expect("shipped key set parses");
+            assert!(m.validate().is_ok(), "shipped key set validates");
+        }
+    }
+
+    /// The prose and the machine-readable key describe one rule. When they
+    /// disagree, refuse — do not pick a side. This is
+    /// `barcode_crf_fdx4_rna004@v0.1.0`, whose sidecar claimed the adapter-end
+    /// window for a read-end model.
+    #[test]
+    fn a_window_string_that_contradicts_the_anchor_is_refused() {
+        let m: CrfMetadata = serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 3500, "stride": 10,
+                         "window": "[adapter_end - chunk, adapter_end]",
+                         "anchor": "read_end"},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]}
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m.validate(),
+            Err(CrfError::AnchorDisagreesWithWindow { .. })
+        ));
+        // The agreeing pair, both ways round, passes.
+        assert!(read_end_meta().validate().is_ok());
+        let adapter: CrfMetadata = serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 3000, "stride": 10,
+                         "window": "[adapter_end - chunk, adapter_end]"},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]}
+            }"#,
+        )
+        .unwrap();
+        assert!(adapter.validate().is_ok());
+    }
+
+    /// The other half of the same defect: a read-end model that pins a
+    /// detector. escpod honours a `boundary` block at runtime (it refuses
+    /// `--method llr` against a `cnn` pin), so believing this one would window
+    /// the 3' adapter and feed the model the far end of the molecule.
+    #[test]
+    fn a_read_end_bundle_may_not_pin_a_boundary_detector() {
+        let m: CrfMetadata = serde_json::from_str(
+            r#"{
+              "standardisation": {"mean": 1.0, "stdev": 1.0},
+              "signal": {"chunk": 3500, "stride": 10, "anchor": "read_end"},
+              "crf": {"state_len": 4, "n_base": 4,
+                      "alphabet": ["N", "A", "C", "G", "T"]},
+              "boundary": {"method": "cnn", "onnx": "adapter_rna004.onnx"}
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m.validate(),
+            Err(CrfError::BoundaryPinnedOnReadEnd { .. })
+        ));
     }
 }

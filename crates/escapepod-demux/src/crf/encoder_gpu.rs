@@ -269,6 +269,9 @@ impl CrfEncoderGpu {
         meta: CrfMetadata,
         device: i32,
     ) -> Result<Self, CrfError> {
+        // Same reason as `CrfEncoder::load`: a hand-built sidecar must not
+        // reach the device unchecked.
+        meta.validate()?;
         let layout = meta.layout()?;
         let alphabet = meta.alphabet_bytes();
 

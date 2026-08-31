@@ -357,6 +357,15 @@ impl Default for FpParams {
 /// [`Detector::detect_batch`] so the GPU variant runs as one onnxruntime call
 /// per block instead of per read.
 enum Detector {
+    /// No detection at all: every head anchors its window on the read end, so
+    /// nothing consumes an `adapter_end`.
+    ///
+    /// A variant rather than an `Option<Detector>` because "there is no
+    /// boundary" is a legitimate, fully-specified configuration rather than a
+    /// missing one, and because it answers the two questions every producer
+    /// asks — `(0, 0)` bounds and *no* decode bound — in the same place the
+    /// other variants answer them, instead of at each call site.
+    None,
     Llr {
         min_adapter: usize,
         border_trim: usize,
@@ -382,6 +391,9 @@ impl Detector {
     /// distribution (medians of ~8 k samples, maxima in the millions).
     fn detect_with(&self, signal: &[i16], scratch: &mut DetectScratch) -> (usize, usize) {
         match self {
+            // Not the detector's "no adapter" sentinel reused: no head that
+            // runs under this variant reads the value at all.
+            Detector::None => (0, 0),
             Detector::Llr {
                 min_adapter,
                 border_trim,
@@ -485,12 +497,16 @@ impl Detector {
             .collect()
     }
 
-    /// Leading samples this detector needs decoded (`None` = the whole read).
+    /// Leading samples this detector needs decoded (`None` = the whole read),
+    /// before any head's own requirement is applied — size a run with
+    /// [`decode_bound`], not with this.
+    ///
     /// CNN only looks at `[min_obs_adapter:max_obs_trace]`, so long reads (mRNA)
     /// can skip decompressing the rest of the signal; LLR normalizes over the
     /// whole read, so it needs all of it.
     fn signal_decode_bound(&self) -> Option<usize> {
         match self {
+            Detector::None => None,
             Detector::Llr { .. } => None,
             #[cfg(feature = "cnn-detect")]
             Detector::Cnn(c) => Some(c.config().max_obs_trace),
@@ -769,6 +785,19 @@ impl ClassifyModel {
             }
         }
     }
+
+    /// Whether this head's window is placed by a boundary detector.
+    ///
+    /// Only a CRF bundle can say no, and only by anchoring on the read end.
+    /// The fingerprint heads take the adapter region itself, so for them the
+    /// question does not arise.
+    fn needs_boundary(&self) -> bool {
+        match self {
+            ClassifyModel::Svm(_) | ClassifyModel::Gbm(_) => true,
+            #[cfg(feature = "crf-decode")]
+            ClassifyModel::Crf(h) => h.encoder.metadata().needs_boundary(),
+        }
+    }
 }
 
 /// Is this `--model` a CTC-CRF encoder bundle rather than a classifier JSON?
@@ -920,6 +949,23 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             };
             #[allow(unused_mut)]
             let mut encoder = encoder;
+            // Both knobs describe how far a window may sit from a *detector's*
+            // adapter_end. A read-end model has no detector, so there is
+            // nothing for either to relax — and silently accepting them would
+            // report a "Boundary margin:" line for a bound that never runs.
+            if !encoder.metadata().needs_boundary() {
+                for (flag, given) in [
+                    ("--boundary-margin", args.boundary_margin.is_some()),
+                    ("--clamp-max-shift", args.clamp_max_shift.is_some()),
+                ] {
+                    if given {
+                        anyhow::bail!(
+                            "{flag} is not applicable: this model anchors its window on the \
+                             read end, so no boundary margin or window shift is involved."
+                        );
+                    }
+                }
+            }
             if let Some(margin) = args.boundary_margin {
                 let was = encoder.metadata().min_adapter_end();
                 encoder.set_boundary_margin(margin);
@@ -1043,7 +1089,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     #[cfg(not(feature = "crf-decode"))]
     let boundary_pin: Option<BoundaryPin> = None;
 
-    let detector = build_detector(&args, boundary_pin, device)?;
+    let detector = build_detector(&args, boundary_pin, device, model.needs_boundary())?;
 
     // Neutralise onnxruntime's at-exit CUDA teardown *here*, at construction,
     // rather than at the end of a successful run.
@@ -1486,6 +1532,22 @@ type BlockItem = (ReadData, Vec<CompressedSignalChunk>, Arc<Vec<RunInfoData>>);
 /// One filled block handed from the reader thread to the processing loop.
 type SignalBlock = (Vec<Option<Vec<i16>>>, Vec<BlockItem>);
 
+/// How much of each read to decompress: the detector's own bound, unless some
+/// head needs the read to its last sample.
+///
+/// The two requirements are not a `min` — they point opposite ways. A
+/// detector's bound is a *prefix* it is willing to work from; a read-end anchor
+/// needs the *suffix*, and truncating to 16 000 samples does not merely shorten
+/// the read, it relocates its end. So a head that needs the whole read
+/// overrides the bound outright, and pays for the extra decompression.
+fn decode_bound(detector: &Detector, needs_full_read: bool) -> Option<usize> {
+    if needs_full_read {
+        None
+    } else {
+        detector.signal_decode_bound()
+    }
+}
+
 /// Stream reads through the fused pipeline in blocks: per Arrow batch do the
 /// single-stream, ascending-order signal sweep (#72) and decode in parallel,
 /// accumulate across batches up to [`DETECT_WINDOW`] reads or
@@ -1733,7 +1795,8 @@ fn produce_cpu(
     let predictor = SvmPredictor::new(model);
     drive_blocks(
         &args.input,
-        detector.signal_decode_bound(),
+        // A fingerprint head reads the adapter region itself, never the read end.
+        decode_bound(detector, false),
         |sigs, items| {
             // Batch-detect the whole block (GPU CNN = grouped onnxruntime calls; LLR
             // / CPU-CNN = parallel per read), then classify reusing each decoded
@@ -1814,7 +1877,8 @@ fn produce_cpu_gbm(
     let predictor = GbmPredictor::new(model);
     drive_blocks(
         &args.input,
-        detector.signal_decode_bound(),
+        // A fingerprint head reads the adapter region itself, never the read end.
+        decode_bound(detector, false),
         |sigs, items| {
             // Batch-detect the whole block, then fingerprint + GBM-classify in
             // chunks. The chunking exists so each rayon task can run the batched
@@ -1918,7 +1982,7 @@ fn produce_cpu_crf(
     let meta = encoder.metadata();
     drive_blocks(
         &args.input,
-        detector.signal_decode_bound(),
+        decode_bound(detector, meta.needs_full_read()),
         |sigs, items| {
             let bounds = detector.detect_batch(&sigs);
             sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
@@ -2481,7 +2545,7 @@ fn produce_gpu_crf(
         let t_producer = std::time::Instant::now();
         let drive = drive_blocks(
             &args.input,
-            detector.signal_decode_bound(),
+            decode_bound(detector, encoder.metadata().needs_full_read()),
             |sigs, items| {
                 if hung_up {
                     return;
@@ -2687,7 +2751,9 @@ fn produce_gpu(
                 type Prepped = (ReadData, Option<Vec<f64>>, Vec<CompressedSignalChunk>);
                 // Windowed: decode once, batch-detect (GPU CNN = one call/window;
                 // LLR / CPU-CNN = parallel per read), then parallel fingerprint.
-                let decode_to = detector.signal_decode_bound();
+                // A fingerprint head reads the adapter region itself, never the
+                // read end.
+                let decode_to = decode_bound(detector, false);
                 for window in bulk.chunks(DETECT_WINDOW) {
                     let signals: Vec<Option<Vec<i16>>> = window
                         .par_iter()
@@ -3046,7 +3112,33 @@ fn build_detector(
     args: &RunArgs,
     pin: Option<BoundaryPin>,
     device: crate::device::Device,
+    needs_boundary: bool,
 ) -> anyhow::Result<Detector> {
+    if !needs_boundary {
+        // Refuse rather than ignore. `--method cnn` here would build a detector
+        // whose `signal_decode_bound` truncates each read to its leading 16 000
+        // samples, and a read-end model would then window "the read end" at
+        // sample 16 000 — running, and wrong, with nothing to show for it.
+        if args.method.is_some() {
+            anyhow::bail!(
+                "--method is not applicable: this model anchors its window on the read \
+                 end and consumes no boundary detector. Passing one would also bound how \
+                 much of each read is decoded, which moves where the read ends."
+            );
+        }
+        #[cfg(feature = "cnn-detect")]
+        if args.cnn_model.is_some() {
+            anyhow::bail!(
+                "--cnn-model is not applicable: this model anchors its window on the \
+                 read end and consumes no boundary detector."
+            );
+        }
+        info!(
+            "{} none (this model anchors its window on the read end)",
+            style::label("Adapter detection:")
+        );
+        return Ok(Detector::None);
+    }
     let (pinned_method, pinned_onnx, pinned_input, pinned_sha) = match pin {
         Some(p) => (Some(p.method), p.onnx, p.input, p.sha256),
         None => (None, None, None, None),

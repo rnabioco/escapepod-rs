@@ -26,6 +26,80 @@
   other user-visible difference is the `@PG` record on the output BAM, which
   now records `escpod classify --model …` as the command line.
 
+### Fixed
+
+- **A CRF bundle's `signal.anchor` is read instead of dropped, so a read-end
+  model is no longer windowed onto the 3' adapter.** `SignalSpec` parsed only
+  `chunk` and `stride`, and carried no `deny_unknown_fields` — so
+  `"anchor": "read_end"` and `"window": "[read_end - chunk, read_end]"`, both
+  shipped in `barcode_crf_fdx4_rna004@v0.1.1`, were discarded at parse time and
+  the window was taken as `[adapter_end - chunk, adapter_end]`.
+
+  This matters because the two anchors sit at opposite ends of the molecule.
+  RNA004 translocates 3'->5', so a 3'-adapter index (`ldx`, `nbc`) is found by
+  windowing back from the boundary detector's `adapter_end`, while a 5' index
+  (`fdx`) goes through the pore last and its adapter is simply where the signal
+  stops. Running the second against the first decodes the far end of the read
+  and returns exactly the output shape it should — a confident wrong answer, no
+  error, nothing downstream that can detect it. It is the consumer-side half of
+  the defect escapepod-models#100 fixed at the source.
+
+  Measured, because "runs and is wrong" needs a number. Every molecule in the
+  FDX Run1 pool carries **both** a 5' fdx index and a 3' ldx index, and ldx code
+  is nested inside fdx library (escapepod-models `config/fdx4_libraries.yaml`),
+  so the shipped `barcode_crf_ldx32_rna004` call is an independent per-read
+  truth label — different adapter, different end of the molecule, different
+  model. Over 5,000 reads (4,113 with an in-pool ldx call), the same fdx4
+  weights on the same reads:
+
+  | window | agrees with ldx truth | precision when called | unclassified |
+  |---|---:|---:|---:|
+  | `[read_end - 3500, read_end]` (fixed) | **92.3%** | 92.4% | 2 |
+  | `[adapter_end - 3500, adapter_end]` (before) | 20.4% | 25.9% | 865 |
+
+  Four codes, so 20.4% is chance. The fixed path lands on the bundle's own
+  published numbers (`balanced_recall@0.97` 0.918, `balanced_precision@0.97`
+  0.944); the old one called 79% of reads anyway, at a **median edit-distance
+  margin of 16** — the panel's maximum — so no per-read confidence field
+  distinguishes the two. The two windows agree on 18.4% of reads, and the
+  damage is not uniform noise: fdx03 collapsed from 950 reads to 21, which in
+  an experiment deletes a library rather than degrading it.
+
+  There was a second, independent instance of the same bug: a CNN detector's
+  `signal_decode_bound` truncates each read to its leading `max_obs_trace`
+  (16 000) samples, so "the read end" would have been sample 16 000 rather than
+  the read's last sample even with the window fixed. A read-end head now
+  overrides that bound and decodes the whole read.
+
+  Bundles that omit `anchor` are unchanged: absent means `adapter_end`, which is
+  what every bundle predating the key was built with.
+
+  Three refusals come with it, because each of these ran and was silently wrong
+  rather than erroring:
+
+  - an unknown key under `signal`, or an unknown `anchor` value. That block is
+    a set of rules the model was built with, so one this runtime does not
+    implement is refused rather than ignored — the doctrine already applied to
+    the charging bundle. The top level stays open for provenance.
+  - a `signal.window` string that contradicts `signal.anchor`. The prose and
+    the machine-readable key describe one rule; when they disagree escpod
+    refuses instead of picking a side. This is `fdx4@v0.1.0` exactly.
+  - a read-end bundle that also pins a boundary detector under `boundary`.
+    escpod honours that block at runtime (it refuses `--method llr` against a
+    `cnn` pin), so believing it would window the wrong end. Provenance belongs
+    under `built_beside`, which is ignored.
+
+  `--method`, `--cnn-model`, `--boundary-margin` and `--clamp-max-shift` are
+  likewise refused against a read-end bundle rather than accepted and ignored;
+  a read-end run builds no detector at all.
+
+  `demux basecall` had the same truncation defect independently — it decodes an
+  `adapter_end`-sized prefix per read — and now decodes the whole read for a
+  read-end bundle, using the boundaries CSV only to select which reads to
+  basecall. `demux --info` no longer describes an `adapter_end` window, a
+  boundary margin or a window clamp for a model that has none, and no longer
+  prints a suggested command line containing the `--method` it would refuse.
+
 ## 0.18.1 (2026-08-29)
 
 ### Fixed
