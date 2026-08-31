@@ -55,8 +55,26 @@ pub struct RunArgs {
     /// Trained classifier — a DTW-SVM / GBM JSON (auto-detected by JSON
     /// shape), or a CTC-CRF encoder bundle directory (`metadata.json` + the
     /// ONNX graph it names). A CRF bundle also needs `--barcodes`.
-    #[arg(long, value_name = "FILE|DIR")]
-    pub model: Option<PathBuf>,
+    ///
+    /// Repeatable, to call several independent barcode axes in **one** pass
+    /// over the POD5 — a dual-indexed library carries a 3' index and a 5' one,
+    /// and reading them in two runs decompresses every read twice:
+    ///
+    ///     escpod demux reads.pod5 --model ldx=ldx32/ --model fdx=fdx4/ --annotate
+    ///
+    /// With more than one model each must be given as `NAME=PATH`, and `NAME`
+    /// becomes that axis's sidecar annotation column — which is what
+    /// `escpod annotate --design` keys a multi-column samplesheet on
+    /// (`ldx,fdx -> condition,replicate`). The name is deliberately yours and
+    /// not the bundle's: it names the axis in *your* experimental design, and
+    /// the same model can serve different axes in different runs.
+    ///
+    /// Several models require `--annotate` (and/or `--classifications`) rather
+    /// than `-d`: splitting POD5 files is single-axis, so do that afterwards
+    /// with `demux split --sidecar --annotation <NAME>`. Only CRF bundles can
+    /// be combined; see the error for why.
+    #[arg(long, value_name = "[NAME=]FILE|DIR", action = clap::ArgAction::Append)]
+    pub model: Vec<String>,
 
     /// Barcode reference CSV (`name,sequence`) for the CTC-CRF head. Required
     /// with a CRF bundle, ignored otherwise: the fingerprint heads carry their
@@ -625,13 +643,46 @@ struct CrfRowScores {
     mean_logpost: f32,
 }
 
+/// One read's calls: one per axis, in head order.
+///
+/// `One` is not a degenerate `Many`. A single-model run is the common one and
+/// emits a row per read, so the `Vec` would be a heap allocation per read for
+/// a single element — on top of the `String` each [`Call`] already carries.
+/// Splitting the case keeps that path allocating exactly what it did before
+/// multiple axes existed.
+enum Calls {
+    One(Call),
+    Many(Vec<Call>),
+}
+
+impl Calls {
+    /// The call that decides POD5 routing, i.e. the first axis.
+    ///
+    /// `Option` rather than an index, because only a single-axis run has POD5
+    /// writers at all (`-d` is refused with several models), so every caller
+    /// that needs this is one that has a `One` — and the alternative is an
+    /// indexing panic guarded by an invariant stated somewhere else.
+    fn primary(&self) -> Option<&Call> {
+        match self {
+            Calls::One(c) => Some(c),
+            Calls::Many(v) => v.first(),
+        }
+    }
+
+    /// Every axis's call, in head order.
+    fn iter(&self) -> std::slice::Iter<'_, Call> {
+        match self {
+            Calls::One(c) => std::slice::from_ref(c).iter(),
+            Calls::Many(v) => v.iter(),
+        }
+    }
+}
+
 /// One classified read on its way to the classifications CSV and the
 /// `--annotate` sidecar.
 struct ClassRow {
     read_id: Uuid,
-    barcode: String,
-    confidence: f64,
-    crf: Option<CrfRowScores>,
+    calls: Calls,
 }
 
 /// The classifications channel. Named because it appears in eight producer
@@ -644,25 +695,25 @@ fn route(
     routers: &Routers,
     class_tx: Option<&ClassTx>,
     read: ReadData,
-    call: Call,
+    calls: Calls,
     chunks: Vec<CompressedSignalChunk>,
     run_infos: Arc<Vec<RunInfoData>>,
 ) {
-    let Call {
-        barcode,
-        confidence,
-        crf,
-    } = call;
+    // Resolve the POD5 destination before the row is moved into the channel.
+    // Empty `routers` on sidecar-only runs (--annotate without -d), and on
+    // every multi-axis run: no POD5 leg, so nothing to resolve.
+    let router = calls.primary().and_then(|c| {
+        routers
+            .get(&c.barcode)
+            .or_else(|| routers.get(UNCLASSIFIED))
+    });
     if let Some(ctx) = class_tx {
         let _ = ctx.send(ClassRow {
             read_id: read.read_id,
-            barcode: barcode.clone(),
-            confidence,
-            crf,
+            calls,
         });
     }
-    // Empty on sidecar-only runs (--annotate without -d): no POD5 leg.
-    if let Some(tx) = routers.get(&barcode).or_else(|| routers.get(UNCLASSIFIED)) {
+    if let Some(tx) = router {
         let _ = tx.send(Routed {
             read,
             chunks,
@@ -798,6 +849,116 @@ impl ClassifyModel {
             ClassifyModel::Crf(h) => h.encoder.metadata().needs_boundary(),
         }
     }
+
+    /// Whether this head needs each read decoded to its last sample. See
+    /// [`decode_bound`] for why this overrides the detector's own bound rather
+    /// than combining with it.
+    fn needs_full_read(&self) -> bool {
+        match self {
+            ClassifyModel::Svm(_) | ClassifyModel::Gbm(_) => false,
+            #[cfg(feature = "crf-decode")]
+            ClassifyModel::Crf(h) => h.encoder.metadata().needs_full_read(),
+        }
+    }
+}
+
+/// One `--model [NAME=]PATH` as given on the command line.
+///
+/// `name` is the axis's output column, not the model's identity: the bundle
+/// cannot know whether the operator calls this axis `ldx`, `index3p` or
+/// `plate`, and the same bundle can serve different axes in different runs. So
+/// it is required as soon as there is more than one model and there is a real
+/// choice to make, and defaults to `barcode` when there is only one — which is
+/// what every single-model run wrote before this existed.
+#[derive(Debug, Clone)]
+struct ModelSpec {
+    name: Option<String>,
+    path: PathBuf,
+}
+
+impl ModelSpec {
+    /// Split `NAME=PATH`, preferring an interpretation that names something
+    /// that actually exists.
+    ///
+    /// A path may legitimately contain `=`, so the split cannot be purely
+    /// syntactic. Asking the filesystem first makes it decidable: if the whole
+    /// argument names something on disk it is a bare path, and only otherwise
+    /// is the text before the first `=` read as a name. A typo'd `NAME=PATH`
+    /// then still parses as a name plus a missing path, and is reported as
+    /// that rather than as one absent file with an `=` in its name.
+    fn parse(arg: &str) -> Self {
+        let whole = PathBuf::from(arg);
+        if whole.exists() {
+            return Self {
+                name: None,
+                path: whole,
+            };
+        }
+        match arg.split_once('=') {
+            Some((name, path)) if !name.is_empty() => Self {
+                name: Some(name.to_string()),
+                path: PathBuf::from(path),
+            },
+            _ => Self {
+                name: None,
+                path: whole,
+            },
+        }
+    }
+}
+
+/// One loaded barcode axis: a classifier plus the column its calls go to.
+struct Head {
+    /// Sidecar annotation column and classifications-CSV column for this axis.
+    name: String,
+    model: ClassifyModel,
+    /// The bundle directory a CRF head came from; `None` for the fingerprint
+    /// heads. The GPU encoder pool loads its extra sessions from the same
+    /// directory, so it has to outlive the load — and only that pool reads it,
+    /// which is why a CPU-only build has no use for it.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    bundle_dir: Option<PathBuf>,
+}
+
+/// The output column for each `--model`, or why the set is not usable.
+///
+/// One model keeps the historical default of `barcode`, so every existing
+/// invocation and everything reading its sidecar is untouched. Several models
+/// must each be named, because there is no defensible way to invent two: the
+/// bundle id (`barcode_crf_ldx32_rna004`) is the model's identity rather than
+/// the axis's, and guessing from the directory name would make the column
+/// depend on where the bundle happens to be unpacked.
+fn resolve_head_names(specs: &[ModelSpec]) -> anyhow::Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let name = match (&spec.name, specs.len()) {
+            (Some(n), _) => n.clone(),
+            (None, 1) => "barcode".to_string(),
+            (None, _) => anyhow::bail!(
+                "--model {} needs a name when several models are given: write it as \
+                 NAME=PATH (e.g. `--model ldx={}`). NAME becomes the sidecar column this \
+                 axis is recorded in, and `escpod annotate --design` keys a samplesheet \
+                 on those column names.",
+                spec.path.display(),
+                spec.path.display(),
+            ),
+        };
+        // Reserved by the sidecar schema itself.
+        if matches!(name.as_str(), "read_id" | "batch_idx" | "row_idx") {
+            anyhow::bail!("`{name}` is a reserved sidecar column name; pick another");
+        }
+        if name == UNCLASSIFIED {
+            anyhow::bail!(
+                "`{UNCLASSIFIED}` names the sentinel written for a read no model could \
+                 place, so it cannot also name an axis"
+            );
+        }
+        if names.contains(&name) {
+            anyhow::bail!("two models are both named `{name}`; each axis needs its own column");
+        }
+        names.push(name);
+    }
+    Ok(names)
 }
 
 /// Is this `--model` a CTC-CRF encoder bundle rather than a classifier JSON?
@@ -831,16 +992,61 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
 
     // Validate the fused-pipeline args here (not via clap `required`) so the
     // advanced subcommands aren't forced to supply them.
-    let model_path = args
-        .model
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("--model <FILE|DIR> is required"))?;
-    // `--info` describes the model and exits: no input, no output dir, no POD5
+    let specs: Vec<ModelSpec> = args.model.iter().map(|m| ModelSpec::parse(m)).collect();
+    if specs.is_empty() {
+        anyhow::bail!("--model <FILE|DIR> is required");
+    }
+    // `--info` describes the models and exits: no input, no output dir, no POD5
     // touched. Checked before the input/output validation below so you can
     // interrogate a model without inventing arguments for a run you are not
     // making.
     if args.info {
-        return super::info::run(&model_path);
+        for (i, spec) in specs.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            super::info::run(&spec.path)?;
+        }
+        return Ok(());
+    }
+    // Names and their uniqueness are settled before anything is opened:
+    // loading two ONNX graphs only to reject the command line wastes ~10 s and,
+    // on a GPU build, a CUDA context.
+    let names = resolve_head_names(&specs)?;
+    if specs.len() > 1 && args.output_dir.is_some() {
+        anyhow::bail!(
+            "-d/--output-dir writes one POD5 per barcode, which is single-axis, but {} \
+             models were given ({}). Use --annotate (and/or --classifications) to record \
+             every axis, then split on whichever one you want:\n    \
+             escpod demux split <in.pod5> --sidecar --annotation {}",
+            specs.len(),
+            names.join(", "),
+            names[0],
+        );
+    }
+    if specs.len() > 1 {
+        // Checked before anything is opened. `crf_bundle_dir` reads one small
+        // JSON, where discovering this inside the load loop means paying a full
+        // ONNX load and a boundary-model resolution for the heads before the
+        // offending one — ~10 s spent to reject a command line.
+        #[cfg(feature = "crf-decode")]
+        for (spec, name) in specs.iter().zip(&names) {
+            if crf_bundle_dir(&spec.path).is_none() {
+                anyhow::bail!(
+                    "`{name}` ({}) is not a CTC-CRF bundle. Only CRF bundles can be \
+                     combined in one run: the fingerprint heads do not declare their own \
+                     segmentation geometry — it is a compiled-in default shared by every \
+                     such model — so a second one would silently be fingerprinted with \
+                     the first one's parameters. Run those models separately.",
+                    spec.path.display(),
+                );
+            }
+        }
+        #[cfg(not(feature = "crf-decode"))]
+        anyhow::bail!(
+            "several models need CTC-CRF bundles, which this build does not support \
+             (rebuild with `--features crf-decode`)"
+        );
     }
     if args.input.is_empty() {
         anyhow::bail!("no input POD5 file(s) given");
@@ -853,6 +1059,18 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // warns exactly once, and every stage below asks the same question of the
     // same answer.
     let device = args.device.resolve();
+    if specs.len() > 1 {
+        // Said once, and phrased as what it is: a property of running several
+        // axes, not a device request the caller made. Going through
+        // `place_and_report` per head would claim the caller asked for CPU.
+        crate::device::note_cpu_only(
+            device,
+            "multi-axis CRF encoding",
+            "the GPU encoder pool routes each read from inside its own worker threads, so \
+             a worker holding one axis's answer has nowhere to put it while another axis \
+             is still running. Adapter detection is shared and still runs on the device.",
+        );
+    }
     let output_dir = match args.output_dir.clone() {
         Some(dir) => Some(dir),
         None if args.annotate => None, // sidecar-only: no split outputs
@@ -861,235 +1079,318 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
         ),
     };
 
-    // Three heads: DTW-SVM (with an optional GPU DTW path), the native GBM tree
-    // ensemble (CPU-only), and the CTC-CRF basecaller. A CRF bundle is a
-    // directory, so check for that before trying to parse `--model` as JSON.
-    // Only the legacy reference-bank WarpDemux JSON is rejected here.
-    #[cfg(feature = "crf-decode")]
-    let crf_dir = crf_bundle_dir(&model_path);
-    #[cfg(not(feature = "crf-decode"))]
-    let crf_dir: Option<PathBuf> = None;
-    // Kept because a pinned boundary model's ONNX path is relative to the
-    // bundle directory, and `crf_dir` is consumed building the head below.
-    #[cfg(feature = "crf-decode")]
-    let crf_dir_for_pin = crf_dir.clone();
-
-    // Whether the CRF head put its encoder on the device. Only the CRF arm can
-    // set it, and only one arm runs, so it is written at most once — but it has
-    // to outlive the `match` because `LeakIf` below needs to know whether any
-    // ORT session exists.
+    // Whether any head put its encoder on the device. `LeakIf` below needs to
+    // know whether an ORT session exists anywhere in the process — a property
+    // of the process, not of one head — so it is accumulated across the loop
+    // rather than returned from it.
     #[cfg_attr(not(feature = "crf-decode"), allow(unused_mut, unused_variables))]
     let mut crf_encoder_on_gpu = false;
+    let mut heads: Vec<Head> = Vec::with_capacity(specs.len());
+    // The detector pin, and which axis staked it. Detection runs once per block
+    // and its answer goes to every head, so the heads that use one have to
+    // agree; the name is kept to say *who* disagreed.
+    let mut shared_pin: Option<(String, BoundaryPin)> = None;
 
-    let model = match crf_dir {
+    for (spec, head_name) in specs.iter().zip(&names) {
+        let model_path = &spec.path;
+        if specs.len() > 1 {
+            info!(
+                "{} {} <- {}",
+                style::label("Axis:"),
+                style::value(head_name),
+                style::path(model_path.display())
+            );
+        }
+        // Three heads: DTW-SVM (with an optional GPU DTW path), the native GBM
+        // tree ensemble (CPU-only), and the CTC-CRF basecaller. A CRF bundle is
+        // a directory, so check for that before trying to parse `--model` as
+        // JSON. Only the legacy reference-bank WarpDemux JSON is rejected here.
         #[cfg(feature = "crf-decode")]
-        Some(dir) => {
-            // The encoder is ~91% of this head's CPU cost, which is why `auto`
-            // sends it to the device; the lattice decode's own placement is the
-            // encoder's business. The session's own intra-op pool is fixed at one
-            // non-spinning thread inside the loader — it used to take `--threads`,
-            // which multiplied by the worker count and starved the prep feeding it.
-            crf_encoder_on_gpu =
-                crate::device::place_and_report(device, crate::device::Stage::CrfEncoder)?.is_gpu();
-            #[cfg(feature = "gpu")]
-            let encoder = if crf_encoder_on_gpu {
-                // Must match `produce_gpu_crf`'s placement: this instance becomes
-                // worker 0, so it has to land on the first *encoder* device —
-                // GPU 0, which detection also shares.
-                let enc_device = crf_encoder_devices(
-                    escapepod_demux::crf::lattice_gpu::visible_device_count()
-                        .unwrap_or(1)
-                        .max(1),
-                )[0];
-                let enc = CrfEncoderGpu::load_bundle_on_device(&dir, enc_device)?;
-                if enc.gpu_decode_active() {
-                    info!(
-                        "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
-                         scores {}",
-                        style::label("CRF encoder:"),
-                        if enc.zero_copy_active() {
-                            "decoded in place on the device"
-                        } else {
-                            "round-tripped through host memory"
-                        }
-                    );
-                    // Zero-copy is *requested* from a cudarc probe, which proves
-                    // only that the CUDA driver works — not that onnxruntime
-                    // registered its CUDA EP. When the load-time probe finds the
-                    // encoder output on the host, the run stays correct but the
-                    // line above overstates it, so say what happened. Most often
-                    // this means ORT_DYLIB_PATH points at a CPU-only build.
-                    if let Some(why) = enc.zero_copy_fallback_reason() {
-                        tracing::warn!(
-                            "Zero-copy scores unavailable, using the copying path \
-                             (same results, slower): {why}"
-                        );
-                    }
+        let crf_dir = crf_bundle_dir(model_path);
+        #[cfg(not(feature = "crf-decode"))]
+        let crf_dir: Option<PathBuf> = None;
+        // Kept because a pinned boundary model's ONNX path is relative to the
+        // bundle directory, and `crf_dir` is consumed building the head below.
+        #[cfg(feature = "crf-decode")]
+        let crf_dir_for_pin = crf_dir.clone();
+
+        let model = match crf_dir {
+            #[cfg(feature = "crf-decode")]
+            Some(dir) => {
+                // The encoder is ~91% of this head's CPU cost, which is why `auto`
+                // sends it to the device; the lattice decode's own placement is the
+                // encoder's business. The session's own intra-op pool is fixed at one
+                // non-spinning thread inside the loader — it used to take `--threads`,
+                // which multiplied by the worker count and starved the prep feeding it.
+                // Per head, then folded in: `crf_encoder_on_gpu` answers "does any
+                // ORT session exist in this process", which is what the `LeakIf`
+                // below needs, while the placement of *this* encoder is what the
+                // loader below needs. With one head the two coincide, which is why
+                // they used to be one variable.
+                //
+                // A multi-axis run pins the encoders to the CPU. The GPU encoder
+                // pool routes each read from inside its own worker threads, so a
+                // worker holding one axis's answer has nowhere to put it while the
+                // other axis is still running; giving each head its own pool and
+                // joining their results is a larger change than this one.
+                // The multi-axis case reports its placement once, before the
+                // loop, via `note_cpu_only`. Going through `place_and_report`
+                // here would attribute the choice to a `--device cpu` the
+                // caller never passed, and repeat it per head.
+                let this_on_gpu = if specs.len() > 1 {
+                    crate::device::place(
+                        crate::device::Device::Cpu,
+                        crate::device::Stage::CrfEncoder,
+                    )?
+                    .is_gpu()
                 } else {
-                    // The decode is the larger half of this path's host cost, so
-                    // running it on the CPU is a ~3x end-to-end difference. Say
-                    // so rather than letting the run look fully accelerated.
-                    tracing::warn!(
-                        "CRF lattice decode fell back to the CPU ({}); the encoder is \
+                    crate::device::place_and_report(device, crate::device::Stage::CrfEncoder)?
+                        .is_gpu()
+                };
+                crf_encoder_on_gpu |= this_on_gpu;
+                #[cfg(feature = "gpu")]
+                let encoder = if this_on_gpu {
+                    // Must match `produce_gpu_crf`'s placement: this instance becomes
+                    // worker 0, so it has to land on the first *encoder* device —
+                    // GPU 0, which detection also shares.
+                    let enc_device = crf_encoder_devices(
+                        escapepod_demux::crf::lattice_gpu::visible_device_count()
+                            .unwrap_or(1)
+                            .max(1),
+                    )[0];
+                    let enc = CrfEncoderGpu::load_bundle_on_device(&dir, enc_device)?;
+                    if enc.gpu_decode_active() {
+                        info!(
+                            "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
+                         scores {}",
+                            style::label("CRF encoder:"),
+                            if enc.zero_copy_active() {
+                                "decoded in place on the device"
+                            } else {
+                                "round-tripped through host memory"
+                            }
+                        );
+                        // Zero-copy is *requested* from a cudarc probe, which proves
+                        // only that the CUDA driver works — not that onnxruntime
+                        // registered its CUDA EP. When the load-time probe finds the
+                        // encoder output on the host, the run stays correct but the
+                        // line above overstates it, so say what happened. Most often
+                        // this means ORT_DYLIB_PATH points at a CPU-only build.
+                        if let Some(why) = enc.zero_copy_fallback_reason() {
+                            tracing::warn!(
+                                "Zero-copy scores unavailable, using the copying path \
+                             (same results, slower): {why}"
+                            );
+                        }
+                    } else {
+                        // The decode is the larger half of this path's host cost, so
+                        // running it on the CPU is a ~3x end-to-end difference. Say
+                        // so rather than letting the run look fully accelerated.
+                        tracing::warn!(
+                            "CRF lattice decode fell back to the CPU ({}); the encoder is \
                          still on the GPU, but expect roughly 3x the wall time.",
-                        enc.decode_fallback_reason().unwrap_or("reason unavailable")
+                            enc.decode_fallback_reason().unwrap_or("reason unavailable")
+                        );
+                    }
+                    CrfEncoderAny::Gpu(Box::new(enc))
+                } else {
+                    CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
+                };
+                #[cfg(not(feature = "gpu"))]
+                let encoder = {
+                    // Unreachable — placement returns CPU under `auto` and errors
+                    // under `--device gpu` when `gpu` is absent — but read, so
+                    // the binding is live in this build too.
+                    debug_assert!(!this_on_gpu);
+                    CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
+                };
+                #[allow(unused_mut)]
+                let mut encoder = encoder;
+                // Both knobs describe how far a window may sit from a *detector's*
+                // adapter_end. A read-end model has no detector, so there is
+                // nothing for either to relax — and silently accepting them would
+                // report a "Boundary margin:" line for a bound that never runs.
+                if !encoder.metadata().needs_boundary() {
+                    for (flag, given) in [
+                        ("--boundary-margin", args.boundary_margin.is_some()),
+                        ("--clamp-max-shift", args.clamp_max_shift.is_some()),
+                    ] {
+                        if given {
+                            anyhow::bail!(
+                                "{flag} is not applicable: this model anchors its window on the \
+                             read end, so no boundary margin or window shift is involved."
+                            );
+                        }
+                    }
+                }
+                if let Some(margin) = args.boundary_margin {
+                    let was = encoder.metadata().min_adapter_end();
+                    encoder.set_boundary_margin(margin);
+                    info!(
+                        "{} adapter_end >= {} (was {}); reads between the two decode instead \
+                     of routing to unclassified",
+                        style::label("Boundary margin:"),
+                        style::count(encoder.metadata().min_adapter_end()),
+                        style::count(was),
                     );
                 }
-                CrfEncoderAny::Gpu(Box::new(enc))
-            } else {
-                CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
-            };
-            #[cfg(not(feature = "gpu"))]
-            let encoder = {
-                // Unreachable — placement returns CPU under `auto` and errors
-                // under `--device gpu` when `gpu` is absent — but read, so
-                // the binding is live in this build too.
-                debug_assert!(!crf_encoder_on_gpu);
-                CrfEncoderAny::Cpu(Box::new(CrfEncoder::load_bundle(&dir)?))
-            };
-            #[allow(unused_mut)]
-            let mut encoder = encoder;
-            // Both knobs describe how far a window may sit from a *detector's*
-            // adapter_end. A read-end model has no detector, so there is
-            // nothing for either to relax — and silently accepting them would
-            // report a "Boundary margin:" line for a bound that never runs.
-            if !encoder.metadata().needs_boundary() {
-                for (flag, given) in [
-                    ("--boundary-margin", args.boundary_margin.is_some()),
-                    ("--clamp-max-shift", args.clamp_max_shift.is_some()),
-                ] {
-                    if given {
-                        anyhow::bail!(
-                            "{flag} is not applicable: this model anchors its window on the \
-                             read end, so no boundary margin or window shift is involved."
-                        );
-                    }
+                if let Some(shift) = args.clamp_max_shift {
+                    encoder.set_clamp_max_shift(shift);
                 }
-            }
-            if let Some(margin) = args.boundary_margin {
-                let was = encoder.metadata().min_adapter_end();
-                encoder.set_boundary_margin(margin);
-                info!(
-                    "{} adapter_end >= {} (was {}); reads between the two decode instead \
-                     of routing to unclassified",
-                    style::label("Boundary margin:"),
-                    style::count(encoder.metadata().min_adapter_end()),
-                    style::count(was),
-                );
-            }
-            if let Some(shift) = args.clamp_max_shift {
-                encoder.set_clamp_max_shift(shift);
-            }
-            let shift = encoder.metadata().clamp_max_shift();
-            if shift > 0 {
-                info!(
-                    "{} reads with adapter_end down to {} decode from [0, {}], sliding up \
+                let shift = encoder.metadata().clamp_max_shift();
+                if shift > 0 {
+                    info!(
+                        "{} reads with adapter_end down to {} decode from [0, {}], sliding up \
                      to {} samples past the adapter",
-                    style::label("Window clamp:"),
-                    style::count(encoder.metadata().signal.chunk.saturating_sub(shift)),
-                    style::count(encoder.metadata().signal.chunk),
-                    style::count(shift),
-                );
-            }
-            // References come from the bundle unless the caller overrides them.
-            // Carrying them in the bundle is what makes the plain
-            // `--model <bundle> -d out/` form work, and it fixes the
-            // emitted-vs-target trimming once at export instead of at every
-            // call site (escapepod-models#36).
-            let refs = match (&args.barcodes, &encoder.metadata().barcodes) {
-                (Some(csv), _) => {
-                    let r = BarcodeRefs::from_csv(csv)?;
-                    if encoder.metadata().barcodes.is_some() {
-                        info!(
-                            "{} overriding the {} references in the bundle",
-                            style::label("Barcodes:"),
-                            style::count(encoder.metadata().barcodes.as_ref().unwrap().len())
-                        );
-                    }
-                    r
+                        style::label("Window clamp:"),
+                        style::count(encoder.metadata().signal.chunk.saturating_sub(shift)),
+                        style::count(encoder.metadata().signal.chunk),
+                        style::count(shift),
+                    );
                 }
-                (None, Some(entries)) => BarcodeRefs::from_pairs(
-                    entries.iter().map(|e| (e.name.clone(), e.sequence.clone())),
-                )?,
-                (None, None) => anyhow::bail!(
-                    "this CTC-CRF bundle carries no barcode references, so --barcodes \
+                // References come from the bundle unless the caller overrides them.
+                // Carrying them in the bundle is what makes the plain
+                // `--model <bundle> -d out/` form work, and it fixes the
+                // emitted-vs-target trimming once at export instead of at every
+                // call site (escapepod-models#36).
+                let refs = match (&args.barcodes, &encoder.metadata().barcodes) {
+                    (Some(csv), _) => {
+                        let r = BarcodeRefs::from_csv(csv)?;
+                        if encoder.metadata().barcodes.is_some() {
+                            info!(
+                                "{} overriding the {} references in the bundle",
+                                style::label("Barcodes:"),
+                                style::count(encoder.metadata().barcodes.as_ref().unwrap().len())
+                            );
+                        }
+                        r
+                    }
+                    (None, Some(entries)) => BarcodeRefs::from_pairs(
+                        entries.iter().map(|e| (e.name.clone(), e.sequence.clone())),
+                    )?,
+                    (None, None) => anyhow::bail!(
+                        "this CTC-CRF bundle carries no barcode references, so --barcodes \
                      <FILE> is required. The CRF emits sequence rather than a class \
                      index and has to be told what to match it against — and those must \
                      be the sequences the model EMITS (target[state_len:]), not the \
                      full-length training targets."
-                ),
-            };
-            info!(
-                "{} {} references, minimum pairwise edit distance {}",
-                style::label("Barcodes:"),
-                style::count(refs.len()),
-                refs.min_pairwise_distance()
-                    .map_or_else(|| "n/a".to_string(), |d| d.to_string()),
-            );
-            // A gate implies the scores it gates on, rather than erroring: the
-            // flags are not independent choices, and `--min-crf-margin` alone
-            // silently doing nothing would be the worse failure.
-            let want_scores =
-                args.ref_scores || args.min_crf_margin.is_some() || args.min_crf_prob.is_some();
-            let chains = want_scores
-                .then(|| encoder.ref_chains(&refs.sequences()))
-                .transpose()?;
-            if let Some(c) = &chains {
+                    ),
+                };
                 info!(
-                    "{} {} references over {} shared lattice cells",
-                    style::label("Lattice scoring:"),
-                    style::count(c.len()),
-                    style::count(c.cells()),
+                    "{} {} references, minimum pairwise edit distance {}",
+                    style::label("Barcodes:"),
+                    style::count(refs.len()),
+                    refs.min_pairwise_distance()
+                        .map_or_else(|| "n/a".to_string(), |d| d.to_string()),
                 );
+                // A gate implies the scores it gates on, rather than erroring: the
+                // flags are not independent choices, and `--min-crf-margin` alone
+                // silently doing nothing would be the worse failure.
+                let want_scores =
+                    args.ref_scores || args.min_crf_margin.is_some() || args.min_crf_prob.is_some();
+                let chains = want_scores
+                    .then(|| encoder.ref_chains(&refs.sequences()))
+                    .transpose()?;
+                if let Some(c) = &chains {
+                    info!(
+                        "{} {} references over {} shared lattice cells",
+                        style::label("Lattice scoring:"),
+                        style::count(c.len()),
+                        style::count(c.cells()),
+                    );
+                }
+                ClassifyModel::Crf(Box::new(CrfHead {
+                    encoder,
+                    refs,
+                    min_margin: args.min_margin,
+                    chains,
+                    min_crf_margin: args.min_crf_margin,
+                    min_crf_prob: args.min_crf_prob,
+                }))
             }
-            ClassifyModel::Crf(Box::new(CrfHead {
-                encoder,
-                refs,
-                min_margin: args.min_margin,
-                chains,
-                min_crf_margin: args.min_crf_margin,
-                min_crf_prob: args.min_crf_prob,
-            }))
-        }
-        #[cfg(not(feature = "crf-decode"))]
-        Some(_) => unreachable!("crf_dir is always None without the crf-decode feature"),
-        None => match load_any_model(&model_path)? {
-            AnyModel::Svm(m) => ClassifyModel::Svm(m),
-            AnyModel::Gbm(m) => ClassifyModel::Gbm(m),
-            AnyModel::WarpDemux(_) => anyhow::bail!(
-                "`demux` needs an SVM, GBM or CTC-CRF model (DtwSvmModel / converted \
+            #[cfg(not(feature = "crf-decode"))]
+            Some(_) => unreachable!("crf_dir is always None without the crf-decode feature"),
+            None => match load_any_model(model_path)? {
+                AnyModel::Svm(m) => ClassifyModel::Svm(m),
+                AnyModel::Gbm(m) => ClassifyModel::Gbm(m),
+                AnyModel::WarpDemux(_) => anyhow::bail!(
+                    "`demux` needs an SVM, GBM or CTC-CRF model (DtwSvmModel / converted \
                  WarpDemuX / native GBM / CRF bundle directory). The reference-bank path \
                  is only on `demux classify --reference`."
-            ),
-        },
-    };
-    // A CRF bundle may pin the boundary detector it was trained against; the
-    // ONNX path in the sidecar is relative to the bundle directory, and the
-    // sidecar may declare the input tensor that detector consumes and the
-    // sha256 of the weights it shipped (#187).
-    #[cfg(feature = "crf-decode")]
-    let boundary_pin = match (&model, &crf_dir_for_pin) {
-        (ClassifyModel::Crf(h), Some(dir)) => h.encoder.metadata().boundary.as_ref().map(|b| {
-            if let Some(id) = &b.model_id {
-                info!(
-                    "{} {} (pinned by the model bundle)",
-                    style::label("Boundary model:"),
-                    style::value(id)
-                );
-            }
-            BoundaryPin {
-                method: b.method.clone(),
-                onnx: b.onnx.as_ref().map(|o| dir.join(o)),
-                input: b.input,
-                sha256: b.sha256.clone(),
-            }
-        }),
-        _ => None,
-    };
-    #[cfg(not(feature = "crf-decode"))]
-    let boundary_pin: Option<BoundaryPin> = None;
+                ),
+            },
+        };
+        // A CRF bundle may pin the boundary detector it was trained against; the
+        // ONNX path in the sidecar is relative to the bundle directory, and the
+        // sidecar may declare the input tensor that detector consumes and the
+        // sha256 of the weights it shipped (#187).
+        #[cfg(feature = "crf-decode")]
+        let boundary_pin = match (&model, &crf_dir_for_pin) {
+            (ClassifyModel::Crf(h), Some(dir)) => h.encoder.metadata().boundary.as_ref().map(|b| {
+                if let Some(id) = &b.model_id {
+                    info!(
+                        "{} {} (pinned by the model bundle)",
+                        style::label("Boundary model:"),
+                        style::value(id)
+                    );
+                }
+                BoundaryPin {
+                    method: b.method.clone(),
+                    onnx: b.onnx.as_ref().map(|o| dir.join(o)),
+                    input: b.input,
+                    sha256: b.sha256.clone(),
+                }
+            }),
+            _ => None,
+        };
+        #[cfg(not(feature = "crf-decode"))]
+        let boundary_pin: Option<BoundaryPin> = None;
 
-    let detector = build_detector(&args, boundary_pin, device, model.needs_boundary())?;
+        if specs.len() > 1 && !matches!(model, ClassifyModel::Crf(_)) {
+            anyhow::bail!(
+                "`{head_name}` ({}) is not a CTC-CRF bundle. Only CRF bundles can be \
+                 combined in one run: the fingerprint heads do not declare their own \
+                 segmentation geometry — it is a compiled-in default shared by every such \
+                 model — so a second one would silently be fingerprinted with the first \
+                 one's parameters. Run those models separately.",
+                model_path.display(),
+            );
+        }
+        // Two bundles pinning different weights, a different `method` or a
+        // different input geometry do not merely prefer different detectors:
+        // each implies a different `adapter_end` and a different amount of
+        // signal decoded per read, so no single pass serves both. Running one
+        // head against the other's detector is the silent 17.2-point failure
+        // escapepod-models#16 measured, so refuse instead.
+        if let Some(p) = boundary_pin {
+            match &shared_pin {
+                Some((owner, existing)) if !existing.agrees_with(&p) => anyhow::bail!(
+                    "`{owner}` and `{head_name}` pin different boundary detectors, and the \
+                     fused pipeline detects once per block for every axis. A different \
+                     detector means a different adapter_end and a different amount of \
+                     signal decoded per read, so no single pass serves both. Run them \
+                     separately."
+                ),
+                Some(_) => {}
+                None => shared_pin = Some((head_name.clone(), p)),
+            }
+        }
+        #[cfg(feature = "crf-decode")]
+        let bundle_dir = crf_dir_for_pin;
+        #[cfg(not(feature = "crf-decode"))]
+        let bundle_dir: Option<PathBuf> = None;
+        heads.push(Head {
+            name: head_name.clone(),
+            model,
+            bundle_dir,
+        });
+    }
+
+    // Every head shares one detector, and a head anchored on the read end wants
+    // none — so a run needs one only if some head places its window with it.
+    let needs_boundary = heads.iter().any(|h| h.model.needs_boundary());
+    let needs_full_read = heads.iter().any(|h| h.model.needs_full_read());
+    let detector = build_detector(&args, shared_pin.map(|(_, p)| p), device, needs_boundary)?;
 
     // Neutralise onnxruntime's at-exit CUDA teardown *here*, at construction,
     // rather than at the end of a successful run.
@@ -1116,7 +1417,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // onnxruntime environment to keep alive, so it does not qualify — the old
     // `args.gpu` predicate leaked on its behalf for nothing.
     let leak_ort = detector.on_gpu() || crf_encoder_on_gpu;
-    let model = LeakIf::new(model, leak_ort);
+    let heads = LeakIf::new(heads, leak_ort);
     let detector = LeakIf::new(detector, leak_ort);
 
     // Classify-head placement, decided here rather than inside the dispatch far
@@ -1127,7 +1428,11 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // loaded — an ORT session cannot be moved to another device after the fact —
     // so the dispatch reads that decision off the `CrfEncoderAny` variant and
     // this only echoes it.
-    let classify_on_gpu = match &*model {
+    //
+    // Only the single-head arms can place anything here: a multi-head run is
+    // CRF-only (refused above otherwise), and every CRF encoder was already
+    // placed at load.
+    let classify_on_gpu = match &heads[0].model {
         ClassifyModel::Svm(_) => {
             crate::device::place_and_report(device, crate::device::Stage::Dtw)?.is_gpu()
         }
@@ -1157,11 +1462,22 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
         style::label("Input:"),
         style::count(args.input.len())
     );
-    info!(
-        "{} {}",
-        style::label("Model:"),
-        style::path(model_path.display())
-    );
+    for (spec, name) in specs.iter().zip(&names) {
+        if specs.len() == 1 {
+            info!(
+                "{} {}",
+                style::label("Model:"),
+                style::path(spec.path.display())
+            );
+        } else {
+            info!(
+                "{} {} -> column {}",
+                style::label("Model:"),
+                style::path(spec.path.display()),
+                style::value(name)
+            );
+        }
+    }
     match &output_dir {
         Some(dir) => info!("{} {}", style::label("Output:"), style::path(dir.display())),
         None => info!(
@@ -1206,7 +1522,10 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // No shipping design is affected: the floor does not bind until 768
     // barcodes, so 4-, 5-, 12-, 16- and 96-code models all get the same depth
     // they got before.
-    let barcodes = model.barcode_names();
+    // Single-axis by construction: `-d` is refused above with more than one
+    // model, so a run that spawns writers has exactly one head to name them
+    // from.
+    let barcodes = heads[0].model.barcode_names();
     let n_barcodes = barcodes.len().max(1);
     let router_depth = (ROUTER_TOTAL_SLOTS / n_barcodes).clamp(MIN_ROUTER_DEPTH, 4096);
     if ROUTER_TOTAL_SLOTS / n_barcodes < MIN_ROUTER_DEPTH {
@@ -1236,85 +1555,125 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // Optional classifications CSV writer (a single small-record stream);
     // with --annotate the same thread also collects the assignment map the
     // sidecar write needs.
-    // The writer resolves `crf_best` from an index, so it needs the panel's
-    // names — and their presence is also what tells it to emit the score
-    // columns at all.
-    #[cfg(feature = "crf-decode")]
-    let ref_names = match &*model {
-        ClassifyModel::Crf(head) if head.chains.is_some() => Some(head.refs.names().to_vec()),
-        _ => None,
-    };
-    #[cfg(not(feature = "crf-decode"))]
-    let ref_names = None;
+    // The writer resolves `crf_best` from an index, so it needs each scoring
+    // panel's names — and their presence is also what tells it to emit that
+    // axis's score columns at all.
+    let axes: Vec<AxisOut> = heads
+        .iter()
+        .map(|h| AxisOut {
+            name: h.name.clone(),
+            #[cfg(feature = "crf-decode")]
+            ref_names: match &h.model {
+                ClassifyModel::Crf(c) if c.chains.is_some() => c.refs.names().to_vec(),
+                _ => Vec::new(),
+            },
+            #[cfg(not(feature = "crf-decode"))]
+            ref_names: Vec::new(),
+        })
+        .collect();
     let (class_tx, class_handle) =
-        spawn_class_writer(args.classifications.as_deref(), args.annotate, ref_names)?;
+        spawn_class_writer(args.classifications.as_deref(), args.annotate, axes)?;
 
     // ---- Stages A/B: produce classified reads ----
-    let produce_result = match &*model {
-        ClassifyModel::Svm(svm) => {
-            // No "the GPU does nothing on this head" warning to emit: `gpu`
-            // is atomic, so a build that can place work on a device always
-            // carries the batched DTW-SVM classify kernel this arm uses. It
-            // used to be reachable on a `cnn-gpu`/`crf-gpu`-only build, which
-            // no longer exists.
-            #[cfg(feature = "gpu")]
-            {
-                if classify_on_gpu {
-                    produce_gpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
-                } else {
+    //
+    // Several axes take their own producer rather than running the dispatch
+    // below N times: the whole point is one pass over the POD5, so the heads
+    // have to be driven inside a single `drive_blocks`.
+    let produce_result = if heads.len() > 1 {
+        #[cfg(feature = "crf-decode")]
+        {
+            let crf_heads: Vec<&CrfHead> = heads
+                .iter()
+                .map(|h| match &h.model {
+                    ClassifyModel::Crf(c) => c.as_ref(),
+                    // Refused at load: a multi-axis run is CRF-only.
+                    _ => unreachable!("multi-axis runs are CRF-only"),
+                })
+                .collect();
+            produce_cpu_crf_multi(
+                &args,
+                &detector,
+                &crf_heads,
+                needs_full_read,
+                &routers,
+                class_tx.as_ref(),
+                &pb,
+            )
+        }
+        #[cfg(not(feature = "crf-decode"))]
+        {
+            // Unreachable: a multi-axis run is CRF-only, and without this
+            // feature nothing loads as a CRF head, so the load loop already
+            // refused the second model.
+            unreachable!("multi-axis demux requires the crf-decode feature")
+        }
+    } else {
+        match &heads[0].model {
+            ClassifyModel::Svm(svm) => {
+                // No "the GPU does nothing on this head" warning to emit: `gpu`
+                // is atomic, so a build that can place work on a device always
+                // carries the batched DTW-SVM classify kernel this arm uses. It
+                // used to be reachable on a `cnn-gpu`/`crf-gpu`-only build, which
+                // no longer exists.
+                #[cfg(feature = "gpu")]
+                {
+                    if classify_on_gpu {
+                        produce_gpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
+                    } else {
+                        produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
+                    }
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    // Placement already refused `--device gpu` on this build and
+                    // returned CPU under `auto`; asserting it here is what keeps the
+                    // two arms from drifting.
+                    debug_assert!(!classify_on_gpu);
                     produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
                 }
             }
-            #[cfg(not(feature = "gpu"))]
-            {
-                // Placement already refused `--device gpu` on this build and
-                // returned CPU under `auto`; asserting it here is what keeps the
-                // two arms from drifting.
-                debug_assert!(!classify_on_gpu);
-                produce_cpu(&args, &detector, svm, fp, &routers, class_tx.as_ref(), &pb)
+            ClassifyModel::Gbm(gbm) => {
+                // CPU-only head; the `--device gpu` note was emitted with the other
+                // placements, before the writer threads existed.
+                produce_cpu_gbm(&args, &detector, gbm, fp, &routers, class_tx.as_ref(), &pb)
             }
-        }
-        ClassifyModel::Gbm(gbm) => {
-            // CPU-only head; the `--device gpu` note was emitted with the other
-            // placements, before the writer threads existed.
-            produce_cpu_gbm(&args, &detector, gbm, fp, &routers, class_tx.as_ref(), &pb)
-        }
-        #[cfg(feature = "crf-decode")]
-        ClassifyModel::Crf(head) => {
-            // No "the encoder stayed on the CPU anyway" warning either. That
-            // warned about a build with a GPU feature but not the CRF one,
-            // where a GPU request silently left ~91% of this head's cost on
-            // tract; `gpu` is atomic now, so placement moves the encoder
-            // whenever it says GPU. Whether the device is usable is a *runtime*
-            // question, and the encoder loader reports its own fallbacks.
-            match &head.encoder {
-                #[cfg(feature = "gpu")]
-                CrfEncoderAny::Gpu(enc) => {
-                    // Extra encoder workers load their own session from the same
-                    // bundle, so the pool needs the directory the head came from.
-                    let bundle = crf_dir_for_pin
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("CRF head without a bundle directory"))?;
-                    produce_gpu_crf(
+            #[cfg(feature = "crf-decode")]
+            ClassifyModel::Crf(head) => {
+                // No "the encoder stayed on the CPU anyway" warning either. That
+                // warned about a build with a GPU feature but not the CRF one,
+                // where a GPU request silently left ~91% of this head's cost on
+                // tract; `gpu` is atomic now, so placement moves the encoder
+                // whenever it says GPU. Whether the device is usable is a *runtime*
+                // question, and the encoder loader reports its own fallbacks.
+                match &head.encoder {
+                    #[cfg(feature = "gpu")]
+                    CrfEncoderAny::Gpu(enc) => {
+                        // Extra encoder workers load their own session from the same
+                        // bundle, so the pool needs the directory the head came from.
+                        let bundle = heads[0].bundle_dir.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("CRF head without a bundle directory")
+                        })?;
+                        produce_gpu_crf(
+                            &args,
+                            &detector,
+                            head,
+                            enc,
+                            bundle,
+                            &routers,
+                            class_tx.as_ref(),
+                            &pb,
+                        )
+                    }
+                    CrfEncoderAny::Cpu(enc) => produce_cpu_crf(
                         &args,
                         &detector,
                         head,
                         enc,
-                        bundle,
                         &routers,
                         class_tx.as_ref(),
                         &pb,
-                    )
+                    ),
                 }
-                CrfEncoderAny::Cpu(enc) => produce_cpu_crf(
-                    &args,
-                    &detector,
-                    head,
-                    enc,
-                    &routers,
-                    class_tx.as_ref(),
-                    &pb,
-                ),
             }
         }
     };
@@ -1328,12 +1687,16 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     }
 
     // Join writers, collect counts.
-    let mut summary = DemuxSummary::default();
+    let mut summary = DemuxSummary {
+        axes: heads.len(),
+        ..Default::default()
+    };
     for (bc, handle) in writer_handles {
         let n = handle
             .join()
             .map_err(|e| anyhow::anyhow!("writer thread for {bc} panicked: {e:?}"))??;
         if n > 0 {
+            summary.wrote_files = true;
             summary.per_barcode.push((bc, n));
         }
     }
@@ -1358,7 +1721,21 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
         // than reading them back off the sidecar. A tally and not a copy of the
         // map: at one entry per read, cloning it to count sixteen labels was
         // the largest single allocation the run made.
-        let label_counts = collected.label_counts();
+        //
+        // Per axis, so a dual-indexed run reports each one. The summary block
+        // itself is single-table, so the axis name is folded into the label.
+        let label_counts: Vec<(String, usize)> = match collected.axes.len() {
+            1 => collected.axes[0].label_counts(),
+            _ => collected
+                .axes
+                .iter()
+                .flat_map(|a| {
+                    a.label_counts()
+                        .into_iter()
+                        .map(|(label, n)| (format!("{}={label}", a.name), n))
+                })
+                .collect(),
+        };
         let columns = collected.into_columns();
         for path in &args.input {
             // One read-modify-write for all five columns: five separate ones
@@ -1389,7 +1766,9 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             );
         }
         // Sidecar-only runs have no writer threads; fill the summary from
-        // the assignment map so the barcode table still prints.
+        // the assignment map so the barcode table still prints. `wrote_files`
+        // stays false, so the total line does not promise files that a
+        // sidecar-only run never created.
         if summary.per_barcode.is_empty() {
             summary.per_barcode = label_counts;
         }
@@ -1815,7 +2194,7 @@ fn produce_cpu(
                             routers,
                             class_tx,
                             read.for_writing(read.run_info_index),
-                            Call::scoreless(barcode, conf),
+                            Calls::One(Call::scoreless(barcode, conf)),
                             chunks,
                             run_infos,
                         );
@@ -1939,7 +2318,7 @@ fn produce_cpu_gbm(
                         routers,
                         class_tx,
                         read.for_writing(read.run_info_index),
-                        Call::scoreless(barcode, conf),
+                        Calls::One(Call::scoreless(barcode, conf)),
                         chunks,
                         run_infos,
                     );
@@ -1961,6 +2340,141 @@ fn produce_cpu_gbm(
 /// `meta.prep` still returns `None` when `adapter_end < chunk` (the adapter sits
 /// too close to the read start), and those route as unclassified.
 ///
+/// Several CRF axes over one pass: decode once, detect once, then call every
+/// head on the same decoded read.
+///
+/// The saving is the shared prefix — one POD5 sweep, one VBZ decode, one
+/// detection — and not the encoders, which are per-model and are most of the
+/// cost. Expect meaningfully less than running the models separately, not
+/// close to one model's time.
+///
+/// The heads are looped *inside* the per-read closure rather than the block
+/// being walked once per head. Walking twice would need `items` kept alive
+/// across both passes and the calls joined by read id afterwards; here each
+/// read's calls are simply built in order and routed together, which is also
+/// what keeps the progress bar counting reads rather than read-axis pairs.
+///
+/// Per-head scratch, not per-worker-shared: `CrfScratch` is sized from the
+/// lattice geometry and the prep buffer from `signal.chunk`, and two bundles
+/// differ in both (ldx32 is 3000 samples, fdx4 3500). Sharing one buffer would
+/// reallocate on every alternation.
+#[cfg(feature = "crf-decode")]
+fn produce_cpu_crf_multi(
+    args: &RunArgs,
+    detector: &Detector,
+    heads: &[&CrfHead],
+    needs_full_read: bool,
+    routers: &Routers,
+    class_tx: Option<&ClassTx>,
+    pb: &indicatif::ProgressBar,
+) -> anyhow::Result<()> {
+    // Every encoder is the CPU one: a multi-axis run pins the encoder stage to
+    // the CPU at load (see `run`), because the GPU pool routes reads from
+    // inside its worker threads and so cannot yet hold half a read's calls.
+    let encoders: Vec<&CrfEncoder> = heads
+        .iter()
+        .map(|h| match &h.encoder {
+            CrfEncoderAny::Cpu(e) => Ok(e.as_ref()),
+            #[cfg(feature = "gpu")]
+            CrfEncoderAny::Gpu(_) => Err(anyhow::anyhow!(
+                "a multi-axis run placed a CRF encoder on the GPU; it should have been \
+                 pinned to the CPU at load"
+            )),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let n = heads.len();
+    drive_blocks(
+        &args.input,
+        decode_bound(detector, needs_full_read),
+        |sigs, items| {
+            let bounds = detector.detect_batch(&sigs);
+            sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
+                || {
+                    (0..n)
+                        .map(|_| (CrfScratch::new(), Vec::<f32>::new()))
+                        .collect::<Vec<_>>()
+                },
+                |scratch, ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
+                    let mut calls = Vec::with_capacity(n);
+                    for ((head, encoder), (scratch, window)) in
+                        heads.iter().zip(&encoders).zip(scratch.iter_mut())
+                    {
+                        calls.push(call_one_crf(
+                            head,
+                            encoder,
+                            &read,
+                            signal.as_deref(),
+                            adapter_end,
+                            scratch,
+                            window,
+                        ));
+                    }
+                    route(
+                        routers,
+                        class_tx,
+                        read.for_writing(read.run_info_index),
+                        Calls::Many(calls),
+                        chunks,
+                        run_infos,
+                    );
+                    pb.inc(1);
+                },
+            );
+        },
+    )
+}
+
+/// One CRF head's verdict on one read: window, encode, decode, match.
+///
+/// Shared by the single- and multi-axis producers so the two cannot drift —
+/// this is the whole of what a CRF head does to a read, and a second copy of it
+/// is a second definition of the model's input.
+#[cfg(feature = "crf-decode")]
+fn call_one_crf(
+    head: &CrfHead,
+    encoder: &CrfEncoder,
+    read: &ReadData,
+    signal: Option<&[i16]>,
+    adapter_end: usize,
+    scratch: &mut CrfScratch,
+    window: &mut Vec<f32>,
+) -> Call {
+    let meta = encoder.metadata();
+    (|| {
+        let adc = signal?;
+        // The detector reports `adapter_end` as an index into the decoded
+        // prefix, which is what `prep` wants. Only the `chunk` samples ending
+        // there are converted — the prefix itself can be the whole read under
+        // LLR, or under a read-end anchor.
+        if !meta.prep_adc_into(
+            adc,
+            adapter_end,
+            read.calibration_offset,
+            read.calibration_scale,
+            window,
+        ) {
+            return None;
+        }
+        match &head.chains {
+            Some(chains) => encoder
+                .basecall_prepped_with_refs(window, scratch, chains)
+                .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                .ok()
+                .map(|s| call_barcode_scored(head, &s)),
+            None => {
+                let seq = encoder
+                    .basecall_prepped(window, scratch)
+                    .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                    .ok()?;
+                call_barcode(head, &seq)
+                    .map(|(b, c)| Call::scoreless(b, c))
+                    .or_else(|| Some(Call::unclassified()))
+            }
+        }
+    })()
+    .unwrap_or_else(Call::unclassified)
+}
+
 /// Detection is batched over the whole block, but the per-read work is *not*
 /// chunked the way `produce_cpu_gbm` chunks: that head batches because
 /// `predict_many` is a genuinely batched kernel, whereas tract has no batched
@@ -1988,45 +2502,20 @@ fn produce_cpu_crf(
             sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
                 || (CrfScratch::new(), Vec::<f32>::new()),
                 |(scratch, window), ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
-                    let call = (|| {
-                        let adc = signal.as_ref()?;
-                        // The detector reports `adapter_end` as an index into
-                        // the decoded prefix, which is what `prep` wants. Only
-                        // the `chunk` samples ending there are converted — the
-                        // prefix itself can be the whole read under LLR.
-                        if !meta.prep_adc_into(
-                            adc,
-                            adapter_end,
-                            read.calibration_offset,
-                            read.calibration_scale,
-                            window,
-                        ) {
-                            return None;
-                        }
-                        match &head.chains {
-                            Some(chains) => encoder
-                                .basecall_prepped_with_refs(window, scratch, chains)
-                                .inspect_err(|e| tracing::warn!("encoder: {e}"))
-                                .ok()
-                                .map(|s| call_barcode_scored(head, &s)),
-                            None => {
-                                let seq = encoder
-                                    .basecall_prepped(window, scratch)
-                                    .inspect_err(|e| tracing::warn!("encoder: {e}"))
-                                    .ok()?;
-                                call_barcode(head, &seq)
-                                    .map(|(b, c)| Call::scoreless(b, c))
-                                    .or_else(|| Some(Call::unclassified()))
-                            }
-                        }
-                    })()
-                    .unwrap_or_else(Call::unclassified);
-
+                    let call = call_one_crf(
+                        head,
+                        encoder,
+                        &read,
+                        signal.as_deref(),
+                        adapter_end,
+                        scratch,
+                        window,
+                    );
                     route(
                         routers,
                         class_tx,
                         read.for_writing(read.run_info_index),
-                        call,
+                        Calls::One(call),
                         chunks,
                         run_infos,
                     );
@@ -2521,7 +3010,7 @@ fn produce_gpu_crf(
                             routers,
                             class_tx,
                             read.for_writing(read.run_info_index),
-                            call,
+                            Calls::One(call),
                             chunks,
                             run_infos,
                         );
@@ -2714,7 +3203,10 @@ fn produce_gpu(
                         routers_ref,
                         class_ref,
                         read,
-                        Call::scoreless(barcode_label(result.predicted_barcode), result.confidence),
+                        Calls::One(Call::scoreless(
+                            barcode_label(result.predicted_barcode),
+                            result.confidence,
+                        )),
                         chunks,
                         run_infos,
                     );
@@ -2803,7 +3295,7 @@ fn produce_gpu(
                                 routers,
                                 class_tx,
                                 read,
-                                Call::unclassified(),
+                                Calls::One(Call::unclassified()),
                                 chunks,
                                 run_infos.clone(),
                             ),
@@ -2890,6 +3382,15 @@ fn writer_thread(
 /// keep them (#241).
 #[derive(Default)]
 struct Collected {
+    /// One entry per axis, in head order.
+    axes: Vec<CollectedAxis>,
+}
+
+/// One axis's accumulated calls.
+#[derive(Default)]
+struct CollectedAxis {
+    /// The sidecar column this axis is written to.
+    name: String,
     /// Distinct barcode labels, indexed by the codes in `barcode`.
     labels: Vec<String>,
     /// Reverse of `labels`, for interning.
@@ -2917,15 +3418,19 @@ struct CollectedScores {
     mean_logpost: HashMap<Uuid, f32>,
 }
 
-impl Collected {
+impl CollectedAxis {
     /// Intern a barcode label, returning its code.
-    fn intern(&mut self, label: String) -> u32 {
-        if let Some(&id) = self.label_ids.get(&label) {
+    ///
+    /// Borrowed, not owned: the hit path is every read after the first of each
+    /// label and now allocates nothing at all, where taking a `String` meant
+    /// the caller allocated one per read for this function to drop.
+    fn intern(&mut self, label: &str) -> u32 {
+        if let Some(&id) = self.label_ids.get(label) {
             return id;
         }
         let id = self.labels.len() as u32;
-        self.labels.push(label.clone());
-        self.label_ids.insert(label, id);
+        self.labels.push(label.to_string());
+        self.label_ids.insert(label.to_string(), id);
         id
     }
 
@@ -2950,40 +3455,69 @@ impl Collected {
         out
     }
 
-    /// The sidecar columns this run produced, in write order.
+    /// This axis's sidecar columns, in write order.
     ///
     /// Both label columns hand over codes plus a dictionary rather than a
     /// `String` per read: materializing them here would put back, all at once
     /// and for every column simultaneously, exactly the allocation the codes
     /// exist to avoid.
-    fn into_columns(self) -> Vec<ColumnWrite> {
+    fn into_columns(self, sole: bool) -> Vec<ColumnWrite> {
         let mut out = vec![ColumnWrite {
-            name: "barcode".to_string(),
+            name: self.name.clone(),
             values: ColumnValues::LabelCodes {
                 dictionary: self.labels,
                 codes: self.barcode,
             },
         }];
         let Some(crf) = self.crf else { return out };
+        // A single-axis run keeps the historical unprefixed score columns, so
+        // every sidecar and every reader of one written before axes existed is
+        // untouched; only a multi-axis run has two sets to tell apart.
+        let col = |suffix: &str| match sole {
+            true => suffix.to_string(),
+            false => format!("{}_{suffix}", self.name),
+        };
         out.push(ColumnWrite {
-            name: "crf_best".to_string(),
+            name: col("crf_best"),
             values: ColumnValues::LabelCodes {
                 dictionary: crf.names,
                 codes: crf.best,
             },
         });
-        for (name, values) in [
+        for (suffix, values) in [
             ("crf_logp", crf.logp),
             ("crf_margin", crf.margin),
             ("mean_logpost", crf.mean_logpost),
         ] {
             out.push(ColumnWrite {
-                name: name.to_string(),
+                name: col(suffix),
                 values: ColumnValues::Scores(values),
             });
         }
         out
     }
+}
+
+impl Collected {
+    /// Every axis's sidecar columns, in head order.
+    fn into_columns(self) -> Vec<ColumnWrite> {
+        let sole = self.axes.len() == 1;
+        self.axes
+            .into_iter()
+            .flat_map(|a| a.into_columns(sole))
+            .collect()
+    }
+}
+
+/// What the output side needs to know about one axis.
+///
+/// `ref_names` is the axis's reference panel, empty unless that head scores
+/// (`--ref-scores`). It is both the lookup that turns a `crf_best` index back
+/// into a name and, by being non-empty, the thing that says to emit the score
+/// columns at all.
+struct AxisOut {
+    name: String,
+    ref_names: Vec<String>,
 }
 
 /// Optional classifications-CSV writer thread. With `collect` it also
@@ -2993,7 +3527,7 @@ impl Collected {
 fn spawn_class_writer(
     path: Option<&Path>,
     collect: bool,
-    ref_names: Option<Vec<String>>,
+    axes: Vec<AxisOut>,
 ) -> anyhow::Result<(
     Option<ClassTx>,
     Option<std::thread::JoinHandle<anyhow::Result<Option<Collected>>>>,
@@ -3005,76 +3539,96 @@ fn spawn_class_writer(
     let path = path.map(Path::to_path_buf);
     let handle = std::thread::spawn(move || -> anyhow::Result<Option<Collected>> {
         use std::io::Write;
-        // The score columns exist for the whole file or not at all — whether
-        // the run scores is a property of the head, not of a read — so the
-        // header is decided once here rather than per row.
-        let names = ref_names.unwrap_or_default();
-        let scored = !names.is_empty();
+        // Whether an axis scores is a property of its head, not of a read, so
+        // the header is settled once here rather than per row.
+        let sole = axes.len() == 1;
         let mut writer = match &path {
             Some(path) => {
                 let file = std::fs::File::create(path)?;
                 let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
-                writeln!(
-                    w,
-                    "read_id,barcode,confidence{}",
-                    if scored {
-                        ",crf_logp,crf_margin,crf_best,mean_logpost"
+                let mut header = String::from("read_id");
+                for axis in &axes {
+                    // One axis keeps the historical `barcode,confidence[,crf_*]`
+                    // spelling verbatim, so existing consumers of this CSV are
+                    // untouched; several need each column to say which axis it
+                    // belongs to.
+                    if sole {
+                        header.push_str(",barcode,confidence");
                     } else {
-                        ""
+                        header.push_str(&format!(",{0},{0}_confidence", axis.name));
                     }
-                )?;
+                    if !axis.ref_names.is_empty() {
+                        for suffix in ["crf_logp", "crf_margin", "crf_best", "mean_logpost"] {
+                            header.push(',');
+                            if sole {
+                                header.push_str(suffix);
+                            } else {
+                                header.push_str(&format!("{}_{suffix}", axis.name));
+                            }
+                        }
+                    }
+                }
+                writeln!(w, "{header}")?;
                 Some(w)
             }
             None => None,
         };
         let mut collected = collect.then(|| Collected {
-            crf: scored.then(|| CollectedScores {
-                names: names.clone(),
-                ..Default::default()
-            }),
-            ..Default::default()
+            axes: axes
+                .iter()
+                .map(|axis| CollectedAxis {
+                    name: axis.name.clone(),
+                    crf: (!axis.ref_names.is_empty()).then(|| CollectedScores {
+                        names: axis.ref_names.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
         });
         for row in rx.iter() {
-            let ClassRow {
-                read_id,
-                barcode,
-                confidence,
-                crf,
-            } = row;
+            let ClassRow { read_id, calls } = row;
             if let Some(w) = &mut writer {
-                write!(w, "{read_id},{barcode},{confidence:.6}")?;
-                if scored {
+                write!(w, "{read_id}")?;
+                for (axis, call) in axes.iter().zip(calls.iter()) {
+                    write!(w, ",{},{:.6}", call.barcode, call.confidence)?;
+                    if axis.ref_names.is_empty() {
+                        continue;
+                    }
                     // Empty rather than absent for a read that never decoded:
                     // the column count has to stay constant, and a zero would
                     // read as a confident score of 1.0.
-                    match crf {
-                        Some(c) => writeln!(
+                    match call.crf {
+                        Some(c) => write!(
                             w,
                             ",{:.4},{},{},{:.4}",
                             c.logp,
                             c.margin.map(|m| format!("{m:.4}")).unwrap_or_default(),
-                            names.get(c.best as usize).map_or("", String::as_str),
+                            axis.ref_names
+                                .get(c.best as usize)
+                                .map_or("", String::as_str),
                             c.mean_logpost,
                         )?,
-                        None => writeln!(w, ",,,,")?,
+                        None => write!(w, ",,,,")?,
                     }
-                } else {
-                    writeln!(w)?;
                 }
+                writeln!(w)?;
             }
             if let Some(out) = &mut collected {
-                let code = out.intern(barcode);
-                out.barcode.insert(read_id, code);
-                // Recorded for gated reads too, matching the CSV: a sidecar
-                // that says `unclassified` should still say what it was
-                // rejected for.
-                if let (Some(dst), Some(c)) = (out.crf.as_mut(), crf) {
-                    dst.best.insert(read_id, c.best);
-                    dst.logp.insert(read_id, c.logp);
-                    if let Some(m) = c.margin {
-                        dst.margin.insert(read_id, m);
+                for (dst, call) in out.axes.iter_mut().zip(calls.iter()) {
+                    let code = dst.intern(&call.barcode);
+                    dst.barcode.insert(read_id, code);
+                    // Recorded for gated reads too, matching the CSV: a sidecar
+                    // that says `unclassified` should still say what it was
+                    // rejected for.
+                    if let (Some(scores), Some(c)) = (dst.crf.as_mut(), call.crf) {
+                        scores.best.insert(read_id, c.best);
+                        scores.logp.insert(read_id, c.logp);
+                        if let Some(m) = c.margin {
+                            scores.margin.insert(read_id, m);
+                        }
+                        scores.mean_logpost.insert(read_id, c.mean_logpost);
                     }
-                    dst.mean_logpost.insert(read_id, c.mean_logpost);
                 }
             }
         }
@@ -3106,6 +3660,45 @@ struct BoundaryPin {
     onnx: Option<PathBuf>,
     input: Option<escapepod_demux::crf::BoundaryInputSpec>,
     sha256: Option<String>,
+}
+
+impl BoundaryPin {
+    /// Whether two bundles ask for the same detector, closely enough that one
+    /// detection pass serves both.
+    ///
+    /// Compared on what changes the *answer*: the method, the exact weights,
+    /// and the input geometry. Deliberately not the ONNX **path** — two bundles
+    /// legitimately ship their own copy of the same detector (every published
+    /// one carries `adapter_rna004.onnx`, byte-identical), and the sha256 is
+    /// what says whether those copies agree. A bundle that declares no sha256
+    /// falls back to the path, which is the strictest check still available.
+    fn agrees_with(&self, other: &Self) -> bool {
+        if self.method != other.method {
+            return false;
+        }
+        // `BoundaryInputSpec` is a plain field bag; differing `max_obs_trace`
+        // alone changes how much signal is decoded per read.
+        let same_input = match (&self.input, &other.input) {
+            (Some(a), Some(b)) => {
+                a.min_obs_adapter == b.min_obs_adapter
+                    && a.max_obs_trace == b.max_obs_trace
+                    && a.downscale_factor == b.downscale_factor
+                    && a.input_len == b.input_len
+                    && a.pad_value == b.pad_value
+            }
+            (None, None) => true,
+            // One declares the contract and one does not. They may well be the
+            // same model, but nothing here says so.
+            _ => false,
+        };
+        if !same_input {
+            return false;
+        }
+        match (&self.sha256, &other.sha256) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => self.onnx == other.onnx,
+        }
+    }
 }
 
 fn build_detector(
@@ -3312,6 +3905,13 @@ mod pinned_sha_tests {
 #[derive(Default)]
 struct DemuxSummary {
     per_barcode: Vec<(String, usize)>,
+    /// How many axes the rows span. Above one the counts are per axis, so they
+    /// sum to `reads x axes` and a single "total reads" line over them would be
+    /// a multiple of the run's actual read count.
+    axes: usize,
+    /// Whether the counts came from POD5 writer threads (so "file(s)" is
+    /// literal) or from the sidecar collector (where nothing was written).
+    wrote_files: bool,
 }
 
 fn print_summary(summary: &DemuxSummary) {
@@ -3322,12 +3922,30 @@ fn print_summary(summary: &DemuxSummary) {
         for (barcode, n) in &summary.per_barcode {
             println!("  {} {}", style::label(barcode), style::count(*n));
         }
-        println!(
-            "{} {} reads across {} barcode file(s)",
-            style::action("Total:"),
-            style::count(total),
-            summary.per_barcode.len()
-        );
+        let labels = summary.per_barcode.len();
+        match (summary.axes > 1, summary.wrote_files) {
+            // Per-axis counts: report the reads once and the labels per axis,
+            // rather than a total that double-counts every read.
+            (true, _) => println!(
+                "{} {} reads x {} axes across {} labels",
+                style::action("Total:"),
+                style::count(total / summary.axes.max(1)),
+                summary.axes,
+                labels,
+            ),
+            (false, true) => println!(
+                "{} {} reads across {} barcode file(s)",
+                style::action("Total:"),
+                style::count(total),
+                labels,
+            ),
+            (false, false) => println!(
+                "{} {} reads across {} label(s)",
+                style::action("Total:"),
+                style::count(total),
+                labels,
+            ),
+        }
     }
 }
 
@@ -3380,7 +3998,7 @@ mod gpu_placement_tests {
 
 #[cfg(all(test, feature = "crf-decode"))]
 mod tests {
-    use super::{Collected, ColumnValues, crf_bundle_dir};
+    use super::{CollectedAxis, ColumnValues, PathBuf, crf_bundle_dir};
     use uuid::Uuid;
 
     /// The sidecar-only barcode summary used to be built by cloning the whole
@@ -3390,19 +4008,19 @@ mod tests {
     /// (sorted), and labels nothing was assigned to left out.
     #[test]
     fn label_counts_match_counting_the_labels() {
-        let mut c = Collected::default();
+        let mut c = CollectedAxis::default();
         let mut expected: std::collections::HashMap<String, usize> = Default::default();
         for (i, label) in ["nbc02", "nbc01", "nbc02", "unclassified", "nbc02"]
             .into_iter()
             .enumerate()
         {
-            let code = c.intern(label.to_string());
+            let code = c.intern(label);
             c.barcode.insert(Uuid::from_u128(i as u128), code);
             *expected.entry(label.to_string()).or_default() += 1;
         }
         // A label that was interned but that no read ended up with — the code
         // path exists because `intern` runs before the insert can fail a gate.
-        c.intern("nbc09".to_string());
+        c.intern("nbc09");
 
         let mut want: Vec<(String, usize)> = expected.into_iter().collect();
         want.sort();
@@ -3415,23 +4033,193 @@ mod tests {
     /// sidecar must resolve every code back to the label it came from.
     #[test]
     fn interning_reuses_codes_and_round_trips_through_columns() {
-        let mut c = Collected::default();
-        let a = c.intern("nbc01".to_string());
-        let b = c.intern("nbc02".to_string());
-        assert_eq!(c.intern("nbc01".to_string()), a, "same label, same code");
+        let mut c = CollectedAxis {
+            name: "barcode".to_string(),
+            ..Default::default()
+        };
+        let a = c.intern("nbc01");
+        let b = c.intern("nbc02");
+        assert_eq!(c.intern("nbc01"), a, "same label, same code");
         assert_ne!(a, b);
 
         let ids: Vec<Uuid> = (0..2).map(Uuid::from_u128).collect();
         c.barcode.insert(ids[0], a);
         c.barcode.insert(ids[1], b);
 
-        let columns = c.into_columns();
+        let columns = c.into_columns(true);
         assert_eq!(columns[0].name, "barcode");
         let ColumnValues::LabelCodes { dictionary, codes } = &columns[0].values else {
             panic!("barcode column must hand over codes, not materialized labels");
         };
         assert_eq!(dictionary[codes[&ids[0]] as usize], "nbc01");
         assert_eq!(dictionary[codes[&ids[1]] as usize], "nbc02");
+    }
+
+    /// `NAME=PATH` is resolved against the filesystem first, so a path that
+    /// genuinely contains `=` — versioned bundle directories are full of them —
+    /// is not silently read as a name plus a shorter path.
+    #[test]
+    fn model_spec_prefers_a_path_that_exists() {
+        use super::ModelSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let awkward = dir.path().join("barcode_crf_ldx32_rna004@v0.2.1=beta");
+        std::fs::create_dir(&awkward).unwrap();
+
+        let spec = ModelSpec::parse(awkward.to_str().unwrap());
+        assert_eq!(spec.name, None, "an existing path is a path, not NAME=PATH");
+        assert_eq!(spec.path, awkward);
+
+        // The same text with a name in front still splits, because the whole
+        // thing does not exist.
+        let named = format!("ldx={}", awkward.display());
+        let spec = ModelSpec::parse(&named);
+        assert_eq!(spec.name.as_deref(), Some("ldx"));
+        assert_eq!(spec.path, awkward);
+
+        // No `=` at all, and nothing on disk: the path is reported verbatim so
+        // the "no such file" error names what was typed.
+        let spec = ModelSpec::parse("/nope/ldx32");
+        assert_eq!(spec.name, None);
+        assert_eq!(spec.path, PathBuf::from("/nope/ldx32"));
+    }
+
+    /// One model keeps writing the `barcode` column; several must each be
+    /// named, and the names must be usable as sidecar columns.
+    #[test]
+    fn head_names_default_for_one_model_and_are_required_for_several() {
+        use super::{ModelSpec, resolve_head_names};
+        let bare = |p: &str| ModelSpec {
+            name: None,
+            path: PathBuf::from(p),
+        };
+        let named = |n: &str, p: &str| ModelSpec {
+            name: Some(n.to_string()),
+            path: PathBuf::from(p),
+        };
+
+        assert_eq!(resolve_head_names(&[bare("m")]).unwrap(), ["barcode"]);
+        assert_eq!(resolve_head_names(&[named("ldx", "m")]).unwrap(), ["ldx"]);
+        assert_eq!(
+            resolve_head_names(&[named("ldx", "a"), named("fdx", "b")]).unwrap(),
+            ["ldx", "fdx"]
+        );
+
+        // Unnamed among several: there is no defensible second default.
+        assert!(resolve_head_names(&[named("ldx", "a"), bare("b")]).is_err());
+        // A collision would have the second axis overwrite the first's column.
+        assert!(resolve_head_names(&[named("ldx", "a"), named("ldx", "b")]).is_err());
+        // Reserved by the sidecar schema, and by the routing sentinel.
+        for reserved in ["read_id", "batch_idx", "row_idx", super::UNCLASSIFIED] {
+            assert!(
+                resolve_head_names(&[named(reserved, "a"), named("fdx", "b")]).is_err(),
+                "{reserved} must be refused as an axis name"
+            );
+        }
+    }
+
+    /// Two bundles shipping their own byte-identical copy of the same detector
+    /// must share one detection pass; anything that changes `adapter_end` or
+    /// how much signal is decoded must not.
+    #[test]
+    fn boundary_pins_agree_on_the_weights_not_the_path() {
+        use super::BoundaryPin;
+        let spec = |max_obs_trace| escapepod_demux::crf::BoundaryInputSpec {
+            min_obs_adapter: 1000,
+            max_obs_trace,
+            downscale_factor: 10,
+            input_len: 1500,
+            pad_value: -5.0,
+        };
+        let pin = |onnx: &str, sha: Option<&str>, input| BoundaryPin {
+            method: "cnn".to_string(),
+            onnx: Some(PathBuf::from(onnx)),
+            input,
+            sha256: sha.map(str::to_string),
+        };
+        let a = pin("ldx32/adapter_rna004.onnx", Some("AB12"), Some(spec(16000)));
+        let b = pin("fdx4/adapter_rna004.onnx", Some("ab12"), Some(spec(16000)));
+        assert!(a.agrees_with(&b), "same sha, different copy of one file");
+
+        let other_weights = pin("fdx4/adapter.onnx", Some("ffff"), Some(spec(16000)));
+        assert!(!a.agrees_with(&other_weights));
+
+        let other_geometry = pin("fdx4/adapter_rna004.onnx", Some("AB12"), Some(spec(8000)));
+        assert!(
+            !a.agrees_with(&other_geometry),
+            "decodes a different prefix"
+        );
+
+        // Undeclared sha falls back to the path, the strictest check left.
+        let undeclared_a = pin("x/adapter.onnx", None, Some(spec(16000)));
+        let undeclared_b = pin("y/adapter.onnx", None, Some(spec(16000)));
+        assert!(undeclared_a.agrees_with(&undeclared_a));
+        assert!(!undeclared_a.agrees_with(&undeclared_b));
+
+        // One declares the input contract and one does not: they may be the
+        // same model, but nothing here says so.
+        assert!(
+            !pin("a.onnx", Some("AB12"), Some(spec(16000))).agrees_with(&pin(
+                "a.onnx",
+                Some("AB12"),
+                None
+            ))
+        );
+    }
+
+    /// A second axis must get its own columns, and a single axis must keep the
+    /// exact historical names — sidecars written before axes existed are read
+    /// by name.
+    #[test]
+    fn axis_columns_are_prefixed_only_when_there_is_more_than_one() {
+        let axis = |name: &str| {
+            let mut a = CollectedAxis {
+                name: name.to_string(),
+                crf: Some(super::CollectedScores {
+                    names: vec!["nbc01".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let code = a.intern("nbc01");
+            a.barcode.insert(Uuid::from_u128(0), code);
+            a
+        };
+
+        let sole = super::Collected {
+            axes: vec![axis("barcode")],
+        };
+        let got: Vec<String> = sole.into_columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            got,
+            [
+                "barcode",
+                "crf_best",
+                "crf_logp",
+                "crf_margin",
+                "mean_logpost"
+            ],
+            "one axis keeps the pre-existing column names verbatim"
+        );
+
+        let dual = super::Collected {
+            axes: vec![axis("ldx"), axis("fdx")],
+        };
+        let got: Vec<String> = dual.into_columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            got,
+            [
+                "ldx",
+                "ldx_crf_best",
+                "ldx_crf_logp",
+                "ldx_crf_margin",
+                "ldx_mean_logpost",
+                "fdx",
+                "fdx_crf_best",
+                "fdx_crf_logp",
+                "fdx_crf_margin",
+                "fdx_mean_logpost",
+            ]
+        );
     }
 
     /// `--model` sniffing must not depend on the extension or the file name

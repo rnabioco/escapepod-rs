@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### Added
+
+- **`demux --model` is repeatable, so several barcode axes are called in one
+  pass over the POD5.** A dual-indexed library carries a 3' index and a 5' one;
+  reading them with two runs decompresses every read twice.
+
+  ```bash
+  escpod demux reads.pod5 --model ldx=ldx32/ --model fdx=fdx4/ --annotate
+  escpod annotate --design samplesheet.csv reads.pod5   # ldx,fdx -> library,condition
+  ```
+
+  With more than one model each is given as `NAME=PATH`, and `NAME` is that
+  axis's sidecar annotation column — which is exactly what `annotate --design`
+  keys a multi-column samplesheet on, a sidecar feature that until now nothing
+  could produce in one command. The name is the operator's, not the bundle's:
+  it names the axis in *your* experimental design, and the same model can serve
+  different axes in different runs. `NAME=PATH` is resolved against the
+  filesystem first, so a bundle directory that itself contains `=` is not
+  misread.
+
+  What is shared is the expensive prefix — one POD5 sweep, one VBZ decode, one
+  adapter detection — and not the encoders, which are per-model and are most of
+  the cost. Expect meaningfully less than two separate runs, not close to one.
+  Measured on 5,000 FDX Run1 reads, the fused `ldx`+`fdx` run is byte-identical
+  to the two separate runs, read for read, on both axes.
+
+  Constraints, each an error rather than a surprise:
+
+  - **Several models require `--annotate`/`--classifications`, not `-d`.**
+    Writing one POD5 per barcode is single-axis; split afterwards with
+    `demux split --sidecar --annotation ldx`.
+  - **Only CRF bundles combine.** The fingerprint heads (DTW-SVM, GBM) do not
+    declare their own segmentation geometry — it is a compiled-in default
+    shared by every such model — so a second one would silently be
+    fingerprinted with the first one's parameters. Checked before any model is
+    opened, so the refusal costs no ONNX load.
+  - **Every axis that needs a boundary detector must pin the same one.**
+    Detection runs once per block and its answer goes to every head; a
+    different detector means a different `adapter_end` and a different amount
+    of signal decoded per read. Compared on method, weights (by sha256, so two
+    bundles shipping their own byte-identical copy agree) and input geometry.
+  - **Multi-axis runs encode on the CPU for now.** The GPU encoder pool routes
+    each read from inside its own worker threads, so a worker holding one
+    axis's answer has nowhere to put it while another axis is still running.
+    Adapter detection is shared and still uses the device.
+
+  A single-model run is unchanged in every respect: the sidecar column is still
+  `barcode`, the classifications CSV header is still
+  `read_id,barcode,confidence[,crf_*]`, and the per-read output is byte-identical.
+  Only a multi-axis run prefixes its columns (`ldx`, `ldx_confidence`,
+  `ldx_crf_margin`, …).
+
 ### Changed
 
 - **`escpod signal classify` is `escpod classify` again.** The command moved
@@ -25,6 +77,11 @@
   The `cl` encoding, flags, output and bundle contract are unchanged. The only
   other user-visible difference is the `@PG` record on the output BAM, which
   now records `escpod classify --model …` as the command line.
+
+- **The demux summary no longer claims to have written files it did not.** A
+  sidecar-only run now ends `N reads across M label(s)` rather than `M barcode
+  file(s)`, and a multi-axis run reports `N reads x A axes` instead of a total
+  that counts every read once per axis.
 
 ### Fixed
 
