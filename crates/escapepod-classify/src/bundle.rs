@@ -465,7 +465,6 @@ struct ResolutionBlock {
 /// same rules for a human reader, and `arch` / `opset` for provenance.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
 #[allow(dead_code)] // `Doc` fields: named, never read
 struct FeatureModelBlock {
     file: String,
@@ -490,7 +489,6 @@ struct FeatureModelBlock {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
 #[allow(dead_code)] // `Doc` fields: named, never read
 struct FeatureModelInput {
     /// Tensor channel names: `n_val` value channels (a subset of
@@ -516,7 +514,6 @@ struct FeatureModelInput {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
 #[allow(dead_code)] // `Doc` fields: named, never read
 struct FeatureModelOutput {
     #[serde(default)]
@@ -531,7 +528,6 @@ struct FeatureModelOutput {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(not(feature = "fnn-onnx"), allow(dead_code))]
 #[allow(dead_code)] // `Doc` fields: named, never read
 struct FeatureModelStd {
     /// One per **value** channel. The observed-mask channels are indicators
