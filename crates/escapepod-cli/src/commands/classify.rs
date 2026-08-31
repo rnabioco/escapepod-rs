@@ -37,11 +37,8 @@ use escapepod_classify::anchor::SkipReason;
 use escapepod_classify::pipeline::{ClassifyStats, ReadCall};
 use escapepod_classify::{
     ChargingBundle, Orientation, Pod5Index, cl_from_probability, classify_reads,
-    junction_positions, resolve_orientation, scan_bam,
+    junction_positions, reference_sequences, resolve_orientation, scan_bam, waveform,
 };
-// Only `run_waveform` reads these, and it is gated on the runtime being linked.
-#[cfg(feature = "classify-waveform")]
-use escapepod_classify::{reference_sequences, waveform};
 
 use crate::progress::create_spinner;
 use crate::style;
@@ -149,7 +146,6 @@ fn input_summary(bundle: &ChargingBundle) -> String {
 
 /// The windowed variant's scan → index → classify, in place of the column
 /// path's. Returns what [`finish`] reports on.
-#[cfg(feature = "classify-waveform")]
 fn run_waveform(
     args: &ClassifyArgs,
     bundle: &ChargingBundle,
@@ -286,9 +282,6 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         bundle.anchor.motif_offset,
     );
 
-    // Without the runtime linked there is no windowed bundle to reach this
-    // point: `ChargingBundle::load` refuses one by name, with the rebuild hint.
-    #[cfg(feature = "classify-waveform")]
     if bundle.waveform.is_some() {
         let (calls, stats, records) = run_waveform(&args, &bundle, &geometry)?;
         return finish(&args, &bundle, calls, stats, records);

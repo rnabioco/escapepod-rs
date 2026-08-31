@@ -46,29 +46,51 @@
   variants still cannot reproduce a banded-DP pass, and are still refused for
   it; the windowed variant reproduces it from its declared parameters.
 
-  Behind a **separate `classify-waveform` feature**, and deliberately not in
-  the default build. Unlike every other ONNX graph `escpod` runs, this one
-  cannot go through tract — not for want of an op, but because tract 0.23's
-  *shape inference* cannot close a **dynamo** export of
-  `nn.MultiheadAttention`: an `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/
-  `Where` chain whose every input is a constant initializer. Measured five
-  ways, and neither onnx-simplifier (which folds away every `Shape` node) nor
-  onnxruntime's own optimiser makes it loadable, so it cannot be papered over
-  at load time the way `fnn::hoist_conv_padding` papers over padded
-  convolutions. So it runs through onnxruntime via `ort`, which — being
-  `load-dynamic` — needs a `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time,
-  and therefore cannot work in the static musl release artifacts at all. A
-  build without the feature refuses such a bundle *by name* with that hint,
-  rather than shipping a binary whose charging command dlopen-fails on the
-  first read.
+  It runs through **tract**, statically linked, like every other ONNX graph
+  `escpod` runs — so it is in the default build and works from a stock release
+  binary. That is true only from `charging_tcn_rna004@v0.1.1` onward, and the
+  reason is worth recording, because it is the second time this model family
+  has hit it.
 
-  This makes the `ort` path a **bridge, not a destination**. The fix belongs in
-  the export, and is the one this model family already needed once —
+  The first export, `@v0.1.0`, could not go through tract at all: not for want
+  of an op, but because tract 0.23's *shape inference* cannot close a **dynamo**
+  export of `nn.MultiheadAttention` — an
+  `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain whose every input
+  is a constant initializer. Measured five ways, and neither onnx-simplifier
+  (which folds away every `Shape` node) nor onnxruntime's own optimiser makes it
+  loadable, so it could not be papered over at load time the way
+  `fnn::hoist_conv_padding` papers over padded convolutions. This ran through
+  onnxruntime via `ort` for exactly as long as that was true — which, `ort`
+  being `load-dynamic`, meant a `libonnxruntime.so` on `ORT_DYLIB_PATH` and no
+  way to run such a bundle from a static-musl release at all.
+
+  The fix belonged in the export, and is the one this family already needed once:
   escapepod-models retracted "tract cannot run `Resize`" in July after finding
-  the same shape-inference cause, an export fix costing one line and no
-  retrain, and a 6x tract speedup for free. Tracked as
-  rnabioco/escapepod-models#96; a tract-loadable re-export would delete this
-  dependency.
+  the same shape-inference cause, an export fix costing one line and no retrain,
+  and a 6x tract speedup for free. `@v0.1.1` is that re-export — same weights,
+  no retrain, no `GatherND` — and with it go the `ort` dependency, the
+  `classify-waveform` feature, and the per-rayon-worker session pool that `ort`
+  needed because `Session::run` takes `&mut self`. Re-measured with
+  `escapepod-demux/examples/tract_dynamo_probe.rs`, which is kept so the claim
+  can be re-run against a later tract or a later export:
+
+  ```text
+  v0.1.0   669 nodes   analysis fails at node_GatherND_329 / node_index
+  v0.1.1   471 nodes   optimized to 655, runs, output [1, 1]
+  ```
+
+  So an unloadable graph is now a *bundle* problem with a named fix and a
+  build-time gate on it (escapepod-models#96 and #97), rather than a runtime
+  gap: `@v0.1.0` fails at load with tract's own analysis error and the file
+  named.
+
+  The swap is not free and the cost is worth stating: on the same harness and
+  the same 256 chunks, tract is **6.27 ms/chunk against onnxruntime's 4.4**,
+  single-threaded — about 1.4x. It is paid back by static linking (the variant
+  is reachable from a release binary at all, which it was not) and recovered in
+  practice by rayon, which this pipeline already fans out across. Graph parity
+  is unaffected: max |dlogit| **3.3e-6** over the corpus's own tensors, median
+  4.8e-7, against an export whose own residual vs torch is 1.3e-5.
 
   The bundle's shipped Platt calibration is **carried, not applied**: the
   operating point beside it is stated on the uncalibrated probability the graph

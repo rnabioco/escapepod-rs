@@ -875,7 +875,6 @@ dependencies = [
  "noodles-bam",
  "noodles-bgzf",
  "noodles-sam",
- "ort",
  "rayon",
  "serde",
  "serde_json",

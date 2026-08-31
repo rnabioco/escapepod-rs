@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: MIT
 
-//! The windowed variant's ONNX graph, through onnxruntime.
+//! The windowed variant's ONNX graph, through tract.
 //!
-//! # Why not tract — and why this is a bridge, not a destination
+//! # Why the export version is load-bearing
 //!
-//! Every other ONNX graph `escpod` runs goes through tract, which is statically
-//! linked and needs nothing at run time. This one cannot, and the reason is
-//! worth stating precisely: **tract runs these ops fine; its shape inference
-//! cannot close this export.** Measured on `charging_tcn_rna004@v0.1.0`, five
-//! ways, all of which parse the graph and then fail during analysis:
+//! This runs through tract, statically linked, like every other ONNX graph
+//! `escpod` loads — but only because the model was re-exported. The first
+//! shipped export could not go through tract at all, and the reason is worth
+//! keeping: **tract runs these ops fine; its shape inference could not close
+//! that export.** `charging_tcn_rna004@v0.1.0` is a PyTorch *dynamo* export,
+//! and dynamo lowers `nn.MultiheadAttention`'s mask handling to an
+//! `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain whose every
+//! input is a constant initializer. Measured five ways, all of which parse the
+//! graph and then fail during analysis:
 //!
 //! ```text
 //! inputs pinned to batch 1        node_conv1d       Sym(batch) vs Val(1)
@@ -18,51 +22,74 @@
 //! nothing pinned at all           node_GatherND_329 Sym(batch) vs Val(1)
 //! ```
 //!
-//! The offending subgraph is `Unsqueeze` -> `Transpose` -> `GatherND` ->
-//! `Transpose` -> `Where`: `nn.MultiheadAttention`'s mask handling, as the
-//! **dynamo** exporter lowers it. Every input to it is a constant initializer
-//! (a `(1,1,11,37,2)` index tensor, an `(11,37)` bool mask), so the pattern is
-//! entirely static and tract still cannot close it. It is *not*
-//! `adaptive_avg_pool1d`, which rnabioco/escapepod-rs#306 named as the suspect
-//! -- those layers are in the model config and are not what tract dies on.
-//!
-//! Neither standard rewrite helps, so this cannot be papered over at load time
-//! the way [`crate::fnn`]'s `hoist_conv_padding` papers over padded
+//! Neither standard rewrite helped, so it could not be papered over at load
+//! time the way [`crate::fnn`]'s `hoist_conv_padding` papers over padded
 //! convolutions: onnx-simplifier folds away every `Shape` node (479 -> 428
 //! nodes) and tract fails at the same `GatherND`; onnxruntime's own optimiser
-//! keeps it and adds hardware-specific fusions.
+//! keeps it and adds hardware-specific fusions. The fix had to be, and was,
+//! the export — rnabioco/escapepod-models#96, the second time this model
+//! family hit tract shape inference and the second time the export was the
+//! cause.
 //!
-//! So this path uses `ort` (onnxruntime), exactly as `escapepod-demux`'s CRF
-//! encoder does, and carries the same runtime cost: `ort` is built
-//! `load-dynamic`, so onnxruntime is **dlopened at run time** and
-//! `ORT_DYLIB_PATH` must point at a `libonnxruntime.so`. Nothing is needed at
-//! build time.
+//! `charging_tcn_rna004@v0.1.1` is that re-export: same weights, no retrain,
+//! and no `GatherND` at all. Re-measured with
+//! `escapepod-demux/examples/tract_dynamo_probe.rs`, which is kept precisely
+//! so this claim can be re-run:
 //!
-//! That cost is why it is a separate feature (`waveform-onnx`) rather than part
-//! of `classify`: a build without it refuses such a bundle *by name*, with the
-//! rebuild hint, instead of shipping a binary whose charging command fails at
-//! the first read with a dlopen error. It also means a *released* `escpod`
-//! cannot run such a bundle at all -- the shipped artifacts are static musl,
-//! which cannot dlopen anything.
+//! ```text
+//! v0.1.0   669 nodes   analysis fails at node_GatherND_329 / node_index
+//! v0.1.1   471 nodes   optimized to 655, runs, output [1, 1]
+//! ```
 //!
-//! Which is why this module is a bridge. The fix belongs in the export, and is
-//! the fix this model family already needed once: `escapepod-models` retracted
-//! "tract cannot run `Resize`" on 2026-07-27 after finding the failure was
-//! shape inference over a runtime-computed shape, that our export was the
-//! cause, and that one line fixed it with no retrain (and a 6x speedup in
-//! tract). A re-export without dynamo's MHA lowering would let this file and
-//! the `ort` dependency go away -- rnabioco/escapepod-models#96.
+//! So an unloadable bundle is now a *bundle* problem with a named fix, not a
+//! runtime gap: escapepod-models refuses to register a graph the shipped
+//! runtime cannot load (escapepod-models#97), and tract's own analysis error
+//! is the most informative thing this loader could say about one that slips
+//! through anyway.
+//!
+//! # What this buys, and why there is no feature flag
+//!
+//! The alternative was `ort` (onnxruntime), which is how this module was first
+//! written. It works, but it is built `load-dynamic`: onnxruntime is dlopened
+//! at run time from `ORT_DYLIB_PATH`, and every `escpod` release artifact is
+//! **static musl**, which cannot dlopen anything. A `waveform_model` bundle
+//! was therefore unreachable from a released binary by construction, and the
+//! variant needed an opt-in feature to keep that runtime requirement out of
+//! the default build.
+//!
+//! On tract all of that goes away — the variant is in the default build, works
+//! from a stock release, and needs nothing on the path. Two smaller things go
+//! with it. There is no session pool: `ort`'s `Session::run` takes `&mut
+//! self`, so scoring under rayon needed one session per worker to avoid
+//! serialising every inference behind a mutex, whereas a tract plan is
+//! immutable and one instance serves every worker. And the `ort` dependency
+//! edge is gone from this crate, which is one fewer place for
+//! `download-binaries` to drag OpenSSL into a build that never downloads
+//! anything.
+//!
+//! It is slower, and by enough to say so: **6.27 ms/chunk against
+//! onnxruntime's 4.4**, single-threaded, on the same 256 chunks through
+//! `examples/verify_waveform_model`. That buys reachability from a release
+//! binary — which the `ort` path did not have at any speed — and this pipeline
+//! scores reads under rayon, so the per-chunk figure is not the wall clock.
+//! Graph parity is unaffected: max |dlogit| 3.3e-6 over the corpus's own
+//! tensors, against an export whose own residual vs torch is 1.3e-5.
 //!
 //! # What is checked, and what is trusted
 //!
-//! The bundle declares three input tensors and one output; this probes the
-//! session for all four and refuses a mismatch at load. That matters more here
-//! than for a single-input graph: the three tensors are *different shapes* and
-//! feeding them in the wrong order is not a shape error on two of the three, so
-//! the names are resolved from the session rather than assumed positional.
+//! The bundle declares three input tensors and one output; this resolves all
+//! four against the graph at load and refuses a mismatch. That matters more
+//! here than for a single-input graph: the three tensors are *different
+//! shapes*, and feeding them in the wrong order is not a shape error on two of
+//! the three, so the names are resolved from the graph rather than assumed
+//! positional.
 
 use anyhow::{Result, anyhow, bail};
 use std::path::Path;
+use std::sync::Arc;
+
+use tract_onnx::prelude::*;
+use tract_onnx::tract_core::model::TypedRunnableModel;
 
 use escapepod_signal::chunk::Chunk;
 
@@ -70,90 +97,72 @@ use crate::bundle::{WaveformSpec, WaveformTensor};
 
 /// A loaded windowed-variant graph, ready to score chunks.
 ///
-/// Holds a **pool** of sessions rather than one. `Session::run` takes `&mut
-/// self` — onnxruntime's own guidance is one session per thread or a batched
-/// call — and this pipeline scores reads under `rayon`, so a single guarded
-/// session would serialise every inference behind one mutex while the assembly
-/// around it stayed parallel. That is not a slow path; it is a pipeline that
-/// stops scaling with cores, and it looks exactly like a correct one.
+/// Batch is pinned to 1 at load, for the reason [`crate::fnn::FeatureNet`]
+/// pins it: classification fans out across reads with rayon, so a batch axis
+/// would buy nothing and cost a re-optimisation per batch size. The plan is
+/// immutable, so the handle is `Sync` and one instance serves every worker.
 pub struct WaveformNet {
-    sessions: Vec<std::sync::Mutex<ort::session::Session>>,
-    /// The session's input names, in the order this runtime feeds them, paired
-    /// with which assembled tensor goes in each.
-    inputs: Vec<(String, WaveformTensor)>,
-    output: String,
+    plan: Arc<TypedRunnableModel>,
+    /// Which assembled tensor feeds each graph input, in the graph's own input
+    /// order — resolved by name at load, never assumed positional.
+    inputs: Vec<WaveformTensor>,
 }
 
 impl std::fmt::Debug for WaveformNet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The plan is a whole optimised graph; printing it in a bundle dump is
+        // noise, and `ChargingBundle` derives Debug.
         f.debug_struct("WaveformNet")
-            .field("sessions", &self.sessions.len())
             .field("inputs", &self.inputs)
-            .field("output", &self.output)
-            .finish()
+            .finish_non_exhaustive()
     }
-}
-
-/// How many sessions the pool holds.
-///
-/// One per worker, capped: each carries its own copy of the weights and its own
-/// arena, and past the point where the CPU is saturated another session is
-/// memory without throughput. `ESCAPEPOD_WAVEFORM_SESSIONS` overrides it for
-/// measurement.
-fn pool_size() -> usize {
-    if let Ok(v) = std::env::var("ESCAPEPOD_WAVEFORM_SESSIONS")
-        && let Ok(n) = v.parse::<usize>()
-        && n > 0
-    {
-        return n;
-    }
-    rayon::current_num_threads().clamp(1, 32)
 }
 
 impl WaveformNet {
     /// Open the graph and pin its contract against `spec`.
     pub fn load(path: &Path, spec: &WaveformSpec) -> Result<Self> {
-        // One intra-op thread per session: parallelism here is across reads,
-        // and letting each session spawn its own pool would oversubscribe the
-        // machine by the pool size squared.
-        let open = || -> Result<ort::session::Session> {
-            ort::session::Session::builder()
-                .map_err(|e| anyhow!("cannot create an onnxruntime session builder: {e}"))?
-                .with_intra_threads(1)
-                .map_err(|e| anyhow!("cannot configure the onnxruntime session: {e}"))?
-                .commit_from_file(path)
-                .map_err(|e| {
-                    anyhow!(
-                        "cannot load the waveform model {}: {e}. `ort` is built \
-                         `load-dynamic`, so onnxruntime is opened at run time — set \
-                         ORT_DYLIB_PATH to a libonnxruntime.so if this is a dlopen failure",
-                        path.display()
-                    )
-                })
-        };
-        let session = open()?;
+        let onnx = tract_onnx::onnx();
+        let proto = onnx
+            .proto_model_for_path(path)
+            .map_err(|e| anyhow!("cannot read the waveform model {}: {e}", path.display()))?;
+        let model = onnx
+            .model_for_proto_model(&proto)
+            .map_err(|e| anyhow!("cannot parse the waveform model {}: {e}", path.display()))?;
 
-        // Resolve each session input to the tensor this runtime assembles for
-        // it, by name. The three differ in shape, so two of the six orderings
-        // would be caught by onnxruntime and the rest would not.
-        let mut inputs = Vec::with_capacity(session.inputs().len());
-        for input in session.inputs() {
-            let role = WaveformTensor::from_name(input.name()).ok_or_else(|| {
-                anyhow!(
-                    "the waveform model takes an input named {:?}, which this runtime \
-                     does not assemble; it produces `signal`, `sequence` and `features`",
-                    input.name()
-                )
-            })?;
-            inputs.push((input.name().to_string(), role));
-        }
+        // Resolve each graph input to the tensor this runtime assembles for
+        // it, by name. Two of the six orderings would be caught by a shape
+        // check and the rest would not, so the name is the only thing that
+        // makes this safe.
+        let inputs: Vec<WaveformTensor> = {
+            let outlets = model
+                .input_outlets()
+                .map_err(|e| anyhow!("the waveform model declares no usable inputs: {e}"))?
+                .to_vec();
+            outlets
+                .iter()
+                .map(|outlet| {
+                    let name = model.node(outlet.node).name.as_str();
+                    WaveformTensor::from_name(name).ok_or_else(|| {
+                        anyhow!(
+                            "the waveform model takes an input named {name:?}, which this \
+                             runtime does not assemble; it produces `signal`, `sequence` \
+                             and `features`"
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?
+        };
+
+        // Every tensor the geometry declares must be an input, and no input
+        // may be one it does not declare. A `[0, _]` shape is how
+        // `tensor_shape` spells "this variant has no such tensor".
         for role in [
             WaveformTensor::Signal,
             WaveformTensor::Sequence,
             WaveformTensor::Features,
         ] {
             let wanted = spec.tensor_shape(role);
-            let present = inputs.iter().any(|(_, r)| *r == role);
+            let present = inputs.contains(&role);
             if present == (wanted[0] == 0) {
                 bail!(
                     "the declared geometry {} a {} tensor, but the graph {} one",
@@ -167,31 +176,50 @@ impl WaveformNet {
                 );
             }
         }
-        if session.outputs().len() != 1 {
+
+        let n_outputs = model
+            .output_outlets()
+            .map_err(|e| anyhow!("the waveform model declares no usable outputs: {e}"))?
+            .len();
+        if n_outputs != 1 {
             bail!(
-                "the waveform model has {} outputs; the contract is exactly one, a \
-                 [batch, 1] logit",
-                session.outputs().len()
+                "the waveform model has {n_outputs} outputs; the contract is exactly one, \
+                 a [batch, 1] logit"
             );
         }
-        let output = session.outputs()[0].name().to_string();
 
-        let n = pool_size();
-        let mut sessions = Vec::with_capacity(n);
-        sessions.push(std::sync::Mutex::new(session));
-        for _ in 1..n {
-            sessions.push(std::sync::Mutex::new(open()?));
+        // Pin the batch, in the graph's input order.
+        let mut model = model;
+        for (i, role) in inputs.iter().enumerate() {
+            let [rows, cols] = spec.tensor_shape(*role);
+            model = model
+                .with_input_fact(i, f32::fact([1, rows, cols]).into())
+                .map_err(|e| {
+                    anyhow!(
+                        "the waveform model {} does not accept the declared {} input \
+                         [1, {rows}, {cols}]: {e}",
+                        path.display(),
+                        role.name()
+                    )
+                })?;
         }
-        tracing::debug!(
-            "waveform model {}: {n} session(s) for {} rayon worker(s)",
-            path.display(),
-            rayon::current_num_threads()
-        );
+        let plan = model
+            .into_optimized()
+            .map_err(|e| {
+                anyhow!(
+                    "cannot optimize the waveform model {}: {e}. tract parses a graph and \
+                     then analyses it, so a failure here is typically shape inference \
+                     rather than a missing op — see `escapepod_classify::waveform_net` \
+                     and rnabioco/escapepod-models#96",
+                    path.display()
+                )
+            })?
+            .into_runnable()
+            .map_err(|e| anyhow!("cannot plan the waveform model {}: {e}", path.display()))?;
 
         let net = Self {
+            plan,
             inputs,
-            output,
-            sessions,
         };
         net.probe(spec)?;
         Ok(net)
@@ -200,9 +228,9 @@ impl WaveformNet {
     /// Run one zeroed chunk and insist the output is a single `[1, 1]` logit.
     ///
     /// The same discipline the other ONNX loaders here use, for the same
-    /// reason: a graph with a two-class softmax head, or a per-timestep output,
-    /// has to fail at load with the file named rather than downstream, where a
-    /// wrong shape becomes a wrong probability on every read.
+    /// reason: a graph with a two-class softmax head, or a per-timestep
+    /// output, has to fail at load with the file named rather than downstream,
+    /// where a wrong shape becomes a wrong probability on every read.
     fn probe(&self, spec: &WaveformSpec) -> Result<()> {
         let zero = Chunk {
             signal: vec![0.0; prod(spec.tensor_shape(WaveformTensor::Signal))],
@@ -225,10 +253,8 @@ impl WaveformNet {
     /// either here would put them out of reach of the caller that has to
     /// report which was applied.
     pub fn logit(&self, chunk: &Chunk, spec: &WaveformSpec) -> Result<f64> {
-        use ort::value::Tensor;
-
-        let mut values: Vec<(&str, ort::value::DynValue)> = Vec::with_capacity(self.inputs.len());
-        for (name, role) in &self.inputs {
+        let mut values: TVec<TValue> = tvec!();
+        for role in &self.inputs {
             let [rows, cols] = spec.tensor_shape(*role);
             let data: &[f32] = match role {
                 WaveformTensor::Signal => &chunk.signal,
@@ -243,32 +269,25 @@ impl WaveformNet {
                     data.len()
                 );
             }
-            let t = Tensor::from_array(([1usize, rows, cols], data.to_vec()))
+            let t = Tensor::from_shape(&[1, rows, cols], data)
                 .map_err(|e| anyhow!("cannot build the {} tensor: {e}", role.name()))?;
-            values.push((name.as_str(), t.into_dyn()));
+            values.push(t.into());
         }
 
-        // One session per rayon worker, so parallel reads do not queue behind
-        // each other. Outside a rayon pool every caller uses session 0, which
-        // is the single-threaded case and correct.
-        let slot = rayon::current_thread_index().unwrap_or(0) % self.sessions.len();
-        let mut session = self.sessions[slot]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outputs = session
+        let out = self
+            .plan
             .run(values)
             .map_err(|e| anyhow!("waveform model inference failed: {e}"))?;
-        let out = outputs
-            .get(self.output.as_str())
-            .ok_or_else(|| anyhow!("the waveform model produced no {:?} output", self.output))?;
-        let (shape, data) = out
-            .try_extract_tensor::<f32>()
+        let view = out[0]
+            .to_plain_array_view::<f32>()
             .map_err(|e| anyhow!("the waveform model output is not f32: {e}"))?;
+        let data: Vec<f32> = view.iter().copied().collect();
         if data.len() != 1 {
             bail!(
-                "the waveform model emitted {} values (shape {shape:?}); the contract is \
-                 one BCE logit per read, so this is a differently-headed graph",
-                data.len()
+                "the waveform model emitted {} values (shape {:?}); the contract is one \
+                 BCE logit per read, so this is a differently-headed graph",
+                data.len(),
+                out[0].shape()
             );
         }
         Ok(data[0] as f64)

@@ -1,16 +1,25 @@
 //! Does tract load this ONNX graph, and if not, where does it give up?
 //!
-//! Written for escapepod-rs#306, where the answer decided a runtime: the leech
-//! waveform TCN (`charging_tcn_rna004@v0.1.0`) is a PyTorch *dynamo* export,
-//! and dynamo lowers its `nn.MultiheadAttention` mask handling to an
-//! `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain. tract 0.23
+//! Written for escapepod-rs#306, where the answer decided a runtime, and then
+//! decided it again. The leech waveform TCN shipped first as
+//! `charging_tcn_rna004@v0.1.0`, a PyTorch *dynamo* export whose
+//! `nn.MultiheadAttention` mask handling dynamo lowers to an
+//! `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain; tract 0.23
 //! parses the whole graph and then fails shape analysis in every configuration
-//! below, which is why `escapepod_classify::waveform_net` runs onnxruntime
-//! instead — and why rnabioco/escapepod-models#96 asks for a re-export rather
-//! than treating that as permanent.
+//! below. That is what rnabioco/escapepod-models#96 asked to fix in the
+//! export rather than work around in the consumer.
 //!
-//! Kept because "we tried and it did not work" is worth being able to re-run
-//! against a later tract. Takes any `.onnx` path.
+//! `@v0.1.1` is that re-export, and this probe is how it was checked:
+//!
+//! ```text
+//! v0.1.0   669 nodes   FAILED at node_GatherND_329 / node_index, all 3 modes
+//! v0.1.1   471 nodes   optimized to 655, ran, output [1, 1], all 3 modes
+//! ```
+//!
+//! So `escapepod_classify::waveform_net` is plain tract, and a bundle tract
+//! cannot load is now a bundle-side problem with a build-time gate on it
+//! (escapepod-models#97). Kept so both halves of that can be re-run against a
+//! later tract or a later export. Takes any `.onnx` path.
 use tract_onnx::prelude::*;
 
 /// Replace every symbolic dimension with a concrete 1, everywhere the proto

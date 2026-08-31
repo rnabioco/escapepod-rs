@@ -265,7 +265,7 @@ jobs:
       - run: cargo check --workspace
 
   features:
-    name: Feature builds (gpu / classify-waveform / models-download)
+    name: Feature builds (gpu / models-download)
     runs-on: ubuntu-latest
     timeout-minutes: 35
     # The default jobs never compile the *opt-in* features, so a dependency bump
@@ -316,16 +316,15 @@ jobs:
         run: cargo clippy -p escapepod-demux --features gpu
       - name: gpu — CLI union (what `--features gpu` users build)
         run: cargo clippy -p escapepod-cli --features gpu
-      # `classify-waveform` is opt-in for the same reason the GPU flags are —
-      # it loads onnxruntime through `ort` at run time — so no default job
-      # compiles a line of it. `--all-targets` on the library crate is what
-      # additionally builds `verify_waveform_model`, the parity harness that
-      # backs the variant's only correctness claim; gated behind
-      # `waveform-onnx`, it would otherwise rot uncompiled.
-      - name: classify-waveform — the ort charging runtime (escapepod-classify)
+      # Not an opt-in feature, but the one library-crate combination no other
+      # job produces: `escapepod-cli`'s default build turns `waveform-onnx` and
+      # `fnn-onnx` on together, so `escapepod-classify` with only the former is
+      # unbuilt everywhere else — and that is precisely where a `cfg(not(...))`
+      # arm lives. `--all-targets` additionally builds `verify_waveform_model`,
+      # the parity harness backing the variant's only correctness claim, which
+      # is gated behind the feature and would otherwise rot uncompiled.
+      - name: waveform-onnx alone — the variant's cfg(not(fnn-onnx)) arms
         run: cargo clippy -p escapepod-classify --features waveform-onnx --all-targets
-      - name: classify-waveform — CLI wiring (what `--features classify-waveform` builds)
-        run: cargo clippy -p escapepod-cli --features classify-waveform
       - name: models-download — k-mer model prefetch (ureq rustls + sha2)
         run: cargo clippy -p escapepod-cli --features models-download
 
@@ -335,13 +334,12 @@ jobs:
       # The clippy steps above cannot catch a regression here, because this
       # runner *does* have libssl-dev — `ort`'s default `download-binaries`
       # pulled in native-tls + openssl-sys, went green here, and failed the
-      # v0.17.0 GPU release build instead. `classify-waveform` is in the loop
-      # because it is a second, independent `ort` dependency edge. Checked over `--target all -e all`
+      # v0.17.0 GPU release build instead. Checked over `--target all -e all`
       # so a target-specific or build-dependency edge counts too.
       - name: no openssl in the dependency graph
         run: |
           set -euo pipefail
-          for feat in gpu classify-waveform models-download; do
+          for feat in gpu models-download; do
             if cargo tree -i openssl-sys -p escapepod-cli \
                  --features "$feat" --target all -e all >/dev/null 2>&1; then
               echo "::error::openssl-sys reachable with --features $feat; \
@@ -351,4 +349,4 @@ jobs:
               exit 1
             fi
           done
-          echo "openssl-sys absent under every feature set"
+          echo "openssl-sys absent under both feature sets"

@@ -1855,13 +1855,12 @@ impl ChargingBundle {
         ))
     }
 
-    /// Without `waveform-onnx` there is no onnxruntime linked, so the bundle
+    /// Without `waveform-onnx` there is no ONNX runtime linked, so the bundle
     /// is refused with the rebuild hint rather than silently mis-scored.
     ///
-    /// This variant is behind its own feature because it costs more than the
-    /// others: unlike tract, which is statically linked, its graph needs
-    /// onnxruntime opened at run time (see [`crate::waveform_net`] for why
-    /// tract cannot load it).
+    /// `escapepod-cli`'s default build enables it, so this path is reachable
+    /// only from a `default-features = false` library consumer that asked for
+    /// the column variants and not this one.
     #[cfg(not(feature = "waveform-onnx"))]
     fn load_waveform_model(
         _dir: &Path,
@@ -1871,9 +1870,7 @@ impl ChargingBundle {
         bail!(
             "this bundle is the windowed raw-signal variant (`waveform_model`), but \
              escapepod-classify was built without the `waveform-onnx` feature — rebuild \
-             with it enabled. It is separate from `fnn-onnx` because its graph runs \
-             through onnxruntime rather than tract, which means a libonnxruntime on \
-             ORT_DYLIB_PATH at run time"
+             with it enabled"
         )
     }
 

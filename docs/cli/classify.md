@@ -106,17 +106,16 @@ warning).
 
 Two things follow from that:
 
-- **It needs a separate build.** `--features classify-waveform`, and a
-  `libonnxruntime.so` on `ORT_DYLIB_PATH` at run time — so a stock release
-  binary, which is static musl and cannot dlopen anything, cannot run one.
-  Unlike every other ONNX graph escpod runs, this one cannot go through the
-  statically linked tract: it is a PyTorch *dynamo* export of
-  `nn.MultiheadAttention`, whose mask handling becomes an
+- **The bundle version decides whether it loads at all.** It goes through the
+  statically linked tract like every other ONNX graph escpod runs, so a stock
+  release binary can run one — but only since `charging_tcn_rna004@v0.1.1`.
+  The first export, `@v0.1.0`, was a PyTorch *dynamo* export of
+  `nn.MultiheadAttention` whose mask handling becomes an
   `Unsqueeze`/`Transpose`/`GatherND`/`Transpose`/`Where` chain that tract's
-  shape inference cannot close. A default build refuses such a bundle by name,
-  with that hint, rather than failing at the first read. This is expected to be
-  temporary — the fix is a re-export, tracked as
-  rnabioco/escapepod-models#96.
+  shape inference cannot close, and no graph rewrite fixed it. The fix was the
+  re-export (rnabioco/escapepod-models#96, and #97's build-time gate so a graph
+  the shipped runtime cannot load never registers). Loading `@v0.1.0` fails at
+  `into_optimized` with tract's own analysis error, naming the file.
 - **Its shipped Platt calibration is carried, not applied.** The operating
   point beside it is stated on the uncalibrated probability the graph emits, so
   calibrating would move the scale out from under the very threshold that ships
