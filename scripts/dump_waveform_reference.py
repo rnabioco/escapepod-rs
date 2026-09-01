@@ -180,6 +180,16 @@ def main() -> None:
     feat_t.tofile(f"{out}.features.f32")
     logits.tofile(f"{out}.logit.f32")
     focus.tofile(f"{out}.focus.i64")
+    # The k-mer window and the chunk-local context sequence, as text. These
+    # probe the reference slice and the chunk's base range WITHOUT involving
+    # the signal at all, which is what splits a sequence-side disagreement
+    # from a signal-side one.
+    Path(f"{out}.seq.txt").write_text(
+        "\n".join(str(x) for x in z["sequences"][:n]) + "\n"
+    )
+    Path(f"{out}.ctx.txt").write_text(
+        "\n".join(str(x) for x in z["sequences_with_kmer_context"][:n]) + "\n"
+    )
     dwells.tofile(f"{out}.dwell.f32")
     Path(f"{out}.json").write_text(
         json.dumps(

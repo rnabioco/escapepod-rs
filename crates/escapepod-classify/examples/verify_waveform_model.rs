@@ -85,6 +85,10 @@ struct Args {
     cache: Option<PathBuf>,
     tol_logit: f64,
     tol_tensor: f64,
+    /// Write our own per-base dwell rows (refined and unrefined) so they can be
+    /// compared against a corpus prepared either way. The dwell row is the one
+    /// place a boundary disagreement shows up as an integer.
+    dump_dwells: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -98,6 +102,7 @@ fn parse_args() -> Args {
         cache: None,
         tol_logit: 1e-3,
         tol_tensor: 0.0,
+        dump_dwells: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -108,6 +113,7 @@ fn parse_args() -> Args {
             "--cache" => args.cache = it.next().map(PathBuf::from),
             "--tol-logit" => args.tol_logit = it.next().unwrap().parse().unwrap(),
             "--tol-tensor" => args.tol_tensor = it.next().unwrap().parse().unwrap(),
+            "--dump-dwells" => args.dump_dwells = it.next().map(PathBuf::from),
             _ => positional.push(a),
         }
     }
@@ -168,6 +174,13 @@ fn main() {
     let ref_logit = read_f32(Path::new(&format!("{}.logit.f32", args.prefix.display())));
     let ref_focus = read_i64(Path::new(&format!("{}.focus.i64", args.prefix.display())));
     let ref_dwell = read_f32(Path::new(&format!("{}.dwell.f32", args.prefix.display())));
+    // The corpus's own k-mer window per chunk. Comparing our reference slice
+    // at the same base index against it tests the sequence side with the
+    // signal held out entirely.
+    let ref_seq_win: Vec<String> =
+        std::fs::read_to_string(format!("{}.seq.txt", args.prefix.display()))
+            .map(|t| t.lines().map(str::to_string).collect())
+            .unwrap_or_default();
     assert_eq!(ref_signal.len(), n * shape(WaveformTensor::Signal));
     assert_eq!(ref_seq.len(), n * shape(WaveformTensor::Sequence));
     assert_eq!(ref_feat.len(), n * shape(WaveformTensor::Features));
@@ -290,6 +303,25 @@ fn main() {
         let mut exact = 0usize;
         let mut best_shifts: Vec<i64> = Vec::new();
         let mut shown = 0usize;
+        // (refined matches, unrefined matches, neither)
+        let mut refine_tally = (0usize, 0usize, 0usize);
+        // Our dwell row per chunk, with the DP on and off. `f32::NAN` marks a
+        // chunk we could not assemble, so the row index still lines up with
+        // the corpus's.
+        let w_dwell = shape(WaveformTensor::Features) / 12;
+        let mut per_sig_ch = vec![0f64; spec.tensor_shape(WaveformTensor::Signal)[0]];
+        let mut sweep: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut ours_sig: Vec<f32> = vec![f32::NAN; n * shape(WaveformTensor::Signal)];
+        let mut ours_on: Vec<f32> = vec![f32::NAN; n * w_dwell];
+        let mut ours_off: Vec<f32> = vec![f32::NAN; n * w_dwell];
+        let mut seq_ok = 0usize;
+        let mut seq_case_only = 0usize;
+        // (clean+match, clean+miss, lowercase+match, lowercase+miss)
+        let mut cross = (0usize, 0usize, 0usize, 0usize);
+        let mut seq_real = 0usize;
+        let mut seq_shown = 0usize;
+        let mut matched_bases: Vec<i64> = Vec::new();
+        let mut missed_bases: Vec<i64> = Vec::new();
         for i in 0..n {
             let Ok(id) = escapepod_signal::parse_uuid_flexible(&read_ids[i]) else {
                 missing += 1;
@@ -318,6 +350,124 @@ fn main() {
                 continue;
             };
             let want = chunk_at(i);
+            // Is the banded DP the thing we disagree about? Assemble the same
+            // read with refinement off and see which reproduces the corpus.
+            // One run answers what a stack of hypotheses about the DP cannot:
+            // whether the corpus was refined at all.
+            {
+                // Sweep the DP's own knobs. If some other setting reproduces
+                // the corpus exactly, the bug is that we pass the wrong one --
+                // which no amount of reading the two call sites will show,
+                // because both name the same fields.
+                if std::env::var("SWEEP").is_ok() {
+                    let base = spec.refine.expect("refine set");
+                    for it in [0usize, 1, 2, 3] {
+                        for hb in [3usize, 5, 10, 20] {
+                            let mut s2 = spec.clone();
+                            s2.refine = Some(escapepod_signal::chunk::RefineParams {
+                                half_bandwidth: hb,
+                                scale_iters: it,
+                                seed: base.seed,
+                            });
+                            let c2 = waveform::assemble_chunk(
+                                bundle.kmer.as_ref(),
+                                &s2,
+                                read,
+                                reference_seq.as_bytes(),
+                                raw,
+                            );
+                            if c2.as_ref().is_some_and(|c| c.features == want.features) {
+                                *sweep.entry((it, hb)).or_insert(0usize) += 1;
+                            }
+                        }
+                    }
+                }
+                let mut plain = spec.clone();
+                plain.refine = None;
+                let off = waveform::assemble_chunk(
+                    bundle.kmer.as_ref(),
+                    &plain,
+                    read,
+                    reference_seq.as_bytes(),
+                    raw,
+                );
+                let on_ok = chunk.features == want.features;
+                let off_ok = off.as_ref().is_some_and(|c| c.features == want.features);
+                match (on_ok, off_ok) {
+                    (true, _) => refine_tally.0 += 1,
+                    (false, true) => refine_tally.1 += 1,
+                    (false, false) => refine_tally.2 += 1,
+                }
+                // Row 0 of `features` is the raw per-base dwell, which is what
+                // the corpus stores as `dwells_flat`.
+                ours_on[i * w_dwell..(i + 1) * w_dwell].copy_from_slice(&chunk.features[..w_dwell]);
+                let sw = shape(WaveformTensor::Signal);
+                ours_sig[i * sw..(i + 1) * sw].copy_from_slice(&chunk.signal);
+                if let Some(c) = off.as_ref() {
+                    ours_off[i * w_dwell..(i + 1) * w_dwell]
+                        .copy_from_slice(&c.features[..w_dwell]);
+                }
+                // The preset's Theil-Sen rescale subsamples only above
+                // `max_points` (200) bases. If agreement tracks that
+                // threshold, the disagreement is the subsample, not the DP.
+                // Our 11-mer at the anchor, from the aligned reference slice.
+                if let Some(theirs) = ref_seq_win.get(i) {
+                    let half = theirs.len() / 2;
+                    let lo = base_indices[i] - half as i64;
+                    let ours: String = (0..theirs.len() as i64)
+                        .map(|k| {
+                            usize::try_from(lo + k)
+                                .ok()
+                                .and_then(|u| reference_seq.as_bytes().get(read.ref_start + u))
+                                .map(|&b| b as char)
+                                .unwrap_or('N')
+                        })
+                        .collect();
+                    // Case is not the question: `extract_levels` uppercases and
+                    // `base_to_int` is case-insensitive, so a purely lowercase
+                    // difference cannot move a boundary. Different LETTERS can.
+                    // Does a lowercase (read-vs-reference mismatch) position
+                    // PREDICT a feature mismatch? Case cannot move a boundary
+                    // by itself, so a strong association would mean it leaks
+                    // somewhere, and independence would exonerate it.
+                    let lower = theirs.bytes().any(|b| b.is_ascii_lowercase());
+                    match (lower, on_ok) {
+                        (false, true) => cross.0 += 1,
+                        (false, false) => cross.1 += 1,
+                        (true, true) => cross.2 += 1,
+                        (true, false) => cross.3 += 1,
+                    }
+                    if &ours == theirs {
+                        seq_ok += 1;
+                    } else if ours.eq_ignore_ascii_case(theirs) {
+                        seq_case_only += 1;
+                    } else {
+                        seq_real += 1;
+                        if seq_shown < 5 {
+                            seq_shown += 1;
+                            println!("  seq DIFFERS chunk {i}: ours {ours} theirs {theirs}");
+                        }
+                    }
+                }
+                let n_bases = read.ref_end - read.ref_start;
+                if on_ok {
+                    matched_bases.push(n_bases as i64);
+                } else {
+                    missed_bases.push(n_bases as i64);
+                }
+            }
+            {
+                let cols = spec.tensor_shape(WaveformTensor::Signal)[1];
+                for (c, acc) in per_sig_ch.iter_mut().enumerate() {
+                    let lo = c * cols;
+                    for j in lo..lo + cols {
+                        let d = (chunk.signal[j] as f64 - want.signal[j] as f64).abs();
+                        if d > *acc {
+                            *acc = d;
+                        }
+                    }
+                }
+            }
             for (k, (a, b)) in [
                 (&chunk.signal, &want.signal),
                 (&chunk.sequence, &want.sequence),
@@ -393,7 +543,25 @@ fn main() {
             worst[0], worst[1], worst[2]
         );
         println!("assembly: max |dlogit| end to end = {worst_logit:.3e}");
+        // Per signal CHANNEL, not pooled. Channel 0 is the plain normalised
+        // current in the window; it depends on the trim, the reverse, the
+        // normalisation and the window placement, but NOT on the base
+        // boundaries. Channel 1 (the k-mer residual) does depend on them. So
+        // pooling the two hides which half of the pipeline disagrees.
+        let sig_rows = spec.tensor_shape(WaveformTensor::Signal)[0];
+        let sig_cols = spec.tensor_shape(WaveformTensor::Signal)[1];
+        println!(
+            "assembly: max |d| per signal channel {:?}",
+            (0..sig_rows)
+                .map(|c| format!("ch{c}={:.3e}", per_sig_ch[c]))
+                .collect::<Vec<_>>()
+        );
+        let _ = sig_cols;
         println!("assembly: {exact} of {compared} chunks bit-identical");
+        println!(
+            "assembly: features reproduced with refinement ON {}, OFF {}, neither {}",
+            refine_tally.0, refine_tally.1, refine_tally.2
+        );
         let mut rows: Vec<(usize, f64)> = per_row.iter().copied().enumerate().collect();
         rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         println!(
@@ -410,6 +578,75 @@ fn main() {
                 ))
                 .collect::<Vec<_>>()
         );
+        let span = |v: &[i64]| {
+            if v.is_empty() {
+                return "-".to_string();
+            }
+            let (mut lo, mut hi, mut over) = (i64::MAX, i64::MIN, 0);
+            for &x in v {
+                lo = lo.min(x);
+                hi = hi.max(x);
+                if x > 200 {
+                    over += 1;
+                }
+            }
+            format!("n={} range {lo}..{hi}, {over} over 200 bases", v.len())
+        };
+        println!(
+            "assembly: anchor 11-mer exact {seq_ok}, case-only {seq_case_only}, \
+             different letters {seq_real} (of {compared})"
+        );
+        println!(
+            "assembly: uppercase-only ref: {} match / {} miss | has lowercase: {} match / {} miss",
+            cross.0, cross.1, cross.2, cross.3
+        );
+        println!("assembly: matched  {}", span(&matched_bases));
+        println!("assembly: mismatch {}", span(&missed_bases));
+        if let Some(dp) = args.dump_dwells.as_ref() {
+            // The read's reference span, as WE compute it from the CIGAR. The
+            // level array is zero-padded at both ends where no full k-mer
+            // window fits, so a span that is off by one moves those zeros --
+            // outside the feature window, and therefore invisible to every
+            // comparison above, but seen by the DP over the whole read.
+            let mut spans = String::new();
+            for rid in read_ids.iter().take(n) {
+                if let Some(r) = escapepod_signal::parse_uuid_flexible(rid)
+                    .ok()
+                    .and_then(|id| by_id.get(&id))
+                {
+                    spans.push_str(&format!("{}\t{}\t{}\n", rid, r.ref_start, r.ref_end));
+                }
+            }
+            std::fs::write(format!("{}.spans.tsv", dp.display()), spans).unwrap();
+            let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            std::fs::write(
+                format!("{}.ours_signal.f32", dp.display()),
+                bytes(&ours_sig),
+            )
+            .unwrap();
+            std::fs::write(
+                format!("{}.ours_refined.f32", dp.display()),
+                bytes(&ours_on),
+            )
+            .unwrap();
+            std::fs::write(
+                format!("{}.ours_unrefined.f32", dp.display()),
+                bytes(&ours_off),
+            )
+            .unwrap();
+            println!(
+                "assembly: wrote our dwell rows ({n} x {w_dwell}) to {}.ours_{{refined,unrefined}}.f32",
+                dp.display()
+            );
+        }
+        if !sweep.is_empty() {
+            let mut rows: Vec<_> = sweep.into_iter().collect();
+            rows.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            println!("assembly: sweep (scale_iters, half_bandwidth) -> chunks reproduced:");
+            for ((it, hb), n) in rows.iter().take(8) {
+                println!("    iters={it} half_bw={hb}  {n}/{compared}");
+            }
+        }
         println!("assembly: focus delta {}", histogram(&focus_delta));
         println!("assembly: best signal shift {}", histogram(&best_shifts));
         if compared == 0 {
