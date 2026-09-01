@@ -670,6 +670,31 @@ struct WaveformPreprocessing {
     refine_scale_iters: i64,
     refine_half_bandwidth: usize,
     refine_kmer_center_idx: usize,
+    /// Where the per-base **sequence** the model is fed comes from: each
+    /// read's `MD` tag (`"md"`) or the reference FASTA (`"fasta"`).
+    ///
+    /// A different question from `motif_reference`, and the two read alike
+    /// enough that conflating them is the whole reason this key exists
+    /// (rnabioco/escapepod-rs#312). `motif_reference` is about the *anchor* —
+    /// the motif is searched in the FASTA, in reference coordinates, which is
+    /// correct and is what [`crate::junction_positions`] does. The **bases**
+    /// handed to the k-mer lookup are a separate choice, and every corpus built
+    /// so far takes them from `MD`, via pysam's `get_reference_sequence()`.
+    /// Nothing in the bundle said so, "find the motif in the REFERENCE"
+    /// answers only the first question, and reading it as an answer to both is
+    /// what this runtime did until #306.
+    ///
+    /// The two are not interchangeable: every record in the shipped tRNA panel
+    /// carries one `N` — an ordered degenerate position, so it cannot be
+    /// resolved upstream — and levels are per 9-mer, so one unknown base blanks
+    /// **nine** consecutive k-mers and moves the refined map for the whole
+    /// read. Both sources score every read and error on none, which is why the
+    /// declaration is checked below rather than defaulted over.
+    ///
+    /// Absent means `md`: optional so bundles published before this key stay
+    /// readable, and `md` because that is what all of them were built with.
+    #[serde(default)]
+    reference_source: Option<String>,
     /// The anchor, restated here from the corpus's own config. Checked against
     /// the `anchor` block rather than merely recorded: they are two statements
     /// of one rule, written by different parts of the builder, and a bundle
@@ -686,10 +711,10 @@ struct WaveformPreprocessing {
     #[serde(default)]
     kmer_len: Option<usize>,
     /// Prose: `focus_rule` restates in words what the geometry above says in
-    /// numbers, `motif_reference` names where the motif was searched (this
-    /// runtime only implements the reference, which `anchor.method` already
-    /// states), and `recover_softclip_signal` was off for every corpus built
-    /// so far — a `true` there is refused below rather than ignored.
+    /// numbers, `motif_reference` names where the *motif* was searched — the
+    /// anchor only, never the bases, which is what `reference_source` above is
+    /// for — and `recover_softclip_signal` was off for every corpus built so
+    /// far, a `true` there being refused below rather than ignored.
     #[serde(default)]
     focus_rule: Doc,
     #[serde(default)]
@@ -1253,6 +1278,25 @@ fn waveform_spec(
             anchor.motif_offset,
             (o as i64 - anchor.motif_offset as i64).abs()
         );
+    }
+
+    // Where the per-base sequence comes from, which the bundle now states
+    // rather than leaving to be inferred from `motif_reference` (#312). The
+    // FASTA and the `MD` tag disagree wherever the panel carries an ambiguity
+    // code, and the shipped panel carries one per record, permanently — the
+    // position is ordered degenerate, so 45% of reads would be silently wrong
+    // under any single substituted base. Assembling from the other source
+    // anyway is the failure this refuses: it scores every read, errors on
+    // none, and moves the refined map for the whole read.
+    match p.reference_source.as_deref() {
+        None | Some("md") => {}
+        Some(other) => bail!(
+            "waveform_model.preprocessing.reference_source is {other:?}, but this runtime \
+             assembles the per-base sequence from each read's `MD` tag (`md`) and \
+             implements no other source. The two disagree wherever the reference carries \
+             an ambiguity code and neither errors, so a bundle built against {other:?} is \
+             refused rather than scored against `md`"
+        ),
     }
 
     let normalization = match p.signal_norm.as_str() {
@@ -2281,6 +2325,45 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(err.contains("recover_softclip_signal"), "{err}");
+        }
+
+        /// The per-base sequence has two plausible sources and the bundle now
+        /// says which one it was built with (#312).
+        ///
+        /// `fasta` is not a hypothetical value: it is what `motif_reference`
+        /// says, about the *motif*, and reading that as an answer for the
+        /// bases too is the mistake that cost 169 of 256 chunks their
+        /// bit-exactness. A runtime that assembled from `md` anyway would score
+        /// such a bundle to five decimal places and never say it had ignored
+        /// the declaration — so it is refused, naming both.
+        #[test]
+        fn a_reference_source_this_runtime_does_not_assemble_is_refused() {
+            for asked in ["fasta", "reference_fasta", "query"] {
+                let err = spec_of(&block(|v| {
+                    v["preprocessing"]["reference_source"] = asked.into();
+                }))
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("reference_source"), "{asked}: {err}");
+                // Both sides named: what the bundle asked for, and what this
+                // runtime does instead.
+                assert!(err.contains(asked), "{asked}: {err}");
+                assert!(err.contains("`MD`"), "{asked}: {err}");
+            }
+        }
+
+        /// Absent means `md`, because that is what every bundle published
+        /// before the key existed was actually built with — so the key stays
+        /// optional and those bundles keep loading.
+        #[test]
+        fn an_absent_reference_source_means_md() {
+            assert!(spec_of(&block(|_| {})).is_ok());
+            assert!(
+                spec_of(&block(|v| {
+                    v["preprocessing"]["reference_source"] = "md".into();
+                }))
+                .is_ok()
+            );
         }
 
         /// A negative iteration count means "no DP at all" on the reference

@@ -103,7 +103,20 @@ scored against is rebuilt from that read's **`MD` tag**, the way the training
 corpus builds it, not sliced out of the FASTA. Those disagree wherever the
 FASTA carries an `N` — the alignment recorded a real base there — and since
 levels are looked up per 9-mer, one `N` blanks nine of them. A read with no
-`MD` tag is skipped (`no MD tag`) rather than silently scored off the FASTA. The base-to-signal map is walked through the CIGAR into *reference*
+`MD` tag is skipped (`no MD tag`) rather than silently scored off the FASTA.
+
+The bundle *says* which source it was built from, in
+`waveform_model.preprocessing.reference_source` — absent meaning `md`, which is
+what every published bundle was built with. That is a different question from
+`motif_reference`, which names where the *motif* is searched (the FASTA, in
+reference coordinates, which is right); reading one as an answer to both is how
+this runtime got it wrong. A bundle naming a source escpod does not assemble is
+refused at load, naming both, rather than scored off `MD` anyway — the ambiguity
+is permanent (it is an ordered degenerate position, so no substituted base is
+right for more than 55% of reads), and both sources score every read without
+erroring.
+
+The base-to-signal map is walked through the CIGAR into *reference*
 coordinates, the anchor is the motif **+2** rather than +3, the spans are
 refined by a banded DP before any feature is taken, and the signal frame comes
 from the bundle instead of a vote (so `--orientation` is ignored, with a

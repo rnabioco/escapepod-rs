@@ -4,6 +4,46 @@
 
 ### Added
 
+- **A waveform bundle declares where its per-base sequence comes from**
+  (#312). `waveform_model.preprocessing.reference_source` is accepted, and a
+  value this runtime does not assemble is refused at load, naming both what the
+  bundle asked for and what escpod does.
+
+  The bundle already carried `motif_reference: "fasta"` and a `focus_rule`
+  saying to "find CCAGGC in the REFERENCE". Both are true, and both are about
+  locating the *anchor* in reference coordinates, which the FASTA is fine for.
+  Neither says where the **bases** come from — and every corpus built so far
+  takes those from each read's `MD` tag, via pysam's
+  `get_reference_sequence()`. Reading "the REFERENCE" the obvious way and
+  slicing the FASTA is what this runtime did until #306, and it validated
+  cleanly: 87 of 256 corpus chunks bit-identical against 256 of 256, with
+  nothing raised on the other 169.
+
+  It is not a difference that can be resolved upstream. The `N` in all 47
+  records of the shipped panel is the 3'-terminal base of the 5' adapter's RNA
+  tail `CUGGN`, ordered **degenerate** on purpose; over 1,055,660 reads no
+  letter covers even 55% of that position, so substituting the modal base
+  would be silently wrong for 45% of reads — strictly worse than an `N`, which
+  is at least visibly unknown. The ambiguity is a permanent property of the
+  input, so the runtime has to be right about its source permanently, and a
+  declaration it can refuse is the only thing that makes that checkable.
+
+  Absent means `md`, so every bundle already published stays readable —
+  `WaveformPreprocessing` is `deny_unknown_fields`, which is also why the key
+  has to be accepted here before escapepod-models can emit it
+  (rnabioco/escapepod-models#109), the same sequencing
+  `barcode_crf_fdx4_rna004`'s `signal.anchor` used.
+
+  A fixture now carries the ambiguity: `trna_reference_ambiguous.fa` is the
+  fixture panel with the code put back where the real one has it. The existing
+  reference has the ambiguity **removed** — 0 codes against the panel's 47 —
+  so every fixture read took the resolved path and no golden here could ever
+  have seen the difference, the same blind spot #306's own `feature_set` had.
+  The new test pins that the ambiguity changes nothing end to end, and, in the
+  same pass, that putting the same `N` into the `MD`-derived sequence *does*
+  move the chunks — so the equality is evidence about the source rather than
+  two paths that never differ.
+
 - **`escpod classify` runs a `waveform_model` charging bundle** (#306).
   A third bundle variant, beside `gbm` and `feature_model`: it reads a *signal
   window* rather than a column vector — normalised current plus its k-mer
