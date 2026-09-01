@@ -11,10 +11,12 @@
 //! `GatherND` because the output size does not divide the input.
 //!
 //! Not `nn.MultiheadAttention`, which escapepod-models#96 and escapepod-rs's
-//! `waveform_net.rs` both named before anyone read the graph: the `GatherND`
-//! consumes the last block of `signal_tcn` and carries that pool's bin mask and
-//! bin widths, while `cross_attn` exports as plain
-//! `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`.
+//! `waveform_net.rs` both named before anyone read the graph. The giveaway is
+//! the constants: an `(11, 37)` index grid and mask are the pool's output width
+//! and its widest bin (390 -> 11 gives bins of 36 or 37), not anything an
+//! attention mask is shaped by. `cross_attn` exports as plain
+//! `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`. Fixed upstream in
+//! rnabioco/leech#233.
 //!
 //! `@v0.1.1` (leech 0.10.0) is the re-export that fixes both, and this probe is
 //! how it was checked from this side:

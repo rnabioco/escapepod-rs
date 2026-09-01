@@ -33,13 +33,24 @@
 //!    `GatherND` because the output size does not divide the input.
 //!
 //! **Not** `nn.MultiheadAttention`, which earlier revisions of this module and
-//! of rnabioco/escapepod-models#96 both named. Reading the graph settles it:
-//! the offending `GatherND` consumes `relu_17`, the last block of `signal_tcn`;
-//! its `(11, 37)` bool mask is a bin mask and its `(11,)` divisor is
-//! `[36, 36, 37, 36, 37, …]`, the bin widths of that pool. `cross_attn` exports
-//! as plain `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`, with no mask and no
-//! gather. rnabioco/escapepod-rs#306's original suspect was right and its
-//! retraction was not.
+//! of rnabioco/escapepod-models#96 both named while explicitly ruling the pool
+//! out. Two constants identify it, and they are worth reading closely.
+//! `charging_tcn_rna004` pools 390 down to 11. PyTorch's bin rule is
+//! `[floor(j*L/K), ceil((j+1)*L/K))`, which for 390 -> 11 gives eleven bins of
+//! width 36 or 37 — so a gather that evaluates every bin at once needs an
+//! `(11, 37)` index grid and an `(11, 37)` mask marking the slot the 36-wide
+//! bins do not use. That is exactly the pair the offending subgraph carries,
+//! alongside a `(11,)` divisor of `[36, 36, 37, 36, 37, …]`. An attention mask
+//! is shaped by sequence length and head count and would never be `11 x 37`.
+//! `cross_attn` in fact exports as plain
+//! `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`, with no mask and no gather.
+//!
+//! The trap is that a non-dividing adaptive pool does not lower to *any* ONNX
+//! pooling op, so grepping the graph for one finds nothing and the ragged-bin
+//! gather looks like it must have come from somewhere else. The layers named in
+//! the model config are real and they are what tract died on — they just do not
+//! appear under a pooling name. rnabioco/escapepod-rs#306's original suspect was
+//! right and its retraction was not.
 //!
 //! Neither standard rewrite helped, so it could not be papered over at load
 //! time the way [`crate::fnn`]'s `hoist_conv_padding` papers over padded
@@ -61,6 +72,10 @@
 //! v0.1.0   669 nodes   analysis fails at node_GatherND_329 / node_index
 //! v0.1.1   471 nodes   optimized to 655, runs, output [1, 1]
 //! ```
+//!
+//! Neither cause is visible to a round-trip check against onnxruntime, which
+//! loads the old graph happily — which is why this surfaced at integration
+//! rather than at build time.
 //!
 //! **The lesson worth carrying**, and the reason escapepod-models now gates
 //! `ship` on it: onnxruntime loaded the broken graph perfectly, so the export's
