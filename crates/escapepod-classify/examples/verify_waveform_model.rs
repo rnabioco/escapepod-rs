@@ -310,7 +310,6 @@ fn main() {
         // the corpus's.
         let w_dwell = shape(WaveformTensor::Features) / 12;
         let mut per_sig_ch = vec![0f64; spec.tensor_shape(WaveformTensor::Signal)[0]];
-        let mut sweep: HashMap<(usize, usize), usize> = HashMap::new();
         let mut ours_sig: Vec<f32> = vec![f32::NAN; n * shape(WaveformTensor::Signal)];
         let mut ours_on: Vec<f32> = vec![f32::NAN; n * w_dwell];
         let mut ours_off: Vec<f32> = vec![f32::NAN; n * w_dwell];
@@ -339,13 +338,8 @@ fn main() {
                 missing += 1;
                 continue;
             };
-            let Some(chunk) = waveform::assemble_chunk(
-                bundle.kmer.as_ref(),
-                &spec,
-                read,
-                reference_seq.as_bytes(),
-                raw,
-            ) else {
+            let Some(chunk) = waveform::assemble_chunk(bundle.kmer.as_ref(), &spec, read, raw)
+            else {
                 missing += 1;
                 continue;
             };
@@ -355,42 +349,9 @@ fn main() {
             // One run answers what a stack of hypotheses about the DP cannot:
             // whether the corpus was refined at all.
             {
-                // Sweep the DP's own knobs. If some other setting reproduces
-                // the corpus exactly, the bug is that we pass the wrong one --
-                // which no amount of reading the two call sites will show,
-                // because both name the same fields.
-                if std::env::var("SWEEP").is_ok() {
-                    let base = spec.refine.expect("refine set");
-                    for it in [0usize, 1, 2, 3] {
-                        for hb in [3usize, 5, 10, 20] {
-                            let mut s2 = spec.clone();
-                            s2.refine = Some(escapepod_signal::chunk::RefineParams {
-                                half_bandwidth: hb,
-                                scale_iters: it,
-                                seed: base.seed,
-                            });
-                            let c2 = waveform::assemble_chunk(
-                                bundle.kmer.as_ref(),
-                                &s2,
-                                read,
-                                reference_seq.as_bytes(),
-                                raw,
-                            );
-                            if c2.as_ref().is_some_and(|c| c.features == want.features) {
-                                *sweep.entry((it, hb)).or_insert(0usize) += 1;
-                            }
-                        }
-                    }
-                }
                 let mut plain = spec.clone();
                 plain.refine = None;
-                let off = waveform::assemble_chunk(
-                    bundle.kmer.as_ref(),
-                    &plain,
-                    read,
-                    reference_seq.as_bytes(),
-                    raw,
-                );
+                let off = waveform::assemble_chunk(bundle.kmer.as_ref(), &plain, read, raw);
                 let on_ok = chunk.features == want.features;
                 let off_ok = off.as_ref().is_some_and(|c| c.features == want.features);
                 match (on_ok, off_ok) {
@@ -638,14 +599,6 @@ fn main() {
                 "assembly: wrote our dwell rows ({n} x {w_dwell}) to {}.ours_{{refined,unrefined}}.f32",
                 dp.display()
             );
-        }
-        if !sweep.is_empty() {
-            let mut rows: Vec<_> = sweep.into_iter().collect();
-            rows.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-            println!("assembly: sweep (scale_iters, half_bandwidth) -> chunks reproduced:");
-            for ((it, hb), n) in rows.iter().take(8) {
-                println!("    iters={it} half_bw={hb}  {n}/{compared}");
-            }
         }
         println!("assembly: focus delta {}", histogram(&focus_delta));
         println!("assembly: best signal shift {}", histogram(&best_shifts));

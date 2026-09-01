@@ -46,6 +46,7 @@ use noodles_bam as bam;
 use noodles_bgzf as bgzf;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
+use noodles_sam::alignment::record::data::field::Tag;
 
 use crate::anchor::SkipReason;
 use crate::bundle::WaveformSpec;
@@ -83,6 +84,78 @@ pub struct WaveformRead {
     pub ref_end: usize,
     /// The anchor base, in the aligned reference slice's own coordinates.
     pub base_index: i64,
+    /// The aligned reference, from this read's `MD` tag — see
+    /// [`reference_from_md`] for why it is not sliced from the FASTA.
+    pub ref_seq: Vec<u8>,
+}
+
+/// The aligned reference, rebuilt from the read's `MD` tag.
+///
+/// **Not a FASTA slice, and the difference is not cosmetic.** The corpus this
+/// model was trained on takes its reference from `pysam`'s
+/// `get_reference_sequence()`, which reconstructs the aligned span from `MD` +
+/// the query rather than reading a FASTA. The two disagree wherever the FASTA
+/// carries an ambiguity code: every reference in the shipped tRNA panel holds
+/// exactly one `N`, and because levels are looked up per 9-mer, one `N` makes
+/// **nine** consecutive k-mers unknown — so `extract_levels` leaves a nine-base
+/// run of zeros that the corpus does not have. The banded DP hits that flat
+/// region and walks a different path from there on, which moved boundaries by
+/// a sample throughout the read and cost 169 of 256 chunks their bit-exactness
+/// (rnabioco/escapepod-rs#306). Reading the FASTA instead scores every read and
+/// errors on none of them, which is why this is spelled out rather than left to
+/// whoever next sees a `reference: &str` parameter and assumes it is the source.
+///
+/// Mismatched positions are lowercased, as `pysam` does. Nothing downstream is
+/// case-sensitive — [`escapepod_signal::resquiggle::extract_levels`] uppercases
+/// and maps `U -> T` — but the corpus stores the sequence with that case, so
+/// keeping it makes the two directly comparable.
+///
+/// `MD` walks *reference* positions: a run length means that many bases match
+/// the query, a letter is the reference base at a mismatch, and `^` introduces
+/// deleted reference bases that the query never carried.
+pub fn reference_from_md(md: &str, query: &[u8], cigar: &[CigarOp]) -> Option<Vec<u8>> {
+    // Reference-consuming positions, seeded with the query base where the two
+    // are aligned and left blank across deletions for `MD` to fill.
+    let mut refbuf: Vec<u8> = Vec::new();
+    let mut q = 0usize;
+    for op in cigar {
+        let len = op.len as usize;
+        match op.kind {
+            CigarKind::Match | CigarKind::SequenceMatch | CigarKind::SequenceMismatch => {
+                for _ in 0..len {
+                    refbuf.push(*query.get(q)?);
+                    q += 1;
+                }
+            }
+            CigarKind::Insertion | CigarKind::SoftClip => q += len,
+            CigarKind::Deletion | CigarKind::Skip => refbuf.extend(std::iter::repeat_n(b'N', len)),
+            CigarKind::HardClip | CigarKind::Pad => {}
+        }
+    }
+
+    let mut i = 0usize;
+    let mut it = md.bytes().peekable();
+    while let Some(c) = it.next() {
+        if c.is_ascii_digit() {
+            let mut n = (c - b'0') as usize;
+            while let Some(d) = it.peek().copied().filter(u8::is_ascii_digit) {
+                n = n * 10 + (d - b'0') as usize;
+                it.next();
+            }
+            i += n;
+        } else if c == b'^' {
+            // Deleted reference bases, which `refbuf` is holding space for.
+            while let Some(d) = it.peek().copied().filter(u8::is_ascii_alphabetic) {
+                *refbuf.get_mut(i)? = d;
+                i += 1;
+                it.next();
+            }
+        } else if c.is_ascii_alphabetic() {
+            *refbuf.get_mut(i)? = c.to_ascii_lowercase();
+            i += 1;
+        }
+    }
+    (i == refbuf.len()).then_some(refbuf)
 }
 
 /// Result of scanning one BAM for the windowed variant.
@@ -168,8 +241,22 @@ fn scan_record(
         return Err(SkipReason::BadName);
     };
 
+    // The reference this read is scored against comes from its own `MD` tag,
+    // never from the FASTA — see `reference_from_md`. Refused rather than
+    // fallen back on, because the fallback is the defect: it scores every read
+    // and errors on none of them while feeding the DP a nine-base run of zero
+    // levels wherever the FASTA carries an `N`.
+    let md =
+        crate::bam_tags::string_tag(record, Tag::new(b'M', b'D')).ok_or(SkipReason::NoMdTag)?;
+    let query: Vec<u8> = record.sequence().as_ref().to_vec();
+    let ref_seq = reference_from_md(&md, &query, &cigar).ok_or(SkipReason::NoMdTag)?;
+    if ref_seq.len() != ref_span {
+        return Err(SkipReason::NoMdTag);
+    }
+
     Ok(WaveformRead {
         read_id,
+        ref_seq,
         reference: ref_name.to_string(),
         mapq,
         ns,
@@ -284,7 +371,6 @@ pub fn assemble_chunk(
     kmer: Option<&KmerLevels>,
     spec: &WaveformSpec,
     read: &WaveformRead,
-    reference: &[u8],
     raw: &[i16],
 ) -> Option<Chunk> {
     let levels = kmer.map(|k| LevelModel {
@@ -298,7 +384,12 @@ pub fn assemble_chunk(
         levels,
         refine: spec.refine,
     };
-    let sequence = reference.get(read.ref_start..read.ref_end)?;
+    // NOT a FASTA slice: the sequence the model was trained against is the
+    // read's own `MD` reconstruction, carried on the read since the scan. The
+    // FASTA is still what the *motif search* reads to place the anchor
+    // (`preprocessing.motif_reference: "fasta"`), but that happens in
+    // `scan_bam`, so this function no longer needs one at all.
+    let sequence = read.ref_seq.as_slice();
     let processed = process_read(
         ReadInputs {
             raw,
@@ -323,13 +414,17 @@ pub fn assemble_chunk(
 /// no-call tallies — the same contract as [`crate::classify_reads`], so a
 /// caller only has to pick the scan.
 ///
+/// Takes no reference FASTA: each read carries the aligned reference it is
+/// scored against, rebuilt from its own `MD` tag during the scan (see
+/// [`reference_from_md`]). The FASTA is still read, once, to place the motif —
+/// that happens in [`scan_bam`] via the geometry.
+///
 /// Gated on the graph runtime; the scan and [`assemble_chunk`] above are not,
 /// so the assembly can be tested — and a corpus built — without one.
 #[cfg(feature = "waveform-onnx")]
 pub fn classify_reads(
     bundle: &ChargingBundle,
     anchored: &HashMap<Uuid, WaveformRead>,
-    references: &HashMap<String, String>,
     pod5: &Pod5Index,
 ) -> Result<(Vec<ReadCall>, ClassifyStats)> {
     let spec = bundle.waveform_spec()?;
@@ -371,16 +466,7 @@ pub fn classify_reads(
             if raw.len() as i64 != read.ns {
                 return Ok(no_call(read, NoCallReason::NsMismatch));
             }
-            // Unreachable given the scan — a read only anchors against a
-            // reference the geometry was built from, and both come from the
-            // same FASTA — but a missing sequence must not be a panic in a
-            // rayon worker, where it would take the whole batch with it.
-            let Some(reference) = references.get(&read.reference) else {
-                return Ok(no_call(read, no_chunk_reason));
-            };
-            let Some(chunk) =
-                assemble_chunk(bundle.kmer.as_ref(), spec, read, reference.as_bytes(), &raw)
-            else {
+            let Some(chunk) = assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw) else {
                 return Ok(no_call(read, no_chunk_reason));
             };
             let logit = net.logit(&chunk, spec)?;
@@ -417,4 +503,114 @@ pub fn classify_reads(
     calls.sort_by_key(|c| c.read_id);
     stats.no_calls.sort_by_key(|n| n.read_id);
     Ok((calls, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(kind: CigarKind, len: u32) -> CigarOp {
+        CigarOp::new(kind, len)
+    }
+
+    fn md(md: &str, query: &str, cigar: &[CigarOp]) -> String {
+        String::from_utf8(reference_from_md(md, query.as_bytes(), cigar).expect("reconstructs"))
+            .unwrap()
+    }
+
+    #[test]
+    fn every_base_matching_returns_the_query() {
+        assert_eq!(
+            md("10", "ACGTACGTAC", &[op(CigarKind::Match, 10)]),
+            "ACGTACGTAC"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_takes_the_reference_base_from_md_and_lowercases_it() {
+        // MD names the REFERENCE base at a mismatch; the query has T there.
+        assert_eq!(
+            md("4G5", "ACGTTCGTAC", &[op(CigarKind::Match, 10)]),
+            "ACGTgCGTAC"
+        );
+    }
+
+    #[test]
+    fn a_deletion_restores_bases_the_query_never_carried() {
+        let cigar = [
+            op(CigarKind::Match, 4),
+            op(CigarKind::Deletion, 2),
+            op(CigarKind::Match, 6),
+        ];
+        let got = md("4^GG6", "ACGTACGTAC", &cigar);
+        assert_eq!(got, "ACGTGGACGTAC");
+        assert_eq!(got.len(), 12, "reference spans the deletion");
+    }
+
+    #[test]
+    fn insertions_and_soft_clips_consume_query_without_reference() {
+        let ins = [
+            op(CigarKind::Match, 4),
+            op(CigarKind::Insertion, 2),
+            op(CigarKind::Match, 4),
+        ];
+        assert_eq!(md("8", "ACGTAACGTA", &ins), "ACGTCGTA");
+        let clip = [op(CigarKind::SoftClip, 2), op(CigarKind::Match, 8)];
+        assert_eq!(md("8", "TTACGTACGT", &clip), "ACGTACGT");
+    }
+
+    #[test]
+    fn a_truncated_md_is_refused_rather_than_half_applied() {
+        // Covers fewer reference positions than the CIGAR does.
+        assert!(reference_from_md("4", b"ACGTACGTAC", &[op(CigarKind::Match, 10)]).is_none());
+    }
+
+    /// The defect this whole path exists to avoid (rnabioco/escapepod-rs#306).
+    ///
+    /// The shipped tRNA references each carry exactly one `N`. Slicing the
+    /// FASTA keeps it; `MD` names the base the aligner actually matched. That
+    /// is not a cosmetic difference: levels are looked up per 9-mer, so a
+    /// single `N` makes **nine** consecutive k-mers unknown and
+    /// `extract_levels` leaves nine zeros the training corpus does not have —
+    /// which moved refined boundaries throughout the read and cost 169 of 256
+    /// chunks their bit-exactness. The fixture reference has no `N` at all,
+    /// which is exactly why the counted golden never caught it.
+    #[test]
+    fn md_resolves_an_ambiguity_code_the_fasta_would_keep() {
+        let fasta = "ACGTACNTACGT";
+        let query = "ACGTACGTACGT";
+        // The alignment recorded a concrete reference base where this FASTA
+        // carries `N` -- observed on all 256 reads of the parity corpus, e.g.
+        // `md CctGgcGgGGC` against `fasta CCTGGNGGGGC`. MD names that base, so
+        // the reconstruction resolves the ambiguity the FASTA keeps.
+        let got = md("6C5", query, &[op(CigarKind::Match, 12)]);
+        assert_eq!(got, "ACGTACcTACGT");
+        assert_ne!(
+            got.to_ascii_uppercase(),
+            fasta.to_ascii_uppercase(),
+            "if these ever agree the regression is not being exercised"
+        );
+
+        // And the blast radius, against ONE table: the resolved sequence gets
+        // levels, the FASTA slice gets a run of zeros. A real k-mer table holds
+        // no `N`-bearing k-mer, so every window touching the `N` misses.
+        let resolved = got.to_ascii_uppercase();
+        let table: std::collections::HashMap<String, f64> = (0..=(resolved.len() - 9))
+            .map(|i| (resolved[i..i + 9].to_string(), (i + 1) as f64))
+            .collect();
+
+        let with_n = escapepod_signal::resquiggle::extract_levels(fasta, &table, 9, Some(4));
+        assert!(
+            with_n.iter().all(|&v| v == 0.0),
+            "one N makes every overlapping 9-mer unknown, so the DP sees a flat run: {with_n:?}"
+        );
+
+        let resolved_levels =
+            escapepod_signal::resquiggle::extract_levels(&resolved, &table, 9, Some(4));
+        assert_eq!(
+            resolved_levels.iter().filter(|&&v| v != 0.0).count(),
+            resolved.len() - 9 + 1,
+            "every full window scores once the ambiguity is resolved"
+        );
+    }
 }

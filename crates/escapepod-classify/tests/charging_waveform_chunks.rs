@@ -131,10 +131,6 @@ fn anchored_reads() -> (
     (scan, out)
 }
 
-fn references() -> std::collections::HashMap<String, String> {
-    escapepod_classify::reference_sequences(&fixtures().join("trna_reference.fa")).unwrap()
-}
-
 /// The anchor is the motif's own origin plus the bundle's offset, which is a
 /// *different base* from the junction the column variants use. Getting this
 /// from the junction instead would displace every window by one base and
@@ -164,7 +160,6 @@ fn the_anchor_is_the_motif_offset_not_the_arm() {
 fn the_shipped_geometry_assembles_from_pod5_and_bam() {
     let spec = spec();
     let kmer = kmer();
-    let refs = references();
     let (scan, reads) = anchored_reads();
     assert!(
         !reads.is_empty(),
@@ -173,10 +168,7 @@ fn the_shipped_geometry_assembles_from_pod5_and_bam() {
 
     let mut assembled = 0usize;
     for (read, raw) in &reads {
-        let reference = refs.get(&read.reference).expect("a known reference");
-        let Some(chunk) =
-            waveform::assemble_chunk(Some(&kmer), &spec, read, reference.as_bytes(), raw)
-        else {
+        let Some(chunk) = waveform::assemble_chunk(Some(&kmer), &spec, read, raw) else {
             continue;
         };
         assembled += 1;
@@ -224,7 +216,6 @@ fn the_shipped_geometry_assembles_from_pod5_and_bam() {
 #[test]
 fn a_window_wider_than_the_read_pads_without_sliding() {
     let kmer = kmer();
-    let refs = references();
     let (_, reads) = anchored_reads();
 
     // Sized from the fixtures rather than guessed, so the branch cannot go
@@ -238,10 +229,7 @@ fn a_window_wider_than_the_read_pads_without_sliding() {
 
     let mut padded = 0usize;
     for (read, raw) in &reads {
-        let reference = refs.get(&read.reference).unwrap();
-        let Some(chunk) =
-            waveform::assemble_chunk(Some(&kmer), &spec, read, reference.as_bytes(), raw)
-        else {
+        let Some(chunk) = waveform::assemble_chunk(Some(&kmer), &spec, read, raw) else {
             continue;
         };
         assert_eq!(chunk.signal.len(), 2 * half);
@@ -272,7 +260,6 @@ fn a_window_wider_than_the_read_pads_without_sliding() {
 #[test]
 fn feature_offsets_past_the_map_pad_rather_than_shift() {
     let kmer = kmer();
-    let refs = references();
     let (_, reads) = anchored_reads();
 
     let mut narrow = spec();
@@ -283,10 +270,9 @@ fn feature_offsets_past_the_map_pad_rather_than_shift() {
 
     let mut checked = 0usize;
     for (read, raw) in &reads {
-        let reference = refs.get(&read.reference).unwrap();
         let (Some(a), Some(b)) = (
-            waveform::assemble_chunk(Some(&kmer), &narrow, read, reference.as_bytes(), raw),
-            waveform::assemble_chunk(Some(&kmer), &wide, read, reference.as_bytes(), raw),
+            waveform::assemble_chunk(Some(&kmer), &narrow, read, raw),
+            waveform::assemble_chunk(Some(&kmer), &wide, read, raw),
         ) else {
             continue;
         };
@@ -321,24 +307,16 @@ fn feature_offsets_past_the_map_pad_rather_than_shift() {
 fn an_anchor_outside_the_map_yields_no_chunk() {
     let spec = spec();
     let kmer = kmer();
-    let refs = references();
     let (_, reads) = anchored_reads();
     let (read, raw) = reads.first().expect("at least one anchored read");
-    let reference = refs.get(&read.reference).unwrap();
 
     let mut off_the_end = read.clone();
     off_the_end.base_index = 1_000_000;
-    assert!(
-        waveform::assemble_chunk(Some(&kmer), &spec, &off_the_end, reference.as_bytes(), raw)
-            .is_none()
-    );
+    assert!(waveform::assemble_chunk(Some(&kmer), &spec, &off_the_end, raw).is_none());
 
     let mut negative = read.clone();
     negative.base_index = -1;
-    assert!(
-        waveform::assemble_chunk(Some(&kmer), &spec, &negative, reference.as_bytes(), raw)
-            .is_none()
-    );
+    assert!(waveform::assemble_chunk(Some(&kmer), &spec, &negative, raw).is_none());
 }
 
 /// Refinement moves the boundaries every feature is measured over, so a corpus
@@ -348,7 +326,6 @@ fn an_anchor_outside_the_map_yields_no_chunk() {
 #[test]
 fn refinement_moves_the_spans_it_is_asked_to_move() {
     let kmer = kmer();
-    let refs = references();
     let (_, reads) = anchored_reads();
 
     let refined = spec();
@@ -358,10 +335,9 @@ fn refinement_moves_the_spans_it_is_asked_to_move() {
     let mut differed = 0usize;
     let mut compared = 0usize;
     for (read, raw) in &reads {
-        let reference = refs.get(&read.reference).unwrap();
         let (Some(a), Some(b)) = (
-            waveform::assemble_chunk(Some(&kmer), &refined, read, reference.as_bytes(), raw),
-            waveform::assemble_chunk(Some(&kmer), &plain, read, reference.as_bytes(), raw),
+            waveform::assemble_chunk(Some(&kmer), &refined, read, raw),
+            waveform::assemble_chunk(Some(&kmer), &plain, read, raw),
         ) else {
             continue;
         };

@@ -37,7 +37,7 @@ use escapepod_classify::anchor::SkipReason;
 use escapepod_classify::pipeline::{ClassifyStats, ReadCall};
 use escapepod_classify::{
     ChargingBundle, Orientation, Pod5Index, cl_from_probability, classify_reads,
-    junction_positions, reference_sequences, resolve_orientation, scan_bam, waveform,
+    junction_positions, resolve_orientation, scan_bam, waveform,
 };
 
 use crate::progress::create_spinner;
@@ -161,11 +161,6 @@ fn run_waveform(
              signal frame from the model's own `reverse_signal`, not from a vote"
         );
     }
-    // The window is cut over the *reference*, and the map is refined against
-    // the expected levels of those bases, so this path needs the sequences and
-    // not only the junction coordinates.
-    let references = reference_sequences(&args.reference)?;
-
     let spinner = create_spinner("scanning BAM")?;
     let scan = waveform::scan_bam(
         &args.bam,
@@ -200,13 +195,14 @@ fn run_waveform(
         pod5.n_files()
     );
 
-    let (calls, stats) = waveform::classify_reads(bundle, &scan.anchored, &references, &pod5)?;
+    let (calls, stats) = waveform::classify_reads(bundle, &scan.anchored, &pod5)?;
     Ok((calls, stats, scan.records_scanned))
 }
 
 fn skip_label(reason: SkipReason) -> &'static str {
     match reason {
         SkipReason::Filtered => "unmapped/filtered",
+        SkipReason::NoMdTag => "no MD tag (aligned reference unavailable)",
         SkipReason::LowMapq => "low mapq",
         SkipReason::NoGeometry => "reference without junction",
         SkipReason::NoTags => "missing mv/ns tags",

@@ -59,6 +59,20 @@ pub fn int_tag(record: &RecordBuf, tag: Tag) -> Option<i64> {
     }
 }
 
+/// Extract a string value from a BAM auxiliary tag.
+///
+/// `MD` is the one this exists for: the windowed charging variant rebuilds the
+/// aligned reference from it rather than slicing a FASTA (see
+/// `crate::waveform::reference_from_md`). Both spellings are accepted because
+/// `MD` is a `Z` string by the spec but some writers emit it as a hex-ish `H`
+/// nothing else here reads.
+pub fn string_tag(record: &RecordBuf, tag: Tag) -> Option<String> {
+    match record.data().get(&tag) {
+        Some(Value::String(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

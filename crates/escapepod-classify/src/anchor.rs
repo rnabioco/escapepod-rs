@@ -152,6 +152,9 @@ pub enum SkipReason {
     QueryOutOfRange,
     /// Query name is not a UUID (signal cannot be fetched from POD5).
     BadName,
+    /// No `MD` tag, so the aligned reference cannot be reconstructed. Only the
+    /// windowed variant needs this; see `waveform::reference_from_md`.
+    NoMdTag,
 }
 
 impl SkipReason {
@@ -159,6 +162,7 @@ impl SkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Filtered => "filtered",
+            Self::NoMdTag => "no_md_tag",
             Self::LowMapq => "low_mapq",
             Self::NoGeometry => "no_geometry",
             Self::NoTags => "no_tags",
