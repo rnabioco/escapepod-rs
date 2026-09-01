@@ -69,12 +69,18 @@ impl<'a> FeatureRecipe<'a> {
     }
 }
 
-impl<'a> From<&'a crate::ChargingBundle> for FeatureRecipe<'a> {
-    fn from(bundle: &'a crate::ChargingBundle) -> Self {
+impl<'a> From<&'a crate::bundle::FeatureSpace> for FeatureRecipe<'a> {
+    /// Borrow a loaded bundle's feature space. Deliberately from the space
+    /// rather than from the bundle: a windowed bundle has no columns at all,
+    /// and a `From` that has to invent an empty recipe for it is a conversion
+    /// that cannot fail where the underlying question can. Use
+    /// [`crate::ChargingBundle::recipe`], which pairs the space with the k-mer
+    /// levels and says so when there is none.
+    fn from(space: &'a crate::bundle::FeatureSpace) -> Self {
         Self {
-            offsets: &bundle.offsets,
-            span_mode: bundle.span_mode,
-            kmer: bundle.kmer.as_ref(),
+            offsets: &space.offsets,
+            span_mode: space.span_mode,
+            kmer: None,
         }
     }
 }

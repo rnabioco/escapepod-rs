@@ -82,7 +82,17 @@ demux = ["dep:escapepod-demux"]
 # worth shipping — 0.727 of reads callable at 99% precision against the GBM's
 # 0.449 on a held-out flowcell. A binary that cannot load it would leave the
 # only supported bundle unusable.
-classify = ["dep:escapepod-classify", "escapepod-classify/fnn-onnx"]
+# `waveform-onnx` (the windowed raw-signal variant) is in for the same reason
+# and at the same price: since `charging_tcn_rna004@v0.1.1` it too goes through
+# tract, so it adds no crate and no run-time requirement. It briefly had its
+# own `classify-waveform` feature, when it needed onnxruntime dlopened from
+# ORT_DYLIB_PATH and therefore could not work in a static-musl release at all;
+# the re-export removed the cost, and with it the reason for the flag.
+classify = [
+    "dep:escapepod-classify",
+    "escapepod-classify/fnn-onnx",
+    "escapepod-classify/waveform-onnx",
+]
 
 # The `escpod` binary and everything it links. Implies the `signal`, `demux`
 # and `cnn-detect` layers. `demux` is in the default build because it pulls in

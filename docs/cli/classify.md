@@ -39,7 +39,7 @@ escpod classify [OPTIONS] -b <BAM> -r <FASTA> -m <BUNDLE> -o <BAM> <POD5>
 | Option | Description |
 |--------|-------------|
 | `-b, --bam <BAM>` | Aligned BAM with move tables (`dorado --emit-moves`, tags preserved through alignment) |
-| `-r, --reference <FASTA>` | Reference FASTA the BAM was aligned to; the CCA\|adapter junction is located in every record |
+| `-r, --reference <FASTA>` | Reference FASTA the BAM was aligned to; the CCA\|adapter junction is located in every record. The `waveform_model` variant additionally rebuilds each read's aligned reference from its `MD` tag rather than slicing this file — see below |
 | `-m, --model <DIR>` | Model bundle directory (or its `metadata.json`) |
 | `-o, --output <BAM>` | Output BAM: input records with `cl` added |
 | `--tsv <PATH>` | Also write per-read calls as TSV (`read_id`, `reference`, `p_<class>`, `cl`, `reason`) |
@@ -90,10 +90,49 @@ The network is what escapepod-models ships, and it is the better model:
 **0.727 of reads callable at 99% precision, against the GBM's 0.449** on a
 held-out flowcell.
 
+### A third variant: the signal window
+
+`waveform_model` reads a **signal window** rather than a column vector: the
+normalised current and its k-mer residual, the sequence k-mer context scattered
+along the signal axis, and 12 per-base dwell/level rows — three tensors, one
+BCE logit out.
+
+It is a second pipeline over the same two files, not a second scorer on the
+first one. It also reads the reference differently: the sequence a read is
+scored against is rebuilt from that read's **`MD` tag**, the way the training
+corpus builds it, not sliced out of the FASTA. Those disagree wherever the
+FASTA carries an `N` — the alignment recorded a real base there — and since
+levels are looked up per 9-mer, one `N` blanks nine of them. A read with no
+`MD` tag is skipped (`no MD tag`) rather than silently scored off the FASTA. The base-to-signal map is walked through the CIGAR into *reference*
+coordinates, the anchor is the motif **+2** rather than +3, the spans are
+refined by a banded DP before any feature is taken, and the signal frame comes
+from the bundle instead of a vote (so `--orientation` is ignored, with a
+warning).
+
+Two things follow from that:
+
+- **The bundle version decides whether it loads at all.** It goes through the
+  statically linked tract like every other ONNX graph escpod runs, so a stock
+  release binary can run one — but only since `charging_tcn_rna004@v0.1.1`.
+  The first export, `@v0.1.0`, defeated tract's shape inference two ways at
+  once — a `value_info` entry per intermediate carrying the batch axis as a
+  *symbol*, so pinning the batch failed at the first convolution; and
+  `adaptive_avg_pool1d(390 → 11)` open-coded into a rank-8 `GatherND` — and no
+  graph rewrite fixed either. The fix was the re-export
+  (rnabioco/escapepod-models#96, and #97's build-time gate so a graph the
+  shipped runtime cannot load never registers again). Loading `@v0.1.0` fails
+  at `into_optimized` with tract's own analysis error, naming the file.
+- **Its shipped Platt calibration is carried, not applied.** The operating
+  point beside it is stated on the uncalibrated probability the graph emits, so
+  calibrating would move the scale out from under the very threshold that ships
+  with the model. escpod says so at load; a caller who wants calibrated
+  probabilities must re-derive the threshold too.
+
 ## How a read is anchored
 
 1. Locate the CCA–aa junction in **reference** coordinates (the `CCAGGC` motif,
-   +3).
+   +3; the windowed variant anchors at +2, one base earlier, and says so in its
+   own metadata).
 2. Map reference → query through the CIGAR.
 3. Map query → signal through the move table, Remora convention
    (`move_pos * stride + ts`).

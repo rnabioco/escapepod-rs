@@ -84,14 +84,15 @@ fn main() -> anyhow::Result<()> {
             .as_deref()
             .map(|v| format!(" v{v}"))
             .unwrap_or_default(),
-        bundle.columns.len(),
+        bundle.feature_space().unwrap().columns.len(),
         net.n_value_channels(),
         net.n_offsets(),
     );
 
     let grid = read_f32(Path::new(&format!("{prefix}.grid.f32")));
     let want = read_f64(Path::new(&format!("{prefix}.p.f64")));
-    let n_cols = bundle.offsets.len() * escapepod_classify::FEAT_STATS.len();
+    let n_cols =
+        bundle.feature_space().unwrap().offsets.len() * escapepod_classify::FEAT_STATS.len();
     assert_eq!(
         grid.len(),
         want.len() * n_cols,
@@ -106,7 +107,7 @@ fn main() -> anyhow::Result<()> {
     for (row, chunk) in grid.chunks_exact(n_cols).enumerate() {
         // The whole runtime path: the bundle's own column selection, then
         // fold + standardise + mask + graph + softmax.
-        let cols = bundle.select_columns(chunk);
+        let cols = bundle.select_columns(chunk).unwrap();
         let p = net.predict(&cols)?[1];
         let d = (p - want[row]).abs();
         if d > worst.1 {

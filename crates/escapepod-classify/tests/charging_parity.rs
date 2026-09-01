@@ -37,8 +37,8 @@ fn golden() -> Value {
 #[test]
 fn charging_chain_matches_reference() {
     let bundle = ChargingBundle::load(&fixtures().join("bundle")).unwrap();
-    assert_eq!(bundle.columns.len(), 100);
-    assert_eq!(bundle.offsets.len(), 25);
+    assert_eq!(bundle.feature_space().unwrap().columns.len(), 100);
+    assert_eq!(bundle.feature_space().unwrap().offsets.len(), 25);
     assert!(bundle.kmer.is_some(), "fixture recipe uses residuals");
     assert!(bundle.operating_point.is_some());
 
@@ -55,7 +55,7 @@ fn charging_chain_matches_reference() {
     let scan = scan_bam(
         &fixtures().join("trna_mappings_padded.bam"),
         &geometry,
-        &bundle.offsets,
+        &bundle.feature_space().unwrap().offsets,
         1,
     )
     .unwrap();
@@ -110,7 +110,7 @@ fn charging_chain_matches_reference() {
         let sig_pa = escapepod_classify::signal_pa(info, &extractors).unwrap();
         assert_eq!(sig_pa.len() as i64, read.ns, "ns tag vs signal length");
 
-        let grid = feature_grid(&bundle.recipe(), read, orientation, &sig_pa);
+        let grid = feature_grid(&bundle.recipe().unwrap(), read, orientation, &sig_pa);
         let want: Vec<f32> = gr["features_bits"]
             .as_array()
             .unwrap()
@@ -181,7 +181,7 @@ fn counted_anchor_matches_reference() {
 
     let bundle = ChargingBundle::load(dir.path()).unwrap();
     assert_eq!(
-        bundle.span_mode,
+        bundle.feature_space().unwrap().span_mode,
         escapepod_classify::SpanMode::Counted {
             arm_bases: arm_bases as u32
         }
@@ -197,7 +197,7 @@ fn counted_anchor_matches_reference() {
     let scan = scan_bam(
         &fixtures().join("trna_mappings_padded.bam"),
         &geometry,
-        &bundle.offsets,
+        &bundle.feature_space().unwrap().offsets,
         1,
     )
     .unwrap();
@@ -219,8 +219,12 @@ fn counted_anchor_matches_reference() {
 
         // The anchoring itself: spans, boundary, and how the boundary was
         // established, all exact.
-        let coords =
-            escapepod_classify::finalize(read, orientation, &bundle.offsets, bundle.span_mode);
+        let coords = escapepod_classify::finalize(
+            read,
+            orientation,
+            &bundle.feature_space().unwrap().offsets,
+            bundle.feature_space().unwrap().span_mode,
+        );
         assert_eq!(
             coords.common_start_sig,
             gr["common_start_sig"].as_i64().unwrap(),
@@ -244,7 +248,7 @@ fn counted_anchor_matches_reference() {
             assert_eq!((a, b), (wa, wb), "read {id} offset index {i}: span");
         }
 
-        let grid = feature_grid(&bundle.recipe(), read, orientation, &sig_pa);
+        let grid = feature_grid(&bundle.recipe().unwrap(), read, orientation, &sig_pa);
         let want: Vec<f32> = gr["f_bits"]
             .as_array()
             .unwrap()

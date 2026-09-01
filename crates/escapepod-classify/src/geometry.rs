@@ -18,6 +18,15 @@ const FIVEP_LEN: usize = 24;
 /// Junction coordinates for one reference record (0-based).
 #[derive(Debug, Clone, Copy)]
 pub struct RefGeometry {
+    /// First base of the anchor motif itself.
+    ///
+    /// The junction is where the *common arm* starts, which is the rule that
+    /// makes the motif unique — but a model may anchor its window somewhere
+    /// else inside the motif (`anchor.motif_offset`), and it needs the motif's
+    /// own origin to do that. Keeping both means one scan serves both, rather
+    /// than a second scan with a different offset finding a different set of
+    /// records.
+    pub motif_start: usize,
     /// First 3'-adapter base (the G of CCA|GGC).
     pub junction: usize,
     /// Last tRNA base (the A of CCA); the amino acid attaches here.
@@ -52,6 +61,16 @@ pub struct RefGeometry {
 }
 
 /// Read a FASTA into `name → uppercase sequence` (name = first word).
+///
+/// Public because a reference-anchored model reads the reference *sequence*,
+/// not only the junction's coordinate: the window is cut over
+/// `reference[alignment_start..alignment_end]`, and the expected k-mer levels
+/// the map is refined against come from those bases. One reader, so the
+/// coordinates and the sequence cannot come from differently-parsed files.
+pub fn reference_sequences(path: &Path) -> Result<HashMap<String, String>> {
+    read_fasta(path)
+}
+
 fn read_fasta(path: &Path) -> Result<HashMap<String, String>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read reference FASTA {}", path.display()))?;
@@ -74,6 +93,28 @@ fn read_fasta(path: &Path) -> Result<HashMap<String, String>> {
         seqs.insert(n, parts.join(""));
     }
     Ok(seqs)
+}
+
+/// Where the common arm begins, relative to the start of the motif.
+///
+/// Derived from the two declared strings rather than declared separately,
+/// because they describe one contiguous construct and a third number stating
+/// how they fit together is a third thing that can disagree. The arm is
+/// allowed to *overlap* the motif's tail — `CCAGGC` and `GGCTTCTTCTTGCTCTT`
+/// are `CCA` + the arm, not the arm after the motif — so this is the earliest
+/// offset at which the motif's suffix is a prefix of the arm. `motif.len()`
+/// always qualifies — the empty suffix is a prefix of anything — so there is
+/// always an answer, and it is `motif.len()` for a motif and arm that do not
+/// overlap at all. That is the right reading of "the arm follows the motif"
+/// rather than a failure, which is why this is infallible.
+///
+/// Deliberately *not* `anchor.motif_offset`: that is where the model's window
+/// is anchored, which the design is free to move (the windowed variant anchors
+/// at +2, a base earlier than the arm) without moving the arm.
+pub fn arm_offset(motif: &str, common_arm: &str) -> usize {
+    (0..=motif.len())
+        .find(|&p| common_arm.len() >= motif.len() - p && common_arm.starts_with(&motif[p..]))
+        .unwrap_or(motif.len())
 }
 
 /// Locate the CCA|adapter junction in every reference record.
@@ -115,6 +156,7 @@ pub fn junction_positions_with_anchors(
     flank_anchors: Option<(i64, i64)>,
 ) -> Result<HashMap<String, RefGeometry>> {
     let (lo_off, hi_off) = flank_anchors.unwrap_or(FLANK_ANCHORS);
+    let arm_off = arm_offset(motif, common_arm);
     let mut out = HashMap::new();
     let seqs = read_fasta(fasta_path)?;
     if seqs.is_empty() {
@@ -136,12 +178,13 @@ pub fn junction_positions_with_anchors(
         // So filter on the arm FIRST and require uniqueness of what survives.
         let candidates: Vec<usize> = seq
             .match_indices(motif)
-            .map(|(i, _)| i + motif_offset)
-            .filter(|&j| {
-                seq.len() >= j + common_arm.len() && &seq[j..j + common_arm.len()] == common_arm
+            .map(|(i, _)| i)
+            .filter(|&i| {
+                let a = i + arm_off;
+                seq.len() >= a + common_arm.len() && &seq[a..a + common_arm.len()] == common_arm
             })
             .collect();
-        let j = match candidates.as_slice() {
+        let motif_start = match candidates.as_slice() {
             [only] => *only,
             [] => bail!(
                 "{}: no {} followed by the common arm {} -- the record does not \
@@ -158,6 +201,10 @@ pub fn junction_positions_with_anchors(
                 motif
             ),
         };
+        // The arm's first base, which is what makes the motif unique, and the
+        // model's anchor, which need not be the same base.
+        let arm_start = motif_start + arm_off;
+        let j = motif_start + motif_offset;
         let anchor_at = |off: i64| -> Option<usize> {
             let p = j as i64 + off;
             if p >= 0 && (p as usize) < seq.len() {
@@ -176,9 +223,10 @@ pub fn junction_positions_with_anchors(
         out.insert(
             name,
             RefGeometry {
+                motif_start,
                 junction: j,
-                cca_a: j - 1,
-                divergent: j + common_arm.len(),
+                cca_a: arm_start - 1,
+                divergent: arm_start + common_arm.len(),
                 body_mid: (FIVEP_LEN + j) / 2,
                 polya_mid: {
                     let n_a = seq.len() - seq.trim_end_matches('A').len();
@@ -256,6 +304,47 @@ mod tests {
         let geo = junction_positions(f.path(), "CCAGGC", 3, ARM).unwrap();
         // The junction is the arm-backed match, not the first one in the body.
         assert_eq!(geo["r1"].junction, body.len() + 3);
+    }
+
+    /// The arm overlaps the motif's tail — `CCAGGC` is `CCA` plus the arm's
+    /// first three bases — and the offset is derived from the two strings
+    /// rather than declared, so a third number cannot disagree with them.
+    #[test]
+    fn arm_offset_is_derived_from_the_two_strings() {
+        assert_eq!(arm_offset("CCAGGC", ARM), 3);
+        // No overlap: the arm simply follows the motif.
+        assert_eq!(arm_offset("CCAGGC", "TTTTT"), 6);
+        // A full overlap: the motif IS the arm's opening.
+        assert_eq!(arm_offset("GGCTT", ARM), 0);
+        // An arm too short to hold a longer overlap falls back to the
+        // no-overlap reading rather than failing; the reference filter then
+        // simply finds no record, which is the honest answer.
+        assert_eq!(arm_offset("CCAGGC", "GG"), 6);
+    }
+
+    /// The motif's own origin is kept beside the junction, because a model may
+    /// anchor its window elsewhere inside the motif — the windowed charging
+    /// variant anchors at +2, one base before the arm — and a second scan at a
+    /// different offset would find a different set of records.
+    #[test]
+    fn the_motif_start_survives_a_different_anchor_offset() {
+        let body = "ACGT".repeat(20);
+        let fa = format!(">r1\n{body}CCA{ARM}TTTTT\n");
+        let f = write_fasta(&fa);
+
+        let at_arm = junction_positions(f.path(), "CCAGGC", 3, ARM).unwrap()["r1"];
+        let at_cca = junction_positions(f.path(), "CCAGGC", 2, ARM).unwrap()["r1"];
+
+        // One motif, located identically either way...
+        assert_eq!(at_arm.motif_start, 80);
+        assert_eq!(at_cca.motif_start, 80);
+        // ...and the anchor moves with the offset the caller asked for.
+        assert_eq!(at_arm.junction, 83);
+        assert_eq!(at_cca.junction, 82);
+        // The arm-derived coordinates do NOT move: they are properties of the
+        // construct, not of where a model happens to look.
+        assert_eq!(at_arm.cca_a, at_cca.cca_a);
+        assert_eq!(at_arm.divergent, at_cca.divergent);
     }
 
     #[test]

@@ -29,9 +29,10 @@ sha2 = { workspace = true }
 # (`fnn::hoist_conv_padding`), so a slow model can be diagnosed without a
 # profiler.
 tracing = { workspace = true }
-# ONNX runtime for the per-base-feature network variant of a charging bundle
-# (`feature_model`). Optional, but free in practice: `escapepod-cli` already
-# links tract through escapepod-demux's `cnn-detect`, so turning this on adds
+# ONNX runtime for both graph-scored variants of a charging bundle — the
+# per-base-feature network (`feature_model`) and the windowed raw-signal one
+# (`waveform_model`). Optional, but free in practice: `escapepod-cli` already
+# links tract through escapepod-demux's `cnn-detect`, so turning either on adds
 # no third-party crate to the binary — only this crate's own edge to it.
 tract-onnx = { workspace = true, optional = true }
 uuid = { workspace = true }
@@ -45,6 +46,12 @@ tempfile = "3"
 name = "verify_feature_model"
 required-features = ["fnn-onnx"]
 
+# The windowed variant's counterpart: checks the graph and the tensor assembly
+# separately, against the corpus the model was trained on.
+[[example]]
+name = "verify_waveform_model"
+required-features = ["waveform-onnx"]
+
 [features]
 default = []
 # Load and score the `feature_model` (per-base-feature ONNX) variant of a
@@ -52,3 +59,13 @@ default = []
 # rebuild hint — never silently mis-scored, and never confused with the
 # raw-signal CNN variant, which this crate does not implement at all.
 fnn-onnx = ["dep:tract-onnx"]
+# Load and score the windowed raw-signal (`waveform_model`) variant. A separate
+# feature from `fnn-onnx` because it names a different *variant*, not a
+# different runtime — both go through tract, and both are in `escapepod-cli`'s
+# default build. Without it such a bundle is refused at load with a rebuild
+# hint, never mis-scored.
+#
+# It ran through `ort` until `charging_tcn_rna004@v0.1.1`, whose re-export
+# tract can load; see `waveform_net` for the measurement and why the export
+# version is the thing that decides this.
+waveform-onnx = ["dep:tract-onnx"]

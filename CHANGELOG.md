@@ -4,6 +4,137 @@
 
 ### Added
 
+- **`escpod classify` runs a `waveform_model` charging bundle** (#306).
+  A third bundle variant, beside `gbm` and `feature_model`: it reads a *signal
+  window* rather than a column vector — normalised current plus its k-mer
+  residual, the sequence k-mer context scattered along the signal axis, and 12
+  per-base dwell/level rows — and emits a single BCE logit. On the feature
+  network's own training rows and test reads it is worth +0.0050 AUROC
+  (n=1,387,667; 3 seeds x 2 geometries, 6/6 positive, paired sd 0.00008), and
+  0.988 recall against 0.960 at the fnn's own FPR.
+
+  The **chunk assembly moved down into `escapepod-signal`**
+  (`escapepod_signal::chunk`) rather than being written a third time here. It
+  was already implemented twice — leech's Python dataset and leech-core's Rust
+  pipeline — and the failure mode is on the record: `escapepod-classify`
+  reproduced a superseded feature definition for two months and its counted
+  golden missed it, because all 19 fixture reads took the other branch. The
+  module is generic in the way that matters: the anchor is a base index, the
+  window is `(left, right)` samples, and **the channels are a list the caller
+  supplies**, so two models that read the same twelve rows in a different order
+  are two `Vec`s rather than two code paths.
+
+  Nothing about those rows is hard-coded here. The bundle ships
+  `waveform_model.channels.{signal,features}.order` — asked of the corpus
+  builder at build time rather than transcribed — and the runtime resolves it,
+  refusing a name it cannot compute or a length that disagrees with the count
+  beside it. This is the one rule no shape check can catch: permute the rows
+  and the tensor still has exactly the dimensions the graph wants, every read
+  still scores, and the answers are wrong.
+
+  Two further rules are cross-checked rather than assumed, because each fails
+  silently. `preprocessing.motif`/`motif_offset` must agree with the `anchor`
+  block — this variant anchors at motif **+2**, one base earlier than the
+  feature-grid variants' +3, and inheriting the other offset places every
+  window off-anchor and validates cleanly. And the graph's single logit is the
+  logit of whichever class the bundle *names*: leech assigned its class
+  integers at merge time and gave `charged` 0, so `P(charged)` is
+  `1 - sigmoid(logit)` here, and reading it the obvious way inverts every call
+  without erroring.
+
+  The refinement refusal at load is narrowed rather than removed: the column
+  variants still cannot reproduce a banded-DP pass, and are still refused for
+  it; the windowed variant reproduces it from its declared parameters.
+
+  **The reference each read is scored against comes from its own `MD` tag, not
+  from the FASTA.** That is how the training corpus builds it (pysam's
+  `get_reference_sequence()`), and the two disagree wherever the FASTA carries
+  an ambiguity code — every reference in the shipped tRNA panel holds exactly
+  one `N`, where the alignment recorded a concrete base. It is not a one-base
+  difference: levels are looked up per 9-mer, so one unknown base makes **nine**
+  consecutive k-mers unknown and leaves a run of zero levels the corpus does not
+  have, which the banded DP then walks a different path through for the rest of
+  the read. Slicing the FASTA instead cost 169 of 256 chunks their
+  bit-exactness, with boundaries moving a sample throughout the read and the
+  feature window 96 bases downstream wrong — while erroring on nothing. A read
+  without an `MD` tag is refused (`no_md_tag`) rather than fallen back on, for
+  that reason. The assembly is now bit-identical to the corpus on 256/256
+  chunks, end to end within 3.3e-6 — the graph's own residual.
+
+  It runs through **tract**, statically linked, like every other ONNX graph
+  `escpod` runs — so it is in the default build and works from a stock release
+  binary. That is true only from `charging_tcn_rna004@v0.1.1` onward, and the
+  reason is worth recording, because it is the second time this model family
+  has hit it.
+
+  The first export, `@v0.1.0`, could not go through tract at all: not for want
+  of an op, but because tract 0.23's *shape inference* cannot close it. Measured
+  five ways, and the failures fall into **two independent causes**, either of
+  which alone is enough:
+
+  - dynamo writes a `value_info` entry for all 667 intermediates with the batch
+    axis as the *symbol* `batch`. A consumer that pins the batch — which every
+    ONNX loader here does — cannot unify that, and tract dies at the **first
+    convolution** with `Sym(batch) vs Val(1)`. Every other graph `escpod` loads
+    carries zero `value_info`; the legacy TorchScript exporter never wrote any.
+  - `adaptive_avg_pool1d(390 -> 11)`, which dynamo open-codes into a rank-8
+    `GatherND` because the output size does not divide the input.
+
+  It is **not** `nn.MultiheadAttention`, which this changelog, the module doc
+  and escapepod-models#96 all named until somebody read the graph. The
+  offending `GatherND` consumes `relu_17`, the last block of `signal_tcn`; its
+  `(11, 37)` bool mask is a bin mask and its `(11,)` divisor is
+  `[36, 36, 37, 36, 37, …]`, that pool's bin widths. `cross_attn` exports as
+  plain `Mul`/`MatMul`/`Softmax`/`MatMul`/`Gemm`, with no mask and no gather.
+  #306's original suspect was right and its retraction was not.
+
+  Neither onnx-simplifier (which folds away every `Shape` node) nor
+  onnxruntime's own optimiser makes it loadable, so it could not be papered over
+  at load time the way `fnn::hoist_conv_padding` papers over padded
+  convolutions. This ran through onnxruntime via `ort` for exactly as long as
+  that was true — which, `ort` being `load-dynamic`, meant a `libonnxruntime.so`
+  on `ORT_DYLIB_PATH` and no way to run such a bundle from a static-musl release
+  at all.
+
+  The fix belonged in the export, and is the one this family already needed once:
+  escapepod-models retracted "tract cannot run `Resize`" in July after finding
+  the same shape-inference cause, an export fix costing one line and no retrain,
+  and a 6x tract speedup for free. `@v0.1.1` is that re-export (leech 0.10.0) —
+  the pool written as one `MatMul` against a constant segment-mean matrix,
+  `value_info` stripped, same weights, no retrain, evaluation bit-identical,
+  479 -> 319 nodes and `GatherND` 2 -> 0. With it go the `ort` dependency, the
+  `classify-waveform` feature, and the per-rayon-worker session pool that `ort`
+  needed because `Session::run` takes `&mut self`. Re-measured from this side
+  with `escapepod-demux/examples/tract_dynamo_probe.rs`, kept so the claim can
+  be re-run against a later tract or a later export (its counts are tract's own
+  after parsing, hence larger than the ONNX node counts):
+
+  ```text
+  v0.1.0   669 nodes   analysis fails at node_GatherND_329 / node_index
+  v0.1.1   471 nodes   optimized to 655, runs, output [1, 1]
+  ```
+
+  So an unloadable graph is now a *bundle* problem with a named fix and a
+  build-time gate on it (escapepod-models#96 and #97), rather than a runtime
+  gap: `@v0.1.0` fails at load with tract's own analysis error and the file
+  named. The lesson generalises, and is why that gate exists: onnxruntime loaded
+  the broken graph perfectly, so the export's own torch round-trip was green
+  throughout. "It exports and agrees with torch" is a weaker claim than "a
+  runtime can load it".
+
+  The swap is not free and the cost is worth stating: on the same harness and
+  the same 256 chunks, tract is **6.27 ms/chunk against onnxruntime's 4.4**,
+  single-threaded — about 1.4x. It is paid back by static linking (the variant
+  is reachable from a release binary at all, which it was not) and recovered in
+  practice by rayon, which this pipeline already fans out across. Graph parity
+  is unaffected: max |dlogit| **3.3e-6** over the corpus's own tensors, median
+  4.8e-7, against an export whose own residual vs torch is 1.3e-5.
+
+  The bundle's shipped Platt calibration is **carried, not applied**: the
+  operating point beside it is stated on the uncalibrated probability the graph
+  emits, so calibrating silently would move the scale out from under the very
+  threshold it ships with. `escpod` says so at load.
+
 - **`demux --model` is repeatable, so several barcode axes are called in one
   pass over the POD5.** A dual-indexed library carries a 3' index and a 5' one;
   reading them with two runs decompresses every read twice.
@@ -108,6 +239,12 @@
   other.
 
 ### Changed
+
+- `ChargingBundle`'s `offsets`/`columns`/`span_mode` moved behind
+  `feature_space()`, and `recipe()`/`select_columns()` are now fallible. A
+  windowed bundle has no columns at all, and three fields that would have to be
+  empty for it cannot distinguish "no feature space" from "a feature space with
+  nothing in it".
 
 - **A directory argument to `annotate` / `demux --annotate` no longer also
   writes per-file sidecars.** The labels go to the directory's collection and

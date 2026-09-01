@@ -316,6 +316,15 @@ jobs:
         run: cargo clippy -p escapepod-demux --features gpu
       - name: gpu — CLI union (what `--features gpu` users build)
         run: cargo clippy -p escapepod-cli --features gpu
+      # Not an opt-in feature, but the one library-crate combination no other
+      # job produces: `escapepod-cli`'s default build turns `waveform-onnx` and
+      # `fnn-onnx` on together, so `escapepod-classify` with only the former is
+      # unbuilt everywhere else — and that is precisely where a `cfg(not(...))`
+      # arm lives. `--all-targets` additionally builds `verify_waveform_model`,
+      # the parity harness backing the variant's only correctness claim, which
+      # is gated behind the feature and would otherwise rot uncompiled.
+      - name: waveform-onnx alone — the variant's cfg(not(fnn-onnx)) arms
+        run: cargo clippy -p escapepod-classify --features waveform-onnx --all-targets
       - name: models-download — k-mer model prefetch (ureq rustls + sha2)
         run: cargo clippy -p escapepod-cli --features models-download
 

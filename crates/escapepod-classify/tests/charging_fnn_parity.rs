@@ -70,7 +70,10 @@ fn feature_tensor_matches_reference_bit_for_bit() {
     let net = net(&bundle);
     assert_eq!(net.n_value_channels(), 4);
     assert_eq!(net.n_offsets(), 25);
-    assert_eq!(net.n_features(), bundle.columns.len());
+    assert_eq!(
+        net.n_features(),
+        bundle.feature_space().unwrap().columns.len()
+    );
 
     let mut n_masked = 0usize;
     for gr in g["reads"].as_array().unwrap() {
@@ -78,7 +81,7 @@ fn feature_tensor_matches_reference_bit_for_bit() {
         // The reference's features, selected through the bundle's own column
         // order — the vector `pipeline::classify_reads` hands the scorer.
         let grid = f32_vec(&gr["features_bits"]);
-        let cols = bundle.select_columns(&grid);
+        let cols = bundle.select_columns(&grid).unwrap();
         let got = net.input_tensor(&cols).unwrap();
         let want = f32_vec(&gr["input_bits"]);
         assert_eq!(got.len(), want.len(), "read {id}: tensor length");
@@ -107,8 +110,8 @@ fn fnn_bundle_classifies_like_the_reference() {
     assert_eq!(bundle.scorer.kind(), "feature-nn (onnx)");
     assert!(bundle.scorer.as_gbm().is_none());
     // The feature half is shared verbatim with the GBM variant.
-    assert_eq!(bundle.columns.len(), 100);
-    assert_eq!(bundle.offsets.len(), 25);
+    assert_eq!(bundle.feature_space().unwrap().columns.len(), 100);
+    assert_eq!(bundle.feature_space().unwrap().offsets.len(), 25);
     assert!(bundle.kmer.is_some(), "fixture recipe uses residuals");
 
     let g = golden();
@@ -122,7 +125,7 @@ fn fnn_bundle_classifies_like_the_reference() {
     let scan = scan_bam(
         &fixtures().join("trna_mappings_padded.bam"),
         &geometry,
-        &bundle.offsets,
+        &bundle.feature_space().unwrap().offsets,
         1,
     )
     .unwrap();
@@ -217,7 +220,7 @@ fn exactly_one_scorer_is_required() {
     .unwrap();
     let err = ChargingBundle::load(dir.path()).unwrap_err().to_string();
     assert!(
-        err.contains("neither `gbm` nor `feature_model`"),
+        err.contains("none of `gbm`, `feature_model` or `waveform_model`"),
         "got: {err}"
     );
 
