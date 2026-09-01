@@ -91,7 +91,20 @@
 //! `features.feature_set`. A third, `abstain`, is named and *carried* rather
 //! than refused — the shipped GBM bundle declares it, so refusing would ground
 //! the fleet; [`ChargingBundle::abstain`] hands it to the caller instead
-//! (rnabioco/escapepod-rs#230).
+//! (rnabioco/escapepod-rs#230). So is a fourth, `basecaller`: which model
+//! called the training corpus is a property of the *data* this runtime is
+//! handed rather than of the computation it performs, and escpod cannot check
+//! it without reading the BAM's `@PG` — so [`ChargingBundle::basecaller`]
+//! states it and leaves the comparison to the caller
+//! (rnabioco/escapepod-rs#314).
+//!
+//! That fourth one is also where the cost above stopped being hypothetical.
+//! escapepod-models#106 added the block, and because this schema had no such
+//! field, **every** charging bundle built from that builder was refused at
+//! load by every escpod in existence — the mechanism working exactly as
+//! designed, against a block that was never a rule. The lesson is not to
+//! loosen the schema but to keep the two sides sequenced: a new key is
+//! accepted here, released, and only then emitted.
 
 use crate::features::FEAT_STATS;
 use crate::recipe::{FeatureRecipe, KmerLevels};
@@ -207,6 +220,10 @@ struct MetaFile {
     refinement: Option<RefinementBlock>,
     #[serde(default)]
     standardisation: Option<StandardisationBlock>,
+    /// The basecaller the training corpus was called with. Carried, not
+    /// enforced — see [`BasecallerBlock`].
+    #[serde(default)]
+    basecaller: Option<BasecallerBlock>,
     // Free-form by design: provenance, not contract. Nothing under these can
     // change what the model sees, so their shape is the builder's business and
     // new documentation with no natural home belongs here.
@@ -762,6 +779,56 @@ struct WaveformChannelList {
     prose: BTreeMap<String, IgnoredAny>,
 }
 
+/// Which basecaller produced the corpus this model was fitted on.
+///
+/// A **named block rather than `provenance`**, which is the judgment call worth
+/// recording (rnabioco/escapepod-rs#314). The charging feature set is
+/// `mean + z-scored k-mer residual`, and the expected level is predicted from
+/// *the read's own basecall* — taking it from the reference instead costs 0.110
+/// AUROC. So a charging model substantially detects **how the basecaller fails**
+/// at the aminoacyl adduct, and swapping the basecaller changes what its
+/// dominant feature means.
+///
+/// Measured rather than argued (rnabioco/escapepod-models#108): the same reads
+/// called two ways, through one model and one shared label vector, move
+/// −0.0098/−0.0096 AUROC across two flow cells, lose 3.0-3.2 pp of TPR *and*
+/// gain 0.4 pp of FPR at the shipped set point — so no threshold recovers it —
+/// and flip **3.9% of per-read calls**. Meanwhile the aggregate charged
+/// fraction moves 0.04 pp: the one statistic anyone would check when changing
+/// basecaller reads "no change" while one read in 26 answers differently.
+///
+/// **Carried, not enforced.** escpod cannot know what called the BAM it is
+/// handed without reading `@PG`, so this runtime states the declaration and
+/// leaves the comparison to a consumer; refusing on mismatch could follow once
+/// the identity is readable, which is what this makes true. The concrete
+/// precedent is on the record either way: the 20260825 RLA QC scored v6 data
+/// with a v5.3.0-trained bundle, and every model shipped before
+/// rnabioco/escapepod-models#106 states the *requirement* ("aligned BAM with
+/// mv/ns/ts tags") and never the *identity*, so nothing could have caught it.
+///
+/// Optional, because every bundle published so far predates the key and must
+/// stay readable — the same shape as `waveform_model.preprocessing`'s
+/// `reference_source` (#312).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // `Doc` fields: named, never read
+struct BasecallerBlock {
+    /// The basecalling model, e.g. `rna004_sup@v6.0.0`.
+    model: String,
+    /// sha256 of that model, where the dataset entry had one to pin. Absent is
+    /// ordinary: a barcode entry names its model by string and has no sha.
+    #[serde(default)]
+    model_sha256: Option<String>,
+    #[serde(default)]
+    dorado_version: Option<String>,
+    /// Prose: `role` says the block is a feature definition rather than
+    /// tooling, and `note` states the domain shift in words.
+    #[serde(default)]
+    role: Doc,
+    #[serde(default)]
+    note: Doc,
+}
+
 /// Post-hoc probability calibration the bundle ships.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -780,6 +847,22 @@ struct CalibrationBlock {
     fit_on: Doc,
     #[serde(default)]
     note: Doc,
+}
+
+/// The basecaller the model's corpus was called with, as the bundle declares
+/// it.
+///
+/// Carried so a caller can compare it against what actually called their BAM —
+/// see [`BasecallerBlock`] for why a mismatch is a domain shift on the
+/// dominant feature rather than a provenance detail, and why this runtime
+/// states it instead of enforcing it.
+#[derive(Debug, Clone)]
+pub struct Basecaller {
+    /// The basecalling model, e.g. `rna004_sup@v6.0.0`.
+    pub model: String,
+    /// sha256 of that model, where the bundle had one to pin.
+    pub model_sha256: Option<String>,
+    pub dorado_version: Option<String>,
 }
 
 /// A Platt scaling of the raw logit: `sigmoid(a * logit + b)`.
@@ -945,6 +1028,9 @@ pub struct ChargingBundle {
     /// [`classify_reads`](crate::classify_reads), which emits no call for a
     /// read the rule excludes.
     pub abstain: Option<Abstain>,
+    /// What called the corpus this model was fitted on. Carried, never
+    /// checked against the BAM — see [`Basecaller`].
+    pub basecaller: Option<Basecaller>,
 }
 
 /// sha256 of a file, lowercase hex.
@@ -1813,6 +1899,11 @@ impl ChargingBundle {
             operating_point: meta.operating_point,
             calibration,
             abstain,
+            basecaller: meta.basecaller.map(|b| Basecaller {
+                model: b.model,
+                model_sha256: b.model_sha256,
+                dorado_version: b.dorado_version,
+            }),
         })
     }
 
@@ -2040,6 +2131,78 @@ mod tests {
             });
             let meta = parse(&v.to_string()).expect("the builder's own prose must parse");
             assert_eq!(meta.abstain.unwrap().rule, "aligner_arm_depth == 0");
+        }
+
+        /// The block escapepod-models#106 now emits in every charging
+        /// bundle, verbatim (rnabioco/escapepod-rs#314).
+        ///
+        /// Its arrival made **every** bundle built from current
+        /// escapepod-models unloadable by every escpod — `MetaFile` is
+        /// `deny_unknown_fields` and had no such field, so the refusal worked
+        /// exactly as designed against a block that was never a rule this
+        /// runtime had to reproduce. The models-side test that would have
+        /// caught it builds the dict and asserts on it in pure Python; its
+        /// runtime arm self-skips without `ext/escapepod-rs`, which is the
+        /// case in that repo's CI. So the fixture lives here, spelled the way
+        /// the builder writes it rather than the way this parser wants it.
+        #[test]
+        fn the_basecaller_block_the_builder_emits_parses() {
+            let json = meta(
+                r#",
+                  "basecaller": {
+                    "model": "rna004_sup@v6.0.0",
+                    "model_sha256": "9cab42f3",
+                    "dorado_version": "2.1.1+d66c17c",
+                    "role": "feature definition, not tooling",
+                    "note": "inference data should be basecalled with this model."
+                  }"#,
+            );
+            let meta = parse(&json).expect("the block escapepod-models#106 emits must parse");
+            let bc = meta.basecaller.expect("carried, not dropped");
+            assert_eq!(bc.model, "rna004_sup@v6.0.0");
+            assert_eq!(bc.dorado_version.as_deref(), Some("2.1.1+d66c17c"));
+        }
+
+        /// A barcode-derived entry names its model by string and has no sha to
+        /// pin, so the identity alone is a legal block.
+        #[test]
+        fn the_basecaller_block_needs_only_the_model() {
+            let m = parse(&meta(r#", "basecaller": {"model": "rna004_sup@v5.3.0"}"#)).unwrap();
+            let bc = m.basecaller.unwrap();
+            assert_eq!(bc.model, "rna004_sup@v5.3.0");
+            assert!(bc.model_sha256.is_none());
+        }
+
+        /// Optional: seven charging bundles are already published without it,
+        /// and they have to keep loading.
+        #[test]
+        fn a_bundle_without_a_basecaller_still_parses() {
+            assert!(parse(&meta("")).unwrap().basecaller.is_none());
+        }
+
+        /// The block is a declaration, so it is closed like every other one —
+        /// a key inside it that this runtime does not implement is refused
+        /// rather than dropped. That is the same strictness that caused #314,
+        /// and it is kept deliberately: the alternative is a rule silently
+        /// ignored, which is the failure this whole schema exists to prevent.
+        /// The coordination cost is real and lands on the emitting side.
+        #[test]
+        fn an_unknown_key_inside_the_basecaller_block_is_refused() {
+            let err = parse(&meta(
+                r#", "basecaller": {"model": "rna004_sup@v6.0.0", "enforce": true}"#,
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unknown field `enforce`"), "{err}");
+        }
+
+        /// A block that names no basecaller declares nothing.
+        #[test]
+        fn a_basecaller_block_without_a_model_is_refused() {
+            let err = parse(&meta(r#", "basecaller": {"dorado_version": "2.1.1"}"#))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("missing field `model`"), "{err}");
         }
 
         /// The point of the whole change: a key nobody has taught this

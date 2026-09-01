@@ -78,6 +78,33 @@ was built with, so a key this runtime does not implement is refused at load
 rather than silently dropped. (`provenance`, `metrics` and `caveats` are exempt
 and free-form.)
 
+That cuts both ways, and it is worth knowing which escpod you are running: a
+bundle from a *newer* builder fails to load rather than loading with its new
+rule quietly ignored. Refusing to answer is the recoverable half of the trade,
+but it does mean a bundle and a runtime have to be released in that order.
+
+### Which basecaller called the corpus
+
+A bundle may declare the basecalling model its training corpus was called with:
+
+```json
+"basecaller": {"model": "rna004_sup@v6.0.0", "dorado_version": "2.1.1+d66c17c"}
+```
+
+escpod prints it at load and **does not check it** — it would have to read the
+BAM's `@PG` to know what called the reads it was handed. Checking it is worth
+the trouble: the charging feature set is `mean + z-scored k-mer residual` and
+the expected level is predicted from the read's own basecall, so a charging
+model substantially detects *how the basecaller fails* at the aminoacyl adduct.
+Scoring the same reads called with a different model loses ~0.010 AUROC, loses
+~3 pp of TPR while gaining ~0.4 pp of FPR at the shipped set point (so no
+threshold recovers it), and flips **3.9% of per-read calls** — while the
+aggregate charged fraction moves 0.04 pp. The one number anyone would check
+reads "no change" while one read in 26 answers differently.
+
+Bundles published before this key exists do not carry it, and load fine; escpod
+says so rather than assuming comparability.
+
 ### Two scorers, one feature space
 
 A bundle carries either a gradient-boosted tree model (`gbm`, which routes
