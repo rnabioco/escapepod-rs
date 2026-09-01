@@ -262,6 +262,29 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         // carries one, so its absence usually means an old or hand-made bundle.
         None => info!("bundle declares no abstain rule; every anchored read is scored"),
     }
+    // Stated, never checked: escpod would have to read the BAM's `@PG` to know
+    // what called it. Saying it out loud is nonetheless the whole point of the
+    // field — a charging model substantially detects how the basecaller fails
+    // at the adduct, so calling the same reads with another model flips ~3.9%
+    // of calls while the aggregate charged fraction moves 0.04 pp, and the
+    // 20260825 RLA QC scored v6 data with a v5.3.0-trained bundle with nothing
+    // in the run to show it.
+    match &bundle.basecaller {
+        Some(bc) => info!(
+            "bundle was trained on basecalls from {}{}; scoring reads called with \
+             another model is a domain shift on the k-mer residual — escpod does not \
+             check this",
+            bc.model,
+            bc.dorado_version
+                .as_deref()
+                .map(|v| format!(" (dorado {v})"))
+                .unwrap_or_default(),
+        ),
+        None => info!(
+            "bundle does not declare which basecaller called its training corpus; \
+             comparability with the reads being scored cannot be checked"
+        ),
+    }
 
     // --- Reference geometry ----------------------------------------------
     let geometry = junction_positions(

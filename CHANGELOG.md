@@ -323,6 +323,50 @@
 
 ### Fixed
 
+- **Charging bundles from current escapepod-models are loadable again**
+  (#314). `MetaFile` accepts an optional top-level `basecaller` block.
+
+  escapepod-models#106 started emitting one in every charging bundle. The
+  schema is `deny_unknown_fields` and had no such field, so **every** charging
+  bundle built from that builder was refused at load by every escpod — on
+  `main`, not just in a release, with `unknown field \`basecaller\`` and a list
+  of the fifteen keys it did know. The refusal worked exactly as designed; the
+  field was simply missing. Absent still means "not declared", so the seven
+  bundles already published keep loading.
+
+  It is a **named block rather than free-form `provenance`**, and that is the
+  judgment call. The charging feature set is `mean + z-scored k-mer residual`
+  and the expected level is predicted from the read's own basecall — taking it
+  from the reference instead costs 0.110 AUROC — so a charging model
+  substantially detects *how the basecaller fails* at the aminoacyl adduct, and
+  swapping the basecaller changes what its dominant feature means. Measured
+  rather than argued (escapepod-models#108): the same reads called two ways,
+  through one model and one shared label vector, lose ~0.0097 AUROC across two
+  flow cells, lose 3.0-3.2 pp of TPR *and* gain ~0.4 pp of FPR at the shipped
+  set point — so no threshold recovers it — and flip **3.9% of per-read
+  calls**, while the aggregate charged fraction moves 0.04 pp. The one
+  statistic anyone would check when changing basecaller reads "no change" while
+  one read in 26 answers differently, which is what a free-form note does not
+  catch and a readable field does.
+
+  **Carried, not enforced.** escpod cannot know what called the BAM it is
+  handed without reading `@PG`, so it states the declaration at load —
+  `bundle was trained on basecalls from rna004_sup@v6.0.0 (dorado 2.1.1+…)`,
+  or a line saying the bundle does not declare one — and leaves the comparison
+  to the caller. `ChargingBundle::basecaller` exposes it. Refusing on mismatch
+  could follow now that the identity is readable. The precedent is on the
+  record: the 20260825 RLA QC scored v6 data with a v5.3.0-trained bundle, and
+  every model shipped before #106 states the *requirement* ("aligned BAM with
+  mv/ns/ts tags") and never the *identity*, so nothing could have caught it.
+
+  The block itself stays closed, like every other declaration here — a key
+  inside it this runtime does not implement is refused rather than dropped.
+  That is the same strictness that caused this bug, kept deliberately: the
+  alternative is a rule silently ignored. What the incident actually argues for
+  is sequencing, which is now the rule on both sides — a new key is accepted
+  here, released, and only then emitted (escapepod-models#113 gates emission on
+  the pinned escpod version).
+
 - **A CRF bundle's `signal.anchor` is read instead of dropped, so a read-end
   model is no longer windowed onto the 3' adapter.** `SignalSpec` parsed only
   `chunk` and `stride`, and carried no `deny_unknown_fields` — so

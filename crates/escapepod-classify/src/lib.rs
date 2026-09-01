@@ -71,7 +71,7 @@ pub use anchor::{
 };
 pub use anchor::{JunctionCoords, SkipReason, finalize, query_positions, scan_record};
 pub use bundle::{
-    Abstain, AbstainRule, Calibration, ChargingBundle, ChargingScorer, FeatureSpace,
+    Abstain, AbstainRule, Basecaller, Calibration, ChargingBundle, ChargingScorer, FeatureSpace,
     OperatingPoint, WaveformSpec, WaveformTensor,
 };
 pub use features::{FEAT_STATS, expected_levels_z, junction_features};
