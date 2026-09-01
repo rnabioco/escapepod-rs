@@ -39,7 +39,7 @@ escpod classify [OPTIONS] -b <BAM> -r <FASTA> -m <BUNDLE> -o <BAM> <POD5>
 | Option | Description |
 |--------|-------------|
 | `-b, --bam <BAM>` | Aligned BAM with move tables (`dorado --emit-moves`, tags preserved through alignment) |
-| `-r, --reference <FASTA>` | Reference FASTA the BAM was aligned to; the CCA\|adapter junction is located in every record |
+| `-r, --reference <FASTA>` | Reference FASTA the BAM was aligned to; the CCA\|adapter junction is located in every record. The `waveform_model` variant additionally rebuilds each read's aligned reference from its `MD` tag rather than slicing this file — see below |
 | `-m, --model <DIR>` | Model bundle directory (or its `metadata.json`) |
 | `-o, --output <BAM>` | Output BAM: input records with `cl` added |
 | `--tsv <PATH>` | Also write per-read calls as TSV (`read_id`, `reference`, `p_<class>`, `cl`, `reason`) |
@@ -98,7 +98,12 @@ along the signal axis, and 12 per-base dwell/level rows — three tensors, one
 BCE logit out.
 
 It is a second pipeline over the same two files, not a second scorer on the
-first one. The base-to-signal map is walked through the CIGAR into *reference*
+first one. It also reads the reference differently: the sequence a read is
+scored against is rebuilt from that read's **`MD` tag**, the way the training
+corpus builds it, not sliced out of the FASTA. Those disagree wherever the
+FASTA carries an `N` — the alignment recorded a real base there — and since
+levels are looked up per 9-mer, one `N` blanks nine of them. A read with no
+`MD` tag is skipped (`no MD tag`) rather than silently scored off the FASTA. The base-to-signal map is walked through the CIGAR into *reference*
 coordinates, the anchor is the motif **+2** rather than +3, the spans are
 refined by a banded DP before any feature is taken, and the signal frame comes
 from the bundle instead of a vote (so `--orientation` is ignored, with a

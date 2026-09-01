@@ -46,6 +46,21 @@
   variants still cannot reproduce a banded-DP pass, and are still refused for
   it; the windowed variant reproduces it from its declared parameters.
 
+  **The reference each read is scored against comes from its own `MD` tag, not
+  from the FASTA.** That is how the training corpus builds it (pysam's
+  `get_reference_sequence()`), and the two disagree wherever the FASTA carries
+  an ambiguity code — every reference in the shipped tRNA panel holds exactly
+  one `N`, where the alignment recorded a concrete base. It is not a one-base
+  difference: levels are looked up per 9-mer, so one unknown base makes **nine**
+  consecutive k-mers unknown and leaves a run of zero levels the corpus does not
+  have, which the banded DP then walks a different path through for the rest of
+  the read. Slicing the FASTA instead cost 169 of 256 chunks their
+  bit-exactness, with boundaries moving a sample throughout the read and the
+  feature window 96 bases downstream wrong — while erroring on nothing. A read
+  without an `MD` tag is refused (`no_md_tag`) rather than fallen back on, for
+  that reason. The assembly is now bit-identical to the corpus on 256/256
+  chunks, end to end within 3.3e-6 — the graph's own residual.
+
   It runs through **tract**, statically linked, like every other ONNX graph
   `escpod` runs — so it is in the default build and works from a stock release
   binary. That is true only from `charging_tcn_rna004@v0.1.1` onward, and the
