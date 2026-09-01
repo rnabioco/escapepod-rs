@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.0 (2026-09-01)
+
 ### Added
 
 - **A waveform bundle declares where its per-base sequence comes from**
@@ -366,6 +368,17 @@
   is sequencing, which is now the rule on both sides — a new key is accepted
   here, released, and only then emitted (escapepod-models#113 gates emission on
   the pinned escpod version).
+
+- **`ESCAPEPOD_CRF_GPU_TRACE` reports reader decode as CPU time, not wall
+  time.** The shard's decode figure was an `Instant` around a `par_iter`, which
+  measures the *calling* thread's slice of an N-thread rayon stage and counts
+  the time it sits blocked on a page fault or a join. It read as a large,
+  stable share of the run and pointed at decode as a bottleneck it was not.
+  The clock is now `CLOCK_THREAD_CPUTIME_ID`, sampled inside the decode
+  closure where the work actually happens, and the two syscalls per read that
+  costs sit behind the same `ESCAPEPOD_CRF_GPU_TRACE=1` that already gates the
+  trace — an ordinary run pays nothing. Diagnostic output only; no classified
+  read changes.
 
 - **A CRF bundle's `signal.anchor` is read instead of dropped, so a read-end
   model is no longer windowed onto the 3' adapter.** `SignalSpec` parsed only
