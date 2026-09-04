@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Changed
+### Performance
 
 - **The CPU boundary CNN loads with its input shape pinned and its
   convolution padding hoisted.** Profiling `demux --method cnn` on the CPU
