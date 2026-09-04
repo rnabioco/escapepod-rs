@@ -97,8 +97,9 @@ pub mod adapter_cnn_gpu;
 pub mod onnx_rewrite;
 
 pub use fingerprint::{
-    BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
-    compute_std_dev_fingerprint, extract_fingerprint_from_signal,
+    BOUNDARY_PADDING_SAMPLES, BarcodeFingerprint, MAX_FINGERPRINT_WINDOW, ReadBoundaries,
+    ReadFingerprint, compute_consensus_fingerprint, compute_std_dev_fingerprint,
+    extract_fingerprint_from_signal,
 };
 
 /// Make onnxruntime CUDA execution-provider registration fatal for every session

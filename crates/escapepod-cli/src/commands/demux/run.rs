@@ -520,12 +520,14 @@ impl Detector {
     /// [`decode_bound`], not with this.
     ///
     /// CNN only looks at `[min_obs_adapter:max_obs_trace]`, so long reads (mRNA)
-    /// can skip decompressing the rest of the signal; LLR normalizes over the
-    /// whole read, so it needs all of it.
+    /// can skip decompressing the rest of the signal. LLR normalizes over what
+    /// it sees and scans all of it, so it is bounded too — see
+    /// [`LLR_DECODE_BOUND`](super::utils::LLR_DECODE_BOUND) for the number and
+    /// what an unbounded decode cost.
     fn signal_decode_bound(&self) -> Option<usize> {
         match self {
             Detector::None => None,
-            Detector::Llr { .. } => None,
+            Detector::Llr { .. } => Some(super::utils::LLR_DECODE_BOUND),
             #[cfg(feature = "cnn-detect")]
             Detector::Cnn(c) => Some(c.config().max_obs_trace),
             #[cfg(feature = "gpu")]

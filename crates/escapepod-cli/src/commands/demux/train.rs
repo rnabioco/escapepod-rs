@@ -358,9 +358,10 @@ fn extract_fingerprints_by_barcode(
                 continue;
             };
 
-            // Decompress + LLR-detect + fingerprint in parallel. No decode
-            // bound: LLR normalizes over the whole read, so the full signal is
-            // genuinely needed (`signal_decode_bound()` is `None` for LLR).
+            // Decompress + LLR-detect + fingerprint in parallel, decoding the
+            // same leading window `demux detect --method llr` does
+            // (`LLR_DECODE_BOUND`), so the reference bank is built from the
+            // boundaries the queries will get.
             // Tag with the read index and re-sort: `get_compressed_signal_bulk`
             // does not promise to return rows in request order, and the
             // per-barcode push order decides the summation order inside
@@ -372,7 +373,10 @@ fn extract_fingerprints_by_barcode(
                 .filter_map(|(i, chunks)| {
                     let r = &reads[*i];
                     let barcode = *wanted.get(&r.read_id)?;
-                    let signal = super::utils::decode_chunks_to(chunks, None)?;
+                    let signal = super::utils::decode_chunks_to(
+                        chunks,
+                        Some(super::utils::LLR_DECODE_BOUND),
+                    )?;
                     let fp = extract_training_fingerprint(&signal, args, norm_method, r.read_id)?;
                     Some((*i, barcode, fp))
                 })

@@ -6,7 +6,7 @@ use crate::style;
 use arrow::array::{ArrayRef, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use escapepod_demux::{ReadFingerprint, extract_fingerprint_from_signal};
+use escapepod_demux::{BOUNDARY_PADDING_SAMPLES, ReadFingerprint, extract_fingerprint_from_signal};
 use escapepod_signal::dtw::NormMethod;
 use escapepod_signal::{Reader, ReadsBatchView};
 use parquet::arrow::ArrowWriter;
@@ -258,7 +258,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
                     // read. Decoding `min(bound, total)` samples is bit-identical
                     // to `get_signal(..)[..bound]`, and the downstream
                     // `.min(signal.len())` clamp stays a no-op.
-                    let decode_to = region_end.saturating_add(100);
+                    let decode_to = region_end.saturating_add(BOUNDARY_PADDING_SAMPLES);
                     let signal = super::utils::decode_chunks_to(chunks, Some(decode_to))?;
                     let fp = extract_fingerprint_from_signal(
                         &signal,

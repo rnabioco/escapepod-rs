@@ -179,6 +179,23 @@ pub fn parse_reference_csv(path: &PathBuf) -> anyhow::Result<Vec<BarcodeFingerpr
     Ok(fingerprints)
 }
 
+/// Leading samples decoded for the LLR detector, per read.
+///
+/// LLR normalizes over what it is given and searches all of it, so its cost is
+/// proportional to read length — and a MinKNOW run's read-length tail is not
+/// where its adapters are. On one RNA004 file, 2.7% of reads (those over 100k
+/// samples, up to 11.3M) held 62% of all samples and half the pipeline's CPU
+/// time; every one of them is a stalled pore, not a molecule with a barcode
+/// 200,000 samples in. Bounding the decode caps that cost at 50 seconds of
+/// signal per read, twenty times the longest tRNA read, while leaving 98% of
+/// reads on this file decoded whole and therefore bit-identical.
+///
+/// Deliberately generous: ADAPTed's own LLR sees only `max_obs_trace`
+/// (16,000) samples, so a bound there would be the parity-improving choice,
+/// but it would also renormalize most real reads and needs a validation run
+/// against WarpDemuX calls before it is the default.
+pub(super) const LLR_DECODE_BOUND: usize = 200_000;
+
 /// Sum of reads across a list of POD5 files (metadata-only scan, no signal I/O).
 ///
 /// `Reader::read_count` only touches the reads Arrow table, so this is cheap
