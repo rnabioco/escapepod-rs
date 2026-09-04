@@ -195,7 +195,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: prefix-dev/setup-pixi@v0.10.1
+      - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           environments: python-test
           cache: true
@@ -241,7 +241,7 @@ jobs:
       # The suite finds the binary via `ESCPOD_BIN`; without it, it prefers
       # `target/release` and would silently test a stale optimised build.
       - run: cargo build -p escapepod-cli
-      - uses: prefix-dev/setup-pixi@v0.10.1
+      - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           environments: python-test
           cache: true
