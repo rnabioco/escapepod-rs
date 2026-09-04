@@ -90,6 +90,12 @@ pub mod adapter_cnn;
 #[cfg(feature = "gpu")]
 pub mod adapter_cnn_gpu;
 
+// Present whenever tract is: both ONNX features pull it, and every tract
+// loader in the workspace (here and in escapepod-classify) runs its graph
+// through this before optimizing.
+#[cfg(any(feature = "cnn-detect", feature = "crf-decode"))]
+pub mod onnx_rewrite;
+
 pub use fingerprint::{
     BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
     compute_std_dev_fingerprint, extract_fingerprint_from_signal,

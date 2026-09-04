@@ -52,7 +52,9 @@ fn batched_matches_per_read() {
     // Per-read reference.
     let per_read: Vec<Result<usize, _>> = refs.iter().map(|s| cnn.detect_adapter_end(s)).collect();
 
-    // Batched (all at once, unsorted — exercises mixed-length padding).
+    // The batch entry point, unsorted. Since #187 every read preps to one
+    // fixed length and the CPU plan is pinned to batch 1, so this exercises
+    // the shared prep/decode path and the per-read error mapping, not padding.
     let batched = cnn.detect_adapter_end_batch(&refs);
 
     assert_eq!(batched.len(), per_read.len());

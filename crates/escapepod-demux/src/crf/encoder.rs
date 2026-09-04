@@ -37,6 +37,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use thiserror::Error;
 use tract_onnx::prelude::*;
+use tract_onnx::tract_core::framework::Framework;
 use tract_onnx::tract_core::model::TypedRunnableModel;
 
 use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs};
@@ -643,9 +644,17 @@ impl CrfEncoder {
         let alphabet = meta.alphabet_bytes();
 
         // The export leaves batch dynamic; tract needs it concrete to optimize,
-        // and CPU inference is per-read, so pin batch = 1 here.
-        let plan = tract_onnx::onnx()
-            .model_for_path(onnx)
+        // and CPU inference is per-read, so pin batch = 1 here. The padding
+        // hoist first: this graph's convolutions are zero-padded like the
+        // boundary CNN's, and `padded_valid_x_loop` was 6% of the CPU encoder
+        // arm in the 2026-09 profile. See `onnx_rewrite::hoist_conv_padding`.
+        let framework = tract_onnx::onnx();
+        let mut proto = framework
+            .proto_model_for_path(onnx)
+            .map_err(|e| CrfError::Load(e.to_string()))?;
+        crate::onnx_rewrite::hoist_conv_padding(&mut proto, 1);
+        let plan = framework
+            .model_for_proto_model(&proto)
             .map_err(|e| CrfError::Load(e.to_string()))?
             .with_input_fact(0, f32::fact([1, 1, meta.signal.chunk]).into())
             .map_err(|e| CrfError::Load(e.to_string()))?
