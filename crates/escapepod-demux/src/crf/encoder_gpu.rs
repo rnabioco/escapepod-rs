@@ -203,14 +203,21 @@ pub struct CrfEncoderGpu {
     /// A run scores one panel, so this is uploaded on the first scoring batch
     /// and reused. It is keyed rather than assumed: a caller that switches
     /// panels mid-encoder gets a rebuild instead of another panel's chains,
-    /// which would score confidently against the wrong references. `None` after
-    /// an attempt means the panel does not fit the kernel and the CPU scan runs.
+    /// which would score confidently against the wrong references.
+    ///
+    /// The *outcome* of the upload is cached, not just a success: an `Err`
+    /// (the panel too wide for the kernel's shared memory, or a driver error)
+    /// means the CPU scan runs — at +57% wall and +5.5 cores (#297) — and it
+    /// used to be discarded with `.ok()`, so the upload was retried on every
+    /// batch and nothing could report why the run was slow. It is exposed
+    /// through [`Self::ref_scan_fallback_reason`] like the other fallbacks.
     ///
     /// `Arc` so the guard is released before the encode rather than held across
     /// it. Each worker owns its own encoder today, so the lock is uncontended
     /// either way — but a shared encoder would then serialize every worker on a
     /// multi-second GPU call, and nothing in the type would say so.
-    ref_scan: Mutex<Option<(u64, Arc<super::lattice_gpu::RefScanDev>)>>,
+    #[allow(clippy::type_complexity)]
+    ref_scan: Mutex<Option<(u64, Result<Arc<super::lattice_gpu::RefScanDev>, String>)>>,
     /// Why [`Self::lattice`] is `None`, when it is.
     decode_fallback: Option<String>,
     /// The graph's output name, resolved once so the IoBinding does not have to
@@ -468,6 +475,20 @@ impl CrfEncoderGpu {
     /// end to end, and that is not something a run should discover silently.
     pub fn decode_fallback_reason(&self) -> Option<&str> {
         self.decode_fallback.as_deref()
+    }
+
+    /// Why the reference scan (`--ref-scores`) ran on the host, if a scoring
+    /// batch has been through this encoder and the panel could not be uploaded.
+    ///
+    /// Unlike the other two fallbacks this is only known after the first
+    /// scoring batch, so the CLI asks at the end of the run. An owned `String`
+    /// because the answer lives behind the cache's lock.
+    pub fn ref_scan_fallback_reason(&self) -> Option<String> {
+        self.ref_scan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|(_, r)| r.as_ref().err().cloned())
     }
 
     /// Run the encoder over a batch of standardised windows.
@@ -869,12 +890,20 @@ impl CrfEncoderGpu {
                 if cache.as_ref().is_none_or(|(fp, _)| *fp != want) {
                     // A panel too wide for the kernel's shared memory fails
                     // here, which is not fatal — it means the CPU scan below.
-                    *cache = lattice
-                        .upload_ref_chains(chains)
-                        .ok()
-                        .map(|t| (want, Arc::new(t)));
+                    // Remembered either way, so a failure is attempted once
+                    // per panel and can be reported.
+                    *cache = Some((
+                        want,
+                        lattice
+                            .upload_ref_chains(chains)
+                            .map(Arc::new)
+                            .map_err(|e| e.to_string()),
+                    ));
                 }
-                cache.as_ref().map(|(_, t)| Arc::clone(t))
+                match cache.as_ref() {
+                    Some((_, Ok(t))) => Some(Arc::clone(t)),
+                    _ => None,
+                }
             };
             if let Some(tables) = tables {
                 let tables = tables.as_ref();

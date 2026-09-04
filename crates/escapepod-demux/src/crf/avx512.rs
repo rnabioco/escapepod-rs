@@ -137,11 +137,13 @@ fn max5(v: [__m512; 5]) -> __m512 {
 #[target_feature(enable = "avx512f")]
 fn lse5(v: [__m512; 5]) -> __m512 {
     let m = max5(v);
-    let mut s = exp16(_mm512_sub_ps(v[0], m));
-    s = _mm512_add_ps(s, exp16(_mm512_sub_ps(v[1], m)));
-    s = _mm512_add_ps(s, exp16(_mm512_sub_ps(v[2], m)));
-    s = _mm512_add_ps(s, exp16(_mm512_sub_ps(v[3], m)));
-    s = _mm512_add_ps(s, exp16(_mm512_sub_ps(v[4], m)));
+    let zero = _mm512_setzero_ps();
+    // The `min(_, 0)` guards an all-unreached cell's `-inf - -inf = NaN`; see
+    // [`super::avx2::lse5`]. Summing from a zero accumulator is exact.
+    let mut s = zero;
+    for x in v {
+        s = _mm512_add_ps(s, exp16(_mm512_min_ps(_mm512_sub_ps(x, m), zero)));
+    }
     _mm512_add_ps(m, ln16(s))
 }
 
@@ -585,6 +587,27 @@ mod tests {
         let (stay, src, mv) = ([0u32; 16], [0u32; 16], [0u32; 16]);
         // SAFETY: `available()` checked; every index is 0 and in range.
         let done = unsafe { chain_tail(&cur, &mut next, &row, &stay, &src, &mv, 0) };
+        assert_eq!(done, 16);
+        for (i, v) in next.iter().enumerate() {
+            assert!(v.is_infinite() && v.is_sign_negative(), "lane {i} is {v}");
+        }
+    }
+
+    /// See [`super::avx2`]'s twin: the head's reduction must absorb
+    /// all-unreached cells through `lse5`'s own guard.
+    #[test]
+    fn chain_head_absorbs_unreached() {
+        if !available() {
+            return;
+        }
+        let cur = vec![f32::NEG_INFINITY; 16];
+        let mut next = vec![0.0f32; 16];
+        let row = vec![0.0f32; 16];
+        let stay = [0u32; 16];
+        let (src, score) = ([0u32; 64], [0u32; 64]);
+        // SAFETY: `available()` checked; every index is 0 and in range, and
+        // `src`/`score` are `4 * n` long.
+        let done = unsafe { chain_head(&cur, &mut next, &row, &stay, &src, &score, 0, 16) };
         assert_eq!(done, 16);
         for (i, v) in next.iter().enumerate() {
             assert!(v.is_infinite() && v.is_sign_negative(), "lane {i} is {v}");

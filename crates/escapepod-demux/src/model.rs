@@ -39,7 +39,8 @@ impl Default for KernelParams {
 /// - Kernel parameters and thresholds
 ///
 /// Models can be exported from WarpDemuX using `export_warpdemux_models.py`
-/// or trained natively in Rust with the `train` feature.
+/// or built from labeled fingerprints with the `train` feature (a labels-only
+/// stub that relies on kernel-weighted voting; see `train.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DtwSvmModel {
     /// Model format version for compatibility checking.
@@ -136,6 +137,12 @@ impl DtwSvmModel {
     }
 
     /// Validate the model structure.
+    ///
+    /// Everything the predictor indexes by class or by pair is checked here,
+    /// because each of those failed silently or per read before it was: a
+    /// short `thresholds` accepted every call for the classes past its end, a
+    /// short `prob_a` was zipped and truncated, a short `dual_coef` or
+    /// `classes` panicked inside a rayon worker on the first read.
     pub fn validate(&self) -> Result<(), String> {
         // Check training data consistency
         if self.training_fingerprints.len() != self.training_labels.len() {
@@ -143,6 +150,36 @@ impl DtwSvmModel {
                 "Mismatch: {} fingerprints but {} labels",
                 self.training_fingerprints.len(),
                 self.training_labels.len()
+            ));
+        }
+
+        // Everything below is sized by `n_classes`, and the pair count
+        // underflows at fewer than two.
+        if self.n_classes < 2 {
+            return Err(format!(
+                "n_classes is {}; a DTW-SVM model needs at least 2",
+                self.n_classes
+            ));
+        }
+        if self.classes.len() != self.n_classes {
+            return Err(format!(
+                "classes lists {} labels but n_classes is {}",
+                self.classes.len(),
+                self.n_classes
+            ));
+        }
+        for cls in 0..self.n_classes {
+            if !self.label_mapper.contains_key(&cls) {
+                return Err(format!("label_mapper is missing class index {}", cls));
+            }
+        }
+        if let Some(t) = &self.thresholds
+            && t.len() != self.n_classes
+        {
+            return Err(format!(
+                "thresholds has {} entries, expected n_classes={}",
+                t.len(),
+                self.n_classes
             ));
         }
 
@@ -177,6 +214,16 @@ impl DtwSvmModel {
             return Err("dual_coef is empty".to_string());
         }
 
+        // OvO layout: one row per class minus one, each over every support
+        // vector. The decision function indexes `dual_coef[j - 1]` for
+        // `j < n_classes`.
+        if self.dual_coef.len() != self.n_classes - 1 {
+            return Err(format!(
+                "dual_coef has {} rows, expected n_classes - 1 = {}",
+                self.dual_coef.len(),
+                self.n_classes - 1
+            ));
+        }
         let n_sv = self.support_indices.len();
         for (i, row) in self.dual_coef.iter().enumerate() {
             if row.len() != n_sv {
@@ -198,6 +245,24 @@ impl DtwSvmModel {
                 n_pairs,
                 self.n_classes
             ));
+        }
+
+        // Platt parameters come in pairs, one per OvO classifier.
+        if self.prob_a.is_some() != self.prob_b.is_some() {
+            return Err("prob_a and prob_b must be given together".to_string());
+        }
+        for (name, p) in [("prob_a", &self.prob_a), ("prob_b", &self.prob_b)] {
+            if let Some(p) = p
+                && p.len() != n_pairs
+            {
+                return Err(format!(
+                    "{} has {} elements, expected {} for {} classes",
+                    name,
+                    p.len(),
+                    n_pairs,
+                    self.n_classes
+                ));
+            }
         }
 
         // Check kernel params
@@ -444,6 +509,14 @@ impl WarpDemuxModel {
         if self.threshold <= 0.0 {
             return Err(format!("Invalid threshold: {}", self.threshold));
         }
+        // The decision rule matches `"kernel"` and treats anything else as the
+        // distance ratio, so a typo here would silently pick a rule; refuse it.
+        if !matches!(self.threshold_type.as_str(), "kernel" | "ratio") {
+            return Err(format!(
+                "threshold_type is {:?}; expected \"kernel\" or \"ratio\"",
+                self.threshold_type
+            ));
+        }
 
         // Check kernel params
         if self.kernel_params.gamma <= 0.0 {
@@ -621,6 +694,49 @@ mod tests {
     fn test_svm_model_validation() {
         let model = create_test_svm_model();
         assert!(model.validate().is_ok());
+    }
+
+    /// Each of these used to load and then fail per read (index out of range
+    /// inside a rayon worker) or, for `thresholds`, silently accept every
+    /// call for the classes past the vector's end.
+    #[test]
+    fn svm_validation_rejects_per_class_and_per_pair_mismatches() {
+        let mut m = create_test_svm_model();
+        m.thresholds = Some(vec![0.5, 0.5]);
+        assert!(m.validate().unwrap_err().contains("thresholds"));
+
+        let mut m = create_test_svm_model();
+        m.prob_a = Some(vec![0.0, 0.0, 0.0]);
+        assert!(m.validate().unwrap_err().contains("prob_a and prob_b"));
+        m.prob_b = Some(vec![0.0, 0.0]);
+        assert!(m.validate().unwrap_err().contains("prob_b has 2"));
+        m.prob_b = Some(vec![0.0, 0.0, 0.0]);
+        assert!(m.validate().is_ok());
+
+        let mut m = create_test_svm_model();
+        m.dual_coef.pop();
+        assert!(m.validate().unwrap_err().contains("dual_coef has 1 rows"));
+
+        let mut m = create_test_svm_model();
+        m.classes.pop();
+        assert!(m.validate().unwrap_err().contains("classes lists 2"));
+
+        let mut m = create_test_svm_model();
+        m.label_mapper.remove(&2);
+        assert!(m.validate().unwrap_err().contains("class index 2"));
+
+        let mut m = create_test_svm_model();
+        m.n_classes = 1;
+        assert!(m.validate().unwrap_err().contains("at least 2"));
+    }
+
+    #[test]
+    fn warpdemux_validation_rejects_an_unknown_threshold_type() {
+        let mut m = create_test_model();
+        m.threshold_type = "kernal".to_string();
+        assert!(m.validate().unwrap_err().contains("threshold_type"));
+        m.threshold_type = "kernel".to_string();
+        assert!(m.validate().is_ok());
     }
 
     #[test]

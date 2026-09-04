@@ -1731,6 +1731,24 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     summary.per_barcode.sort();
     produce_result?;
 
+    // Known only after the first scoring batch, unlike the other two GPU
+    // fallbacks the loader reports: a `--ref-scores` panel the device could
+    // not take costs +57% wall on the host scan (#297), and the encoder used
+    // to swallow the upload error and retry it every batch.
+    #[cfg(feature = "gpu")]
+    for h in heads.iter() {
+        if let ClassifyModel::Crf(c) = &h.model
+            && let CrfEncoderAny::Gpu(enc) = &c.encoder
+            && let Some(why) = enc.ref_scan_fallback_reason()
+        {
+            tracing::warn!(
+                "`{}`: the reference panel could not be scored on the device ({why}); every \
+                 batch used the host scan instead, which is ~1.6x the wall time (#297).",
+                h.name
+            );
+        }
+    }
+
     pb.finish_with_message("complete");
 
     // --annotate: record the collected assignments in each input's sidecar.
@@ -2156,7 +2174,7 @@ fn fill_shard(
             let t_dec = std::time::Instant::now();
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<ReadData> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
+                .filter_map(|row| super::utils::read_row_or_warn(&view, row))
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
             // One sequential, ascending-order sweep pulls this batch's
@@ -3378,7 +3396,7 @@ fn produce_gpu(
                 let batch = batch?;
                 let view = ReadsBatchView::new(&batch, false)?;
                 let reads: Vec<ReadData> = (0..view.num_rows())
-                    .filter_map(|row| view.read(row).ok())
+                    .filter_map(|row| super::utils::read_row_or_warn(&view, row))
                     .filter(|r| !r.signal_rows.is_empty())
                     .collect();
 

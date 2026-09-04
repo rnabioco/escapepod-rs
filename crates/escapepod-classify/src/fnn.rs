@@ -47,7 +47,6 @@ use tract_onnx::prelude::*;
 use tract_onnx::tract_core::framework::Framework;
 use tract_onnx::tract_core::model::TypedRunnableModel;
 
-
 /// A loaded per-base-feature network, with the input contract it was
 /// declared with.
 ///
@@ -276,7 +275,6 @@ fn softmax2(a: f64, b: f64) -> [f64; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     /// The fold, standardisation and missingness rules, without a graph.
     ///

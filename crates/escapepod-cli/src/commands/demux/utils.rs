@@ -196,6 +196,23 @@ pub fn parse_reference_csv(path: &PathBuf) -> anyhow::Result<Vec<BarcodeFingerpr
 /// against WarpDemuX calls before it is the default.
 pub(super) const LLR_DECODE_BOUND: usize = 200_000;
 
+/// `view.read(row)` for a batch walk, warning about a row that does not
+/// decode instead of dropping it silently.
+///
+/// Every demux stage used `filter_map(|row| view.read(row).ok())`, so a read
+/// with a malformed record vanished from the output: not routed, not counted,
+/// exit 0. Such rows are rare enough that one warning each is the right
+/// volume, and a run whose input is corrupt should say so somewhere.
+pub(super) fn read_row_or_warn(view: &ReadsBatchView, row: usize) -> Option<ReadData> {
+    match view.read(row) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!("skipping reads-table row {row}: {e}");
+            None
+        }
+    }
+}
+
 /// Sum of reads across a list of POD5 files (metadata-only scan, no signal I/O).
 ///
 /// `Reader::read_count` only touches the reads Arrow table, so this is cheap
@@ -304,7 +321,7 @@ where
             let batch = batch?;
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<ReadData> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
+                .filter_map(|row| read_row_or_warn(&view, row))
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
             if reads.is_empty() {

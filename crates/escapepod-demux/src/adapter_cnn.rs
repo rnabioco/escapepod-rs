@@ -295,9 +295,12 @@ impl AdapterCnn {
             });
         }
         let length_out = shape[2];
-        Ok(decode_adapter_end(&cfg, length_out, window.valid_len, |k| {
-            scores[[0, 0, k]]
-        }))
+        Ok(decode_adapter_end(
+            &cfg,
+            length_out,
+            window.valid_len,
+            |k| scores[[0, 0, k]],
+        ))
     }
 
     /// Adapter-end detection over many signals, one result per input in the
@@ -514,6 +517,7 @@ pub(crate) fn decode_adapter_end(
 /// zero-pad the mismatched rows and the reads would come back with plausible,
 /// wrong boundaries. The cost is one `HashMap` pass per block, far below the
 /// inference it guards.
+#[cfg(feature = "gpu")]
 pub(crate) fn group_by_len(
     prepped: &[Option<PreppedWindow>],
     valid_idx: &[usize],
@@ -546,6 +550,7 @@ pub(crate) fn group_by_len(
 ///
 /// Shared by the CPU (tract) and GPU (onnxruntime) batch paths so the layout
 /// stays byte-identical between backends.
+#[cfg(feature = "gpu")]
 pub(crate) fn pack_batch(
     prepped: &[Option<PreppedWindow>],
     indices: &[usize],
@@ -567,6 +572,7 @@ pub(crate) fn pack_batch(
 /// original index: `Ok` writes each read's decoded adapter-end in order; `Err`
 /// clones the error to every read in the group. Shared by the CPU and GPU batch
 /// paths (which resolve `indices` per whole-group and per sub-batch respectively).
+#[cfg(feature = "gpu")]
 pub(crate) fn scatter_group(
     out: &mut [Result<usize, AdapterCnnError>],
     indices: &[usize],

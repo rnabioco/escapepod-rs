@@ -221,7 +221,7 @@ pub fn run(args: FingerprintArgs) -> anyhow::Result<()> {
             // Metadata-only pre-filter: boundaries + non-empty signal_rows.
             // Columns are resolved once per batch, not once per read.
             let reads: Vec<_> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
+                .filter_map(|row| super::utils::read_row_or_warn(&view, row))
                 .filter(|r| !r.signal_rows.is_empty() && boundaries_map.contains_key(&r.read_id))
                 .collect();
             if reads.is_empty() {

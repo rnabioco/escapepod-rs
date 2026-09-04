@@ -188,7 +188,6 @@ mod tests {
     // against golden vectors bit-exactly, and it loads through this rewrite.
     // What is left to check here is the *shape* of the transform and, more
     // importantly, that every guard refuses rather than guesses.
-    use super::*;
 
     fn attr_ints(name: &str, ints: &[i64]) -> pb::AttributeProto {
         pb::AttributeProto {

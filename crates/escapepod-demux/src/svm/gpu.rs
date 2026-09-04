@@ -176,7 +176,19 @@ pub fn classify_with_svm_batch_gpu_with_ctx(
             debug_assert_eq!(decisions.ncols(), n_pairs);
         }
 
-        let _ = producer.join();
+        // A producer that panicked (cudarc aborts with a `panic!` on a missing
+        // driver symbol, for one) closed the channel early; the loop above
+        // then `break`s with a short `out`. Every caller zips the result with
+        // its queries, so a short vector meant reads silently vanishing from
+        // the output. Report it instead.
+        producer.join().map_err(|_| {
+            escapepod_signal::dtw::GpuDtwError::Worker("classify producer panicked")
+        })?;
+        if out.len() != fingerprints.len() {
+            return Err(escapepod_signal::dtw::GpuDtwError::Worker(
+                "fewer results than queries",
+            ));
+        }
         Ok(())
     })?;
 

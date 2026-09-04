@@ -92,18 +92,6 @@ impl BarcodeFingerprint {
     }
 }
 
-/// Extract a fingerprint from an adapter region of a signal.
-///
-/// Returns `None` if the region is too small or segmentation fails.
-///
-/// Two pipeline variants are selected by `keep_last`:
-/// * `None` — segment the (MAD-normalized) adapter signal directly and
-///   normalize the resulting feature vector once.
-/// * `Some(n)` — segment the clipped (but not pre-normalized) signal,
-///   normalize the full segment-mean population, then keep the last `n`
-///   features. Normalizing over the full population before truncation makes
-///   the z-score stable against the choice of `n`; truncating first would
-///   leave the statistics at the mercy of the small retained tail.
 /// Context kept on either side of the nominal adapter boundaries under the
 /// `keep_last` pipeline, in samples. Public because a caller that decodes only
 /// a prefix of the read (the `fingerprint` subcommand) has to decode at least
@@ -132,6 +120,18 @@ pub const BOUNDARY_PADDING_SAMPLES: usize = 100;
 /// caps `adapter_end` at 6,500 samples and never reaches this.
 pub const MAX_FINGERPRINT_WINDOW: usize = 30_000;
 
+/// Extract a fingerprint from an adapter region of a signal.
+///
+/// Returns `None` if the region is too small or segmentation fails.
+///
+/// Two pipeline variants are selected by `keep_last`:
+/// * `None` — segment the (MAD-normalized) adapter signal directly and
+///   normalize the resulting feature vector once.
+/// * `Some(n)` — segment the clipped (but not pre-normalized) signal,
+///   normalize the full segment-mean population, then keep the last `n`
+///   features. Normalizing over the full population before truncation makes
+///   the z-score stable against the choice of `n`; truncating first would
+///   leave the statistics at the mercy of the small retained tail.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_fingerprint_from_signal(
     signal: &[i16],
@@ -308,7 +308,11 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
     }
     let target_length = length_counts
         .into_iter()
-        .max_by_key(|(_, count)| *count)
+        // Most common length, shortest on a tie. The tie used to fall to
+        // `HashMap` iteration order, so two equally common lengths gave a
+        // different consensus per process — the last non-determinism in
+        // `demux train`'s output.
+        .max_by_key(|&(len, count)| (count, std::cmp::Reverse(len)))
         .map(|(len, _)| len)
         .unwrap_or(0);
 
@@ -618,6 +622,9 @@ mod keep_last_width_tests {
         let narrow_end = MAX_FINGERPRINT_WINDOW - 5_000;
         let a = fp(0, narrow_end).expect("narrow");
         let b = fp(1_000, narrow_end).expect("narrow, later start");
-        assert_ne!(a, b, "a window inside the bound must see its declared start");
+        assert_ne!(
+            a, b,
+            "a window inside the bound must see its declared start"
+        );
     }
 }
