@@ -179,6 +179,40 @@ pub fn parse_reference_csv(path: &PathBuf) -> anyhow::Result<Vec<BarcodeFingerpr
     Ok(fingerprints)
 }
 
+/// Leading samples decoded for the LLR detector, per read.
+///
+/// LLR normalizes over what it is given and searches all of it, so its cost is
+/// proportional to read length — and a MinKNOW run's read-length tail is not
+/// where its adapters are. On one RNA004 file, 2.7% of reads (those over 100k
+/// samples, up to 11.3M) held 62% of all samples and half the pipeline's CPU
+/// time; every one of them is a stalled pore, not a molecule with a barcode
+/// 200,000 samples in. Bounding the decode caps that cost at 50 seconds of
+/// signal per read, twenty times the longest tRNA read, while leaving 98% of
+/// reads on this file decoded whole and therefore bit-identical.
+///
+/// Deliberately generous: ADAPTed's own LLR sees only `max_obs_trace`
+/// (16,000) samples, so a bound there would be the parity-improving choice,
+/// but it would also renormalize most real reads and needs a validation run
+/// against WarpDemuX calls before it is the default.
+pub(super) const LLR_DECODE_BOUND: usize = 200_000;
+
+/// `view.read(row)` for a batch walk, warning about a row that does not
+/// decode instead of dropping it silently.
+///
+/// Every demux stage used `filter_map(|row| view.read(row).ok())`, so a read
+/// with a malformed record vanished from the output: not routed, not counted,
+/// exit 0. Such rows are rare enough that one warning each is the right
+/// volume, and a run whose input is corrupt should say so somewhere.
+pub(super) fn read_row_or_warn(view: &ReadsBatchView, row: usize) -> Option<ReadData> {
+    match view.read(row) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!("skipping reads-table row {row}: {e}");
+            None
+        }
+    }
+}
+
 /// Sum of reads across a list of POD5 files (metadata-only scan, no signal I/O).
 ///
 /// `Reader::read_count` only touches the reads Arrow table, so this is cheap
@@ -287,7 +321,7 @@ where
             let batch = batch?;
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<ReadData> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
+                .filter_map(|row| read_row_or_warn(&view, row))
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
             if reads.is_empty() {

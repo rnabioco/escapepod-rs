@@ -217,8 +217,37 @@ impl GbmModel {
                             it, cls, ni, node.left, node.right, n_nodes
                         ));
                     }
+                    // sklearn's node arrays are append-ordered, so a child
+                    // always has a larger index than its parent. A back-edge
+                    // is not a tree: `subtree_depth` recurses on it without
+                    // end and the leaf lookup loops forever, neither of which
+                    // a load-time error can be mistaken for.
+                    if node.left as usize <= ni || node.right as usize <= ni {
+                        return Err(format!(
+                            "tree [{}][{}] node {} points at an earlier node \
+                             (left={}, right={}); the tree has a cycle",
+                            it, cls, ni, node.left, node.right
+                        ));
+                    }
+                }
+                // The compact arena stores child and feature indices as u16.
+                if n_nodes > usize::from(u16::MAX) + 1 {
+                    return Err(format!(
+                        "tree [{}][{}] has {} nodes; the arena addresses at most {}",
+                        it,
+                        cls,
+                        n_nodes,
+                        usize::from(u16::MAX) + 1
+                    ));
                 }
             }
+        }
+        if self.n_features > usize::from(u16::MAX) {
+            return Err(format!(
+                "n_features is {}; the arena addresses at most {} features",
+                self.n_features,
+                u16::MAX
+            ));
         }
         // Every class index must map to a barcode so output isn't all -1.
         for cls in 0..self.n_classes {
@@ -610,6 +639,16 @@ mod tests {
     #[test]
     fn validates_ok() {
         toy_model().validate().expect("toy model should validate");
+    }
+
+    /// A child index that points back at its parent (or earlier) is a cycle;
+    /// before this check `GbmPredictor::new` recursed on it without end.
+    #[test]
+    fn rejects_a_back_edge() {
+        let mut m = toy_model();
+        m.trees[0][0].nodes[0].right = 0;
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("cycle"), "{err}");
     }
 
     #[test]

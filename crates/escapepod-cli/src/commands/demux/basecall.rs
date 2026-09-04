@@ -392,7 +392,7 @@ fn produce_blocks(
             let batch = batch_result?;
             let view = ReadsBatchView::new(&batch, false)?;
             let reads: Vec<_> = (0..view.num_rows())
-                .filter_map(|row| view.read(row).ok())
+                .filter_map(|row| super::utils::read_row_or_warn(&view, row))
                 .filter(|r| !r.signal_rows.is_empty() && boundaries.contains_key(&r.read_id))
                 .collect();
             if reads.is_empty() {

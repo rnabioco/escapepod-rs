@@ -182,6 +182,18 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         (true, true) => anyhow::bail!("Only one of --reference or --model can be specified"),
         _ => {}
     }
+    // Only the reference-CSV path reads `--window`. A DTW-SVM model JSON
+    // carries the band it was trained with and the predictor uses that; the
+    // WarpDemuX reference bank and the GBM have no band at all. The flag was
+    // accepted with `--model` and ignored, which the documented example
+    // invited.
+    if args.model.is_some() && args.window.is_some() {
+        anyhow::bail!(
+            "--window applies to --reference (CSV) mode only: a DtwSvmModel JSON records \
+             its own DTW window (`window`), and the WarpDemuX and GBM models use none. \
+             Drop --window, or change `window` in the model file."
+        );
+    }
 
     // Resolved once, before the model is parsed, so `--gpu`'s deprecation
     // warning is emitted exactly once whichever head runs.
@@ -341,12 +353,12 @@ fn run_with_svm_model(
 
     let unclassified_count = total_count - confident_count;
 
-    println!(
+    info!(
         "{} classifications written to {}",
         style::action("Wrote"),
         style::path(args.output.display())
     );
-    println!(
+    info!(
         "{} {} confident, {} unclassified",
         style::label("Result:"),
         style::count(confident_count),
@@ -370,26 +382,28 @@ fn run_with_gbm_model(
     model: GbmModel,
     device: crate::device::Device,
 ) -> anyhow::Result<()> {
-    println!("{} reads using GBM model", style::action("Classifying"));
-    println!(
+    // Status, not data: these go to stderr through `tracing` like every other
+    // stage's, so `-q` silences them and a piped stdout stays clean.
+    info!("{} reads using GBM model", style::action("Classifying"));
+    info!(
         "{} {}",
         style::label("Fingerprints:"),
         style::path(args.fingerprints.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("GBM Model:"),
         style::path(gbm_model_path.display())
     );
-    println!(
+    info!(
         "{} {}",
         style::label("Output:"),
         style::path(args.output.display())
     );
     if args.probabilities {
-        println!("{} per-class probabilities", style::label("Including:"));
+        info!("{} per-class probabilities", style::label("Including:"));
     }
-    println!(
+    info!(
         "{} {} classes, {} features, {} boosting iterations",
         style::label("Model:"),
         style::count(model.n_classes),
@@ -408,7 +422,7 @@ fn run_with_gbm_model(
 
     let query_fps = read_query_fingerprints_f64(&args.fingerprints)?;
 
-    println!(
+    info!(
         "{} {} query fingerprints",
         style::label("Loaded:"),
         style::count(query_fps.len())
@@ -431,7 +445,7 @@ fn run_with_gbm_model(
         );
     }
 
-    println!("{} reads with GBM...", style::action("Classifying"));
+    info!("{} reads with GBM...", style::action("Classifying"));
     let predictor = GbmPredictor::new(&model);
     let n = query_fps.len();
     let (confident_count, total_count) = stream_svm_classifications(

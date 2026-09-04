@@ -221,7 +221,10 @@ fn collect_assignments_from_directory(
 
                 // Only the read_id is needed here, so use the lighter
                 // view.read_id() rather than decoding all 22 fields.
-                if let Ok(batches) = reader.read_batches() {
+                {
+                    let batches = reader
+                        .read_batches()
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", pod5_path.display()))?;
                     for batch_result in batches {
                         let batch = batch_result?;
                         let view = ReadsBatchView::new(&batch, false)?;
@@ -321,18 +324,17 @@ fn extract_fingerprints_by_barcode(
             .map(|(id, bc)| (*id, bc.as_str()))
             .collect();
 
-        let Ok(reader) = Reader::open(pod5_path) else {
-            continue;
-        };
-        let Ok(batches) = reader.read_batches() else {
-            continue;
-        };
+        // An unreadable input is an error, not a file with no assigned reads:
+        // skipping it built a consensus from whatever else was there and
+        // exited 0, which is the #293 failure `detect`/`fingerprint`/`basecall`
+        // were cured of in #294 and this command was not.
+        let at = |e: escapepod_signal::pod5::Error| anyhow::anyhow!("{}: {e}", pod5_path.display());
+        let reader = Reader::open(pod5_path).map_err(at)?;
+        let batches = reader.read_batches().map_err(at)?;
 
         for batch_result in batches {
-            let Ok(batch) = batch_result else { continue };
-            let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                continue;
-            };
+            let batch = batch_result.map_err(at)?;
+            let view = ReadsBatchView::new(&batch, false).map_err(at)?;
 
             // Metadata-only pre-filter. `read_id` is one fixed-width column;
             // `read()` decodes the whole record, so only assigned rows pay it.
@@ -342,7 +344,7 @@ fn extract_fingerprints_by_barcode(
                         .map(|id| wanted.contains_key(&id))
                         .unwrap_or(false)
                 })
-                .filter_map(|row| view.read(row).ok())
+                .filter_map(|row| super::utils::read_row_or_warn(&view, row))
                 .filter(|r| !r.signal_rows.is_empty())
                 .collect();
             if reads.is_empty() {
@@ -354,13 +356,12 @@ fn extract_fingerprints_by_barcode(
                 .enumerate()
                 .map(|(i, r)| (i, r.signal_rows.clone()))
                 .collect();
-            let Ok(bulk) = reader.get_compressed_signal_bulk(&keyed) else {
-                continue;
-            };
+            let bulk = reader.get_compressed_signal_bulk(&keyed).map_err(at)?;
 
-            // Decompress + LLR-detect + fingerprint in parallel. No decode
-            // bound: LLR normalizes over the whole read, so the full signal is
-            // genuinely needed (`signal_decode_bound()` is `None` for LLR).
+            // Decompress + LLR-detect + fingerprint in parallel, decoding the
+            // same leading window `demux detect --method llr` does
+            // (`LLR_DECODE_BOUND`), so the reference bank is built from the
+            // boundaries the queries will get.
             // Tag with the read index and re-sort: `get_compressed_signal_bulk`
             // does not promise to return rows in request order, and the
             // per-barcode push order decides the summation order inside
@@ -372,7 +373,10 @@ fn extract_fingerprints_by_barcode(
                 .filter_map(|(i, chunks)| {
                     let r = &reads[*i];
                     let barcode = *wanted.get(&r.read_id)?;
-                    let signal = super::utils::decode_chunks_to(chunks, None)?;
+                    let signal = super::utils::decode_chunks_to(
+                        chunks,
+                        Some(super::utils::LLR_DECODE_BOUND),
+                    )?;
                     let fp = extract_training_fingerprint(&signal, args, norm_method, r.read_id)?;
                     Some((*i, barcode, fp))
                 })

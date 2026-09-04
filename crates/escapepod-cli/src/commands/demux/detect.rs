@@ -1,6 +1,6 @@
 //! Detect subcommand - LLR-based adapter boundary detection.
 
-use super::utils::{process_reads_par, total_read_count};
+use super::utils::{LLR_DECODE_BOUND, process_reads_par, total_read_count};
 use crate::progress::create_progress_bar;
 use crate::style;
 use escapepod_demux::ReadBoundaries;
@@ -328,7 +328,7 @@ fn run_llr(args: DetectArgs) -> anyhow::Result<()> {
     let results: Vec<ReadBoundaries> = process_reads_par(
         &args.input,
         Some(&progress_bar),
-        None, // LLR scans the full read
+        Some(LLR_DECODE_BOUND),
         |read_id, num_samples, signal| {
             let (adapter_start, adapter_end) =
                 llr_boundaries(signal, (min_adapter, border_trim, downscale_factor));
@@ -671,12 +671,13 @@ fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()
             .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?;
         // The CNN alone needs only the leading `max_obs_trace` samples, which is
         // what lets long mRNA reads skip most of their decompression. The LLR
-        // arm normalizes over the *whole* read, so with `--emit-llr-delta` that
-        // saving has to go: scoring LLR on the CNN's prefix would not be the
-        // detector `--method llr` runs, and the delta would measure the
+        // arm normalizes over everything it is handed, so with
+        // `--emit-llr-delta` the decode has to reach as far as `--method llr`
+        // itself decodes: scoring LLR on the CNN's prefix would not be the
+        // detector that command runs, and the delta would measure the
         // truncation rather than the disagreement.
         let decode_bound = if args.emit_llr_delta {
-            None
+            Some(LLR_DECODE_BOUND.max(cnn.config().max_obs_trace))
         } else {
             Some(cnn.config().max_obs_trace)
         };

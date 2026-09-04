@@ -164,11 +164,20 @@ unsafe fn max5(v: [__m256; 5]) -> __m256 {
 unsafe fn lse5(v: [__m256; 5]) -> __m256 {
     unsafe {
         let m = max5(v);
-        let mut s = exp8(_mm256_sub_ps(v[0], m));
-        s = _mm256_add_ps(s, exp8(_mm256_sub_ps(v[1], m)));
-        s = _mm256_add_ps(s, exp8(_mm256_sub_ps(v[2], m)));
-        s = _mm256_add_ps(s, exp8(_mm256_sub_ps(v[3], m)));
-        s = _mm256_add_ps(s, exp8(_mm256_sub_ps(v[4], m)));
+        let zero = _mm256_setzero_ps();
+        // `v - m <= 0` for every lane some path has reached, so the clamp acts
+        // only on the `-inf - -inf = NaN` of a cell none has, turning it into
+        // `exp(0)` and the result into `-inf + ln(5)`: `-inf`, as the scalar
+        // guard produces. Without it the `NaN` survives `exp8` and is scrubbed
+        // only by `ln8`'s `max(x, MIN_POSITIVE)` returning its second operand
+        // on an unordered compare — the argument-order accident `chain_tail`
+        // refuses to depend on, and `chain_head`, which reduces through here
+        // over its all-unreached first rows, was depending on. Adding to a
+        // zero accumulator is exact, so the sum is bit-identical to before.
+        let mut s = zero;
+        for x in v {
+            s = _mm256_add_ps(s, exp8(_mm256_min_ps(_mm256_sub_ps(x, m), zero)));
+        }
         _mm256_add_ps(m, ln8(s))
     }
 }
@@ -716,6 +725,29 @@ mod tests {
         let (stay, src, mv) = ([0u32; 8], [0u32; 8], [0u32; 8]);
         // SAFETY: `available()` checked; every index is 0 and in range.
         let done = unsafe { chain_tail(&cur, &mut next, &row, &stay, &src, &mv, 0) };
+        assert_eq!(done, 8);
+        for (i, v) in next.iter().enumerate() {
+            assert!(v.is_infinite() && v.is_sign_negative(), "lane {i} is {v}");
+        }
+    }
+
+    /// The head's five-term reduction meets the same all-unreached cells on
+    /// the first rows of every scan (layer `j` is unreached for `t < j - 1`)
+    /// and has to absorb them the same way — through `lse5`'s own guard, not
+    /// through `ln8`'s clamp happening to scrub a `NaN`.
+    #[test]
+    fn chain_head_absorbs_unreached() {
+        if !available() {
+            return;
+        }
+        let cur = vec![f32::NEG_INFINITY; 8];
+        let mut next = vec![0.0f32; 8];
+        let row = vec![0.0f32; 8];
+        let stay = [0u32; 8];
+        let (src, score) = ([0u32; 32], [0u32; 32]);
+        // SAFETY: `available()` checked; every index is 0 and in range, and
+        // `src`/`score` are `4 * n` long.
+        let done = unsafe { chain_head(&cur, &mut next, &row, &stay, &src, &score, 0, 8) };
         assert_eq!(done, 8);
         for (i, v) in next.iter().enumerate() {
             assert!(v.is_infinite() && v.is_sign_negative(), "lane {i} is {v}");

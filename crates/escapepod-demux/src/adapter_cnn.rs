@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tract_onnx::prelude::*;
+use tract_onnx::tract_core::framework::Framework;
 use tract_onnx::tract_core::model::TypedRunnableModel;
 
 /// Parameters controlling the CNN detector. Defaults match ADAPTed's
@@ -188,12 +189,30 @@ impl AdapterCnn {
         path: impl AsRef<Path>,
         config: AdapterCnnConfig,
     ) -> Result<Self, AdapterCnnError> {
-        // Dynamic input shape: `[batch=1, channels=1, length=S]` where S depends
-        // on the input signal. We re-compile per signal length cheaply by
-        // leaving `length` symbolic in the ONNX graph and re-resolving for the
-        // actual length at call time.
-        let model = tract_onnx::onnx()
-            .model_for_path(path)
+        // Since #187 every input is the one shape `[1, 1, input_len]`: prep
+        // pads each read to `input_len`, and CPU inference is per read. Pin it,
+        // and hoist the convolutions' padding out of the graph first.
+        //
+        // Both are load-time rewrites that tract then plans around, and each
+        // was measured on its own (adapter_rna004, 119k reads, 32 threads):
+        // the graph used to be optimized with `length` left symbolic — a
+        // comment here said tract "re-resolves for the actual length at call
+        // time", which stopped being a reason once the length stopped
+        // varying — and pinning it alone took the run from 600 to 401
+        // CPU-seconds. Hoisting the padding (nine zero-padded 1-D convs,
+        // dilations 1-8) took it to 380: tract's im2col leaves its block-copy
+        // path when `pads != 0`, the defect `onnx_rewrite::hoist_conv_padding`
+        // documents on the charging network. Sorted classifications were
+        // identical across all three loaders.
+        let onnx = tract_onnx::onnx();
+        let mut proto = onnx
+            .proto_model_for_path(path)
+            .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
+        crate::onnx_rewrite::hoist_conv_padding(&mut proto, 1);
+        let model = onnx
+            .model_for_proto_model(&proto)
+            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
+            .with_input_fact(0, f32::fact([1, 1, config.input_len()]).into())
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?
             .into_optimized()
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?
@@ -213,11 +232,12 @@ impl AdapterCnn {
 
     /// Run one dummy forward pass and assert the output is `[_, 2, _]`
     /// (per-position scores for the two boundary channels). Cheap; catches a
-    /// mismatched ONNX model at load time rather than per-read.
+    /// mismatched ONNX model at load time rather than per-read. Probes at the
+    /// pinned input length, the only shape the plan accepts.
     fn probe_output_contract(&self) -> Result<(), AdapterCnnError> {
-        const PROBE_LEN: usize = 1024;
-        let dummy = vec![0f32; PROBE_LEN];
-        let input = Tensor::from_shape(&[1, 1, PROBE_LEN], &dummy)
+        let probe_len = self.config.input_len();
+        let dummy = vec![0f32; probe_len];
+        let input = Tensor::from_shape(&[1, 1, probe_len], &dummy)
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let outputs = self
             .plan
@@ -251,9 +271,14 @@ impl AdapterCnn {
                 len: signal_pa.len(),
                 required: cfg.min_obs_adapter + cfg.downscale_factor,
             })?;
+        self.run_window(&normalized)
+    }
 
-        // Feed through the ONNX plan.
-        let input = Tensor::from_shape(&[1, 1, normalized.len()], &normalized.data)
+    /// One prepped window through the plan: the `[1, 1, input_len]` forward
+    /// pass and the argmax decode.
+    fn run_window(&self, window: &PreppedWindow) -> Result<usize, AdapterCnnError> {
+        let cfg = self.config;
+        let input = Tensor::from_shape(&[1, 1, window.len()], &window.data)
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
         let outputs = self
             .plan
@@ -273,98 +298,40 @@ impl AdapterCnn {
         Ok(decode_adapter_end(
             &cfg,
             length_out,
-            normalized.valid_len,
+            window.valid_len,
             |k| scores[[0, 0, k]],
         ))
     }
 
-    /// Batched adapter-end detection over many signals in one forward pass.
+    /// Adapter-end detection over many signals, one result per input in the
+    /// same order. Reads that are too short produce `Err(SignalTooShort)`.
     ///
-    /// Returns one result per input signal, in the same order. Reads that are
-    /// too short produce `Err(SignalTooShort)` and are excluded from the batch;
-    /// a model-load/run/shape failure maps every otherwise-valid read to the
-    /// corresponding `Err`.
-    ///
-    /// **Bit-exact with [`detect_adapter_end`]**: signals are grouped by exact
-    /// prepped length and each group is run as an *unpadded* `[group, 1, len]`
-    /// batch, so every read is fed at precisely its own length — identical to
-    /// running it alone. (Cross-read zero-padding is *not* safe here: this
-    /// model's conv boundary handling makes a padded short read score
-    /// differently than when run solo.) Downscaling collapses ranges of sample
-    /// counts onto one length, so groups stay sizable; the main use is the GPU
-    /// backend, where a length group is one onnxruntime batch.
+    /// **Bit-exact with [`detect_adapter_end`]** by construction: each read runs
+    /// through the same `[1, 1, input_len]` plan on its own. The plan is pinned
+    /// to batch 1 at load — tract has no efficient batched convolution, and
+    /// batching it here measured *slower* than per-read parallelism across
+    /// reads — so there is no CPU batch to assemble. The batched call is the
+    /// GPU backend's, where a block of prepped rows is one onnxruntime call
+    /// ([`AdapterCnnGpu::detect_prepped`](crate::adapter_cnn_gpu::AdapterCnnGpu::detect_prepped));
+    /// this method keeps the two backends' signatures aligned and is what
+    /// `tests/adapter_cnn_batch_parity.rs` pins.
     pub fn detect_adapter_end_batch(
         &self,
         signals: &[&[f32]],
     ) -> Vec<Result<usize, AdapterCnnError>> {
         let cfg = self.config;
         let min_len = cfg.min_obs_adapter + cfg.downscale_factor;
-
-        // 1. Prep each signal independently; record which are usable.
-        let prepped: Vec<Option<PreppedWindow>> = signals
+        signals
             .iter()
-            .map(|&sig| prep_adapter_signal(sig, &cfg))
-            .collect();
-
-        let valid_idx: Vec<usize> = (0..signals.len())
-            .filter(|&i| prepped[i].is_some())
-            .collect();
-
-        // Helper to build the all-error / too-short result vector.
-        let short_err = |i: usize| AdapterCnnError::SignalTooShort {
-            len: signals[i].len(),
-            required: min_len,
-        };
-        if valid_idx.is_empty() {
-            return (0..signals.len()).map(|i| Err(short_err(i))).collect();
-        }
-
-        // 2. Group by exact prepped length and run each group as an *unpadded*
-        //    `[group, 1, len]` batch, so batched results are bit-identical to
-        //    the per-read path. Since #187 prep emits one fixed length, so this
-        //    is a single group covering the whole block — but the grouping is
-        //    what makes that a property rather than an assumption. Batching
-        //    must never introduce its own padding: `cnn_pad_probe` measured
-        //    this graph's scores changing *before* the pad begins, so a row
-        //    padded here would score differently than run alone.
-        let mut out: Vec<Result<usize, AdapterCnnError>> =
-            (0..signals.len()).map(|i| Err(short_err(i))).collect();
-
-        for (len, group) in group_by_len(&prepped, &valid_idx) {
-            let run = (|| -> Result<Vec<usize>, AdapterCnnError> {
-                let g = group.len();
-                let data = pack_batch(&prepped, &group, len);
-                let input = Tensor::from_shape(&[g, 1, len], &data)
-                    .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                let outputs = self
-                    .plan
-                    .run(tvec!(input.into()))
-                    .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                let scores = outputs[0]
-                    .to_plain_array_view::<f32>()
-                    .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-                let shape = scores.shape();
-                if shape.len() != 3 || shape[0] != g || shape[1] != 2 {
-                    return Err(AdapterCnnError::BadShape {
-                        got: shape.to_vec(),
-                    });
-                }
-                let length_out = shape[2];
-                Ok((0..g)
-                    .map(|row| {
-                        // Each read's own pre-padding length, never the group's
-                        // tensor width — see `PreppedWindow`.
-                        let valid_len = prepped[group[row]]
-                            .as_ref()
-                            .expect("group points at prepped signals")
-                            .valid_len;
-                        decode_adapter_end(&cfg, length_out, valid_len, |k| scores[[row, 0, k]])
-                    })
-                    .collect())
-            })();
-            scatter_group(&mut out, &group, run);
-        }
-        out
+            .map(|&sig| {
+                let window =
+                    prep_adapter_signal(sig, &cfg).ok_or(AdapterCnnError::SignalTooShort {
+                        len: sig.len(),
+                        required: min_len,
+                    })?;
+                self.run_window(&window)
+            })
+            .collect()
     }
 }
 
@@ -550,6 +517,7 @@ pub(crate) fn decode_adapter_end(
 /// zero-pad the mismatched rows and the reads would come back with plausible,
 /// wrong boundaries. The cost is one `HashMap` pass per block, far below the
 /// inference it guards.
+#[cfg(feature = "gpu")]
 pub(crate) fn group_by_len(
     prepped: &[Option<PreppedWindow>],
     valid_idx: &[usize],
@@ -582,6 +550,7 @@ pub(crate) fn group_by_len(
 ///
 /// Shared by the CPU (tract) and GPU (onnxruntime) batch paths so the layout
 /// stays byte-identical between backends.
+#[cfg(feature = "gpu")]
 pub(crate) fn pack_batch(
     prepped: &[Option<PreppedWindow>],
     indices: &[usize],
@@ -603,6 +572,7 @@ pub(crate) fn pack_batch(
 /// original index: `Ok` writes each read's decoded adapter-end in order; `Err`
 /// clones the error to every read in the group. Shared by the CPU and GPU batch
 /// paths (which resolve `indices` per whole-group and per sub-batch respectively).
+#[cfg(feature = "gpu")]
 pub(crate) fn scatter_group(
     out: &mut [Result<usize, AdapterCnnError>],
     indices: &[usize],

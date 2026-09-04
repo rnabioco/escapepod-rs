@@ -500,7 +500,7 @@ escpod demux classify <FINGERPRINTS> --model <JSON> -o <OUTPUT>
 | `--reference <FILE>` | Reference fingerprints CSV (from train command) |
 | `--model <FILE>` | WarpDemuX model JSON file |
 | `-o, --output <FILE>` | Output classifications CSV (required) |
-| `--window <N>` | DTW window size (Sakoe-Chiba band, optional) |
+| `--window <N>` | DTW window size (Sakoe-Chiba band) for `--reference` mode; a model JSON carries its own, and passing this with `--model` is an error |
 | `--min-ratio <RATIO>` | Top-2 distance-ratio threshold below which a read is confident (default: 0.8) |
 | `--model-name <NAME>` | Use a fetched model bundle by name instead of `--model` |
 | `--probabilities` | Emit per-class probabilities (SVM models) |
@@ -542,8 +542,11 @@ c3d4e5f6-...,unclassified,0.912,0.345,0.378
 # Using reference fingerprints
 escpod demux classify fingerprints.csv --reference reference.csv -o classifications.csv
 
-# Using WarpDemuX model
-escpod demux classify fingerprints.csv --model warpdemux.json -o classifications.csv --window 10
+# Using WarpDemuX model (the DTW window comes from the model file)
+escpod demux classify fingerprints.csv --model warpdemux.json -o classifications.csv
+
+# Reference fingerprints with a Sakoe-Chiba band
+escpod demux classify fingerprints.csv --reference reference.csv -o classifications.csv --window 10
 
 # With a custom confidence ratio
 escpod demux classify fingerprints.csv --reference reference.csv -o out.csv --min-ratio 0.7

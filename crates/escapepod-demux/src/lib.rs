@@ -10,8 +10,9 @@
 //! - [`WarpDemuxModel`] and [`DtwSvmModel`] JSON loaders.
 //! - Per-read DTW classifier ([`classify_read`]) and full SVM predictor
 //!   ([`classify_with_svm`]) with Platt scaling + libsvm-style OvO coupling.
-//! - Optional `train` feature: fit a `DtwSvmModel` from labeled fingerprints
-//!   via linfa-svm ([`train_svm`] and friends).
+//! - Optional `train` feature: build a `DtwSvmModel` from labeled fingerprints
+//!   ([`train_svm`] and friends). Today this is a labels-only stub that relies
+//!   on kernel-weighted voting at predict time; see `train.rs`.
 //! - Optional `gpu` feature: batched GPU DTW matrix (routed through
 //!   `escapepod-signal`'s CUDA kernel) for classify and training.
 //! - Optional `cnn-detect` feature: adapter-end detection by running an
@@ -90,9 +91,16 @@ pub mod adapter_cnn;
 #[cfg(feature = "gpu")]
 pub mod adapter_cnn_gpu;
 
+// Present whenever tract is: both ONNX features pull it, and every tract
+// loader in the workspace (here and in escapepod-classify) runs its graph
+// through this before optimizing.
+#[cfg(any(feature = "cnn-detect", feature = "crf-decode"))]
+pub mod onnx_rewrite;
+
 pub use fingerprint::{
-    BarcodeFingerprint, ReadBoundaries, ReadFingerprint, compute_consensus_fingerprint,
-    compute_std_dev_fingerprint, extract_fingerprint_from_signal,
+    BOUNDARY_PADDING_SAMPLES, BarcodeFingerprint, MAX_FINGERPRINT_WINDOW, ReadBoundaries,
+    ReadFingerprint, compute_consensus_fingerprint, compute_std_dev_fingerprint,
+    extract_fingerprint_from_signal,
 };
 
 /// Make onnxruntime CUDA execution-provider registration fatal for every session

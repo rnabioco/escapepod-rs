@@ -92,6 +92,34 @@ impl BarcodeFingerprint {
     }
 }
 
+/// Context kept on either side of the nominal adapter boundaries under the
+/// `keep_last` pipeline, in samples. Public because a caller that decodes only
+/// a prefix of the read (the `fingerprint` subcommand) has to decode at least
+/// this far past `adapter_end`, or the right-hand context silently vanishes.
+pub const BOUNDARY_PADDING_SAMPLES: usize = 100;
+
+/// The most samples, ending at `adapter_end`, that a fingerprint is ever
+/// computed from.
+///
+/// The fingerprint keeps the *last* segments of the window — the barcode sits
+/// against `adapter_end` — so only the tail of a wide window ever reaches the
+/// model, but every sample of it was paid for: two `f64` prefix sums, a
+/// t-score per position, and a sort of every local maximum. A boundary
+/// detector with nothing to bound it can hand this function a window of
+/// millions of samples (the LLR detector on a read that is one long stall),
+/// and one such read then runs for seconds on one thread while the rest of
+/// the pool sits idle behind it.
+///
+/// Measured on a MinKNOW RNA004 run (119,255 reads): windows over 20k samples
+/// were 1.0% of reads and 41% of all window samples, with a maximum of 4.6M;
+/// the pipeline spent its last 6 of 11 seconds on a single worker inside this
+/// function. Real adapter windows on that run sat at 4,070 (median) and 5,120
+/// (p90) samples, so 30,000 — seven seconds of signal at 4 kHz — is several
+/// times anything an adapter produces, and clamping a wider window to its
+/// last 30,000 samples leaves the retained tail untouched. The CNN detector
+/// caps `adapter_end` at 6,500 samples and never reaches this.
+pub const MAX_FINGERPRINT_WINDOW: usize = 30_000;
+
 /// Extract a fingerprint from an adapter region of a signal.
 ///
 /// Returns `None` if the region is too small or segmentation fails.
@@ -125,7 +153,6 @@ pub fn extract_fingerprint_from_signal(
     // aren't clamped. The buffer is a fixed sample count rather than a
     // fraction so it remains meaningful regardless of adapter length.
     let (slice_start, slice_end) = if keep_last.is_some() {
-        const BOUNDARY_PADDING_SAMPLES: usize = 100;
         let ss = adapter_start.saturating_sub(BOUNDARY_PADDING_SAMPLES);
         let se = adapter_end
             .saturating_add(BOUNDARY_PADDING_SAMPLES)
@@ -134,6 +161,9 @@ pub fn extract_fingerprint_from_signal(
     } else {
         (adapter_start, adapter_end.min(signal.len()))
     };
+    // Bound the work to the tail of the window, where the barcode is. See
+    // [`MAX_FINGERPRINT_WINDOW`]; a no-op for every real adapter.
+    let slice_start = slice_start.max(slice_end.saturating_sub(MAX_FINGERPRINT_WINDOW));
 
     if slice_end <= slice_start || slice_end - slice_start < window_width * 2 {
         return None;
@@ -278,7 +308,11 @@ pub fn compute_consensus_fingerprint(fingerprints: &[Vec<f32>]) -> Vec<f32> {
     }
     let target_length = length_counts
         .into_iter()
-        .max_by_key(|(_, count)| *count)
+        // Most common length, shortest on a tie. The tie used to fall to
+        // `HashMap` iteration order, so two equally common lengths gave a
+        // different consensus per process — the last non-determinism in
+        // `demux train`'s output.
+        .max_by_key(|&(len, count)| (count, std::cmp::Reverse(len)))
         .map(|(len, _)| len)
         .unwrap_or(0);
 
@@ -544,5 +578,53 @@ mod keep_last_width_tests {
                 assert_eq!(fp.values.len(), 25, "len={len}: ragged fingerprint emitted");
             }
         }
+    }
+
+    /// A window wider than [`MAX_FINGERPRINT_WINDOW`] is fingerprinted from its
+    /// last `MAX_FINGERPRINT_WINDOW` samples — the same answer as a detector
+    /// that had reported the start there — and a window inside the bound is
+    /// untouched by the clamp.
+    #[test]
+    fn a_wide_window_is_clamped_to_its_tail() {
+        let read_id = uuid::Uuid::nil();
+        let len = MAX_FINGERPRINT_WINDOW + 20_000;
+        let signal: Vec<i16> = (0..len)
+            .map(|i| {
+                let x = i as f32 * 0.05;
+                (500.0 + 80.0 * x.sin() + 25.0 * (x * 3.1).cos()) as i16
+            })
+            .collect();
+        let fp = |start: usize, end: usize| {
+            extract_fingerprint_from_signal(
+                &signal,
+                start,
+                end,
+                111,
+                12,
+                NormMethod::ZScore,
+                read_id,
+                Some(6),
+                Some(25),
+                false,
+            )
+            .map(|f| f.values)
+        };
+        let wide = fp(0, len).expect("a long window still fingerprints");
+        // The clamp is applied after the boundary padding, so the equivalent
+        // explicit start is `len + padding - MAX`.
+        let explicit = fp(len + BOUNDARY_PADDING_SAMPLES - MAX_FINGERPRINT_WINDOW, len)
+            .expect("the explicit tail fingerprints");
+        assert_eq!(wide, explicit, "a wide window must be its own tail");
+
+        // Inside the bound the clamp does nothing: shifting the start by one
+        // sample changes the segmentation, which it could not if the clamp had
+        // already moved it.
+        let narrow_end = MAX_FINGERPRINT_WINDOW - 5_000;
+        let a = fp(0, narrow_end).expect("narrow");
+        let b = fp(1_000, narrow_end).expect("narrow, later start");
+        assert_ne!(
+            a, b,
+            "a window inside the bound must see its declared start"
+        );
     }
 }

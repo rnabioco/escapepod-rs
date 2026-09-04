@@ -91,6 +91,10 @@ pub enum GpuDtwError {
     /// Input too large to address with i32 offsets (the kernel uses `int`).
     #[error("input exceeds GPU kernel limits: {what}")]
     InputTooLarge { what: &'static str },
+    /// A worker thread driving the device died, or handed back fewer results
+    /// than it was given queries.
+    #[error("GPU worker failed: {0}")]
+    Worker(&'static str),
 }
 
 /// A handle to a CUDA device with the DTW kernel pre-loaded.

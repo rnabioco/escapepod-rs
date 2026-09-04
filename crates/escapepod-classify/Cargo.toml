@@ -58,7 +58,11 @@ default = []
 # charging bundle. Without it such a bundle is *refused at load* with a
 # rebuild hint — never silently mis-scored, and never confused with the
 # raw-signal CNN variant, which this crate does not implement at all.
-fnn-onnx = ["dep:tract-onnx"]
+#
+# `escapepod-demux/cnn-detect` is what makes `escapepod_demux::onnx_rewrite`
+# exist (the padding hoist every tract loader applies); it adds nothing to the
+# dependency graph that `dep:tract-onnx` did not already.
+fnn-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 # Load and score the windowed raw-signal (`waveform_model`) variant. A separate
 # feature from `fnn-onnx` because it names a different *variant*, not a
 # different runtime — both go through tract, and both are in `escapepod-cli`'s
@@ -68,4 +72,4 @@ fnn-onnx = ["dep:tract-onnx"]
 # It ran through `ort` until `charging_tcn_rna004@v0.1.1`, whose re-export
 # tract can load; see `waveform_net` for the measurement and why the export
 # version is the thing that decides this.
-waveform-onnx = ["dep:tract-onnx"]
+waveform-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
