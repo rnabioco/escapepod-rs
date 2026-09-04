@@ -10,8 +10,9 @@
 //! - [`WarpDemuxModel`] and [`DtwSvmModel`] JSON loaders.
 //! - Per-read DTW classifier ([`classify_read`]) and full SVM predictor
 //!   ([`classify_with_svm`]) with Platt scaling + libsvm-style OvO coupling.
-//! - Optional `train` feature: fit a `DtwSvmModel` from labeled fingerprints
-//!   via linfa-svm ([`train_svm`] and friends).
+//! - Optional `train` feature: build a `DtwSvmModel` from labeled fingerprints
+//!   ([`train_svm`] and friends). Today this is a labels-only stub that relies
+//!   on kernel-weighted voting at predict time; see `train.rs`.
 //! - Optional `gpu` feature: batched GPU DTW matrix (routed through
 //!   `escapepod-signal`'s CUDA kernel) for classify and training.
 //! - Optional `cnn-detect` feature: adapter-end detection by running an

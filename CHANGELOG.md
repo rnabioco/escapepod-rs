@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+### Changed
+
+- **The CPU boundary CNN loads with its input shape pinned and its
+  convolution padding hoisted.** Profiling `demux --method cnn` on the CPU
+  put 38% of all CPU time in tract's `padded_valid_x_loop`, the per-element
+  im2col path it falls back to when `pads != 0` — the defect
+  `escapepod-classify` already works around for the charging network. The
+  loader also still optimized the graph with `length` symbolic, a choice
+  #187 made obsolete when prep started padding every read to one shape.
+  Measured on 119,255 RNA004 reads at 32 threads: 600 → 401 CPU-seconds from
+  the input fact alone, 380 with the hoist; sorted per-read classifications
+  identical. The rewrite now lives in `escapepod_demux::onnx_rewrite` and the
+  CTC-CRF encoder loader applies it too. Pinning batch 1 means the CPU batch
+  entry point runs reads one at a time, which is what CPU batching measured
+  against anyway.
+
+- **Per-read work on the LLR path is bounded.** The fingerprint is computed
+  from at most the last `MAX_FINGERPRINT_WINDOW` (30,000) samples of the
+  adapter window, and the LLR detector is handed at most `LLR_DECODE_BOUND`
+  (200,000) samples of a read, in the fused pipeline and in `demux detect`
+  and `demux train`. Neither touches a real read: adapter windows on a
+  MinKNOW RNA004 run sat at 4,070 (median) / 5,120 (p90) samples, and 98% of
+  its reads are under the decode bound. What they bound is the read-length
+  tail: 2.7% of that run's reads (over 100k samples, up to 11.3M) held 62%
+  of all samples, LLR reported "adapter" windows up to 4.6M samples on
+  stalled pores, and the pipeline spent its last 6 of 11 seconds on one
+  rayon worker fingerprinting one such chunk while the pool idled. With the
+  reads the caps target filtered out, wall fell 11.4 → 5.1 s and CPU 61 →
+  31 s on node-local input. `--method cnn` was already bounded and is
+  unaffected. ADAPTed's own LLR sees only `max_obs_trace` samples; adopting
+  that would be the parity-improving choice but renormalizes most real reads
+  and needs a validation run first.
+
+### Fixed
+
+- `DtwSvmModel::validate` now checks everything the predictor indexes by
+  class or pair: `thresholds`, `prob_a`/`prob_b`, the `dual_coef` row count,
+  `classes` and `label_mapper` coverage, and `n_classes >= 2`. A short
+  `thresholds` used to accept every call for the classes past its end; the
+  others panicked inside a rayon worker on the first read. A WarpDemuX
+  model's `threshold_type` must be `kernel` or `ratio` — anything else
+  silently selected the ratio rule. `GbmModel::validate` refuses a tree with
+  a back-edge, which recursed without end in `GbmPredictor::new`.
+- `demux train` no longer skips an unreadable POD5 (or batch) and exits 0
+  with a consensus built from whatever else was there — the #293 failure
+  the other stages were cured of in #294.
+- `demux classify --window` with `--model` is an error rather than silently
+  ignored: a DTW-SVM model carries its own window, and the WarpDemuX and
+  GBM heads use none. The documented example used it that way.
+- `demux classify`'s SVM and GBM status lines go through `tracing` to
+  stderr like every other stage's, so `-q` silences them and a piped stdout
+  stays clean.
+- A reads-table row that fails to decode is warned about instead of
+  vanishing from the output of every demux stage.
+- `compute_consensus_fingerprint` breaks a tie between equally common
+  fingerprint lengths deterministically (shortest wins); it used to fall to
+  `HashMap` iteration order, the last non-determinism in `demux train`.
+- The AVX2 and AVX-512 `logsumexp` kernels guard the `-inf - -inf = NaN` of
+  an all-unreached lattice cell themselves. `chain_head` reduces through
+  them over the first rows of every `--ref-scores` scan, and its result was
+  correct only because `ln8`'s `max(x, MIN_POSITIVE)` clamp happened to
+  return its second operand on an unordered compare — the accident
+  `chain_tail`'s guard was written to stop depending on. Bit-identical for
+  every reachable lane; pinned by `chain_head_absorbs_unreached`.
+- The GPU CRF encoder remembers a failed `--ref-scores` panel upload instead
+  of discarding the error and retrying it every batch, and the fused
+  pipeline reports the fallback at the end of the run (the host scan it
+  falls to is +57% wall, #297).
+- GPU DTW-SVM classification returns an error when its producer thread dies
+  or returns fewer results than queries; every caller zipped the result with
+  its queries, so the missing reads silently dropped out of the output.
+
+### Removed
+
+- `linfa` and `linfa-svm` from `escapepod-demux`'s `train` feature. They
+  were compiled for every `--features train` build and never imported; the
+  SVM fit has been a labels-only stub since #152.
+
 ## 0.19.0 (2026-09-01)
 
 ### Added
