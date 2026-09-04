@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.20.0 (2026-09-04)
+
 ### Performance
 
 - **The CPU boundary CNN loads with its input shape pinned and its
