@@ -25,7 +25,8 @@ use crate::style;
 use escapepod_demux::crf::CrfEncoderGpu;
 #[cfg(feature = "crf-decode")]
 use escapepod_demux::crf::{
-    BarcodeRefs, CrfEncoder, CrfError, CrfScratch, RefChains, ScoredDecode,
+    BarcodeRefs, CrfEncoder, CrfError, CrfMetadata, CrfScratch, RefChains, ScoredDecode,
+    WindowRefusal,
 };
 use escapepod_demux::{
     AnyModel, DtwSvmModel, GbmModel, GbmPredictor, SvmPredictor, SvmWorkspace,
@@ -151,17 +152,20 @@ pub struct RunArgs {
     /// encoder needs: `adapter_end >= chunk` already yields a full window, and
     /// the extra samples exist only because `extract_chunks.py` demanded them.
     /// Reads in `[chunk, chunk + margin)` are therefore dropped undecoded even
-    /// though they are decodable. Lowering it recovers them at the cost of a
-    /// window reaching into the read's opening samples, which the model never
-    /// saw in training. Measured on a 1.0M-read RNA004 nbc16 run: 0 recovered
-    /// 36,921 reads (demux yield 85.44% -> 89.13%), all decoding at median edit
-    /// distance 0 with 98.3% within 2 edits — cleaner than the reads that
-    /// already passed.
+    /// though they are decodable. Lowering it decodes them from a window that
+    /// reaches into the read's opening samples, which the model never saw in
+    /// training — and whether those calls are *right* has to be checked against
+    /// a label the decode cannot influence. Measured that way on ldx32 over a
+    /// co-barcoded run (#323), the `[chunk, chunk + 200)` band agreed with the
+    /// 5' index on the same molecule 55% of the time, against 85% for reads
+    /// with a full window; under the bundle's lattice gate it agreed 84% at 56%
+    /// yield. Use it under a gate, and prefer declaring the measured value in
+    /// the bundle.
     ///
-    /// This is an escape hatch for evaluating a change before baking it into an
-    /// export. The bundle should state the margin its corpus was built with;
-    /// once measured, set `boundary.margin` there rather than passing this on
-    /// every run.
+    /// With several models it applies to every head that has a boundary
+    /// detector; read-end heads ignore it and are named as doing so. With only
+    /// read-end models it is refused. The run summary reports how many reads
+    /// each window rule refused, per axis.
     #[cfg(feature = "crf-decode")]
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub boundary_margin: Option<usize>,
@@ -174,15 +178,18 @@ pub struct RunArgs {
     /// before sample 0, so there is nothing to relax — the signal genuinely runs
     /// out. Clamping keeps the window width and anchors it at the read start
     /// instead, sliding `chunk - adapter_end` samples of downstream signal into
-    /// the tail. Such reads are truncated mid-adapter, so part of the barcode is
-    /// already gone; the bound is how much of that you accept.
+    /// the tail.
     ///
-    /// Measured on the RNA004 nbc16 run: known-good reads deliberately slid
-    /// forward still call the same barcode 98.6% of the time at shift 0 and
-    /// 93.5% at 500. Applying it to the real `adapter_end` 2,500-2,999 band
-    /// recovered 42,404 reads, all decoding, median edit distance 0, but with
-    /// agreement falling 97.4% -> 92.9% within 2 edits across that range and the
-    /// share still aligning to a tRNA falling 78.5% -> 50.0%.
+    /// Measured against an independent per-read label (the 5' index on the same
+    /// molecule; ldx32 v0.2.1 over FDX Run1, #323), the reads this reaches are
+    /// not merely truncated: at shifts up to 300 the calls agree with the
+    /// design 28% of the time against 85% for full-window reads, 45% of them
+    /// land on codes absent from the pool, and larger shifts are at chance. The
+    /// earlier nbc16 figures (97% within 2 edits of a reference) could not see
+    /// this — a window holding no barcode still decodes to a perfect reference.
+    /// Leave it at 0 unless a measurement of that kind says otherwise.
+    ///
+    /// Scoped to the heads with a boundary detector, like `--boundary-margin`.
     #[cfg(feature = "crf-decode")]
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub clamp_max_shift: Option<usize>,
@@ -685,6 +692,11 @@ impl Calls {
 struct ClassRow {
     read_id: Uuid,
     calls: Calls,
+    /// The boundary detector's `adapter_end` for this read, so the CSV can say
+    /// which window rule a refused read fell under without a second `detect`
+    /// pass. 0 where no detector ran (a read-end-only run), and the writer
+    /// then omits the column rather than print a number that means nothing.
+    adapter_end: usize,
 }
 
 /// The classifications channel. Named because it appears in eight producer
@@ -698,6 +710,7 @@ fn route(
     class_tx: Option<&ClassTx>,
     read: ReadData,
     calls: Calls,
+    adapter_end: usize,
     chunks: Vec<CompressedSignalChunk>,
     run_infos: Arc<Vec<RunInfoData>>,
 ) {
@@ -713,6 +726,7 @@ fn route(
         let _ = ctx.send(ClassRow {
             read_id: read.read_id,
             calls,
+            adapter_end,
         });
     }
     if let Some(tx) = router {
@@ -757,6 +771,77 @@ struct CrfHead {
     chains: Option<RefChains>,
     min_crf_margin: Option<f32>,
     min_crf_prob: Option<f32>,
+    /// Why this head's reads went `unclassified`, for the run summary.
+    refusals: Refusals,
+}
+
+/// Why a CRF head's reads ended up `unclassified`, tallied across the run.
+///
+/// Six things look identical in the summary — a confidence-0 `unclassified`
+/// row — and only one of them is a classifier decision. The rest are window
+/// rules (`boundary.margin`, `boundary.clamp_max_shift`, the detector's
+/// sentinel, read length) whose counts are exactly what decides whether a
+/// bundle's declared values are worth changing; until they were counted here,
+/// answering that meant a second `detect` pass and a join by hand (#323).
+///
+/// Atomics because the producers hold `&CrfHead` across rayon workers and the
+/// GPU pool's threads; the counts are read once, after every producer has
+/// returned.
+#[cfg(feature = "crf-decode")]
+#[derive(Default)]
+struct Refusals {
+    /// Indexed by [`WindowRefusal::index`].
+    window: [std::sync::atomic::AtomicUsize; 5],
+    /// No signal could be decoded for the read.
+    no_signal: std::sync::atomic::AtomicUsize,
+    /// The encoder failed on the read (warned per read as it happened).
+    encoder: std::sync::atomic::AtomicUsize,
+    /// The decoded sequence matched no reference at all.
+    no_match: std::sync::atomic::AtomicUsize,
+    /// A gate rejected the call: `--min-margin`, `--min-crf-margin` or
+    /// `--min-crf-prob`.
+    gated: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "crf-decode")]
+impl Refusals {
+    fn window(&self, why: WindowRefusal) {
+        Self::bump(&self.window[why.index()]);
+    }
+
+    fn bump(counter: &std::sync::atomic::AtomicUsize) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(reason, count)` for every reason that refused at least one read, in
+    /// report order: the window rules first, then everything downstream.
+    fn report(&self) -> Vec<(String, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut out: Vec<(String, usize)> = WindowRefusal::ALL
+            .iter()
+            .map(|&why| {
+                (
+                    why.label().to_string(),
+                    self.window[why.index()].load(Relaxed),
+                )
+            })
+            .collect();
+        out.push((
+            "no signal decoded".to_string(),
+            self.no_signal.load(Relaxed),
+        ));
+        out.push(("encoder error".to_string(), self.encoder.load(Relaxed)));
+        out.push((
+            "decoded sequence matched no reference".to_string(),
+            self.no_match.load(Relaxed),
+        ));
+        out.push((
+            "gated (--min-margin / --min-crf-margin / --min-crf-prob)".to_string(),
+            self.gated.load(Relaxed),
+        ));
+        out.retain(|(_, n)| *n > 0);
+        out
+    }
 }
 
 /// Where CRF encoder inference runs. The lattice decode is on the CPU either
@@ -1050,6 +1135,13 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
              (rebuild with `--features crf-decode`)"
         );
     }
+    // Which heads the two window-rule overrides reach, settled before any
+    // encoder is built: it is one small JSON parse per bundle here, where
+    // learning it inside the load loop costs an ONNX load per head before the
+    // offending one — and, on a GPU build, an ORT session torn down on the
+    // error path (pykeio/ort#609).
+    #[cfg(feature = "crf-decode")]
+    let window_flags = WindowFlagScope::plan(&args, &specs, &names)?;
     if args.input.is_empty() {
         anyhow::bail!("no input POD5 file(s) given");
     }
@@ -1192,41 +1284,34 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                 #[allow(unused_mut)]
                 let mut encoder = encoder;
                 // Both knobs describe how far a window may sit from a *detector's*
-                // adapter_end. A read-end model has no detector, so there is
-                // nothing for either to relax — and silently accepting them would
-                // report a "Boundary margin:" line for a bound that never runs.
-                if !encoder.metadata().needs_boundary() {
-                    for (flag, given) in [
-                        ("--boundary-margin", args.boundary_margin.is_some()),
-                        ("--clamp-max-shift", args.clamp_max_shift.is_some()),
-                    ] {
-                        if given {
-                            anyhow::bail!(
-                                "{flag} is not applicable: this model anchors its window on the \
-                             read end, so no boundary margin or window shift is involved."
-                            );
-                        }
-                    }
-                }
-                if let Some(margin) = args.boundary_margin {
+                // adapter_end. Which heads can take them was settled before the
+                // loop (`WindowFlagScope`); a read-end head skips them here and
+                // was named as doing so.
+                let takes_window_flags = window_flags.applies_to(head_name);
+                let axis = if specs.len() > 1 {
+                    format!("{head_name}: ")
+                } else {
+                    String::new()
+                };
+                if let Some(margin) = args.boundary_margin.filter(|_| takes_window_flags) {
                     let was = encoder.metadata().min_adapter_end();
                     encoder.set_boundary_margin(margin);
                     info!(
-                        "{} adapter_end >= {} (was {}); reads between the two decode instead \
-                     of routing to unclassified",
+                        "{} {axis}adapter_end >= {} (was {}); reads between the two decode \
+                         instead of routing to unclassified",
                         style::label("Boundary margin:"),
                         style::count(encoder.metadata().min_adapter_end()),
                         style::count(was),
                     );
                 }
-                if let Some(shift) = args.clamp_max_shift {
+                if let Some(shift) = args.clamp_max_shift.filter(|_| takes_window_flags) {
                     encoder.set_clamp_max_shift(shift);
                 }
                 let shift = encoder.metadata().clamp_max_shift();
                 if shift > 0 {
                     info!(
-                        "{} reads with adapter_end down to {} decode from [0, {}], sliding up \
-                     to {} samples past the adapter",
+                        "{} {axis}reads with adapter_end down to {} decode from [0, {}], \
+                         sliding up to {} samples past the adapter",
                         style::label("Window clamp:"),
                         style::count(encoder.metadata().signal.chunk.saturating_sub(shift)),
                         style::count(encoder.metadata().signal.chunk),
@@ -1291,6 +1376,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                     chains,
                     min_crf_margin: args.min_crf_margin,
                     min_crf_prob: args.min_crf_prob,
+                    refusals: Refusals::default(),
                 }))
             }
             #[cfg(not(feature = "crf-decode"))]
@@ -1556,8 +1642,12 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             ref_names: Vec::new(),
         })
         .collect();
-    let (class_tx, class_handle) =
-        spawn_class_writer(args.classifications.as_deref(), args.annotate, axes)?;
+    let (class_tx, class_handle) = spawn_class_writer(
+        args.classifications.as_deref(),
+        args.annotate,
+        axes,
+        needs_boundary,
+    )?;
 
     // ---- Stages A/B: produce classified reads ----
     //
@@ -1730,6 +1820,15 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     }
     summary.per_barcode.sort();
     produce_result?;
+    #[cfg(feature = "crf-decode")]
+    for h in heads.iter() {
+        if let ClassifyModel::Crf(c) = &h.model {
+            let report = c.refusals.report();
+            if !report.is_empty() {
+                summary.refusals.push((h.name.clone(), report));
+            }
+        }
+    }
 
     // Known only after the first scoring batch, unlike the other two GPU
     // fallbacks the loader reports: a `--ref-scores` panel the device could
@@ -2277,6 +2376,7 @@ fn produce_cpu(
                             class_tx,
                             read.for_writing(read.run_info_index),
                             Calls::One(Call::scoreless(barcode, conf)),
+                            e,
                             chunks,
                             run_infos,
                         );
@@ -2372,7 +2472,9 @@ fn produce_cpu_gbm(
                 let predicted = predictor.predict_many(&present).ok();
 
                 let mut next = 0usize;
-                for ((_, _, (read, chunks, run_infos)), feat) in chunk.into_iter().zip(&features) {
+                for ((_, (_, e), (read, chunks, run_infos)), feat) in
+                    chunk.into_iter().zip(&features)
+                {
                     let (barcode, conf) = match feat {
                         Some(_) => {
                             let out = match &predicted {
@@ -2401,6 +2503,7 @@ fn produce_cpu_gbm(
                         class_tx,
                         read.for_writing(read.run_info_index),
                         Calls::One(Call::scoreless(barcode, conf)),
+                        e,
                         chunks,
                         run_infos,
                     );
@@ -2496,6 +2599,7 @@ fn produce_cpu_crf_multi(
                         class_tx,
                         read.for_writing(read.run_info_index),
                         Calls::Many(calls),
+                        adapter_end,
                         chunks,
                         run_infos,
                     );
@@ -2523,34 +2627,42 @@ fn call_one_crf(
 ) -> Call {
     let meta = encoder.metadata();
     (|| {
-        let adc = signal?;
+        let Some(adc) = signal else {
+            Refusals::bump(&head.refusals.no_signal);
+            return None;
+        };
         // The detector reports `adapter_end` as an index into the decoded
         // prefix, which is what `prep` wants. Only the `chunk` samples ending
         // there are converted — the prefix itself can be the whole read under
         // LLR, or under a read-end anchor.
-        if !meta.prep_adc_into(
+        if let Err(why) = meta.prep_adc_into(
             adc,
             adapter_end,
             read.calibration_offset,
             read.calibration_scale,
             window,
         ) {
+            head.refusals.window(why);
             return None;
         }
         match &head.chains {
             Some(chains) => encoder
                 .basecall_prepped_with_refs(window, scratch, chains)
-                .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                .inspect_err(|e| {
+                    Refusals::bump(&head.refusals.encoder);
+                    tracing::warn!("encoder: {e}");
+                })
                 .ok()
                 .map(|s| call_barcode_scored(head, &s)),
             None => {
                 let seq = encoder
                     .basecall_prepped(window, scratch)
-                    .inspect_err(|e| tracing::warn!("encoder: {e}"))
+                    .inspect_err(|e| {
+                        Refusals::bump(&head.refusals.encoder);
+                        tracing::warn!("encoder: {e}");
+                    })
                     .ok()?;
-                call_barcode(head, &seq)
-                    .map(|(b, c)| Call::scoreless(b, c))
-                    .or_else(|| Some(Call::unclassified()))
+                Some(call_barcode(head, &seq))
             }
         }
     })()
@@ -2598,6 +2710,7 @@ fn produce_cpu_crf(
                         class_tx,
                         read.for_writing(read.run_info_index),
                         Calls::One(call),
+                        adapter_end,
                         chunks,
                         run_infos,
                     );
@@ -2610,10 +2723,10 @@ fn produce_cpu_crf(
 
 /// Match one decoded sequence to a reference, applying `--min-margin`.
 ///
-/// `None` means "no call" — either nothing matched, or the runner-up was too
-/// close — and the caller routes those to `unclassified`. Shared by the CPU and
-/// GPU CRF producers so the two cannot drift on the gate or on what confidence
-/// means.
+/// `unclassified` means "no call" — either nothing matched, or the runner-up
+/// was too close — and each is counted on the head as what it was. Shared by
+/// the CPU and GPU CRF producers so the two cannot drift on the gate or on
+/// what confidence means.
 ///
 /// Same gate as `demux basecall --min-margin`, including its treatment of a
 /// single reference: with no runner-up there is no margin to test, so the call
@@ -2621,15 +2734,19 @@ fn produce_cpu_crf(
 /// `eval_recovery.py`; a lone reference reports 0 rather than a fabricated
 /// distance.
 #[cfg(feature = "crf-decode")]
-fn call_barcode(head: &CrfHead, seq: &str) -> Option<(String, f64)> {
-    let m = head.refs.match_sequence(seq.as_bytes())?;
+fn call_barcode(head: &CrfHead, seq: &str) -> Call {
+    let Some(m) = head.refs.match_sequence(seq.as_bytes()) else {
+        Refusals::bump(&head.refusals.no_match);
+        return Call::unclassified();
+    };
     if !m.margin.is_none_or(|v| v >= head.min_margin) {
-        return None;
+        Refusals::bump(&head.refusals.gated);
+        return Call::unclassified();
     }
-    Some((
+    Call::scoreless(
         head.refs.name(m.index).to_string(),
         f64::from(m.margin.unwrap_or(0)),
-    ))
+    )
 }
 
 /// [`call_barcode`] with the lattice consulted as well — `--ref-scores`.
@@ -2646,6 +2763,7 @@ fn call_barcode(head: &CrfHead, seq: &str) -> Option<(String, f64)> {
 #[cfg(feature = "crf-decode")]
 fn call_barcode_scored(head: &CrfHead, scored: &ScoredDecode) -> Call {
     let Some(m) = head.refs.match_sequence(scored.sequence.as_bytes()) else {
+        Refusals::bump(&head.refusals.no_match);
         return Call::unclassified();
     };
     let crf = scored.call(m.index).map(|(logp, margin)| CrfRowScores {
@@ -2660,6 +2778,9 @@ fn call_barcode_scored(head: &CrfHead, scored: &ScoredDecode) -> Call {
                 .is_some_and(|t| c.margin.is_some_and(|m| m < t))
                 || head.min_crf_prob.is_some_and(|t| c.logp.exp() < t)
         });
+    if gated {
+        Refusals::bump(&head.refusals.gated);
+    }
     Call {
         barcode: if gated {
             UNCLASSIFIED.to_string()
@@ -2968,12 +3089,13 @@ fn produce_gpu_crf(
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
     /// Prepped windows per head (`None` = no usable window for that head),
-    /// each inner vector aligned with `items`.
+    /// each inner vector aligned with the items, which carry the detector's
+    /// `adapter_end` for the classifications CSV.
     ///
     /// Per head and not per read, because the heads disagree about the window:
     /// `signal.chunk` and the standardisation constants are both per bundle, so
     /// there is no shared tensor to hand the device.
-    type Block = (Vec<Vec<Option<Vec<f32>>>>, Vec<BlockItem>);
+    type Block = (Vec<Vec<Option<Vec<f32>>>>, Vec<(BlockItem, usize)>);
 
     let n_heads = heads.len();
     let gpu_block = crf_gpu_block();
@@ -3134,10 +3256,7 @@ fn produce_gpu_crf(
                                 .par_iter()
                                 .map(|seq| {
                                     seq.as_deref()
-                                        .and_then(|s| call_barcode(head, s))
-                                        .map_or_else(Call::unclassified, |(b, c)| {
-                                            Call::scoreless(b, c)
-                                        })
+                                        .map_or_else(Call::unclassified, |s| call_barcode(head, s))
                                 })
                                 .collect(),
                             (None, None) => unreachable!("one of the two arms always ran"),
@@ -3149,7 +3268,9 @@ fn produce_gpu_crf(
 
                     let n = items.len() as u64;
                     let t_route = std::time::Instant::now();
-                    for (i, (read, chunks, run_infos)) in items.into_iter().enumerate() {
+                    for (i, ((read, chunks, run_infos), adapter_end)) in
+                        items.into_iter().enumerate()
+                    {
                         // `Calls::One` for a single axis so that path keeps the
                         // allocation profile it had before axes existed.
                         let calls = match n_heads {
@@ -3169,6 +3290,7 @@ fn produce_gpu_crf(
                             class_tx,
                             read.for_writing(read.run_info_index),
                             calls,
+                            adapter_end,
                             chunks,
                             run_infos,
                         );
@@ -3239,19 +3361,27 @@ fn produce_gpu_crf(
                             chunk
                                 .par_iter()
                                 .map(|((signal, (_s, adapter_end)), (read, _, _))| {
-                                    let adc = signal.as_ref()?;
+                                    let Some(adc) = signal.as_ref() else {
+                                        Refusals::bump(&head.refusals.no_signal);
+                                        return None;
+                                    };
                                     let mut w = Vec::new();
                                     // Same conversion as the CPU path: only the
                                     // `chunk` samples ending at the anchor are
                                     // calibrated.
-                                    meta.prep_adc_into(
+                                    match meta.prep_adc_into(
                                         adc,
                                         *adapter_end,
                                         read.calibration_offset,
                                         read.calibration_scale,
                                         &mut w,
-                                    )
-                                    .then_some(w)
+                                    ) {
+                                        Ok(()) => Some(w),
+                                        Err(why) => {
+                                            head.refusals.window(why);
+                                            None
+                                        }
+                                    }
                                 })
                                 .collect()
                         })
@@ -3262,7 +3392,10 @@ fn produce_gpu_crf(
                     // Also frees this sub-block's decoded signal, on this
                     // thread, while the encoders wait behind it.
                     let t_drop = std::time::Instant::now();
-                    let items: Vec<BlockItem> = chunk.into_iter().map(|(_, item)| item).collect();
+                    let items: Vec<(BlockItem, usize)> = chunk
+                        .into_iter()
+                        .map(|((_, (_, adapter_end)), item)| (item, adapter_end))
+                        .collect();
                     if tracing_on {
                         GpuTrace::add(&trace.drop_ms, t_drop);
                     }
@@ -3345,7 +3478,12 @@ fn produce_gpu(
 ) -> anyhow::Result<()> {
     use escapepod_signal::dtw::GpuDtwContext;
 
-    type Meta = (ReadData, Vec<CompressedSignalChunk>, Arc<Vec<RunInfoData>>);
+    type Meta = (
+        ReadData,
+        Vec<CompressedSignalChunk>,
+        Arc<Vec<RunInfoData>>,
+        usize,
+    );
     type Block = (Vec<Vec<f64>>, Vec<Meta>);
     const GPU_BATCH: usize = 65_536;
 
@@ -3369,7 +3507,9 @@ fn produce_gpu(
                     escapepod_demux::DEFAULT_GPU_CHUNK_CELLS,
                 )
                 .map_err(|e| anyhow::anyhow!("GPU classify: {e}"))?;
-                for ((read, chunks, run_infos), (_p, result)) in metas.into_iter().zip(results) {
+                for ((read, chunks, run_infos, adapter_end), (_p, result)) in
+                    metas.into_iter().zip(results)
+                {
                     route(
                         routers_ref,
                         class_ref,
@@ -3378,6 +3518,7 @@ fn produce_gpu(
                             barcode_label(result.predicted_barcode),
                             result.confidence,
                         )),
+                        adapter_end,
                         chunks,
                         run_infos,
                     );
@@ -3411,7 +3552,12 @@ fn produce_gpu(
                     .collect();
                 let bulk = reader.get_compressed_signal_bulk(&keyed)?;
 
-                type Prepped = (ReadData, Option<Vec<f64>>, Vec<CompressedSignalChunk>);
+                type Prepped = (
+                    ReadData,
+                    Option<Vec<f64>>,
+                    Vec<CompressedSignalChunk>,
+                    usize,
+                );
                 // Windowed: decode once, batch-detect (GPU CNN = one call/window;
                 // LLR / CPU-CNN = parallel per read), then parallel fingerprint.
                 // A fingerprint head reads the adapter region itself, never the
@@ -3451,22 +3597,24 @@ fn produce_gpu(
                                 read.for_writing(read.run_info_index),
                                 features,
                                 chunks.clone(),
+                                e,
                             ))
                         })
                         .collect();
                     pb.inc(window.len() as u64);
 
-                    for (read, fp_opt, chunks) in prepped.into_iter().flatten() {
+                    for (read, fp_opt, chunks, adapter_end) in prepped.into_iter().flatten() {
                         match fp_opt {
                             Some(values) => {
                                 fps.push(values);
-                                metas.push((read, chunks, run_infos.clone()));
+                                metas.push((read, chunks, run_infos.clone(), adapter_end));
                             }
                             None => route(
                                 routers,
                                 class_tx,
                                 read,
                                 Calls::One(Call::unclassified()),
+                                adapter_end,
                                 chunks,
                                 run_infos.clone(),
                             ),
@@ -3691,14 +3839,49 @@ struct AxisOut {
     ref_names: Vec<String>,
 }
 
+/// The classifications CSV header for these axes.
+///
+/// One axis keeps the historical `barcode,confidence[,crf_*]` spelling
+/// verbatim, so existing consumers of this CSV are untouched; several need
+/// each column to say which axis it belongs to. `adapter_end` comes last, and
+/// only when a boundary detector ran: consumers read this file by column name,
+/// so a trailing column is the one addition that cannot shift anything.
+fn class_header(axes: &[AxisOut], with_adapter_end: bool) -> String {
+    let sole = axes.len() == 1;
+    let mut header = String::from("read_id");
+    for axis in axes {
+        if sole {
+            header.push_str(",barcode,confidence");
+        } else {
+            header.push_str(&format!(",{0},{0}_confidence", axis.name));
+        }
+        if !axis.ref_names.is_empty() {
+            for suffix in ["crf_logp", "crf_margin", "crf_best", "mean_logpost"] {
+                header.push(',');
+                if sole {
+                    header.push_str(suffix);
+                } else {
+                    header.push_str(&format!("{}_{suffix}", axis.name));
+                }
+            }
+        }
+    }
+    if with_adapter_end {
+        header.push_str(",adapter_end");
+    }
+    header
+}
+
 /// Optional classifications-CSV writer thread. With `collect` it also
 /// accumulates what the `--annotate` sidecar write records, returned through
-/// the join handle.
+/// the join handle. `with_adapter_end` adds the detector's `adapter_end` as
+/// the last CSV column — see [`class_header`].
 #[allow(clippy::type_complexity)]
 fn spawn_class_writer(
     path: Option<&Path>,
     collect: bool,
     axes: Vec<AxisOut>,
+    with_adapter_end: bool,
 ) -> anyhow::Result<(
     Option<ClassTx>,
     Option<std::thread::JoinHandle<anyhow::Result<Option<Collected>>>>,
@@ -3712,34 +3895,11 @@ fn spawn_class_writer(
         use std::io::Write;
         // Whether an axis scores is a property of its head, not of a read, so
         // the header is settled once here rather than per row.
-        let sole = axes.len() == 1;
         let mut writer = match &path {
             Some(path) => {
                 let file = std::fs::File::create(path)?;
                 let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
-                let mut header = String::from("read_id");
-                for axis in &axes {
-                    // One axis keeps the historical `barcode,confidence[,crf_*]`
-                    // spelling verbatim, so existing consumers of this CSV are
-                    // untouched; several need each column to say which axis it
-                    // belongs to.
-                    if sole {
-                        header.push_str(",barcode,confidence");
-                    } else {
-                        header.push_str(&format!(",{0},{0}_confidence", axis.name));
-                    }
-                    if !axis.ref_names.is_empty() {
-                        for suffix in ["crf_logp", "crf_margin", "crf_best", "mean_logpost"] {
-                            header.push(',');
-                            if sole {
-                                header.push_str(suffix);
-                            } else {
-                                header.push_str(&format!("{}_{suffix}", axis.name));
-                            }
-                        }
-                    }
-                }
-                writeln!(w, "{header}")?;
+                writeln!(w, "{}", class_header(&axes, with_adapter_end))?;
                 Some(w)
             }
             None => None,
@@ -3758,7 +3918,11 @@ fn spawn_class_writer(
                 .collect(),
         });
         for row in rx.iter() {
-            let ClassRow { read_id, calls } = row;
+            let ClassRow {
+                read_id,
+                calls,
+                adapter_end,
+            } = row;
             if let Some(w) = &mut writer {
                 write!(w, "{read_id}")?;
                 for (axis, call) in axes.iter().zip(calls.iter()) {
@@ -3782,6 +3946,9 @@ fn spawn_class_writer(
                         )?,
                         None => write!(w, ",,,,")?,
                     }
+                }
+                if with_adapter_end {
+                    write!(w, ",{adapter_end}")?;
                 }
                 writeln!(w)?;
             }
@@ -4076,6 +4243,10 @@ mod pinned_sha_tests {
 #[derive(Default)]
 struct DemuxSummary {
     per_barcode: Vec<(String, usize)>,
+    /// Per CRF axis, why its reads went `unclassified`: `(axis, [(reason,
+    /// count)])`, reasons with a zero count already dropped. Empty for the
+    /// fingerprint heads, which have no window rules to report on.
+    refusals: Vec<(String, Vec<(String, usize)>)>,
     /// How many axes the rows span. Above one the counts are per axis, so they
     /// sum to `reads x axes` and a single "total reads" line over them would be
     /// a multiple of the run's actual read count.
@@ -4092,6 +4263,9 @@ fn print_summary(summary: &DemuxSummary) {
         println!("\n{}", style::action("Demux summary:"));
         for (barcode, n) in &summary.per_barcode {
             println!("  {} {}", style::label(barcode), style::count(*n));
+        }
+        for line in refusal_lines(&summary.refusals, summary.axes > 1) {
+            println!("{line}");
         }
         let labels = summary.per_barcode.len();
         match (summary.axes > 1, summary.wrote_files) {
@@ -4117,6 +4291,242 @@ fn print_summary(summary: &DemuxSummary) {
                 labels,
             ),
         }
+    }
+}
+
+/// The `unclassified` breakdown under the barcode table: one line per
+/// `(axis, reason)`, the axis named only when there are several.
+///
+/// Plain text rather than styled, and a function rather than inline in
+/// `print_summary`, so the exact wording is pinned by a test — this is the
+/// line a pipeline greps to decide whether a bundle's window rules are worth
+/// revisiting.
+fn refusal_lines(refusals: &[(String, Vec<(String, usize)>)], name_axes: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if refusals.is_empty() {
+        return out;
+    }
+    out.push("  unclassified, by reason:".to_string());
+    for (axis, reasons) in refusals {
+        for (reason, n) in reasons {
+            if name_axes {
+                out.push(format!("    {axis}: {reason} {n}"));
+            } else {
+                out.push(format!("    {reason} {n}"));
+            }
+        }
+    }
+    out
+}
+
+/// Which heads `--boundary-margin` / `--clamp-max-shift` reach.
+///
+/// Both describe how far a window may sit from a *detector's* `adapter_end`,
+/// so a read-end head has nothing for them to relax. With only such models the
+/// flags are refused — accepting them would print a "Boundary margin:" line
+/// for a bound that never runs. In a run that also has heads with a detector
+/// the flags go to those, and the read-end heads are named as ignoring them:
+/// refusing there made the flags unusable on any dual-indexed library, which
+/// is exactly where a bundle that declares no margin of its own needs them
+/// (#323).
+#[cfg(feature = "crf-decode")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WindowFlagScope {
+    /// Heads the overrides apply to.
+    applies: Vec<String>,
+    /// Read-end heads that ignore them.
+    ignored: Vec<String>,
+}
+
+#[cfg(feature = "crf-decode")]
+impl WindowFlagScope {
+    /// Decide from the command line and each bundle's sidecar, warning once for
+    /// the heads that ignore the flags. Loads no encoder.
+    fn plan(args: &RunArgs, specs: &[ModelSpec], names: &[String]) -> anyhow::Result<Self> {
+        let given: Vec<&str> = [
+            ("--boundary-margin", args.boundary_margin.is_some()),
+            ("--clamp-max-shift", args.clamp_max_shift.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, given)| given.then_some(flag))
+        .collect();
+        if given.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut heads = Vec::with_capacity(specs.len());
+        for (spec, name) in specs.iter().zip(names) {
+            // The fingerprint heads never had these flags; they are ignored
+            // there as before and are not what this decides.
+            let Some(dir) = crf_bundle_dir(&spec.path) else {
+                continue;
+            };
+            let meta = CrfMetadata::load(dir.join("metadata.json"))?;
+            heads.push((name.clone(), meta.needs_boundary()));
+        }
+        let scope = Self::resolve(&given, heads)?;
+        if !scope.ignored.is_empty() {
+            tracing::warn!(
+                "{} appl{} to {}; {} anchor{} on the read end and ignore{} {}",
+                given.join(" and "),
+                if given.len() == 1 { "ies" } else { "y" },
+                scope.applies.join(", "),
+                scope.ignored.join(", "),
+                if scope.ignored.len() == 1 { "s" } else { "" },
+                if scope.ignored.len() == 1 { "s" } else { "" },
+                if given.len() == 1 { "it" } else { "them" },
+            );
+        }
+        Ok(scope)
+    }
+
+    /// The decision itself, over `(head, has a boundary detector)` pairs — pure,
+    /// so it is testable without bundles on disk.
+    fn resolve(given: &[&str], heads: Vec<(String, bool)>) -> anyhow::Result<Self> {
+        let (applies, ignored): (Vec<_>, Vec<_>) = heads
+            .into_iter()
+            .partition(|(_, has_boundary)| *has_boundary);
+        let applies: Vec<String> = applies.into_iter().map(|(name, _)| name).collect();
+        let ignored: Vec<String> = ignored.into_iter().map(|(name, _)| name).collect();
+        if applies.is_empty() && !ignored.is_empty() {
+            anyhow::bail!(
+                "{} {} not applicable: {} anchors its window on the read end, so no \
+                 boundary margin or window shift is involved.",
+                given.join(" and "),
+                if given.len() == 1 { "is" } else { "are" },
+                if ignored.len() == 1 {
+                    "this model"
+                } else {
+                    "every model given"
+                },
+            );
+        }
+        Ok(Self { applies, ignored })
+    }
+
+    fn applies_to(&self, head: &str) -> bool {
+        self.applies.iter().any(|h| h == head)
+    }
+}
+
+#[cfg(test)]
+mod window_rule_tests {
+    use super::{AxisOut, class_header, refusal_lines};
+
+    fn axis(name: &str, scored: bool) -> AxisOut {
+        AxisOut {
+            name: name.to_string(),
+            ref_names: if scored {
+                vec!["a".to_string(), "b".to_string()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// `adapter_end` is a trailing column, present only when a detector ran,
+    /// and the historical single-axis spelling stays byte-identical without it.
+    #[test]
+    fn adapter_end_is_a_trailing_column() {
+        assert_eq!(
+            class_header(&[axis("barcode", false)], false),
+            "read_id,barcode,confidence"
+        );
+        assert_eq!(
+            class_header(&[axis("barcode", false)], true),
+            "read_id,barcode,confidence,adapter_end"
+        );
+        assert_eq!(
+            class_header(&[axis("barcode", true)], true),
+            "read_id,barcode,confidence,crf_logp,crf_margin,crf_best,mean_logpost,adapter_end"
+        );
+        assert_eq!(
+            class_header(&[axis("ldx", false), axis("fdx", true)], true),
+            "read_id,ldx,ldx_confidence,fdx,fdx_confidence,fdx_crf_logp,fdx_crf_margin,\
+             fdx_crf_best,fdx_mean_logpost,adapter_end"
+        );
+    }
+
+    /// The breakdown names the axis only when there are several, and prints
+    /// nothing at all when nothing was refused.
+    #[test]
+    fn refusal_lines_name_axes_only_when_several() {
+        assert!(refusal_lines(&[], true).is_empty());
+        let one = vec![(
+            "barcode".to_string(),
+            vec![("adapter_end within the boundary margin".to_string(), 7)],
+        )];
+        assert_eq!(
+            refusal_lines(&one, false),
+            [
+                "  unclassified, by reason:",
+                "    adapter_end within the boundary margin 7"
+            ]
+        );
+        let two = vec![
+            (
+                "ldx".to_string(),
+                vec![("read shorter than the window".to_string(), 1)],
+            ),
+            (
+                "fdx".to_string(),
+                vec![("read shorter than the window".to_string(), 2)],
+            ),
+        ];
+        assert_eq!(
+            refusal_lines(&two, true),
+            [
+                "  unclassified, by reason:",
+                "    ldx: read shorter than the window 1",
+                "    fdx: read shorter than the window 2"
+            ]
+        );
+    }
+
+    /// The flags go to the heads with a detector and are refused only when no
+    /// head has one — the case the original single-model refusal was for.
+    #[cfg(feature = "crf-decode")]
+    #[test]
+    fn window_flags_scope_to_boundary_heads() {
+        use super::WindowFlagScope;
+        let scope = WindowFlagScope::resolve(
+            &["--clamp-max-shift"],
+            vec![("ldx".to_string(), true), ("fdx".to_string(), false)],
+        )
+        .unwrap();
+        assert_eq!(scope.applies, ["ldx"]);
+        assert_eq!(scope.ignored, ["fdx"]);
+        assert!(scope.applies_to("ldx"));
+        assert!(!scope.applies_to("fdx"));
+
+        let err = WindowFlagScope::resolve(
+            &["--boundary-margin", "--clamp-max-shift"],
+            vec![("fdx".to_string(), false)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--boundary-margin and --clamp-max-shift are not applicable"),
+            "{err}"
+        );
+        assert!(
+            err.contains("this model anchors its window on the read end"),
+            "{err}"
+        );
+
+        // Two read-end heads: still refused, and the wording says so.
+        let err = WindowFlagScope::resolve(
+            &["--clamp-max-shift"],
+            vec![("a".to_string(), false), ("b".to_string(), false)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("every model given anchors"), "{err}");
+
+        // No CRF head at all (fingerprint models): nothing to scope, nothing refused.
+        assert_eq!(
+            WindowFlagScope::resolve(&["--clamp-max-shift"], Vec::new()).unwrap(),
+            WindowFlagScope::default()
+        );
     }
 }
 
