@@ -122,7 +122,11 @@ pub struct BasecallArgs {
     /// `chunk - adapter_end` is at most N. 0 disables it.
     ///
     /// Reaches reads `--boundary-margin` cannot: their window would start before
-    /// sample 0. See `escpod demux --help` for the recovery/quality tradeoff.
+    /// sample 0. Measured against an independent label those reads are mostly
+    /// not callable (28% design-consistent at shifts up to 300 against 85% for
+    /// full-window reads; #323) — see `escpod demux --help` before turning it
+    /// on, and check the calls it adds against something the decode cannot
+    /// influence.
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub clamp_max_shift: Option<usize>,
 
@@ -447,7 +451,8 @@ fn produce_blocks(
                             read.calibration_scale,
                             &mut w,
                         )
-                        .then_some(w)
+                        .ok()
+                        .map(|()| w)
                     })();
                     (read.read_id, adapter_end, window)
                 })

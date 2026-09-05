@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A fused run with a read-end head no longer refuses `--boundary-margin` /
+  `--clamp-max-shift`** (#323). Both flags describe how far a CRF window may
+  sit from a *detector's* `adapter_end`, and the guard that refuses them for a
+  read-end bundle (which has no detector) ran per head — so any run that
+  combined a 3′ index with a 5′ one bailed with "not applicable", and the
+  flags could not be used on exactly the dual-indexed library where a bundle
+  that declares no margin of its own needs them. The scope is now settled once,
+  before any encoder is built (one JSON parse per bundle, so the refusal no
+  longer costs an ONNX load — or, on a GPU build, an ORT session torn down on
+  the error path — per head ahead of the offending one): the flags apply to
+  every head with a boundary detector, read-end heads ignore them and are
+  named as doing so, and a run with only read-end models is refused as
+  before. The `Boundary margin:` / `Window clamp:` status lines name their
+  axis in a multi-axis run.
+
+### Added
+
+- **`Demux summary:` breaks `unclassified` down by reason**, per axis. Six
+  things produced an identical confidence-0 `unclassified` row — the boundary
+  margin, the window clamp, the detector's `adapter_end = 0` sentinel, a read
+  shorter than the window, an encoder error, a decode that matched no
+  reference — plus the gates, and only the last is a classifier decision. The
+  rest are exactly the counts that decide whether a bundle's window rules are
+  worth revisiting, and until now getting them meant a second `demux detect`
+  pass and a join by hand. `CrfMetadata::prep_adc_into` now returns
+  `Result<(), WindowRefusal>` rather than a `bool`, `CrfMetadata::refusal`
+  asks the same question without converting anything, and the CRF heads tally
+  each reason as they refuse.
+- **The classifications CSV carries `adapter_end`** as a trailing column
+  whenever a boundary detector ran (every head, single- or multi-axis), so
+  calls can be split by `adapter_end` band against an independent label per
+  run. Trailing, and absent when no detector ran, so consumers that read the
+  file by column name see nothing move.
+
+### Changed
+
+- **The window clamp is documented against an independent label, and the
+  advice has reversed.** #194's recommendation rested on "within 2 edits of
+  the nearest reference" — a metric a window holding no barcode passes, since
+  such a window still decodes to a *perfect* reference, whichever one the
+  degenerate signal sits nearest. Scored instead against the 5′ index on the
+  same molecule (`barcode_crf_ldx32_rna004@v0.2.1`, FDX Run1, 20k reads
+  stratified by `adapter_end`; chance ≈ 12%):
+
+  | `adapter_end` | share of run | rule | design-consistent | calls to absent codes |
+  |---|---|---|---|---|
+  | ≥ 3200 | 85.1% | none | 85% | 5% |
+  | 3000–3199 | 1.7% | margin 0 | 55% | 27% |
+  | 2700–2999 | 2.0% | clamp ≤ 300 | 28% | 45% |
+  | < 2700 | 8.5% | larger clamps | chance | 56–67% |
+
+  The flag help, `CrfMetadata::clamp_max_shift`'s doc and a new "Window
+  rules" section in `docs/cli/demux.md` now say so: leave the clamp at 0, use
+  a lowered margin only under `--min-crf-margin` (84% consistent at 56% yield
+  under the bundle's gate of 2.0), and declare measured values in the bundle
+  rather than passing the flags per run. The nbc16 numbers were not wrong on
+  their own terms — a 16-code panel has every attractor code *in* the pool,
+  which is precisely what that metric cannot see.
+
 ## 0.20.0 (2026-09-04)
 
 ### Performance

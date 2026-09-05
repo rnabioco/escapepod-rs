@@ -35,10 +35,11 @@ Key options (see `escpod demux --help` for the full set):
 | `--model [NAME=]<PATH>` | Model: DTW-SVM / GBM JSON, or a CTC-CRF bundle directory. Repeatable — see [Several barcode axes](#several-barcode-axes-in-one-pass) |
 | `-d, --output-dir <DIR>` | Write per-barcode POD5 files (optional with `--annotate`) |
 | `--annotate` | Record assignments in each input's `.p5s` sidecar |
-| `--classifications <FILE>` | Also write a `read_id,barcode,confidence` CSV |
+| `--classifications <FILE>` | Also write a `read_id,barcode,confidence[,crf_*],adapter_end` CSV |
 | `--prefix <STR>` | Split-file prefix (default: `barcode`) |
 | `--method <cnn\|llr>` | Adapter detector (CRF bundles pin their own) |
 | `--device <auto\|cpu\|gpu>` | Where GPU-capable stages run (default `auto`) — see [GPU acceleration](#gpu-acceleration) |
+| `--boundary-margin <N>`, `--clamp-max-shift <N>` | Overrule a CRF bundle's window rules — see [Window rules](#window-rules-which-reads-a-crf-head-decodes) before using either |
 | `--info` | Describe the model and exit |
 
 ### Sidecar output
@@ -115,8 +116,62 @@ Four rules, each an error rather than a surprise:
   or `unclassified`.
 
 A single-model run is unchanged: the sidecar column is still `barcode` and
-the classifications CSV is still `read_id,barcode,confidence`. Only a
-multi-axis run prefixes its columns (`ldx`, `ldx_confidence`, …).
+the classifications CSV is still `read_id,barcode,confidence` (plus a trailing
+`adapter_end` whenever a boundary detector ran). Only a multi-axis run
+prefixes its columns (`ldx`, `ldx_confidence`, …).
+
+### Window rules: which reads a CRF head decodes
+
+A CTC-CRF head decodes a fixed window of `signal.chunk` samples measured back
+from the boundary detector's `adapter_end` — or from the read's last sample,
+for a read-end bundle such as a 5′ index, which has no detector and only ever
+refuses a read shorter than the window. Two rules in the bundle decide whether
+a read has such a window at all, and both can be overruled per run:
+
+| Rule | Bundle key | Flag | Refuses |
+|---|---|---|---|
+| Boundary margin | `boundary.margin` (unset → 200) | `--boundary-margin N` | `adapter_end` in `[chunk, chunk + margin)` |
+| Window clamp | `boundary.clamp_max_shift` (unset → 0, off) | `--clamp-max-shift N` | `adapter_end < chunk`, unless `chunk - adapter_end ≤ N`, in which case the read decodes from `[0, chunk]` instead |
+
+A refused read routes to `unclassified` with confidence 0, undecoded. On the
+two RNA004 tRNA flowcells this was measured on, about 15% of reads have an
+`adapter_end` below 3200 (the ldx32 window plus its margin), so the rules are
+worth knowing about — but relaxing them is not free. Measured on
+`barcode_crf_ldx32_rna004@v0.2.1` over a co-barcoded run, scoring each 3′
+call against the independent 5′ index on the same molecule
+([#323](https://github.com/rnabioco/escapepod-rs/issues/323)):
+
+| `adapter_end` | share of run | rule that reaches it | design-consistent calls | calls to codes absent from the pool |
+|---|---|---|---|---|
+| ≥ 3200 | 85.1% | none | 85% | 5% |
+| 3000–3199 | 1.7% | `--boundary-margin 0` | 55% | 27% |
+| 2700–2999 | 2.0% | `--clamp-max-shift 300` | 28% | 45% |
+| < 2700 | 8.5% | a larger clamp | chance | 56–67% |
+
+A window that holds no barcode still decodes to a *perfect* reference —
+whichever one the degenerate signal happens to sit nearest — so a recovered
+band reporting "median edit distance 0" is not evidence that it is callable.
+Check recovered calls against something the decode cannot influence (a second
+index, an adapter the basecaller reads, a pool of known composition), and if a
+band is worth keeping, keep it under `--min-crf-margin`: the margin band above
+is 84% consistent under the ldx32 bundle's declared gate of 2.0, at 56% yield.
+Leave the clamp at 0 unless a measurement of that kind says otherwise, and
+prefer declaring measured values in the bundle — `escpod demux --model
+<bundle> --info` shows what it declares — over passing the flags on every run.
+
+Two things make the rules observable without a second `detect` pass:
+
+- **The summary says why.** Under the barcode table, `unclassified, by reason:`
+  counts each window rule, the detector's `adapter_end = 0` sentinel, reads
+  shorter than the window, encoder errors, decodes that matched no reference,
+  and the gates — per axis in a multi-axis run.
+- **The classifications CSV carries `adapter_end`** as its last column
+  whenever a boundary detector ran, so calls can be split by band against any
+  independent label.
+
+In a multi-axis run both flags apply to every head that has a boundary
+detector; a read-end head ignores them and is named as doing so. With only
+read-end models they are refused.
 
 The stepwise subcommands below remain available for running stages
 individually or inspecting intermediates.
