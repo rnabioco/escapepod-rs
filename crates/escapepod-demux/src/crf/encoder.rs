@@ -434,14 +434,13 @@ impl CrfMetadata {
     /// overloaded "no adapter" / "too short" / "inference failed" sentinel)
     /// ends up unclassified rather than guessed at.
     pub fn prep(&self, signal_pa: &[f32], adapter_end: usize) -> Option<Vec<f32>> {
-        let (lo, hi) = self.window(adapter_end, signal_pa.len())?;
+        let (lo, hi) = self.window(adapter_end, signal_pa.len()).ok()?;
         let mut out = Vec::with_capacity(self.signal.chunk);
         self.standardise(&signal_pa[lo..hi], &mut out);
         Some(out)
     }
 
-    /// The `chunk`-sample window to decode, or `None` if the read cannot supply
-    /// one.
+    /// The `chunk`-sample window to decode, or why the read cannot supply one.
     ///
     /// Which end it is measured from is the bundle's [`Anchor`]. Under
     /// [`Anchor::ReadEnd`] this is `[len - chunk, len]` and `adapter_end` is
@@ -449,14 +448,26 @@ impl CrfMetadata {
     /// and no shift to clamp, and the only way to fail is a read shorter than
     /// the window. `len` must therefore be the read's *full* length; see
     /// [`Self::needs_full_read`].
-    fn window(&self, adapter_end: usize, len: usize) -> Option<(usize, usize)> {
+    fn window(&self, adapter_end: usize, len: usize) -> Result<(usize, usize), WindowRefusal> {
         match self.signal.anchor() {
             Anchor::AdapterEnd => self.window_from_adapter_end(adapter_end, len),
-            // `checked_sub` rather than a `len >= chunk` guard with
-            // `then_some`, which evaluates the subtraction eagerly and
-            // underflows on exactly the short read the guard exists to reject.
-            Anchor::ReadEnd => len.checked_sub(self.signal.chunk).map(|lo| (lo, len)),
+            // `checked_sub` rather than a `len >= chunk` guard, which evaluates
+            // the subtraction eagerly and underflows on exactly the short read
+            // the guard exists to reject.
+            Anchor::ReadEnd => len
+                .checked_sub(self.signal.chunk)
+                .map(|lo| (lo, len))
+                .ok_or(WindowRefusal::ShortRead),
         }
+    }
+
+    /// Why [`Self::prep`] would refuse this read, if it would.
+    ///
+    /// The same decision `prep` and [`Self::prep_adc_into`] make, exposed so a
+    /// caller that only wants to *count* refusals (a run summary) need not
+    /// convert the window to find out.
+    pub fn refusal(&self, adapter_end: usize, len: usize) -> Option<WindowRefusal> {
+        self.window(adapter_end, len).err()
     }
 
     /// [`Self::window`] under [`Anchor::AdapterEnd`].
@@ -467,32 +478,42 @@ impl CrfMetadata {
     /// substitutes `[0, chunk]`: the same width, anchored at the read start,
     /// sliding `chunk - adapter_end` samples of downstream signal into the tail.
     ///
-    /// The CRF tolerates that slide better than it looks: measured on RNA004
-    /// nbc16 with known-good reads deliberately slid forward, the same barcode
-    /// is still called for 98.6% at shift 0 and 93.5% at shift 500. Quality does
-    /// decay with the shift, which is why the allowance is a bound and not a
-    /// bool — see [`CrfMetadata::clamp_max_shift`].
-    fn window_from_adapter_end(&self, adapter_end: usize, len: usize) -> Option<(usize, usize)> {
+    /// Whether that slide decodes anything useful is a property of the data,
+    /// not of the decoder, and it has to be measured against a label the decode
+    /// cannot influence — see [`CrfMetadata::clamp_max_shift`] for what that
+    /// measurement found. Here the rule is only applied.
+    fn window_from_adapter_end(
+        &self,
+        adapter_end: usize,
+        len: usize,
+    ) -> Result<(usize, usize), WindowRefusal> {
         let chunk = self.signal.chunk;
         if adapter_end > len {
-            return None;
+            return Err(WindowRefusal::PastEnd);
         }
         if adapter_end >= self.min_adapter_end() {
-            return Some((adapter_end - chunk, adapter_end));
+            return Ok((adapter_end - chunk, adapter_end));
         }
         // `adapter_end` in `[chunk, chunk + margin)` has a real window and is
         // refused by the margin, not by geometry; clamping is not that lever.
         if adapter_end >= chunk {
-            return None;
+            return Err(WindowRefusal::BelowMargin);
         }
         // 0 is the detector's overloaded "no adapter" / "too short" / "inference
         // failed" sentinel. Clamping it would decode a window with no adapter in
         // it at all and hand back a confident-looking call.
-        if adapter_end == 0 || len < chunk {
-            return None;
+        if adapter_end == 0 {
+            return Err(WindowRefusal::NoAdapter);
+        }
+        if len < chunk {
+            return Err(WindowRefusal::ShortRead);
         }
         let shift = chunk - adapter_end;
-        (shift <= self.clamp_max_shift()).then_some((0, chunk))
+        if shift <= self.clamp_max_shift() {
+            Ok((0, chunk))
+        } else {
+            Err(WindowRefusal::BeforeChunk)
+        }
     }
 
     /// [`Self::prep`], but straight from ADC counts and converting only the
@@ -517,8 +538,9 @@ impl CrfMetadata {
     /// not: two roundings instead of one, differing by ~1 ulp. Both CRF entry
     /// points now agree with the reference.
     ///
-    /// Writes into `out` so a per-worker buffer survives across reads. Returns
-    /// `false`, leaving `out` empty, exactly where [`Self::prep`] returns `None`.
+    /// Writes into `out` so a per-worker buffer survives across reads. Refuses,
+    /// leaving `out` empty, exactly where [`Self::prep`] returns `None` — and
+    /// says why, so a caller can count the reasons rather than the fact.
     pub fn prep_adc_into(
         &self,
         adc: &[i16],
@@ -526,11 +548,9 @@ impl CrfMetadata {
         offset: f32,
         scale: f32,
         out: &mut Vec<f32>,
-    ) -> bool {
+    ) -> Result<(), WindowRefusal> {
         out.clear();
-        let Some((lo, hi)) = self.window(adapter_end, adc.len()) else {
-            return false;
-        };
+        let (lo, hi) = self.window(adapter_end, adc.len())?;
         let (mean, stdev) = (self.standardisation.mean, self.standardisation.stdev);
         let bias = offset * scale;
         out.extend(
@@ -538,7 +558,7 @@ impl CrfMetadata {
                 .iter()
                 .map(|&v| (f32::from(v).mul_add(scale, bias) - mean) / stdev),
         );
-        true
+        Ok(())
     }
 
     /// Smallest `adapter_end` that yields a usable window.
@@ -564,13 +584,23 @@ impl CrfMetadata {
     /// clamping entirely.
     ///
     /// A bound rather than a bool because recovery quality decays with the
-    /// shift, so the useful question is how far to go, not whether. On the
-    /// RNA004 nbc16 run, decoding the whole `adapter_end` 2,500-2,999 band this
-    /// way returned 42,404 reads at median edit distance 0 — but agreement fell
-    /// from 97.4% within 2 edits at shift 0-99 to 92.9% at 400-499, and the
-    /// fraction that still align to a tRNA fell from 78.5% to 50.0%, because a
-    /// larger shift means more of the adapter was truncated in the first place.
-    /// Pick the bound from how much of that tail is worth having.
+    /// shift, so the useful question is how far to go, not whether. What that
+    /// curve looks like depends on the data far more than on the decoder, and
+    /// it has to be measured against a label the decode cannot influence: the
+    /// edit distance to the nearest reference is *not* one, because a window
+    /// holding no barcode still decodes to a perfect reference — whichever one
+    /// the degenerate signal happens to sit nearest.
+    ///
+    /// Measured that way on `barcode_crf_ldx32_rna004@v0.2.1` over FDX Run1,
+    /// scoring each 3' call against the 5' index on the same molecule
+    /// (rnabioco/escapepod-rs#323): reads with a full window agree with the
+    /// design 85% of the time; the `[chunk - 300, chunk)` band a clamp of 300
+    /// reaches agrees 28% of the time, with 45% of its calls landing on codes
+    /// absent from the pool, and every band further down is at chance. The
+    /// nbc16 numbers that motivated the flag (97% "within 2 edits") came from a
+    /// 16-code panel where every attractor code was in the pool — exactly the
+    /// case an edit-distance metric cannot see. Declare a non-zero bound only
+    /// from a measurement of the first kind.
     pub fn clamp_max_shift(&self) -> usize {
         self.clamp_override
             .or_else(|| self.boundary.as_ref().and_then(|b| b.clamp_max_shift))
@@ -594,6 +624,65 @@ impl CrfMetadata {
     /// before it is baked into an export.
     pub fn set_boundary_margin(&mut self, margin: usize) {
         self.margin_override = Some(margin);
+    }
+}
+
+/// Why a read has no window to decode.
+///
+/// One variant per rule in [`CrfMetadata::window`], so a run can say *which*
+/// rule refused its reads instead of folding every refusal into
+/// `unclassified`. Which one binds is the whole question when deciding
+/// whether a bundle's margin or clamp is worth changing, and until this
+/// existed answering it meant re-running detection and joining by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WindowRefusal {
+    /// `adapter_end == 0`: the boundary detector's overloaded "no adapter" /
+    /// "too short" / "inference failed" sentinel. Never clamped.
+    NoAdapter,
+    /// `adapter_end` in `[chunk, chunk + margin)`: a full window exists, but
+    /// the training corpus never held one this close to the read's start.
+    BelowMargin,
+    /// `adapter_end < chunk` and `chunk - adapter_end` exceeds the clamp (or
+    /// clamping is off): the window would start before sample 0.
+    BeforeChunk,
+    /// The read holds fewer than `chunk` samples, so no window of that width
+    /// fits — the only refusal a read-end anchor can produce.
+    ShortRead,
+    /// `adapter_end` lies past the decoded signal: the detector saw more of
+    /// the read than the caller decoded.
+    PastEnd,
+}
+
+impl WindowRefusal {
+    /// Every variant, in the order a summary should list them.
+    pub const ALL: [Self; 5] = [
+        Self::NoAdapter,
+        Self::BelowMargin,
+        Self::BeforeChunk,
+        Self::ShortRead,
+        Self::PastEnd,
+    ];
+
+    /// Stable position in [`Self::ALL`], for indexing a counter array.
+    pub fn index(self) -> usize {
+        match self {
+            Self::NoAdapter => 0,
+            Self::BelowMargin => 1,
+            Self::BeforeChunk => 2,
+            Self::ShortRead => 3,
+            Self::PastEnd => 4,
+        }
+    }
+
+    /// A short, user-facing label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoAdapter => "no adapter detected (adapter_end = 0)",
+            Self::BelowMargin => "adapter_end within the boundary margin",
+            Self::BeforeChunk => "adapter ends before the window, beyond the clamp",
+            Self::ShortRead => "read shorter than the window",
+            Self::PastEnd => "adapter_end past the decoded signal",
+        }
     }
 }
 
@@ -953,35 +1042,62 @@ mod tests {
         assert_eq!(m.clamp_max_shift(), 0, "off unless asked for");
 
         // Disabled: anything short of a full window is refused.
-        assert_eq!(m.window(chunk, 9_000), Some((0, chunk)), "exactly a window");
-        assert_eq!(m.window(1_900, 9_000), None);
+        assert_eq!(m.window(chunk, 9_000), Ok((0, chunk)), "exactly a window");
+        assert_eq!(m.window(1_900, 9_000), Err(WindowRefusal::BeforeChunk));
 
         m.set_clamp_max_shift(500);
         // Inside the bound: same width, anchored at the read start.
-        assert_eq!(m.window(1_900, 9_000), Some((0, chunk)), "shift 100");
+        assert_eq!(m.window(1_900, 9_000), Ok((0, chunk)), "shift 100");
         assert_eq!(
             m.window(1_500, 9_000),
-            Some((0, chunk)),
+            Ok((0, chunk)),
             "shift 500, the edge"
         );
         // Past it.
-        assert_eq!(m.window(1_499, 9_000), None, "shift 501");
+        assert_eq!(
+            m.window(1_499, 9_000),
+            Err(WindowRefusal::BeforeChunk),
+            "shift 501"
+        );
         // A normal read is untouched by clamping.
-        assert_eq!(m.window(3_000, 9_000), Some((1_000, 3_000)));
+        assert_eq!(m.window(3_000, 9_000), Ok((1_000, 3_000)));
 
         // The detector's "no adapter" sentinel must never be clamped, however
         // generous the bound — the window would hold no adapter at all.
         m.set_clamp_max_shift(chunk + 1_000);
-        assert_eq!(m.window(0, 9_000), None, "adapter_end == 0 stays refused");
+        assert_eq!(
+            m.window(0, 9_000),
+            Err(WindowRefusal::NoAdapter),
+            "adapter_end == 0 stays refused"
+        );
         // Nor may a clamp invent signal the read does not have.
-        assert_eq!(m.window(1_900, chunk - 1), None, "read shorter than chunk");
+        assert_eq!(
+            m.window(1_900, chunk - 1),
+            Err(WindowRefusal::ShortRead),
+            "read shorter than chunk"
+        );
 
         // Clamping does not rescue a read the MARGIN refuses: that window
         // exists, so it is a different decision.
         let mut margin_gated = meta();
         margin_gated.set_clamp_max_shift(500);
         assert_eq!(margin_gated.min_adapter_end(), chunk + BOUNDARY_MARGIN);
-        assert_eq!(margin_gated.window(chunk + 50, 9_000), None);
+        assert_eq!(
+            margin_gated.window(chunk + 50, 9_000),
+            Err(WindowRefusal::BelowMargin)
+        );
+        // And a detector that saw further than the caller decoded is its own
+        // reason, not a geometry refusal.
+        assert_eq!(
+            margin_gated.window(9_001, 9_000),
+            Err(WindowRefusal::PastEnd)
+        );
+        // `refusal` is the same decision, asked without converting anything.
+        assert_eq!(
+            margin_gated.refusal(chunk + 50, 9_000),
+            Some(WindowRefusal::BelowMargin)
+        );
+        assert_eq!(margin_gated.refusal(5_000, 9_000), None);
     }
 
     /// The bundle can declare the clamp, and an override beats it.
@@ -998,12 +1114,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(declared.clamp_max_shift(), 400);
-        assert_eq!(declared.window(1_600, 9_000), Some((0, 2_000)));
-        assert_eq!(declared.window(1_599, 9_000), None);
+        assert_eq!(declared.window(1_600, 9_000), Ok((0, 2_000)));
+        assert_eq!(
+            declared.window(1_599, 9_000),
+            Err(WindowRefusal::BeforeChunk)
+        );
 
         let mut overridden = declared;
         overridden.set_clamp_max_shift(0);
-        assert_eq!(overridden.window(1_600, 9_000), None, "override disables");
+        assert_eq!(
+            overridden.window(1_600, 9_000),
+            Err(WindowRefusal::BeforeChunk),
+            "override disables"
+        );
     }
 
     /// The boundary block's `input` contract and `sha256` are optional
@@ -1091,7 +1214,7 @@ mod tests {
         for end in [2200usize, 3000, 4000, 5000] {
             let want = m.prep(&pa, end).expect("usable window");
             let mut got = Vec::new();
-            assert!(m.prep_adc_into(&adc, end, offset, scale, &mut got));
+            assert!(m.prep_adc_into(&adc, end, offset, scale, &mut got).is_ok());
             assert_eq!(got, want, "adapter_end {end}");
         }
     }
@@ -1105,10 +1228,13 @@ mod tests {
         let adc = vec![100i16; 5000];
         let mut buf = vec![1.0f32; 8];
         for end in [0usize, 2199, 6000] {
-            assert!(!m.prep_adc_into(&adc, end, 0.0, 1.0, &mut buf), "end {end}");
+            assert!(
+                m.prep_adc_into(&adc, end, 0.0, 1.0, &mut buf).is_err(),
+                "end {end}"
+            );
             assert!(buf.is_empty(), "end {end}: buffer not cleared");
         }
-        assert!(m.prep_adc_into(&adc, 2200, 0.0, 1.0, &mut buf));
+        assert!(m.prep_adc_into(&adc, 2200, 0.0, 1.0, &mut buf).is_ok());
         assert_eq!(buf.len(), 2000);
     }
 
@@ -1145,21 +1271,25 @@ mod tests {
         assert!(!m.needs_boundary());
         assert!(m.needs_full_read());
 
-        assert_eq!(m.window(0, 9_000), Some((5_500, 9_000)), "sentinel ignored");
+        assert_eq!(m.window(0, 9_000), Ok((5_500, 9_000)), "sentinel ignored");
         assert_eq!(
             m.window(4_242, 9_000),
-            Some((5_500, 9_000)),
+            Ok((5_500, 9_000)),
             "any adapter_end gives the same window"
         );
-        assert_eq!(m.window(0, 3_500), Some((0, 3_500)), "exactly a window");
-        assert_eq!(m.window(0, 3_499), None, "read shorter than chunk");
+        assert_eq!(m.window(0, 3_500), Ok((0, 3_500)), "exactly a window");
+        assert_eq!(
+            m.window(0, 3_499),
+            Err(WindowRefusal::ShortRead),
+            "read shorter than chunk"
+        );
 
         // Neither knob applies, so neither can rescue or refuse a read: the
         // margin would otherwise gate everything below chunk + 200.
         let mut m = m;
         m.set_boundary_margin(5_000);
         m.set_clamp_max_shift(5_000);
-        assert_eq!(m.window(0, 3_600), Some((100, 3_600)), "margin is inert");
+        assert_eq!(m.window(0, 3_600), Ok((100, 3_600)), "margin is inert");
     }
 
     /// `prep` reads the tail, so it must be handed the read's *full* signal —
@@ -1184,7 +1314,7 @@ mod tests {
         assert_eq!(m.signal.anchor(), Anchor::AdapterEnd);
         assert!(m.needs_boundary());
         assert!(!m.needs_full_read());
-        assert_eq!(m.window(4_000, 9_000), Some((2_000, 4_000)));
+        assert_eq!(m.window(4_000, 9_000), Ok((2_000, 4_000)));
     }
 
     /// `deny_unknown_fields` on `signal` only. A rule this runtime does not

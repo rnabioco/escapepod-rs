@@ -60,6 +60,7 @@ pub use barcode::{BarcodeError, BarcodeMatch, BarcodeRefs};
 #[cfg(feature = "crf-decode")]
 pub use encoder::{
     Anchor, BarcodeEntry, BoundarySpec, CrfEncoder, CrfError, CrfMetadata, ModelIdent,
+    WindowRefusal,
 };
 
 /// The input tensor a bundle's pinned boundary CNN consumes
