@@ -29,11 +29,40 @@
     rounding boundary); no call crosses the operating point. Anything that is
     not this graph stays on tract, and `ESCAPEPOD_FNN_TRACT=1` forces it.
 
-    The kernel's floor is L2 bandwidth, not FMAs: each timestep re-streams
-    147 KB of `Rᵀ` per direction, ~9.7 MB per read. Naming the eight
-    accumulators explicitly (against a suspected spill) changed nothing.
-    Scoring 2–3 reads per pass so each weight row feeds several accumulator
-    sets is the identified next step, and would need a batched scorer entry.
+    The single-read kernel's floor is L2 bandwidth, not FMAs: each timestep
+    re-streams 147 KB of `Rᵀ` per direction, ~9.7 MB per read. Naming the
+    eight accumulators explicitly (against a suspected spill) changed
+    nothing.
+
+  - **The kernel scores three reads in lockstep.** `NativeBiLstm::logits_batch`
+    advances every read in a group by one timestep together, so each 32-gate
+    slice of a weight row is loaded once and applied to all of the group's
+    accumulators — 4 accumulators × 3 reads, 3 broadcasts and one row load
+    is the AVX2 register file exactly, which is where 3 comes from. The
+    recurrent weights are repacked block-major (`[4H/32][H][32]`) so one pass
+    over the `H` rows of a block streams 12 KB contiguously; that alone is
+    −14% on the single-read kernel. The per-lane accumulation order is
+    unchanged by the batch or the layout, so the batched kernel is
+    **bit-identical** to the single-read one (pinned for every group size
+    from 1 to 8, tails included) and the end-to-end TSV is byte-identical.
+    Measured on the shipped weights, one core, one node: **122 µs/read**
+    against 194 single-read (block-major), 226 single-read as the base PR
+    ships it, and 490 through tract — 1.6× and 4.0×. End to end on 65,821
+    reads: 27.1 → 22.3 CPU-s single-threaded and 27.2 → 22.2 at
+    `--threads 8`, −18% both, stable across three rounds on two nodes.
+    `classify_reads` hands the scorer `par_chunks` of eight groups, not one:
+    with one group per chunk the prep for the next chunk evicted the weights
+    between calls, and a chunk that lost a read to the abstain rule scored a
+    2-wide group (a sixth of them). The GBM and tract paths report a batch
+    of 1 and are unchanged. What bounds the loop now is not L2 — misses are
+    negligible and 14% of cycles are memory-stalled — but the FMA and load
+    ports at half occupancy; `benchmarks/README.md` has the counters and the
+    five hypotheses that were run down (two kept, two reverted). An AVX-512
+    variant (16 lanes, 32 registers, 6 reads × 4 accumulators, half the µops
+    per lane) is the next lever on rna and the gpu nodes. Profile this
+    kernel under `release-with-debug`, not `profiling`: without fat LTO the
+    const-generic accumulator array is not unrolled into registers and the
+    batched kernel reads slower than the single-read one there.
 
   - **The per-read median/MAD gauge** — the single largest symbol in the
     profile, 11.5% of CPU in `select_nth_unstable_by(total_cmp)` over ~10k

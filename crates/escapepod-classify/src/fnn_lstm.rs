@@ -103,6 +103,13 @@ pub struct NativeBiLstm {
     bias: [Vec<f32>; 2],
     /// Per direction: `R` transposed to `[H][4H]`.
     rt: [Vec<f32>; 2],
+    /// Per direction: the same `Rᵀ` packed block-major, `[4H/32][H][32]`,
+    /// so one 32-gate pass over all `H` rows streams a contiguous 12 KB
+    /// instead of 32 floats out of every 1.5 KB row — worth 14% of the
+    /// single-read kernel and 11% of the batched one. Empty unless `4H` is
+    /// a multiple of 32 (the AVX2 backend's precondition, `H % 8 == 0`); the
+    /// scalar path keeps reading `rt`.
+    rt_blocked: [Vec<f32>; 2],
     /// `[n_cls][4H]` over the readout in the order the graph concatenates.
     head_w: Vec<f32>,
     head_b: Vec<f32>,
@@ -397,6 +404,7 @@ impl NativeBiLstm {
         let mut wt = [Vec::new(), Vec::new()];
         let mut bias = [Vec::new(), Vec::new()];
         let mut rt = [Vec::new(), Vec::new()];
+        let mut rt_blocked = [Vec::new(), Vec::new()];
         for d in 0..2 {
             let mut wtd = vec![0.0f32; n_in * g];
             for gi in 0..g {
@@ -414,6 +422,7 @@ impl NativeBiLstm {
                     rtd[j * g + gi] = r[(d * g + gi) * h + j];
                 }
             }
+            rt_blocked[d] = block_rows(&rtd, h, g, 32);
             rt[d] = rtd;
         }
         Ok(Self {
@@ -423,12 +432,117 @@ impl NativeBiLstm {
             wt,
             bias,
             rt,
+            rt_blocked,
             head_w,
             head_b,
             n_cls,
             mean_first,
             backend: Backend::best_for(h),
         })
+    }
+
+    /// How many reads [`Self::logits_batch`] scores per pass at full
+    /// efficiency on this backend.
+    ///
+    /// The kernel is bound by streaming `Rᵀ` from L2 once per timestep, so
+    /// reads scored in lockstep share every weight-row load. Three is what the
+    /// AVX2 register file holds — 4 accumulators × 3 reads, 3 broadcasts, one
+    /// row load — and a caller batching in multiples of it loses nothing to
+    /// the tail.
+    pub fn preferred_batch(&self) -> usize {
+        // `ESCAPEPOD_LSTM_BATCH` overrides the width, clamped to what the
+        // backend has kernels for — the sweep lever, and the way to measure
+        // the single-read kernel inside a binary that batches.
+        static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let wanted = OVERRIDE.get_or_init(|| {
+            std::env::var("ESCAPEPOD_LSTM_BATCH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n >= 1)
+        });
+        let max = match self.backend {
+            Backend::Scalar => 1,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2 => 3,
+        };
+        wanted.map_or(max, |n| n.min(max))
+    }
+
+    /// Logits for several reads, scored in lockstep.
+    ///
+    /// `xs` are per-read inputs as [`Self::logits`] takes them; `out` is
+    /// `[n_reads][n_cls]`, flat. Identical to calling [`Self::logits`] per
+    /// read — the per-lane accumulation order does not change with the
+    /// batch — but each `Rᵀ` row streamed from L2 serves every read in the
+    /// group rather than one, which is where the single-read kernel's time
+    /// goes.
+    pub fn logits_batch(&self, xs: &[&[f32]], out: &mut [f32]) -> Result<()> {
+        let (seq, n_in, h, g) = (self.seq, self.n_in, self.h, 4 * self.h);
+        if out.len() != xs.len() * self.n_cls {
+            bail!(
+                "{} logit slots for {} reads of {} classes",
+                out.len(),
+                xs.len(),
+                self.n_cls
+            );
+        }
+        for x in xs {
+            if x.len() != n_in * seq {
+                bail!(
+                    "input has {} values, the graph takes {n_in} x {seq}",
+                    x.len()
+                );
+            }
+        }
+        let batch = self.preferred_batch();
+        let (xw_len, hs_len) = (2 * seq * g, seq * 2 * h);
+        SCRATCH.with(|s| {
+            let mut s = s.borrow_mut();
+            s.resize(batch * (xw_len + hs_len + g), 0.0);
+            let (xw, rest) = s.split_at_mut(batch * xw_len);
+            let (hs, gates) = rest.split_at_mut(batch * hs_len);
+            let mut done = 0usize;
+            while done < xs.len() {
+                let n = (xs.len() - done).min(batch);
+                let group = &xs[done..done + n];
+                match (self.backend, n) {
+                    #[cfg(target_arch = "x86_64")]
+                    // Safety: as for `run_avx2` — buffer sizes are checked
+                    // above and `preferred_batch` sized the scratch; the
+                    // features are guaranteed by the dispatch.
+                    (Backend::Avx2, 3) => unsafe { self.run_avx2_batch::<3>(group, xw, hs, gates) },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx2, 2) => unsafe { self.run_avx2_batch::<2>(group, xw, hs, gates) },
+                    #[cfg(target_arch = "x86_64")]
+                    // A lone read takes the single-read kernel, on exactly
+                    // one read's worth of the scratch: it copies gates by
+                    // exact length.
+                    (Backend::Avx2, _) => unsafe {
+                        self.run_avx2(
+                            group[0],
+                            &mut xw[..xw_len],
+                            &mut hs[..hs_len],
+                            &mut gates[..g],
+                        )
+                    },
+                    (Backend::Scalar, _) => {
+                        for (r, x) in group.iter().enumerate() {
+                            let (xw_r, hs_r) = (
+                                &mut xw[r * xw_len..(r + 1) * xw_len],
+                                &mut hs[r * hs_len..(r + 1) * hs_len],
+                            );
+                            self.run_scalar(x, xw_r, hs_r, &mut gates[..g]);
+                        }
+                    }
+                }
+                for r in 0..n {
+                    let o = &mut out[(done + r) * self.n_cls..(done + r + 1) * self.n_cls];
+                    self.readout(&hs[r * hs_len..(r + 1) * hs_len], o);
+                }
+                done += n;
+            }
+        });
+        Ok(())
     }
 
     /// Logits for one read.
@@ -571,6 +685,7 @@ impl NativeBiLstm {
                 hcur.iter_mut().for_each(|v| *v = 0.0);
                 c.iter_mut().for_each(|v| *v = 0.0);
                 let rt = self.rt[d].as_ptr();
+                let rtb = self.rt_blocked[d].as_ptr();
                 for step in 0..seq {
                     let t = if d == 0 { step } else { seq - 1 - step };
                     gates.copy_from_slice(&xwd[t * g..(t + 1) * g]);
@@ -597,18 +712,23 @@ impl NativeBiLstm {
                             let mut a5 = _mm256_loadu_ps(p.add(40));
                             let mut a6 = _mm256_loadu_ps(p.add(48));
                             let mut a7 = _mm256_loadu_ps(p.add(56));
-                            let mut row = rt.add(base);
+                            // Two 32-gate blocks of `rt_blocked`, each a
+                            // contiguous `H x 32` run: two sequential
+                            // streams the prefetcher can follow.
+                            let mut row0 = rtb.add((base / 32) * h * 32);
+                            let mut row1 = row0.add(h * 32);
                             for &hj in hcur.iter() {
                                 let hv = _mm256_set1_ps(hj);
-                                a0 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row), a0);
-                                a1 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(8)), a1);
-                                a2 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(16)), a2);
-                                a3 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(24)), a3);
-                                a4 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(32)), a4);
-                                a5 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(40)), a5);
-                                a6 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(48)), a6);
-                                a7 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row.add(56)), a7);
-                                row = row.add(g);
+                                a0 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0), a0);
+                                a1 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0.add(8)), a1);
+                                a2 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0.add(16)), a2);
+                                a3 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0.add(24)), a3);
+                                a4 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1), a4);
+                                a5 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1.add(8)), a5);
+                                a6 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1.add(16)), a6);
+                                a7 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1.add(24)), a7);
+                                row0 = row0.add(32);
+                                row1 = row1.add(32);
                             }
                             _mm256_storeu_ps(p, a0);
                             _mm256_storeu_ps(p.add(8), a1);
@@ -647,6 +767,129 @@ impl NativeBiLstm {
                         _mm256_storeu_ps(hcur.as_mut_ptr().add(u), _mm256_mul_ps(go, tanh8(cn)));
                     }
                     hs[t * 2 * h + d * h..t * 2 * h + (d + 1) * h].copy_from_slice(&hcur);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl NativeBiLstm {
+    /// `N` reads in lockstep: one recurrence step advances every read, and
+    /// each 32-gate slice of a weight row is loaded once and applied to all
+    /// `N` accumulator sets. Layout of the scratch: `xw` is `[N][2][seq][G]`,
+    /// `hs` is `[N][seq][2H]`, `gates` is `[N][G]`.
+    ///
+    /// Bit-identical to [`Self::run_avx2`]: every gate lane still accumulates
+    /// `h[j] * Rᵀ[j]` over `j` in order, whatever the chunk width or the
+    /// batch. The register budget is `4 accumulators × N + N broadcasts + 1
+    /// row load`, which is why `N ≤ 3`.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn run_avx2_batch<const N: usize>(
+        &self,
+        xs: &[&[f32]],
+        xw: &mut [f32],
+        hs: &mut [f32],
+        gates: &mut [f32],
+    ) {
+        use std::arch::x86_64::*;
+        debug_assert_eq!(xs.len(), N);
+        let (seq, h, g) = (self.seq, self.h, 4 * self.h);
+        debug_assert!(h.is_multiple_of(8));
+        let (xw_len, hs_len) = (2 * seq * g, seq * 2 * h);
+        // Safety: as for `run_avx2`. `logits_batch` checked every input
+        // length and sized the scratch for `preferred_batch() >= N` reads.
+        unsafe {
+            let mut hcur = vec![0.0f32; N * h];
+            let mut c = vec![0.0f32; N * h];
+            for d in 0..2 {
+                for (r, x) in xs.iter().enumerate() {
+                    let off = r * xw_len + d * seq * g;
+                    self.input_contribution(d, x, &mut xw[off..off + seq * g]);
+                }
+                hcur.iter_mut().for_each(|v| *v = 0.0);
+                c.iter_mut().for_each(|v| *v = 0.0);
+                let rt = self.rt[d].as_ptr();
+                let rtb = self.rt_blocked[d].as_ptr();
+                for step in 0..seq {
+                    let t = if d == 0 { step } else { seq - 1 - step };
+                    for r in 0..N {
+                        let src = r * xw_len + d * seq * g + t * g;
+                        gates[r * g..(r + 1) * g].copy_from_slice(&xw[src..src + g]);
+                    }
+                    if step > 0 {
+                        let gp = gates.as_mut_ptr();
+                        let mut base = 0usize;
+                        while base + 32 <= g {
+                            // `acc[v][r]`: vector `v` of the 32-gate slice,
+                            // for read `r` — so one row load serves the
+                            // inner loop over reads.
+                            let mut acc = [[_mm256_setzero_ps(); N]; 4];
+                            for (v, accv) in acc.iter_mut().enumerate() {
+                                for (r, a) in accv.iter_mut().enumerate() {
+                                    *a = _mm256_loadu_ps(gp.add(r * g + base + v * 8));
+                                }
+                            }
+                            // One 32-gate block of `rt_blocked`: the `H`
+                            // rows this pass reads are contiguous.
+                            let mut row = rtb.add((base / 32) * h * 32);
+                            // Raw reads of `hcur`: indexed, every `j` paid
+                            // two bounds checks per read inside the loop
+                            // that streams the recurrent weights.
+                            let hc = hcur.as_ptr();
+                            for j in 0..h {
+                                let mut hv = [_mm256_setzero_ps(); N];
+                                for (r, hvr) in hv.iter_mut().enumerate() {
+                                    *hvr = _mm256_set1_ps(*hc.add(r * h + j));
+                                }
+                                for (v, accv) in acc.iter_mut().enumerate() {
+                                    let w = _mm256_loadu_ps(row.add(v * 8));
+                                    for (a, hvr) in accv.iter_mut().zip(hv.iter()) {
+                                        *a = _mm256_fmadd_ps(*hvr, w, *a);
+                                    }
+                                }
+                                row = row.add(32);
+                            }
+                            for (v, accv) in acc.iter().enumerate() {
+                                for (r, a) in accv.iter().enumerate() {
+                                    _mm256_storeu_ps(gp.add(r * g + base + v * 8), *a);
+                                }
+                            }
+                            base += 32;
+                        }
+                        while base < g {
+                            for r in 0..N {
+                                let mut a = _mm256_loadu_ps(gp.add(r * g + base));
+                                let hc = hcur.as_ptr().add(r * h);
+                                for j in 0..h {
+                                    a = _mm256_fmadd_ps(
+                                        _mm256_set1_ps(*hc.add(j)),
+                                        _mm256_loadu_ps(rt.add(j * g + base)),
+                                        a,
+                                    );
+                                }
+                                _mm256_storeu_ps(gp.add(r * g + base), a);
+                            }
+                            base += 8;
+                        }
+                    }
+                    for r in 0..N {
+                        let gp = gates.as_ptr().add(r * g);
+                        let cp = c.as_mut_ptr().add(r * h);
+                        let hp = hcur.as_mut_ptr().add(r * h);
+                        for u in (0..h).step_by(8) {
+                            let gi = sigmoid8(_mm256_loadu_ps(gp.add(u)));
+                            let go = sigmoid8(_mm256_loadu_ps(gp.add(h + u)));
+                            let gf = sigmoid8(_mm256_loadu_ps(gp.add(2 * h + u)));
+                            let gc = tanh8(_mm256_loadu_ps(gp.add(3 * h + u)));
+                            let cprev = _mm256_loadu_ps(cp.add(u));
+                            let cn = _mm256_fmadd_ps(gf, cprev, _mm256_mul_ps(gi, gc));
+                            _mm256_storeu_ps(cp.add(u), cn);
+                            _mm256_storeu_ps(hp.add(u), _mm256_mul_ps(go, tanh8(cn)));
+                        }
+                        let dst = r * hs_len + t * 2 * h + d * h;
+                        hs[dst..dst + h].copy_from_slice(&hcur[r * h..(r + 1) * h]);
+                    }
                 }
             }
         }
@@ -742,6 +985,24 @@ fn attr_ints<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a [i64]> {
 
 fn attr_tensor<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a pb::TensorProto> {
     attr(node, name).and_then(|a| a.t.as_ref())
+}
+
+/// `rows` as `[h][g]` repacked block-major, `[g / width][h][width]`, so a
+/// pass over all `h` rows of one `width`-gate block is one contiguous run.
+/// Empty when `g` is not a multiple of `width`; the caller keeps the row
+/// layout for that case.
+fn block_rows(rows: &[f32], h: usize, g: usize, width: usize) -> Vec<f32> {
+    if !g.is_multiple_of(width) {
+        return Vec::new();
+    }
+    let mut out = vec![0.0f32; h * g];
+    for (blk, dst) in out.chunks_exact_mut(h * width).enumerate() {
+        for (j, row) in dst.chunks_exact_mut(width).enumerate() {
+            let src = j * g + blk * width;
+            row.copy_from_slice(&rows[src..src + width]);
+        }
+    }
+    out
 }
 
 /// A float initializer's values, from whichever field the export used.
@@ -1176,6 +1437,52 @@ pub(crate) mod tests {
         let m = lstm_model(n_ch, n_off, h, 1);
         assert!(NativeBiLstm::from_proto(&m, n_ch + 2, n_off).is_none());
         assert!(NativeBiLstm::from_proto(&m, n_ch, n_off + 1).is_none());
+    }
+
+    /// Scoring reads in lockstep changes nothing about any read's answer:
+    /// the batched kernel is bit-identical to the single-read one, for every
+    /// group size up to and past the preferred batch, including the tails.
+    #[test]
+    fn batched_matches_single_bit_for_bit() {
+        let (n_ch, n_off, h) = (4, 33, 96);
+        let proto = lstm_model(n_ch, n_off, h, 21);
+        let net = NativeBiLstm::from_proto(&proto, n_ch, n_off).expect("recognised");
+        for n_reads in 1..=8usize {
+            let inputs: Vec<Vec<f32>> = (1..=n_reads as u64)
+                .map(|s| input(n_ch, n_off, 40 + s))
+                .collect();
+            let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+            let mut batched = vec![0.0f32; 2 * n_reads];
+            net.logits_batch(&refs, &mut batched).unwrap();
+            for (r, x) in inputs.iter().enumerate() {
+                let mut single = [0.0f32; 2];
+                net.logits(x, &mut single).unwrap();
+                assert_eq!(
+                    single.map(f32::to_bits),
+                    [batched[2 * r].to_bits(), batched[2 * r + 1].to_bits()],
+                    "n_reads={n_reads} read {r}: {single:?} vs {:?}",
+                    &batched[2 * r..2 * r + 2]
+                );
+            }
+        }
+        // The scalar backend batches by looping, which is trivially the same;
+        // it goes through the same entry point and says so.
+        let scalar = NativeBiLstm::from_proto(&proto, n_ch, n_off)
+            .unwrap()
+            .with_backend(Backend::Scalar);
+        assert_eq!(scalar.preferred_batch(), 1);
+        let inputs: Vec<Vec<f32>> = (1..=4u64).map(|s| input(n_ch, n_off, 60 + s)).collect();
+        let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+        let mut batched = vec![0.0f32; 8];
+        scalar.logits_batch(&refs, &mut batched).unwrap();
+        for (r, x) in inputs.iter().enumerate() {
+            let mut single = [0.0f32; 2];
+            scalar.logits(x, &mut single).unwrap();
+            assert_eq!(
+                single.map(f32::to_bits),
+                [batched[2 * r].to_bits(), batched[2 * r + 1].to_bits()]
+            );
+        }
     }
 
     /// The concat order is read from the graph, not assumed.
