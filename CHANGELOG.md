@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Added
+
+- **The charging classifier has benchmarks.** A production report that
+  `escpod classify` had got 2× slower could not be answered from this
+  repository: `crates/escapepod-classify` had no `benches/` at all, and the
+  criterion suites stop at pod5 I/O, the signal hot paths and demux. Answering
+  it meant rebuilding an A/B by hand out of released tarballs.
+
+  `crates/escapepod-classify/benches/charging.rs` covers the per-read chain —
+  `finalize` (offsets to signal spans), `expected_levels_z` (the k-mer
+  residual), `junction_features` (the span statistics) and `feature_grid`
+  (all three, which is what the pipeline calls), each over both span modes
+  where they differ. Everything is synthetic and self-contained, because the
+  `ext/` fixtures do not exist in CI (the `.gitmodules` is empty) and a bench
+  that needed a real POD5 would be one that never runs there. The k-mer table
+  is built at its full 4^9 size rather than only the k-mers the synthetic read
+  contains: a table small enough to sit in L2 measures a cache the production
+  path does not have. A `scorer` group measures a real bundle when
+  `ESCAPEPOD_CHARGING_BUNDLE` names one, and says why it skipped when it does
+  not — the weights are not redistributable.
+
+  `benchmarks/benchmark_charging.sh` is the end-to-end counterpart, and takes
+  several `--bin` arguments to A/B released binaries against a local build. It
+  interleaves the arms rather than grouping them, and reports CPU beside wall,
+  because both of those decide the answer: the first arm to touch a POD5 set
+  pays to page it in (212 s against 55–68 s warm, on a 12 GB set), and its CPU
+  time reads *lower* than the same run warm (107 s against 264) because
+  blocked page faults are not CPU. Grouped arms hand that entire effect to
+  whichever version runs first, and either half read alone invents a 2× that
+  is not there.
+
+  The measurement that prompted this is in `benchmarks/README.md`: across
+  0.17.1 → 0.20.0 on identical input, wall *falls* 15% and CPU is flat within
+  2%, with all eight runs producing the same 65,821 calls at median
+  P(charged) = 0.125.
+
 ## 0.21.0 (2026-09-06)
 
 ### Fixed

@@ -1,5 +1,106 @@
 # Benchmark Results
 
+## Charging classifier: version A/B, and why it looked slower (2026-09-06)
+
+A production report that `escpod classify` had "got 2× slower" — and nothing in
+the repo could answer it. `crates/escapepod-classify` had no benches, so the
+only way to check was to rebuild an A/B out of released tarballs by hand. Both
+harnesses below exist so the next version of that question is a two-minute
+answer rather than a morning.
+
+Input: `ldx14_frozen_edx06.bam` (65,821 scored reads) against a 12.3 GB, 2-file
+POD5 set and `charging_feature_nn_rna004@v0.1.1`. Node `rna`, `--threads 8`,
+arms interleaved, 2 reps. All eight runs produced **65,821 calls at median
+P(charged) = 0.125** — identical work, so the times compare.
+
+| escpod | rep 1 wall | rep 1 CPU | rep 2 wall | rep 2 CPU | cores busy (rep 2) |
+|---|---:|---:|---:|---:|---:|
+| 0.17.1 | 211.9 s (cold) | 107 s | 64.6 s | 264 s | 4.1 |
+| 0.18.1 | 67.7 s | 211 s | 56.7 s | 270 s | 4.8 |
+| 0.19.0 | 63.0 s | 224 s | 55.1 s | 270 s | 4.9 |
+| 0.20.0 | 66.9 s | 245 s | **54.6 s** | 268 s | 4.9 |
+
+**There is no regression — 0.20.0 is 15% faster in wall than 0.17.1, with CPU
+flat within 2%.** Two traps are visible in that table and both nearly produced
+the opposite conclusion:
+
+- **Rep 1 is a warm-up, not a measurement.** The first arm to touch the POD5
+  set pays for paging it in: 212 s wall against 55–68 s for every later arm.
+  Read rep 1 alone and 0.17.1 looks 3× faster than everything after it.
+- **Cold CPU time is not comparable to warm CPU time.** 0.17.1 rep 1 reads
+  107 CPU-seconds against 264 for the identical run warm, because blocked page
+  faults are not CPU. Compare 107 to 0.18.1's 211 and you "discover" a doubling
+  that does not exist.
+
+What actually doubled in production was **concurrency**, not the classifier.
+Per-read cost across runs of the pipeline, from the `classify_charging` logs:
+
+| run | escpod | reads | µs/read | peak concurrent jobs |
+|---|---|---:|---:|---:|
+| results_suppressor | 0.18.1 | 17.1 M | 1809 | 6 |
+| results_suppressor_v05 | 0.19.0 | 17.4 M | **1436** | 5 |
+| results_v05 | 0.19.0→0.20.0 | 171.9 M | **3603** | **36** |
+| results_glnrs_tc_pilot | 0.20.0 | 8.4 M | 3300 | 34 |
+
+The middle two rows are the same escpod and the same model bundle. 36 processes
+demand-paging one shared multi-hundred-GB POD5 set off BeeGFS is the whole
+effect; the fix is a scheduler cap on the pipeline side, not a change here.
+
+Note also **cores busy: 4.1–4.9 of the 8 allocated.** The command does not scale
+past ~5 cores on this input because it is waiting on the POD5, which matches the
+305%-of-48-cores seen on a 1.06 M-read sample in August.
+
+### Where the per-read time goes
+
+`cargo bench -p escapepod-classify --bench charging --features fnn-onnx`, node
+`rna`, one core, against `charging_feature_nn_rna004@v0.1.1` (the shipped
+`arch: lstm` arm) and a synthetic 150-base / 4,500-sample read:
+
+| group | time | share of the 535 µs |
+|---|---:|---:|
+| `scorer/predict` (ONNX through tract) | 493 µs | 92.1% |
+| `junction_features/33_offsets` | 33.3 µs | 6.2% |
+| `expected_levels_z/9mer` | 7.7 µs | 1.4% |
+| `finalize/{aligner,counted_arm_24}` | 0.28 / 0.29 µs | 0.05% |
+| `feature_grid/{aligner,counted_arm_24}` (the three above together) | 41.7 / 42.1 µs | — |
+
+`scorer/per_read` (487 µs) is `select_columns` + `predict` and lands inside the
+noise of `predict` alone, so the fold from the canonical grid to the model's
+column order is free. Span resolution is free too. **Within the charging path,
+scoring is everything** — which is the same conclusion the August profiling
+reached about the LSTM arm, and why an AVX2 BiLSTM kernel is the only lever
+that would move this number.
+
+**But the charging path is not where a real run's time goes.** The end-to-end
+harness on the same machine did 65,821 reads in 276 CPU-seconds — 4,193 µs of
+CPU per read against the 535 µs above, so **the whole per-read chain this bench
+measures is ~13% of a production run's CPU.** The other ~87% is BGZF decode of
+the input BAM, VBZ decode of the signal, and BGZF *compression* of the output
+BAM, which an earlier 1.06 M-read profile put at 60% of wall on its own. Treat
+this bench as a tripwire on the feature and scoring code, not as a model of the
+command; `benchmarks/benchmark_charging.sh` is what measures the command.
+
+(The synthetic read is 4,500 samples. `junction_features` includes the per-read
+median/MAD gauge, which is O(signal length), so a longer real read moves that
+row and only that row.)
+
+### Reproducing
+
+```bash
+# Per-read feature path (self-contained; no POD5, no bundle, runs in CI).
+cargo bench -p escapepod-classify --bench charging
+cargo bench -p escapepod-classify --bench charging -- feature_grid
+
+# Add the scorer group — needs a real bundle, which is not redistributable.
+ESCAPEPOD_CHARGING_BUNDLE=/path/to/bundle \
+  cargo bench -p escapepod-classify --bench charging --features fnn-onnx
+
+# End-to-end, and A/B across builds. Arms are interleaved by construction.
+srun -p rna -c 8 --mem 32G -- benchmarks/benchmark_charging.sh \
+    --pod5 run/pod5 --bam sample.bam --reference ref.fa --model bundle/ \
+    --bin /path/to/escpod-0.20.0 --bin ./target/release/escpod
+```
+
 ## Fused demux pipeline rework (2026-07-26)
 
 Input: `Ma_20aa.pod5` — 1,220,602 reads, 10.4 GB, RNA004. Node: `rna`

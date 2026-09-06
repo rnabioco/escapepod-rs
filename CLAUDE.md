@@ -175,6 +175,14 @@ cargo bench --bench hot_paths -- --baseline <name>     # compare future runs
 
 Env overrides: `ESCAPEPOD_BENCH_THREADS=N` (rayon pool size for the matrix bench), `ESCAPEPOD_BENCH_SAMPLES=N` (criterion sample size for slow groups).
 
+`crates/escapepod-classify/benches/charging.rs` covers the per-read charging path — `finalize`, `expected_levels_z`, `junction_features`, `feature_grid` — over both span modes. Self-contained by design: `ext/` fixtures do not exist in CI, so the read, the signal and the (full 4^9) k-mer table are synthesised. `ESCAPEPOD_CHARGING_BUNDLE=<dir>` adds a `scorer` group against a real bundle (needs `--features fnn-onnx`); without it that group skips itself and says so, since the weights are not redistributable.
+
+```bash
+cargo bench -p escapepod-classify --bench charging
+ESCAPEPOD_CHARGING_BUNDLE=/path/to/bundle \
+  cargo bench -p escapepod-classify --bench charging --features fnn-onnx
+```
+
 ### End-to-end (hyperfine vs. Python pod5)
 
 ```bash
@@ -183,6 +191,14 @@ cargo build --release
 ```
 
 Runs `inspect summary`, `view`, `merge`, `filter`, `subset` via hyperfine against Python `pod5` (installed in the pixi env). Results persist as JSON under `/tmp/escapepod_benchmark/`. Historical numbers are in `benchmarks/README.md`.
+
+`benchmarks/benchmark_charging.sh` does the same job for `escpod classify` and additionally A/Bs escpod *builds* — one `--bin` per arm, so a released tarball can be measured beside a local build on one input. Two properties of it are load-bearing and were learned by getting them wrong: **arms are interleaved, not grouped**, because the first arm to touch a POD5 set pays to page it in (212 s against 55–68 s warm on a 12 GB set), and **CPU is reported beside wall**, because a cold run's CPU time reads *lower* than the same run warm (107 s against 264) — blocked page faults are not CPU, so either half read alone invents a 2× that is not there. Rep 1 is a warm-up; compare arms within rep 2+.
+
+```bash
+srun -p rna -c 8 --mem 32G -- benchmarks/benchmark_charging.sh \
+    --pod5 run/pod5 --bam sample.bam --reference ref.fa --model bundle/ \
+    --bin /path/to/escpod-0.20.0 --bin ./target/release/escpod
+```
 
 ### Profiling workflow
 
