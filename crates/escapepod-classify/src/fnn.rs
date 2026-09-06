@@ -186,6 +186,8 @@ impl FeatureNet {
                 crate::fnn_lstm::Backend::Scalar => "native bilstm (scalar)",
                 #[cfg(target_arch = "x86_64")]
                 crate::fnn_lstm::Backend::Avx2 => "native bilstm (avx2)",
+                #[cfg(target_arch = "x86_64")]
+                crate::fnn_lstm::Backend::Avx512 => "native bilstm (avx512)",
             },
             None => "tract",
         }

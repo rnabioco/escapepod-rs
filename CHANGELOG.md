@@ -54,15 +54,48 @@
     with one group per chunk the prep for the next chunk evicted the weights
     between calls, and a chunk that lost a read to the abstain rule scored a
     2-wide group (a sixth of them). The GBM and tract paths report a batch
-    of 1 and are unchanged. What bounds the loop now is not L2 — misses are
-    negligible and 14% of cycles are memory-stalled — but the FMA and load
-    ports at half occupancy; `benchmarks/README.md` has the counters and the
-    five hypotheses that were run down (two kept, two reverted). An AVX-512
-    variant (16 lanes, 32 registers, 6 reads × 4 accumulators, half the µops
-    per lane) is the next lever on rna and the gpu nodes. Profile this
-    kernel under `release-with-debug`, not `profiling`: without fat LTO the
-    const-generic accumulator array is not unrolled into registers and the
-    batched kernel reads slower than the single-read one there.
+    of 1 and are unchanged. The loop is bound by L2→L1 bandwidth (~23
+    B/cycle on rna; `examples/axpy_probe.rs` measures every shape from L1,
+    L2 and L3), which is why reads per row load is the axis that pays;
+    `benchmarks/README.md` has the counters and the five hypotheses that
+    were run down (two kept, two reverted). Profile this kernel under
+    `release-with-debug`, not `profiling`: without fat LTO the const-generic
+    accumulator array is not unrolled into registers and the batched kernel
+    reads slower than the single-read one there.
+
+  - **An AVX-512 kernel, sized by a probe.** On a machine with AVX-512F the
+    same 32-gate slices run sixteen lanes wide with **eight reads per row
+    load** (`NativeBiLstm::run_avx512_batch`: 2 accumulators × 8 + 8
+    broadcasts + 2 loads = 26 of 32 ZMM). Runtime-dispatched, never a
+    baseline bump — the release artifact stays Haswell, and Broadwell login
+    nodes and Alpine's Zen3 take the AVX2 kernel; a lone read takes the AVX2
+    single-read kernel on every machine (faster than the 16-wide one at
+    width 1). Bit-identical to both AVX2 kernels, `vec16` mirroring `vec8`
+    op for op, pinned for every group width 1–17 on rna. Same node, same
+    run: **97 µs/read** against 115 (AVX2, three in lockstep), 168
+    (single) and 512 (tract); end to end −6% CPU single-threaded and −7% at
+    `--threads 8`, TSVs identical. `ESCAPEPOD_LSTM_BACKEND=scalar|avx2|avx512`
+    caps the dispatch, the A/B lever inside one binary. The shape was
+    chosen by `examples/axpy_probe.rs`, kept re-runnable: the first cut
+    (four reads over 64-gate slices) read twice the bytes per row and lost
+    to the AVX2 kernel per read; 16-gate slices win per row and lose it
+    back on the row count. The probe also settled what bounds the loop —
+    5.0 cycles per row from L1, 11.2 from L2 — after the counters had been
+    read the other way.
+
+    A trap found on the way, and two guards for it: with the kernels
+    inlined into `logits_batch` beside one another, the AVX2 width-2 kernel
+    returned wrong logits for its second read — the same wrong bits every
+    run, from kernel source that had passed the day before — and the
+    failure followed the *form* of the dispatch (an or-pattern over the two
+    lone-read arms failed; two arms with the same body passed). The unsafe
+    code was audited for aliasing and bounds and nothing was found; an
+    LLVM miscompile is suspected, not proven. The three kernels are now
+    `#[inline(never)]` (large leaf functions; inlining bought nothing), and
+    `batched_matches_single_bit_for_bit` pins every kernel on every backend
+    the machine has rather than the one the dispatch prefers — which is how
+    a green run on an AVX-512 node had stopped exercising the AVX2 batched
+    kernels at all.
 
   - **The per-read median/MAD gauge** — the single largest symbol in the
     profile, 11.5% of CPU in `select_nth_unstable_by(total_cmp)` over ~10k
