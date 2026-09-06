@@ -33,36 +33,81 @@ pub const FEAT_STATS: [&str; 4] = ["dwell", "mean", "std", "resid"];
 /// Minimum valid expected levels for a meaningful per-read z-score.
 const MIN_VALID_LEVELS: usize = 20;
 
-/// Median of `f32` data, NumPy semantics: order statistic for odd length,
-/// `f32` midpoint average for even length. `data` is scratch (reordered).
-fn median_f32(data: &mut [f32]) -> f32 {
-    let n = data.len();
+/// An `f32` as a `u32` that sorts in `total_cmp` order.
+///
+/// Negative values have their bits inverted (so a larger magnitude sorts
+/// lower), positive values get the sign bit set; `-0.0 < +0.0` and the NaN
+/// payloads land at the ends exactly as `total_cmp` places them. This is
+/// what `total_cmp` computes on every comparison — done once per element
+/// here, so the selection below compares plain integers. The per-read gauge
+/// was the single largest symbol in `escpod classify`'s profile (11.5% of
+/// CPU in `select_nth_unstable_by`); this is where that cost is paid down.
+#[inline]
+fn order_key(x: f32) -> u32 {
+    let b = x.to_bits();
+    if b & 0x8000_0000 != 0 {
+        !b
+    } else {
+        b | 0x8000_0000
+    }
+}
+
+#[inline]
+fn key_value(k: u32) -> f32 {
+    f32::from_bits(if k & 0x8000_0000 != 0 {
+        k & 0x7fff_ffff
+    } else {
+        !k
+    })
+}
+
+/// Median of a key array, NumPy semantics: the middle order statistic for odd
+/// length, the `f32` midpoint of the two middle ones for even. `keys` is
+/// scratch and is reordered.
+///
+/// A comparison select on the integer keys. The comparison is a plain `u32`
+/// compare rather than `total_cmp`'s per-call bit manipulation, and the
+/// selection is the standard library's branchless pdqsort-derived one. A
+/// 256-bin radix select was tried in its place and measured 1.8× *slower*
+/// on ~5k samples — the histogram's store-to-load dependency chain and the
+/// branchy partition cost more than the comparisons they replace at this
+/// size — so this is deliberately the simpler kernel.
+fn median_of_keys(keys: &mut [u32]) -> f32 {
+    let n = keys.len();
     debug_assert!(n > 0);
     let mid = n / 2;
-    let (_, m, _) = data.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    let hi = *m;
+    let (below, &mut hi_key, _) = keys.select_nth_unstable(mid);
+    let hi = key_value(hi_key);
     if n % 2 == 1 {
-        hi
-    } else {
-        let lo = data[..mid]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        (lo + hi) / 2.0
+        return hi;
     }
+    // The (mid-1)-th is the largest of what the selection left below.
+    let lo = key_value(below.iter().copied().max().unwrap_or(hi_key));
+    (lo + hi) / 2.0
+}
+
+/// Median of `f32` data, NumPy semantics: order statistic for odd length,
+/// `f32` midpoint average for even length.
+#[cfg(test)]
+fn median_f32(data: &[f32]) -> f32 {
+    let mut keys: Vec<u32> = data.iter().map(|&x| order_key(x)).collect();
+    median_of_keys(&mut keys)
 }
 
 /// The per-read robust gauge: `(median, scale)` where `scale` is
 /// `1.4826 * MAD` floored at `1e-3` MAD (then 1.0), matching
 /// `_base_features`. `scale` is returned in `f64` (the Python keeps it as a
 /// float) — the per-sample division rounds it to `f32`.
+///
+/// One allocation: the signal is keyed straight into the scratch the two
+/// selections reorder, and the deviations are re-keyed in place.
 fn read_gauge(signal: &[f32]) -> (f32, f64) {
-    let mut scratch = signal.to_vec();
-    let med = median_f32(&mut scratch);
-    for v in &mut scratch {
-        *v = (*v - med).abs();
+    let mut keys: Vec<u32> = signal.iter().map(|&x| order_key(x)).collect();
+    let med = median_of_keys(&mut keys);
+    for key in &mut keys {
+        *key = order_key((key_value(*key) - med).abs());
     }
-    let mad = median_f32(&mut scratch);
+    let mad = median_of_keys(&mut keys);
     let scale = if mad as f64 > 1e-3 {
         1.4826 * mad as f64
     } else {
@@ -141,14 +186,12 @@ pub fn expected_levels_z(
     qf: &[i64],
     nb: usize,
 ) -> Vec<f32> {
-    let mut out = vec![f32::NAN; qf.len()];
-    if seq.is_empty() {
-        return out;
-    }
-    let seq_str = match std::str::from_utf8(seq) {
-        Ok(s) => s,
-        Err(_) => return out,
+    let Ok(seq_str) = std::str::from_utf8(seq) else {
+        return vec![f32::NAN; qf.len()];
     };
+    if seq.is_empty() {
+        return vec![f32::NAN; qf.len()];
+    }
     let lv64 = escapepod_signal::resquiggle::extract_levels(
         seq_str,
         kmer_to_level,
@@ -157,7 +200,31 @@ pub fn expected_levels_z(
     );
     // leech's Python extract_levels stores float32; round-trip to match.
     let lv: Vec<f64> = lv64.iter().map(|&v| (v as f32) as f64).collect();
+    z_score_levels(&lv, qf, nb)
+}
 
+/// [`expected_levels_z`] over a packed table — the same levels as a direct
+/// index rather than a hash probe per base. See
+/// [`crate::KmerLevels::packed`]; the two must agree to the bit, and
+/// `escapepod_signal`'s `packed_extraction_matches_the_map_path` pins that.
+pub fn expected_levels_z_packed(
+    seq: &[u8],
+    table: &escapepod_signal::resquiggle::KmerTable,
+    center_idx: usize,
+    qf: &[i64],
+    nb: usize,
+) -> Vec<f32> {
+    if seq.is_empty() || std::str::from_utf8(seq).is_err() {
+        return vec![f32::NAN; qf.len()];
+    }
+    let lv32 = table.extract_levels_lenient(seq, center_idx);
+    let lv: Vec<f64> = lv32.iter().map(|&v| v as f64).collect();
+    z_score_levels(&lv, qf, nb)
+}
+
+/// The z-score half of [`expected_levels_z`], shared by both level sources.
+fn z_score_levels(lv: &[f64], qf: &[i64], nb: usize) -> Vec<f32> {
+    let mut out = vec![f32::NAN; qf.len()];
     let valid: Vec<f64> = lv
         .iter()
         .copied()
@@ -189,10 +256,64 @@ mod tests {
 
     #[test]
     fn test_median_f32_numpy_semantics() {
-        assert_eq!(median_f32(&mut [3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median_f32(&[3.0, 1.0, 2.0]), 2.0);
         // Even length: f32 midpoint average.
-        assert_eq!(median_f32(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
-        assert_eq!(median_f32(&mut [1.0]), 1.0);
+        assert_eq!(median_f32(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(median_f32(&[1.0]), 1.0);
+    }
+
+    /// The radix selection returns the same order statistic, to the bit, as
+    /// `select_nth_unstable_by(total_cmp)` did — on lengths from 1 up, with
+    /// duplicates, both zeros, negatives, and values that share a leading
+    /// byte (the case that makes the histogram pass through unchanged).
+    #[test]
+    fn median_matches_the_comparison_select() {
+        let reference = |data: &[f32]| -> f32 {
+            let mut d = data.to_vec();
+            let n = d.len();
+            let mid = n / 2;
+            let (_, m, _) = d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            let hi = *m;
+            if n % 2 == 1 {
+                hi
+            } else {
+                let lo = d[..mid].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                (lo + hi) / 2.0
+            }
+        };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in 1..=300usize {
+            for shape in 0..4 {
+                let data: Vec<f32> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        match shape {
+                            // Wide range, both signs.
+                            0 => ((r as u32 as f32) / (u32::MAX as f32) - 0.5) * 400.0,
+                            // A narrow band of picoamp-like values: every key
+                            // shares its top byte.
+                            1 => 80.0 + (r % 1000) as f32 * 0.03,
+                            // Heavy duplicates and both zeros.
+                            2 => [0.0, -0.0, 1.5, 1.5, -2.25, 7.0][(r % 6) as usize],
+                            // Integers, so the even-length midpoint is exact.
+                            _ => (r % 17) as f32 - 8.0,
+                        }
+                    })
+                    .collect();
+                let want = reference(&data);
+                let got = median_f32(&data);
+                assert!(
+                    want.to_bits() == got.to_bits(),
+                    "n={n} shape={shape}: {got} != {want}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -235,6 +356,46 @@ mod tests {
         assert_eq!(f[4], 6.0); // dwell of span 1
         assert!(f[8].is_nan()); // unaligned base
         assert!(f[12].is_nan()); // span past signal end
+    }
+
+    /// The packed table and the map give the same z-scores to the bit —
+    /// with a k-mer the map lacks, a non-base in the read, and lowercase.
+    #[test]
+    fn packed_levels_match_the_map_path() {
+        let k = 3usize;
+        let mut map = HashMap::new();
+        let mut v = 61.3f64;
+        for i in 0..64usize {
+            let kmer: String = (0..k)
+                .rev()
+                .map(|p| b"ACGT"[(i >> (2 * p)) & 3] as char)
+                .collect();
+            if kmer != "CGA" {
+                map.insert(kmer, v);
+            }
+            v = (v * 1.31) % 40.0 + 60.0;
+        }
+        let levels = crate::KmerLevels::new(map, k, 1);
+        let table = levels.packed().expect("k=3 packs");
+        let qf: Vec<i64> = (0..40).collect();
+        for seq in [
+            b"ACGTTGCATGCACGATTACGGCTAGCTAGGATCCAGGCTTC".to_vec(),
+            b"acgttgcatgcacgattacggctagctaggatccaggcttc".to_vec(),
+            b"ACGTTGCANGCACGATTACGGCTAGCTAGGATCCAGGCTTC".to_vec(),
+            b"CGACGACGACGACGACGACGACGACGACGACGACGACGACG".to_vec(),
+        ] {
+            let want = expected_levels_z(&seq, &levels.map, k, 1, &qf, seq.len());
+            let got = expected_levels_z_packed(&seq, table, 1, &qf, seq.len());
+            let same = want
+                .iter()
+                .zip(&got)
+                .all(|(a, b)| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()));
+            assert!(
+                same,
+                "{}: {want:?} vs {got:?}",
+                String::from_utf8_lossy(&seq)
+            );
+        }
     }
 
     #[test]

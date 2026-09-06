@@ -138,8 +138,10 @@ for rep in $(seq 1 "$REPS"); do
         # and their times do not compare however clean the timing looks.
         calls=$(grep -oE '[0-9]+ reads classified; median P\(charged\) = [0-9.]+' "$log" | head -1)
 
-        printf 'rep%-2s arm%-2s %-24s rc=%s wall=%s cpu=%.1fs rss=%sG  %s\n' \
-            "$rep" "$i" "${VERSIONS[$i]}" "$rc" "$wall" \
+        # Version AND basename: two builds of one commit (an allocator
+        # feature, a wrapper setting an env var) report the same version.
+        printf 'rep%-2s arm%-2s %-22s %-26s rc=%s wall=%s cpu=%.1fs rss=%sG  %s\n' \
+            "$rep" "$i" "${VERSIONS[$i]}" "$(basename "$bin")" "$rc" "$wall" \
             "$(echo "$user + $sys" | bc)" "$rss" "${calls:-NO CALLS PARSED}"
 
         rm -f "$SCRATCH/$tag.bam" "$SCRATCH/$tag.tsv"

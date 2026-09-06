@@ -37,6 +37,16 @@ pub struct BamScan {
     pub skips: HashMap<SkipReason, u64>,
 }
 
+/// BGZF inflate workers for a scan that anchors records on the rayon pool.
+///
+/// `MultithreadedReader::new` is ONE worker, whatever the name suggests. The
+/// scan decodes on one cursor and anchors in parallel, so the reader gets
+/// half the pool: enough that inflate keeps ahead of the anchoring, without
+/// doubling the thread count on a shared node.
+pub(crate) fn bgzf_workers() -> std::num::NonZero<usize> {
+    std::num::NonZero::new(rayon::current_num_threads().div_ceil(2).max(1)).expect("at least one")
+}
+
 /// Scan an aligned BAM into anchored reads and orientation votes.
 ///
 /// Every record runs through [`anchor::scan_record`]; records whose
@@ -51,7 +61,7 @@ pub fn scan_bam(
 ) -> Result<BamScan> {
     let file = std::fs::File::open(bam_path)
         .with_context(|| format!("cannot open BAM {}", bam_path.display()))?;
-    let decoder = bgzf::io::MultithreadedReader::new(file);
+    let decoder = bgzf::io::MultithreadedReader::with_worker_count(bgzf_workers(), file);
     let mut reader = bam::io::Reader::from(decoder);
     let header = reader.read_header()?;
     let ref_names: Vec<String> = header
@@ -255,9 +265,12 @@ pub fn feature_grid_at(
     // resolved to -- using it here leaves dwell/mean/std right and the
     // residual silently wrong.
     let qf = anchor::query_positions(read, recipe.offsets, recipe.span_mode);
-    let expected = recipe
-        .kmer
-        .map(|k| features::expected_levels_z(&read.seq, &k.map, k.k, k.center_idx, &qf, read.nb));
+    let expected = recipe.kmer.map(|k| match k.packed() {
+        Some(table) => {
+            features::expected_levels_z_packed(&read.seq, table, k.center_idx, &qf, read.nb)
+        }
+        None => features::expected_levels_z(&read.seq, &k.map, k.k, k.center_idx, &qf, read.nb),
+    });
     features::junction_features(sig_pa, coords, expected.as_deref())
 }
 
@@ -445,7 +458,19 @@ pub fn classify_reads(
     let extractors = pod5.extractors()?;
     let predictor = Scorer::new(bundle)?;
     let recipe = bundle.recipe()?;
-    let reads: Vec<&AnchoredRead> = anchored.values().collect();
+    let mut reads: Vec<&AnchoredRead> = anchored.values().collect();
+    // Walk each POD5 forward. `anchored` is a HashMap, so its order is the
+    // hash's, and each worker's next read was a random seek into a file that
+    // is a mmap over shared storage. Ordered by file and first signal row, a
+    // rayon chunk is a contiguous forward sweep, which is what the kernel's
+    // readahead and the filesystem's prefetch can serve — the same reason
+    // `demux` streams its input (#72). Reads without signal sort first and
+    // cost nothing.
+    reads.sort_by_cached_key(|r| {
+        pod5.reads()
+            .get(&r.read_id)
+            .map(|i| (i.reader_idx, i.signal_rows.first().copied().unwrap_or(0)))
+    });
 
     enum Outcome {
         Call(ReadCall),

@@ -129,6 +129,81 @@ impl KmerTable {
         })
     }
 
+    /// Build a table from a `k-mer -> level` map of the shape
+    /// [`load_kmer_table`](super::load_kmer_table) returns.
+    ///
+    /// The map is what the charging bundle loads and pins by sha256, and
+    /// [`extract_levels`](super::extract_levels) probes it once per base —
+    /// a `String`-keyed hash lookup, ~2.5% of `escpod classify`'s CPU. This is
+    /// the same table as a direct index. Levels are narrowed with `as f32`,
+    /// which is what every consumer of the map does to them anyway, so the
+    /// values are identical to the map path's rather than re-parsed (a
+    /// decimal parsed straight to `f32` can differ by an ulp from one parsed
+    /// to `f64` and then narrowed).
+    ///
+    /// Only keys spelled in uppercase `ACGT` are indexed. That is not a
+    /// normalisation shortcut: the map path uppercases and `U -> T`s the
+    /// *sequence* and then looks it up verbatim, so a lowercase or `U` key
+    /// can never match there either, and indexing it here would make the
+    /// two paths disagree.
+    pub fn from_levels_map(map: &std::collections::HashMap<String, f64>, k: usize) -> Result<Self> {
+        if k == 0 || k > 13 {
+            bail!("k-mer length {k} outside 1..=13");
+        }
+        let mut levels = vec![0.0f32; 1usize << (2 * k)];
+        for (kmer, &level) in map {
+            let bytes = kmer.as_bytes();
+            if bytes.len() != k || !bytes.iter().all(|b| matches!(b, b'A' | b'C' | b'G' | b'T')) {
+                continue;
+            }
+            if let Some(idx) = encode_kmer(bytes) {
+                levels[idx] = level as f32;
+            }
+        }
+        let dominant_base = determine_dominant_base(&levels, k);
+        Ok(KmerTable {
+            levels,
+            k,
+            dominant_base,
+        })
+    }
+
+    /// [`Self::extract_levels_at`] with the map path's tolerance: a window
+    /// holding anything but a base contributes nothing (its position stays
+    /// `0.0`), and a sequence shorter than `k` is all zeros rather than an
+    /// error. Lowercase and `U` are read as bases, as the map path reads them
+    /// after uppercasing.
+    ///
+    /// This is [`super::extract_levels`] over the packed table, and it must
+    /// stay equivalent to it: the charging residual is defined against these
+    /// levels, and a base that resolves on one path and not the other is a
+    /// silently different feature.
+    pub fn extract_levels_lenient(&self, seq: &[u8], centre: usize) -> Vec<f32> {
+        let mut levels = vec![0.0f32; seq.len()];
+        if seq.len() < self.k || centre >= self.k {
+            return levels;
+        }
+        let mask = (1usize << (2 * self.k)) - 1;
+        let (mut idx, mut run) = (0usize, 0usize);
+        for (pos, &base) in seq.iter().enumerate() {
+            match encode_base(base) {
+                Some(b) => {
+                    idx = ((idx << 2) | b) & mask;
+                    run += 1;
+                }
+                None => {
+                    idx = 0;
+                    run = 0;
+                }
+            }
+            if run >= self.k {
+                // The window is `seq[pos + 1 - k ..= pos]`.
+                levels[pos + 1 - self.k + centre] = self.levels[idx];
+            }
+        }
+        levels
+    }
+
     /// Normalize levels using MAD: (level - median) / (MAD * 1.4826).
     pub fn fix_gauge(&mut self) -> Result<()> {
         let median = median_f32(&self.levels).ok_or_else(|| anyhow::anyhow!("empty levels"))?;
@@ -314,6 +389,48 @@ mod tests {
         assert_eq!(encode_kmer(b"GT"), Some(0b1011));
         assert_eq!(encode_kmer(b"AAAAAAAAA"), Some(0));
         assert_eq!(encode_kmer(b"N"), None);
+    }
+
+    /// The packed table and the map path resolve exactly the same positions
+    /// to exactly the same values — including around a non-base, at the
+    /// sequence ends, on lowercase and `U` input, and for a key the map lacks.
+    #[test]
+    fn packed_extraction_matches_the_map_path() {
+        use std::collections::HashMap;
+        let k = 3;
+        let mut map: HashMap<String, f64> = HashMap::new();
+        let mut v = 0.37f64;
+        for i in 0..64usize {
+            let kmer: String = (0..k)
+                .rev()
+                .map(|p| b"ACGT"[(i >> (2 * p)) & 3] as char)
+                .collect();
+            // Leave one k-mer out, and give another a lowercase twin the map
+            // path can never hit.
+            if kmer == "GTA" {
+                continue;
+            }
+            map.insert(kmer, v);
+            v = v * 1.7 % 5.0 + 0.01;
+        }
+        map.insert("acg".into(), 99.0);
+        let table = KmerTable::from_levels_map(&map, k).unwrap();
+
+        for seq in [
+            "ACGTACGTTGCA",
+            "acguacgu",
+            "ACGNTACGT",
+            "NNNACG",
+            "AC",
+            "",
+            "GTAGTAGTA",
+            "TTTTTTTTTTTTTTTT",
+        ] {
+            let want = super::super::extract_levels(seq, &map, k, Some(1));
+            let got = table.extract_levels_lenient(seq.as_bytes(), 1);
+            let want32: Vec<f32> = want.iter().map(|&x| x as f32).collect();
+            assert_eq!(got, want32, "{seq}");
+        }
     }
 
     #[test]

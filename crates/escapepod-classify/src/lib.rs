@@ -56,6 +56,9 @@ pub mod bundle;
 pub mod features;
 #[cfg(feature = "fnn-onnx")]
 pub mod fnn;
+/// The recurrence of the shipped `feature_model` graph, run directly.
+#[cfg(feature = "fnn-onnx")]
+pub mod fnn_lstm;
 pub mod geometry;
 pub mod pipeline;
 pub mod recipe;

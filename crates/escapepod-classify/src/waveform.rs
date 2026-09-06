@@ -293,7 +293,8 @@ pub fn scan_bam(
 ) -> Result<WaveformScan> {
     let file = std::fs::File::open(bam_path)
         .with_context(|| format!("cannot open BAM {}", bam_path.display()))?;
-    let decoder = bgzf::io::MultithreadedReader::new(file);
+    let decoder =
+        bgzf::io::MultithreadedReader::with_worker_count(crate::pipeline::bgzf_workers(), file);
     let mut reader = bam::io::Reader::from(decoder);
     let header = reader.read_header()?;
     let ref_names: Vec<String> = header

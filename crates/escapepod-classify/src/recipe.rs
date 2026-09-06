@@ -26,7 +26,9 @@
 //! [`ChargingBundle`]: crate::ChargingBundle
 
 use crate::anchor::SpanMode;
+use escapepod_signal::resquiggle::KmerTable;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// The k-mer level model the `resid` statistic is defined against.
 ///
@@ -39,6 +41,35 @@ pub struct KmerLevels {
     pub k: usize,
     /// Which base of the k-mer a level belongs to (default `k / 2`).
     pub center_idx: usize,
+    /// The same levels as a direct index, built on first use. The map is
+    /// the pinned artefact; this is how it is read per base — see
+    /// [`Self::packed`].
+    packed: OnceLock<Option<KmerTable>>,
+}
+
+impl KmerLevels {
+    pub fn new(map: HashMap<String, f64>, k: usize, center_idx: usize) -> Self {
+        Self {
+            map,
+            k,
+            center_idx,
+            packed: OnceLock::new(),
+        }
+    }
+
+    /// The levels as a flat table indexed by 2-bit-packed k-mer.
+    ///
+    /// Probing the `String`-keyed map once per base was ~2.5% of `escpod
+    /// classify`'s CPU (a SipHash and a `memcmp` per k-mer); the table is one
+    /// load. Built lazily so a recipe that never computes a residual — the
+    /// corpus builder's coordinate-only paths, the bindings — pays nothing,
+    /// and `None` when `k` is outside what a flat table can hold, in which
+    /// case the map is used directly. Either way the values are the map's.
+    pub fn packed(&self) -> Option<&KmerTable> {
+        self.packed
+            .get_or_init(|| KmerTable::from_levels_map(&self.map, self.k).ok())
+            .as_ref()
+    }
 }
 
 /// Everything [`crate::feature_grid`] needs, and nothing else.

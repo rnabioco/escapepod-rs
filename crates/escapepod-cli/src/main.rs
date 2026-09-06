@@ -8,6 +8,19 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
+// The release artifact is static-musl, built by `cross`, and on `escpod
+// classify` with 8 threads it made 9.2 M voluntary context switches against
+// 79 k for a glibc build of the same code, running 2.35x slower in wall and
+// 3.9x in CPU. Not musl as such — the same source built static-musl with zig's
+// musl (mallocng) runs like glibc — but the `cross` image's older musl, whose
+// allocator takes one global lock per call. mimalloc is per-thread by design
+// and keeps Rust allocations off whatever libc malloc the artifact links. A
+// feature, so the two allocators can still be measured against each other; on
+// by default because the tarball is what production runs.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod commands;
 mod device;
 mod progress;
@@ -818,12 +831,18 @@ fn main() -> anyhow::Result<()> {
     // kernel it probes on each `demux detect --method cnn` run. `RUST_LOG`
     // remains the escape hatch for dependency logs. `-q` silences everything
     // but errors, dependencies included, so it stays a flat global level.
+    //
+    // Every workspace crate is named here, and a new one must be added: a
+    // crate left off this list is held at `warn` like a dependency, and its
+    // `info!` lines vanish with nothing to say so. `escapepod_classify` was
+    // missing from the day it was created, so which scorer a bundle resolved
+    // to — tract, or the native BiLSTM kernel — was logged and never shown.
     let filter = if cli.quiet {
         level.to_string()
     } else {
         format!(
             "warn,escpod={level},escapepod_cli={level},escapepod_demux={level},\
-             escapepod_signal={level},escapepod_pod5={level}"
+             escapepod_signal={level},escapepod_pod5={level},escapepod_classify={level}"
         )
     };
     tracing_subscriber::fmt()

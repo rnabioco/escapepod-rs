@@ -87,11 +87,7 @@ fn kmer() -> KmerLevels {
     let (map, k) =
         escapepod_signal::resquiggle::load_kmer_table(&fixtures().join("bundle/kmer_levels.tsv"))
             .expect("the fixture k-mer table loads");
-    KmerLevels {
-        map,
-        k,
-        center_idx: k / 2,
-    }
+    KmerLevels::new(map, k, k / 2)
 }
 
 /// Every fixture read that anchors, with its raw signal.

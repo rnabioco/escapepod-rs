@@ -61,3 +61,5 @@ notes/
 
 # leech caches a parsed kmer table beside the .tsv; a build artifact, not a fixture.
 *.tsv.pkl
+# static-musl A/B builds (cargo zigbuild --target-dir target-musl, benchmarks/README.md)
+/target-musl/

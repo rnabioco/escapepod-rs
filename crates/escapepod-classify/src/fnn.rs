@@ -56,6 +56,9 @@ use tract_onnx::tract_core::model::TypedRunnableModel;
 /// immutable, so the handle is `Sync` and one instance serves every worker.
 pub struct FeatureNet {
     plan: Arc<TypedRunnableModel>,
+    /// The graph's recurrence run directly, when the graph is the one
+    /// [`crate::fnn_lstm`] recognises. `None` scores through `plan`.
+    native: Option<crate::fnn_lstm::NativeBiLstm>,
     /// Value channels — half the tensor's channels; the other half are their
     /// observed-mask partners.
     n_val: usize,
@@ -74,6 +77,7 @@ impl std::fmt::Debug for FeatureNet {
         f.debug_struct("FeatureNet")
             .field("n_val", &self.n_val)
             .field("n_off", &self.n_off)
+            .field("backend", &self.backend())
             .finish_non_exhaustive()
     }
 }
@@ -102,6 +106,25 @@ impl FeatureNet {
         let mut proto = onnx
             .proto_model_for_path(path)
             .map_err(|e| anyhow!("cannot read feature model {}: {e}", path.display()))?;
+        // Matched on the proto as exported, before any rewrite. The env var
+        // is the escape hatch that keeps both paths measurable from one
+        // binary — and a way back to the general runtime if a bundle ever
+        // disagrees with its own kernel.
+        let native = if std::env::var_os("ESCAPEPOD_FNN_TRACT").is_some() {
+            None
+        } else {
+            crate::fnn_lstm::NativeBiLstm::from_proto(&proto, n_ch, n_off)
+                .filter(|net| net.n_classes() == 2)
+        };
+        match &native {
+            Some(net) => tracing::info!(
+                "feature model {}: bidirectional LSTM (hidden {}), run natively ({})",
+                path.display(),
+                net.hidden(),
+                net.backend().name()
+            ),
+            None => tracing::info!("feature model {}: run through tract", path.display()),
+        }
         let hoisted = hoist_conv_padding(&mut proto, 1);
         if hoisted > 0 {
             tracing::debug!(
@@ -126,6 +149,7 @@ impl FeatureNet {
 
         let net = Self {
             plan,
+            native,
             n_val,
             n_off,
             mu: mu.iter().map(|&v| v as f32).collect(),
@@ -152,6 +176,19 @@ impl FeatureNet {
 
     pub fn n_offsets(&self) -> usize {
         self.n_off
+    }
+
+    /// What scores a read: the native kernel and its instruction set, or
+    /// tract.
+    pub fn backend(&self) -> &'static str {
+        match &self.native {
+            Some(net) => match net.backend() {
+                crate::fnn_lstm::Backend::Scalar => "native bilstm (scalar)",
+                #[cfg(target_arch = "x86_64")]
+                crate::fnn_lstm::Backend::Avx2 => "native bilstm (avx2)",
+            },
+            None => "tract",
+        }
     }
 
     /// Run one zeroed input at load and insist the output is `[1, 2]`.
@@ -203,7 +240,24 @@ impl FeatureNet {
     /// Returns `[P(classes[0]), P(classes[1])]`.
     pub fn predict(&self, columns: &[f64]) -> Result<[f64; 2]> {
         let flat = self.input_tensor(columns)?;
-        let t = Tensor::from_shape(&[1, 2 * self.n_val, self.n_off], &flat)
+        if let Some(net) = &self.native {
+            let mut logits = [0.0f32; 2];
+            net.logits(&flat, &mut logits)?;
+            return Ok(softmax2(logits[0] as f64, logits[1] as f64));
+        }
+        self.predict_tract_flat(&flat)
+    }
+
+    /// [`Self::predict`] through tract regardless of the native kernel — the
+    /// general path, kept callable so the two can be compared on real
+    /// weights.
+    pub fn predict_tract(&self, columns: &[f64]) -> Result<[f64; 2]> {
+        let flat = self.input_tensor(columns)?;
+        self.predict_tract_flat(&flat)
+    }
+
+    fn predict_tract_flat(&self, flat: &[f32]) -> Result<[f64; 2]> {
+        let t = Tensor::from_shape(&[1, 2 * self.n_val, self.n_off], flat)
             .map_err(|e| anyhow!("cannot build the feature tensor: {e}"))?;
         let out = self
             .plan
