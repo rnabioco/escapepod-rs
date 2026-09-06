@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.21.0 (2026-09-06)
+
 ### Fixed
 
 - **A fused run with a read-end head no longer refuses `--boundary-margin` /
