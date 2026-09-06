@@ -248,6 +248,37 @@ impl FeatureNet {
         self.predict_tract_flat(&flat)
     }
 
+    /// How many reads [`Self::predict_batch`] scores per pass at full
+    /// efficiency: the native kernel's lockstep width, or 1 through tract.
+    pub fn preferred_batch(&self) -> usize {
+        self.native.as_ref().map_or(1, |n| n.preferred_batch())
+    }
+
+    /// [`Self::predict`] for several reads at once.
+    ///
+    /// Through the native kernel the reads are scored in lockstep, so every
+    /// weight row streamed from L2 serves the whole group — the single-read
+    /// kernel's bound. Through tract it is a loop. Either way each read's
+    /// probability is exactly what [`Self::predict`] gives it.
+    pub fn predict_batch(&self, columns: &[&[f64]]) -> Result<Vec<[f64; 2]>> {
+        let Some(net) = &self.native else {
+            return columns.iter().map(|c| self.predict(c)).collect();
+        };
+        let flats: Vec<Vec<f32>> = columns
+            .iter()
+            .map(|c| self.input_tensor(c))
+            .collect::<Result<_>>()?;
+        let refs: Vec<&[f32]> = flats.iter().map(Vec::as_slice).collect();
+        let mut logits = vec![0.0f32; 2 * columns.len()];
+        net.logits_batch(&refs, &mut logits)?;
+        Ok(logits
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|l| softmax2(l[0] as f64, l[1] as f64))
+            .collect())
+    }
+
     /// [`Self::predict`] through tract regardless of the native kernel — the
     /// general path, kept callable so the two can be compared on real
     /// weights.

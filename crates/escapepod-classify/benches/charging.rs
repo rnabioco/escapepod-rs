@@ -348,6 +348,20 @@ fn bench_scorer(c: &mut Criterion) {
     g.bench_function("predict_tract", |b| {
         b.iter(|| black_box(net.predict_tract(black_box(&columns))))
     });
+    // The lockstep group, at the kernel's preferred width; throughput is
+    // per read, so this reads directly against `predict`.
+    let batch = net.preferred_batch();
+    let group_cols: Vec<Vec<f64>> = (0..batch)
+        .map(|_| {
+            let g: Vec<f32> = (0..grid.len()).map(|_| rng.float() * 2.0 - 1.0).collect();
+            bundle.select_columns(&g).unwrap()
+        })
+        .collect();
+    let group_refs: Vec<&[f64]> = group_cols.iter().map(Vec::as_slice).collect();
+    g.throughput(Throughput::Elements(batch as u64));
+    g.bench_function(BenchmarkId::new("predict_batch", batch), |b| {
+        b.iter(|| black_box(net.predict_batch(black_box(&group_refs))))
+    });
     g.bench_function("per_read", |b| {
         b.iter(|| {
             let cols = bundle.select_columns(black_box(&grid)).unwrap();

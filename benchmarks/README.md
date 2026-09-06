@@ -65,6 +65,82 @@ which cuts the traffic per read by that factor; it needs a batched scorer
 entry and a `par_chunks` in `classify_reads`, and is the identified next
 step rather than part of this change.
 
+### Three reads in lockstep (the stacked change)
+
+`NativeBiLstm::logits_batch` advances a group of reads one timestep
+together, so each 32-gate slice of a weight row is loaded once and applied
+to every read's accumulators. The recurrent weights are also repacked
+block-major (`[4H/32][H][32]`), so a pass over the `H` rows of one block
+streams 12 KB contiguously instead of 32 floats out of every 1.5 KB row.
+Same weights, same bench, one core, one node (`compute17`):
+
+| `scorer/…` | per read | vs tract |
+|---|---:|---:|
+| `predict_tract` | 490 µs | 1× |
+| `predict` (single read, row-major — the base PR) | 226 µs | 2.2× |
+| `predict` (single read, block-major) | 194 µs | 2.5× |
+| **`predict_batch/3`** | **122 µs** | **4.0×** |
+
+Three reads is exactly the AVX2 register file (4 accumulators × 3 + 3
+broadcasts + 1 row load = 16 YMM), not a tuned value. The batched kernel is
+bit-identical to the single-read one — the per-lane FMA order over `j` does
+not depend on the chunk width, the batch or the weight layout — pinned for
+every group size 1–8, and the end-to-end TSV of the batched binary is
+byte-identical to the unbatched one (70,189 rows).
+
+End to end, `escpod-glibc-all` (the speedups PR) against the same source
+plus this change, interleaved, rep 2, `compute15`:
+
+| `--threads` | unbatched wall / CPU | batched wall / CPU | CPU |
+|---:|---:|---:|---:|
+| 1 | 62.8 s / 27.1 s | 44.4 s / 22.3 s | −18% |
+| 8 | 12.4 s / 27.2 s | 12.9 s / 22.2 s | −18% |
+
+(At one thread wall is BeeGFS page-fault latency, one fault in flight at a
+time; at eight, the two BAM passes bound it on an input this small. The CPU
+column is the measurement, and it held within a second across three rounds
+on two nodes.)
+
+**A number to retract.** An earlier draft of this section put the batched
+kernel at 75 µs/read, 3.0× the single-read kernel. That was the kernel's
+first form; the version that survived clippy's rewrite of its accumulator
+loops measured 136 µs on the same node beside the same 226, and criterion's
+own history for the bench agrees. The table above is one node, one run.
+
+**What the rest of the gap is not.** At 122 µs the batched loop runs ~11
+cycles per 12 FMAs against a 6-cycle port bound. Five hypotheses, one per
+round, each measured on the criterion bench and end to end:
+
+- *One scorer group per rayon task.* A chunk that lost a read to the abstain
+  rule scored a 2-wide group (a sixth of them), and every group refetched
+  the weights after the next chunk's prep evicted them. Eight groups per
+  chunk: a few CPU-seconds end to end. Kept.
+- *Bounds checks in the recurrence loop.* `hcur[r * h + j]` cost two per
+  read per step, 33 instructions per 12 FMAs. Removed; the bench did not
+  move. Kept, since it is also simpler.
+- *Column-strided weight reads.* Block-major packing, above: −14% on the
+  single-read kernel, −11% batched. Kept.
+- *Frontend.* `idq_uops_not_delivered` is 5% of issue slots. Unrolling the
+  loop two hidden units per trip changed nothing; reverted.
+- *Split cache-line loads* from 16-byte-aligned `Vec`s. Aligning the weights
+  and the scratch to 64 bytes left `l1d.replacement` and cycles unchanged;
+  reverted.
+
+What the counters leave (`perf stat`, the bench, `compute15`): IPC 1.7, 20%
+of cycles with nothing executing, L2 misses negligible, FMA and load ports
+at about half occupancy. That reads as the latency of a row load into the
+three FMAs that consume it, on a loop with one load per three FMAs — and
+the base PR's reading of the single-read kernel as L2-bandwidth-bound was
+this same shape seen from the other side (its counters: 20% memory-stalled
+cycles, not a bandwidth floor). AVX-512 — 16 lanes, 32 registers, 6 reads ×
+4 accumulators, half the µops per lane — is the lever left on rna and the
+gpu nodes, and is untested.
+
+Profile this kernel with `release-with-debug`, never `profiling`: without
+fat LTO the const-generic accumulator array is not unrolled into registers,
+and under that profile the batched binary reads *slower* than the single-read
+one end to end, which the release build contradicts.
+
 ### Parity of the kernel against tract, on real reads
 
 Same binary, `ESCAPEPOD_FNN_TRACT=1` on and off, TSVs joined on read id:

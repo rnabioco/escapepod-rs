@@ -420,6 +420,25 @@ impl Scorer<'_> {
             Self::FeatureNn(net) => Ok(net.predict(features)?[1]),
         }
     }
+
+    /// How many reads to hand [`Self::p_positive_batch`] at a time. One for
+    /// a scorer that gains nothing from a group.
+    fn preferred_batch(&self) -> usize {
+        match self {
+            Self::Gbm(_) => 1,
+            #[cfg(feature = "fnn-onnx")]
+            Self::FeatureNn(net) => net.preferred_batch(),
+        }
+    }
+
+    /// [`Self::p_positive`] for a group of reads, in order.
+    fn p_positive_batch(&self, features: &[&[f64]]) -> Result<Vec<f64>> {
+        match self {
+            Self::Gbm(_) => features.iter().map(|f| self.p_positive(f)).collect(),
+            #[cfg(feature = "fnn-onnx")]
+            Self::FeatureNn(net) => Ok(net.predict_batch(features)?.iter().map(|p| p[1]).collect()),
+        }
+    }
 }
 
 /// Does the bundle's abstain rule exclude this read?
@@ -483,34 +502,70 @@ pub fn classify_reads(
             reason,
         })
     };
+    // Reads go to the scorer in groups: the native BiLSTM kernel streams its
+    // recurrent weights from L2 once per timestep and scores a group in
+    // lockstep, so the group shares that traffic. The per-read work before
+    // scoring — signal, coordinates, the abstain rule, the feature grid — is
+    // unchanged and still per read; only the reads a chunk actually scores are
+    // handed over together, in order.
+    //
+    // A chunk is several of the scorer's groups, not one. With chunks of
+    // exactly one group the single-thread saving was a quarter of what it is
+    // now: the prep between chunks evicted the 295 KB of weights, so every
+    // group re-fetched them, and a chunk that lost one read to the abstain
+    // rule scored a narrower group (a sixth of them did). Eight groups per
+    // chunk amortise the reload over the chunk and leave one tail per chunk
+    // instead of one per group.
+    let batch = predictor.preferred_batch().max(1);
+    let chunk_reads = batch * if batch > 1 { 8 } else { 1 };
     let outcomes: Vec<Outcome> = reads
-        .par_iter()
-        .map(|read| {
-            let Some(info) = pod5.reads().get(&read.read_id) else {
-                return Ok(no_call(read, NoCallReason::NoSignal));
-            };
-            let sig_pa = signal_pa(info, &extractors)?;
-            if sig_pa.len() as i64 != read.ns {
-                return Ok(no_call(read, NoCallReason::NsMismatch));
+        .par_chunks(chunk_reads)
+        .map(|chunk| -> Result<Vec<Outcome>> {
+            let mut outs: Vec<Option<Outcome>> = (0..chunk.len()).map(|_| None).collect();
+            let mut to_score: Vec<(usize, Vec<f64>)> = Vec::with_capacity(chunk.len());
+            for (i, read) in chunk.iter().enumerate() {
+                let Some(info) = pod5.reads().get(&read.read_id) else {
+                    outs[i] = Some(no_call(read, NoCallReason::NoSignal));
+                    continue;
+                };
+                let sig_pa = signal_pa(info, &extractors)?;
+                if sig_pa.len() as i64 != read.ns {
+                    outs[i] = Some(no_call(read, NoCallReason::NsMismatch));
+                    continue;
+                }
+                // Resolved once and reused: the abstain rule reads the same
+                // coords the features are taken from, so the two cannot
+                // disagree about what the aligner reached.
+                let coords = anchor::finalize(read, orientation, recipe.offsets, recipe.span_mode);
+                if let Some(rule) = abstained_by(bundle.abstain.as_ref(), &coords) {
+                    outs[i] = Some(no_call(read, NoCallReason::Abstained(rule)));
+                    continue;
+                }
+                let grid = feature_grid_at(&recipe, read, &coords, &sig_pa);
+                to_score.push((i, bundle.select_columns(&grid)?));
             }
-            // Resolved once and reused: the abstain rule reads the same coords
-            // the features are taken from, so the two cannot disagree about
-            // what the aligner reached.
-            let coords = anchor::finalize(read, orientation, recipe.offsets, recipe.span_mode);
-            if let Some(rule) = abstained_by(bundle.abstain.as_ref(), &coords) {
-                return Ok(no_call(read, NoCallReason::Abstained(rule)));
+            if !to_score.is_empty() {
+                let cols: Vec<&[f64]> = to_score.iter().map(|(_, c)| c.as_slice()).collect();
+                let ps = predictor.p_positive_batch(&cols)?;
+                for ((i, _), p) in to_score.iter().zip(ps) {
+                    let read = chunk[*i];
+                    outs[*i] = Some(Outcome::Call(ReadCall {
+                        read_id: read.read_id,
+                        reference: read.reference.clone(),
+                        p,
+                        cl: crate::cl_from_probability(p),
+                    }));
+                }
             }
-            let grid = feature_grid_at(&recipe, read, &coords, &sig_pa);
-            let features = bundle.select_columns(&grid)?;
-            let p = predictor.p_positive(&features)?;
-            Ok(Outcome::Call(ReadCall {
-                read_id: read.read_id,
-                reference: read.reference.clone(),
-                p,
-                cl: crate::cl_from_probability(p),
-            }))
+            Ok(outs
+                .into_iter()
+                .map(|o| o.expect("every read in the group has an outcome"))
+                .collect())
         })
-        .collect::<Result<_>>()?;
+        .collect::<Result<Vec<Vec<Outcome>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let mut stats = ClassifyStats::default();
     let mut calls = Vec::with_capacity(outcomes.len());
