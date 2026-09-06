@@ -861,6 +861,7 @@ name = "escapepod-classify"
 version = "0.21.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "escapepod-demux",
  "escapepod-signal",
  "noodles-bam",

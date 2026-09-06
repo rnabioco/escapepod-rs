@@ -38,7 +38,17 @@ tract-onnx = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3"
+
+# The per-read charging path — the step `escpod classify` repeats once per
+# read, and the one thing in this crate a regression would show up in at
+# production scale. Self-contained (synthetic read, synthetic k-mer table), so
+# it runs in CI where the `ext/` fixtures do not exist; the scorer group needs
+# a real bundle and skips itself without one.
+[[bench]]
+harness = false
+name = "charging"
 
 # Verifies a real bundle against reference probabilities; needs the runtime it
 # is verifying.
