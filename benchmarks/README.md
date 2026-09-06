@@ -6,6 +6,32 @@ The follow-up to the section below it. Same input (65,821 scored reads, warm
 12 GB POD5, `--threads 8`, rna), same harness, interleaved arms, two reps;
 every arm produced the same 65,821 calls at median P(charged) = 0.125.
 
+### End to end (`benchmarks/benchmark_charging.sh`, 8 threads, two reps)
+
+The clean run, on `compute15` with nothing else on the socket; both reps
+agreed within a few percent on every arm, so one is shown. A second run on
+`compute16` reproduced every arm in rep 1 and then drifted by up to 1.6× in
+rep 2 as other jobs landed on the node — the shared-node caveat the demux
+notes already carry, restated.
+
+| arm | wall | CPU-s | cores busy |
+|---|---:|---:|---:|
+| 0.20.0 tarball (CI, `cross`, static musl) | 58.3 s | 280 | 4.8 |
+| unmodified source, static musl via zigbuild | 27.6 s | 81 | 2.9 |
+| unmodified source, glibc | 24.0 s | 73 | 3.0 |
+| fixes, kernel **off** (tract), mimalloc | 19.6 s | 72 | 3.7 |
+| fixes, kernel on, system allocator | 16.8 s | 46 | 2.7 |
+| **fixes, kernel on, mimalloc** | **15.7 s** | **42** | 2.7 |
+| fixes, kernel on, mimalloc, **static musl via zigbuild** | 17.0 s | 36 | 2.1 |
+
+Same 65,821 calls at median P(charged) = 0.125 on every arm. Read the pairs:
+kernel off → on is 72 → 42 CPU-s inside one binary; system allocator →
+mimalloc is 46 → 42; the BGZF and ordering changes show in wall, not CPU
+(24.0 → 19.6 s with the kernel off). The last row is the shape the release
+artifact would take with this branch built the way `benchmarks/README.md`
+above describes; it runs like the glibc build, where the CI tarball ran at
+3.5× its CPU.
+
 ### Per component (criterion, one core, against the saved `before`)
 
 | group | before | after | Δ |
