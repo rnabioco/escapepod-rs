@@ -370,7 +370,7 @@ impl AnchoredReads {
                 "center_idx {center_idx} outside a {k}-mer"
             )));
         }
-        self.kmer = Some(KmerLevels { map, k, center_idx });
+        self.kmer = Some(KmerLevels::new(map, k, center_idx));
         Ok(k)
     }
 

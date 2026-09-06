@@ -41,6 +41,10 @@ flate2 = { version = "1", optional = true }
 indicatif = { workspace = true, optional = true }
 # Reset SIGPIPE to default so `escpod view … | head` exits quietly (Unix only)
 libc = { version = "0.2", optional = true }
+# The global allocator for the binary; see main.rs for the measurement. Its
+# own feature rather than part of `cli`, so a build without it exists to
+# measure against.
+mimalloc = { version = "0.1", optional = true }
 # BAM file support
 noodles-bam = { version = "0.95", optional = true }
 noodles-bgzf = { version = "0.51", optional = true }
@@ -66,8 +70,12 @@ uuid = { workspace = true, optional = true }
 walkdir = { version = "2", optional = true }
 
 [features]
-# The `cli` feature ships the `escpod` CLI out of the box.
-default = ["cli"]
+# The `cli` feature ships the `escpod` CLI out of the box, with mimalloc as
+# its allocator. `--no-default-features --features cli` is the same binary on
+# the system allocator, kept buildable so the two can be measured against each
+# other (benchmarks/README.md has the numbers that put mimalloc here).
+default = ["cli", "mimalloc"]
+mimalloc = ["dep:mimalloc"]
 
 # Library re-export layers. `signal` pulls the pod5 layer transitively.
 pod5 = ["dep:escapepod-pod5"]

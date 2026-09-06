@@ -1,5 +1,66 @@
 # Benchmark Results
 
+## Charging classifier: native BiLSTM kernel and the per-read path (2026-09-06)
+
+The follow-up to the section below it. Same input (65,821 scored reads, warm
+12 GB POD5, `--threads 8`, rna), same harness, interleaved arms, two reps;
+every arm produced the same 65,821 calls at median P(charged) = 0.125.
+
+### Per component (criterion, one core, against the saved `before`)
+
+| group | before | after | Δ |
+|---|---:|---:|---:|
+| `scorer/predict` — tract → native BiLSTM (AVX2) | 490.9 µs | **221.7 µs** | −56% |
+| `junction_features/33_offsets` — the median/MAD gauge | 33.3 µs | **21.5 µs** | −35% |
+| `feature_grid/*` — the whole feature step, packed k-mer path | 41.7 µs | **23.8 µs** | −43% |
+| `expected_levels_z/9mer` — the *map* path, unchanged code | 7.7 µs | 8.5 µs | noise |
+| `finalize/*` | 0.28 µs | 0.30 µs | noise |
+
+`feature_grid` minus its parts puts the packed k-mer lookup at ~2.6 µs
+against the map path's 7.7.
+
+**Two things that did not work, kept here so they are not tried again.** A
+256-bin radix select for the gauge measured `junction_features` at 58.8 µs —
+1.8× *slower* than the comparison select it replaced; at ~5–10k elements the
+histogram's store-to-load dependency chain and the branchy partition cost
+more than the comparisons. The shipped version keeps the `u32` order-key
+trick and selects with `select_nth_unstable` on the integers. And naming the
+kernel's eight accumulators explicitly (against a suspected stack spill)
+changed nothing: 217.6 → 221.7 µs, i.e. LLVM already had them in registers.
+
+**Where the kernel's floor is.** 2 directions × 33 steps × 96 × 384 = 2.4 M
+multiply-adds per read — ~55 µs of FMA at AVX2 rates — yet it measures 222.
+Each timestep re-streams the 147 KB transposed recurrent matrix per direction
+from L2: ~9.7 MB per read, which at 25–40 B/cycle is 110–220 µs. The kernel is
+L2-bandwidth-bound on `Rᵀ`, not compute-bound. The lever is to score two or
+three reads per pass so each weight row feeds several accumulator sets (4
+accumulators × 3 reads + 3 broadcasts + 1 load fills the 16 YMM registers),
+which cuts the traffic per read by that factor; it needs a batched scorer
+entry and a `par_chunks` in `classify_reads`, and is the identified next
+step rather than part of this change.
+
+### Parity of the kernel against tract, on real reads
+
+Same binary, `ESCAPEPOD_FNN_TRACT=1` on and off, TSVs joined on read id:
+65,821 calls on both, identical sets; |Δp| median 0 at the TSV's six
+decimals, p99 1e-6, p99.9 2e-6, max 2.1e-5; `cl` (uint8) differs on 2 reads;
+**zero calls cross the operating point.** The feature grid's own parity
+tolerance is 1e-4.
+
+### The release tarball, revisited
+
+The section below attributes the CI tarball's 2.35× wall / 3.9× CPU to
+"musl". That was too broad. A static-musl build of the *same* source with
+zig's musl (`cargo zigbuild --profile dist --target x86_64-unknown-linux-musl`,
+`-C target-cpu=haswell`, the release workflow's flags) runs like glibc —
+28.4 s / 78 CPU-s / 153 k voluntary context switches against the tarball's
+62.5 s / 246 CPU-s / 7.9 M. The tarball's strings carry `GCC: (GNU) 9.4.0`:
+it is `cross`'s old musl image, whose musl predates mallocng and takes one
+global lock per allocation. mimalloc as the global allocator keeps every Rust
+allocation off that path whichever libc the artifact links; measured on glibc
+it is worth a further ~10% of CPU. The confirmation on a CI-built tarball is
+the next release's to make.
+
 ## Charging classifier: version A/B, and why it looked slower (2026-09-06)
 
 A production report that `escpod classify` had "got 2× slower" — and nothing in

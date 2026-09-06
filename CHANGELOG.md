@@ -2,6 +2,87 @@
 
 ## Unreleased
 
+### Performance
+
+- **`escpod classify` runs the shipped charging network's recurrence
+  natively, and the per-read feature path is cheaper.** Measured end to end
+  on 65,821 scored reads (warm 12 GB POD5, `--threads 8`, rna, interleaved
+  arms, two reps, identical calls on every arm): a glibc build went from
+  24.0 s wall / 73 CPU-s to **15.7 s / 42 CPU-s** (−35% wall, −42% CPU).
+  Component by component:
+
+  - **The BiLSTM kernel** (`fnn_lstm`). `charging_feature_nn_rna004` is
+    `arch: lstm` — bidirectional, 96 hidden, 33 timesteps, mean-and-max
+    readout — and through tract it cost 491 µs/read, ~34% of the whole
+    command's CPU with only ~14% of that in arithmetic; the rest was
+    per-timestep bookkeeping, and an unrolled graph measured 3× *worse*.
+    `NativeBiLstm::from_proto` recognises exactly that graph in the ONNX
+    proto, refuses every variation the LSTM op permits (peepholes, custom
+    activations, `clip`, `input_forget`, a non-zero initial state, sequence
+    lengths, `layout`), and runs the recurrence as unit-stride axpys under a
+    runtime-dispatched AVX2+FMA kernel: **222 µs/read on one core (2.2×)**,
+    and in the 8-thread run the kernel-on/off pair inside one binary is
+    72 → 42 CPU-s, because tract's per-thread working set contends for memory
+    bandwidth where the kernel's 295 KB of transposed weights sit in L2.
+    Parity against tract on real reads: 65,821 of 65,821 calls, |Δp| median 0
+    at six decimals, p99 1e-6, max 2.1e-5; `cl` differs on 2 reads (a uint8
+    rounding boundary); no call crosses the operating point. Anything that is
+    not this graph stays on tract, and `ESCAPEPOD_FNN_TRACT=1` forces it.
+
+    The kernel's floor is L2 bandwidth, not FMAs: each timestep re-streams
+    147 KB of `Rᵀ` per direction, ~9.7 MB per read. Naming the eight
+    accumulators explicitly (against a suspected spill) changed nothing.
+    Scoring 2–3 reads per pass so each weight row feeds several accumulator
+    sets is the identified next step, and would need a batched scorer entry.
+
+  - **The per-read median/MAD gauge** — the single largest symbol in the
+    profile, 11.5% of CPU in `select_nth_unstable_by(total_cmp)` over ~10k
+    samples — now selects on order-preserving `u32` keys computed once per
+    element: `junction_features` 33.3 → 21.5 µs (−35%), bit-identical, pinned
+    against the comparison select on every length to 300 with duplicates,
+    both zeros and a narrow picoamp band. A 256-bin radix select was tried
+    first and measured 1.8× *slower* at this size; the histogram's
+    store-to-load chain and the branchy partition cost more than the
+    comparisons they replace.
+
+  - **The k-mer level lookup** goes through `KmerLevels::packed()`, a flat
+    table indexed by 2-bit k-mer, instead of a `String`-keyed hash probe per
+    base: ~7.7 → ~2.6 µs per read. `KmerTable::from_levels_map` builds it
+    from the pinned map so the values are the map's `as f32`, never
+    re-parsed (a decimal parsed straight to `f32` can differ by an ulp from
+    one parsed to `f64` and narrowed), and indexes only uppercase `ACGT` keys
+    because that is all the map path can ever match. Equivalence is pinned in
+    both crates, around a non-base, at the ends, on lowercase and `U`.
+
+  - **Both BAM passes' BGZF pools are sized from the rayon pool.**
+    `MultithreadedReader::new` and `MultithreadedWriter::new` are ONE worker
+    each, whatever the name suggests; the output BAM's deflate was 5.7% of
+    CPU on a single thread. The scan's reader gets half the pool, the
+    tagging pass's writer the whole of it. **`classify_reads` walks each POD5
+    forward**, sorting its work on `(file, first signal row)` instead of
+    taking `HashMap` order — a rayon chunk becomes a forward sweep the
+    kernel's readahead can serve. Together these show in wall rather than
+    CPU: with the kernel off, 24.0 → 19.6 s at unchanged CPU.
+
+  - **mimalloc is the binary's allocator** (`escapepod-cli`'s `mimalloc`
+    feature, on by default; `--no-default-features --features cli` keeps the
+    system allocator buildable for comparison). On glibc it is worth ~10% of
+    CPU (46 → 42 CPU-s). It is here for the release artifact: the static-musl
+    tarball production runs was measured at 2.35× the wall and 3.9× the CPU of
+    a glibc build of the same code, with 9.2 M voluntary context switches
+    against 79 k. A static-musl build of the same source with zig's musl runs
+    like glibc, and the tarball's strings show `GCC: (GNU) 9.4.0` — `cross`'s
+    old musl image, whose allocator predates mallocng and serialises every
+    thread on one lock. mimalloc keeps Rust allocations out of that path
+    whatever libc the artifact links; the confirmation on the CI-built
+    tarball itself is the next release's, not this branch's.
+
+- **`escapepod_classify`'s log lines were never shown.** The CLI's default
+  filter names each workspace crate to hold at the verbosity level and
+  dependencies at `warn`; the classify crate was missing from the list since
+  it was created, so every `info!` it emitted — now including which scorer a
+  bundle resolved to — was dropped silently. Added.
+
 ### Added
 
 - **The charging classifier has benchmarks.** A production report that

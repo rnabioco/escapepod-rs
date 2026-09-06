@@ -1767,7 +1767,7 @@ impl ChargingBundle {
                     if center_idx >= k {
                         bail!("kmer_table center_idx {center_idx} out of range for k={k}");
                     }
-                    Ok(Some(KmerLevels { map, k, center_idx }))
+                    Ok(Some(KmerLevels::new(map, k, center_idx)))
                 }
                 None if needed.is_empty() => Ok(None),
                 None => bail!(

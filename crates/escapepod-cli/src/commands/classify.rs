@@ -472,8 +472,17 @@ fn finish(
     // --- Pass 2: write the BAM with `cl` ----------------------------------
     let cl_by_id: HashMap<uuid::Uuid, u8> = calls.iter().map(|c| (c.read_id, c.cl)).collect();
 
+    // `MultithreadedReader::new` / `MultithreadedWriter::new` are ONE worker
+    // each, whatever the name suggests. This pass is decode -> add one tag ->
+    // re-encode, and the BGZF deflate of the output is 5.7% of the whole
+    // command's CPU on one thread — so the writer gets the pool's width and the
+    // reader, whose inflate is far cheaper, a quarter of it.
+    let threads = rayon::current_num_threads().max(1);
+    let reader_workers = std::num::NonZero::new(threads.div_ceil(4)).expect("at least one");
+    let writer_workers = std::num::NonZero::new(threads).expect("at least one");
+
     let file = std::fs::File::open(&args.bam)?;
-    let decoder = bgzf::io::MultithreadedReader::new(file);
+    let decoder = bgzf::io::MultithreadedReader::with_worker_count(reader_workers, file);
     let mut reader = bam::io::Reader::from(decoder);
     let mut out_header = reader.read_header()?;
     let pg = Map::<Program>::builder()
@@ -490,7 +499,7 @@ fn finish(
     out_header.programs_mut().add("escpod-classify", pg)?;
 
     let out_file = std::fs::File::create(&args.output)?;
-    let encoder = bgzf::io::MultithreadedWriter::new(out_file);
+    let encoder = bgzf::io::MultithreadedWriter::with_worker_count(writer_workers, out_file);
     let mut writer = bam::io::Writer::from(encoder);
     writer.write_header(&out_header)?;
 

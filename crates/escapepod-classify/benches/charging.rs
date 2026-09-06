@@ -148,11 +148,7 @@ fn kmer_levels() -> KmerLevels {
             80.0 + rng.float() as f64 * 40.0,
         );
     }
-    KmerLevels {
-        map,
-        k: K,
-        center_idx: 4,
-    }
+    KmerLevels::new(map, K, 4)
 }
 
 /// The whole per-read feature step, which is what `classify_reads` calls.
@@ -343,8 +339,14 @@ fn bench_scorer(c: &mut Criterion) {
     let mut g = c.benchmark_group("scorer");
     g.sample_size(bench_sample_size(50));
     g.throughput(Throughput::Elements(1));
+    eprintln!("scorer backend: {}", net.backend());
     g.bench_function("predict", |b| {
         b.iter(|| black_box(net.predict(black_box(&columns))))
+    });
+    // The general path, whatever `predict` resolved to: the pair is the
+    // native kernel's speedup on the real weights.
+    g.bench_function("predict_tract", |b| {
+        b.iter(|| black_box(net.predict_tract(black_box(&columns))))
     });
     g.bench_function("per_read", |b| {
         b.iter(|| {
