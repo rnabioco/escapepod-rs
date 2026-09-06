@@ -128,13 +128,65 @@ round, each measured on the criterion bench and end to end:
 
 What the counters leave (`perf stat`, the bench, `compute15`): IPC 1.7, 20%
 of cycles with nothing executing, L2 misses negligible, FMA and load ports
-at about half occupancy. That reads as the latency of a row load into the
-three FMAs that consume it, on a loop with one load per three FMAs — and
-the base PR's reading of the single-read kernel as L2-bandwidth-bound was
-this same shape seen from the other side (its counters: 20% memory-stalled
-cycles, not a bandwidth floor). AVX-512 — 16 lanes, 32 registers, 6 reads ×
-4 accumulators, half the µops per lane — is the lever left on rna and the
-gpu nodes, and is untested.
+at about half occupancy. That was read at first as "not L2", and it was
+wrong — see the next section: L2 *hits* have a bandwidth, and the miss
+counter cannot see it.
+
+### AVX-512, and the probe that sized it (the third stacked change)
+
+`run_avx512_batch::<N>`: the same 32-gate slices, sixteen lanes, eight
+reads per row load (2 accumulators × 8 reads + 8 broadcasts + 2 row loads =
+26 of the 32 ZMM registers). Runtime-dispatched on `avx512f`, never a
+baseline bump; a lone read still takes the AVX2 single-read kernel (208
+against 168 µs through the 16-wide kernel at `N = 1`). Bit-identical to
+both AVX2 kernels — `vec16` mirrors `vec8` op for op — and pinned for every
+group width from 1 to 17 in `avx512_matches_avx2_bit_for_bit`, which runs
+on rna and says so when it skips on CI. `ESCAPEPOD_LSTM_BACKEND=avx2` caps
+the dispatch: the A/B lever inside one binary. Same node, same run
+(`compute21`, under load):
+
+| `scorer/…` | per read |
+|---|---:|
+| `predict_tract` | 512 µs |
+| `predict` (AVX2 single) | 168 µs |
+| `predict_batch/3` (AVX2) | 115 µs |
+| **`predict_batch/8` (AVX-512)** | **97 µs** |
+
+End to end, the same binary capped at AVX2 against itself, interleaved,
+rep 2: 23.1 → 21.8 CPU-s single-threaded, 21.9 → 20.3 at `--threads 8`
+(−6% and −7%). TSVs identical (70,189 rows). The 512-bit clock licence is
+in those numbers, not modelled: the per-read prep between chunks runs at
+whatever the licence leaves, and the CPU column still came out ahead.
+
+**What the loop is bound by, finally.** `examples/axpy_probe.rs` runs each
+loop shape on synthetic weights sized for L1 (24 KB), the shipped `Rᵀ`
+(144 KB, L2), 1 MB and 5.9 MB, and reports cycles per row. The single-read
+loop costs 5.0 cycles per row from L1 and 11.2 from L2: it is **L2→L1
+bandwidth after all**, about 23 B/cycle for this access pattern on rna, as
+the speedups PR's docs first said. FP assists are zero at both widths
+(`fp_assist.any`), so denormals are not in it either. The shape table, at
+144 KB, normalised to cycles per read per timestep — cycles per row per
+read × rows per step — because narrower slices mean more rows:
+
+| loop shape | cycles / row / read | rows / step | per read per step |
+|---|---:|---:|---:|
+| AVX2, 1 read × 64 gates (single) | 11.2 | 576 | 6474 |
+| AVX2, 3 × 32 (#328) | 2.9 | 1152 | 3306 |
+| AVX2, 5 × 16 | 1.5 | 2304 | 3410 |
+| AVX-512, 4 × 64 (this PR's first cut) | 3.9 | 576 | 2229 |
+| **AVX-512, 8 × 32 (shipped)** | **1.7** | **1152** | **1981** |
+| AVX-512, 12 × 16 | 1.1 | 2304 | 2465 |
+
+Wider slices read more bytes per row; narrower ones win per row and lose it
+back on the row count; the accumulator array and hand-named registers are
+identical at every size, so the kernel's codegen was never the problem. The
+first AVX-512 cut (4 × 64) measured 101 µs/read and was replaced by 8 × 32
+before this PR was opened. What remains: ~2000 cycles per read-step in the
+recurrence against an FMA floor of ~1150 on two 512-bit ports, and the
+activations — 60 sixteen-lane sigmoid/tanh per read-step, each with an
+IEEE divide — are now about a third of the kernel. Replacing the divides
+with `rcp14` and a Newton step would break the bit-identity across widths
+that keeps P(charged) the same on every x86 machine, and is not taken.
 
 Profile this kernel with `release-with-debug`, never `profiling`: without
 fat LTO the const-generic accumulator array is not unrolled into registers,

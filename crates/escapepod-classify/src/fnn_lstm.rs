@@ -50,31 +50,67 @@ use tract_onnx::pb;
 const ONNX_FLOAT: i32 = 1;
 const ONNX_INT64: i32 = 7;
 
-/// Which kernel scores a read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which kernel scores a read. Ordered slowest to fastest, so a cap from
+/// `ESCAPEPOD_LSTM_BACKEND` is a comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Backend {
     Scalar,
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+}
+
+/// `ESCAPEPOD_LSTM_BACKEND=scalar|avx2|avx512` caps the kernel the
+/// dispatch may pick — the A/B lever between the widths inside one binary.
+/// Never raises: a cap the machine cannot run is simply not reached.
+fn backend_cap() -> Option<Backend> {
+    static CAP: std::sync::OnceLock<Option<Backend>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let v = std::env::var("ESCAPEPOD_LSTM_BACKEND").ok()?;
+        match v.as_str() {
+            "scalar" => Some(Backend::Scalar),
+            #[cfg(target_arch = "x86_64")]
+            "avx2" => Some(Backend::Avx2),
+            #[cfg(target_arch = "x86_64")]
+            "avx512" => Some(Backend::Avx512),
+            other => {
+                tracing::warn!("ESCAPEPOD_LSTM_BACKEND={other}: not a kernel name, ignored");
+                None
+            }
+        }
+    })
 }
 
 impl Backend {
     /// The fastest kernel this machine can run for a hidden size.
     ///
-    /// The AVX2 activations are 8-wide, so a hidden size that is not a
-    /// multiple of 8 stays scalar rather than growing a masked tail nobody
-    /// ships.
+    /// The AVX-512 activations are 16-wide and the AVX2 ones 8-wide, so a
+    /// hidden size that is not a multiple of the width falls through to the
+    /// next kernel rather than growing a masked tail nobody ships. AVX-512
+    /// is runtime-detected, never a baseline bump: the release artifact is
+    /// built for Haswell, and Broadwell login nodes and Alpine's Zen3 take
+    /// the AVX2 kernel.
     pub fn best_for(h: usize) -> Self {
+        let cap = backend_cap();
+        let allowed = |b: Backend| cap.is_none_or(|c| b <= c);
         #[cfg(target_arch = "x86_64")]
         {
+            if h.is_multiple_of(16)
+                && allowed(Backend::Avx512)
+                && is_x86_feature_detected!("avx512f")
+            {
+                return Backend::Avx512;
+            }
             if h.is_multiple_of(8)
+                && allowed(Backend::Avx2)
                 && is_x86_feature_detected!("avx2")
                 && is_x86_feature_detected!("fma")
             {
                 return Backend::Avx2;
             }
         }
-        let _ = h;
+        let _ = (h, allowed);
         Backend::Scalar
     }
 
@@ -83,6 +119,8 @@ impl Backend {
             Backend::Scalar => "scalar",
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2 => "avx2",
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx512 => "avx512",
         }
     }
 }
@@ -154,6 +192,13 @@ impl NativeBiLstm {
             assert!(
                 self.h.is_multiple_of(8),
                 "the AVX2 kernel needs a hidden size that is a multiple of 8"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        if backend == Backend::Avx512 {
+            assert!(
+                self.h.is_multiple_of(16),
+                "the AVX-512 kernel needs a hidden size that is a multiple of 16"
             );
         }
         self.backend = backend;
@@ -444,11 +489,11 @@ impl NativeBiLstm {
     /// How many reads [`Self::logits_batch`] scores per pass at full
     /// efficiency on this backend.
     ///
-    /// The kernel is bound by streaming `Rᵀ` from L2 once per timestep, so
-    /// reads scored in lockstep share every weight-row load. Three is what the
-    /// AVX2 register file holds — 4 accumulators × 3 reads, 3 broadcasts, one
-    /// row load — and a caller batching in multiples of it loses nothing to
-    /// the tail.
+    /// Reads scored in lockstep share every weight-row load. Three is what
+    /// the AVX2 register file holds — 4 accumulators × 3 reads, 3 broadcasts,
+    /// one row load — and eight fills the AVX-512 one over the same 32-gate
+    /// slices (2 accumulators × 8 reads, 8 broadcasts, 2 row loads). A
+    /// caller batching in multiples of it loses nothing to the tail.
     pub fn preferred_batch(&self) -> usize {
         // `ESCAPEPOD_LSTM_BATCH` overrides the width, clamped to what the
         // backend has kernels for — the sweep lever, and the way to measure
@@ -464,6 +509,8 @@ impl NativeBiLstm {
             Backend::Scalar => 1,
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2 => 3,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx512 => 8,
         };
         wanted.map_or(max, |n| n.min(max))
     }
@@ -509,14 +556,57 @@ impl NativeBiLstm {
                     #[cfg(target_arch = "x86_64")]
                     // Safety: as for `run_avx2` — buffer sizes are checked
                     // above and `preferred_batch` sized the scratch; the
-                    // features are guaranteed by the dispatch.
+                    // features are guaranteed by the dispatch. The 16-wide
+                    // kernel takes every width up to eight, a lone read
+                    // included.
+                    (Backend::Avx512, 8) => unsafe {
+                        self.run_avx512_batch::<8>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx512, 7) => unsafe {
+                        self.run_avx512_batch::<7>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx512, 6) => unsafe {
+                        self.run_avx512_batch::<6>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx512, 5) => unsafe {
+                        self.run_avx512_batch::<5>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx512, 4) => unsafe {
+                        self.run_avx512_batch::<4>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx512, 3) => unsafe {
+                        self.run_avx512_batch::<3>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (Backend::Avx512, 2) => unsafe {
+                        self.run_avx512_batch::<2>(group, xw, hs, gates)
+                    },
+                    #[cfg(target_arch = "x86_64")]
                     (Backend::Avx2, 3) => unsafe { self.run_avx2_batch::<3>(group, xw, hs, gates) },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx2, 2) => unsafe { self.run_avx2_batch::<2>(group, xw, hs, gates) },
                     #[cfg(target_arch = "x86_64")]
-                    // A lone read takes the single-read kernel, on exactly
-                    // one read's worth of the scratch: it copies gates by
-                    // exact length.
+                    // A lone read on either wide backend takes the AVX2
+                    // single-read kernel: eight accumulators over a 64-gate
+                    // slice, against two per 32-gate slice through the
+                    // 16-wide kernel at `N = 1` (208 against 168 µs/read).
+                    // Every AVX-512F machine has AVX2 + FMA, and the two are
+                    // bit-identical. Two arms, not an or-pattern: see the
+                    // `#[inline(never)]` on the kernels.
+                    (Backend::Avx512, _) => unsafe {
+                        self.run_avx2(
+                            group[0],
+                            &mut xw[..xw_len],
+                            &mut hs[..hs_len],
+                            &mut gates[..g],
+                        )
+                    },
+                    #[cfg(target_arch = "x86_64")]
                     (Backend::Avx2, _) => unsafe {
                         self.run_avx2(
                             group[0],
@@ -574,6 +664,10 @@ impl NativeBiLstm {
                 // Safety: `best_for` / `with_backend` only select this when
                 // the CPU has AVX2 + FMA and `h` is a multiple of 8.
                 Backend::Avx2 => unsafe { self.run_avx2(x, xw, hs, gates) },
+                #[cfg(target_arch = "x86_64")]
+                // A lone read takes the AVX2 kernel on an AVX-512 machine
+                // too (see `logits_batch`); it is bit-identical.
+                Backend::Avx512 => unsafe { self.run_avx2(x, xw, hs, gates) },
             }
             self.readout(hs, out);
         });
@@ -666,6 +760,20 @@ impl NativeBiLstm {
     }
 
     #[cfg(target_arch = "x86_64")]
+    // `#[inline(never)]` on all three kernels, on evidence rather than
+    // taste: with the kernels inlined into `logits_batch` beside one another
+    // (the crate baseline is x86-64-v3, so the AVX2 ones may be), the
+    // AVX2 width-2 kernel returned wrong logits for its second read — wrong
+    // by the same bits on every run, on a node where the same kernel source
+    // had passed the day before. Bisected to the *form* of the dispatch (an
+    // or-pattern over the two lone-read arms failed, two arms with the same
+    // body passed) and cleared by this attribute with the or-pattern kept.
+    // The kernels' unsafe code was audited for aliasing and bounds and
+    // nothing was found; an LLVM miscompile is suspected and not proven.
+    // These are large leaf functions, so inlining them buys nothing, and
+    // `batched_matches_single_bit_for_bit` now pins every kernel on every
+    // backend the machine has, whichever the dispatch prefers.
+    #[inline(never)]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn run_avx2(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
         use std::arch::x86_64::*;
@@ -784,6 +892,7 @@ impl NativeBiLstm {
     /// `h[j] * Rᵀ[j]` over `j` in order, whatever the chunk width or the
     /// batch. The register budget is `4 accumulators × N + N broadcasts + 1
     /// row load`, which is why `N ≤ 3`.
+    #[inline(never)]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn run_avx2_batch<const N: usize>(
         &self,
@@ -902,6 +1011,172 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")]
+impl NativeBiLstm {
+    /// `N` reads in lockstep, sixteen lanes wide, over the same 32-gate
+    /// slices as the AVX2 kernel: 2 accumulators × `N`, `N` broadcasts and
+    /// 2 row loads, which fits the 32 ZMM registers up to `N = 8`. The
+    /// weights are streamed once per eight reads instead of three. Measured
+    /// shape by shape in `examples/axpy_probe.rs`: over 64-gate slices with
+    /// four reads this loop reads twice the bytes per row and loses to the
+    /// AVX2 one per read; over 16-gate slices it wins per row and loses it
+    /// back on the row count.
+    ///
+    /// Bit-identical to [`Self::run_avx2_batch`] and [`Self::run_avx2`]: each
+    /// gate lane still accumulates `h[j] * Rᵀ[j]` over `j` in order whatever
+    /// the vector width, and every activation is the same sequence of IEEE
+    /// operations per lane (`vec16` mirrors `vec8` op for op). Pinned across
+    /// widths in `avx512_matches_avx2_bit_for_bit`.
+    #[inline(never)]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn run_avx512_batch<const N: usize>(
+        &self,
+        xs: &[&[f32]],
+        xw: &mut [f32],
+        hs: &mut [f32],
+        gates: &mut [f32],
+    ) {
+        use std::arch::x86_64::*;
+        use vec16::{sigmoid16, tanh16};
+        debug_assert_eq!(xs.len(), N);
+        let (seq, h, g) = (self.seq, self.h, 4 * self.h);
+        // `h % 16 == 0` (the dispatch's precondition) makes `g` a multiple of
+        // 64, so the slice loop has no tail and `rt_blocked` is populated.
+        debug_assert!(h.is_multiple_of(16));
+        debug_assert!(N <= 8);
+        let (xw_len, hs_len) = (2 * seq * g, seq * 2 * h);
+        // Safety: as for `run_avx2_batch` — every length was checked by
+        // `logits`/`logits_batch`, the scratch was sized for
+        // `preferred_batch() >= N` reads, and the feature is guaranteed by
+        // the dispatch.
+        unsafe {
+            let mut hcur = vec![0.0f32; N * h];
+            let mut c = vec![0.0f32; N * h];
+            for d in 0..2 {
+                for (r, x) in xs.iter().enumerate() {
+                    let off = r * xw_len + d * seq * g;
+                    self.input_contribution(d, x, &mut xw[off..off + seq * g]);
+                }
+                hcur.iter_mut().for_each(|v| *v = 0.0);
+                c.iter_mut().for_each(|v| *v = 0.0);
+                let rtb = self.rt_blocked[d].as_ptr();
+                for step in 0..seq {
+                    let t = if d == 0 { step } else { seq - 1 - step };
+                    for r in 0..N {
+                        let src = r * xw_len + d * seq * g + t * g;
+                        gates[r * g..(r + 1) * g].copy_from_slice(&xw[src..src + g]);
+                    }
+                    if step > 0 {
+                        let gp = gates.as_mut_ptr();
+                        let hc = hcur.as_ptr();
+                        let mut base = 0usize;
+                        while base < g {
+                            // `acc[v][r]`: vector `v` of the 32-gate slice
+                            // for read `r`; one block of `rt_blocked`, one
+                            // contiguous stream.
+                            let mut acc = [[_mm512_setzero_ps(); N]; 2];
+                            for (v, accv) in acc.iter_mut().enumerate() {
+                                for (r, a) in accv.iter_mut().enumerate() {
+                                    *a = _mm512_loadu_ps(gp.add(r * g + base + v * 16));
+                                }
+                            }
+                            let mut row = rtb.add((base / 32) * h * 32);
+                            for j in 0..h {
+                                let mut hv = [_mm512_setzero_ps(); N];
+                                for (r, hvr) in hv.iter_mut().enumerate() {
+                                    *hvr = _mm512_set1_ps(*hc.add(r * h + j));
+                                }
+                                let w = [_mm512_loadu_ps(row), _mm512_loadu_ps(row.add(16))];
+                                for (accv, wv) in acc.iter_mut().zip(w.iter()) {
+                                    for (a, hvr) in accv.iter_mut().zip(hv.iter()) {
+                                        *a = _mm512_fmadd_ps(*hvr, *wv, *a);
+                                    }
+                                }
+                                row = row.add(32);
+                            }
+                            for (v, accv) in acc.iter().enumerate() {
+                                for (r, a) in accv.iter().enumerate() {
+                                    _mm512_storeu_ps(gp.add(r * g + base + v * 16), *a);
+                                }
+                            }
+                            base += 32;
+                        }
+                    }
+                    for r in 0..N {
+                        let gp = gates.as_ptr().add(r * g);
+                        let cp = c.as_mut_ptr().add(r * h);
+                        let hp = hcur.as_mut_ptr().add(r * h);
+                        for u in (0..h).step_by(16) {
+                            let gi = sigmoid16(_mm512_loadu_ps(gp.add(u)));
+                            let go = sigmoid16(_mm512_loadu_ps(gp.add(h + u)));
+                            let gf = sigmoid16(_mm512_loadu_ps(gp.add(2 * h + u)));
+                            let gc = tanh16(_mm512_loadu_ps(gp.add(3 * h + u)));
+                            let cprev = _mm512_loadu_ps(cp.add(u));
+                            let cn = _mm512_fmadd_ps(gf, cprev, _mm512_mul_ps(gi, gc));
+                            _mm512_storeu_ps(cp.add(u), cn);
+                            _mm512_storeu_ps(hp.add(u), _mm512_mul_ps(go, tanh16(cn)));
+                        }
+                        let dst = r * hs_len + t * 2 * h + d * h;
+                        hs[dst..dst + h].copy_from_slice(&hcur[r * h..(r + 1) * h]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `vec8`, sixteen wide: the same operations in the same order, so a lane
+/// through here and a lane through `vec8` produce the same bits.
+#[cfg(target_arch = "x86_64")]
+mod vec16 {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub fn exp16(x: __m512) -> __m512 {
+        let x = _mm512_min_ps(_mm512_set1_ps(88.376_26), x);
+        let x = _mm512_max_ps(_mm512_set1_ps(-88.376_26), x);
+        let fx = _mm512_fmadd_ps(
+            x,
+            _mm512_set1_ps(std::f32::consts::LOG2_E),
+            _mm512_set1_ps(0.5),
+        );
+        // Floor with exceptions suppressed: what `_mm256_floor_ps` is.
+        let fx = _mm512_roundscale_ps::<0x09>(fx);
+        let r = _mm512_fnmadd_ps(fx, _mm512_set1_ps(0.693_359_4), x);
+        let r = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.121_944_4e-4), r);
+        let r2 = _mm512_mul_ps(r, r);
+        let mut y = _mm512_set1_ps(1.987_569_1e-4);
+        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.398_199_9e-3));
+        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.333_452e-3));
+        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.166_579_6e-2));
+        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.666_666_6e-1));
+        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5e-1));
+        y = _mm512_fmadd_ps(y, r2, r);
+        y = _mm512_add_ps(y, _mm512_set1_ps(1.0));
+        let imm = _mm512_cvtps_epi32(fx);
+        let pow2 = _mm512_castsi512_ps(_mm512_slli_epi32::<23>(_mm512_add_epi32(
+            imm,
+            _mm512_set1_epi32(0x7f),
+        )));
+        _mm512_mul_ps(y, pow2)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub fn sigmoid16(x: __m512) -> __m512 {
+        let e = exp16(_mm512_sub_ps(_mm512_setzero_ps(), x));
+        _mm512_div_ps(_mm512_set1_ps(1.0), _mm512_add_ps(_mm512_set1_ps(1.0), e))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub fn tanh16(x: __m512) -> __m512 {
+        let s = sigmoid16(_mm512_add_ps(x, x));
+        _mm512_fmsub_ps(_mm512_set1_ps(2.0), s, _mm512_set1_ps(1.0))
+    }
+}
+
 mod vec8 {
     use std::arch::x86_64::*;
 
@@ -1370,6 +1645,61 @@ pub(crate) mod tests {
         }
     }
 
+    /// The 16-wide kernel is the 8-wide one op for op, so it is pinned bit
+    /// for bit — batched at every width it takes, and single — against the
+    /// AVX2 kernels rather than to a tolerance. Skips on a machine without
+    /// AVX-512F (CI), and says so.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_matches_avx2_bit_for_bit() {
+        if !is_x86_feature_detected!("avx512f") {
+            eprintln!("no AVX-512F on this machine: cross-width pin not exercised");
+            return;
+        }
+        let (n_ch, n_off, h) = (4, 33, 96);
+        let proto = lstm_model(n_ch, n_off, h, 33);
+        let wide = NativeBiLstm::from_proto(&proto, n_ch, n_off)
+            .unwrap()
+            .with_backend(Backend::Avx512);
+        let narrow = NativeBiLstm::from_proto(&proto, n_ch, n_off)
+            .unwrap()
+            .with_backend(Backend::Avx2);
+        assert_eq!(wide.preferred_batch(), 8);
+        // 1..=17 covers every group width and every tail after a full group.
+        for n_reads in 1..=17usize {
+            let inputs: Vec<Vec<f32>> = (1..=n_reads as u64)
+                .map(|s| input(n_ch, n_off, 70 + s))
+                .collect();
+            let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+            let (mut a, mut b) = (vec![0.0f32; 2 * n_reads], vec![0.0f32; 2 * n_reads]);
+            wide.logits_batch(&refs, &mut a).unwrap();
+            narrow.logits_batch(&refs, &mut b).unwrap();
+            assert_eq!(
+                a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "n_reads={n_reads}: avx512 {a:?} vs avx2 {b:?}"
+            );
+            for x in &inputs {
+                let (mut sa, mut sb) = ([0.0f32; 2], [0.0f32; 2]);
+                wide.logits(x, &mut sa).unwrap();
+                narrow.logits(x, &mut sb).unwrap();
+                assert_eq!(
+                    sa.map(f32::to_bits),
+                    sb.map(f32::to_bits),
+                    "single: {sa:?} vs {sb:?}"
+                );
+            }
+        }
+        // A hidden size that is a multiple of 8 but not 16 is the AVX2
+        // kernel's, whatever the machine has — unless `ESCAPEPOD_LSTM_BACKEND`
+        // caps the dispatch, which the closing round sets to run these
+        // tests under every backend.
+        if backend_cap().is_none() {
+            assert_eq!(Backend::best_for(88), Backend::Avx2);
+            assert_eq!(Backend::best_for(96), Backend::Avx512);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_matches_scalar() {
@@ -1442,27 +1772,48 @@ pub(crate) mod tests {
     /// Scoring reads in lockstep changes nothing about any read's answer:
     /// the batched kernel is bit-identical to the single-read one, for every
     /// group size up to and past the preferred batch, including the tails.
+    /// Every kernel the machine has, not only the one the dispatch prefers:
+    /// on an AVX-512 node the dispatch never reaches the AVX2 batched
+    /// kernels, and a run that only followed the dispatch stayed green
+    /// while the AVX2 width-2 kernel was returning wrong logits (see the
+    /// note on `run_avx2`).
     #[test]
     fn batched_matches_single_bit_for_bit() {
         let (n_ch, n_off, h) = (4, 33, 96);
         let proto = lstm_model(n_ch, n_off, h, 21);
-        let net = NativeBiLstm::from_proto(&proto, n_ch, n_off).expect("recognised");
-        for n_reads in 1..=8usize {
-            let inputs: Vec<Vec<f32>> = (1..=n_reads as u64)
-                .map(|s| input(n_ch, n_off, 40 + s))
-                .collect();
-            let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
-            let mut batched = vec![0.0f32; 2 * n_reads];
-            net.logits_batch(&refs, &mut batched).unwrap();
-            for (r, x) in inputs.iter().enumerate() {
-                let mut single = [0.0f32; 2];
-                net.logits(x, &mut single).unwrap();
-                assert_eq!(
-                    single.map(f32::to_bits),
-                    [batched[2 * r].to_bits(), batched[2 * r + 1].to_bits()],
-                    "n_reads={n_reads} read {r}: {single:?} vs {:?}",
-                    &batched[2 * r..2 * r + 2]
-                );
+        let mut backends = vec![Backend::Scalar];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                backends.push(Backend::Avx2);
+            }
+            if is_x86_feature_detected!("avx512f") {
+                backends.push(Backend::Avx512);
+            }
+        }
+        for &backend in &backends {
+            let net = NativeBiLstm::from_proto(&proto, n_ch, n_off)
+                .expect("recognised")
+                .with_backend(backend);
+            // Up to one more than the widest group, so every width and
+            // every tail after a full group is scored.
+            for n_reads in 1..=net.preferred_batch() + 1 {
+                let inputs: Vec<Vec<f32>> = (1..=n_reads as u64)
+                    .map(|s| input(n_ch, n_off, 40 + s))
+                    .collect();
+                let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+                let mut batched = vec![0.0f32; 2 * n_reads];
+                net.logits_batch(&refs, &mut batched).unwrap();
+                for (r, x) in inputs.iter().enumerate() {
+                    let mut single = [0.0f32; 2];
+                    net.logits(x, &mut single).unwrap();
+                    assert_eq!(
+                        single.map(f32::to_bits),
+                        [batched[2 * r].to_bits(), batched[2 * r + 1].to_bits()],
+                        "{backend:?} n_reads={n_reads} read {r}: {single:?} vs {:?}",
+                        &batched[2 * r..2 * r + 2]
+                    );
+                }
             }
         }
         // The scalar backend batches by looping, which is trivially the same;
