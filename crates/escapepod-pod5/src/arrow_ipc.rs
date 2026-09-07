@@ -9,6 +9,30 @@ use rayon::prelude::*;
 /// Magic bytes at start and end of Arrow IPC files.
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
 
+/// Batches below which [`ArrowIpcFooter::read_row_counts`] stays serial.
+///
+/// The walk it parallelises is latency, not work, so the threshold is about
+/// when a fan-out stops being free rather than when it starts paying: a POD5
+/// with a handful of batches is a small file whose headers are likely on the
+/// same pages anyway.
+const ROW_COUNT_PARALLEL_MIN: usize = 16;
+
+/// Whether `ESCAPEPOD_POD5_FOOTER_SERIAL` asks for the pre-parallel walk.
+///
+/// Read once. The answer cannot change within a process, and this sits on a
+/// path that a reader hits per file — one that a `classify` run may open
+/// dozens of.
+fn footer_walk_forced_serial() -> bool {
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        matches!(
+            std::env::var("ESCAPEPOD_POD5_FOOTER_SERIAL").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 /// Read a little-endian `i32` at `off`, returning an error instead of panicking
 /// if the 4-byte window falls outside `bytes`. Used throughout the hand-rolled
 /// parser so that malformed/truncated input propagates `Error::InvalidArrowIpc`
@@ -289,31 +313,44 @@ impl ArrowIpcFooter {
                     let block_size = 24; // Aligned size
                     let blocks_start = vec_pos + 4;
 
+                    // Pass one: the block descriptors. Every one of them is a
+                    // fixed-size struct inside the footer, which the tail read
+                    // above already made resident, so this pass touches
+                    // nothing scattered and nothing new.
                     for i in 0..vec_len {
                         let block_pos = blocks_start + i * block_size;
                         if block_pos + 20 > footer_bytes.len() {
                             break;
                         }
 
-                        let offset = read_i64_le(footer_bytes, block_pos)?;
-                        let metadata_length = read_i32_le(footer_bytes, block_pos + 8)?;
-                        // Skip 4 bytes padding
-                        let body_length = read_i64_le(footer_bytes, block_pos + 16)?;
-
-                        // Parse row count from the batch message metadata —
-                        // unless a caller supplied it, which is the whole
-                        // point: this read is the scattered one.
-                        let row_count = match known.and_then(|k| k.get(i).copied()) {
-                            Some(rows) => rows,
-                            None => Self::parse_batch_row_count(full_ipc, offset as usize)?,
-                        };
-
                         record_batches.push(BatchBlock {
-                            offset,
-                            metadata_length,
-                            body_length,
-                            row_count,
+                            offset: read_i64_le(footer_bytes, block_pos)?,
+                            metadata_length: read_i32_le(footer_bytes, block_pos + 8)?,
+                            // Skip 4 bytes padding
+                            body_length: read_i64_le(footer_bytes, block_pos + 16)?,
+                            // Filled in by pass two.
+                            row_count: 0,
                         });
+                    }
+
+                    // Pass two: the row counts, the one field the footer does
+                    // not carry. Supplied per batch where a caller knows them
+                    // — which is the whole point, this read is the scattered
+                    // one — and read for the rest, together rather than one
+                    // after another.
+                    let unknown: Vec<(usize, i64)> = record_batches
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| known.and_then(|k| k.get(*i)).is_none())
+                        .map(|(i, b)| (i, b.offset))
+                        .collect();
+                    for (i, b) in record_batches.iter_mut().enumerate() {
+                        if let Some(rows) = known.and_then(|k| k.get(i).copied()) {
+                            b.row_count = rows;
+                        }
+                    }
+                    for (i, rows) in Self::read_row_counts(full_ipc, &unknown)? {
+                        record_batches[i].row_count = rows;
                     }
                 }
             }
@@ -374,6 +411,45 @@ impl ArrowIpcFooter {
             total_rows,
             cumulative_rows,
         })
+    }
+
+    /// Read the row counts of the given `(index, offset)` batches, together.
+    ///
+    /// [`Self::parse_batch_row_count`] is a pure read of one message header at
+    /// an offset the footer already gave us, and **every offset is in hand
+    /// before the first header is read**. Nothing about this walk is
+    /// sequential except that it was written as a loop.
+    ///
+    /// On a local file that distinction does not matter. On a network
+    /// filesystem it is the whole cost: each header is a cold page fault
+    /// costing a server round trip — 15-24 ms measured on BeeGFS — and a large
+    /// POD5 has thousands of batches, so doing them one after another spends
+    /// minutes accumulating a latency that could have overlapped. Measured
+    /// against escapepod-rs#334's file set, opening one 6.3 GB POD5 and taking
+    /// a signal extractor from it cost ~10 s of which ~97% was this loop
+    /// blocked on faults at essentially zero CPU. That is the "slow to get
+    /// going" stall, and it is not bandwidth: the walk moves a few KB per
+    /// batch.
+    ///
+    /// So issue them together. The bytes read are identical, the row counts
+    /// are identical, and the order they are *collected* in is fixed by the
+    /// index each carries rather than by which thread finished first — this
+    /// returns pairs, not a bare vector, so a caller cannot accidentally
+    /// depend on completion order.
+    ///
+    /// Below [`ROW_COUNT_PARALLEL_MIN`] batches it stays serial: a handful of
+    /// round trips is not worth a fan-out, and a small file is exactly where
+    /// that overhead would show. `ESCAPEPOD_POD5_FOOTER_SERIAL=1` forces the
+    /// serial path at any size, which is the A/B lever and the way back.
+    fn read_row_counts(full_ipc: &[u8], wanted: &[(usize, i64)]) -> Result<Vec<(usize, u64)>> {
+        let read_one = |&(i, off): &(usize, i64)| {
+            Ok((i, Self::parse_batch_row_count(full_ipc, off as usize)?))
+        };
+
+        if wanted.len() < ROW_COUNT_PARALLEL_MIN || footer_walk_forced_serial() {
+            return wanted.iter().map(read_one).collect();
+        }
+        wanted.par_iter().map(read_one).collect()
     }
 
     /// Parse the row count from a RecordBatch message at the given offset.
@@ -906,6 +982,135 @@ mod tests {
         };
         assert_eq!(block.total_length(), 250);
         assert_eq!(block.byte_range(), 100..350);
+    }
+
+    /// A POD5 with more signal batches than [`ROW_COUNT_PARALLEL_MIN`], so
+    /// the walk under test actually fans out.
+    ///
+    /// Written here rather than taken from `ext/`, because the fixtures there
+    /// are a submodule CI does not check out — a test that needs one is a test
+    /// that never runs (escapepod-rs, `.gitmodules` is empty).
+    fn many_batch_pod5(dir: &std::path::Path) -> std::path::PathBuf {
+        use crate::types::{EndReason, ReadData, RunInfoData};
+        use crate::{Writer, WriterOptions};
+
+        let path = dir.join("many_batches.pod5");
+        let mut writer = Writer::create(
+            &path,
+            WriterOptions {
+                // Two rows a batch, so 61 reads make 30 full batches and a
+                // final short one — a geometry a shuffled count breaks.
+                signal_batch_size: 2,
+                ..Default::default()
+            },
+        )
+        .expect("writer::create");
+
+        let run_idx = writer
+            .add_run_info(RunInfoData {
+                acquisition_id: "row_counts".into(),
+                acquisition_start_time: 1_609_459_200_000,
+                adc_max: 2047,
+                adc_min: -2048,
+                sample_rate: 4_000,
+                ..Default::default()
+            })
+            .expect("add_run_info");
+
+        for i in 0..61u32 {
+            let read = ReadData {
+                read_id: crate::Uuid::new_v4(),
+                read_number: i + 1,
+                start_sample: i as u64 * 100,
+                channel: 1,
+                well: 1,
+                pore_type: "not_set".into(),
+                calibration_offset: 0.5,
+                calibration_scale: 0.95,
+                median_before: 200.0,
+                end_reason: EndReason::SignalPositive,
+                end_reason_forced: false,
+                run_info_index: run_idx,
+                num_minknow_events: 100,
+                tracked_scaling_scale: 1.0,
+                tracked_scaling_shift: 0.0,
+                predicted_scaling_scale: 1.0,
+                predicted_scaling_shift: 0.0,
+                num_reads_since_mux_change: 0,
+                time_since_mux_change: 0.0,
+                num_samples: 100,
+                open_pore_level: 220.0,
+                expected_open_pore_level: 0.0,
+                selected_read_level: 0.0,
+                signal_rows: Vec::new(),
+            };
+            let signal: Vec<i16> = (0..100).map(|s| (s * 7 + i as i32) as i16).collect();
+            writer.add_read(read, &signal).expect("add_read");
+        }
+        writer.finish().expect("finish");
+        path
+    }
+
+    /// The parallel walk must answer exactly what the serial one would, and
+    /// must answer for the batch it was asked about.
+    ///
+    /// A fan-out does not risk a wrong row count — reading one message header
+    /// is pure — it risks a wrong *pairing*. Results come back in completion
+    /// order, so a collect that lost track of which batch it asked about would
+    /// still build a perfectly plausible footer, with every batch carrying
+    /// some other batch's row count and every cumulative offset after the
+    /// first short batch wrong. Nothing about the shape of the answer would
+    /// look off. So this asserts the mapping, not the multiset.
+    #[test]
+    fn parallel_row_counts_keep_their_batch() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = many_batch_pod5(tmp.path());
+
+        let reader = crate::Reader::open(&path).expect("open");
+        let signal_bytes = reader.signal_table_bytes().expect("signal bytes");
+        let footer = ArrowIpcFooter::parse(signal_bytes).expect("parse");
+
+        assert!(
+            footer.record_batches.len() >= ROW_COUNT_PARALLEL_MIN,
+            "fixture has {} batches, below the {ROW_COUNT_PARALLEL_MIN} that \
+             makes the walk parallel — this test would prove nothing",
+            footer.record_batches.len()
+        );
+
+        let wanted: Vec<(usize, i64)> = footer
+            .record_batches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, b.offset))
+            .collect();
+        let got = ArrowIpcFooter::read_row_counts(signal_bytes, &wanted).expect("row counts");
+        assert_eq!(got.len(), wanted.len());
+
+        let mut answered: Vec<Option<u64>> = vec![None; wanted.len()];
+        for (i, rows) in got {
+            assert!(answered[i].is_none(), "batch {i} answered twice");
+            answered[i] = Some(rows);
+        }
+        for &(i, offset) in &wanted {
+            let serial = ArrowIpcFooter::parse_batch_row_count(signal_bytes, offset as usize)
+                .expect("serial row count");
+            assert_eq!(
+                answered[i],
+                Some(serial),
+                "batch {i} came back with another batch's row count"
+            );
+            assert_eq!(footer.record_batches[i].row_count, serial);
+        }
+
+        // The short last batch is what a shuffle would move, so say out loud
+        // that the fixture has one.
+        let last = footer.record_batches.last().expect("batches").row_count;
+        let first = footer.record_batches[0].row_count;
+        assert!(
+            last < first,
+            "fixture's last batch is not short ({last} vs {first}); a shuffled \
+             geometry would be undetectable"
+        );
     }
 
     #[test]
