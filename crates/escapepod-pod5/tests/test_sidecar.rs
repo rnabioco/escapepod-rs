@@ -603,6 +603,105 @@ fn index_via_sidecar_matches_scan() {
     }
 }
 
+/// `has_sidecar_index` answers what a command needs before it decides whether
+/// to tell the user about `escpod index`: is there a sidecar *this* file can
+/// take an index from?
+///
+/// A sidecar bound to a different POD5 answers no. That is not a contradiction
+/// of `read_index`, which errors on one rather than falling back — the two
+/// questions are "should I mention the remedy" and "may I trust this file",
+/// and only the second is a ruling.
+#[test]
+fn has_sidecar_index_sees_only_a_sidecar_bound_to_this_file() {
+    let (tmp, path, ids, _original) = fixture();
+    let other = tmp.path().join("other.pod5");
+    write_fixture(&other, "other_acq", N_READS, 700);
+
+    assert!(!Reader::open(&path).unwrap().has_sidecar_index());
+
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+    assert!(Reader::open(&path).unwrap().has_sidecar_index());
+
+    std::fs::copy(sidecar_path(&path), sidecar_path(&other)).unwrap();
+    assert!(
+        !Reader::open(&other).unwrap().has_sidecar_index(),
+        "a sidecar bound to another POD5 must not count as this file's index"
+    );
+}
+
+/// The four-column lookup a classifier fetches signal through must return
+/// exactly what a full-row scan would, whichever way the index arrived.
+///
+/// It reads columns by *position* (`0, 1, 16, 17` — read_id, signal,
+/// calibration_offset, calibration_scale), so a reads-schema change that
+/// reorders or inserts a column would silently hand back another column's
+/// floats. Comparing against `Reader::reads()`, which resolves by name, is
+/// what makes that a failure rather than a wrong answer.
+#[test]
+fn signal_rows_with_calibration_match_a_full_scan() {
+    let (tmp, path, ids, _original) = fixture();
+
+    let bare = tmp.path().join("bare.pod5");
+    std::fs::copy(&path, &bare).unwrap();
+    write_annotation(
+        &path,
+        &make_assignments(&ids, 5),
+        &AnnotateOptions::default(),
+    )
+    .unwrap();
+
+    // Every other read, so the lookup is a real subset rather than a scan
+    // wearing a different name.
+    let wanted: HashSet<Uuid> = ids.iter().copied().step_by(2).collect();
+    assert!(wanted.len() > 1, "fixture is too small to subset");
+
+    let scan_reader = Reader::open(&bare).unwrap();
+    let expected: HashMap<Uuid, (Vec<u64>, f32, f32)> = scan_reader
+        .reads()
+        .unwrap()
+        .map(|r| r.unwrap())
+        .filter(|r| wanted.contains(&r.read_id))
+        .map(|r| {
+            (
+                r.read_id,
+                (r.signal_rows, r.calibration_offset, r.calibration_scale),
+            )
+        })
+        .collect();
+    assert_eq!(expected.len(), wanted.len());
+
+    for (label, file) in [("built index", &bare), ("sidecar index", &path)] {
+        let reader = Reader::open(file).unwrap();
+        let found = reader
+            .find_signal_rows_with_calibration_by_ids(&wanted)
+            .unwrap();
+        assert_eq!(found.len(), wanted.len(), "{label}: wrong number of reads");
+        for sc in found {
+            let (rows, offset, scale) = expected.get(&sc.read_id).expect("a wanted read");
+            assert_eq!(
+                &sc.signal_rows, rows,
+                "{label}: signal rows for {}",
+                sc.read_id
+            );
+            assert_eq!(
+                sc.calibration_offset, *offset,
+                "{label}: calibration offset for {}",
+                sc.read_id
+            );
+            assert_eq!(
+                sc.calibration_scale, *scale,
+                "{label}: calibration scale for {}",
+                sc.read_id
+            );
+        }
+    }
+}
+
 /// Assign a float to the first `n` reads.
 fn make_scores(ids: &[Uuid], n: usize) -> HashMap<Uuid, f32> {
     ids.iter()

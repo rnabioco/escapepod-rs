@@ -448,7 +448,11 @@ pub fn classify_reads(
         Call(ReadCall),
         None(NoCall),
     }
-    let reads: Vec<&WaveformRead> = anchored.values().collect();
+    let mut reads: Vec<&WaveformRead> = anchored.values().collect();
+    // Storage order, for the same reason the column variant takes it: the
+    // reads arrive in BAM order through a `HashMap`, and reading them that way
+    // walks the whole POD5 pseudo-randomly. See [`Pod5Index::storage_key`].
+    reads.sort_by_cached_key(|r| pod5.storage_key(&r.read_id));
     let no_call = |read: &WaveformRead, reason| {
         Outcome::None(NoCall {
             read_id: read.read_id,

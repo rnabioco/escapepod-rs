@@ -149,6 +149,52 @@ pub struct Pod5ReadInfo {
     pub signal_rows: Vec<u64>,
 }
 
+/// Say, once, that some of this run's POD5 inputs have no `.p5s` sidecar.
+///
+/// Not an error and not a fallback: [`Pod5Index::build`] gets an index either
+/// way, because a reader with no sidecar builds one in memory. What differs is
+/// that the in-memory one is discarded at exit, so every run over the same
+/// file pays for it again — and *nothing else distinguishes the two runs but
+/// the clock*. The right answer arrives either way, which is exactly why the
+/// missing sidecar went unnoticed fourteen times over (escapepod-rs#334). This
+/// line is the symptom it otherwise does not have.
+fn warn_unindexed(paths: &[&Path]) {
+    if let Some(message) = unindexed_hint(paths) {
+        tracing::warn!("{message}");
+    }
+}
+
+/// The wording of [`warn_unindexed`], split out so a test can hold it to the
+/// two things it must always carry: the remedy (`escpod index`) and the file
+/// to run it on. `None` when every input is already indexed.
+fn unindexed_hint(paths: &[&Path]) -> Option<String> {
+    const SHOWN: usize = 3;
+    let (first, rest) = paths.split_first()?;
+    if rest.is_empty() {
+        let p = first.display();
+        return Some(format!(
+            "no `.p5s` read index for {p} — building one in memory for this run, and \
+             every later run over it will build it again. `escpod index {p}` writes it \
+             once, beside the POD5."
+        ));
+    }
+    let mut listed: Vec<String> = paths
+        .iter()
+        .take(SHOWN)
+        .map(|p| p.display().to_string())
+        .collect();
+    if paths.len() > SHOWN {
+        listed.push(format!("and {} more", paths.len() - SHOWN));
+    }
+    Some(format!(
+        "no `.p5s` read index for {} of this run's POD5 inputs ({}) — building them in \
+         memory for this run, and every later run over them will build them again. \
+         `escpod index` on those files writes them once, beside each POD5.",
+        paths.len(),
+        listed.join(", "),
+    ))
+}
+
 /// An index over one or more POD5 files, restricted to wanted read ids.
 pub struct Pod5Index {
     readers: Vec<escapepod_signal::Reader>,
@@ -157,30 +203,48 @@ pub struct Pod5Index {
 
 impl Pod5Index {
     /// Index `paths`, keeping only reads in `wanted`.
+    ///
+    /// Goes through each reader's read index — the `.p5s` sidecar when there
+    /// is one, an in-memory build when there is not — rather than decoding
+    /// every reads batch and discarding the rows nobody asked for. A charging
+    /// run selects its reads from a BAM, so `wanted` is typically a small
+    /// fraction of a production POD5 (20 k of 12.1 M in escapepod-rs#334), and
+    /// the lookup is projected to the four columns a signal fetch needs
+    /// against the 22 a full row carries.
+    ///
+    /// Nothing about *which* reads are indexed changes: an id `wanted` names
+    /// and the file holds is found either way, and one it does not hold is
+    /// absent either way.
     pub fn build(paths: &[PathBuf], wanted: &HashSet<Uuid>) -> Result<Self> {
-        let mut reads = HashMap::new();
         let mut readers = Vec::with_capacity(paths.len());
-        for (reader_idx, path) in paths.iter().enumerate() {
-            let reader = escapepod_signal::Reader::open(path)?;
-            for batch_result in reader.read_batches()? {
-                let batch = batch_result?;
-                let view = escapepod_signal::ReadsBatchView::new(&batch, false)?;
-                for row in 0..view.num_rows() {
-                    let read = view.read(row)?;
-                    if wanted.contains(&read.read_id) {
-                        reads.insert(
-                            read.read_id,
-                            Pod5ReadInfo {
-                                reader_idx,
-                                calibration_scale: read.calibration_scale,
-                                calibration_offset: read.calibration_offset,
-                                signal_rows: read.signal_rows,
-                            },
-                        );
-                    }
-                }
+        for path in paths {
+            readers.push(escapepod_signal::Reader::open(path)?);
+        }
+        // Ahead of the lookups, not after them: a line about how long this run
+        // is going to take is only useful while the run is still ahead of you.
+        // Opening a reader is an mmap and a footer parse; the index — the part
+        // a sidecar saves — is not built until the first lookup below.
+        let unindexed: Vec<&Path> = paths
+            .iter()
+            .zip(&readers)
+            .filter(|(_, reader)| !reader.has_sidecar_index())
+            .map(|(path, _)| path.as_path())
+            .collect();
+        warn_unindexed(&unindexed);
+
+        let mut reads = HashMap::new();
+        for (reader_idx, reader) in readers.iter().enumerate() {
+            for found in reader.find_signal_rows_with_calibration_by_ids(wanted)? {
+                reads.insert(
+                    found.read_id,
+                    Pod5ReadInfo {
+                        reader_idx,
+                        calibration_scale: found.calibration_scale,
+                        calibration_offset: found.calibration_offset,
+                        signal_rows: found.signal_rows,
+                    },
+                );
             }
-            readers.push(reader);
         }
         Ok(Self { readers, reads })
     }
@@ -188,6 +252,30 @@ impl Pod5Index {
     /// Indexed reads (those of `wanted` that have signal).
     pub fn reads(&self) -> &HashMap<Uuid, Pod5ReadInfo> {
         &self.reads
+    }
+
+    /// Where a read sits in the POD5 set: its file, then its first signal row.
+    ///
+    /// Sort a selection on this before reading it and each worker's next read
+    /// is forward of its last, which is what the kernel's readahead and the
+    /// filesystem's prefetch can serve — the same reason `demux` streams its
+    /// input (escapepod-rs#72).
+    ///
+    /// Nothing else supplies that order. The reads a charging run scores
+    /// arrive from a BAM, which is `SO:coordinate` — sorted by reference
+    /// position, and against a tRNA reference that groups reads by *identity*,
+    /// which has nothing to do with when a molecule was sequenced. So BAM
+    /// order is not merely uncorrelated with POD5 layout, it is structured
+    /// against it, and a caller cannot fix that: the layout is knowable only
+    /// from the POD5 (escapepod-rs#334). Order is not selection — sorting
+    /// changes which reads are read *when*, never which reads are read.
+    ///
+    /// `None` — a read this index does not hold — sorts first and costs
+    /// nothing to visit.
+    pub fn storage_key(&self, read_id: &Uuid) -> Option<(usize, u64)> {
+        self.reads
+            .get(read_id)
+            .map(|i| (i.reader_idx, i.signal_rows.first().copied().unwrap_or(0)))
     }
 
     pub fn n_files(&self) -> usize {
@@ -479,17 +567,11 @@ pub fn classify_reads(
     let recipe = bundle.recipe()?;
     let mut reads: Vec<&AnchoredRead> = anchored.values().collect();
     // Walk each POD5 forward. `anchored` is a HashMap, so its order is the
-    // hash's, and each worker's next read was a random seek into a file that
-    // is a mmap over shared storage. Ordered by file and first signal row, a
-    // rayon chunk is a contiguous forward sweep, which is what the kernel's
-    // readahead and the filesystem's prefetch can serve — the same reason
-    // `demux` streams its input (#72). Reads without signal sort first and
-    // cost nothing.
-    reads.sort_by_cached_key(|r| {
-        pod5.reads()
-            .get(&r.read_id)
-            .map(|i| (i.reader_idx, i.signal_rows.first().copied().unwrap_or(0)))
-    });
+    // hash's — and behind that, the BAM's — and each worker's next read would
+    // be a random seek into a file that is a mmap over shared storage. Ordered
+    // by [`Pod5Index::storage_key`], a rayon chunk is a contiguous forward
+    // sweep instead.
+    reads.sort_by_cached_key(|r| pod5.storage_key(&r.read_id));
 
     enum Outcome {
         Call(ReadCall),
@@ -586,4 +668,33 @@ pub fn classify_reads(
     calls.sort_by_key(|c| c.read_id);
     stats.no_calls.sort_by_key(|n| n.read_id);
     Ok((calls, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hint has one job: name the remedy and the file. A rewording that
+    /// drops either is the fifteenth occurrence waiting to happen.
+    #[test]
+    fn the_unindexed_hint_names_the_command_and_the_file() {
+        assert!(unindexed_hint(&[]).is_none());
+
+        let one = unindexed_hint(&[Path::new("/data/run/reads.pod5")]).unwrap();
+        assert!(one.contains("escpod index /data/run/reads.pod5"), "{one}");
+        assert!(one.contains(".p5s"), "{one}");
+
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|i| PathBuf::from(format!("f{i}.pod5")))
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let many = unindexed_hint(&refs).unwrap();
+        assert!(many.contains("escpod index"), "{many}");
+        assert!(many.contains("5 of this run's POD5 inputs"), "{many}");
+        assert!(many.contains("f0.pod5"), "{many}");
+        // Listed, then truncated — a directory of hundreds must not print one
+        // line per file.
+        assert!(many.contains("and 2 more"), "{many}");
+        assert!(!many.contains("f4.pod5"), "{many}");
+    }
 }

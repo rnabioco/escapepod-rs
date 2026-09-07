@@ -45,7 +45,7 @@ pub use escapepod_pod5::{
     FieldError, MergeOptions, MergePhase, MergeProgress, MergeResult, PoreType,
     PredefinedDictionaries, Progress, ProgressCallback, ReadColumns, ReadData, ReadIndex, Reader,
     ReaderCache, ReadsBatchView, RecordBatch, RepackOptions, RepackResult, Result, RunInfoData,
-    SignalExtractor, SignalType, Statistics, Uuid, Writer, WriterOptions,
+    SignalCalibration, SignalExtractor, SignalType, Statistics, Uuid, Writer, WriterOptions,
     abort_all_in_flight_writes, autoindex_max, cached_reader, compute_n50, compute_statistics,
     determine_fields, get_field_value, global_reader_cache, merge_files, parse_uuid_flexible,
     repack_files, write_field_value,
