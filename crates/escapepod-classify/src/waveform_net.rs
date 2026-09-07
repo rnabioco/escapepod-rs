@@ -194,6 +194,15 @@ impl WaveformNet {
         // hoist is not a win here, not that it is precisely a 7% loss. The
         // default is therefore what this loader has always done.
         //
+        // It is the family, not one export. `charging_tcn_rna004@v0.1.1` and
+        // `@v0.1.2` are byte-identical ONNX (md5 b16810fc...), so the pair
+        // above was measured on what ships; and a second, independently built
+        // bundle (`charging_tcn_sup6_rna004@v0.1.0`) carries the same 29
+        // convolutions, the same 27 padded, and the same causal dilation
+        // ladder 1..32. So a future `waveform_model` will have this shape too,
+        // and this decision travels with it rather than needing re-litigating
+        // per bundle.
+        //
         // What IS settled is parity: both arms return the same logit to the
         // bit (the rewrite splices in the zeros the padding already was), so
         // `ESCAPEPOD_WAVEFORM_HOIST=1` is safe to turn on for a re-measurement

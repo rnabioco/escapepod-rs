@@ -173,6 +173,12 @@
   arms in one job; two `srun`s plus a criterion baseline will confidently
   report whichever answer the scheduler handed you.
 
+  The result travels. `charging_tcn_rna004@v0.1.1` and `@v0.1.2` are
+  byte-identical ONNX, so this was measured on what ships, and a second,
+  independently built bundle (`charging_tcn_sup6_rna004@v0.1.0`) carries the
+  same 29 convolutions, the same 27 padded, and the same causal dilation ladder
+  — so the decision holds for the architecture family rather than one export.
+
 - **The charging classifier has benchmarks.** A production report that
   `escpod classify` had got 2× slower could not be answered from this
   repository: `crates/escapepod-classify` had no `benches/` at all, and the
