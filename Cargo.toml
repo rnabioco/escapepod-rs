@@ -53,7 +53,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Pure-Rust ONNX runtime for the CNN adapter detector (opt-in via `cnn-detect`).
-tract-onnx = "0.23"
+tract-onnx = "0.23.6"
 uuid = { version = "1", features = ["v4"] }
 # Compression
 zstd = "0.13"

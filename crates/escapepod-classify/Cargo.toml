@@ -35,6 +35,21 @@ tracing = { workspace = true }
 # links tract through escapepod-demux's `cnn-detect`, so turning either on adds
 # no third-party crate to the binary — only this crate's own edge to it.
 tract-onnx = { workspace = true, optional = true }
+# CUDA execution for a tract graph. Optional and NOT in any default build;
+# cudarc dlopens, so this costs nothing at build time and needs a visible GPU
+# only at run time. See the `cuda` feature.
+# `cuda-13000` (tract-cuda's own default), NOT the `cuda-12020` the workspace
+# pins for the DTW kernels: tract-cuda compiles its kernels at run time through
+# NVRTC, which pulls the *node's* CUDA headers, and the gpu partition ships
+# 13.0. Built against 12.2 bindings, NVRTC fails to parse 13.0's
+# `cuda_fp4.hpp` / `cuda_fp6.hpp` and every launch dies with a dozen syntax
+# errors out of a header nobody wrote. If this ever shares a build with
+# `escapepod-signal/gpu`, cargo unifies the two cudarc feature sets and that
+# conflict has to be resolved rather than discovered on a GPU node.
+tract-cuda = { version = "0.23.6", optional = true, default-features = false, features = [
+    "cuda-12020",
+] }
+tract-core = { version = "0.23.6", optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
@@ -62,6 +77,12 @@ required-features = ["fnn-onnx"]
 name = "verify_waveform_model"
 required-features = ["waveform-onnx"]
 
+# Decides whether the windowed variant should get a device path at all. Builds
+# without CUDA present; needs a GPU only to run.
+[[example]]
+name = "tcn_cuda_probe"
+required-features = ["waveform-onnx"]
+
 [features]
 default = []
 # Load and score the `feature_model` (per-base-feature ONNX) variant of a
@@ -83,3 +104,9 @@ fnn-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 # tract can load; see `waveform_net` for the measurement and why the export
 # version is the thing that decides this.
 waveform-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
+# Run a tract graph on a CUDA device. Opt-in, and nothing CUDA is needed at
+# BUILD time: tract-cuda goes through cudarc, which dlopens, exactly like this
+# workspace's other GPU paths. Today it feeds `examples/tcn_cuda_probe` only —
+# the measurement that decides whether the windowed variant should have a
+# device path at all. It is not wired into any scorer.
+cuda = ["dep:tract-cuda", "dep:tract-core", "waveform-onnx"]
