@@ -18,6 +18,13 @@ name = "classify"
 harness = false
 name = "crf_decode"
 
+# The encoder half of the same path, against a real bundle named by
+# `ESCAPEPOD_CRF_BUNDLE`; skips itself with a message otherwise (#331).
+[[bench]]
+harness = false
+name = "crf_encoder"
+required-features = ["crf-decode"]
+
 # The boundary-CNN input prep (`AdapterCnnConfig::prep`), which only exists
 # under `cnn-detect`; run with `--features cnn-detect`.
 [[bench]]

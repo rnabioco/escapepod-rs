@@ -222,6 +222,16 @@ srun -p rna -c 8 --mem 32G -- benchmarks/benchmark_charging.sh \
     --bin /path/to/escpod-0.20.0 --bin ./target/release/escpod
 ```
 
+`benchmarks/benchmark_demux_crf.sh` is the same harness for the fused CRF demux path — the command the aa-tRNA-seq pipeline actually runs (`escpod demux --model ldx=… --model fdx=… --annotate --classifications … --ref-scores`), which `benchmark_demux.sh` (SVM/DTW against WarpDemuX, hyperfine, one binary) never measured. Same interleaving and CPU-beside-wall rules, plus a third: **the input is never touched** — `--annotate` writes its `.p5s` beside the path *as given*, so each arm runs against a symlink in node-local scratch and the script asserts no sidecar appeared beside the canonical file. `--pod5`/`--truth` default to the labelled 20k dual-axis set at `data/bench/dual_axis_20k/` (gitignored; provenance in `benchmarks/README.md`); `--model` is required. After the reps, `benchmarks/evaluate_demux_crf.py` scores the last rep's CSVs against the truth and every arm against arm 0 read for read, attributing disagreements by `crf_margin` — the contract an encoder change is held to (#331). The per-read counterpart is `crates/escapepod-demux/benches/crf_encoder.rs`, gated on `ESCAPEPOD_CRF_BUNDLE` like the charging `scorer` group.
+
+```bash
+srun -p rna -c 32 --mem 32G -- benchmarks/benchmark_demux_crf.sh \
+    --model ldx=bundles/barcode_crf_ldx32_rna004@v0.2.1 --model fdx=bundles/barcode_crf_fdx4_rna004@v0.1.1 \
+    --bin /path/to/escpod-0.20.0 --bin ./target/release/escpod --threads 32
+ESCAPEPOD_CRF_BUNDLE=bundles/barcode_crf_ldx32_rna004@v0.2.1 \
+  cargo bench -p escapepod-demux --features crf-decode --bench crf_encoder
+```
+
 ### Profiling workflow
 
 ```bash
