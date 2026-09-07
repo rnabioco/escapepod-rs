@@ -129,6 +129,15 @@ cuda-nvrtc = ">=12,<13"    # GPU DTW (cudarc): libnvrtc.so.12
 libcublas = "*"            # ort CUDA EP links libcublas.so.12 + libcublasLt.so.12
 cuda-cudart = "*"          # ort CUDA EP links libcudart.so.12
 cudnn = ">=9,<10"          # ort CUDA EP dlopens libcudnn.so.9
+# HEADERS, not libraries, and they are needed at RUN time — which is the one
+# way `tract-cuda` differs from every other GPU path here. cudarc's driver API
+# and ort both dlopen a prebuilt library and are done; tract-cuda compiles its
+# kernels through NVRTC on the machine that runs them, so it needs
+# `cuda_fp16.h` and the CCCL headers present or `cuda_context()` aborts with
+# "Could not find a toolkit include dir". Without these two the `cuda` feature
+# of escapepod-classify builds fine and dies on first use.
+cuda-cudart-dev = "*"
+cuda-cccl = "*"
 # The CUDA-enabled libonnxruntime that `ort` (load-dynamic) dlopens. Version is
 # pinned against the workspace's ort 2.0.0-rc.13 (crates/escapepod-demux/
 # Cargo.toml) — bump the two together, deliberately. The `*cuda129` build
