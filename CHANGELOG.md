@@ -231,6 +231,31 @@
 
 ### Added
 
+- **A windowed (`waveform_model`) bundle can declare which reference/adapter
+  panel its feature window is verified safe against, in a new `adapter_window`
+  block** (#340). `charging_tcn_sup6_rna004@v0.1.0` cuts its feature window out
+  to reference offset +20 from the anchor motif — inside the constant region
+  of `edx07` (diverges at +24) but past where `edx01`/`edx02` diverge (+17), so
+  scoring against the wrong panel reads adapter identity as signal, not
+  charging. Until now that was a caveat string in `provenance.notes`.
+
+  `adapter_window` restates `waveform_model.preprocessing.feature_end` and
+  `anchor.motif_offset`, so a builder bug that lets either drift from what it
+  names is caught the same way the existing `motif`/`motif_offset` restatement
+  is, and a bundle whose own `verified_safe_to` falls short of its
+  `feature_end` is refused outright — that is the bundle contradicting itself,
+  not a question about the caller's sample. `reference_panel` and
+  `verified_safe_to` are carried, not enforced, the same treatment as
+  `basecaller` (#314): escpod has no registry mapping a `--reference` FASTA to
+  a named panel, so which panel a run is actually scored against is left to a
+  caller that does know its own sample (rnabioco/escapepod-rs#178 tracks that
+  on the pipeline side). `ChargingBundle::adapter_window` carries the result.
+
+  Optional, because every bundle published before this key must stay
+  readable, and needs the same staged rollout as `reference_source`:
+  escapepod-models should only emit it once a pinned escpod version
+  understands it (escapepod-models#138).
+
 - **`escapepod_demux::onnx_rewrite::expand_instance_norm`, and the finding
   that made it necessary: batching the windowed charging graph through tract
   does not score reads independently.** tract lowers ONNX

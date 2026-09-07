@@ -105,6 +105,21 @@
 //! designed, against a block that was never a rule. The lesson is not to
 //! loosen the schema but to keep the two sides sequenced: a new key is
 //! accepted here, released, and only then emitted.
+//!
+//! A fifth, `adapter_window` (rnabioco/escapepod-rs#340), splits the
+//! difference: a windowed bundle's `feature_end` can reach past the point
+//! where 3' adapter families diverge, which reads adapter identity as signal
+//! rather than charging — but *which* adapter panel a run is scored against is
+//! a property of the caller's sample, not of this bundle, so escpod cannot
+//! name the mismatch itself any more than it can for `basecaller`. What it
+//! *can* check is internal to the bundle: `adapter_window` restates
+//! `waveform_model.preprocessing.feature_end` and `anchor.motif_offset`, so a
+//! builder bug that lets the two drift is caught the same way the
+//! `motif`/`motif_offset` restatement below is, and a bundle whose own
+//! `verified_safe_to` falls short of its `feature_end` is refused outright —
+//! that is not a caller's business to notice, it is the bundle contradicting
+//! itself. [`ChargingBundle::adapter_window`] carries the rest (the named
+//! panel, the verified extent) for a caller that does know its own sample.
 
 use crate::features::FEAT_STATS;
 use crate::recipe::{FeatureRecipe, KmerLevels};
@@ -224,6 +239,11 @@ struct MetaFile {
     /// enforced — see [`BasecallerBlock`].
     #[serde(default)]
     basecaller: Option<BasecallerBlock>,
+    /// Which reference/adapter panel a windowed bundle's `feature_end` is
+    /// verified safe against. Cross-checked, then carried — see
+    /// [`AdapterWindowBlock`].
+    #[serde(default)]
+    adapter_window: Option<AdapterWindowBlock>,
     // Free-form by design: provenance, not contract. Nothing under these can
     // change what the model sees, so their shape is the builder's business and
     // new documentation with no natural home belongs here.
@@ -829,6 +849,54 @@ struct BasecallerBlock {
     note: Doc,
 }
 
+/// Where a windowed bundle's `feature_end` stops being safe against 3' adapter
+/// divergence (rnabioco/escapepod-rs#340).
+///
+/// `charging_tcn_sup6_rna004@v0.1.0` (escapepod-models#138) cuts its feature
+/// window out to reference offset +20 from the anchor motif. That is inside
+/// the constant region of `edx07` (diverges at +24 in this bundle's
+/// coordinate) but reaches past where `edx01`/`edx02` diverge (+17) — score a
+/// read against the wrong panel and the window's tail reads adapter identity,
+/// not the aminoacyl adduct, and nothing about the output shape says so.
+///
+/// A **top-level block, not a new key on [`WaveformPreprocessing`]**: that
+/// struct already restates `anchor`'s geometry for cross-checking, and this
+/// is a different kind of statement — which reference panel the restated
+/// `feature_end` was verified against — so it gets its own name instead of
+/// overloading one that is about the window's shape.
+///
+/// `feature_end` and `motif_offset` are cross-checked against
+/// `waveform_model.preprocessing.feature_end` and `anchor.motif_offset`
+/// respectively, and `verified_safe_to < feature_end` is refused outright —
+/// both are the bundle's own numbers disagreeing with themselves, not a
+/// question about the caller's sample. `reference_panel` and
+/// `verified_safe_to` are carried, not enforced: escpod has no registry
+/// mapping a `--reference` FASTA to a named panel, so — like `basecaller` —
+/// the comparison against what a run is actually scored against belongs to
+/// the caller (rnabioco/escapepod-rs#178 tracks that on the pipeline side).
+///
+/// Optional, because every bundle published before this key must stay
+/// readable — the same shape as `basecaller` (#314) and `reference_source`
+/// (#312).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // `Doc` fields: named, never read
+struct AdapterWindowBlock {
+    /// Restates `waveform_model.preprocessing.feature_end`, checked rather
+    /// than merely carried.
+    feature_end: i64,
+    /// Restates `anchor.motif_offset`, checked rather than merely carried.
+    motif_offset: usize,
+    /// The reference/adapter panel `verified_safe_to` was measured against,
+    /// e.g. `eschColi_K_12_MG1655-edx07.fa`.
+    reference_panel: String,
+    /// How far out from the anchor `reference_panel` stays constant across
+    /// the adapter families it covers. Must be at least `feature_end`.
+    verified_safe_to: i64,
+    #[serde(default)]
+    note: Doc,
+}
+
 /// Post-hoc probability calibration the bundle ships.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -863,6 +931,26 @@ pub struct Basecaller {
     /// sha256 of that model, where the bundle had one to pin.
     pub model_sha256: Option<String>,
     pub dorado_version: Option<String>,
+}
+
+/// Where a windowed bundle's `feature_end` stops being safe against 3'
+/// adapter divergence, as the bundle declares it.
+///
+/// Carried so a caller that knows its own sample's reference/adapter panel
+/// can refuse to score against a mismatch — see [`AdapterWindowBlock`] for
+/// why escpod checks the bundle against itself but not against the caller's
+/// sample.
+#[derive(Debug, Clone)]
+pub struct AdapterWindow {
+    /// How far out from the anchor, in reference-offset coordinates, the
+    /// window's features reach. Matches
+    /// `waveform_model.preprocessing.feature_end`.
+    pub feature_end: i64,
+    /// The reference/adapter panel `verified_safe_to` was measured against.
+    pub reference_panel: String,
+    /// How far out `reference_panel` stays constant across the adapter
+    /// families it covers; always `>= feature_end`.
+    pub verified_safe_to: i64,
 }
 
 /// A Platt scaling of the raw logit: `sigmoid(a * logit + b)`.
@@ -1031,6 +1119,10 @@ pub struct ChargingBundle {
     /// What called the corpus this model was fitted on. Carried, never
     /// checked against the BAM — see [`Basecaller`].
     pub basecaller: Option<Basecaller>,
+    /// Where this window's `feature_end` stops being safe against 3' adapter
+    /// divergence. Cross-checked against the bundle's own geometry at load;
+    /// never checked against the caller's sample — see [`AdapterWindow`].
+    pub adapter_window: Option<AdapterWindow>,
 }
 
 /// sha256 of a file, lowercase hex.
@@ -1339,6 +1431,7 @@ fn waveform_spec(
     wm: &WaveformModelBlock,
     anchor: &AnchorBlock,
     classes: &[&str; 2],
+    adapter_window: Option<&AdapterWindowBlock>,
 ) -> Result<WaveformSpec> {
     let p = &wm.preprocessing;
 
@@ -1364,6 +1457,45 @@ fn waveform_spec(
             anchor.motif_offset,
             (o as i64 - anchor.motif_offset as i64).abs()
         );
+    }
+
+    // `adapter_window` (#340) restates `feature_end` (against this block) and
+    // `motif_offset` (against `anchor`) so a builder bug that lets either
+    // drift from what it names is caught the same way the pair above is,
+    // and its own `verified_safe_to` is refused if it falls short of the
+    // `feature_end` it is supposed to cover — a bundle contradicting itself,
+    // not a question about the caller's sample. Which reference panel a run
+    // is actually scored against is the caller's to check, not escpod's: see
+    // [`AdapterWindowBlock`].
+    if let Some(aw) = adapter_window {
+        if aw.feature_end != p.feature_end {
+            bail!(
+                "adapter_window.feature_end is {} but waveform_model.preprocessing.\
+                 feature_end is {}; they are two statements of the same window, and \
+                 disagreeing means `verified_safe_to` was measured against a window this \
+                 bundle does not actually cut",
+                aw.feature_end,
+                p.feature_end
+            );
+        }
+        if aw.motif_offset != anchor.motif_offset {
+            bail!(
+                "adapter_window.motif_offset is {} but anchor.motif_offset is {}; \
+                 `feature_end` is stated relative to the anchor this bundle does not \
+                 actually cut at",
+                aw.motif_offset,
+                anchor.motif_offset
+            );
+        }
+        if aw.verified_safe_to < aw.feature_end {
+            bail!(
+                "adapter_window declares feature_end {} past verified_safe_to {}; the \
+                 bundle states its own window reaches further than it was verified safe, \
+                 which is the exact mismatch this block exists to catch",
+                aw.feature_end,
+                aw.verified_safe_to
+            );
+        }
     }
 
     // Where the per-base sequence comes from, which the bundle now states
@@ -1828,7 +1960,8 @@ impl ChargingBundle {
                     .waveform_model
                     .as_ref()
                     .expect("the probe saw a `waveform_model` block");
-                let spec = waveform_spec(wm, &meta.anchor, &[&c0, &c1])?;
+                let spec =
+                    waveform_spec(wm, &meta.anchor, &[&c0, &c1], meta.adapter_window.as_ref())?;
                 let kmer = kmer_table(if spec.refine.is_some() || spec.chunk.needs_levels() {
                     "the window geometry needs expected k-mer levels"
                 } else {
@@ -1855,6 +1988,20 @@ impl ChargingBundle {
                 (scorer, Some(spec), kmer)
             }
         };
+
+        // `adapter_window` (#340) is a `waveform_model` concept — it restates
+        // `feature_end`, which only that variant has. Checked here rather
+        // than left to score cleanly against nothing: a `feature_model`
+        // bundle carrying it would have declared a window it never cuts.
+        if variant != Variant::Waveform && meta.adapter_window.is_some() {
+            bail!(
+                "the bundle declares `adapter_window`, which states where a windowed \
+                 bundle's `feature_end` stops being safe against 3' adapter divergence — \
+                 a `waveform_model` concept only. This bundle's variant is `{}`, which has \
+                 no `feature_end` to check it against",
+                variant.key()
+            );
+        }
 
         let abstain = meta.abstain.as_ref().map(Abstain::parse).transpose()?;
         if let Some(a) = &abstain
@@ -1903,6 +2050,11 @@ impl ChargingBundle {
                 model: b.model,
                 model_sha256: b.model_sha256,
                 dorado_version: b.dorado_version,
+            }),
+            adapter_window: meta.adapter_window.map(|aw| AdapterWindow {
+                feature_end: aw.feature_end,
+                reference_panel: aw.reference_panel,
+                verified_safe_to: aw.verified_safe_to,
             }),
         })
     }
@@ -2225,6 +2377,59 @@ mod tests {
             assert!(err.contains("unknown field `dwell_transform`"), "{err}");
         }
 
+        /// The block escapepod-rs#340 asks for, spelled the way a builder
+        /// would emit it.
+        #[test]
+        fn the_adapter_window_block_the_builder_emits_parses() {
+            let json = meta(
+                r#",
+                  "adapter_window": {
+                    "feature_end": 20,
+                    "motif_offset": 3,
+                    "reference_panel": "eschColi_K_12_MG1655-edx07.fa",
+                    "verified_safe_to": 25,
+                    "note": "constant to +25 across edx07; diverges at +17 on edx01/edx02"
+                  }"#,
+            );
+            let meta = parse(&json).expect("the block #340 asks for must parse");
+            let aw = meta.adapter_window.expect("carried, not dropped");
+            assert_eq!(aw.feature_end, 20);
+            assert_eq!(aw.reference_panel, "eschColi_K_12_MG1655-edx07.fa");
+            assert_eq!(aw.verified_safe_to, 25);
+        }
+
+        /// Optional: every bundle published before this key must stay
+        /// readable.
+        #[test]
+        fn a_bundle_without_an_adapter_window_still_parses() {
+            assert!(parse(&meta("")).unwrap().adapter_window.is_none());
+        }
+
+        /// Closed like every other block that can carry a rule.
+        #[test]
+        fn an_unknown_key_inside_the_adapter_window_block_is_refused() {
+            let err = parse(&meta(
+                r#", "adapter_window": {"feature_end": 20, "motif_offset": 3,
+                     "reference_panel": "edx07.fa", "verified_safe_to": 25,
+                     "enforce": true}"#,
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unknown field `enforce`"), "{err}");
+        }
+
+        /// A window with no verified extent declares nothing checkable.
+        #[test]
+        fn an_adapter_window_block_missing_verified_safe_to_is_refused() {
+            let err = parse(&meta(
+                r#", "adapter_window": {"feature_end": 20, "motif_offset": 3,
+                     "reference_panel": "edx07.fa"}"#,
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("missing field `verified_safe_to`"), "{err}");
+        }
+
         /// Provenance is the sanctioned home for shape nobody validates.
         #[test]
         fn provenance_metrics_and_caveats_stay_free_form() {
@@ -2340,7 +2545,27 @@ mod tests {
         }
 
         fn spec_of(wm: &WaveformModelBlock) -> Result<WaveformSpec> {
-            waveform_spec(wm, &anchor_block(), &["uncharged", "charged"])
+            waveform_spec(wm, &anchor_block(), &["uncharged", "charged"], None)
+        }
+
+        /// An `adapter_window` consistent with [`block`] (`feature_end: 20`)
+        /// and [`anchor_block`] (`motif_offset: 2`), plus whatever `patch`
+        /// splices in.
+        fn adapter_window_block(patch: impl Fn(&mut serde_json::Value)) -> AdapterWindowBlock {
+            let mut v: serde_json::Value = serde_json::from_str(
+                r#"{"feature_end": 20, "motif_offset": 2,
+                    "reference_panel": "edx07.fa", "verified_safe_to": 25}"#,
+            )
+            .unwrap();
+            patch(&mut v);
+            serde_json::from_value(v).expect("the fixture block must parse")
+        }
+
+        fn spec_of_with_window(
+            wm: &WaveformModelBlock,
+            aw: &AdapterWindowBlock,
+        ) -> Result<WaveformSpec> {
+            waveform_spec(wm, &anchor_block(), &["uncharged", "charged"], Some(aw))
         }
 
         #[test]
@@ -2539,6 +2764,54 @@ mod tests {
             }))
             .unwrap();
             assert!(spec.refine.is_none());
+        }
+
+        /// A consistent `adapter_window` is accepted and changes nothing about
+        /// the resolved geometry — it is a safety declaration, not an input to
+        /// the assembly (escapepod-rs#340).
+        #[test]
+        fn a_consistent_adapter_window_is_accepted() {
+            let aw = adapter_window_block(|_| {});
+            assert!(spec_of_with_window(&block(|_| {}), &aw).is_ok());
+        }
+
+        /// Two statements of the same window disagreeing means
+        /// `verified_safe_to` was measured against a window this bundle does
+        /// not actually cut.
+        #[test]
+        fn adapter_window_feature_end_must_match_preprocessing() {
+            let aw = adapter_window_block(|v| {
+                v["feature_end"] = 19.into();
+            });
+            let err = spec_of_with_window(&block(|_| {}), &aw)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("feature_end"), "{err}");
+        }
+
+        /// `feature_end` is meaningless without the anchor it is offset from.
+        #[test]
+        fn adapter_window_motif_offset_must_match_anchor() {
+            let aw = adapter_window_block(|v| {
+                v["motif_offset"] = 3.into();
+            });
+            let err = spec_of_with_window(&block(|_| {}), &aw)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("motif_offset"), "{err}");
+        }
+
+        /// The exact mismatch this block exists to catch: a window that
+        /// reaches further than the bundle itself says was verified.
+        #[test]
+        fn adapter_window_verified_safe_to_must_cover_feature_end() {
+            let aw = adapter_window_block(|v| {
+                v["verified_safe_to"] = 17.into();
+            });
+            let err = spec_of_with_window(&block(|_| {}), &aw)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("verified_safe_to"), "{err}");
         }
     }
 
