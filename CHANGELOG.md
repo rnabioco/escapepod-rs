@@ -26,6 +26,35 @@
 
 ### Performance
 
+- **Opening a POD5 on a network filesystem is ~20× cheaper.** Recovering the
+  signal table's per-batch row counts — the one field the Arrow IPC footer's
+  block list does not carry — means reading every batch's own message header.
+  Every offset is known before the first header is read, so nothing about that
+  walk is sequential except that it was written as a loop; on BeeGFS each
+  header is a cold page fault costing a server round trip (15–24 ms), and a
+  large POD5 has thousands of batches. It now issues them together.
+
+  Measured cold on escapepod-rs#334's 574 GB set (rna, `-c 32`, twelve
+  never-touched files, arms alternating with the order flipped each round),
+  as `signal_extractor()` per read, since batch count scales with file size:
+  **112 µs/read serial against 5.5 µs/read parallel**, with no overlap
+  between the arms (serial 69–171, parallel 4.6–7.6). On the largest file
+  in the sample, 576,007 reads, that is **82.3 s → ~2.6 s**. Major faults
+  track read count in both arms: the same bytes are read, just not one round
+  trip at a time. `ESCAPEPOD_POD5_FOOTER_SERIAL=1` forces the old walk.
+
+  This cost is charged to no read, so it never appeared in a reads/s figure,
+  and it is paid per file per process — which is what a run over a directory
+  of POD5s spends its first minutes on, at essentially zero CPU. A `.p5s`
+  sidecar still skips the walk outright (`escpod index`); this is what
+  happens when there isn't one.
+
+- **`examples/open_cost`** (escapepod-pod5) times what a reader costs before
+  a single read is fetched — `Reader::open`, `read_index()` and
+  `signal_extractor()` apart, with major faults — because the probe that
+  measured escapepod-rs#334's lookup and read order spent 85–95% of its wall
+  clock outside every timer it had, in exactly these calls.
+
 - **`escpod classify` runs the shipped charging network's recurrence
   natively, and the per-read feature path is cheaper.** Measured end to end
   on 65,821 scored reads (warm 12 GB POD5, `--threads 8`, rna, interleaved
