@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.22.0 (2026-09-07)
+
 ### Fixed
 
 - **`escapepod-classify` builds on non-x86_64 targets again.** The native
@@ -23,6 +25,37 @@
   `Backend::lanes`. `Backend::available()` lists what a machine can run and
   the kernel pins sweep it; AVX-512 requires AVX2 + FMA explicitly, since
   its lone-read path is the AVX2 kernel.
+
+- **`escpod classify` looks its reads up through the POD5 read index, and says
+  so when there isn't one** (#334). `Pod5Index::build` decoded *every* reads
+  batch of every input and kept the rows the BAM had anchored, so the `.p5s`
+  sidecar — which `escpod index` exists to write, and which the reader already
+  knows how to use — bought this command nothing. The lookup now goes through
+  `Reader::find_signal_rows_with_calibration_by_ids`: the sidecar's index when
+  there is one, an in-memory build when there is not, projected to the four
+  columns a signal fetch needs against the 22 a full row carries. A charging
+  run selects from a BAM, so the wanted set is typically a small fraction of
+  the file — 20,000 of 12,129,287 reads (0.165%) in the report.
+
+  When an input has no sidecar the run now says so in one line, naming the
+  file and `escpod index`. Nothing else distinguishes an indexed run from an
+  unindexed one: the calls are identical and only the clock differs, which is
+  why the missing sidecar went unnoticed fourteen times over.
+
+  The windowed (`waveform_model`) variant now also reads in **storage order**
+  — by file, then first signal row — which the column variant took in 0.21.0.
+  Read order is escpod's to choose and no caller's: a BAM is `SO:coordinate`,
+  and against a tRNA reference that groups reads by *identity*, which is
+  unrelated to when a molecule was sequenced, so BAM order is not merely
+  uncorrelated with POD5 layout but structured against it. `Pod5Index::storage_key`
+  is now the one statement of that rule, used by both variants.
+
+  Selection is untouched by all of this: which reads are scored, and their
+  probabilities, are bit-identical with and without a sidecar
+  (`tests/charging_index_order.rs`). That file also carries the tripwire —
+  a sidecar whose locators are rotated one row along, which an indexed lookup
+  refuses and a table scan cannot notice — so a future change back to a scan
+  fails a test instead of costing a fifteenth slow run.
 
 ### Performance
 
@@ -195,39 +228,6 @@
   dependencies at `warn`; the classify crate was missing from the list since
   it was created, so every `info!` it emitted — now including which scorer a
   bundle resolved to — was dropped silently. Added.
-
-### Fixed
-
-- **`escpod classify` looks its reads up through the POD5 read index, and says
-  so when there isn't one** (#334). `Pod5Index::build` decoded *every* reads
-  batch of every input and kept the rows the BAM had anchored, so the `.p5s`
-  sidecar — which `escpod index` exists to write, and which the reader already
-  knows how to use — bought this command nothing. The lookup now goes through
-  `Reader::find_signal_rows_with_calibration_by_ids`: the sidecar's index when
-  there is one, an in-memory build when there is not, projected to the four
-  columns a signal fetch needs against the 22 a full row carries. A charging
-  run selects from a BAM, so the wanted set is typically a small fraction of
-  the file — 20,000 of 12,129,287 reads (0.165%) in the report.
-
-  When an input has no sidecar the run now says so in one line, naming the
-  file and `escpod index`. Nothing else distinguishes an indexed run from an
-  unindexed one: the calls are identical and only the clock differs, which is
-  why the missing sidecar went unnoticed fourteen times over.
-
-  The windowed (`waveform_model`) variant now also reads in **storage order**
-  — by file, then first signal row — which the column variant took in 0.21.0.
-  Read order is escpod's to choose and no caller's: a BAM is `SO:coordinate`,
-  and against a tRNA reference that groups reads by *identity*, which is
-  unrelated to when a molecule was sequenced, so BAM order is not merely
-  uncorrelated with POD5 layout but structured against it. `Pod5Index::storage_key`
-  is now the one statement of that rule, used by both variants.
-
-  Selection is untouched by all of this: which reads are scored, and their
-  probabilities, are bit-identical with and without a sidecar
-  (`tests/charging_index_order.rs`). That file also carries the tripwire —
-  a sidecar whose locators are rotated one row along, which an indexed lookup
-  refuses and a table scan cannot notice — so a future change back to a scan
-  fails a test instead of costing a fifteenth slow run.
 
 ### Added
 
