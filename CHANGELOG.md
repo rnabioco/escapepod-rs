@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`escapepod-classify` builds on non-x86_64 targets again.** The native
+  BiLSTM's `vec8` module (`fnn_lstm.rs`) was not gated on
+  `target_arch = "x86_64"` while everything around it was, so every aarch64
+  build — the post-merge `Check (aarch64)` job, both `aarch64-*` release
+  rows, the macOS clippy gate — failed on `std::arch::x86_64`, and main's
+  CI was red from #329. Gated, together with the two warnings that would
+  have failed the same build under `-Dwarnings` right behind it
+  (`rt_blocked` is read only by the x86_64 kernels; an unneeded `mut` on
+  the kernel test's backend list).
+- **`NativeBiLstm::with_backend` can no longer hand safe code an
+  instruction the CPU lacks.** It asserted the hidden-size width and checked
+  nothing about the machine, so `with_backend(Backend::Avx512)` on a
+  Broadwell or Zen3 node executed ZMM instructions from a safe function. It
+  now returns `Result`, refusing a kernel this machine cannot run or a
+  hidden size that is not a multiple of its width — the same two rules
+  `best_for` applies, written once as `Backend::supported` and
+  `Backend::lanes`. `Backend::available()` lists what a machine can run and
+  the kernel pins sweep it; AVX-512 requires AVX2 + FMA explicitly, since
+  its lone-read path is the AVX2 kernel.
+
 ### Performance
 
 - **`escpod classify` runs the shipped charging network's recurrence

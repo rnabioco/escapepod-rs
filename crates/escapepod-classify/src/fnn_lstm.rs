@@ -83,35 +83,65 @@ fn backend_cap() -> Option<Backend> {
 }
 
 impl Backend {
-    /// The fastest kernel this machine can run for a hidden size.
+    /// Every kernel, slowest to fastest.
+    #[cfg(target_arch = "x86_64")]
+    const ALL: [Backend; 3] = [Backend::Scalar, Backend::Avx2, Backend::Avx512];
+    #[cfg(not(target_arch = "x86_64"))]
+    const ALL: [Backend; 1] = [Backend::Scalar];
+
+    /// The vector width. A hidden size must be a multiple of it: the
+    /// activations run `lanes` units at a time and there is no masked tail.
+    fn lanes(self) -> usize {
+        match self {
+            Backend::Scalar => 1,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2 => 8,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx512 => 16,
+        }
+    }
+
+    /// Whether this machine can run the kernel.
     ///
-    /// The AVX-512 activations are 16-wide and the AVX2 ones 8-wide, so a
-    /// hidden size that is not a multiple of the width falls through to the
-    /// next kernel rather than growing a masked tail nobody ships. AVX-512
-    /// is runtime-detected, never a baseline bump: the release artifact is
-    /// built for Haswell, and Broadwell login nodes and Alpine's Zen3 take
-    /// the AVX2 kernel.
-    pub fn best_for(h: usize) -> Self {
-        let cap = backend_cap();
-        let allowed = |b: Backend| cap.is_none_or(|c| b <= c);
-        #[cfg(target_arch = "x86_64")]
-        {
-            if h.is_multiple_of(16)
-                && allowed(Backend::Avx512)
-                && is_x86_feature_detected!("avx512f")
-            {
-                return Backend::Avx512;
-            }
-            if h.is_multiple_of(8)
-                && allowed(Backend::Avx2)
-                && is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("fma")
-            {
-                return Backend::Avx2;
+    /// The one place the `unsafe` calls into the `#[target_feature]` kernels
+    /// rest on: both constructors (`best_for`, `with_backend`) consult it, so
+    /// a backend a `NativeBiLstm` carries is one whose instructions the CPU
+    /// can execute. AVX-512 asks for AVX2 + FMA as well, because its
+    /// lone-read path is the AVX2 kernel.
+    pub fn supported(self) -> bool {
+        match self {
+            Backend::Scalar => true,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2 => is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx512 => {
+                is_x86_feature_detected!("avx512f")
+                    && is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("fma")
             }
         }
-        let _ = (h, allowed);
-        Backend::Scalar
+    }
+
+    /// Every kernel this machine can run, slowest to fastest — what an
+    /// equivalence test sweeps, whichever one the dispatch prefers.
+    pub fn available() -> Vec<Backend> {
+        Self::ALL.into_iter().filter(|b| b.supported()).collect()
+    }
+
+    /// The fastest kernel this machine can run for a hidden size.
+    ///
+    /// A hidden size that is not a multiple of a kernel's width falls
+    /// through to the next kernel rather than growing a masked tail nobody
+    /// ships. AVX-512 is runtime-detected, never a baseline bump: the release
+    /// artifact is built for Haswell, and Broadwell login nodes and Alpine's
+    /// Zen3 take the AVX2 kernel.
+    pub fn best_for(h: usize) -> Self {
+        let cap = backend_cap();
+        Self::ALL
+            .into_iter()
+            .rev()
+            .find(|&b| h.is_multiple_of(b.lanes()) && cap.is_none_or(|c| b <= c) && b.supported())
+            .unwrap_or(Backend::Scalar)
     }
 
     pub fn name(self) -> &'static str {
@@ -146,7 +176,9 @@ pub struct NativeBiLstm {
     /// instead of 32 floats out of every 1.5 KB row — worth 14% of the
     /// single-read kernel and 11% of the batched one. Empty unless `4H` is
     /// a multiple of 32 (the AVX2 backend's precondition, `H % 8 == 0`); the
-    /// scalar path keeps reading `rt`.
+    /// scalar path keeps reading `rt`. Only the x86_64 kernels read it, so
+    /// on any other target it is built and never read.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     rt_blocked: [Vec<f32>; 2],
     /// `[n_cls][4H]` over the readout in the order the graph concatenates.
     head_w: Vec<f32>,
@@ -186,23 +218,27 @@ impl NativeBiLstm {
     }
 
     /// Choose the kernel explicitly (tests; equivalence checks).
-    pub fn with_backend(mut self, backend: Backend) -> Self {
-        #[cfg(target_arch = "x86_64")]
-        if backend == Backend::Avx2 {
-            assert!(
-                self.h.is_multiple_of(8),
-                "the AVX2 kernel needs a hidden size that is a multiple of 8"
-            );
+    ///
+    /// Refused when this machine cannot run it or the hidden size is not a
+    /// multiple of its width — the two rules `best_for` applies — so a
+    /// `NativeBiLstm` never carries a backend its kernels cannot execute.
+    /// It used to assert the width and check nothing about the CPU, which
+    /// made it a safe function through which safe code could reach an
+    /// AVX-512 instruction on a machine without one.
+    pub fn with_backend(mut self, backend: Backend) -> Result<Self> {
+        if !backend.supported() {
+            bail!("this machine cannot run the {} kernel", backend.name());
         }
-        #[cfg(target_arch = "x86_64")]
-        if backend == Backend::Avx512 {
-            assert!(
-                self.h.is_multiple_of(16),
-                "the AVX-512 kernel needs a hidden size that is a multiple of 16"
+        if !self.h.is_multiple_of(backend.lanes()) {
+            bail!(
+                "the {} kernel needs a hidden size that is a multiple of {}, not {}",
+                backend.name(),
+                backend.lanes(),
+                self.h
             );
         }
         self.backend = backend;
-        self
+        Ok(self)
     }
 
     pub fn hidden(&self) -> usize {
@@ -1011,7 +1047,6 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[cfg(target_arch = "x86_64")]
 impl NativeBiLstm {
     /// `N` reads in lockstep, sixteen lanes wide, over the same 32-gate
     /// slices as the AVX2 kernel: 2 accumulators × `N`, `N` broadcasts and
@@ -1177,6 +1212,7 @@ mod vec16 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod vec8 {
     use std::arch::x86_64::*;
 
@@ -1612,7 +1648,8 @@ pub(crate) mod tests {
             let mut got = [0.0f32; 2];
             let scalar = NativeBiLstm::from_proto(&proto, n_ch, n_off)
                 .unwrap()
-                .with_backend(Backend::Scalar);
+                .with_backend(Backend::Scalar)
+                .unwrap();
             scalar.logits(&x, &mut got).unwrap();
             let d = max_abs_diff(&got, &want);
             assert!(
@@ -1652,7 +1689,7 @@ pub(crate) mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_matches_avx2_bit_for_bit() {
-        if !is_x86_feature_detected!("avx512f") {
+        if !Backend::Avx512.supported() {
             eprintln!("no AVX-512F on this machine: cross-width pin not exercised");
             return;
         }
@@ -1660,10 +1697,12 @@ pub(crate) mod tests {
         let proto = lstm_model(n_ch, n_off, h, 33);
         let wide = NativeBiLstm::from_proto(&proto, n_ch, n_off)
             .unwrap()
-            .with_backend(Backend::Avx512);
+            .with_backend(Backend::Avx512)
+            .unwrap();
         let narrow = NativeBiLstm::from_proto(&proto, n_ch, n_off)
             .unwrap()
-            .with_backend(Backend::Avx2);
+            .with_backend(Backend::Avx2)
+            .unwrap();
         assert_eq!(wide.preferred_batch(), 8);
         // 1..=17 covers every group width and every tail after a full group.
         for n_reads in 1..=17usize {
@@ -1703,17 +1742,20 @@ pub(crate) mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_matches_scalar() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !Backend::Avx2.supported() {
+            eprintln!("no AVX2 + FMA on this machine: avx2-vs-scalar pin not exercised");
             return;
         }
         let (n_ch, n_off, h) = (4, 33, 96);
         let proto = lstm_model(n_ch, n_off, h, 5);
         let s = NativeBiLstm::from_proto(&proto, n_ch, n_off)
             .unwrap()
-            .with_backend(Backend::Scalar);
+            .with_backend(Backend::Scalar)
+            .unwrap();
         let v = NativeBiLstm::from_proto(&proto, n_ch, n_off)
             .unwrap()
-            .with_backend(Backend::Avx2);
+            .with_backend(Backend::Avx2)
+            .unwrap();
         for seed in 1..=4u64 {
             let x = input(n_ch, n_off, seed);
             let (mut a, mut b) = ([0.0f32; 2], [0.0f32; 2]);
@@ -1781,20 +1823,11 @@ pub(crate) mod tests {
     fn batched_matches_single_bit_for_bit() {
         let (n_ch, n_off, h) = (4, 33, 96);
         let proto = lstm_model(n_ch, n_off, h, 21);
-        let mut backends = vec![Backend::Scalar];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                backends.push(Backend::Avx2);
-            }
-            if is_x86_feature_detected!("avx512f") {
-                backends.push(Backend::Avx512);
-            }
-        }
-        for &backend in &backends {
+        for backend in Backend::available() {
             let net = NativeBiLstm::from_proto(&proto, n_ch, n_off)
                 .expect("recognised")
-                .with_backend(backend);
+                .with_backend(backend)
+                .unwrap();
             // Up to one more than the widest group, so every width and
             // every tail after a full group is scored.
             for n_reads in 1..=net.preferred_batch() + 1 {
@@ -1820,7 +1853,8 @@ pub(crate) mod tests {
         // it goes through the same entry point and says so.
         let scalar = NativeBiLstm::from_proto(&proto, n_ch, n_off)
             .unwrap()
-            .with_backend(Backend::Scalar);
+            .with_backend(Backend::Scalar)
+            .unwrap();
         assert_eq!(scalar.preferred_batch(), 1);
         let inputs: Vec<Vec<f32>> = (1..=4u64).map(|s| input(n_ch, n_off, 60 + s)).collect();
         let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
