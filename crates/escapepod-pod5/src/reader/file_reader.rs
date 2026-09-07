@@ -23,9 +23,13 @@ use super::read_iter::{ReadIterator, extract_read_from_batch};
 use super::signal_extractor::SignalExtractor;
 
 /// Signal-row + calibration data for a single read, returned by
-/// `find_signal_rows_with_calibration_by_ids` and helpers.
-#[allow(dead_code)]
-pub(crate) struct SignalCalibration {
+/// [`Reader::find_signal_rows_with_calibration_by_ids`].
+///
+/// Everything a caller needs to fetch and calibrate one read's signal, and
+/// nothing else: the four columns are the whole projection that lookup
+/// decodes, against the 22 a full `ReadData` would.
+#[derive(Debug, Clone)]
+pub struct SignalCalibration {
     pub read_id: Uuid,
     pub signal_rows: Vec<u64>,
     pub calibration_offset: f32,
@@ -1227,6 +1231,32 @@ impl Reader {
         self.read_index.get()
     }
 
+    /// Is there a `.p5s` sidecar on disk that this reader could take its read
+    /// index from?
+    ///
+    /// Schema metadata only — it never decodes the (potentially
+    /// multi-million-row) index, so a command may ask before deciding whether
+    /// to tell the user about `escpod index`.
+    ///
+    /// A sidecar that exists but does not load — wrong version, bound to a
+    /// different POD5 — answers `false` here. That is a hint, not the ruling:
+    /// [`Self::read_index`] is where such a sidecar is an *error* rather than
+    /// a reason to fall back, and it stays that way. This predicate exists so
+    /// that "you have no index" can be said before the lookup starts, not to
+    /// classify why.
+    pub fn has_sidecar_index(&self) -> bool {
+        let Some(p5s_path) = self.p5s_path() else {
+            return false;
+        };
+        let Ok(identity) = self.sidecar_identity() else {
+            return false;
+        };
+        matches!(
+            crate::sidecar::read_sidecar_metadata(&p5s_path, &identity),
+            Ok(Some(_))
+        )
+    }
+
     /// Get or lazily build the read UUID index.
     ///
     /// Checks for a `.p5s` sidecar first and falls back to a column-projected
@@ -1454,9 +1484,13 @@ impl Reader {
 
     /// Look up signal rows and calibration data for a set of target UUIDs.
     ///
-    /// Same strategy as [`Self::find_signal_rows_by_ids`].
-    #[allow(dead_code)]
-    pub(crate) fn find_signal_rows_with_calibration_by_ids(
+    /// Same strategy as [`Self::find_signal_rows_by_ids`], and the same
+    /// reasoning as [`Self::reads_by_ids`] for why it indexes rather than
+    /// scans — but projected to the four columns a signal fetch actually
+    /// needs, so it is the lookup a classifier wants: it never materialises
+    /// the read strings, the run-info dictionary or the twelve per-read
+    /// scalars that a `ReadData` carries.
+    pub fn find_signal_rows_with_calibration_by_ids(
         &self,
         target_ids: &HashSet<Uuid>,
     ) -> Result<Vec<SignalCalibration>> {
