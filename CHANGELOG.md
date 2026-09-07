@@ -147,6 +147,70 @@
 
 ### Added
 
+- **`escapepod_demux::onnx_rewrite::expand_instance_norm`, and the finding
+  that made it necessary: batching the windowed charging graph through tract
+  does not score reads independently.** tract lowers ONNX
+  `InstanceNormalization` by reducing over every axis but the channel
+  (`tract-onnx/src/ops/nn/instance_norm.rs`), which for a rank-3 `[N, C, W]`
+  input is `axes = [0, 2]` — the batch axis included. The operator is defined
+  per *instance*. At batch 1 the two agree exactly, which is why nothing here
+  has ever noticed: every tract graph `escpod` runs is pinned to batch 1, and
+  **no shipped result is affected.** Above batch 1 each read is normalised
+  against the reads beside it. Feeding `charging_tcn_rna004@v0.1.2` an
+  identical read 0 at every batch size, its logit goes `+1.474677` (batch 1),
+  `+0.263454` (2), `+1.320732` (8), `-0.284231` (128) — a sign flip, not a
+  tolerance.
+
+  The rewrite replaces each `InstanceNormalization` with the spec's own
+  per-instance formula over the spatial axis alone, handling both the pre-18
+  and post-18 spellings of `ReduceMean`'s axes, and refusing anything it
+  cannot be sure of (a rank other than 3, an opset below 13, a custom domain).
+  Read 0 then scores `+1.474679` at batch 1, 2, 8 and 128 alike, and matches
+  the batch-1 value tract's own lowering produces to 2e-6 — the `rsqrt` versus
+  `sqrt`+`div` last ulp, since ONNX has no `Rsqrt` to spell the former with.
+
+  It is **not** enabled in `waveform_net.rs`. The CPU path scores batch 1,
+  where tract's lowering is already the spec, and the explicit graph measures
+  ~5% slower there (4.95 → 5.15 ms/read) because tract fuses its own two-axis
+  reduce better. This is a prerequisite for a batched or device path, not an
+  improvement to the shipped one.
+
+- **`examples/tcn_cuda_probe` reports where each node ran**, which is how the
+  above was found. `--dump` prints the host/device split as *islands* — the
+  unit of cost is the round trip, not the node — plus the convolution kernel
+  each `CudaConv` got, since cuDNN and the naive `conv1d_f32_generic` fallback
+  share an op name and are otherwise invisible. On the CUDA-transformed graph
+  every host node was the same op: 29 `Reduce<MeanOfSquares>`, one per
+  `InstanceNormalization`, each its own island. `GpuReduce::new` takes a
+  single axis, and tract-cuda's `split_multi_axis_reduce` covers
+  `Sum | Prod | Min | Max | Any | All` and correctly not `MeanOfSquares`,
+  which does not chain.
+
+  Fixing the reduction fixes the placement with it — A30,
+  `charging_tcn_rna004@v0.1.2`, arms interleaved, two reps:
+
+  | | host nodes | device syncs | batch-128 CUDA |
+  |---|---:|---:|---:|
+  | as tract lowers it | 29 | 62 | 1.26 ms/read |
+  | `--fix-norm` | 0 | 4 | 0.59 ms/read |
+
+  Four syncs is the floor — three inputs in, one output back. Against a CPU
+  core the sweep is 0.99× at batch 1, 5.2× at 8, 11.1× at 128, 11.7× at 256:
+  **a single read is still no faster on the device than on a core**, and the
+  win is entirely the batch, which is the mirror image of the CPU finding that
+  batching buys nothing there.
+
+  The probe also carries `--hoist`, and on the resident graph
+  `hoist_conv_padding` — a *loss* on the CPU, and worth nothing on the device
+  before this — is worth **4.1×** (0.59 → 0.14 ms/read at batch 128, three
+  reps), because 24 of the 27 convolutions pad asymmetrically and so miss
+  cuDNN. It is off, because it costs three orders of parity (max |Δlogit|
+  3.1e-5 → 1.7e-2, identical across reps, so the algorithm rather than the
+  scheduling): with padding hoisted cuDNN is free to pick a Winograd-class
+  algorithm for a k=3 convolution and 22 layers compound it. Pinning an
+  algorithm, or taking the 11× and keeping the numbers, is a decision for
+  whoever builds the device path.
+
 - **The windowed (`waveform_model`) charging graph has a benchmark, and the
   padding hoist is measured on it and *not* taken.** `benches/charging.rs`
   covered the column path's five steps and stopped; nothing timed the TCN
