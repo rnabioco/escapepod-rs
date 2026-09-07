@@ -129,6 +129,7 @@ use std::sync::Arc;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_core::model::TypedRunnableModel;
 
+use escapepod_demux::onnx_rewrite::hoist_conv_padding;
 use escapepod_signal::chunk::Chunk;
 
 use crate::bundle::{WaveformSpec, WaveformTensor};
@@ -165,9 +166,55 @@ impl WaveformNet {
     /// Open the graph and pin its contract against `spec`.
     pub fn load(path: &Path, spec: &WaveformSpec) -> Result<Self> {
         let onnx = tract_onnx::onnx();
-        let proto = onnx
+        // Taken as a proto so the padding *can* be hoisted, but it is not
+        // hoisted by default — and that is a measurement, not an oversight.
+        //
+        // 27 of this graph's 29 convolutions carry a causal left pad, which
+        // looks like exactly the shape [`hoist_conv_padding`] exists for:
+        // tract's im2col abandons its block-copy path whenever `pads != 0`,
+        // and on the shipped FNN CNN hoisting was worth 6.1x (305 -> 50 us,
+        // bit-identical). It does not transfer. Paired, in one job on one
+        // node, `benches/charging.rs`'s `waveform` group on
+        // `charging_tcn_rna004@v0.1.2`:
+        //
+        //     hoist on    6.4240 ms/read
+        //     hoist off   5.9613 ms/read
+        //
+        // The rewrite splices a zero block in front of the convolution, and
+        // here that block is ~(390+64) x 64 x 4 B per padded conv — about
+        // 2.5 MB of extra copy per read. On the FNN CNN the activations were
+        // 33 wide and the copy was free; at 390 it is not, and it is doing
+        // more work than the im2col path it avoids. The convolutions are also
+        // 64->64 over 390 samples, so the per-element fallback it removes is a
+        // small share of a large GEMM rather than the whole cost.
+        //
+        // Read that pair narrowly. Run-to-run variance across *separate* jobs
+        // was larger than the effect (the same "on" arm measured 5.86 ms in
+        // one job and 6.42 ms in another), so what is established is that the
+        // hoist is not a win here, not that it is precisely a 7% loss. The
+        // default is therefore what this loader has always done.
+        //
+        // What IS settled is parity: both arms return the same logit to the
+        // bit (the rewrite splices in the zeros the padding already was), so
+        // `ESCAPEPOD_WAVEFORM_HOIST=1` is safe to turn on for a re-measurement
+        // on another machine or a future export whose shapes differ. The batch
+        // argument must be the batch pinned below, because the zero block is a
+        // concrete constant.
+        let mut proto = onnx
             .proto_model_for_path(path)
             .map_err(|e| anyhow!("cannot read the waveform model {}: {e}", path.display()))?;
+        let hoisted = if std::env::var_os("ESCAPEPOD_WAVEFORM_HOIST").is_some() {
+            hoist_conv_padding(&mut proto, 1)
+        } else {
+            0
+        };
+        if hoisted > 0 {
+            tracing::debug!(
+                "waveform model {}: hoisted the padding out of {hoisted} convolution(s) \
+                 (ESCAPEPOD_WAVEFORM_HOIST); this measured *slower* than leaving it alone",
+                path.display()
+            );
+        }
         let model = onnx
             .model_for_proto_model(&proto)
             .map_err(|e| anyhow!("cannot parse the waveform model {}: {e}", path.display()))?;

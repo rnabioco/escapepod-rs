@@ -147,6 +147,32 @@
 
 ### Added
 
+- **The windowed (`waveform_model`) charging graph has a benchmark, and the
+  padding hoist is measured on it and *not* taken.** `benches/charging.rs`
+  covered the column path's five steps and stopped; nothing timed the TCN
+  variant at all, so a review that flagged `waveform_net` as the one tract
+  loader in the workspace not calling `hoist_conv_padding` could not be
+  answered. It now can: a `waveform` group scores a real `waveform_model`
+  bundle's graph on synthetic tensors of the bundle's declared shape, and
+  `ESCAPEPOD_WAVEFORM_HOIST=1` reloads the same weights through the rewrite so
+  the pair is one binary apart.
+
+  The rewrite is bit-exact here (identical logit bits both ways) and it is
+  **slower**: 6.4240 ms/read against 5.9613 without, paired in one job on
+  `charging_tcn_rna004@v0.1.2`. It splices a zero block in front of each
+  `pads=0` convolution, which on this graph's 390-wide activations is ~2.5 MB
+  of extra copy per read — where the FNN CNN's 33-wide ones made that free and
+  the same rewrite was worth 6.1x. The convolutions are also 64->64 over 390
+  samples, so the per-element im2col fallback it removes is a small share of a
+  large GEMM. The default is unchanged; the lever and the numbers are there for
+  a future export whose shapes differ.
+
+  Read that pair narrowly. Across *separate* jobs the same arm measured 5.86 ms
+  and 6.42 ms — variance larger than the effect — so what is established is
+  that hoisting is not a win here, not that it is precisely a 7% loss. Run both
+  arms in one job; two `srun`s plus a criterion baseline will confidently
+  report whichever answer the scheduler handed you.
+
 - **The charging classifier has benchmarks.** A production report that
   `escpod classify` had got 2× slower could not be answered from this
   repository: `crates/escapepod-classify` had no `benches/` at all, and the

@@ -91,9 +91,11 @@ pub mod adapter_cnn;
 #[cfg(feature = "gpu")]
 pub mod adapter_cnn_gpu;
 
-// Present whenever tract is: both ONNX features pull it, and every tract
-// loader in the workspace (here and in escapepod-classify) runs its graph
-// through this before optimizing.
+// Present whenever tract is: both ONNX features pull it. The CNN loaders here
+// and `escapepod-classify`'s `fnn` run every graph through it before
+// optimizing; `escapepod-classify`'s `waveform_net` deliberately does not, and
+// says why (measured slower on 390-wide activations, where the zero block it
+// splices in costs more than the im2col path it avoids).
 #[cfg(any(feature = "cnn-detect", feature = "crf-decode"))]
 pub mod onnx_rewrite;
 

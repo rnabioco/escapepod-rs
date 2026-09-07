@@ -24,10 +24,17 @@
 //! Env vars:
 //!   ESCAPEPOD_BENCH_SAMPLES=N     criterion sample size (default 100).
 //!   ESCAPEPOD_CHARGING_BUNDLE=DIR Score a REAL bundle directory as well.
-//!                                 Needs `--features fnn-onnx`; without the
-//!                                 var the scorer group is skipped, since the
-//!                                 weights are not redistributable and CI has
-//!                                 none. Adds `scorer/{batch}` groups.
+//!                                 Without the var the bundle groups are
+//!                                 skipped, since the weights are not
+//!                                 redistributable and CI has none. A
+//!                                 `feature_model` bundle adds `scorer/*`
+//!                                 (needs `--features fnn-onnx`); a
+//!                                 `waveform_model` one adds `waveform/logit`
+//!                                 (needs `--features waveform-onnx`).
+//!   ESCAPEPOD_WAVEFORM_HOIST=1    Reload the waveform graph through
+//!                                 `hoist_conv_padding`. Off by default
+//!                                 because it measured slower — run both arms
+//!                                 in ONE job, see `bench_waveform_scorer`.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -374,6 +381,106 @@ fn bench_scorer(c: &mut Criterion) {
 #[cfg(not(feature = "fnn-onnx"))]
 fn bench_scorer(_c: &mut Criterion) {}
 
+/// The windowed variant's graph, on a real `waveform_model` bundle.
+///
+/// Separate from `scorer` because it is a different pipeline, not a different
+/// scorer on the same features: it reads three tensors of a shape the bundle
+/// declares, and there is no column vector anywhere in it.
+///
+/// It is the pair that matters, and it is what established that the padding
+/// hoist is *not* a win here: `ESCAPEPOD_WAVEFORM_HOIST=1` reloads the same
+/// weights through `hoist_conv_padding`, and on
+/// `charging_tcn_rna004@v0.1.2` that measured 6.4240 ms/read against 5.9613
+/// without it. See `waveform_net::WaveformNet::load` for why.
+///
+/// **Run both arms inside one job.** Across separate jobs the same arm varied
+/// 5.86 -> 6.42 ms, which is larger than the effect; two `srun`s and a
+/// criterion baseline will confidently report whichever answer the scheduler
+/// handed you.
+///
+/// Synthetic tensors, deliberately: the graph's cost is its shape, and a real
+/// chunk would make this need a POD5, a BAM and a corpus. What the numbers
+/// must not be used for is parity — that is `examples/verify_waveform_model`.
+#[cfg(feature = "waveform-onnx")]
+fn bench_waveform_scorer(c: &mut Criterion) {
+    use escapepod_classify::{ChargingBundle, ChargingScorer, WaveformTensor};
+    use escapepod_signal::chunk::Chunk;
+
+    let Ok(dir) = std::env::var("ESCAPEPOD_CHARGING_BUNDLE") else {
+        eprintln!(
+            "skipping the `waveform` group: set ESCAPEPOD_CHARGING_BUNDLE to a \
+             `waveform_model` bundle directory to measure it"
+        );
+        return;
+    };
+    let bundle = match ChargingBundle::load(std::path::Path::new(&dir)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping the `waveform` group: {dir} did not load: {e:#}");
+            return;
+        }
+    };
+    let ChargingScorer::Waveform(net) = &bundle.scorer else {
+        eprintln!("skipping the `waveform` group: {dir} is not a `waveform_model` bundle");
+        return;
+    };
+    let spec = match bundle.waveform_spec() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skipping the `waveform` group: {dir} declares no window: {e:#}");
+            return;
+        }
+    };
+
+    // Each tensor at exactly the shape the bundle declares, so the graph does
+    // the work it would do on a real read.
+    let mut rng = Rng(11);
+    let mut plane = |role| {
+        let [rows, cols] = spec.tensor_shape(role);
+        (0..rows * cols)
+            .map(|_| rng.float() * 2.0 - 1.0)
+            .collect::<Vec<f32>>()
+    };
+    let signal = plane(WaveformTensor::Signal);
+    let features = plane(WaveformTensor::Features);
+    let [sequence_rows, sequence_cols] = spec.tensor_shape(WaveformTensor::Sequence);
+    let sequence = plane(WaveformTensor::Sequence);
+    let chunk = Chunk {
+        signal,
+        sequence,
+        sequence_rows,
+        sequence_cols,
+        features,
+        base_index: 0,
+        focus_signal_pos: 0,
+    };
+
+    // Printed so the pair of runs is a parity check as well as a timing one:
+    // the rewrite splices a zero block in front of a `pads=0` convolution,
+    // which is what the padding already was, so the two arms must agree to the
+    // bit. A changed logit here means the rewrite is not value-preserving on
+    // this graph, and no speedup would be worth that.
+    eprintln!(
+        "waveform graph: padding hoist {}; logit on the synthetic chunk = {:?}",
+        if std::env::var_os("ESCAPEPOD_WAVEFORM_HOIST").is_some() {
+            "ON (ESCAPEPOD_WAVEFORM_HOIST)"
+        } else {
+            "off (the default)"
+        },
+        net.logit(&chunk, spec).map(f64::to_bits),
+    );
+    let mut g = c.benchmark_group("waveform");
+    g.sample_size(bench_sample_size(20));
+    g.throughput(Throughput::Elements(1));
+    g.bench_function("logit", |b| {
+        b.iter(|| black_box(net.logit(black_box(&chunk), spec)))
+    });
+    g.finish();
+}
+
+#[cfg(not(feature = "waveform-onnx"))]
+fn bench_waveform_scorer(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_feature_grid,
@@ -381,5 +488,6 @@ criterion_group!(
     bench_junction_features,
     bench_finalize,
     bench_scorer,
+    bench_waveform_scorer,
 );
 criterion_main!(benches);
