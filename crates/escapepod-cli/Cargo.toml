@@ -207,7 +207,23 @@ demux-models = ["demux"]
 # Caveat for the DTW leg specifically: on a full node the CPU DTW is *faster*
 # (113.0 s on 64 cores vs 132.4 s on an A30 for 1.22M reads, +~2.2 GB RSS) —
 # the wins are CNN detection and the CRF encoder. See benchmarks/README.md.
-gpu = ["demux", "cnn-detect", "crf-decode", "escapepod-demux/gpu"]
+#
+# `escapepod-classify/cuda` is the fourth leg: the windowed charging
+# classifier's TCN, batched through `tract-cuda` rather than `ort` (no LSTM in
+# that graph, so tract-cuda's Conv kernel is enough — see
+# `escapepod-classify/examples/tcn_cuda_probe.rs` for the measurement this
+# leg is built from). A plain `cargo build --features gpu` already enables
+# `classify`'s `waveform-onnx`, so this needs nothing beyond the one edge
+# here; `cuda`'s own `dep:tract-cuda` pins `cudarc` at the same version
+# `escapepod-demux/gpu` already pulls in (`cuda-12020`), so the two coexist in
+# one binary without a resolver conflict.
+gpu = [
+    "demux",
+    "cnn-detect",
+    "crf-decode",
+    "escapepod-demux/gpu",
+    "escapepod-classify/cuda",
+]
 # Training support for demux SVM models (implies `demux`).
 train = ["demux", "escapepod-demux/train"]
 

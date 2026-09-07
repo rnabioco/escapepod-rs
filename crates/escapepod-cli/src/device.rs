@@ -135,6 +135,12 @@ pub enum Stage {
     CrfEncoder,
     /// Batched DTW distance for classify / train-svm, via the CUDA DTW kernel.
     Dtw,
+    /// The windowed charging classifier's TCN inference (`escpod classify`
+    /// against a `waveform_model` bundle), via `tract-cuda`. Backed by
+    /// `escapepod-classify`'s own `cuda` feature, but this crate's `gpu`
+    /// feature forwards to it, so `feature()`/`compiled_in()` report the same
+    /// umbrella name every other stage does.
+    WaveformTcn,
 }
 
 impl Stage {
@@ -144,6 +150,7 @@ impl Stage {
             Self::CnnDetect => "boundary CNN adapter detection",
             Self::CrfEncoder => "CTC-CRF encoder inference",
             Self::Dtw => "DTW distance",
+            Self::WaveformTcn => "windowed charging classifier (TCN) inference",
         }
     }
 
@@ -155,7 +162,7 @@ impl Stage {
     /// future stage whose feature *does* differ has somewhere to say so.
     pub const fn feature(self) -> &'static str {
         match self {
-            Self::CnnDetect | Self::CrfEncoder | Self::Dtw => "gpu",
+            Self::CnnDetect | Self::CrfEncoder | Self::Dtw | Self::WaveformTcn => "gpu",
         }
     }
 
@@ -165,9 +172,11 @@ impl Stage {
     /// the feature has to be able to *say* it lacks the feature.
     pub const fn compiled_in(self) -> bool {
         match self {
-            // One feature now covers all three: `gpu` is atomic, so a
+            // One feature now covers all four: `gpu` is atomic, so a
             // build either has every device path or none of them.
-            Self::CnnDetect | Self::CrfEncoder | Self::Dtw => cfg!(feature = "gpu"),
+            Self::CnnDetect | Self::CrfEncoder | Self::Dtw | Self::WaveformTcn => {
+                cfg!(feature = "gpu")
+            }
         }
     }
 
@@ -183,6 +192,12 @@ impl Stage {
             Self::CrfEncoder => Some("~4x slower than GPU end-to-end"),
             // Not a typo and not an omission: see `auto_prefers_gpu`.
             Self::Dtw => None,
+            // `examples/tcn_cuda_probe.rs`: 11.1x at batch 128, plateauing by
+            // there. A single read is *not* faster on the GPU (0.99x) — the
+            // win is entirely the batch, which is why `waveform::
+            // classify_reads_gpu` routes anything short of one full batch to
+            // the CPU scorer instead of paying a padded GPU call for it.
+            Self::WaveformTcn => Some("~11x slower than GPU at production batch sizes"),
         }
     }
 
@@ -208,9 +223,21 @@ impl Stage {
     /// GBM classification is not here at all because it has no GPU path, and
     /// adding one is not planned: a 32-core CPU pool beats a single GPU stream
     /// on the tree walk by roughly 20x.
+    ///
+    /// # Why `WaveformTcn` defaulting to GPU is safe despite a real per-read cost
+    ///
+    /// Unlike `CnnDetect`/`CrfEncoder`, this stage is a genuine *loss* on the
+    /// GPU below one full batch (0.99x at batch 1, per the probe). Defaulting
+    /// `auto` to GPU anyway is only correct because
+    /// [`escapepod_classify::waveform::classify_reads_gpu`] never actually
+    /// pays that cost: it scores whole batches on the GPU and routes anything
+    /// short of one full batch to the CPU scorer instead of padding it
+    /// through a GPU call. Do not "simplify" that fallback away without
+    /// re-deciding this default — without it, `auto` would slow down every
+    /// run smaller than one GPU batch.
     pub const fn auto_prefers_gpu(self) -> bool {
         match self {
-            Self::CnnDetect | Self::CrfEncoder => true,
+            Self::CnnDetect | Self::CrfEncoder | Self::WaveformTcn => true,
             Self::Dtw => false,
         }
     }
@@ -462,7 +489,12 @@ mod tests {
 
     #[test]
     fn cpu_forces_cpu_for_every_stage() {
-        for stage in [Stage::CnnDetect, Stage::CrfEncoder, Stage::Dtw] {
+        for stage in [
+            Stage::CnnDetect,
+            Stage::CrfEncoder,
+            Stage::Dtw,
+            Stage::WaveformTcn,
+        ] {
             assert_eq!(
                 place(Device::Cpu, stage).unwrap(),
                 Placement::Cpu(CpuReason::Requested)
@@ -484,7 +516,12 @@ mod tests {
     /// `auto` never errors, whatever the build or the node.
     #[test]
     fn auto_is_infallible() {
-        for stage in [Stage::CnnDetect, Stage::CrfEncoder, Stage::Dtw] {
+        for stage in [
+            Stage::CnnDetect,
+            Stage::CrfEncoder,
+            Stage::Dtw,
+            Stage::WaveformTcn,
+        ] {
             assert!(place(Device::Auto, stage).is_ok());
         }
     }
@@ -493,7 +530,12 @@ mod tests {
     /// the flag — this is the musl-release case from the module docs.
     #[test]
     fn gpu_on_an_uncompiled_stage_names_the_feature() {
-        for stage in [Stage::CnnDetect, Stage::CrfEncoder, Stage::Dtw] {
+        for stage in [
+            Stage::CnnDetect,
+            Stage::CrfEncoder,
+            Stage::Dtw,
+            Stage::WaveformTcn,
+        ] {
             if stage.compiled_in() {
                 continue;
             }
@@ -530,7 +572,12 @@ mod tests {
     /// costs, and the one that is not must not claim a cost it does not have.
     #[test]
     fn cpu_cost_tracks_auto_preference() {
-        for stage in [Stage::CnnDetect, Stage::CrfEncoder, Stage::Dtw] {
+        for stage in [
+            Stage::CnnDetect,
+            Stage::CrfEncoder,
+            Stage::Dtw,
+            Stage::WaveformTcn,
+        ] {
             assert_eq!(stage.auto_prefers_gpu(), stage.cpu_cost().is_some());
         }
     }

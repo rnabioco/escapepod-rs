@@ -106,7 +106,15 @@ fnn-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 waveform-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 # Run a tract graph on a CUDA device. Opt-in, and nothing CUDA is needed at
 # BUILD time: tract-cuda goes through cudarc, which dlopens, exactly like this
-# workspace's other GPU paths. Today it feeds `examples/tcn_cuda_probe` only —
-# the measurement that decides whether the windowed variant should have a
-# device path at all. It is not wired into any scorer.
+# workspace's other GPU paths. Backs `waveform_net_gpu::WaveformNetGpu`, the
+# windowed variant's batched GPU scorer — `examples/tcn_cuda_probe` is the
+# measurement that decided the scorer was worth building, kept re-runnable
+# rather than retired now that it is. `escapepod-cli`'s `gpu` feature forwards
+# to this one, so the code compiles and links end to end — but
+# `commands/classify.rs` currently refuses `--device gpu` for this stage
+# outright (`place_ruled_out`, not `place_and_report`): real reads diverge
+# from the CPU scorer at every batch size tried, though
+# `examples/tcn_cuda_probe`'s synthetic-data check reports it fine from
+# batch 2 up. See rnabioco/escapepod-rs#343 and `waveform_net_gpu`'s module
+# doc before re-enabling the command-level path.
 cuda = ["dep:tract-cuda", "dep:tract-core", "waveform-onnx"]

@@ -66,6 +66,9 @@ pub mod recipe;
 pub mod waveform;
 #[cfg(feature = "waveform-onnx")]
 pub mod waveform_net;
+/// The windowed variant's graph, batched through `tract-cuda`.
+#[cfg(feature = "cuda")]
+pub mod waveform_net_gpu;
 pub mod window;
 
 pub use anchor::{
@@ -86,6 +89,8 @@ pub use pipeline::{
     feature_grid_at, scan_bam, signal_pa,
 };
 pub use recipe::{FeatureRecipe, KmerLevels};
+#[cfg(feature = "cuda")]
+pub use waveform_net_gpu::WaveformNetGpu;
 pub use window::{BaseJustify, signal_window};
 
 /// Encode a probability as the `cl` BAM tag value: `round(p * 255)` as u8.

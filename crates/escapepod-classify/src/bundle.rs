@@ -1123,6 +1123,13 @@ pub struct ChargingBundle {
     /// divergence. Cross-checked against the bundle's own geometry at load;
     /// never checked against the caller's sample — see [`AdapterWindow`].
     pub adapter_window: Option<AdapterWindow>,
+    /// Path to the windowed variant's ONNX file, retained so a GPU-batched
+    /// scorer can be built on demand (`waveform_net_gpu`) — the CPU scorer
+    /// above is already loaded from it and does not need the path again.
+    /// `None` for every other variant, and for the windowed variant when
+    /// `cuda` is not linked in.
+    #[cfg(feature = "cuda")]
+    waveform_onnx_path: Option<PathBuf>,
 }
 
 /// sha256 of a file, lowercase hex.
@@ -1909,6 +1916,9 @@ impl ChargingBundle {
             }
         };
 
+        #[cfg(feature = "cuda")]
+        let mut waveform_onnx_path: Option<PathBuf> = None;
+
         let (scorer, waveform, kmer) = match variant {
             Variant::Gbm | Variant::FeatureNn => {
                 let f = meta
@@ -1984,6 +1994,10 @@ impl ChargingBundle {
                         wm.preprocessing.refine_kmer_center_idx
                     );
                 }
+                #[cfg(feature = "cuda")]
+                {
+                    waveform_onnx_path = Some(dir.join(&wm.file));
+                }
                 let scorer = Self::load_waveform_model(&dir, wm, &spec)?;
                 (scorer, Some(spec), kmer)
             }
@@ -2056,6 +2070,8 @@ impl ChargingBundle {
                 reference_panel: aw.reference_panel,
                 verified_safe_to: aw.verified_safe_to,
             }),
+            #[cfg(feature = "cuda")]
+            waveform_onnx_path,
         })
     }
 
@@ -2126,6 +2142,24 @@ impl ChargingBundle {
             self.model_id,
             self.scorer.kind()
         )
+    }
+
+    /// Build a GPU-batched scorer for the windowed variant's graph, pinned to
+    /// `batch` reads per call. Lazy and on demand — never built at bundle
+    /// load time, since that runs before `--device` is resolved.
+    #[cfg(feature = "cuda")]
+    pub fn waveform_net_gpu(
+        &self,
+        batch: usize,
+    ) -> Result<crate::waveform_net_gpu::WaveformNetGpu> {
+        let path = self.waveform_onnx_path.as_ref().ok_or_else(|| {
+            anyhow!(
+                "bundle {} carries no windowed graph to run ({})",
+                self.model_id,
+                self.scorer.kind()
+            )
+        })?;
+        crate::waveform_net_gpu::WaveformNetGpu::load(path, self.waveform_spec()?, batch)
     }
 
     /// Load and contract-check the `waveform_model` variant.
