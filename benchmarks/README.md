@@ -1,5 +1,121 @@
 # Benchmark Results
 
+## Demux, CRF path: the harness and the before numbers (2026-09-06)
+
+Part 1 of rnabioco/escapepod-rs#331. The command the aa-tRNA-seq pipeline
+runs — `escpod demux --model ldx=… --model fdx=… --annotate --classifications
+… --ref-scores` — had no harness in this repository (the three demux scripts
+below measure the SVM/DTW path against WarpDemuX, wall only, one binary), so
+this section is both the harness and the number the native encoder in part 2
+has to beat.
+
+### The test set: `data/bench/dual_axis_20k/`
+
+20,000 reads from the 20260828 FDX1-4 Run1 flowcell (PBK54437), every
+molecule co-barcoded fdx (5') + ldx (3'), in one file (`test20k.pod5`,
+218 MB). 17,556 of them are the fdx4 v1 corpus's recorded held-out split —
+the fdx model never trained on them — and carry an fdx truth; the other 2,444
+fell outside the corpus (below the 80% adapter-reach gate), so they are the
+realistic hard reads, with no fdx truth. The ldx truth for all 20,000 is the
+3'-side call the corpus labels were derived from (nbc16 v0.3.0,
+`Run1_libraries.parquet`). `truth.csv` carries both; `samplesheet.csv` maps
+(ldx, fdx) to library and condition; `make_testset.py` regenerates the ids
+from the corpus tables (its FDX manifest input still lives in
+`~/scratch/fdx/`); `REPORT.md` is the 2026-09-05 dual-axis validation the
+set was built for. The directory is gitignored — reference it, never copy it.
+Models throughout: `barcode_crf_ldx32_rna004@v0.2.1` (3' axis, CNN-anchored,
+chunk 3000) and `barcode_crf_fdx4_rna004@v0.1.1` (5' axis, read-end
+anchored, chunk 3500), the pair the REPORT used, from
+`~/devel/rnabioco/escapepod-models/models/`.
+
+### Per read (criterion, one core)
+
+`crates/escapepod-demux/benches/crf_encoder.rs`, `ESCAPEPOD_CRF_BUNDLE` set
+to each bundle in turn, on rna `compute21` (a shared node at load ~12):
+
+| `crf_encoder/…` | ldx32 (T = 300) | fdx4 (T = 350) |
+|---|---:|---:|
+| `encode/tract` — the encoder alone | **17.06 ms** | **19.98 ms** |
+| `basecall/tract` — encoder + AVX-512 lattice decode | 18.88 ms | 21.82 ms |
+
+A first run before the benchmark ids carried the bundle name measured
+17.31 / 19.11 and 19.93 / 22.69 ms — agreement within 4%. (The ids carry the
+bundle now because criterion had "compared" the fdx4 run against the ldx32
+baseline and reported a +15% regression that was only the longer window.)
+#173's 13.0 ms was the nbc16 bundle at T = 200; the cost is linear in T.
+
+### End to end (`benchmarks/benchmark_demux_crf.sh`)
+
+The fused dual-axis pass over the 20k set, `--ref-scores` on, two reps with
+the arms interleaved, on rna `compute15`; rep 2 shown. Every CPU arm agreed
+with its rep 1 within 2% — the input is small enough that paging it in costs
+a second, not the minutes the 12 GB charging set costs. Calls are identical
+on every read across all CPU arms; accuracy against the truth is ldx 96.9%
+(20,000 labelled) and fdx 94.5% (17,556) on every arm.
+
+| threads | arm | wall | CPU-s | RSS |
+|---:|---|---:|---:|---:|
+| 32 | 0.20.0 release tarball (CI, `cross`, static musl) | 9:55 | 18,613 | 0.8 GB |
+| 32 | **main @ `fa09dd6`, glibc + mimalloc** | **47.4 s** | **1,438** | 1.3 GB |
+| 32 | 0.21.0 release tarball (CI, `cross`, static musl; predates mimalloc) | 10:06 | 18,968 | 0.8 GB |
+| 8 | 0.20.0 release tarball | 9:43 | 4,245 | 0.5 GB |
+| 8 | main | 2:00 | 944 | 0.8 GB |
+| 1 | 0.20.0 release tarball | 18:35 | 1,110 | 0.5 GB |
+| 1 | **main** | **14:18** | **855** | 0.6 GB |
+| GPU, 16 | 0.20.0 `gpu` build, one A30 (`compgpu01`) | 10.4 s | 17.5 | 2.1 GB |
+
+**Where the CPU goes.** Single-threaded, main spends 42.7 ms of
+CPU per read, and the two encoders alone are 37.0 of it (17.06 + 19.98):
+the tract encoder is **~85% of the CPU path** on this input, with the two
+decodes (~3.6 ms), the boundary CNN (~4 ms) and everything else in the rest.
+At 32 threads the same work reads 72 ms/read because `-c 32` on rna is 16
+physical cores plus their HT siblings; at 8 threads it is 47. That 37 ms is
+the number part 2 is measured against.
+
+**The release tarball.** 0.20.0's static-musl artifact is the allocator
+story from CLAUDE.md ("Allocator"), now measured on the demux path: 18,613
+CPU-s at 32 threads is **13× the CPU** of the same source against glibc and
+12.6× the wall; at 8 threads 4.5× and 4.9×; at one thread 1.3× —
+the convoy scales with the thread count, as a global malloc lock does, and
+the CRF path allocates far more per read than `classify` (where the same
+tarball measured 3.5×). `/usr/bin/time` says where the time is: the 0.20.0
+arm's 18,613 CPU-s are 3,196 s *user* and **15,416 s system**, on 39.7 M
+voluntary context switches, against 1,425 s / 12 s / 52 k for the glibc
+build — the process is in the kernel, on a lock. The 0.21.0 tarball (third
+row) is the same shape and measures the same, 18,968 CPU-s and 10:06,
+because that release *predates* the mimalloc change (#327 landed after it;
+`strings` finds no `mimalloc` in the tarball and seven in the local build).
+Whether mimalloc clears this on the demux path is therefore still the next
+CI-built tarball's measurement to make, and this harness is how to make it:
+one more `--bin`.
+
+**CPU against GPU, attributed.** `benchmarks/evaluate_demux_crf.py` over
+the rep-2 CSVs: 4 of 20,000 calls differ between main on CPU and the 0.20.0
+GPU build (3 ldx, 1 fdx), all four with |crf_margin| between 0.115 and
+0.223 nats — under the 0.25 the script flags as a near tie. That reproduces
+#322's finding with the margins in hand rather than asserted, and is the bar
+a native encoder is held to: no more disagreements than that, and none
+outside the near-tie band. The GPU rep 1 was 23.7 s against rep 2's 10.4 —
+the ort session build and the page-in, both one-off.
+
+### Reproducing
+
+```bash
+# one node, three thread counts, two arms; ~1.5 h, most of it the 0.20.0 arm
+srun -p rna -c 32 --mem=32G -t 3:00:00 -- benchmarks/benchmark_demux_crf.sh \
+    --model ldx=$M/barcode_crf_ldx32_rna004@v0.2.1 --model fdx=$M/barcode_crf_fdx4_rna004@v0.1.1 \
+    --bin /path/to/escpod-0.20.0 --bin ./target/release/escpod --threads 32 --out out_t32
+# the GPU reference arm (needs a gpu-featured binary and the ort runtime)
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 -- pixi run -e gpu benchmarks/benchmark_demux_crf.sh \
+    --model ldx=… --model fdx=… --bin ./escpod-gpu --device gpu --threads 16 --out out_gpu
+# cross-device attribution over the CSVs the runs left behind
+pixi run -e python-test python benchmarks/evaluate_demux_crf.py \
+    --truth data/bench/dual_axis_20k/truth.csv cpu=out_t32/arm1_rep2.csv gpu=out_gpu/arm0_rep2.csv
+# the per-read number
+ESCAPEPOD_CRF_BUNDLE=$M/barcode_crf_ldx32_rna004@v0.2.1 \
+    srun -p rna -c 32 --mem=32G -- pixi run cargo bench -p escapepod-demux --features crf-decode --bench crf_encoder
+```
+
 ## Charging classifier: native BiLSTM kernel and the per-read path (2026-09-06)
 
 The follow-up to the section below it. Same input (65,821 scored reads, warm

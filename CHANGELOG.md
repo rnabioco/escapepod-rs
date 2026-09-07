@@ -181,6 +181,37 @@
   2%, with all eight runs producing the same 65,821 calls at median
   P(charged) = 0.125.
 
+- **The CRF demux path has a harness (#331, part 1).** The command the
+  aa-tRNA-seq pipeline runs — `escpod demux --model ldx=… --model fdx=…
+  --annotate --classifications … --ref-scores` — had none: the three demux
+  benchmark scripts measure the SVM/DTW path against WarpDemuX, wall only,
+  one binary. `benchmarks/benchmark_demux_crf.sh` is `benchmark_charging.sh`'s
+  design over that command (interleaved `--bin` arms, CPU beside wall, rep 1
+  a warm-up) with one rule of its own: **the input is never touched**.
+  `--annotate` writes its `.p5s` beside the path *as given*, so each arm runs
+  against a symlink in node-local scratch, the sidecar lands beside the link,
+  and the script asserts after every arm that none appeared beside the
+  canonical file. It defaults to a labelled 20,000-read co-barcoded set at
+  `data/bench/dual_axis_20k/` (gitignored; provenance in the README), and
+  ends by running `benchmarks/evaluate_demux_crf.py` over the last rep:
+  accuracy against the truth per axis, and every arm against arm 0 read for
+  read with the disagreements attributed by `crf_margin` — the bar an encoder
+  change is held to. `crates/escapepod-demux/benches/crf_encoder.rs` is the
+  per-read counterpart, gated on `ESCAPEPOD_CRF_BUNDLE` like the charging
+  `scorer` group, and measures the encoder alone and encoder-plus-decode.
+
+  The before numbers, in `benchmarks/README.md`: the tract encoder is
+  **17.3 ms/read** on the ldx32 bundle (T = 300) and 19.9 ms on fdx4
+  (T = 350), one core on rna; the fused dual-axis pass over the 20k set costs
+  **1,440 CPU-s (47 s wall) at 32 threads** for a glibc build of main against
+  17.5 CPU-s (10.4 s) on one A30. And the **0.20.0 release tarball takes
+  18,600 CPU-s and 9 min 55 s** on the same input — 13× the CPU of the same
+  source built against glibc, 15,400 of those seconds *system* time on 40 M
+  voluntary context switches: the musl-allocator convoy, measured on the
+  demux path for the first time. The 0.21.0 tarball measures the same, and
+  predates the mimalloc change, so whether mimalloc clears it here is the
+  next release's tarball to measure. Calls are identical across every arm.
+
 ## 0.21.0 (2026-09-06)
 
 ### Fixed
