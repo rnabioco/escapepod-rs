@@ -1994,6 +1994,7 @@ mod tests {
     /// The 16-wide kernel and the 8-wide one must agree bit for bit through
     /// the whole stack, single-read and batched, wherever the machine has
     /// AVX-512F. Skips (and says so) where it does not, e.g. CI.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_matches_avx2_bit_for_bit() {
         if !LstmBackend::Avx512.supported() {
