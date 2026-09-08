@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.24.0 (2026-09-08)
+
 ### Fixed
 
 - **`escpod classify --device gpu` no longer aborts the process on a mismatched
@@ -18,6 +20,15 @@
   handing off to `tract-cuda`: `--device gpu` fails with a clear, actionable
   error naming the missing symbol instead of crashing, and `--device auto`
   logs a warning and falls back to the CPU scorer instead of aborting.
+- **The same panic-instead-of-error gap existed one layer up, in the CUDA
+  *driver* check every GPU stage shares.** `escapepod_demux::cuda::
+  visible_device_count` claimed to return `None` when no CUDA driver library
+  is discoverable at all, but cudarc's own `culib()` `panic!`s in that case
+  instead of returning an `Err` — so a `-gpu`-featured binary run on a
+  machine with no NVIDIA driver whatsoever (the exact case `--device auto`
+  exists to fall back from) crashed instead. Fixed the same way: a
+  `is_culib_present` pre-check before ever calling into cudarc's panicking
+  path.
 - The pixi `gpu` environment now supplies the unversioned `libcudart.so`
   symlink cudarc's dynamic loader tries **first** (`get_lib_name_candidates`
   checks the bare name before any versioned one) via a small activation
