@@ -50,6 +50,16 @@ tract-cuda = { version = "0.23.6", optional = true, default-features = false, fe
     "cuda-12020",
 ] }
 tract-core = { version = "0.23.6", optional = true }
+# Named directly (not only pulled in transitively via tract-cuda) so
+# `waveform_net_gpu::cudart_runtime_probe` can check the host's CUDA
+# *runtime* library for the symbol tract-cuda's pinned `cuda-12020` build
+# resolves against, without ever calling cudarc's own dlsym wrapper — that
+# wrapper `panic!`s on a miss (rnabioco/escapepod-rs#347) rather than
+# returning a `Result`, and this workspace's `release` profile pins
+# `panic = "abort"`, so such a panic is not even catchable in the binaries
+# actually shipped. Cargo unifies this with the workspace's own `cudarc`
+# pin (also `cuda-12020` + `dynamic-loading`), so this adds no new build.
+cudarc = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
@@ -125,4 +135,4 @@ waveform-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 # gate. See rnabioco/escapepod-rs#343 and `waveform_net_gpu`'s module doc for
 # the full evidence trail, including a separate rare anomaly never seen at
 # batch >= 2.
-cuda = ["dep:tract-cuda", "dep:tract-core", "waveform-onnx"]
+cuda = ["dep:tract-cuda", "dep:tract-core", "dep:cudarc", "waveform-onnx"]

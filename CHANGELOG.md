@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`escpod classify --device gpu` no longer aborts the process on a mismatched
+  CUDA runtime** (#347). `WaveformNetGpu::load` (the windowed TCN's GPU path,
+  `tract-cuda`) needs a working CUDA *runtime* library (`libcudart`), not just
+  a visible driver — and cudarc's own dynamic loader `panic!`s on a missing
+  symbol rather than returning an error, which this workspace's `release`
+  profile (`panic = "abort"`, what every shipped `-gpu` binary builds with)
+  turns into an unrecoverable process abort with no diagnosable message
+  (`Missing symbol cudaGetDeviceProperties_v2: dlsym failed`, reported on
+  nodes with a working CUDA driver but a mismatched or absent CUDA 12
+  runtime). `--device` placement for this stage now probes the CUDA runtime
+  library directly — without ever calling cudarc's panicking wrapper — before
+  handing off to `tract-cuda`: `--device gpu` fails with a clear, actionable
+  error naming the missing symbol instead of crashing, and `--device auto`
+  logs a warning and falls back to the CPU scorer instead of aborting.
+- The pixi `gpu` environment now supplies the unversioned `libcudart.so`
+  symlink cudarc's dynamic loader tries **first** (`get_lib_name_candidates`
+  checks the bare name before any versioned one) via a small activation
+  script, so `pixi run -e gpu` resolves this environment's pinned CUDA 12
+  runtime rather than risking a fall-through to whichever unversioned
+  `libcudart.so` the node's own default library path happens to expose.
+- `docs/cli/classify.md` gained a GPU acceleration section — the `--device`
+  flag was undocumented there entirely, and `waveform_model`'s GPU path has a
+  runtime requirement (a working CUDA *runtime* library, not just the driver)
+  that the existing `demux` GPU docs don't cover, since `demux`'s GPU stages
+  go through onnxruntime instead of `tract-cuda`.
+
 ### Performance
 
 - **The CTC-CRF barcode encoder can run natively instead of through tract**

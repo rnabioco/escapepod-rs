@@ -133,6 +133,81 @@ use escapepod_signal::chunk::Chunk;
 use crate::bundle::{WaveformSpec, WaveformTensor};
 use crate::waveform_net::{pack_batch, resolve_inputs, unpack_logits};
 
+/// The runtime symbol tract-cuda's pinned cudarc build (`cuda-12020`, this
+/// crate's `Cargo.toml`) resolves against to read a device's properties.
+/// Hardcoded rather than derived: cudarc's own `#[cfg]` split
+/// (`runtime::result::device::get_device_prop`) picks this exact name for
+/// every `cuda-12000`..`cuda-12090` feature and the unversioned
+/// `cudaGetDeviceProperties` for `cuda-110x0`/`cuda-130x0` — if the pinned
+/// feature above ever moves out of the 12.x range, this name has to move
+/// with it.
+const REQUIRED_CUDART_SYMBOL: &str = "cudaGetDeviceProperties_v2";
+
+/// Whether the CUDA *runtime* library (`libcudart`) this process can dlopen
+/// actually exports [`REQUIRED_CUDART_SYMBOL`] — checked without ever
+/// calling cudarc's own runtime wrapper for it.
+///
+/// # Why this exists (rnabioco/escapepod-rs#347)
+///
+/// [`WaveformNetGpu::load`] moves the graph onto CUDA via
+/// `tract_cuda::CudaTransform`, which internally builds a
+/// `TractCudaContext` — and that constructor does not stop at the CUDA
+/// *driver* call [`escapepod_demux::cuda::device_visible`] already checked
+/// (`cuCtxCreate` et al.): it also calls the CUDA *runtime*'s
+/// `cudaGetDeviceProperties_v2`, dlsym'd lazily by cudarc
+/// (`cudarc-0.19.9/src/runtime/sys/mod.rs`'s `load::<F>`). On a miss that
+/// function does not return an `Err` — it `panic!`s. This workspace's
+/// `release` profile pins `panic = "abort"` (root `Cargo.toml`), the profile
+/// every shipped `-gpu` release artifact builds with (`.github/workflows/
+/// release.yml`), so that panic is not a `Result` a caller ever sees or a
+/// panic `catch_unwind` could intercept — the process is gone.
+///
+/// This hit production: a node whose driver answers `cuInit` fine (so the
+/// existing device-visible check says GPU) paired with a discoverable
+/// `libcudart.so` from a CUDA runtime that does not export the `_v2` symbol
+/// — for instance a bare `-gpu` release binary run outside the pixi `gpu`
+/// environment's `LD_LIBRARY_PATH`, landing on a host CUDA 13 install where
+/// cudarc's own `cuda-13000` build already knows to call the unversioned
+/// symbol instead (see the `#[cfg]` split next to `REQUIRED_CUDART_SYMBOL`'s
+/// doc) — silently aborted the whole run instead of falling back to the CPU
+/// scorer or naming the problem.
+///
+/// [`cudarc::runtime::sys::is_culib_present`] and
+/// [`cudarc::runtime::sys::culib`] are the same lookups cudarc's own
+/// generated wrappers use internally, and neither panics here:
+/// `is_culib_present` only reports yes/no, and `culib` panics solely on "no
+/// library found at all" — already ruled out by the check just before it.
+/// The symbol itself is then resolved on the returned handle directly,
+/// which reports a miss as an `Err` rather than a panic.
+pub fn cudart_runtime_probe() -> Result<(), String> {
+    // Safety: `is_culib_present`/`culib` only dlopen a shared library and
+    // dlsym a symbol on it — no pointers are dereferenced, and `culib`'s own
+    // panic path is unreachable here because `is_culib_present` already
+    // proved a library opens.
+    unsafe {
+        if !cudarc::runtime::sys::is_culib_present() {
+            return Err(
+                "no CUDA runtime library (libcudart) is dlopen-able; a visible \
+                 GPU driver is not enough for this stage — see \
+                 docs/cli/classify.md#gpu-acceleration"
+                    .to_string(),
+            );
+        }
+        cudarc::runtime::sys::culib()
+            .get::<unsafe extern "C" fn()>(REQUIRED_CUDART_SYMBOL.as_bytes())
+            .map(|_symbol| ())
+            .map_err(|e| {
+                format!(
+                    "the CUDA runtime library found does not export `{REQUIRED_CUDART_SYMBOL}` \
+                     ({e}); escpod's GPU build needs a CUDA 12.x runtime discoverable at \
+                     dlopen time — run under `pixi run -e gpu`, where it is pinned, rather \
+                     than relying on whatever CUDA the host happens to have on its default \
+                     library search path"
+                )
+            })
+    }
+}
+
 /// A loaded windowed-variant graph, pinned to `batch` reads per call.
 ///
 /// Unlike [`crate::waveform_net::WaveformNet`], batch is fixed at load time —

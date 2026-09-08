@@ -26,7 +26,29 @@ use cudarc::driver::CudaContext;
 /// Ordinals `0..count` index the same devices onnxruntime's `device_id` does,
 /// which is what lets an encoder session and its lattice-decode context be
 /// placed together by passing the same ordinal to both.
+///
+/// # Why this checks `is_culib_present` first
+///
+/// `CudaContext::device_count()` does not return an `Err` when no CUDA
+/// driver library (`libcuda.so`) is discoverable at all — cudarc's own
+/// dlopen wrapper `panic!`s in that case
+/// (`cudarc-0.19.9/src/driver/sys/mod.rs`'s `culib()`), which this
+/// function's own doc above used to claim was handled gracefully. That is
+/// the same failure *shape* as rnabioco/escapepod-rs#347 (there, the CUDA
+/// *runtime*, `libcudart`, one level further along the same stage) — see
+/// `escapepod_classify::waveform_net_gpu::cudart_runtime_probe`'s doc for
+/// the full explanation. It matters here specifically because this
+/// function backs `--device auto`, whose entire contract is "never fails" —
+/// a `-gpu`-featured binary run on a machine with no NVIDIA driver at all
+/// (a laptop, a login node, this workspace's own CPU-only CI/build hosts)
+/// is exactly the case `auto` exists to fall back from, not crash on.
 pub fn visible_device_count() -> Option<usize> {
+    // Safety: `is_culib_present` only attempts to `dlopen` a shared library
+    // by name and reports whether that succeeded — no pointers from it are
+    // ever dereferenced.
+    if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        return None;
+    }
     CudaContext::device_count().ok().map(|n| n.max(0) as usize)
 }
 
