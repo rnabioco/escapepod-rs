@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 0.23.0 (2026-09-08)
+
+### Added
+
+- **`escpod classify` scores the windowed (`waveform_model`) TCN on the GPU**
+  (#341-adjacent work, #344; investigation in #343). `--device auto|cpu|gpu`
+  now covers this stage the same way it already covers `demux`'s CNN
+  detect/CRF encoder/DTW: `WaveformNetGpu` batches reads through
+  `tract-cuda`, falling back to the CPU scorer for whatever remainder is
+  too small to fill a batch, so GPU is never slower than CPU for a run too
+  small to benefit. Default batch is 128
+  (`ESCAPEPOD_WAVEFORM_GPU_BATCH` to tune).
+
+  Getting here took a real correctness investigation, not just wiring: a
+  batch-1 bug in `tract-cuda`'s handling of this graph's fused
+  `RmsNorm` reduction is confirmed and permanently guarded
+  (`WaveformNetGpu::load` refuses batch < 2 outright — there is no speed
+  benefit at batch 1 either). An initially-reported batch-2 divergence on
+  real reads did not survive follow-up — eleven runs against the exact
+  bundle and fixture that first showed it, then four more at the production
+  default batch size against an independent ~5,000-read real dataset, all
+  bit-for-bit identical to the CPU scorer, zero flipped calls. A separate,
+  rare (1-in-51 trials) anomaly with the same failure signature turned up
+  once on a different bundle during that investigation and has not
+  recurred in any run at batch ≥ 2 since; it remains flagged in
+  `waveform_net_gpu`'s module doc as the thing that would justify closing
+  this gate again.
+
 ## 0.22.0 (2026-09-07)
 
 ### Fixed
