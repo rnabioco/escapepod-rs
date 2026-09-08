@@ -409,7 +409,72 @@ pub fn assemble_chunk(
     cut_chunk(&processed, &rows, &spec.chunk, read.base_index)
 }
 
-/// Classify every anchored read with signal, in parallel.
+/// Whether "no chunk" is a refusal the bundle asked for, or simply a read
+/// this runtime could not score. The two are the same event and different
+/// reports; see [`NoCallReason::NoChunk`].
+#[cfg(feature = "waveform-onnx")]
+fn no_chunk_reason(bundle: &ChargingBundle) -> NoCallReason {
+    let declared = bundle
+        .abstain
+        .as_ref()
+        .is_some_and(|a| a.kind == AbstainRule::NoChunk);
+    if declared {
+        NoCallReason::Abstained(AbstainRule::NoChunk)
+    } else {
+        NoCallReason::NoChunk
+    }
+}
+
+#[cfg(feature = "waveform-onnx")]
+fn no_call(read: &WaveformRead, reason: NoCallReason) -> NoCall {
+    NoCall {
+        read_id: read.read_id,
+        reference: read.reference.clone(),
+        reason,
+    }
+}
+
+/// One BCE logit, of whichever class the bundle says, turned into the
+/// reported call. `cl` is always `P(classes[1])`, so a positive class of 0
+/// inverts here and nowhere else.
+#[cfg(feature = "waveform-onnx")]
+fn call_from_logit(read: &WaveformRead, spec: &WaveformSpec, logit: f64) -> ReadCall {
+    let s = 1.0 / (1.0 + (-logit).exp());
+    let p = if spec.positive_class == 1 { s } else { 1.0 - s };
+    ReadCall {
+        read_id: read.read_id,
+        reference: read.reference.clone(),
+        p,
+        cl: crate::cl_from_probability(p),
+    }
+}
+
+#[cfg(feature = "waveform-onnx")]
+fn record_no_call(stats: &mut ClassifyStats, n: NoCall) {
+    match n.reason {
+        NoCallReason::NoSignal => stats.no_signal += 1,
+        NoCallReason::NsMismatch => stats.ns_mismatch += 1,
+        NoCallReason::NoChunk => stats.no_chunk += 1,
+        NoCallReason::Abstained(_) => stats.abstained += 1,
+    }
+    stats.no_calls.push(n);
+}
+
+/// Anchored reads, in POD5 storage order.
+///
+/// The reads arrive in BAM order through a `HashMap`, and reading them that
+/// way walks the whole POD5 pseudo-randomly. See [`Pod5Index::storage_key`].
+#[cfg(feature = "waveform-onnx")]
+fn sorted_reads<'a>(
+    anchored: &'a HashMap<Uuid, WaveformRead>,
+    pod5: &Pod5Index,
+) -> Vec<&'a WaveformRead> {
+    let mut reads: Vec<&WaveformRead> = anchored.values().collect();
+    reads.sort_by_cached_key(|r| pod5.storage_key(&r.read_id));
+    reads
+}
+
+/// Classify every anchored read with signal, in parallel, on the CPU scorer.
 ///
 /// Returns calls sorted by read id (deterministic output order) plus the
 /// no-call tallies — the same contract as [`crate::classify_reads`], so a
@@ -431,61 +496,29 @@ pub fn classify_reads(
     let spec = bundle.waveform_spec()?;
     let net = bundle.waveform_net()?;
     let extractors = pod5.extractors()?;
-    // Whether "no chunk" is a refusal the bundle asked for, or simply a read
-    // this runtime could not score. The two are the same event and different
-    // reports; see `NoCallReason::NoChunk`.
-    let declared_no_chunk = bundle
-        .abstain
-        .as_ref()
-        .is_some_and(|a| a.kind == AbstainRule::NoChunk);
-    let no_chunk_reason = if declared_no_chunk {
-        NoCallReason::Abstained(AbstainRule::NoChunk)
-    } else {
-        NoCallReason::NoChunk
-    };
+    let no_chunk = no_chunk_reason(bundle);
 
     enum Outcome {
         Call(ReadCall),
         None(NoCall),
     }
-    let mut reads: Vec<&WaveformRead> = anchored.values().collect();
-    // Storage order, for the same reason the column variant takes it: the
-    // reads arrive in BAM order through a `HashMap`, and reading them that way
-    // walks the whole POD5 pseudo-randomly. See [`Pod5Index::storage_key`].
-    reads.sort_by_cached_key(|r| pod5.storage_key(&r.read_id));
-    let no_call = |read: &WaveformRead, reason| {
-        Outcome::None(NoCall {
-            read_id: read.read_id,
-            reference: read.reference.clone(),
-            reason,
-        })
-    };
+    let reads = sorted_reads(anchored, pod5);
 
     let outcomes: Vec<Outcome> = reads
         .par_iter()
         .map(|read| {
             let Some(info) = pod5.reads().get(&read.read_id) else {
-                return Ok(no_call(read, NoCallReason::NoSignal));
+                return Ok(Outcome::None(no_call(read, NoCallReason::NoSignal)));
             };
             let raw = signal_adc(info, &extractors)?;
             if raw.len() as i64 != read.ns {
-                return Ok(no_call(read, NoCallReason::NsMismatch));
+                return Ok(Outcome::None(no_call(read, NoCallReason::NsMismatch)));
             }
             let Some(chunk) = assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw) else {
-                return Ok(no_call(read, no_chunk_reason));
+                return Ok(Outcome::None(no_call(read, no_chunk)));
             };
             let logit = net.logit(&chunk, spec)?;
-            // One BCE logit, of whichever class the bundle says. `cl` is
-            // always `P(classes[1])`, so a positive class of 0 inverts here
-            // and nowhere else.
-            let s = 1.0 / (1.0 + (-logit).exp());
-            let p = if spec.positive_class == 1 { s } else { 1.0 - s };
-            Ok(Outcome::Call(ReadCall {
-                read_id: read.read_id,
-                reference: read.reference.clone(),
-                p,
-                cl: crate::cl_from_probability(p),
-            }))
+            Ok(Outcome::Call(call_from_logit(read, spec, logit)))
         })
         .collect::<Result<_>>()?;
 
@@ -494,17 +527,99 @@ pub fn classify_reads(
     for o in outcomes {
         match o {
             Outcome::Call(c) => calls.push(c),
-            Outcome::None(n) => {
-                match n.reason {
-                    NoCallReason::NoSignal => stats.no_signal += 1,
-                    NoCallReason::NsMismatch => stats.ns_mismatch += 1,
-                    NoCallReason::NoChunk => stats.no_chunk += 1,
-                    NoCallReason::Abstained(_) => stats.abstained += 1,
-                }
-                stats.no_calls.push(n);
-            }
+            Outcome::None(n) => record_no_call(&mut stats, n),
         }
     }
+    calls.sort_by_key(|c| c.read_id);
+    stats.no_calls.sort_by_key(|n| n.read_id);
+    Ok((calls, stats))
+}
+
+/// Classify every anchored read on the GPU-batched scorer, falling back to
+/// the CPU scorer for whatever does not fill a full batch.
+///
+/// Same contract as [`classify_reads`] (sorted calls, the same no-call
+/// tallies), and shares its per-read preparation (signal fetch, chunk
+/// assembly) — but not its parallel *scoring*: a tract-cuda plan's batch is
+/// fixed at compile time, so reads are collected into groups of exactly
+/// `gpu.batch_size()` and scored with one sequential GPU call per group,
+/// rather than one call per read under `rayon`.
+///
+/// Reads are processed in memory-bounded superbatches rather than all at
+/// once: at this bundle's geometry a [`Chunk`] is tens of KB, so holding
+/// every chunk of a production run in memory at once would be tens of GB.
+/// `SUPERBATCH` matches `commands/demux/detect.rs`'s `GPU_BLOCK`, the same
+/// shape of bound for the same reason.
+///
+/// The last, short group of each superbatch (and the whole run, if it has
+/// fewer reads than one GPU batch) is scored on the CPU rather than padded
+/// through a full GPU call — a tract-cuda plan's cost is per call, not per
+/// valid row, so padding a mostly-empty batch would cost the same as a full
+/// one for a handful of reads. This is what makes "GPU is never worse than
+/// CPU" true; see [`crate::waveform_net_gpu`]'s module doc for the numbers.
+#[cfg(feature = "cuda")]
+pub fn classify_reads_gpu(
+    bundle: &ChargingBundle,
+    anchored: &HashMap<Uuid, WaveformRead>,
+    pod5: &Pod5Index,
+    gpu: &crate::waveform_net_gpu::WaveformNetGpu,
+) -> Result<(Vec<ReadCall>, ClassifyStats)> {
+    let spec = bundle.waveform_spec()?;
+    let cpu_fallback = bundle.waveform_net()?;
+    let extractors = pod5.extractors()?;
+    let no_chunk = no_chunk_reason(bundle);
+    let reads = sorted_reads(anchored, pod5);
+    let batch = gpu.batch_size();
+
+    enum Prepared<'r> {
+        Ready(&'r WaveformRead, Chunk),
+        None(NoCall),
+    }
+
+    const SUPERBATCH: usize = 16_384;
+    let mut stats = ClassifyStats::default();
+    let mut calls: Vec<ReadCall> = Vec::with_capacity(reads.len());
+
+    for slice in reads.chunks(SUPERBATCH) {
+        let prepared: Vec<Prepared> = slice
+            .par_iter()
+            .map(|&read| {
+                let Some(info) = pod5.reads().get(&read.read_id) else {
+                    return Ok(Prepared::None(no_call(read, NoCallReason::NoSignal)));
+                };
+                let raw = signal_adc(info, &extractors)?;
+                if raw.len() as i64 != read.ns {
+                    return Ok(Prepared::None(no_call(read, NoCallReason::NsMismatch)));
+                }
+                let Some(chunk) = assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw) else {
+                    return Ok(Prepared::None(no_call(read, no_chunk)));
+                };
+                Ok(Prepared::Ready(read, chunk))
+            })
+            .collect::<Result<_>>()?;
+
+        let mut ready: Vec<(&WaveformRead, Chunk)> = Vec::with_capacity(prepared.len());
+        for p in prepared {
+            match p {
+                Prepared::Ready(read, chunk) => ready.push((read, chunk)),
+                Prepared::None(n) => record_no_call(&mut stats, n),
+            }
+        }
+
+        let mut groups = ready.chunks_exact(batch);
+        for group in &mut groups {
+            let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
+            let logits = gpu.logits(&refs, spec)?;
+            for ((read, _), logit) in group.iter().zip(logits) {
+                calls.push(call_from_logit(read, spec, logit));
+            }
+        }
+        for (read, chunk) in groups.remainder() {
+            let logit = cpu_fallback.logit(chunk, spec)?;
+            calls.push(call_from_logit(read, spec, logit));
+        }
+    }
+
     calls.sort_by_key(|c| c.read_id);
     stats.no_calls.sort_by_key(|n| n.read_id);
     Ok((calls, stats))

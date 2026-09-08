@@ -187,11 +187,19 @@ use tract_onnx::prelude::*;
 struct Rng(u64);
 
 impl Rng {
-    fn float(&mut self) -> f32 {
+    /// Uniform draws in `[-scale, scale]`. Every prior run of this probe used
+    /// `scale = 1.0` — see rnabioco/escapepod-rs#343: real assembled chunks
+    /// have raw-level feature channels with variance up to 1e5 (values in the
+    /// hundreds), and this probe's own synthetic parity check has never drawn
+    /// anything beyond `[-1, 1]`. `--scale` closes that gap without needing a
+    /// real bundle's chunks, so the magnitude hypothesis in #343 can be tested
+    /// in isolation from everything else (packing, chunk assembly, real k-mer
+    /// tables) that differs between this probe and `classify_reads_gpu`.
+    fn float(&mut self, scale: f32) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
-        (self.0 as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0
+        ((self.0 as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0) * scale
     }
 }
 
@@ -235,7 +243,10 @@ macro_rules! run_timed {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
-        eprintln!("usage: tcn_cuda_probe <waveform bundle dir> [--batches 1,4,8] [--iters N]");
+        eprintln!(
+            "usage: tcn_cuda_probe <waveform bundle dir> [--batches 1,4,8] [--iters N] \
+             [--dump] [--fix-norm] [--hoist] [--scale F]"
+        );
         std::process::exit(2);
     };
     let mut batches = vec![1usize, 4, 8, 16, 32];
@@ -243,6 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dump = false;
     let mut hoist = false;
     let mut fix_norm = false;
+    let mut scale = 1.0f32;
     // Read 0's logit at the first batch in the sweep, to compare the rest to.
     let mut solo: Option<f32> = None;
     while let Some(flag) = args.next() {
@@ -259,6 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--dump" => dump = true,
             "--hoist" => hoist = true,
             "--fix-norm" => fix_norm = true,
+            "--scale" => scale = args.next().expect("--scale needs a value").parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -313,6 +326,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let typed = model.into_typed()?.into_decluttered()?;
         println!("nodes:  {} decluttered", typed.nodes().len());
+        // rnabioco/escapepod-rs#343: tract's optimizer can collapse the
+        // `expand_instance_norm` rewrite's Sub/Mul/ReduceMean/Add/Sqrt/Div
+        // chain into a single fused `RmsNorm` op (`declutter_mean_of_square`
+        // + `detect_rms_norm` in tract-core, both unconditional passes with
+        // no opt-out) — on CUDA that dispatches to a hand-written kernel
+        // (`tract-cuda`'s `rms_norm_*_f32`) rather than the generic, already
+        // real-hardware-validated `GpuReduce` + elementwise chain. Whether a
+        // given bundle's decluttered graph hits this fusion at all has so far
+        // only been asserted in prose (`waveform_net_gpu`'s module doc); this
+        // makes it a printed fact for whichever bundle is pointed at the probe.
+        let rms_norm_nodes = typed
+            .nodes()
+            .iter()
+            .filter(|n| n.op.name() == "RmsNorm")
+            .count();
+        println!(
+            "norm:   {rms_norm_nodes} node(s) fused into RmsNorm (bypasses the per-axis Reduce \
+             chain; see rnabioco/escapepod-rs#343)"
+        );
         if dump {
             report_ops("declut", &typed);
         }
@@ -330,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(i, role)| {
                 let mut rng = Rng(0xC0FFEE + i as u64);
                 let [rows, cols] = spec.tensor_shape(*role);
-                let data: Vec<f32> = (0..batch * rows * cols).map(|_| rng.float()).collect();
+                let data: Vec<f32> = (0..batch * rows * cols).map(|_| rng.float(scale)).collect();
                 Tensor::from_shape(&[batch, rows, cols], &data).map(IntoTValue::into_tvalue)
             })
             .collect::<TractResult<_>>()?;

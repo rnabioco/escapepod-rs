@@ -83,6 +83,14 @@ required-features = ["waveform-onnx"]
 name = "tcn_cuda_probe"
 required-features = ["waveform-onnx"]
 
+# rnabioco/escapepod-rs#343's own repro, kept runnable as a quick CPU-vs-GPU
+# regression check that skips the CLI's BAM/FASTA/POD5 plumbing — calls
+# `classify_reads`/`classify_reads_gpu` directly, against either the shipped
+# fixture or a real dataset via `--pod5`/`--bam`/`--fasta`/`--limit`.
+[[example]]
+name = "diag_343"
+required-features = ["cuda"]
+
 [features]
 default = []
 # Load and score the `feature_model` (per-base-feature ONNX) variant of a
@@ -106,7 +114,15 @@ fnn-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 waveform-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 # Run a tract graph on a CUDA device. Opt-in, and nothing CUDA is needed at
 # BUILD time: tract-cuda goes through cudarc, which dlopens, exactly like this
-# workspace's other GPU paths. Today it feeds `examples/tcn_cuda_probe` only —
-# the measurement that decides whether the windowed variant should have a
-# device path at all. It is not wired into any scorer.
+# workspace's other GPU paths. Backs `waveform_net_gpu::WaveformNetGpu`, the
+# windowed variant's batched GPU scorer — `examples/tcn_cuda_probe` is the
+# measurement that decided the scorer was worth building, kept re-runnable
+# rather than retired now that it is. `escapepod-cli`'s `gpu` feature forwards
+# to this one, so the code compiles and links end to end, and
+# `commands/classify.rs` routes this stage through `place_and_report` like
+# every other GPU-capable stage — `WaveformNetGpu::load` still refuses batch
+# < 2 outright (a confirmed, reproducible bug there), independent of this
+# gate. See rnabioco/escapepod-rs#343 and `waveform_net_gpu`'s module doc for
+# the full evidence trail, including a separate rare anomaly never seen at
+# batch >= 2.
 cuda = ["dep:tract-cuda", "dep:tract-core", "waveform-onnx"]

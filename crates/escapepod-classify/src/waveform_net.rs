@@ -229,63 +229,22 @@ impl WaveformNet {
             .map_err(|e| anyhow!("cannot parse the waveform model {}: {e}", path.display()))?;
 
         // Resolve each graph input to the tensor this runtime assembles for
-        // it, by name. Two of the six orderings would be caught by a shape
-        // check and the rest would not, so the name is the only thing that
-        // makes this safe.
-        let inputs: Vec<WaveformTensor> = {
-            let outlets = model
-                .input_outlets()
-                .map_err(|e| anyhow!("the waveform model declares no usable inputs: {e}"))?
-                .to_vec();
-            outlets
-                .iter()
-                .map(|outlet| {
-                    let name = model.node(outlet.node).name.as_str();
-                    WaveformTensor::from_name(name).ok_or_else(|| {
-                        anyhow!(
-                            "the waveform model takes an input named {name:?}, which this \
-                             runtime does not assemble; it produces `signal`, `sequence` \
-                             and `features`"
-                        )
-                    })
-                })
-                .collect::<Result<_>>()?
-        };
-
-        // Every tensor the geometry declares must be an input, and no input
-        // may be one it does not declare. A `[0, _]` shape is how
-        // `tensor_shape` spells "this variant has no such tensor".
-        for role in [
-            WaveformTensor::Signal,
-            WaveformTensor::Sequence,
-            WaveformTensor::Features,
-        ] {
-            let wanted = spec.tensor_shape(role);
-            let present = inputs.contains(&role);
-            if present == (wanted[0] == 0) {
-                bail!(
-                    "the declared geometry {} a {} tensor, but the graph {} one",
-                    if wanted[0] == 0 {
-                        "produces no"
-                    } else {
-                        "produces"
-                    },
-                    role.name(),
-                    if present { "takes" } else { "does not take" }
-                );
-            }
-        }
-
+        // it, by name — see `resolve_inputs`, shared verbatim with the GPU
+        // loader so the "resolve by name, not position" safety property below
+        // cannot silently drift between the two.
+        let outlets = model
+            .input_outlets()
+            .map_err(|e| anyhow!("the waveform model declares no usable inputs: {e}"))?
+            .to_vec();
+        let input_names: Vec<&str> = outlets
+            .iter()
+            .map(|outlet| model.node(outlet.node).name.as_str())
+            .collect();
         let n_outputs = model
             .output_outlets()
             .map_err(|e| anyhow!("the waveform model declares no usable outputs: {e}"))?
             .len();
-        if n_outputs != 1 {
-            bail!(
-                "the waveform model has {n_outputs} outputs; the contract is exactly one, \
-                 a [batch, 1] logit"
-            );
-        }
+        let inputs = resolve_inputs(&input_names, n_outputs, spec)?;
 
         // Pin the batch, in the graph's input order.
         let mut model = model;
@@ -392,4 +351,279 @@ impl WaveformNet {
 
 fn prod(shape: [usize; 2]) -> usize {
     shape[0] * shape[1]
+}
+
+/// Build one row-major `[batch, rows, cols]` buffer for `role`, one row per
+/// chunk, zero-filling the trailing `batch - chunks.len()` rows.
+///
+/// Shared by [`crate::waveform_net_gpu::WaveformNetGpu`]: a tract-cuda plan's
+/// batch is fixed at compile time, so a shorter group of chunks is padded
+/// rather than rebuilding the plan. Padding with zero rows is safe only
+/// because the GPU loader unconditionally applies
+/// [`escapepod_demux::onnx_rewrite::expand_instance_norm`] first — with it, a
+/// zero row's own normalisation cannot perturb any real row's, since each row
+/// only reduces over its own axis. Pure and tract-independent so it is
+/// testable without the `cuda` feature.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn pack_batch(
+    role: WaveformTensor,
+    chunks: &[&Chunk],
+    spec: &WaveformSpec,
+    batch: usize,
+) -> Result<Vec<f32>> {
+    let [rows, cols] = spec.tensor_shape(role);
+    let cell = rows * cols;
+    let mut buf = vec![0.0f32; batch * cell];
+    for (i, chunk) in chunks.iter().enumerate() {
+        let data: &[f32] = match role {
+            WaveformTensor::Signal => &chunk.signal,
+            WaveformTensor::Sequence => &chunk.sequence,
+            WaveformTensor::Features => &chunk.features,
+        };
+        if data.len() != cell {
+            bail!(
+                "the assembled {} tensor is {} values, but the geometry says {rows} x {cols}",
+                role.name(),
+                data.len()
+            );
+        }
+        buf[i * cell..(i + 1) * cell].copy_from_slice(data);
+    }
+    Ok(buf)
+}
+
+/// The first `n_valid` values of a `[batch, 1]` output, as f64 logits —
+/// padding rows are sliced off here, before anything downstream sees them.
+/// Takes a plain iterator rather than a tract array-view type, so, like
+/// [`pack_batch`], it needs nothing beyond `waveform-onnx` to test.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn unpack_logits(values: impl Iterator<Item = f32>, n_valid: usize) -> Result<Vec<f64>> {
+    let data: Vec<f32> = values.collect();
+    if data.len() < n_valid {
+        bail!(
+            "the waveform model emitted {} values, fewer than the {n_valid} requested",
+            data.len()
+        );
+    }
+    Ok(data[..n_valid].iter().map(|&v| v as f64).collect())
+}
+
+/// Resolve a graph's input names (in the graph's own input order) to the
+/// tensor each one is, and cross-check against `spec`: every tensor the
+/// geometry declares must be an input, and no input may be one it does not
+/// declare (a `[0, _]` shape is how `tensor_shape` spells "this variant has
+/// no such tensor"). Also checks there is exactly one output — the contract
+/// is a single `[batch, 1]` logit.
+///
+/// Takes bare names rather than a tract model so it works identically
+/// whether the caller's model is still an `InferenceModel` (the CPU loader,
+/// and the GPU loader before `into_typed()`) or already a `TypedModel` —
+/// and so it needs no tract types at all, which is what makes it testable
+/// without any ONNX runtime feature linked in beyond `waveform-onnx`.
+///
+/// Two of the six input orderings would be caught by a shape check and the
+/// rest would not, so the name is the only thing that makes this safe —
+/// shared between both loaders so that property cannot silently drift.
+pub(crate) fn resolve_inputs(
+    input_names: &[&str],
+    n_outputs: usize,
+    spec: &WaveformSpec,
+) -> Result<Vec<WaveformTensor>> {
+    let inputs: Vec<WaveformTensor> = input_names
+        .iter()
+        .map(|name| {
+            WaveformTensor::from_name(name).ok_or_else(|| {
+                anyhow!(
+                    "the waveform model takes an input named {name:?}, which this \
+                     runtime does not assemble; it produces `signal`, `sequence` \
+                     and `features`"
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    for role in [
+        WaveformTensor::Signal,
+        WaveformTensor::Sequence,
+        WaveformTensor::Features,
+    ] {
+        let wanted = spec.tensor_shape(role);
+        let present = inputs.contains(&role);
+        if present == (wanted[0] == 0) {
+            bail!(
+                "the declared geometry {} a {} tensor, but the graph {} one",
+                if wanted[0] == 0 {
+                    "produces no"
+                } else {
+                    "produces"
+                },
+                role.name(),
+                if present { "takes" } else { "does not take" }
+            );
+        }
+    }
+
+    if n_outputs != 1 {
+        bail!(
+            "the waveform model has {n_outputs} outputs; the contract is exactly one, \
+             a [batch, 1] logit"
+        );
+    }
+
+    Ok(inputs)
+}
+
+#[cfg(test)]
+mod gpu_support_tests {
+    use super::{pack_batch, resolve_inputs, unpack_logits};
+    use crate::bundle::WaveformTensor;
+    use escapepod_signal::chunk::Chunk;
+
+    /// A minimal `WaveformSpec` whose declared tensors are exactly `present`
+    /// — enough to drive `tensor_shape`'s `[0, _]`-means-absent convention,
+    /// nothing else about the geometry matters to `resolve_inputs`.
+    fn spec_with(present: &[WaveformTensor]) -> crate::bundle::WaveformSpec {
+        use escapepod_signal::chunk::{
+            BaseJustify, ChunkSpec, FeatureChannel, SeqEncoding, SignalChannel, SignalNorm,
+        };
+        let has = |t: WaveformTensor| present.contains(&t);
+        crate::bundle::WaveformSpec {
+            chunk: ChunkSpec {
+                signal_context: (0, 0),
+                signal_len: 4,
+                base_justify: BaseJustify::Center,
+                signal_channels: if has(WaveformTensor::Signal) {
+                    vec![SignalChannel::Current]
+                } else {
+                    vec![]
+                },
+                seq_encoding: if has(WaveformTensor::Sequence) {
+                    SeqEncoding::BaseOneHot { context: 1 }
+                } else {
+                    SeqEncoding::None
+                },
+                feature_offsets: (0, 2),
+                feature_channels: if has(WaveformTensor::Features) {
+                    vec![FeatureChannel::Dwell]
+                } else {
+                    vec![]
+                },
+                dwell_window: 3,
+            },
+            reverse_signal: false,
+            normalization: SignalNorm::MedianMad,
+            refine: None,
+            positive_class: 1,
+        }
+    }
+
+    #[test]
+    fn resolves_known_names_in_graph_order() {
+        let spec = spec_with(&[
+            WaveformTensor::Signal,
+            WaveformTensor::Sequence,
+            WaveformTensor::Features,
+        ]);
+        let got = resolve_inputs(&["sequence", "signal", "features"], 1, &spec).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                WaveformTensor::Sequence,
+                WaveformTensor::Signal,
+                WaveformTensor::Features,
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_an_unknown_input_name() {
+        let spec = spec_with(&[WaveformTensor::Signal]);
+        let err = resolve_inputs(&["signal", "mystery"], 1, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mystery"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_tensor_the_geometry_does_not_declare() {
+        let spec = spec_with(&[WaveformTensor::Signal]);
+        let err = resolve_inputs(&["signal", "sequence"], 1, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sequence"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_missing_declared_tensor() {
+        let spec = spec_with(&[WaveformTensor::Signal, WaveformTensor::Sequence]);
+        let err = resolve_inputs(&["signal"], 1, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sequence"), "{err}");
+    }
+
+    #[test]
+    fn refuses_more_than_one_output() {
+        let spec = spec_with(&[WaveformTensor::Signal]);
+        let err = resolve_inputs(&["signal"], 2, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 outputs"), "{err}");
+    }
+
+    fn filled_chunk(value: f32, len: usize) -> Chunk {
+        Chunk {
+            signal: vec![value; len],
+            sequence: vec![],
+            sequence_rows: 0,
+            sequence_cols: 0,
+            features: vec![],
+            base_index: 0,
+            focus_signal_pos: 0,
+        }
+    }
+
+    #[test]
+    fn pack_batch_zero_pads_the_trailing_rows() {
+        let spec = spec_with(&[WaveformTensor::Signal]);
+        let [rows, cols] = spec.tensor_shape(WaveformTensor::Signal);
+        let cell = rows * cols;
+        let chunk = filled_chunk(1.0, cell);
+        let refs = [&chunk, &chunk];
+        let buf = pack_batch(WaveformTensor::Signal, &refs, &spec, 4).unwrap();
+        assert_eq!(buf.len(), 4 * cell);
+        assert!(
+            buf[..2 * cell].iter().all(|&v| v == 1.0),
+            "real rows: {buf:?}"
+        );
+        assert!(
+            buf[2 * cell..].iter().all(|&v| v == 0.0),
+            "padding rows: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn pack_batch_refuses_a_mismatched_tensor_length() {
+        let spec = spec_with(&[WaveformTensor::Signal]);
+        let chunk = filled_chunk(1.0, 1);
+        let refs = [&chunk];
+        let err = pack_batch(WaveformTensor::Signal, &refs, &spec, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("geometry says"), "{err}");
+    }
+
+    #[test]
+    fn unpack_logits_takes_only_the_valid_rows_in_order() {
+        let got = unpack_logits([1.0f32, 2.0, 3.0, 4.0].into_iter(), 2).unwrap();
+        assert_eq!(got, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn unpack_logits_refuses_fewer_values_than_requested() {
+        let err = unpack_logits([1.0f32].into_iter(), 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fewer than"), "{err}");
+    }
 }

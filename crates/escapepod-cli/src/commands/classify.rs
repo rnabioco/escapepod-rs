@@ -85,6 +85,13 @@ pub struct ClassifyArgs {
     /// Number of threads for parallel processing
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
+
+    /// Where the windowed (`waveform_model`) variant's TCN inference runs
+    /// (`auto` by default, which prefers the GPU here at production batch
+    /// sizes). Has no effect on the GBM / feature-network variants, which
+    /// have no GPU path — see [`crate::device::note_cpu_only`].
+    #[command(flatten)]
+    pub device: crate::device::DeviceArgs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,10 +153,14 @@ fn input_summary(bundle: &ChargingBundle) -> String {
 
 /// The windowed variant's scan → index → classify, in place of the column
 /// path's. Returns what [`finish`] reports on.
+///
+/// `gpu` is a placement decision already made by [`run`] (via
+/// [`crate::device::place_and_report`]) — this function only acts on it.
 fn run_waveform(
     args: &ClassifyArgs,
     bundle: &ChargingBundle,
     geometry: &HashMap<String, escapepod_classify::RefGeometry>,
+    gpu: bool,
 ) -> anyhow::Result<(Vec<ReadCall>, ClassifyStats, u64)> {
     if args.orientation != OrientationArg::Auto {
         // Not silently ignored: the flag exists to override a *vote*, and this
@@ -195,8 +206,35 @@ fn run_waveform(
         pod5.n_files()
     );
 
-    let (calls, stats) = waveform::classify_reads(bundle, &scan.anchored, &pod5)?;
+    let (calls, stats) = if gpu {
+        #[cfg(feature = "gpu")]
+        {
+            let net = bundle.waveform_net_gpu(waveform_gpu_batch())?;
+            waveform::classify_reads_gpu(bundle, &scan.anchored, &pod5, &net)?
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("place_and_report only returns Placement::Gpu when Stage::compiled_in()")
+        }
+    } else {
+        waveform::classify_reads(bundle, &scan.anchored, &pod5)?
+    };
     Ok((calls, stats, scan.records_scanned))
+}
+
+/// The GPU scorer's fixed batch size — a hardware-tuning knob, not a routine
+/// flag, so it is an env var like `ESCAPEPOD_LSTM_BACKEND` rather than a
+/// `--batch` option. 128 is the default: `examples/tcn_cuda_probe.rs`'s sweep
+/// plateaus by there (11.1x at 128 vs 11.7x at 256), and a smaller compiled
+/// batch means a cheaper worst-case CPU-remainder fallback (see
+/// `waveform::classify_reads_gpu`) and a smaller fixed GPU memory reservation.
+#[cfg(feature = "gpu")]
+fn waveform_gpu_batch() -> usize {
+    std::env::var("ESCAPEPOD_WAVEFORM_GPU_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(128)
 }
 
 fn skip_label(reason: SkipReason) -> &'static str {
@@ -301,10 +339,43 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         bundle.anchor.motif_offset,
     );
 
+    // Resolved once, early — placement and the CPU-cost warnings both hang
+    // off it, and the point of the warnings is that they arrive before the
+    // scan rather than after a run that already ran on the wrong device.
+    let device = args.device.resolve();
+
     if bundle.waveform.is_some() {
-        let (calls, stats, records) = run_waveform(&args, &bundle, &geometry)?;
+        // GPU placement at batch >= 2 (`WaveformNetGpu::load` refuses batch
+        // < 2 outright regardless of this call, so batch 1 is not reachable
+        // here — see its module doc's "Batch 1 is refused outright" section
+        // for the confirmed, reproducible bug that guards against). #343's
+        // original real-chunk batch-2 divergence did not survive follow-up:
+        // eleven runs against the exact checksummed fixture bundle (bit-for-
+        // bit identical, zero flipped calls), then four more at the actual
+        // production batch size (128) against an independent ~5,000-read
+        // real dataset (rnabioco/2026-aars-in-vitro), also bit-for-bit
+        // identical, zero flips. The "real feature magnitude breaks the
+        // fused kernel" hypothesis behind the original report is refuted (a
+        // 500x synthetic magnitude sweep at batch 2 shows no degradation),
+        // and the "only this bundle's graph fuses into RmsNorm" claim is
+        // refuted too (both bundles fuse identically). See
+        // rnabioco/escapepod-rs#343 for the full writeup — including a
+        // separate, rare (1-in-51 trials), non-deterministic anomaly found
+        // at batch 1 on a different bundle during that investigation, never
+        // reproduced at batch >= 2 in ~15 total runs across two independent
+        // real datasets and dozens of synthetic ones. Root cause still
+        // unknown; flagged there for anyone who hits it again.
+        let placement = crate::device::place_and_report(device, crate::device::Stage::WaveformTcn)?;
+        let (calls, stats, records) = run_waveform(&args, &bundle, &geometry, placement.is_gpu())?;
         return finish(&args, &bundle, calls, stats, records);
     }
+    crate::device::note_cpu_only(
+        device,
+        "GBM / feature-network classification",
+        "the tree walk and the small per-base network have no GPU path and are not \
+         expected to get one — the feature network is ~5 MFLOP/read and latency-bound, \
+         so a GPU would add launch overhead rather than remove a bottleneck",
+    );
 
     // --- Pass 1: scan the BAM, anchor reads, vote on orientation ---------
     let spinner = create_spinner("scanning BAM")?;
