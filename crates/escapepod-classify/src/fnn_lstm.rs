@@ -25,161 +25,45 @@
 //! non-zero initial state, per-sequence lengths, the `layout` flag); each is
 //! refused explicitly rather than assumed absent.
 //!
-//! The kernel is the axpy form of the recurrence: for each hidden unit `j`,
-//! the previous state `h[j]` scales row `j` of `Rᵀ` into the 4H gate
-//! pre-activations, so every inner loop is a unit-stride fused multiply-add
-//! and nothing is horizontally reduced. The input contribution does not
-//! depend on the recurrence and is computed for all timesteps up front with
-//! both bias halves folded in. AVX2+FMA is runtime-dispatched per the build
-//! policy (never a baseline bump); the scalar path is the reference and the
-//! fallback.
+//! The recurrence itself — the axpy-form kernel, its AVX2/AVX-512 dispatch,
+//! and the batched "N reads in lockstep" entry points — lives in
+//! [`escapepod_signal::lstm`], run once per direction into one interleaved
+//! `[seq][2H]` buffer. `escapepod_demux::crf::encoder_native` is the other
+//! caller, running the same primitive once per (unidirectional) layer of the
+//! barcode CRF's five-layer stack; nothing about the recurrence is specific
+//! to either shape. What stays here is the parts that are: recognising
+//! *this* graph, and the mean/max readout into a linear head.
 //!
 //! Numerics: ONNX gate order is `i, o, f, c`; the default activations are
-//! sigmoid, tanh, tanh. The vector path uses a Cephes-style `exp` — the same
-//! construction `escapepod_demux::crf::avx2` uses — and `tanh(x) = 2σ(2x) −
-//! 1`, so it is not bit-identical to the scalar path, or to tract, which uses
-//! its own vector approximations. The contract is agreement on the
-//! probability within the parity tolerance the feature grid already carries
-//! (1e-4), pinned by the tests below against tract on the real graph shape.
+//! sigmoid, tanh, tanh. The vector path uses a Cephes-style `exp` and
+//! `tanh(x) = 2σ(2x) − 1`, so it is not bit-identical to the scalar path, or
+//! to tract, which uses its own vector approximations. The contract is
+//! agreement on the probability within the parity tolerance the feature grid
+//! already carries (1e-4), pinned by the tests below against tract on the
+//! real graph shape.
 
 use anyhow::{Result, bail};
-use std::cell::RefCell;
+use escapepod_signal::lstm::{self, LstmBackend, LstmWeights};
 use std::collections::HashMap;
 use tract_onnx::pb;
 
 const ONNX_FLOAT: i32 = 1;
 const ONNX_INT64: i32 = 7;
 
-/// Which kernel scores a read. Ordered slowest to fastest, so a cap from
-/// `ESCAPEPOD_LSTM_BACKEND` is a comparison.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Backend {
-    Scalar,
-    #[cfg(target_arch = "x86_64")]
-    Avx2,
-    #[cfg(target_arch = "x86_64")]
-    Avx512,
-}
-
-/// `ESCAPEPOD_LSTM_BACKEND=scalar|avx2|avx512` caps the kernel the
-/// dispatch may pick — the A/B lever between the widths inside one binary.
-/// Never raises: a cap the machine cannot run is simply not reached.
-fn backend_cap() -> Option<Backend> {
-    static CAP: std::sync::OnceLock<Option<Backend>> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        let v = std::env::var("ESCAPEPOD_LSTM_BACKEND").ok()?;
-        match v.as_str() {
-            "scalar" => Some(Backend::Scalar),
-            #[cfg(target_arch = "x86_64")]
-            "avx2" => Some(Backend::Avx2),
-            #[cfg(target_arch = "x86_64")]
-            "avx512" => Some(Backend::Avx512),
-            other => {
-                tracing::warn!("ESCAPEPOD_LSTM_BACKEND={other}: not a kernel name, ignored");
-                None
-            }
-        }
-    })
-}
-
-impl Backend {
-    /// Every kernel, slowest to fastest.
-    #[cfg(target_arch = "x86_64")]
-    const ALL: [Backend; 3] = [Backend::Scalar, Backend::Avx2, Backend::Avx512];
-    #[cfg(not(target_arch = "x86_64"))]
-    const ALL: [Backend; 1] = [Backend::Scalar];
-
-    /// The vector width. A hidden size must be a multiple of it: the
-    /// activations run `lanes` units at a time and there is no masked tail.
-    fn lanes(self) -> usize {
-        match self {
-            Backend::Scalar => 1,
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx2 => 8,
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx512 => 16,
-        }
-    }
-
-    /// Whether this machine can run the kernel.
-    ///
-    /// The one place the `unsafe` calls into the `#[target_feature]` kernels
-    /// rest on: both constructors (`best_for`, `with_backend`) consult it, so
-    /// a backend a `NativeBiLstm` carries is one whose instructions the CPU
-    /// can execute. AVX-512 asks for AVX2 + FMA as well, because its
-    /// lone-read path is the AVX2 kernel.
-    pub fn supported(self) -> bool {
-        match self {
-            Backend::Scalar => true,
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx2 => is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx512 => {
-                is_x86_feature_detected!("avx512f")
-                    && is_x86_feature_detected!("avx2")
-                    && is_x86_feature_detected!("fma")
-            }
-        }
-    }
-
-    /// Every kernel this machine can run, slowest to fastest — what an
-    /// equivalence test sweeps, whichever one the dispatch prefers.
-    pub fn available() -> Vec<Backend> {
-        Self::ALL.into_iter().filter(|b| b.supported()).collect()
-    }
-
-    /// The fastest kernel this machine can run for a hidden size.
-    ///
-    /// A hidden size that is not a multiple of a kernel's width falls
-    /// through to the next kernel rather than growing a masked tail nobody
-    /// ships. AVX-512 is runtime-detected, never a baseline bump: the release
-    /// artifact is built for Haswell, and Broadwell login nodes and Alpine's
-    /// Zen3 take the AVX2 kernel.
-    pub fn best_for(h: usize) -> Self {
-        let cap = backend_cap();
-        Self::ALL
-            .into_iter()
-            .rev()
-            .find(|&b| h.is_multiple_of(b.lanes()) && cap.is_none_or(|c| b <= c) && b.supported())
-            .unwrap_or(Backend::Scalar)
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Backend::Scalar => "scalar",
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx2 => "avx2",
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx512 => "avx512",
-        }
-    }
-}
+/// Which kernel scores a read. Re-exported so callers that logged
+/// `NativeBiLstm::backend()` before the recurrence moved need not learn a new
+/// path.
+pub type Backend = LstmBackend;
 
 /// The recognised graph's weights, repacked for the step loop.
 #[derive(Debug)]
 pub struct NativeBiLstm {
     /// Timesteps (the offset axis).
     seq: usize,
-    /// Input channels per timestep.
-    n_in: usize,
     /// Hidden units per direction.
     h: usize,
-    /// Per direction: `W` transposed to `[n_in][4H]`, so the input
-    /// contribution for one timestep is `n_in` axpys over a 4H vector.
-    wt: [Vec<f32>; 2],
-    /// Per direction: `[4H]`, both ONNX bias halves summed.
-    bias: [Vec<f32>; 2],
-    /// Per direction: `R` transposed to `[H][4H]`.
-    rt: [Vec<f32>; 2],
-    /// Per direction: the same `Rᵀ` packed block-major, `[4H/32][H][32]`,
-    /// so one 32-gate pass over all `H` rows streams a contiguous 12 KB
-    /// instead of 32 floats out of every 1.5 KB row — worth 14% of the
-    /// single-read kernel and 11% of the batched one. Empty unless `4H` is
-    /// a multiple of 32 (the AVX2 backend's precondition, `H % 8 == 0`); the
-    /// scalar path keeps reading `rt`. Only the x86_64 kernels read it, so
-    /// on any other target it is built and never read.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    rt_blocked: [Vec<f32>; 2],
+    /// Per direction's recurrence weights — see [`escapepod_signal::lstm`].
+    weights: [LstmWeights; 2],
     /// `[n_cls][4H]` over the readout in the order the graph concatenates.
     head_w: Vec<f32>,
     head_b: Vec<f32>,
@@ -187,13 +71,6 @@ pub struct NativeBiLstm {
     /// Whether the `Concat` puts the mean block before the max block.
     mean_first: bool,
     backend: Backend,
-}
-
-// Per-thread scratch: one read's input contribution, per-timestep outputs
-// and gate buffer. Sized on first use and kept, so the steady state
-// allocates nothing.
-thread_local! {
-    static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 impl NativeBiLstm {
@@ -481,39 +358,23 @@ impl NativeBiLstm {
             return Err("Gemm does not produce the graph output".into());
         }
 
-        // --- repack ---------------------------------------------------------
-        let mut wt = [Vec::new(), Vec::new()];
-        let mut bias = [Vec::new(), Vec::new()];
-        let mut rt = [Vec::new(), Vec::new()];
-        let mut rt_blocked = [Vec::new(), Vec::new()];
-        for d in 0..2 {
-            let mut wtd = vec![0.0f32; n_in * g];
-            for gi in 0..g {
-                for k in 0..n_in {
-                    wtd[k * g + gi] = w[(d * g + gi) * n_in + k];
-                }
-            }
-            wt[d] = wtd;
-            bias[d] = (0..g)
-                .map(|gi| b[d * 8 * h + gi] + b[d * 8 * h + g + gi])
-                .collect();
-            let mut rtd = vec![0.0f32; h * g];
-            for gi in 0..g {
-                for j in 0..h {
-                    rtd[j * g + gi] = r[(d * g + gi) * h + j];
-                }
-            }
-            rt_blocked[d] = block_rows(&rtd, h, g, 32);
-            rt[d] = rtd;
-        }
+        // --- repack -----------------------------------------------------
+        // `w`/`r`/`b` hold both directions back to back
+        // (`[2, ...]` in ONNX); slice the direction axis off before handing
+        // each half to the shared packer.
+        let weights = [0, 1].map(|d| {
+            LstmWeights::from_onnx(
+                n_in,
+                h,
+                &w[d * g * n_in..(d + 1) * g * n_in],
+                &r[d * g * h..(d + 1) * g * h],
+                &b[d * 8 * h..(d + 1) * 8 * h],
+            )
+        });
         Ok(Self {
             seq: n_off,
-            n_in,
             h,
-            wt,
-            bias,
-            rt,
-            rt_blocked,
+            weights,
             head_w,
             head_b,
             n_cls,
@@ -523,32 +384,9 @@ impl NativeBiLstm {
     }
 
     /// How many reads [`Self::logits_batch`] scores per pass at full
-    /// efficiency on this backend.
-    ///
-    /// Reads scored in lockstep share every weight-row load. Three is what
-    /// the AVX2 register file holds — 4 accumulators × 3 reads, 3 broadcasts,
-    /// one row load — and eight fills the AVX-512 one over the same 32-gate
-    /// slices (2 accumulators × 8 reads, 8 broadcasts, 2 row loads). A
-    /// caller batching in multiples of it loses nothing to the tail.
+    /// efficiency on this backend. See [`LstmBackend::preferred_batch`].
     pub fn preferred_batch(&self) -> usize {
-        // `ESCAPEPOD_LSTM_BATCH` overrides the width, clamped to what the
-        // backend has kernels for — the sweep lever, and the way to measure
-        // the single-read kernel inside a binary that batches.
-        static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        let wanted = OVERRIDE.get_or_init(|| {
-            std::env::var("ESCAPEPOD_LSTM_BATCH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|&n| n >= 1)
-        });
-        let max = match self.backend {
-            Backend::Scalar => 1,
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx2 => 3,
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx512 => 8,
-        };
-        wanted.map_or(max, |n| n.min(max))
+        self.backend.preferred_batch()
     }
 
     /// Logits for several reads, scored in lockstep.
@@ -560,7 +398,7 @@ impl NativeBiLstm {
     /// group rather than one, which is where the single-read kernel's time
     /// goes.
     pub fn logits_batch(&self, xs: &[&[f32]], out: &mut [f32]) -> Result<()> {
-        let (seq, n_in, h, g) = (self.seq, self.n_in, self.h, 4 * self.h);
+        let (seq, n_in, h, g) = (self.seq, self.weights[0].n_in, self.h, 4 * self.h);
         if out.len() != xs.len() * self.n_cls {
             bail!(
                 "{} logit slots for {} reads of {} classes",
@@ -579,7 +417,7 @@ impl NativeBiLstm {
         }
         let batch = self.preferred_batch();
         let (xw_len, hs_len) = (2 * seq * g, seq * 2 * h);
-        SCRATCH.with(|s| {
+        lstm::LSTM_SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
             s.resize(batch * (xw_len + hs_len + g), 0.0);
             let (xw, rest) = s.split_at_mut(batch * xw_len);
@@ -590,42 +428,46 @@ impl NativeBiLstm {
                 let group = &xs[done..done + n];
                 match (self.backend, n) {
                     #[cfg(target_arch = "x86_64")]
-                    // Safety: as for `run_avx2` — buffer sizes are checked
-                    // above and `preferred_batch` sized the scratch; the
-                    // features are guaranteed by the dispatch. The 16-wide
-                    // kernel takes every width up to eight, a lone read
-                    // included.
+                    // Safety: as for `run_both_avx2` — buffer sizes are
+                    // checked above and `preferred_batch` sized the scratch;
+                    // the features are guaranteed by the dispatch. The
+                    // 16-wide kernel takes every width up to eight, a lone
+                    // read included.
                     (Backend::Avx512, 8) => unsafe {
-                        self.run_avx512_batch::<8>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<8>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx512, 7) => unsafe {
-                        self.run_avx512_batch::<7>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<7>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx512, 6) => unsafe {
-                        self.run_avx512_batch::<6>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<6>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx512, 5) => unsafe {
-                        self.run_avx512_batch::<5>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<5>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx512, 4) => unsafe {
-                        self.run_avx512_batch::<4>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<4>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx512, 3) => unsafe {
-                        self.run_avx512_batch::<3>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<3>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx512, 2) => unsafe {
-                        self.run_avx512_batch::<2>(group, xw, hs, gates)
+                        self.run_both_avx512_batch::<2>(group, xw, hs, gates)
                     },
                     #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx2, 3) => unsafe { self.run_avx2_batch::<3>(group, xw, hs, gates) },
+                    (Backend::Avx2, 3) => unsafe {
+                        self.run_both_avx2_batch::<3>(group, xw, hs, gates)
+                    },
                     #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx2, 2) => unsafe { self.run_avx2_batch::<2>(group, xw, hs, gates) },
+                    (Backend::Avx2, 2) => unsafe {
+                        self.run_both_avx2_batch::<2>(group, xw, hs, gates)
+                    },
                     #[cfg(target_arch = "x86_64")]
                     // A lone read on either wide backend takes the AVX2
                     // single-read kernel: eight accumulators over a 64-gate
@@ -635,7 +477,7 @@ impl NativeBiLstm {
                     // bit-identical. Two arms, not an or-pattern: see the
                     // `#[inline(never)]` on the kernels.
                     (Backend::Avx512, _) => unsafe {
-                        self.run_avx2(
+                        self.run_both_avx2(
                             group[0],
                             &mut xw[..xw_len],
                             &mut hs[..hs_len],
@@ -644,7 +486,7 @@ impl NativeBiLstm {
                     },
                     #[cfg(target_arch = "x86_64")]
                     (Backend::Avx2, _) => unsafe {
-                        self.run_avx2(
+                        self.run_both_avx2(
                             group[0],
                             &mut xw[..xw_len],
                             &mut hs[..hs_len],
@@ -657,7 +499,7 @@ impl NativeBiLstm {
                                 &mut xw[r * xw_len..(r + 1) * xw_len],
                                 &mut hs[r * hs_len..(r + 1) * hs_len],
                             );
-                            self.run_scalar(x, xw_r, hs_r, &mut gates[..g]);
+                            self.run_both_scalar(x, xw_r, hs_r, &mut gates[..g]);
                         }
                     }
                 }
@@ -677,7 +519,7 @@ impl NativeBiLstm {
     /// what [`crate::fnn::fold_standardise`] produces. `out` receives one
     /// logit per class.
     pub fn logits(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
-        let (seq, n_in, h, g) = (self.seq, self.n_in, self.h, 4 * self.h);
+        let (seq, n_in, h, g) = (self.seq, self.weights[0].n_in, self.h, 4 * self.h);
         if x.len() != n_in * seq {
             bail!(
                 "input has {} values, the graph takes {n_in} x {seq}",
@@ -689,25 +531,118 @@ impl NativeBiLstm {
         }
         let xw_len = 2 * seq * g;
         let hs_len = seq * 2 * h;
-        SCRATCH.with(|s| {
+        lstm::LSTM_SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
             s.resize(xw_len + hs_len + g, 0.0);
             let (xw, rest) = s.split_at_mut(xw_len);
             let (hs, gates) = rest.split_at_mut(hs_len);
             match self.backend {
-                Backend::Scalar => self.run_scalar(x, xw, hs, gates),
+                Backend::Scalar => self.run_both_scalar(x, xw, hs, gates),
                 #[cfg(target_arch = "x86_64")]
                 // Safety: `best_for` / `with_backend` only select this when
                 // the CPU has AVX2 + FMA and `h` is a multiple of 8.
-                Backend::Avx2 => unsafe { self.run_avx2(x, xw, hs, gates) },
+                Backend::Avx2 => unsafe { self.run_both_avx2(x, xw, hs, gates) },
                 #[cfg(target_arch = "x86_64")]
                 // A lone read takes the AVX2 kernel on an AVX-512 machine
                 // too (see `logits_batch`); it is bit-identical.
-                Backend::Avx512 => unsafe { self.run_avx2(x, xw, hs, gates) },
+                Backend::Avx512 => unsafe { self.run_both_avx2(x, xw, hs, gates) },
             }
             self.readout(hs, out);
         });
         Ok(())
+    }
+
+    /// Both directions, scalar reference kernel, into one interleaved
+    /// `[seq][2H]` buffer — `xw` is `[2][seq][4H]`, sliced per direction here
+    /// since the shared kernel no longer knows about a direction count.
+    fn run_both_scalar(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
+        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
+        for d in 0..2 {
+            let xwd = &mut xw[d * seq * g..(d + 1) * seq * g];
+            lstm::run_scalar(
+                &self.weights[d],
+                seq,
+                d == 1,
+                x,
+                xwd,
+                hs,
+                2 * h,
+                d * h,
+                gates,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// # Safety
+    ///
+    /// As [`escapepod_signal::lstm::run_avx2`]: the caller must have AVX2 +
+    /// FMA and `self.h` a multiple of 8 (guaranteed by `Backend::best_for` /
+    /// `with_backend`).
+    unsafe fn run_both_avx2(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
+        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
+        for d in 0..2 {
+            let xwd = &mut xw[d * seq * g..(d + 1) * seq * g];
+            // Safety: forwarded from the caller.
+            unsafe {
+                lstm::run_avx2(
+                    &self.weights[d],
+                    seq,
+                    d == 1,
+                    x,
+                    xwd,
+                    hs,
+                    2 * h,
+                    d * h,
+                    gates,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// # Safety
+    ///
+    /// As [`escapepod_signal::lstm::run_avx2_batch`]; additionally
+    /// `xs.len() == N`.
+    unsafe fn run_both_avx2_batch<const N: usize>(
+        &self,
+        xs: &[&[f32]],
+        xw: &mut [f32],
+        hs: &mut [f32],
+        gates: &mut [f32],
+    ) {
+        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
+        let per_dir = N * seq * g;
+        let (xw0, xw1) = xw[..2 * per_dir].split_at_mut(per_dir);
+        // Safety: forwarded from the caller; `xw` was sized for at least
+        // `preferred_batch()` reads by `logits_batch`.
+        unsafe {
+            lstm::run_avx2_batch::<N>(&self.weights[0], seq, false, xs, xw0, hs, 2 * h, 0, gates);
+            lstm::run_avx2_batch::<N>(&self.weights[1], seq, true, xs, xw1, hs, 2 * h, h, gates);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// # Safety
+    ///
+    /// As [`escapepod_signal::lstm::run_avx512_batch`]; additionally
+    /// `xs.len() == N`.
+    unsafe fn run_both_avx512_batch<const N: usize>(
+        &self,
+        xs: &[&[f32]],
+        xw: &mut [f32],
+        hs: &mut [f32],
+        gates: &mut [f32],
+    ) {
+        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
+        let per_dir = N * seq * g;
+        let (xw0, xw1) = xw[..2 * per_dir].split_at_mut(per_dir);
+        // Safety: forwarded from the caller.
+        unsafe {
+            lstm::run_avx512_batch::<N>(&self.weights[0], seq, false, xs, xw0, hs, 2 * h, 0, gates);
+            lstm::run_avx512_batch::<N>(&self.weights[1], seq, true, xs, xw1, hs, 2 * h, h, gates);
+        }
     }
 
     /// Mean and max over time of `[seq][2H]`, in the graph's concat order,
@@ -744,533 +679,7 @@ impl NativeBiLstm {
             *o = acc;
         }
     }
-
-    /// The input contribution for every timestep of one direction, biases
-    /// folded in: `xw[t][g] = b[g] + Σ_k W[g][k] x[k][t]`.
-    fn input_contribution(&self, d: usize, x: &[f32], xw: &mut [f32]) {
-        let (seq, n_in, g) = (self.seq, self.n_in, 4 * self.h);
-        for t in 0..seq {
-            let row = &mut xw[t * g..(t + 1) * g];
-            row.copy_from_slice(&self.bias[d]);
-            for k in 0..n_in {
-                let xk = x[k * seq + t];
-                let wk = &self.wt[d][k * g..(k + 1) * g];
-                for (r, w) in row.iter_mut().zip(wk) {
-                    *r += xk * w;
-                }
-            }
-        }
-    }
-
-    fn run_scalar(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
-        let (seq, h, g) = (self.seq, self.h, 4 * self.h);
-        let mut hcur = vec![0.0f32; h];
-        let mut c = vec![0.0f32; h];
-        for d in 0..2 {
-            let xwd = &mut xw[d * seq * g..(d + 1) * seq * g];
-            self.input_contribution(d, x, xwd);
-            hcur.iter_mut().for_each(|v| *v = 0.0);
-            c.iter_mut().for_each(|v| *v = 0.0);
-            for step in 0..seq {
-                let t = if d == 0 { step } else { seq - 1 - step };
-                gates.copy_from_slice(&xwd[t * g..(t + 1) * g]);
-                if step > 0 {
-                    for (j, &hj) in hcur.iter().enumerate() {
-                        let row = &self.rt[d][j * g..(j + 1) * g];
-                        for (ga, r) in gates.iter_mut().zip(row) {
-                            *ga += hj * r;
-                        }
-                    }
-                }
-                for u in 0..h {
-                    let i = sigmoid(gates[u]);
-                    let o = sigmoid(gates[h + u]);
-                    let f = sigmoid(gates[2 * h + u]);
-                    let ct = gates[3 * h + u].tanh();
-                    c[u] = f * c[u] + i * ct;
-                    hcur[u] = o * c[u].tanh();
-                }
-                hs[t * 2 * h + d * h..t * 2 * h + (d + 1) * h].copy_from_slice(&hcur);
-            }
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    // `#[inline(never)]` on all three kernels, on evidence rather than
-    // taste: with the kernels inlined into `logits_batch` beside one another
-    // (the crate baseline is x86-64-v3, so the AVX2 ones may be), the
-    // AVX2 width-2 kernel returned wrong logits for its second read — wrong
-    // by the same bits on every run, on a node where the same kernel source
-    // had passed the day before. Bisected to the *form* of the dispatch (an
-    // or-pattern over the two lone-read arms failed, two arms with the same
-    // body passed) and cleared by this attribute with the or-pattern kept.
-    // The kernels' unsafe code was audited for aliasing and bounds and
-    // nothing was found; an LLVM miscompile is suspected and not proven.
-    // These are large leaf functions, so inlining them buys nothing, and
-    // `batched_matches_single_bit_for_bit` now pins every kernel on every
-    // backend the machine has, whichever the dispatch prefers.
-    #[inline(never)]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn run_avx2(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
-        use std::arch::x86_64::*;
-        let (seq, h, g) = (self.seq, self.h, 4 * self.h);
-        debug_assert!(h.is_multiple_of(8));
-        // Safety: every pointer below is derived from a slice whose length
-        // was checked by `logits` (`gates` is 4H, `rt[d]` is H x 4H, and the
-        // AVX2 backend is only selected for H a multiple of 8), so each
-        // 8-wide load and store stays inside its buffer; the target features
-        // are guaranteed by the dispatch in `Backend::best_for`.
-        unsafe {
-            let mut hcur = vec![0.0f32; h];
-            let mut c = vec![0.0f32; h];
-            for d in 0..2 {
-                let xwd = &mut xw[d * seq * g..(d + 1) * seq * g];
-                self.input_contribution(d, x, xwd);
-                hcur.iter_mut().for_each(|v| *v = 0.0);
-                c.iter_mut().for_each(|v| *v = 0.0);
-                let rt = self.rt[d].as_ptr();
-                let rtb = self.rt_blocked[d].as_ptr();
-                for step in 0..seq {
-                    let t = if d == 0 { step } else { seq - 1 - step };
-                    gates.copy_from_slice(&xwd[t * g..(t + 1) * g]);
-                    if step > 0 {
-                        // gates += h[j] * Rᵀ[j][..]: an axpy per hidden unit, so
-                        // every load is unit-stride and nothing is horizontally
-                        // reduced. Accumulators stay in registers a chunk at a
-                        // time; 64 gates = 8 vectors held live.
-                        let gp = gates.as_mut_ptr();
-                        let mut base = 0usize;
-                        while base + 64 <= g {
-                            // Eight named accumulators, not an array: an
-                            // indexed `[__m256; 8]` walked by closures was
-                            // measured at ~3x the arithmetic bound, which is
-                            // the signature of the accumulators living on the
-                            // stack. Named, they are eight independent FMA
-                            // chains in eight registers.
-                            let p = gp.add(base);
-                            let mut a0 = _mm256_loadu_ps(p);
-                            let mut a1 = _mm256_loadu_ps(p.add(8));
-                            let mut a2 = _mm256_loadu_ps(p.add(16));
-                            let mut a3 = _mm256_loadu_ps(p.add(24));
-                            let mut a4 = _mm256_loadu_ps(p.add(32));
-                            let mut a5 = _mm256_loadu_ps(p.add(40));
-                            let mut a6 = _mm256_loadu_ps(p.add(48));
-                            let mut a7 = _mm256_loadu_ps(p.add(56));
-                            // Two 32-gate blocks of `rt_blocked`, each a
-                            // contiguous `H x 32` run: two sequential
-                            // streams the prefetcher can follow.
-                            let mut row0 = rtb.add((base / 32) * h * 32);
-                            let mut row1 = row0.add(h * 32);
-                            for &hj in hcur.iter() {
-                                let hv = _mm256_set1_ps(hj);
-                                a0 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0), a0);
-                                a1 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0.add(8)), a1);
-                                a2 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0.add(16)), a2);
-                                a3 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row0.add(24)), a3);
-                                a4 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1), a4);
-                                a5 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1.add(8)), a5);
-                                a6 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1.add(16)), a6);
-                                a7 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(row1.add(24)), a7);
-                                row0 = row0.add(32);
-                                row1 = row1.add(32);
-                            }
-                            _mm256_storeu_ps(p, a0);
-                            _mm256_storeu_ps(p.add(8), a1);
-                            _mm256_storeu_ps(p.add(16), a2);
-                            _mm256_storeu_ps(p.add(24), a3);
-                            _mm256_storeu_ps(p.add(32), a4);
-                            _mm256_storeu_ps(p.add(40), a5);
-                            _mm256_storeu_ps(p.add(48), a6);
-                            _mm256_storeu_ps(p.add(56), a7);
-                            base += 64;
-                        }
-                        // A hidden size that is a multiple of 8 but not of 16
-                        // leaves a tail narrower than one chunk.
-                        while base < g {
-                            let mut a = _mm256_loadu_ps(gp.add(base));
-                            for (j, &hj) in hcur.iter().enumerate() {
-                                a = _mm256_fmadd_ps(
-                                    _mm256_set1_ps(hj),
-                                    _mm256_loadu_ps(rt.add(j * g + base)),
-                                    a,
-                                );
-                            }
-                            _mm256_storeu_ps(gp.add(base), a);
-                            base += 8;
-                        }
-                    }
-                    let gp = gates.as_ptr();
-                    for u in (0..h).step_by(8) {
-                        let gi = sigmoid8(_mm256_loadu_ps(gp.add(u)));
-                        let go = sigmoid8(_mm256_loadu_ps(gp.add(h + u)));
-                        let gf = sigmoid8(_mm256_loadu_ps(gp.add(2 * h + u)));
-                        let gc = tanh8(_mm256_loadu_ps(gp.add(3 * h + u)));
-                        let cprev = _mm256_loadu_ps(c.as_ptr().add(u));
-                        let cn = _mm256_fmadd_ps(gf, cprev, _mm256_mul_ps(gi, gc));
-                        _mm256_storeu_ps(c.as_mut_ptr().add(u), cn);
-                        _mm256_storeu_ps(hcur.as_mut_ptr().add(u), _mm256_mul_ps(go, tanh8(cn)));
-                    }
-                    hs[t * 2 * h + d * h..t * 2 * h + (d + 1) * h].copy_from_slice(&hcur);
-                }
-            }
-        }
-    }
 }
-
-#[cfg(target_arch = "x86_64")]
-impl NativeBiLstm {
-    /// `N` reads in lockstep: one recurrence step advances every read, and
-    /// each 32-gate slice of a weight row is loaded once and applied to all
-    /// `N` accumulator sets. Layout of the scratch: `xw` is `[N][2][seq][G]`,
-    /// `hs` is `[N][seq][2H]`, `gates` is `[N][G]`.
-    ///
-    /// Bit-identical to [`Self::run_avx2`]: every gate lane still accumulates
-    /// `h[j] * Rᵀ[j]` over `j` in order, whatever the chunk width or the
-    /// batch. The register budget is `4 accumulators × N + N broadcasts + 1
-    /// row load`, which is why `N ≤ 3`.
-    #[inline(never)]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn run_avx2_batch<const N: usize>(
-        &self,
-        xs: &[&[f32]],
-        xw: &mut [f32],
-        hs: &mut [f32],
-        gates: &mut [f32],
-    ) {
-        use std::arch::x86_64::*;
-        debug_assert_eq!(xs.len(), N);
-        let (seq, h, g) = (self.seq, self.h, 4 * self.h);
-        debug_assert!(h.is_multiple_of(8));
-        let (xw_len, hs_len) = (2 * seq * g, seq * 2 * h);
-        // Safety: as for `run_avx2`. `logits_batch` checked every input
-        // length and sized the scratch for `preferred_batch() >= N` reads.
-        unsafe {
-            let mut hcur = vec![0.0f32; N * h];
-            let mut c = vec![0.0f32; N * h];
-            for d in 0..2 {
-                for (r, x) in xs.iter().enumerate() {
-                    let off = r * xw_len + d * seq * g;
-                    self.input_contribution(d, x, &mut xw[off..off + seq * g]);
-                }
-                hcur.iter_mut().for_each(|v| *v = 0.0);
-                c.iter_mut().for_each(|v| *v = 0.0);
-                let rt = self.rt[d].as_ptr();
-                let rtb = self.rt_blocked[d].as_ptr();
-                for step in 0..seq {
-                    let t = if d == 0 { step } else { seq - 1 - step };
-                    for r in 0..N {
-                        let src = r * xw_len + d * seq * g + t * g;
-                        gates[r * g..(r + 1) * g].copy_from_slice(&xw[src..src + g]);
-                    }
-                    if step > 0 {
-                        let gp = gates.as_mut_ptr();
-                        let mut base = 0usize;
-                        while base + 32 <= g {
-                            // `acc[v][r]`: vector `v` of the 32-gate slice,
-                            // for read `r` — so one row load serves the
-                            // inner loop over reads.
-                            let mut acc = [[_mm256_setzero_ps(); N]; 4];
-                            for (v, accv) in acc.iter_mut().enumerate() {
-                                for (r, a) in accv.iter_mut().enumerate() {
-                                    *a = _mm256_loadu_ps(gp.add(r * g + base + v * 8));
-                                }
-                            }
-                            // One 32-gate block of `rt_blocked`: the `H`
-                            // rows this pass reads are contiguous.
-                            let mut row = rtb.add((base / 32) * h * 32);
-                            // Raw reads of `hcur`: indexed, every `j` paid
-                            // two bounds checks per read inside the loop
-                            // that streams the recurrent weights.
-                            let hc = hcur.as_ptr();
-                            for j in 0..h {
-                                let mut hv = [_mm256_setzero_ps(); N];
-                                for (r, hvr) in hv.iter_mut().enumerate() {
-                                    *hvr = _mm256_set1_ps(*hc.add(r * h + j));
-                                }
-                                for (v, accv) in acc.iter_mut().enumerate() {
-                                    let w = _mm256_loadu_ps(row.add(v * 8));
-                                    for (a, hvr) in accv.iter_mut().zip(hv.iter()) {
-                                        *a = _mm256_fmadd_ps(*hvr, w, *a);
-                                    }
-                                }
-                                row = row.add(32);
-                            }
-                            for (v, accv) in acc.iter().enumerate() {
-                                for (r, a) in accv.iter().enumerate() {
-                                    _mm256_storeu_ps(gp.add(r * g + base + v * 8), *a);
-                                }
-                            }
-                            base += 32;
-                        }
-                        while base < g {
-                            for r in 0..N {
-                                let mut a = _mm256_loadu_ps(gp.add(r * g + base));
-                                let hc = hcur.as_ptr().add(r * h);
-                                for j in 0..h {
-                                    a = _mm256_fmadd_ps(
-                                        _mm256_set1_ps(*hc.add(j)),
-                                        _mm256_loadu_ps(rt.add(j * g + base)),
-                                        a,
-                                    );
-                                }
-                                _mm256_storeu_ps(gp.add(r * g + base), a);
-                            }
-                            base += 8;
-                        }
-                    }
-                    for r in 0..N {
-                        let gp = gates.as_ptr().add(r * g);
-                        let cp = c.as_mut_ptr().add(r * h);
-                        let hp = hcur.as_mut_ptr().add(r * h);
-                        for u in (0..h).step_by(8) {
-                            let gi = sigmoid8(_mm256_loadu_ps(gp.add(u)));
-                            let go = sigmoid8(_mm256_loadu_ps(gp.add(h + u)));
-                            let gf = sigmoid8(_mm256_loadu_ps(gp.add(2 * h + u)));
-                            let gc = tanh8(_mm256_loadu_ps(gp.add(3 * h + u)));
-                            let cprev = _mm256_loadu_ps(cp.add(u));
-                            let cn = _mm256_fmadd_ps(gf, cprev, _mm256_mul_ps(gi, gc));
-                            _mm256_storeu_ps(cp.add(u), cn);
-                            _mm256_storeu_ps(hp.add(u), _mm256_mul_ps(go, tanh8(cn)));
-                        }
-                        let dst = r * hs_len + t * 2 * h + d * h;
-                        hs[dst..dst + h].copy_from_slice(&hcur[r * h..(r + 1) * h]);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[inline(always)]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-#[cfg(target_arch = "x86_64")]
-impl NativeBiLstm {
-    /// `N` reads in lockstep, sixteen lanes wide, over the same 32-gate
-    /// slices as the AVX2 kernel: 2 accumulators × `N`, `N` broadcasts and
-    /// 2 row loads, which fits the 32 ZMM registers up to `N = 8`. The
-    /// weights are streamed once per eight reads instead of three. Measured
-    /// shape by shape in `examples/axpy_probe.rs`: over 64-gate slices with
-    /// four reads this loop reads twice the bytes per row and loses to the
-    /// AVX2 one per read; over 16-gate slices it wins per row and loses it
-    /// back on the row count.
-    ///
-    /// Bit-identical to [`Self::run_avx2_batch`] and [`Self::run_avx2`]: each
-    /// gate lane still accumulates `h[j] * Rᵀ[j]` over `j` in order whatever
-    /// the vector width, and every activation is the same sequence of IEEE
-    /// operations per lane (`vec16` mirrors `vec8` op for op). Pinned across
-    /// widths in `avx512_matches_avx2_bit_for_bit`.
-    #[inline(never)]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn run_avx512_batch<const N: usize>(
-        &self,
-        xs: &[&[f32]],
-        xw: &mut [f32],
-        hs: &mut [f32],
-        gates: &mut [f32],
-    ) {
-        use std::arch::x86_64::*;
-        use vec16::{sigmoid16, tanh16};
-        debug_assert_eq!(xs.len(), N);
-        let (seq, h, g) = (self.seq, self.h, 4 * self.h);
-        // `h % 16 == 0` (the dispatch's precondition) makes `g` a multiple of
-        // 64, so the slice loop has no tail and `rt_blocked` is populated.
-        debug_assert!(h.is_multiple_of(16));
-        debug_assert!(N <= 8);
-        let (xw_len, hs_len) = (2 * seq * g, seq * 2 * h);
-        // Safety: as for `run_avx2_batch` — every length was checked by
-        // `logits`/`logits_batch`, the scratch was sized for
-        // `preferred_batch() >= N` reads, and the feature is guaranteed by
-        // the dispatch.
-        unsafe {
-            let mut hcur = vec![0.0f32; N * h];
-            let mut c = vec![0.0f32; N * h];
-            for d in 0..2 {
-                for (r, x) in xs.iter().enumerate() {
-                    let off = r * xw_len + d * seq * g;
-                    self.input_contribution(d, x, &mut xw[off..off + seq * g]);
-                }
-                hcur.iter_mut().for_each(|v| *v = 0.0);
-                c.iter_mut().for_each(|v| *v = 0.0);
-                let rtb = self.rt_blocked[d].as_ptr();
-                for step in 0..seq {
-                    let t = if d == 0 { step } else { seq - 1 - step };
-                    for r in 0..N {
-                        let src = r * xw_len + d * seq * g + t * g;
-                        gates[r * g..(r + 1) * g].copy_from_slice(&xw[src..src + g]);
-                    }
-                    if step > 0 {
-                        let gp = gates.as_mut_ptr();
-                        let hc = hcur.as_ptr();
-                        let mut base = 0usize;
-                        while base < g {
-                            // `acc[v][r]`: vector `v` of the 32-gate slice
-                            // for read `r`; one block of `rt_blocked`, one
-                            // contiguous stream.
-                            let mut acc = [[_mm512_setzero_ps(); N]; 2];
-                            for (v, accv) in acc.iter_mut().enumerate() {
-                                for (r, a) in accv.iter_mut().enumerate() {
-                                    *a = _mm512_loadu_ps(gp.add(r * g + base + v * 16));
-                                }
-                            }
-                            let mut row = rtb.add((base / 32) * h * 32);
-                            for j in 0..h {
-                                let mut hv = [_mm512_setzero_ps(); N];
-                                for (r, hvr) in hv.iter_mut().enumerate() {
-                                    *hvr = _mm512_set1_ps(*hc.add(r * h + j));
-                                }
-                                let w = [_mm512_loadu_ps(row), _mm512_loadu_ps(row.add(16))];
-                                for (accv, wv) in acc.iter_mut().zip(w.iter()) {
-                                    for (a, hvr) in accv.iter_mut().zip(hv.iter()) {
-                                        *a = _mm512_fmadd_ps(*hvr, *wv, *a);
-                                    }
-                                }
-                                row = row.add(32);
-                            }
-                            for (v, accv) in acc.iter().enumerate() {
-                                for (r, a) in accv.iter().enumerate() {
-                                    _mm512_storeu_ps(gp.add(r * g + base + v * 16), *a);
-                                }
-                            }
-                            base += 32;
-                        }
-                    }
-                    for r in 0..N {
-                        let gp = gates.as_ptr().add(r * g);
-                        let cp = c.as_mut_ptr().add(r * h);
-                        let hp = hcur.as_mut_ptr().add(r * h);
-                        for u in (0..h).step_by(16) {
-                            let gi = sigmoid16(_mm512_loadu_ps(gp.add(u)));
-                            let go = sigmoid16(_mm512_loadu_ps(gp.add(h + u)));
-                            let gf = sigmoid16(_mm512_loadu_ps(gp.add(2 * h + u)));
-                            let gc = tanh16(_mm512_loadu_ps(gp.add(3 * h + u)));
-                            let cprev = _mm512_loadu_ps(cp.add(u));
-                            let cn = _mm512_fmadd_ps(gf, cprev, _mm512_mul_ps(gi, gc));
-                            _mm512_storeu_ps(cp.add(u), cn);
-                            _mm512_storeu_ps(hp.add(u), _mm512_mul_ps(go, tanh16(cn)));
-                        }
-                        let dst = r * hs_len + t * 2 * h + d * h;
-                        hs[dst..dst + h].copy_from_slice(&hcur[r * h..(r + 1) * h]);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// `vec8`, sixteen wide: the same operations in the same order, so a lane
-/// through here and a lane through `vec8` produce the same bits.
-#[cfg(target_arch = "x86_64")]
-mod vec16 {
-    use std::arch::x86_64::*;
-
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    pub fn exp16(x: __m512) -> __m512 {
-        let x = _mm512_min_ps(_mm512_set1_ps(88.376_26), x);
-        let x = _mm512_max_ps(_mm512_set1_ps(-88.376_26), x);
-        let fx = _mm512_fmadd_ps(
-            x,
-            _mm512_set1_ps(std::f32::consts::LOG2_E),
-            _mm512_set1_ps(0.5),
-        );
-        // Floor with exceptions suppressed: what `_mm256_floor_ps` is.
-        let fx = _mm512_roundscale_ps::<0x09>(fx);
-        let r = _mm512_fnmadd_ps(fx, _mm512_set1_ps(0.693_359_4), x);
-        let r = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.121_944_4e-4), r);
-        let r2 = _mm512_mul_ps(r, r);
-        let mut y = _mm512_set1_ps(1.987_569_1e-4);
-        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.398_199_9e-3));
-        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.333_452e-3));
-        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.166_579_6e-2));
-        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.666_666_6e-1));
-        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5e-1));
-        y = _mm512_fmadd_ps(y, r2, r);
-        y = _mm512_add_ps(y, _mm512_set1_ps(1.0));
-        let imm = _mm512_cvtps_epi32(fx);
-        let pow2 = _mm512_castsi512_ps(_mm512_slli_epi32::<23>(_mm512_add_epi32(
-            imm,
-            _mm512_set1_epi32(0x7f),
-        )));
-        _mm512_mul_ps(y, pow2)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    pub fn sigmoid16(x: __m512) -> __m512 {
-        let e = exp16(_mm512_sub_ps(_mm512_setzero_ps(), x));
-        _mm512_div_ps(_mm512_set1_ps(1.0), _mm512_add_ps(_mm512_set1_ps(1.0), e))
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    pub fn tanh16(x: __m512) -> __m512 {
-        let s = sigmoid16(_mm512_add_ps(x, x));
-        _mm512_fmsub_ps(_mm512_set1_ps(2.0), s, _mm512_set1_ps(1.0))
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-mod vec8 {
-    use std::arch::x86_64::*;
-
-    /// Cephes-style `exp`, the same construction `escapepod_demux::crf::avx2`
-    /// uses: range-reduce by `log2 e`, a degree-5 polynomial on the
-    /// remainder, and the power of two assembled straight into the exponent
-    /// field.
-    // Safe functions with the target features enabled: the intrinsics they
-    // use are safe under those features, so callers that share the features
-    // (`run_avx2`) call them like any other function, and a caller that does
-    // not is made to write the `unsafe` it owes.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    pub fn exp8(x: __m256) -> __m256 {
-        let x = _mm256_min_ps(_mm256_set1_ps(88.376_26), x);
-        let x = _mm256_max_ps(_mm256_set1_ps(-88.376_26), x);
-        let fx = _mm256_fmadd_ps(
-            x,
-            _mm256_set1_ps(std::f32::consts::LOG2_E),
-            _mm256_set1_ps(0.5),
-        );
-        let fx = _mm256_floor_ps(fx);
-        let r = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693_359_4), x);
-        let r = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.121_944_4e-4), r);
-        let r2 = _mm256_mul_ps(r, r);
-        let mut y = _mm256_set1_ps(1.987_569_1e-4);
-        y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.398_199_9e-3));
-        y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(8.333_452e-3));
-        y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(4.166_579_6e-2));
-        y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.666_666_6e-1));
-        y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(5e-1));
-        y = _mm256_fmadd_ps(y, r2, r);
-        y = _mm256_add_ps(y, _mm256_set1_ps(1.0));
-        let imm = _mm256_cvtps_epi32(fx);
-        let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32(
-            _mm256_add_epi32(imm, _mm256_set1_epi32(0x7f)),
-            23,
-        ));
-        _mm256_mul_ps(y, pow2)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    pub fn sigmoid8(x: __m256) -> __m256 {
-        let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), x));
-        _mm256_div_ps(_mm256_set1_ps(1.0), _mm256_add_ps(_mm256_set1_ps(1.0), e))
-    }
-
-    /// `tanh(x) = 2σ(2x) − 1`: one `exp`, like the sigmoid.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    pub fn tanh8(x: __m256) -> __m256 {
-        let s = sigmoid8(_mm256_add_ps(x, x));
-        _mm256_fmsub_ps(_mm256_set1_ps(2.0), s, _mm256_set1_ps(1.0))
-    }
-}
-#[cfg(target_arch = "x86_64")]
-use vec8::{sigmoid8, tanh8};
 
 // ---- proto helpers ------------------------------------------------------------
 
@@ -1296,24 +705,6 @@ fn attr_ints<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a [i64]> {
 
 fn attr_tensor<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a pb::TensorProto> {
     attr(node, name).and_then(|a| a.t.as_ref())
-}
-
-/// `rows` as `[h][g]` repacked block-major, `[g / width][h][width]`, so a
-/// pass over all `h` rows of one `width`-gate block is one contiguous run.
-/// Empty when `g` is not a multiple of `width`; the caller keeps the row
-/// layout for that case.
-fn block_rows(rows: &[f32], h: usize, g: usize, width: usize) -> Vec<f32> {
-    if !g.is_multiple_of(width) {
-        return Vec::new();
-    }
-    let mut out = vec![0.0f32; h * g];
-    for (blk, dst) in out.chunks_exact_mut(h * width).enumerate() {
-        for (j, row) in dst.chunks_exact_mut(width).enumerate() {
-            let src = j * g + blk * width;
-            row.copy_from_slice(&rows[src..src + width]);
-        }
-    }
-    out
 }
 
 /// A float initializer's values, from whichever field the export used.
@@ -1733,7 +1124,7 @@ pub(crate) mod tests {
         // kernel's, whatever the machine has — unless `ESCAPEPOD_LSTM_BACKEND`
         // caps the dispatch, which the closing round sets to run these
         // tests under every backend.
-        if backend_cap().is_none() {
+        if lstm::backend_cap().is_none() {
             assert_eq!(Backend::best_for(88), Backend::Avx2);
             assert_eq!(Backend::best_for(96), Backend::Avx512);
         }

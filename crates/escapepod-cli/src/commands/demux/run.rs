@@ -2567,116 +2567,245 @@ fn produce_cpu_crf_multi(
             )),
         })
         .collect::<anyhow::Result<_>>()?;
-    let n = heads.len();
+    let n_heads = heads.len();
     drive_blocks(
         &args.input,
         decode_bound(detector, needs_full_read),
         |sigs, items| {
             let bounds = detector.detect_batch(&sigs);
-            sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
+            let rows: Vec<_> = sigs.into_iter().zip(bounds).zip(items).collect();
+            rows.par_chunks(CRF_ENCODE_GROUP).for_each_init(
                 || {
-                    (0..n)
-                        .map(|_| (CrfScratch::new(), Vec::<f32>::new()))
-                        .collect::<Vec<_>>()
+                    let scratch = (0..n_heads).map(|_| CrfScratch::new()).collect::<Vec<_>>();
+                    let windows = (0..n_heads)
+                        .map(|_| crf_group_buffers())
+                        .collect::<Vec<_>>();
+                    let scores = (0..n_heads)
+                        .map(|_| crf_group_buffers())
+                        .collect::<Vec<_>>();
+                    (scratch, windows, scores)
                 },
-                |scratch, ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
-                    let mut calls = Vec::with_capacity(n);
-                    for ((head, encoder), (scratch, window)) in
-                        heads.iter().zip(&encoders).zip(scratch.iter_mut())
-                    {
-                        calls.push(call_one_crf(
+                |(scratch, windows, scores), group| {
+                    // Every read's calls, one `Vec` per head, built up head by
+                    // head below rather than walking the block once per head:
+                    // `items` (owned `ReadData`/`chunks`/`run_infos`) is
+                    // consumed once already, into `rows`, above.
+                    let mut per_read: Vec<Vec<Call>> = (0..group.len())
+                        .map(|_| Vec::with_capacity(n_heads))
+                        .collect();
+                    for (h, (head, encoder)) in heads.iter().zip(&encoders).enumerate() {
+                        let head_windows = &mut windows[h];
+                        let head_scores = &mut scores[h];
+                        // Prep fully (mutating each window) before borrowing
+                        // any of them into `refs` — the borrow checker cannot
+                        // see that `head_windows[i]`'s mutable and immutable
+                        // borrows below never overlap in practice, since both
+                        // go through `Index`/`IndexMut` on the whole `Vec`.
+                        let mut prepped: Vec<bool> = Vec::with_capacity(group.len());
+                        for (i, row) in group.iter().enumerate() {
+                            let ((signal, (_s, adapter_end)), (read, _chunks, _run_infos)) = row;
+                            let ok = prep_one_crf(
+                                head,
+                                encoder,
+                                read,
+                                signal.as_deref(),
+                                *adapter_end,
+                                &mut head_windows[i],
+                            );
+                            prepped.push(ok);
+                        }
+                        let refs: Vec<&[f32]> = prepped
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &ok)| ok)
+                            .map(|(i, _)| head_windows[i].as_slice())
+                            .collect();
+                        encode_crf_group(
                             head,
                             encoder,
-                            &read,
-                            signal.as_deref(),
-                            adapter_end,
-                            scratch,
-                            window,
-                        ));
+                            &refs,
+                            &mut head_scores[..refs.len()],
+                            &mut prepped,
+                        );
+                        let mut slot = 0usize;
+                        for (i, ok) in prepped.iter().enumerate() {
+                            let call = if *ok {
+                                let c = decode_one_crf(
+                                    head,
+                                    encoder,
+                                    &head_scores[slot],
+                                    &mut scratch[h],
+                                );
+                                slot += 1;
+                                c
+                            } else {
+                                Call::unclassified()
+                            };
+                            per_read[i].push(call);
+                        }
                     }
-                    route(
-                        routers,
-                        class_tx,
-                        read.for_writing(read.run_info_index),
-                        Calls::Many(calls),
-                        adapter_end,
-                        chunks,
-                        run_infos,
-                    );
-                    pb.inc(1);
+                    for (i, row) in group.iter().enumerate() {
+                        let ((_signal, (_s, adapter_end)), (read, chunks, run_infos)) = row;
+                        route(
+                            routers,
+                            class_tx,
+                            read.for_writing(read.run_info_index),
+                            Calls::Many(std::mem::take(&mut per_read[i])),
+                            *adapter_end,
+                            chunks.clone(),
+                            run_infos.clone(),
+                        );
+                        pb.inc(1);
+                    }
                 },
             );
         },
     )
 }
 
-/// One CRF head's verdict on one read: window, encode, decode, match.
-///
-/// Shared by the single- and multi-axis producers so the two cannot drift —
-/// this is the whole of what a CRF head does to a read, and a second copy of it
-/// is a second definition of the model's input.
+/// One CRF head's window for one read, ready for the encoder. `window`
+/// receives the standardised `chunk`-sample slice on success (matching
+/// [`CrfMetadata::prep_adc_into`]'s contract), or is left empty. Bumps the
+/// right refusal counter and returns `false` on any failure short of the
+/// encoder itself — shared by the grouped and any future single-read caller
+/// so the two cannot drift on what counts as a refusal.
 #[cfg(feature = "crf-decode")]
-fn call_one_crf(
+fn prep_one_crf(
     head: &CrfHead,
     encoder: &CrfEncoder,
     read: &ReadData,
     signal: Option<&[i16]>,
     adapter_end: usize,
-    scratch: &mut CrfScratch,
     window: &mut Vec<f32>,
-) -> Call {
-    let meta = encoder.metadata();
-    (|| {
-        let Some(adc) = signal else {
-            Refusals::bump(&head.refusals.no_signal);
-            return None;
-        };
-        // The detector reports `adapter_end` as an index into the decoded
-        // prefix, which is what `prep` wants. Only the `chunk` samples ending
-        // there are converted — the prefix itself can be the whole read under
-        // LLR, or under a read-end anchor.
-        if let Err(why) = meta.prep_adc_into(
-            adc,
-            adapter_end,
-            read.calibration_offset,
-            read.calibration_scale,
-            window,
-        ) {
-            head.refusals.window(why);
-            return None;
+) -> bool {
+    let Some(adc) = signal else {
+        Refusals::bump(&head.refusals.no_signal);
+        window.clear();
+        return false;
+    };
+    // The detector reports `adapter_end` as an index into the decoded
+    // prefix, which is what `prep` wants. Only the `chunk` samples ending
+    // there are converted — the prefix itself can be the whole read under
+    // LLR, or under a read-end anchor.
+    if let Err(why) = encoder.metadata().prep_adc_into(
+        adc,
+        adapter_end,
+        read.calibration_offset,
+        read.calibration_scale,
+        window,
+    ) {
+        head.refusals.window(why);
+        return false;
+    }
+    true
+}
+
+/// Encode a group of already-prepped windows through [`CrfEncoder::encode_group`],
+/// marking every read in the group unclassified (`prepped[i] = false`) and
+/// bumping the encoder-refusal counter once per read on failure — the encoder
+/// output is all-or-nothing per call, so a mid-group error cannot leave a
+/// caller reading a previous group's stale scores out of a reused buffer. A
+/// no-op when nothing in the group was prepped.
+#[cfg(feature = "crf-decode")]
+fn encode_crf_group(
+    head: &CrfHead,
+    encoder: &CrfEncoder,
+    refs: &[&[f32]],
+    out: &mut [Vec<f32>],
+    prepped: &mut [bool],
+) {
+    if refs.is_empty() {
+        return;
+    }
+    if let Err(e) = encoder.encode_group(refs, out) {
+        for _ in 0..refs.len() {
+            Refusals::bump(&head.refusals.encoder);
         }
-        match &head.chains {
-            Some(chains) => encoder
-                .basecall_prepped_with_refs(window, scratch, chains)
+        tracing::warn!("encoder: {e}");
+        for ok in prepped.iter_mut() {
+            *ok = false;
+        }
+    }
+}
+
+/// Decode and match one already-encoded read: the second half of what
+/// [`prep_one_crf`] + [`CrfEncoder::encode_group`] feed into. `scores` is one
+/// read's `t_len * n_score` output, from either encoder backend — decoding
+/// straight out of it is [`CrfEncoder::decode_scores`] /
+/// [`CrfEncoder::decode_scores_with_refs`]'s whole contract, so this is
+/// exactly what [`CrfEncoder::basecall_prepped`] /
+/// [`CrfEncoder::basecall_prepped_with_refs`] do internally for the
+/// single-read path, reused here so grouped and single-read decode cannot
+/// drift.
+#[cfg(feature = "crf-decode")]
+fn decode_one_crf(
+    head: &CrfHead,
+    encoder: &CrfEncoder,
+    scores: &[f32],
+    scratch: &mut CrfScratch,
+) -> Call {
+    (|| match &head.chains {
+        Some(chains) => {
+            let mut ref_logp = Vec::with_capacity(chains.len());
+            let sequence = encoder
+                .decode_scores_with_refs(scores, scratch, encoder.backend(), chains, &mut ref_logp)
                 .inspect_err(|e| {
                     Refusals::bump(&head.refusals.encoder);
                     tracing::warn!("encoder: {e}");
                 })
-                .ok()
-                .map(|s| call_barcode_scored(head, &s)),
-            None => {
-                let seq = encoder
-                    .basecall_prepped(window, scratch)
-                    .inspect_err(|e| {
-                        Refusals::bump(&head.refusals.encoder);
-                        tracing::warn!("encoder: {e}");
-                    })
-                    .ok()?;
-                Some(call_barcode(head, &seq))
-            }
+                .ok()?;
+            let scored = ScoredDecode {
+                sequence,
+                ref_logp,
+                mean_logpost: scratch.path_score() / encoder.metadata().t_len().max(1) as f32,
+            };
+            Some(call_barcode_scored(head, &scored))
+        }
+        None => {
+            let seq = encoder
+                .decode_scores(scores, scratch, encoder.backend())
+                .inspect_err(|e| {
+                    Refusals::bump(&head.refusals.encoder);
+                    tracing::warn!("encoder: {e}");
+                })
+                .ok()?;
+            Some(call_barcode(head, &seq))
         }
     })()
     .unwrap_or_else(Call::unclassified)
 }
 
-/// Detection is batched over the whole block, but the per-read work is *not*
-/// chunked the way `produce_cpu_gbm` chunks: that head batches because
-/// `predict_many` is a genuinely batched kernel, whereas tract has no batched
-/// LSTM, so a chunk here would only ever run its reads serially. At ~14 ms per
-/// read (13 ms encode + 1.2 ms decode) even a modest chunk is seconds of work a
-/// starved worker cannot steal, so this fans out per read and keeps one
-/// `CrfScratch` per *worker* via `for_each_init` — the same shape as
-/// `produce_cpu`.
+/// Reads batched together for one [`CrfEncoder::encode_group`] call. Larger
+/// than any native backend's own `preferred_batch()` (8, the AVX-512 width)
+/// on purpose: `encode_group` sub-chunks internally to whatever the active
+/// encoder actually prefers (including looping one read at a time through
+/// tract, where grouping buys nothing but costs nothing either), so this is
+/// just the unit of work one rayon task claims from a block — big enough
+/// that a group's own bookkeeping is worth it, small enough that no worker is
+/// left carrying a disproportionate share of a block alone. Measured
+/// (rnabioco/escapepod-rs#331): the native kernel goes from ~17.5 ms/read
+/// single-read to ~14.2 ms/read at this width on `barcode_crf_ldx32_rna004`,
+/// against tract's ~18.2 ms/read either way.
+#[cfg(feature = "crf-decode")]
+const CRF_ENCODE_GROUP: usize = 8;
+
+/// Per-worker scratch for one head's share of a [`CRF_ENCODE_GROUP`]-sized
+/// group: one window (or score) buffer per slot, reused across groups.
+#[cfg(feature = "crf-decode")]
+fn crf_group_buffers() -> Vec<Vec<f32>> {
+    (0..CRF_ENCODE_GROUP).map(|_| Vec::new()).collect()
+}
+
+/// CRF producer for a single axis: detect → group reads → batch-encode →
+/// decode + match each, per [`CRF_ENCODE_GROUP`]-sized group.
+///
+/// Detection is batched over the whole block; the per-read prep/decode/match
+/// work is chunked into groups so [`CrfEncoder::encode_group`] can share the
+/// native kernel's recurrent weight-row loads across the reads in a group
+/// (see [`CRF_ENCODE_GROUP`]) — through tract this is the same per-read work
+/// as before, just gathered into a group first. One `CrfScratch` and one pair
+/// of group-sized buffers per *worker* via `for_each_init`, reused across
+/// groups.
 #[cfg(feature = "crf-decode")]
 fn produce_cpu_crf(
     args: &RunArgs,
@@ -2693,28 +2822,57 @@ fn produce_cpu_crf(
         decode_bound(detector, meta.needs_full_read()),
         |sigs, items| {
             let bounds = detector.detect_batch(&sigs);
-            sigs.into_par_iter().zip(bounds).zip(items).for_each_init(
-                || (CrfScratch::new(), Vec::<f32>::new()),
-                |(scratch, window), ((signal, (_s, adapter_end)), (read, chunks, run_infos))| {
-                    let call = call_one_crf(
+            let rows: Vec<_> = sigs.into_iter().zip(bounds).zip(items).collect();
+            rows.par_chunks(CRF_ENCODE_GROUP).for_each_init(
+                || (CrfScratch::new(), crf_group_buffers(), crf_group_buffers()),
+                |(scratch, windows, scores), group| {
+                    let mut prepped: Vec<bool> = Vec::with_capacity(group.len());
+                    for (i, row) in group.iter().enumerate() {
+                        let ((signal, (_s, adapter_end)), (read, _chunks, _run_infos)) = row;
+                        let ok = prep_one_crf(
+                            head,
+                            encoder,
+                            read,
+                            signal.as_deref(),
+                            *adapter_end,
+                            &mut windows[i],
+                        );
+                        prepped.push(ok);
+                    }
+                    let refs: Vec<&[f32]> = prepped
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &ok)| ok)
+                        .map(|(i, _)| windows[i].as_slice())
+                        .collect();
+                    encode_crf_group(
                         head,
                         encoder,
-                        &read,
-                        signal.as_deref(),
-                        adapter_end,
-                        scratch,
-                        window,
+                        &refs,
+                        &mut scores[..refs.len()],
+                        &mut prepped,
                     );
-                    route(
-                        routers,
-                        class_tx,
-                        read.for_writing(read.run_info_index),
-                        Calls::One(call),
-                        adapter_end,
-                        chunks,
-                        run_infos,
-                    );
-                    pb.inc(1);
+                    let mut slot = 0usize;
+                    for (i, row) in group.iter().enumerate() {
+                        let ((_signal, (_s, adapter_end)), (read, chunks, run_infos)) = row;
+                        let call = if prepped[i] {
+                            let c = decode_one_crf(head, encoder, &scores[slot], scratch);
+                            slot += 1;
+                            c
+                        } else {
+                            Call::unclassified()
+                        };
+                        route(
+                            routers,
+                            class_tx,
+                            read.for_writing(read.run_info_index),
+                            Calls::One(call),
+                            *adapter_end,
+                            chunks.clone(),
+                            run_infos.clone(),
+                        );
+                        pb.inc(1);
+                    }
                 },
             );
         },

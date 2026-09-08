@@ -116,6 +116,82 @@ ESCAPEPOD_CRF_BUNDLE=$M/barcode_crf_ldx32_rna004@v0.2.1 \
     srun -p rna -c 32 --mem=32G -- pixi run cargo bench -p escapepod-demux --features crf-decode --bench crf_encoder
 ```
 
+## Demux, CRF path: the native encoder (2026-09-08)
+
+Part 2 of rnabioco/escapepod-rs#331 — the harness and before numbers above are
+what this is measured against. `crf::encoder_native::Recognized` recognises
+the shipped export's shape (3 `Conv`+SiLU stages, 5 stacked unidirectional
+LSTM layers, a linear head, the blank edge via `Pad`) and runs it through
+`escapepod_signal::lstm`'s axpy-form AVX2/AVX-512 kernel instead of tract;
+anything else, or a self-check disagreement against tract at load time,
+falls back to tract unchanged.
+
+**The recognizer had never once matched the shipped bundle before this.**
+Four real bugs, each confirmed against the real export's ONNX graph by direct
+inspection, not assumed from the ONNX spec: the `Conv` output's SiLU
+(`x * sigmoid(x)`) has *two* consumers (`Sigmoid` and the `Mul` that combines
+them) where the matcher assumed one; a layer's reverse-input detection
+couldn't tell "this layer reverses" from "the previous layer's un-reverse
+`Slice` happens to feed me" by producer type alone; the output side carries
+the same ambiguity in mirror; and `trace_through_reshapes` took the sole
+`Reshape` consumer of a node that, in the real export, also feeds a `Shape`
+node belonging to the graph's dynamic-shape subgraph.
+
+### Per read (criterion, one core), before vs. after
+
+Same harness, same node family (rna), both bundles. `basecall/native`
+replaces `basecall/tract` once the native path loads — same measurement,
+different backend:
+
+| `crf_encoder/…` | ldx32 (T = 300) | fdx4 (T = 350) |
+|---|---:|---:|
+| `encode/tract` | 18.39 ms | 20.84 ms |
+| `encode/native/1` (one read) | **17.12 ms (1.07×)** | **19.82 ms (1.05×)** |
+| `encode/native/8` (a group of 8, /read) | **14.52 ms (1.27×)** | **18.16 ms/read (1.15×)** |
+| `basecall/native (avx512)` | 19.09 ms | 20.76 ms |
+
+**This is real but modest — well short of the issue's ~3-6× estimate**, and
+the shortfall has a cause rather than being unexplained: the estimate
+assumed the CRF stack pays the same L2-bandwidth-bound cost per timestep the
+charging BiLSTM does (#329's 490 µs/read through tract, ~97 µs/read native —
+a genuine 5×), but `input_contribution`'s cost scales with `n_in`, and this
+stack's later layers take `n_in = 96` (an LSTM layer's own hidden width)
+against the charging net's small fixed per-base feature width. A much
+smaller share of tract's cost on this graph was ever per-timestep
+bookkeeping to begin with, so there was less of that specific inefficiency
+to remove. Getting native below tract *at all* took three fixes beyond a
+direct port, in the order they were found and measured (single-read
+`encode/native/1`, ldx32, same node):
+
+1. Branch-free zero-padding in the convolution — a small, first-guess fix
+   (~2%), not the real problem.
+2. Loop reordering to the axpy form in the convolutions, plus a vectorised
+   `tanh` (`lstm::tanh_slice`) in the linear head, replacing a scalar
+   `f32::tanh` call per output — convs 19.5 → 13.2 ms, linear head
+   10.8 → 3.3 ms.
+3. **Polyphase decomposition of the strided convolution** — splitting each
+   input channel into `stride` phase sub-arrays turns the strided gather
+   into a contiguous read — convs 13.2 → ~2.5 ms. This was the fix that
+   finally got native under tract; without it, native measured **2.2×
+   slower** (40 ms/read vs tract's 18 ms), the opposite of the goal.
+
+### End to end
+
+Not re-run as a full fused fdx+ldx pass with `benchmark_demux_crf.sh` (the
+per-read numbers above and the validation below cover the same ground more
+cheaply). Instead, validated directly: `escpod demux --model ldx=… --annotate`
+run twice over the 20,000-read dual-axis set
+(`data/bench/dual_axis_20k/`, real ldx32 bundle, boundary detector, 32
+barcode references) — once with the native encoder, once with
+`ESCAPEPOD_CRF_TRACT=1` forcing tract — and the two `.p5s` outputs compared
+read for read: **0 of 20,000 calls differ**, and both score **96.9%**
+accuracy against the ldx truth (matching the GPU-vs-CPU accuracy already on
+record above). Wall clock for the fused run was ~23-24 s either way at 32
+threads on this 20k input, consistent with the per-read numbers above: the
+CRF encoder was never the dominant cost of *this* command relative to
+detection and I/O at this scale, which is also why the modest per-read win
+does not show up as a large end-to-end one.
+
 ## Charging classifier: native BiLSTM kernel and the per-read path (2026-09-06)
 
 The follow-up to the section below it. Same input (65,821 scored reads, warm

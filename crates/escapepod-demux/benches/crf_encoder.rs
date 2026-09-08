@@ -98,19 +98,74 @@ fn bench_encoder(c: &mut Criterion) {
     g.sample_size(bench_sample_size(30));
     // One element = one read, so the reported throughput is reads/s directly.
     g.throughput(Throughput::Elements(1));
+    // Always the tract path, whichever encoder is active on `encoder` itself
+    // (`encode` and `basecall_prepped` route to the native kernel once one
+    // loads) — the "before" number rnabioco/escapepod-rs#331 pins against.
     g.bench_function(BenchmarkId::new("encode/tract", &bundle), |b| {
-        b.iter(|| black_box(encoder.encode(black_box(&window)).expect("encode succeeds")))
-    });
-    g.bench_function(BenchmarkId::new("basecall/tract", &bundle), |b| {
-        let mut scratch = CrfScratch::new();
         b.iter(|| {
             black_box(
                 encoder
-                    .basecall_prepped(black_box(&window), &mut scratch)
-                    .expect("basecall succeeds"),
+                    .encode_tract(black_box(&window))
+                    .expect("encode succeeds"),
             )
         })
     });
+    // Named by the backend that actually ran, not assumed: on a bundle whose
+    // export the native recognizer does not match, this is the same tract
+    // number as above under a different label.
+    g.bench_function(
+        BenchmarkId::new(format!("basecall/{}", encoder.encoder_backend()), &bundle),
+        |b| {
+            let mut scratch = CrfScratch::new();
+            b.iter(|| {
+                black_box(
+                    encoder
+                        .basecall_prepped(black_box(&window), &mut scratch)
+                        .expect("basecall succeeds"),
+                )
+            })
+        },
+    );
+
+    if encoder.encoder_backend().starts_with("native") {
+        // `encode/native/1`: one read through the native kernel — the
+        // apples-to-apples comparison against `encode/tract` above.
+        g.bench_function(BenchmarkId::new("encode/native/1", &bundle), |b| {
+            b.iter(|| black_box(encoder.encode(black_box(&window)).expect("encode succeeds")))
+        });
+
+        // `encode/native/8`: a group of 8 reads through the same kernel —
+        // `preferred_batch()` reads share the recurrent weights' row loads
+        // wherever the backend is AVX-512 (`Backend::preferred_batch` is
+        // narrower on AVX2/scalar; `encode_group` chunks internally either
+        // way, so this measures "the group entry point at width 8" rather
+        // than assuming the backend's own preferred width). Throughput is
+        // still reported per read.
+        let group = 8usize;
+        let windows: Vec<Vec<f32>> = (0..group)
+            .map(|i| {
+                let mut rng = Rng(0x9E37_79B9_7F4A_7C15u64.wrapping_add(i as u64));
+                (0..chunk).map(|_| rng.normal()).collect()
+            })
+            .collect();
+        let refs: Vec<&[f32]> = windows.iter().map(Vec::as_slice).collect();
+        g.throughput(Throughput::Elements(group as u64));
+        g.bench_function(BenchmarkId::new("encode/native/8", &bundle), |b| {
+            let mut out: Vec<Vec<f32>> = (0..group).map(|_| Vec::new()).collect();
+            b.iter(|| {
+                encoder
+                    .encode_group(black_box(&refs), black_box(&mut out))
+                    .expect("encode_group succeeds");
+                black_box(&out);
+            })
+        });
+    } else {
+        eprintln!(
+            "crf_encoder: {dir}: no native kernel loaded (encoder_backend = {:?}), \
+             skipping encode/native/1 and encode/native/8",
+            encoder.encoder_backend()
+        );
+    }
     g.finish();
 }
 

@@ -36,6 +36,13 @@ pub mod barcode;
 #[cfg(feature = "crf-decode")]
 pub mod encoder;
 
+/// The native CPU forward pass `encoder` runs when the export matches
+/// (`encoder_native::Recognized::from_proto`); private because `encoder` is
+/// the only caller, `CrfEncoder` is the crate's one public entry point to it,
+/// and nothing about the recognizer is meant to be driven directly.
+#[cfg(feature = "crf-decode")]
+mod encoder_native;
+
 #[cfg(feature = "gpu")]
 pub mod encoder_gpu;
 

@@ -40,6 +40,7 @@ use tract_onnx::prelude::*;
 use tract_onnx::tract_core::framework::Framework;
 use tract_onnx::tract_core::model::TypedRunnableModel;
 
+use super::encoder_native;
 use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs};
 use super::refchain::{RefChains, ScoredDecode};
 
@@ -321,6 +322,15 @@ pub struct CrfSpec {
     pub n_base: usize,
     /// Blank symbol first, then one per base — e.g. `["N", "A", "C", "G", "T"]`.
     pub alphabet: Vec<String>,
+    /// The constant score `crf::encoder_native` expects to find literally
+    /// embedded in the graph's `Pad` node — bonito's fixed (not learned)
+    /// blank-edge score. Every bundle inspected so far already carries this
+    /// key; it was simply unconsumed. `None` (an older export, or a future
+    /// one that drops it) still lets a native encoder load — the value used
+    /// there always comes from the graph itself — but costs the one
+    /// independent cross-check this field buys.
+    #[serde(default)]
+    pub blank_score: Option<f32>,
 }
 
 impl CrfMetadata {
@@ -693,18 +703,33 @@ const BOUNDARY_MARGIN: usize = 200;
 // tract 0.23 renamed `SimplePlan<F, O, M>` to `RunnableModel<F, O>`.
 type Plan = TypedRunnableModel;
 
-/// CPU CTC-CRF basecaller: tract for the encoder, [`super::lattice`] for the
-/// decode.
+/// CPU CTC-CRF basecaller: the encoder (native where the export matches,
+/// tract otherwise) plus [`super::lattice`] for the decode.
 ///
 /// Build once and share across rayon workers — the plan is immutable, so
 /// `&CrfEncoder` is `Sync` and each worker only needs its own [`CrfScratch`].
 ///
-/// Inference runs one read at a time. That is deliberate and matches the
-/// boundary-CNN path: tract has no efficient batched convolution, so batching
-/// buys nothing on CPU and parallelism comes from running reads concurrently.
-/// The GPU path batches instead.
+/// Single-read inference (`encode`, `basecall_prepped`) runs one read at a
+/// time either way. Through tract that is deliberate — no efficient batched
+/// convolution, so batching buys nothing and parallelism comes from running
+/// reads concurrently. The native path *can* batch (`crf::encoder_native`'s
+/// recurrence kernel scores several reads in lockstep, as
+/// `escapepod_classify::fnn_lstm` does), which [`Self::encode_batch`] uses;
+/// single-read callers are unaffected.
 pub struct CrfEncoder {
     plan: Arc<Plan>,
+    /// The graph's convolutions and LSTM stack run directly, when the graph
+    /// is the one `crf::encoder_native` recognises. `None` scores through
+    /// `plan`.
+    ///
+    /// `plan` stays loaded either way — mirrors
+    /// `escapepod_classify::fnn::FeatureNet`, and for the same reasons:
+    /// `ESCAPEPOD_CRF_TRACT=1` and the load-time self-check both need it, and
+    /// keeping it lets [`Self::encode_tract`] compare the two on the same
+    /// encoder instead of forcing a second load. The memory cost is one CRF
+    /// encoder's ONNX plan (a few MB), which the LSTM weights already
+    /// duplicated in native form dwarf.
+    native: Option<encoder_native::Recognized>,
     meta: CrfMetadata,
     layout: CrfLayout,
     alphabet: Vec<u8>,
@@ -732,15 +757,37 @@ impl CrfEncoder {
         let layout = meta.layout()?;
         let alphabet = meta.alphabet_bytes();
 
-        // The export leaves batch dynamic; tract needs it concrete to optimize,
-        // and CPU inference is per-read, so pin batch = 1 here. The padding
-        // hoist first: this graph's convolutions are zero-padded like the
-        // boundary CNN's, and `padded_valid_x_loop` was 6% of the CPU encoder
-        // arm in the 2026-09 profile. See `onnx_rewrite::hoist_conv_padding`.
         let framework = tract_onnx::onnx();
         let mut proto = framework
             .proto_model_for_path(onnx)
             .map_err(|e| CrfError::Load(e.to_string()))?;
+
+        // Matched on the proto as exported, before the padding hoist below
+        // rewrites its `Conv` nodes — see `encoder_native`'s module doc for
+        // why the recognizer needs the original shape. The env var is the
+        // escape hatch that keeps both paths measurable from one binary, and
+        // a way back if a bundle's export ever disagrees with the native
+        // kernel (its own load-time self-check already refuses such a graph;
+        // this is the operator's override besides).
+        let native = if std::env::var_os("ESCAPEPOD_CRF_TRACT").is_some() {
+            None
+        } else {
+            encoder_native::Recognized::from_proto(&proto, &meta, &layout)
+        };
+        match &native {
+            Some(net) => tracing::info!(
+                "CRF encoder: run natively ({}), blank score {}",
+                net.backend().name(),
+                net.blank_score()
+            ),
+            None => tracing::info!("CRF encoder: run through tract"),
+        }
+
+        // The export leaves batch dynamic; tract needs it concrete to
+        // optimize, and CPU inference is per-read, so pin batch = 1 here. The
+        // padding hoist: this graph's convolutions are zero-padded like the
+        // boundary CNN's, and `padded_valid_x_loop` was 6% of the CPU encoder
+        // arm in the 2026-09 profile. See `onnx_rewrite::hoist_conv_padding`.
         crate::onnx_rewrite::hoist_conv_padding(&mut proto, 1);
         let plan = framework
             .model_for_proto_model(&proto)
@@ -754,6 +801,7 @@ impl CrfEncoder {
 
         let encoder = Self {
             plan,
+            native,
             meta,
             layout,
             alphabet,
@@ -859,15 +907,86 @@ impl CrfEncoder {
 
     /// Run the encoder on one standardised `chunk`-sample window, returning
     /// `t_len * n_score` scores in the decoder's expected `[t][dest][edge]`
-    /// order.
+    /// order — through the native kernel where one loaded, else tract.
     ///
     /// This allocates and copies the whole score buffer — 1 MB for the RNA004
-    /// geometry. [`Self::basecall_prepped`] decodes out of tract's own output
-    /// instead and does not pay it; prefer that unless you genuinely need to own
-    /// the scores.
+    /// geometry, either way. [`Self::basecall_prepped`] decodes out of the
+    /// tract path's own output tensor instead and does not pay it for that
+    /// path; prefer that unless you genuinely need to own the scores.
     pub fn encode(&self, prepped: &[f32]) -> Result<Vec<f32>, CrfError> {
+        if let Some(net) = &self.native {
+            return Ok(net.encode(prepped));
+        }
+        self.encode_tract(prepped)
+    }
+
+    /// [`Self::encode`] through tract regardless of whether a native kernel
+    /// loaded — kept callable so the two can be compared on the same encoder
+    /// instead of forcing a second load, as
+    /// `escapepod_classify::fnn::FeatureNet::predict_tract` does for the
+    /// charging feature net.
+    pub fn encode_tract(&self, prepped: &[f32]) -> Result<Vec<f32>, CrfError> {
         let outputs = self.run_encoder(prepped)?;
         Ok(self.scores_of(&outputs)?.to_vec())
+    }
+
+    /// What scores a read: the native kernel and its instruction set, or
+    /// tract. Mirrors `escapepod_classify::fnn::FeatureNet::backend`.
+    pub fn encoder_backend(&self) -> &'static str {
+        match &self.native {
+            Some(net) => match net.backend() {
+                escapepod_signal::lstm::LstmBackend::Scalar => "native (scalar)",
+                #[cfg(target_arch = "x86_64")]
+                escapepod_signal::lstm::LstmBackend::Avx2 => "native (avx2)",
+                #[cfg(target_arch = "x86_64")]
+                escapepod_signal::lstm::LstmBackend::Avx512 => "native (avx512)",
+            },
+            None => "tract",
+        }
+    }
+
+    /// How many reads [`Self::encode_group`] scores per pass at full
+    /// efficiency. `1` with no native kernel loaded: tract has no efficient
+    /// batched LSTM, so a caller in that case is better served calling
+    /// [`Self::basecall_prepped`] directly per read than routing through a
+    /// group of one.
+    pub fn preferred_batch(&self) -> usize {
+        match &self.native {
+            Some(net) => net.preferred_batch(),
+            None => 1,
+        }
+    }
+
+    /// Encode a group of already-prepped reads at once. `out[i]` receives
+    /// read `i`'s `t_len * n_score` scores, replacing whatever it held —
+    /// callers decode each independently afterwards (with
+    /// [`Self::decode_scores`] or [`Self::decode_scores_with_refs`]); the
+    /// group step is the encode only.
+    ///
+    /// Through the native kernel the group scores in lockstep — every read in
+    /// a [`Self::preferred_batch`]-sized chunk shares that chunk's recurrent
+    /// weight-row loads, which is where the single-read kernel's time goes
+    /// (see [`super::encoder_native`]). Through tract this is a plain
+    /// per-read loop over [`Self::encode_tract`]: tract has no efficient
+    /// batched LSTM, so grouping buys nothing there and exists only so a
+    /// caller need not branch on which encoder loaded.
+    pub fn encode_group(&self, prepped: &[&[f32]], out: &mut [Vec<f32>]) -> Result<(), CrfError> {
+        assert_eq!(prepped.len(), out.len(), "one output slot per prepped read");
+        if let Some(net) = &self.native {
+            let stride = self.meta.t_len() * self.layout.n_score;
+            let mut flat = vec![0.0f32; prepped.len() * stride];
+            net.encode_batch_into(prepped, &mut flat);
+            for (o, chunk) in out.iter_mut().zip(flat.chunks_exact(stride)) {
+                o.clear();
+                o.extend_from_slice(chunk);
+            }
+            return Ok(());
+        }
+        for (p, o) in prepped.iter().zip(out.iter_mut()) {
+            o.clear();
+            o.extend_from_slice(&self.encode_tract(p)?);
+        }
+        Ok(())
     }
 
     /// Build the constrained lattices for a reference panel, once per run.
@@ -915,6 +1034,23 @@ impl CrfEncoder {
         scratch: &mut CrfScratch,
         chains: &RefChains,
     ) -> Result<ScoredDecode, CrfError> {
+        if let Some(net) = &self.native {
+            return net.encode_with(prepped, |scores| {
+                let mut ref_logp = Vec::with_capacity(chains.len());
+                let sequence = self.decode_scores_with_refs(
+                    scores,
+                    scratch,
+                    self.backend,
+                    chains,
+                    &mut ref_logp,
+                )?;
+                Ok(ScoredDecode {
+                    sequence,
+                    ref_logp,
+                    mean_logpost: scratch.path_score() / self.meta.t_len().max(1) as f32,
+                })
+            });
+        }
         let outputs = self.run_encoder(prepped)?;
         let scores = self.scores_of(&outputs)?;
         let mut ref_logp = Vec::with_capacity(chains.len());
@@ -929,15 +1065,23 @@ impl CrfEncoder {
 
     /// Basecall one already-prepped read.
     ///
-    /// The scores are decoded straight out of tract's output tensor. The decode
-    /// immediately transposes them into `scratch`, so materialising an owned
-    /// copy first would be a 1 MB allocation and memcpy per read that nothing
-    /// ever reads twice.
+    /// Through the native kernel the scores land in a thread-local scratch
+    /// buffer the decode reads directly (see
+    /// [`encoder_native::Recognized::encode_with`]) — no owned copy. Through
+    /// tract the scores are decoded straight out of its output tensor: the
+    /// decode immediately transposes them into `scratch`, so materialising an
+    /// owned copy first would be a 1 MB allocation and memcpy per read that
+    /// nothing ever reads twice.
     pub fn basecall_prepped(
         &self,
         prepped: &[f32],
         scratch: &mut CrfScratch,
     ) -> Result<String, CrfError> {
+        if let Some(net) = &self.native {
+            return net.encode_with(prepped, |scores| {
+                self.decode_scores(scores, scratch, self.backend)
+            });
+        }
         let outputs = self.run_encoder(prepped)?;
         let scores = self.scores_of(&outputs)?;
         self.decode_scores(scores, scratch, self.backend)

@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+### Performance
+
+- **The CTC-CRF barcode encoder can run natively instead of through tract**
+  (#331, part 2). `crf::encoder_native::Recognized` recognises the shipped
+  export's exact shape — 3 `Conv`+SiLU stages, 5 stacked unidirectional LSTM
+  layers (bonito's reverse trick: an ONNX-forward `LSTM` wrapped in
+  `Slice(steps=[-1])` before and after, not a `direction="reverse"`
+  attribute), a linear head, and the blank edge via `Pad` — lifts the
+  weights, and runs the whole stack through `escapepod_signal::lstm`, the
+  same axpy-form AVX2/AVX-512 kernel #328/#329 built for the charging
+  classifier's BiLSTM. Anything else, or a mismatch the recognizer's own
+  numeric self-check catches against tract on random weights at load time,
+  falls back to tract unchanged; `ESCAPEPOD_CRF_TRACT=1` forces it either
+  way. `CrfEncoder::encode_group` batches `preferred_batch()` reads through
+  the kernel at once (8 on AVX-512, sharing weight-row loads across reads
+  the way the charging kernel's `logits_batch` does), and now backs
+  `escpod demux`'s fused CPU pipeline in groups of 8 (`produce_cpu_crf`/
+  `produce_cpu_crf_multi`).
+
+  The recognizer had never once matched the shipped bundle before this: four
+  real bugs, each confirmed against the real export's ONNX graph by direct
+  inspection. The `Conv` output's SiLU (`x * sigmoid(x)`) has *two*
+  consumers (`Sigmoid` and the `Mul` that combines them), not one; a layer's
+  reverse-input detection couldn't tell "this layer reverses" from "the
+  previous layer's un-reverse `Slice` happens to feed me" by producer type
+  alone; the output side has the same ambiguity in mirror; and
+  `trace_through_reshapes` took the sole `Reshape` consumer of a node that,
+  in the real export, also feeds a `Shape` node belonging to the graph's
+  dynamic-shape subgraph.
+
+  Performance is real but modest — well short of the issue's ~3-6× estimate.
+  Measured on rna, one core: on the ldx32 bundle (T=300) `encode/native/1`
+  (one read) is **17.12 ms against tract's 18.39 ms — 1.07×**, and
+  `encode/native/8` (a group of 8) is **14.5 ms/read — 1.27×**; on fdx4
+  (T=350) the same pair is **19.82 ms vs 20.84 ms — 1.05×** and
+  **18.2 ms/read — 1.15×**. The estimate
+  assumed the CRF stack pays the same L2-bandwidth-bound cost per timestep
+  the charging BiLSTM does; it doesn't, because `input_contribution`'s cost
+  scales with `n_in`, and this stack's later layers take `n_in = 96` against
+  the charging net's small fixed per-base feature width — so a much smaller
+  share of tract's cost here was ever per-timestep bookkeeping to begin
+  with. Getting native below tract at all took three fixes beyond a direct
+  port: branch-free zero-padding, loop reordering plus a vectorised `tanh`
+  in the linear head, and — the one that mattered — a polyphase
+  decomposition of the strided convolution (splitting each input channel
+  into `stride` phase sub-arrays turns the strided gather into a contiguous
+  read).
+
+  Validated end to end on the 20,000-read dual-axis set
+  (`data/bench/dual_axis_20k/`, real ldx32 bundle, boundary detector, 32
+  barcode references): **0 of 20,000 calls differ** between the native and
+  tract paths, and both score 96.9% accuracy against the ldx truth.
+
 ## 0.23.0 (2026-09-08)
 
 ### Added

@@ -26,6 +26,7 @@ flate2 = "1"
 ndarray = "0.17"
 rand = "0.10"
 rayon = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 # GPU acceleration (opt-in via `gpu` feature; NVRTC-compiled CUDA kernels).
