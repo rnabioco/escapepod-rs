@@ -153,6 +153,7 @@ onnxruntime-cpp = { version = "1.28.*", build = "*cuda129" }
 # at startup — has nothing left to guard against.
 [feature.gpu.activation]
 env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH", ORT_DYLIB_PATH = "$CONDA_PREFIX/lib/libonnxruntime.so" }
+scripts = ["scripts/gpu_env_libcudart_shim.sh"]
 
 [feature.warpdemux-bench.dependencies]
 # Pinned to 3.12: ADAPTed's `@dataclass` patterns with mutable defaults

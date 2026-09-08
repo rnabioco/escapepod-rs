@@ -314,6 +314,32 @@ fn arm_strict_ep() {
     escapepod_demux::require_cuda_ep();
 }
 
+/// [`Stage::WaveformTcn`]-only: is the CUDA *runtime* library usable for
+/// tract-cuda, on top of the driver check [`cuda_available`] already did?
+///
+/// tract-cuda is the one GPU path in this binary that also needs the CUDA
+/// *runtime* (`libcudart`), not just the driver — see
+/// `escapepod_classify::waveform_net_gpu::cudart_runtime_probe`'s doc for
+/// why that gap matters: cudarc's own runtime wrapper `panic!`s on a missing
+/// symbol rather than returning an error, and this workspace's `release`
+/// profile (what every shipped `-gpu` binary builds with) pins
+/// `panic = "abort"`, so that panic reaches nothing this module could turn
+/// into a diagnosable message. Checking first, here, is the only way to
+/// keep rnabioco/escapepod-rs#347 from aborting the process again.
+///
+/// `Ok(())` in a build without `gpu` — unreachable in practice, since every
+/// caller only reaches this after [`Stage::compiled_in`] already said yes.
+fn cudart_runtime_ok() -> Result<(), String> {
+    #[cfg(feature = "gpu")]
+    {
+        escapepod_classify::waveform_net_gpu::cudart_runtime_probe()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Ok(())
+    }
+}
+
 /// Decide where `stage` runs under `device`.
 ///
 /// Errors only under `--device gpu`, and only for the two causes it can settle
@@ -345,19 +371,47 @@ pub fn place(device: Device, stage: Stage) -> anyhow::Result<Placement> {
                     stage.label(),
                 );
             }
+            // Driver visible is necessary but, for this one stage, not
+            // sufficient — see `cudart_runtime_ok`'s doc for why tract-cuda
+            // additionally needs a working CUDA *runtime* (rnabioco/
+            // escapepod-rs#347).
+            if stage == Stage::WaveformTcn
+                && let Err(reason) = cudart_runtime_ok()
+            {
+                anyhow::bail!(
+                    "--device gpu cannot run {}: {reason} Use `--device auto` to \
+                     fall back to the CPU instead.",
+                    stage.label(),
+                );
+            }
             arm_strict_ep();
             Ok(Placement::Gpu)
         }
         Device::Auto => {
             if !stage.auto_prefers_gpu() {
-                Ok(Placement::Cpu(CpuReason::FasterOnCpu))
-            } else if !stage.compiled_in() {
-                Ok(Placement::Cpu(CpuReason::NotCompiledIn))
-            } else if !cuda_available() {
-                Ok(Placement::Cpu(CpuReason::NoDevice))
-            } else {
-                Ok(Placement::Gpu)
+                return Ok(Placement::Cpu(CpuReason::FasterOnCpu));
             }
+            if !stage.compiled_in() {
+                return Ok(Placement::Cpu(CpuReason::NotCompiledIn));
+            }
+            if !cuda_available() {
+                return Ok(Placement::Cpu(CpuReason::NoDevice));
+            }
+            if stage == Stage::WaveformTcn
+                && let Err(reason) = cudart_runtime_ok()
+            {
+                tracing::warn!(
+                    "{} cannot use the GPU under `--device auto`, falling back to \
+                     the CPU: {reason}",
+                    stage.label(),
+                );
+                return Ok(Placement::Cpu(CpuReason::Incompatible(
+                    "CUDA runtime (libcudart) does not support tract-cuda on this \
+                     host — see the warning above for the exact symbol lookup \
+                     failure",
+                )));
+            }
+            Ok(Placement::Gpu)
         }
     }
 }

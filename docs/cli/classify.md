@@ -46,6 +46,7 @@ escpod classify [OPTIONS] -b <BAM> -r <FASTA> -m <BUNDLE> -o <BAM> <POD5>
 | `--min-mapq <N>` | Minimum mapping quality to classify a read (default: `1`) |
 | `--orientation <MODE>` | Move-table signal frame: `auto` (default), `time`, or `reversed` |
 | `-t, --threads <N>` | Threads for parallel processing |
+| `--device <auto\|cpu\|gpu>` | Where the `waveform_model` variant's TCN inference runs (default `auto`) — see [GPU acceleration](#gpu-acceleration). Ignored (with a one-line note) for a GBM/feature-network bundle, which has no GPU path |
 | `-h, --help` | Print help |
 
 ## Output
@@ -190,6 +191,65 @@ commit.
 Leave it at `auto` for a normal run. Use `--orientation time` or
 `--orientation reversed` to force the frame on a batch too small for the vote
 to resolve.
+
+## GPU acceleration
+
+Only the `waveform_model` variant has a GPU path — the windowed TCN, batched
+through [`tract-cuda`](https://github.com/sonos/tract) rather than
+onnxruntime. GBM and `feature_model` bundles have no device path at all;
+`--device gpu` on one of those is a no-op with a one-line log note, never an
+error. Build with `--features gpu` (see [demux's GPU
+section](demux.md#gpu-acceleration) for the Cargo/pixi setup — one `gpu`
+feature covers every GPU-capable stage in the binary, `classify` included).
+
+**tract-cuda needs more than the demux GPU stages do.** `detect --method cnn`
+and the CRF encoder go through onnxruntime, which only `dlopen`s a prebuilt
+`libonnxruntime` — the CUDA *driver* (`libcuda.so`, part of the NVIDIA driver,
+always present on a GPU node) is enough for that check. `classify`'s TCN
+instead builds a CUDA context and *compiles its own kernels at run time*
+through NVRTC, and needs two more things the driver alone does not supply:
+
+- The CUDA **runtime** library, `libcudart`, discoverable by name at `dlopen`
+  time — not just the driver. A node can have a perfectly good driver and
+  still fail here if the `libcudart` it finds is the wrong major version (see
+  rnabioco/escapepod-rs#347's post-mortem below).
+- CUDA **headers** (`cuda_fp16.h`, the CCCL headers) on disk at run time, for
+  NVRTC to compile against — nothing else in this binary needs headers past
+  build time.
+
+The pixi `gpu` environment (`pixi run install-gpu`, then `pixi run -e gpu …` —
+see [demux's runtime-libraries
+section](demux.md#runtime-libraries-the-pixi-environment)) already pins both:
+`cuda-cudart`/`cuda-cudart-dev` for the runtime library and `cuda-cccl` for
+the headers. Run `escpod classify --device gpu` the same way you would run any
+other GPU-capable command — inside `pixi run -e gpu`, or with that
+environment's `LD_LIBRARY_PATH` reproduced by hand. Running the released
+`-gpu` binary bare, with no CUDA environment set up by the caller, means
+`libcudart` resolution falls through to whatever the *node* happens to expose
+on its default library path — see the warning below.
+
+!!! warning "rnabioco/escapepod-rs#347: `Missing symbol cudaGetDeviceProperties_v2`"
+    Reported as a raw panic —
+    `thread 'main' panicked at cudarc-0.19.9/.../runtime/sys/mod.rs: Missing
+    symbol cudaGetDeviceProperties_v2: dlsym failed` — on nodes where the CUDA
+    *driver* worked fine (other CUDA tools on the same node ran normally) but
+    `escpod classify --device gpu` was invoked **without** the pixi `gpu`
+    environment's `LD_LIBRARY_PATH` active. cudarc's dynamic loader tries the
+    bare, unversioned `libcudart.so` before any versioned name, so on a node
+    whose default library path exposes a system CUDA install of a different
+    major version — CUDA 13, say — that is the one it finds, and CUDA 13
+    dropped the `_v2` symbol this build's pinned CUDA 12.x API needs.
+
+    escpod now turns this into a named error instead of a process abort
+    (`--device gpu` fails with the missing-symbol detail and a pointer to this
+    section; `--device auto` logs a warning and falls back to the CPU scorer
+    rather than crashing) — but the fix that lets the *GPU* actually run is
+    making sure `libcudart` resolves inside the pixi `gpu` environment before
+    anything from the node's own CUDA install is on the search path. A
+    pipeline that shadows a GPU-enabled `escpod` onto `PATH` for one command
+    (rather than invoking it via `pixi run -e gpu`) has to reproduce that
+    `LD_LIBRARY_PATH` itself, the same way it already would for the CNN/CRF
+    onnxruntime stages.
 
 ## Notes
 
