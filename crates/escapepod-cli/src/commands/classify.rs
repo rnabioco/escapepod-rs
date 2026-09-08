@@ -345,34 +345,27 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let device = args.device.resolve();
 
     if bundle.waveform.is_some() {
-        // GPU placement is refused outright, not merely defaulted off.
-        // `WaveformNetGpu` has a *confirmed, reproducible* correctness bug at
-        // batch 1 (max |dlogit| 4.45e-1 vs a CPU reference stable to 3.6e-7 —
-        // see `waveform_net_gpu`'s module doc), which is why
-        // `WaveformNetGpu::load` refuses batch < 2 outright regardless of
-        // this gate. The original report also claimed a batch-2 divergence on
-        // real reads from this fixture; that specific claim did not
-        // reproduce on follow-up (eleven runs against the exact checksummed
-        // bundle and fixture, bit-for-bit identical, zero flipped calls), and
-        // the "real feature magnitude breaks the fused kernel" hypothesis
-        // behind it is refuted (a 500x synthetic magnitude sweep at batch 2
-        // shows no degradation). The gate stays closed anyway: the same
-        // investigation also turned up a genuinely rare (1-in-51 trials),
-        // non-deterministic anomaly at batch 1 with the same failure
-        // signature (a whole logit gone wrong) on a *different*,
-        // otherwise-clean bundle, which means a finite number of clean runs
-        // at batch >= 2 is evidence, not proof that the same anomaly cannot
-        // occur there too. See rnabioco/escapepod-rs#343 for the full
-        // writeup, evidence and next steps — remove this gate only once a
-        // run large enough to bound that rate says it is safe, not on the
-        // strength of the batch-2 retraction alone.
-        let placement = crate::device::place_ruled_out(
-            device,
-            crate::device::Stage::WaveformTcn,
-            "the GPU-batched scorer has a confirmed batch-1 correctness bug and a \
-             separate unexplained rare anomaly of the same kind — scoring on the \
-             CPU until this is root-caused",
-        )?;
+        // GPU placement at batch >= 2 (`WaveformNetGpu::load` refuses batch
+        // < 2 outright regardless of this call, so batch 1 is not reachable
+        // here — see its module doc's "Batch 1 is refused outright" section
+        // for the confirmed, reproducible bug that guards against). #343's
+        // original real-chunk batch-2 divergence did not survive follow-up:
+        // eleven runs against the exact checksummed fixture bundle (bit-for-
+        // bit identical, zero flipped calls), then four more at the actual
+        // production batch size (128) against an independent ~5,000-read
+        // real dataset (rnabioco/2026-aars-in-vitro), also bit-for-bit
+        // identical, zero flips. The "real feature magnitude breaks the
+        // fused kernel" hypothesis behind the original report is refuted (a
+        // 500x synthetic magnitude sweep at batch 2 shows no degradation),
+        // and the "only this bundle's graph fuses into RmsNorm" claim is
+        // refuted too (both bundles fuse identically). See
+        // rnabioco/escapepod-rs#343 for the full writeup — including a
+        // separate, rare (1-in-51 trials), non-deterministic anomaly found
+        // at batch 1 on a different bundle during that investigation, never
+        // reproduced at batch >= 2 in ~15 total runs across two independent
+        // real datasets and dozens of synthetic ones. Root cause still
+        // unknown; flagged there for anyone who hits it again.
+        let placement = crate::device::place_and_report(device, crate::device::Stage::WaveformTcn)?;
         let (calls, stats, records) = run_waveform(&args, &bundle, &geometry, placement.is_gpu())?;
         return finish(&args, &bundle, calls, stats, records);
     }

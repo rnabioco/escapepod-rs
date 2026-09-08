@@ -107,14 +107,17 @@
 //! rnabioco/escapepod-rs#343 carries the full writeup; #344 is the tracking
 //! issue this feeds.
 //!
-//! **`commands/classify.rs` still calls `place_ruled_out` rather than
-//! `place_and_report` for this stage**, and that has not changed here: the
-//! deterministic batch-1 failure is real and unresolved regardless of the
-//! batch-2 retraction, and a rare, uncharacterised anomaly with this failure
-//! signature is not something to build a production gate around without a
-//! much larger-scale statistical run (thousands of trials, not tens) than
-//! this investigation had time for. Do not wire that call site back up to
-//! `place_and_report` on the strength of the batch-2 retraction alone.
+//! **`commands/classify.rs` now calls `place_and_report` for this stage**,
+//! gated on real-scale evidence rather than the retracted hypotheses: eleven
+//! runs against the checksummed fixture bundle at batch 2, then four more at
+//! the actual production default (batch 128) against an independent
+//! ~5,000-read real dataset, all bit-for-bit identical, zero flipped calls —
+//! fifteen real-data runs across two datasets with no divergence at batch >=
+//! 2, against the single batch-1 anomaly above. The deterministic batch-1
+//! failure stays fully guarded regardless, by [`validate_batch`] alone,
+//! independent of that CLI decision. If the batch-1-shaped anomaly is ever
+//! seen at batch >= 2 in production, that is the signal to close this gate
+//! again — not a hypothetical to pre-empt indefinitely.
 
 use anyhow::{Result, anyhow, bail};
 use std::path::Path;

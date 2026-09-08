@@ -83,10 +83,10 @@ required-features = ["waveform-onnx"]
 name = "tcn_cuda_probe"
 required-features = ["waveform-onnx"]
 
-# rnabioco/escapepod-rs#343's own repro, kept runnable now that
-# `commands/classify.rs` refuses `--device gpu` for a waveform_model bundle
-# outright — calls `classify_reads`/`classify_reads_gpu` directly against the
-# shipped fixture, bypassing only the CLI's `place_ruled_out` gate.
+# rnabioco/escapepod-rs#343's own repro, kept runnable as a quick CPU-vs-GPU
+# regression check that skips the CLI's BAM/FASTA/POD5 plumbing — calls
+# `classify_reads`/`classify_reads_gpu` directly, against either the shipped
+# fixture or a real dataset via `--pod5`/`--bam`/`--fasta`/`--limit`.
 [[example]]
 name = "diag_343"
 required-features = ["cuda"]
@@ -118,11 +118,11 @@ waveform-onnx = ["dep:tract-onnx", "escapepod-demux/cnn-detect"]
 # windowed variant's batched GPU scorer — `examples/tcn_cuda_probe` is the
 # measurement that decided the scorer was worth building, kept re-runnable
 # rather than retired now that it is. `escapepod-cli`'s `gpu` feature forwards
-# to this one, so the code compiles and links end to end — but
-# `commands/classify.rs` currently refuses `--device gpu` for this stage
-# outright (`place_ruled_out`, not `place_and_report`): real reads diverge
-# from the CPU scorer at every batch size tried, though
-# `examples/tcn_cuda_probe`'s synthetic-data check reports it fine from
-# batch 2 up. See rnabioco/escapepod-rs#343 and `waveform_net_gpu`'s module
-# doc before re-enabling the command-level path.
+# to this one, so the code compiles and links end to end, and
+# `commands/classify.rs` routes this stage through `place_and_report` like
+# every other GPU-capable stage — `WaveformNetGpu::load` still refuses batch
+# < 2 outright (a confirmed, reproducible bug there), independent of this
+# gate. See rnabioco/escapepod-rs#343 and `waveform_net_gpu`'s module doc for
+# the full evidence trail, including a separate rare anomaly never seen at
+# batch >= 2.
 cuda = ["dep:tract-cuda", "dep:tract-core", "waveform-onnx"]
