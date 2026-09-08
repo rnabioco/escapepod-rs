@@ -960,6 +960,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
  "tract-onnx",
  "uuid",
 ]
@@ -1017,6 +1018,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 

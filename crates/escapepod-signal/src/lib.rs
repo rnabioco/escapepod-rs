@@ -26,6 +26,7 @@
 pub mod chunk;
 pub mod dtw;
 pub mod features;
+pub mod lstm;
 pub mod mapping;
 pub mod resquiggle;
 pub mod segmentation;
