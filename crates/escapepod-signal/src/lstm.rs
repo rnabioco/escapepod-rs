@@ -941,6 +941,7 @@ mod tests {
         (0..n_in * seq).map(|_| rng.next(1.5)).collect()
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b)
