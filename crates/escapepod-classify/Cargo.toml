@@ -101,6 +101,15 @@ required-features = ["waveform-onnx"]
 name = "diag_343"
 required-features = ["cuda"]
 
+# rnabioco/escapepod-rs#351's end-to-end measurement: unlike `tcn_cuda_probe`
+# (which internally `#[cfg]`-gates its CUDA-specific code so it builds either
+# way), this one calls `classify_reads_gpu`/`waveform_net_gpu` unconditionally
+# — it exists to measure the GPU pipeline specifically, not to degrade to a
+# CPU-only mode, so it needs `cuda` to build at all rather than just to run.
+[[example]]
+name = "waveform_gpu_pipeline_probe"
+required-features = ["cuda"]
+
 [features]
 default = []
 # Load and score the `feature_model` (per-base-feature ONNX) variant of a
