@@ -345,26 +345,33 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let device = args.device.resolve();
 
     if bundle.waveform.is_some() {
-        // GPU placement is refused outright, not merely defaulted off: on
-        // real reads from this fixture, batches of 2 through the actual
-        // `WaveformNetGpu` path disagree with the CPU scorer by up to ~0.9
-        // in probability on more than half the reads it scored (e.g. 0.999
-        // CPU vs 0.06-0.11 GPU) — a wrong classification, not a tolerance
-        // gap. The `examples/tcn_cuda_probe.rs` parity numbers this design
-        // relied on used synthetic per-role random tensors, which do not
-        // reproduce this; no root cause is confirmed yet (NaN and
-        // near-zero-variance feature channels have both been ruled out).
-        // See rnabioco/escapepod-rs#343 for the full writeup, evidence and
-        // next steps. `place_ruled_out` reports it plainly under auto/cpu
-        // and errors under an explicit `--device gpu` rather than let a
-        // user silently get a wrong charging call — remove this gate only
-        // once #343 is resolved on real, not synthetic, chunks.
+        // GPU placement is refused outright, not merely defaulted off.
+        // `WaveformNetGpu` has a *confirmed, reproducible* correctness bug at
+        // batch 1 (max |dlogit| 4.45e-1 vs a CPU reference stable to 3.6e-7 —
+        // see `waveform_net_gpu`'s module doc), which is why
+        // `WaveformNetGpu::load` refuses batch < 2 outright regardless of
+        // this gate. The original report also claimed a batch-2 divergence on
+        // real reads from this fixture; that specific claim did not
+        // reproduce on follow-up (eleven runs against the exact checksummed
+        // bundle and fixture, bit-for-bit identical, zero flipped calls), and
+        // the "real feature magnitude breaks the fused kernel" hypothesis
+        // behind it is refuted (a 500x synthetic magnitude sweep at batch 2
+        // shows no degradation). The gate stays closed anyway: the same
+        // investigation also turned up a genuinely rare (1-in-51 trials),
+        // non-deterministic anomaly at batch 1 with the same failure
+        // signature (a whole logit gone wrong) on a *different*,
+        // otherwise-clean bundle, which means a finite number of clean runs
+        // at batch >= 2 is evidence, not proof that the same anomaly cannot
+        // occur there too. See rnabioco/escapepod-rs#343 for the full
+        // writeup, evidence and next steps — remove this gate only once a
+        // run large enough to bound that rate says it is safe, not on the
+        // strength of the batch-2 retraction alone.
         let placement = crate::device::place_ruled_out(
             device,
             crate::device::Stage::WaveformTcn,
-            "the GPU-batched scorer disagrees with the CPU scorer on real reads \
-             (unresolved correctness issue, not a speed trade-off) — scoring on \
-             the CPU until this is root-caused",
+            "the GPU-batched scorer has a confirmed batch-1 correctness bug and a \
+             separate unexplained rare anomaly of the same kind — scoring on the \
+             CPU until this is root-caused",
         )?;
         let (calls, stats, records) = run_waveform(&args, &bundle, &geometry, placement.is_gpu())?;
         return finish(&args, &bundle, calls, stats, records);

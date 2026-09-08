@@ -53,37 +53,68 @@
 //! The CPU reference itself is stable across the sweep (read 0's logit is
 //! batch-invariant to 3.6e-7, as it must be), so this is not noise on either
 //! side: batch 1 lands 4 orders of magnitude off a reference every other
-//! batch size agrees with to ~2.5e-5. The cause is not confirmed — this
-//! export's decluttered graph shows tract's optimizer fusing the
-//! `expand_instance_norm` rewrite into an `RmsNorm` op, 30 of them, where
-//! `charging_tcn_rna004@v0.1.2`'s graph (the one the rest of this module doc's
-//! numbers come from) does not, so this may be a kernel- or fusion-level bug
-//! specific to that op at `N = 1`. But the fix does not need the cause: a
-//! batch size with no speed upside and a demonstrated correctness failure has
-//! nothing to recommend it, so [`validate_batch`] refuses anything below 2
-//! rather than trusting a future bundle to avoid the same trap.
+//! batch size agrees with to ~2.5e-5, and it reproduces every time (dozens
+//! of repeat trials, 2026-09-07). The cause is not confirmed. **One claim
+//! from an earlier revision of this doc is now known to be wrong and is
+//! retracted**: `charging_tcn_rna004@v0.1.2`'s decluttered graph fuses into
+//! the same 30 `RmsNorm` nodes as `charging_tcn_sup6_rna004@v0.1.0`'s — the
+//! fusion is not what distinguishes a bundle that fails at batch 1 from one
+//! that doesn't (`examples/tcn_cuda_probe.rs --dump` prints the count
+//! directly; both bundles report 30). Whatever is wrong at batch 1 is
+//! either a per-bundle numeric sensitivity or something else entirely, not
+//! "this bundle's graph takes the fused path and that one doesn't." The fix
+//! does not need the cause, though: a batch size with no speed upside and a
+//! demonstrated correctness failure has nothing to recommend it, so
+//! [`validate_batch`] refuses anything below 2 rather than trusting a future
+//! bundle to avoid the same trap.
 //!
-//! # Batch 2 and up is *also* not yet trustworthy — on real chunks
+//! # Batch 2 and up: the original real-chunk divergence did not reproduce
 //!
-//! The sweep above uses the probe's synthetic per-role tensors: uniform
-//! `[-1, 1]` random draws, independent per batch element. Scoring **real**
-//! reads from `charging_tcn_sup6_rna004@v0.1.0` through the actual
-//! [`crate::waveform::classify_reads_gpu`] path at batch 2 disagrees with the
-//! CPU scorer on more than half the reads it scored — not a tolerance gap, a
-//! flipped call (0.999 CPU vs 0.06-0.11 GPU on several reads). NaN and
-//! near-zero-variance feature channels are both ruled out; the leading
-//! unconfirmed hypothesis is that real feature values (variance up to 1e5 in
-//! the raw-level channels, against the probe's ~0.33) trigger a
-//! numerically-unstable reduction inside whichever kernel evaluates the
-//! decluttered `RmsNorm` fusion — a regime the probe's synthetic data never
-//! exercises. Full writeup, evidence and next steps:
-//! rnabioco/escapepod-rs#343.
+//! An earlier revision of this doc reported that real reads from
+//! `charging_tcn_sup6_rna004@v0.1.0` disagreed with the CPU scorer on more
+//! than half of a 19-read fixture at batch 2, and hypothesised that real
+//! feature magnitude (variance up to 1e5 in the raw-level channels) was
+//! triggering a numerically-unstable reduction in the fused `RmsNorm` path.
+//! Neither claim survived follow-up (2026-09-07, A30):
 //!
-//! **This is why `commands/classify.rs` calls `place_ruled_out` rather than
-//! `place_and_report` for this stage** — `--device gpu` is refused outright
-//! rather than routed here, regardless of what batch size is requested. Do
-//! not wire that call site back up to `place_and_report` until #343 is
-//! resolved and re-verified on real, not synthetic, chunks.
+//! * **The magnitude hypothesis is refuted.** `examples/tcn_cuda_probe.rs`
+//!   gained a `--scale` flag; sweeping the probe's synthetic per-role tensors
+//!   from `[-1, 1]` up to `[-500, 500]` (past the real per-channel range) at
+//!   batch 2 shows no degradation at all — max |dlogit| stays at 3.6e-7 to
+//!   2.5e-5 across the whole sweep, the same floor as `scale = 1`.
+//! * **The real-chunk divergence itself does not currently reproduce.**
+//!   `examples/diag_343.rs` runs `classify_reads` and `classify_reads_gpu`
+//!   directly against the exact fixture and the exact checksummed
+//!   `charging_tcn_sup6_rna004@v0.1.0` weights (`sha256` verified at load,
+//!   predates this investigation) — the same 19 reads named in the original
+//!   report (`87011a00`, `b69ae1f6`, …). Eleven repeat runs, batch 2: every
+//!   one agrees with the CPU scorer to max |delta p| = 1.536e-7, zero flipped
+//!   calls at the bundle's own operating point. This is not a tolerance
+//!   argument, it is bit-for-bit identical across all eleven runs.
+//!
+//! **A separate, genuinely rare, non-deterministic anomaly was found while
+//! looking for this, and is not explained.** One `tcn_cuda_probe` run out of
+//! 51 total trials at batch 1 against `charging_tcn_rna004@v0.1.2` (a bundle
+//! otherwise never seen to fail at any batch size) returned max |dlogit| =
+//! 5.950e-1 — as wrong as the sup6 batch-1 failure, and not a value that
+//! reproduced on retry (fifty further trials, all clean at 1.907e-6). Nothing
+//! about it is understood: not tied to `--dump`, not tied to which bundle ran
+//! first in the same job, no crash or NaN reported. It is flagged here rather
+//! than dismissed because it is the same *character* of failure (a whole
+//! logit gone wrong, not a drifting tolerance) on a bundle otherwise believed
+//! safe, and it means an absence of divergence in any *finite* number of
+//! trials — including the eleven above — is evidence, not proof.
+//! rnabioco/escapepod-rs#343 carries the full writeup; #344 is the tracking
+//! issue this feeds.
+//!
+//! **`commands/classify.rs` still calls `place_ruled_out` rather than
+//! `place_and_report` for this stage**, and that has not changed here: the
+//! deterministic batch-1 failure is real and unresolved regardless of the
+//! batch-2 retraction, and a rare, uncharacterised anomaly with this failure
+//! signature is not something to build a production gate around without a
+//! much larger-scale statistical run (thousands of trials, not tens) than
+//! this investigation had time for. Do not wire that call site back up to
+//! `place_and_report` on the strength of the batch-2 retraction alone.
 
 use anyhow::{Result, anyhow, bail};
 use std::path::Path;

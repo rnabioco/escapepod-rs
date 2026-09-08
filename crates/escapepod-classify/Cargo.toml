@@ -83,6 +83,14 @@ required-features = ["waveform-onnx"]
 name = "tcn_cuda_probe"
 required-features = ["waveform-onnx"]
 
+# rnabioco/escapepod-rs#343's own repro, kept runnable now that
+# `commands/classify.rs` refuses `--device gpu` for a waveform_model bundle
+# outright — calls `classify_reads`/`classify_reads_gpu` directly against the
+# shipped fixture, bypassing only the CLI's `place_ruled_out` gate.
+[[example]]
+name = "diag_343"
+required-features = ["cuda"]
+
 [features]
 default = []
 # Load and score the `feature_model` (per-base-feature ONNX) variant of a
