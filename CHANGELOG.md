@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.24.1 (2026-09-08)
+
 ### Performance
 
 - **The waveform classify path's dwell-penalty DP dropped its dominant
