@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+## 0.24.2 (2026-09-09)
+
+### Performance
+
+- **`escpod classify --device gpu` (the windowed TCN variant) needs far
+  fewer CPU threads to keep the GPU fed** (#359). The GPU scores a batch-128
+  chunk in ~0.59 ms/read (`examples/tcn_cuda_probe.rs`); CPU prep — signal
+  fetch, banded-DP refinement, chunk assembly — cost ~19 ms/read, so it took
+  roughly 32 cores of prep to keep one A30 saturated. #353/#355/#357 already
+  cut some of that; this closes most of the rest by transposing the
+  dwell-penalty DP's inner loop (`dp_step_with_dwell_penalty`,
+  `resquiggle/dp/fill.rs`) from `band_pos`-outer to `dwell_idx`-outer.
+
+  For a fixed `dwell_idx` every array access in the untransposed loop
+  (`band_pos - dwell_idx`) is unit-stride, and the `band_pos` range that does
+  real work collapses to a closed form (`lo(dwell_idx)..hi(dwell_idx)`) that
+  absorbs all three of the untransposed loop's per-element guards —
+  including the `truncate_for_zero_offset` edge case. **Bit-identical by
+  construction**: same association, same ascending-`dwell_idx` tie-breaking,
+  no multiply so no FMA-contraction risk — pinned by `assert_eq!` on both
+  `current_scores` and `current_traceback` (not a tolerance) over 4,000
+  randomized trials against the retained pre-transpose body.
+
+  Measured on `resquiggle_dwell_dp` (new criterion group; the hot loop had
+  never had one), rna, one node: 80 bases/30-sample dwell went 5.098 ms →
+  0.975 ms, 150 bases/50-sample dwell 25.19 ms → 4.808 ms — **~5.1-5.2x**.
+  Most of that is not the reordering itself (the transposed-but-unvectorized
+  form is only ~6% faster than the untransposed one) but that the transpose
+  removes the per-element branches blocking LLVM's autovectorization of the
+  now-straight-line inner loop; see `benchmarks/README.md` for the measured
+  breakdown, including a hand-written AVX2 kernel that measured 1.10-1.12x
+  *slower* than the compiler's own 4-wide code and was dropped. A
+  runtime-dispatched AVX-512 kernel (`resquiggle/dp/fill_simd.rs`, gated on
+  `avx512f`, `ESCAPEPOD_DP_BACKEND` to force a backend for A/B) is the one
+  hand-written win measured, 1.06-1.35x over the autovectorized scalar path.
+
+  Two smaller bit-identical fixes in the same per-read prep path: the
+  windowed variant's k-mer level extraction (`chunk.rs`) ran twice per read
+  (once for the residual channels, once inside the DP refinement) for the
+  same answer both times — now computed once; and the CPU-fallback tail at
+  the end of each GPU superbatch (up to 127 reads, scored one at a time on
+  the producer thread with the rayon pool and the GPU both idle) now runs on
+  the pool.
+
 ## 0.24.1 (2026-09-08)
 
 ### Performance
