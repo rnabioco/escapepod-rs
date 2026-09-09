@@ -31,6 +31,15 @@ impl ViterbiBuffers {
 pub(super) struct StepBuffers {
     pub(super) base_scores: Vec<f32>,
     pub(super) base_traceback: Vec<i32>,
+    /// Scratch for the internal baseline-Viterbi fallback pass.
+    ///
+    /// `dp_step_with_dwell_penalty` runs a full Viterbi pass every call (once
+    /// per base, per refinement iteration) to get a fallback score beyond the
+    /// dwell check horizon. Owning the buffer here — instead of going through
+    /// [`dp_step`](super::fill::dp_step), which allocates a fresh
+    /// [`ViterbiBuffers`] on every call — is what makes that pass reuse
+    /// scratch instead of heap-allocating twice per base.
+    pub(super) viterbi_buf: ViterbiBuffers,
 }
 
 impl StepBuffers {
@@ -38,6 +47,7 @@ impl StepBuffers {
         Self {
             base_scores: vec![0.0f32; capacity],
             base_traceback: vec![0i32; capacity],
+            viterbi_buf: ViterbiBuffers::new(capacity),
         }
     }
 
@@ -49,5 +59,6 @@ impl StepBuffers {
         }
         self.base_scores[..len].fill(0.0);
         self.base_traceback[..len].fill(0);
+        self.viterbi_buf.prepare(len);
     }
 }
