@@ -557,6 +557,41 @@ pub fn classify_reads(
 /// valid row, so padding a mostly-empty batch would cost the same as a full
 /// one for a handful of reads. This is what makes "GPU is never worse than
 /// CPU" true; see [`crate::waveform_net_gpu`]'s module doc for the numbers.
+///
+/// # Pipelining (#351)
+///
+/// A prior version prepared a whole superbatch on CPU (`par_iter` over all
+/// 16,384 reads), fully serially, before issuing a single GPU call — so the
+/// GPU sat idle for the entire prep phase and the CPU sat idle for the
+/// entire scoring phase, alternating in bursts. Confirmed live on a
+/// production node (`nvidia-smi dmon`, 4-core `--threads 4` job): 331 of 381
+/// one-second samples flat at `sm=0`, a 13.1% duty cycle. This version
+/// overlaps the two: a dedicated GPU consumer thread scores each group as it
+/// becomes ready while the producer (this function's caller thread, using
+/// `rayon`'s pool the same as before) prepares the next one, connected by a
+/// bounded channel — the same producer/CPU-pool-thread ->
+/// bounded-channel -> single-GPU-consumer-thread shape as
+/// `commands/demux/detect.rs`'s GPU path, just with the channel carrying
+/// exactly-`batch`-sized groups instead of whole superbatches (a tract-cuda
+/// plan's batch dimension is fixed, unlike `detect.rs`'s CNN which accepts
+/// one grouped call per length bucket).
+///
+/// Reads are prepared `prep_chunk` at a time — a size independent of
+/// `batch`, see its doc below — so a group can be handed to the GPU as soon
+/// as it fills, but a `carry` buffer folds the occasional no-call read
+/// across those raw sub-chunks. Which reads land in which GPU group, and in
+/// what order, is unaffected by any of this: this is a scheduling change,
+/// not a grouping change, and the two are bit-identical by construction —
+/// verified on the same real dataset at every point of the tuning sweep
+/// below (BAM and TSV output, byte-for-byte).
+///
+/// End to end on that dataset (55,446 anchored reads, real POD5 + aligned
+/// BAM + `charging_tcn_sup6_rna004@v0.1.0`, A30, `--threads 4`): 364.7s
+/// fully-serial -> 203.3s pipelined at the tuned defaults below, ~1.8x. Most
+/// of that came from `groups_in_flight` and `prep_chunk`, not from the
+/// overlap alone — see their doc comments for the sweep that found them; the
+/// first cut of this fix (both at their most conservative plausible values)
+/// only reached 315.2s.
 #[cfg(feature = "cuda")]
 pub fn classify_reads_gpu(
     bundle: &ChargingBundle,
@@ -577,49 +612,126 @@ pub fn classify_reads_gpu(
     }
 
     const SUPERBATCH: usize = 16_384;
+    // Groups in flight through the channel. `detect.rs`'s GPU_BLOCK channel
+    // (a different pipeline entirely — see the doc above) uses depth 2, and
+    // that was this function's first guess too; it measured badly here. At
+    // depth 2 the producer blocks on `tx.send` as soon as one group is
+    // queued and the consumer hasn't drained it yet, and on a 4-core node
+    // that block is *idle* rather than useful work — CPU never rose above
+    // ~194% of the 4 allocated cores, and wall time barely improved on the
+    // fully-serial version it replaced (315s vs 365s on a real 55k-read,
+    // 60k-BAM-record production sample, `charging_tcn_sup6_rna004@v0.1.0`,
+    // A30, `--threads 4`). Depth swept 2/8/16/32 at the default prep chunk
+    // (below) plateaus and then regresses past 16: 315s / 242s / 222s / 240s,
+    // CPU 194% / 256% / 278% / 257%. 16 is the plateau, not a guess.
+    let groups_in_flight: usize = std::env::var("ESCAPEPOD_WAVEFORM_GPU_GROUPS_IN_FLIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(16);
+    // How many reads' worth of prep `rayon` load-balances per synchronous
+    // `par_iter` call, independent of `batch` (the GPU's own fixed contract).
+    // Tying this 1:1 to `batch` — the first version's choice — was a second
+    // mistake compounding the channel-depth one: every sync point produced
+    // *exactly* one GPU group, so the finest possible handoff granularity
+    // *and* the coarsest possible rayon load-balancing window landed on the
+    // same number for no reason but convenience. Widening it (same sweep,
+    // `groups_in_flight` pinned at 16) kept helping well past `batch` itself:
+    // 128/256/512/1024 reads/chunk measured 222s / 212s / 206s / 203s wall,
+    // 278% / 289% / 297% / 303% CPU — before flattening at 1024 (`chunk`
+    // above `batch` still yields one GPU group as soon as `batch` valid
+    // reads accumulate in `carry`; it does not wait for the whole chunk to
+    // become one bigger GPU call). 8x batch sits on that plateau without
+    // guessing how far past it diminishing returns would go for a
+    // differently-shaped bundle. All numbers bit-identical to the
+    // fully-serial baseline at every point on the sweep (see the module doc).
+    let prep_chunk: usize = std::env::var("ESCAPEPOD_WAVEFORM_GPU_PREP_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(batch.saturating_mul(8));
+
+    type Group<'r> = Vec<(&'r WaveformRead, Chunk)>;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Group>(groups_in_flight);
+
     let mut stats = ClassifyStats::default();
     let mut calls: Vec<ReadCall> = Vec::with_capacity(reads.len());
 
-    for slice in reads.chunks(SUPERBATCH) {
-        let prepared: Vec<Prepared> = slice
-            .par_iter()
-            .map(|&read| {
-                let Some(info) = pod5.reads().get(&read.read_id) else {
-                    return Ok(Prepared::None(no_call(read, NoCallReason::NoSignal)));
-                };
-                let raw = signal_adc(info, &extractors)?;
-                if raw.len() as i64 != read.ns {
-                    return Ok(Prepared::None(no_call(read, NoCallReason::NsMismatch)));
+    let gpu_calls = std::thread::scope(|scope| -> Result<Vec<ReadCall>> {
+        // The only thread that calls `gpu.logits()`, so GPU calls stay
+        // sequential exactly as before — only now overlapped with the next
+        // group's CPU prep instead of blocking it.
+        let gpu_handle = scope.spawn(move || -> Result<Vec<ReadCall>> {
+            let mut out = Vec::new();
+            while let Ok(group) = rx.recv() {
+                let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
+                let logits = gpu.logits(&refs, spec)?;
+                for ((read, _), logit) in group.iter().zip(logits) {
+                    out.push(call_from_logit(read, spec, logit));
                 }
-                let Some(chunk) = assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw) else {
-                    return Ok(Prepared::None(no_call(read, no_chunk)));
-                };
-                Ok(Prepared::Ready(read, chunk))
-            })
-            .collect::<Result<_>>()?;
-
-        let mut ready: Vec<(&WaveformRead, Chunk)> = Vec::with_capacity(prepared.len());
-        for p in prepared {
-            match p {
-                Prepared::Ready(read, chunk) => ready.push((read, chunk)),
-                Prepared::None(n) => record_no_call(&mut stats, n),
             }
-        }
+            Ok(out)
+        });
 
-        let mut groups = ready.chunks_exact(batch);
-        for group in &mut groups {
-            let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
-            let logits = gpu.logits(&refs, spec)?;
-            for ((read, _), logit) in group.iter().zip(logits) {
+        'outer: for slice in reads.chunks(SUPERBATCH) {
+            // Valid preps not yet folded into a full group, in the same
+            // order they would have landed in `ready` if the whole
+            // superbatch were prepared up front — so which reads share a
+            // GPU group is unaffected by streaming them in smaller pieces.
+            let mut carry: Vec<(&WaveformRead, Chunk)> = Vec::with_capacity(batch);
+
+            for raw in slice.chunks(prep_chunk) {
+                let prepared: Vec<Prepared> = raw
+                    .par_iter()
+                    .map(|&read| {
+                        let Some(info) = pod5.reads().get(&read.read_id) else {
+                            return Ok(Prepared::None(no_call(read, NoCallReason::NoSignal)));
+                        };
+                        let raw = signal_adc(info, &extractors)?;
+                        if raw.len() as i64 != read.ns {
+                            return Ok(Prepared::None(no_call(read, NoCallReason::NsMismatch)));
+                        }
+                        let Some(chunk) = assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw)
+                        else {
+                            return Ok(Prepared::None(no_call(read, no_chunk)));
+                        };
+                        Ok(Prepared::Ready(read, chunk))
+                    })
+                    .collect::<Result<_>>()?;
+
+                for p in prepared {
+                    match p {
+                        Prepared::Ready(read, chunk) => carry.push((read, chunk)),
+                        Prepared::None(n) => record_no_call(&mut stats, n),
+                    }
+                }
+
+                while carry.len() >= batch {
+                    let group: Group = carry.drain(0..batch).collect();
+                    if tx.send(group).is_err() {
+                        // The GPU thread died; stop producing and surface
+                        // its error at `join` below instead of this one.
+                        break 'outer;
+                    }
+                }
+            }
+
+            // Fewer than `batch` valid reads left at the end of this
+            // superbatch: score them on the CPU rather than pad a GPU call —
+            // same rule as before, see the doc comment above.
+            for (read, chunk) in carry.drain(..) {
+                let logit = cpu_fallback.logit(&chunk, spec)?;
                 calls.push(call_from_logit(read, spec, logit));
             }
         }
-        for (read, chunk) in groups.remainder() {
-            let logit = cpu_fallback.logit(chunk, spec)?;
-            calls.push(call_from_logit(read, spec, logit));
-        }
-    }
 
+        drop(tx);
+        gpu_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("GPU scoring thread panicked"))?
+    })?;
+
+    calls.extend(gpu_calls);
     calls.sort_by_key(|c| c.read_id);
     stats.no_calls.sort_by_key(|n| n.read_id);
     Ok((calls, stats))

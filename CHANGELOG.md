@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Performance
+
+- **`escpod classify --device gpu` (the windowed TCN variant) no longer
+  starves the GPU behind a fully-serial CPU prep phase** (#351).
+  `waveform::classify_reads_gpu` used to prepare a whole 16,384-read
+  superbatch on CPU (`par_iter`, zero GPU calls) before issuing a single run
+  of sequential GPU calls — confirmed live on a production node via
+  `nvidia-smi dmon`: 331 of 381 one-second samples flat at `sm=0`, a 13.1%
+  duty cycle, on a 4-core (`--threads 4`) job. It now pipelines the two
+  phases through a bounded channel and a dedicated GPU consumer thread — the
+  same producer/CPU-pool-thread -> bounded-channel -> single-GPU-consumer-
+  thread shape `commands/demux/detect.rs`'s GPU path already used, adapted
+  to a tract-cuda plan's fixed batch size. Two scheduling constants
+  (`groups_in_flight`, `prep_chunk` — both overridable via
+  `ESCAPEPOD_WAVEFORM_GPU_GROUPS_IN_FLIGHT`/`ESCAPEPOD_WAVEFORM_GPU_PREP_CHUNK`)
+  were swept on a real production sample (55,446 anchored reads, real POD5 +
+  aligned BAM, `charging_tcn_sup6_rna004@v0.1.0`, A30, `--threads 4`) rather
+  than guessed: a shallow channel (depth 2, borrowed from `detect.rs`'s
+  differently-shaped pipeline) barely moved the needle (365s -> 315s), and
+  tying the CPU prep chunk 1:1 to the GPU's batch size compounded it —
+  widening both to their swept defaults (channel depth 16, prep chunk 8x
+  batch) reached 203s, **~1.8x**. Output is bit-identical to the prior
+  fully-serial code at every point on the sweep (same `ReadCall`s, same
+  no-call tallies, BAM and TSV byte-for-byte) — this is a scheduling change,
+  not a numerics change. New end-to-end probe:
+  `examples/waveform_gpu_pipeline_probe.rs`, sibling to `tcn_cuda_probe.rs`
+  but against real inputs with a built-in `nvidia-smi dmon` duty-cycle
+  capture, since an isolated-kernel probe cannot see a starved pipeline.
+
 ## 0.24.0 (2026-09-08)
 
 ### Fixed
