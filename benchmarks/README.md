@@ -1,5 +1,58 @@
 # Benchmark Results
 
+## Dwell-penalty DP: a hand-written AVX2 kernel lost to the compiler (2026-09-09)
+
+A register-blocked AVX2 kernel for the `dwell_idx`-outer sweep in
+`dp_step_with_dwell_penalty` (`crates/escapepod-signal/src/resquiggle/dp/
+fill_simd.rs`) was benchmarked against its own `Scalar` backend and reported
+as a 4-6x win. That baseline was wrong: the `Scalar` backend it was compared
+against was a *regression*, not the pre-existing code. Immediately before
+this module existed, the same sweep was one flat loop written inline in
+`fill.rs`, and LLVM autovectorized it 4-wide (`vsubpd` -> `vcvtpd2ps` ->
+`vaddps`/`vaddps` -> `vcmpltps` -> `vmaskmovps`). The `Scalar` backend had
+reimplemented that loop by delegating to a helper taking `block_start`/
+`block_end` as ordinary `usize` parameters; with the block bound opaque to
+the call site, LLVM could no longer prove `cand`/`cand_tb`/`cum` accesses
+in-bounds, so a bounds check (and its panic branch) stayed inside the loop
+and blocked autovectorization outright — a ~4.7-5.1x regression on its own,
+independent of any SIMD kernel.
+
+`cargo bench -p escapepod-signal --bench hot_paths -- dwell`, rna, one node,
+one run, before vs. after restoring the flat loop as `Scalar` (and deleting
+the AVX2 kernel, see below):
+
+| shape | flat loop (pre-regression / restored) | regressed `Scalar` (opaque-block helper) | AVX2 kernel | AVX-512 kernel |
+|---|---:|---:|---:|---:|
+| 80bases_30dwell | **0.975 ms** | 4.785 ms | 1.147 ms | 0.952 ms |
+| 150bases_50dwell | **4.808 ms** | 23.99 ms | 5.171 ms | 3.616 ms |
+
+Measured against the correct baseline (the restored flat loop), not the
+regressed one the kernel was originally compared to:
+
+- The register-blocked **AVX2 kernel is 1.10-1.12x *slower*** than LLVM's
+  own 4-wide autovectorization of the flat loop. Removed outright
+  (`dwell_block_kernel_avx2`, `sweep_avx2`, the `Avx2` backend variant) —
+  do not re-propose a hand-written AVX2 kernel for this loop; LLVM's own
+  codegen already wins.
+- The **AVX-512 kernel is the only real win**, 1.08-1.30x faster than the
+  flat loop. Kept, gated on `avx512f`.
+- The transpose itself (`dwell_idx`-outer instead of `band_pos`-outer, the
+  follow-up to #356's prefix sum) is real but small next to
+  autovectorization. Comparing the two *unvectorized* forms like for like —
+  the transposed-but-unvectorized `Scalar` regression above at 4.785 ms
+  against #356/#357's shipped `band_pos`-outer loop at 5.098 ms, both at
+  80bases_30dwell — the reordering on its own is worth only ~6%. Its actual
+  value is that it *enables* 4-wide autovectorization of the inner loop:
+  0.975 ms against that 5.098 ms baseline. Most of the win is the
+  compiler's, not the reordering's — which is also why the accidental
+  regression cost 4.7x rather than 6%.
+
+Confirmed by disassembly of the bench binary (`objdump -d`) that the
+restored flat loop vectorizes again: `vcvtpd2ps` present in the loop body,
+no `panic_bounds_check` call inside it. `ESCAPEPOD_DP_BACKEND=scalar` and
+`ESCAPEPOD_DP_BACKEND=avx512` select each backend for A/B; `avx2` is
+accepted but ignored (with a warning) since the kernel no longer exists.
+
 ## Demux, CRF path: the harness and the before numbers (2026-09-06)
 
 Part 1 of rnabioco/escapepod-rs#331. The command the aa-tRNA-seq pipeline

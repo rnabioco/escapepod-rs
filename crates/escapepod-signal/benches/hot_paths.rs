@@ -3,6 +3,9 @@
 //! Covers:
 //! - DTW distance (classic Viterbi-style 2-row DP used by demux)
 //! - Resquiggle DP step (banded Viterbi used by resquiggle)
+//! - Resquiggle dwell-penalty banded DP (the `waveform_model` classify hot
+//!   path — end-to-end `banded_dp` over a `BandingAlgo::Fixed` band, not
+//!   just the per-step function)
 //! - Fingerprint MAD normalization (demux fingerprint preprocessing)
 //! - VBZ roundtrip (SVB16 + ZSTD — signal compression hot path)
 //! - DTW distance-matrix (training path)
@@ -25,7 +28,8 @@ use std::hint::black_box;
 use escapepod_signal::compression::vbz;
 use escapepod_signal::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
 use escapepod_signal::resquiggle::adaptive_dp::adaptive_banded_dp;
-use escapepod_signal::resquiggle::dp::{ViterbiBuffers, dp_step_buffered};
+use escapepod_signal::resquiggle::bands::Band;
+use escapepod_signal::resquiggle::dp::{ViterbiBuffers, banded_dp, dp_step_buffered};
 use escapepod_signal::resquiggle::types::RefineAlgo;
 
 /// Read ESCAPEPOD_BENCH_THREADS and pre-configure the rayon global pool.
@@ -118,6 +122,73 @@ fn bench_dp_step(c: &mut Criterion) {
                 );
             });
         });
+    }
+    group.finish();
+}
+
+/// The actual hot path behind rnabioco/escapepod-rs#353/#356: `banded_dp`
+/// with `RefineAlgo::DwellPenalty` over a `BandingAlgo::Fixed` band — what
+/// every shipped `waveform_model` bundle resolves (`RefineAlgo::default()`).
+/// `bench_dp_step` above only exercises `dp_step_buffered`, the plain-
+/// Viterbi step that #353's profiling attributed 1.66% of real cycles to;
+/// `dp_step_with_dwell_penalty` (dispatched from here via `DpContext::step`)
+/// is where the other ~75% goes, and until now nothing in this file called
+/// it end to end.
+fn bench_dwell_dp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resquiggle_dwell_dp");
+    // (n_bases, samples_per_base): a tRNA-shaped read and a longer one.
+    for &(n_bases, dwell) in &[(80usize, 30usize), (150, 50)] {
+        let signal_len = n_bases * dwell;
+        let levels = pseudo_floats(n_bases, 0x0DDE_1EAF);
+
+        // Per-base constant level plus a little per-sample noise — same
+        // shape as `test_banded_dp_dwell_penalty_end_to_end`
+        // (resquiggle/dp/mod.rs) but not a perfectly clean signal, which a
+        // real read never produces and which would make every dwell
+        // transition score identically.
+        let mut signal = vec![0.0f32; signal_len];
+        for (i, &level) in levels.iter().enumerate() {
+            for j in 0..dwell {
+                signal[i * dwell + j] = level;
+            }
+        }
+        let noise = pseudo_floats(signal_len, 0x0B00_F1E5);
+        for (s, n) in signal.iter_mut().zip(noise.iter()) {
+            *s += n * 0.05;
+        }
+
+        // Band construction exactly as `refine.rs::refinement_step` builds
+        // it for `BandingAlgo::Fixed`: a signal band at `half_bandwidth = 5`
+        // around the (zero-based) true map, then converted to a sequence
+        // band with `adjust_band_min_size = 2`. Built once outside the
+        // timed region, like `bench_adaptive_dp`'s `initial_map` below —
+        // deterministic setup, not what's being measured, and `banded_dp`
+        // only borrows the band (never mutates it), so one build serves
+        // every iteration.
+        let map_zeroed: Vec<usize> = (0..=n_bases).map(|i| i * dwell).collect();
+        let mut band = Band::compute_signal_band(&map_zeroed, n_bases, 5).unwrap();
+        band.convert_to_sequence_band(2).unwrap();
+
+        let method = RefineAlgo::DwellPenalty {
+            target: dwell as f32,
+            weight: 0.5,
+        };
+
+        group.throughput(Throughput::Elements(n_bases as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_bases}bases_{dwell}dwell")),
+            &n_bases,
+            |bench, _| {
+                bench.iter(|| {
+                    banded_dp(
+                        black_box(&signal),
+                        black_box(&levels),
+                        black_box(&band),
+                        black_box(&method),
+                    )
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -278,6 +349,7 @@ criterion_group!(
     benches,
     bench_dtw,
     bench_dp_step,
+    bench_dwell_dp,
     bench_adaptive_dp,
     bench_fingerprint_mad,
     bench_vbz_roundtrip,

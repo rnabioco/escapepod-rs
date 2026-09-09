@@ -549,12 +549,18 @@ pub fn process_read(
 
     let mut levels = None;
     if let Some(lm) = cfg.levels {
+        // Computed once and shared with `refine_map` below: that function used
+        // to call `extract_levels_bytes` again internally, so the `HashMap<
+        // String, f64>` k-mer probe ran over the whole sequence twice per read
+        // for the same answer both times.
+        let f64_levels = extract_levels_bytes(&sequence, &lm);
         if let Some(rp) = cfg.refine {
-            refine_map(&signal, &mut seq_to_sig, &sequence, &lm, &rp);
+            let f32_levels: Vec<f32> = f64_levels.iter().map(|&v| v as f32).collect();
+            refine_map(&signal, &mut seq_to_sig, &f32_levels, &rp);
         }
         // Extracted whether or not the boundaries moved: the residual channels
         // need them either way.
-        levels = Some(extract_levels_bytes(&sequence, &lm));
+        levels = Some(f64_levels);
     }
 
     if seq_to_sig.len() < 2 {
@@ -584,17 +590,7 @@ fn extract_levels_bytes(sequence: &[u8], lm: &LevelModel<'_>) -> Vec<f64> {
 /// weakly identified — which destroys exactly the cross-read comparability the
 /// residual channels depend on (measured in leech: level-vs-expected
 /// correlation r = +0.72 keeping the read-wide gauge, +0.03 applying the fit).
-fn refine_map(
-    signal: &[f32],
-    seq_to_sig: &mut Vec<i64>,
-    sequence: &[u8],
-    lm: &LevelModel<'_>,
-    rp: &RefineParams,
-) {
-    let levels: Vec<f32> = extract_levels_bytes(sequence, lm)
-        .iter()
-        .map(|&v| v as f32)
-        .collect();
+fn refine_map(signal: &[f32], seq_to_sig: &mut Vec<i64>, levels: &[f32], rp: &RefineParams) {
     if levels.is_empty() || seq_to_sig.len() != levels.len() + 1 {
         return;
     }
@@ -611,7 +607,7 @@ fn refine_map(
         RefineSettings::move_table_refinement(rp.half_bandwidth, rp.scale_iters, rp.seed);
     // The signal is already normalised, so start from identity scaling and let
     // the rough rescale derive the level-matching transform.
-    let Ok(result) = refine_signal_map(&settings, signal, &map, &levels, 1.0, 0.0) else {
+    let Ok(result) = refine_signal_map(&settings, signal, &map, levels, 1.0, 0.0) else {
         return;
     };
     if result.seq_to_signal_map.len() != seq_to_sig.len() {

@@ -4,6 +4,7 @@
 //! Forward DP fill: per-base step implementations and dwell penalty model.
 
 use super::buffers::{StepBuffers, ViterbiBuffers};
+use super::fill_simd::{self, DpBackend};
 use super::{DpContext, INVALID_PENALTY, score};
 use crate::resquiggle::bands::Band;
 
@@ -235,10 +236,105 @@ pub fn dp_step_buffered(
 /// found zero disagreement at real-dataset scale — the bar this one did not
 /// clear.
 ///
-/// **Not hand-vectorized.** Breaking the dependency was the point — whether
-/// it also needs explicit SIMD intrinsics is a measure-first question (see
-/// #356's non-goals); this is deliberately still a scalar loop pending that
-/// measurement.
+/// **The loop below is transposed, `dwell_idx`-outer rather than
+/// `band_pos`-outer.** The scalar `band_pos`-outer form (kept verbatim under
+/// `#[cfg(test)]` as [`dp_step_with_dwell_penalty_prefix_scalar`], the
+/// immediate pre-transpose baseline) indexes every array it touches by
+/// `band_pos - dwell_idx`: `cum[band_pos + 1] - cum[band_pos - dwell_idx]`
+/// and `previous_scores[band_pos - dwell_idx - 1 + prev_band_offset]`. For a
+/// *fixed* `dwell_idx` that offset is constant, so as `band_pos` varies every
+/// one of those accesses is unit-stride — the access pattern was already
+/// there, it was just the outer loop variable holding the wrong thing fixed.
+/// Swapping which variable is outer turns the inner loop into a straight
+/// sequential scan and removes two per-element branches it used to carry
+/// (the `dwell_offset >= previous_scores.len()` skip, and the
+/// `dwell_idx < penalty_table.len()` table-bounds check — see below), which
+/// sets up for the register-blocked SIMD kernels that read this same
+/// transposed shape (a separate, later change, not this one).
+///
+/// For a fixed `dwell_idx`, the set of `band_pos` that perform a candidate
+/// update — i.e. that would *not* hit the `continue` in the untransposed
+/// form — is the contiguous range `lo(dwell_idx)..hi(dwell_idx)`:
+///
+/// ```text
+/// lo(dwell_idx) = dwell_idx + (if prev_band_offset == 0 { 1 } else { 0 })
+/// hi(dwell_idx) = min(len, previous_scores.len() + dwell_idx + 1 - prev_band_offset)
+/// ```
+///
+/// `lo` falls out of two constraints that turn out to coincide. First,
+/// `dwell_idx` has to sit within the untransposed loop's own upper bound
+/// `effective_upper(band_pos) = min(band_pos - (if prev_band_offset == 0
+/// {1} else {0}), max_check - 1)`, which rearranges to `band_pos >=
+/// dwell_idx + 1` when `prev_band_offset == 0`, else `band_pos >=
+/// dwell_idx`. Second, `dwell_offset = band_pos - dwell_idx - 1 +
+/// prev_band_offset` has to be `>= 0`, or the untransposed loop's own
+/// `continue` would have fired — which rearranges to `band_pos >= dwell_idx
+/// + 1 - prev_band_offset`. Checking both cases shows the second is always
+/// implied by the first (when `prev_band_offset == 0` they're the same
+/// inequality; when `prev_band_offset >= 1` the second is strictly weaker),
+/// so `lo` needs no separate `max()` of the two. `hi` is the mirror
+/// constraint, `dwell_offset < previous_scores.len()`, solved for
+/// `band_pos`. Three guards from the untransposed form fall out of this for
+///   free, needing no separate test in the vector loop below:
+///
+/// - `truncate_for_zero_offset` (present in
+///   [`dp_step_with_dwell_penalty_prefix_scalar`] below) is exactly the `+1`
+///   in `lo` when `prev_band_offset == 0` — it existed only to keep
+///   `dwell_idx` from reaching `band_pos` itself in that case, which
+///   `lo(dwell_idx) = dwell_idx + 1` already guarantees by construction:
+///   `band_pos == dwell_idx` is simply outside the range.
+/// - The `band_pos == 0 && prev_band_offset == 0` early `continue` is
+///   subsumed the same way: `lo(0) = 1` when `prev_band_offset == 0`, so
+///   `band_pos == 0` is never in range for any `dwell_idx`, and the
+///   candidate buffer is left at its initial sentinel — the same value the
+///   early `continue` produces by leaving `current_scores[0]` untouched
+///   after the sentinel write.
+/// - The "past end of previous band" early-stay guard (`band_pos as i32 +
+///   prev_band_offset as i32 - previous_scores.len() as i32 >= max_check as
+///   i32`) is implied by `hi(dwell_idx)` for every `dwell_idx <= max_check -
+///   1`: a `band_pos` at or past that guard's threshold is at or past
+///   `hi(max_check - 1)` too, so no `dwell_idx` iteration ever reaches it —
+///   the vector loop needs no test for it at all. It still needs its own
+///   test in the scalar tail pass below, because the tail pass is what
+///   actually *writes* `current_scores`/`current_traceback` for such a
+///   `band_pos` (the candidate sweep just never touches it, leaving
+///   whatever sentinel or stray candidate sat in `buf.cand` for that
+///   position irrelevant — the tail pass overrides it unconditionally
+///   before any other read).
+///
+/// `max_check <= DWELL_TABLE_SIZE` (256) and `penalty_table.len() ==
+/// DWELL_TABLE_SIZE` always (every caller builds the table via
+/// [`build_dwell_penalty_table`]), so `dwell_idx < penalty_table.len()`
+/// holds across the whole `0..max_check` outer range — the `else` branch
+/// computing `dwell_penalty(..)` inline was already dead in production, and
+/// is replaced below by a debug assertion instead of a per-element branch.
+///
+/// **This is bit-identical, not merely equivalent.** The per-candidate
+/// arithmetic is untouched: the same `(cum[band_pos + 1] - cum[band_pos -
+/// dwell_idx]) as f32` (an `f64` subtraction, then one `as f32` cast,
+/// round-to-nearest-even like every other numeric cast in this codebase),
+/// the same left-associated `previous_scores[..] + running_pos_score +
+/// pen`, the same strict `<` update. `dwell_idx` is still visited in
+/// ascending order for every `band_pos` a given `dwell_idx` touches (the
+/// outer loop counts up from 0), so a fixed `band_pos`'s candidates are
+/// compared in exactly the same order as before — just produced by
+/// different outer-loop iterations instead of gathered into one inner
+/// loop, which is invisible to the comparison itself. There is no multiply
+/// anywhere in the body, so there is no FMA-contraction risk to weigh
+/// either. The property tests below (`transposed_matches_prefix_scalar_*`)
+/// assert `assert_eq!` — exact equality of both `current_scores` and
+/// `current_traceback` against [`dp_step_with_dwell_penalty_prefix_scalar`]
+/// — not a tolerance; if any case turns up where that doesn't hold, the fix
+/// is to find the bug, not to widen the assertion.
+///
+/// **Still scalar.** The register-blocked SIMD kernels that read this
+/// transposed shape are a separate, later change. This one lands alone
+/// because it already wins on its own — the two guards leave the inner
+/// loop, the iterations the `dwell_offset` guard used to `continue` past
+/// are never visited at all instead of merely skipped, and the branch on
+/// `penalty_table.len()` is gone — and because landing it alone keeps the
+/// bit-identical claim easy to check before SIMD adds its own edge cases on
+/// top of it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dp_step_with_dwell_penalty(
     current_scores: &mut [f32],
@@ -249,8 +345,43 @@ pub(super) fn dp_step_with_dwell_penalty(
     prev_band_offset: usize,
     penalty_table: &[f32],
     target: f32,
+    weight: f32,
+    buf: &mut StepBuffers,
+) {
+    dp_step_with_dwell_penalty_with_backend(
+        current_scores,
+        current_traceback,
+        previous_scores,
+        current_level,
+        current_signal,
+        prev_band_offset,
+        penalty_table,
+        target,
+        weight,
+        buf,
+        DpBackend::best_for(),
+    )
+}
+
+/// [`dp_step_with_dwell_penalty`], with the `dwell_idx`-sweep backend chosen
+/// explicitly rather than via [`DpBackend::best_for`]. Split out so the
+/// property tests below can sweep every backend `DpBackend::available()`
+/// reports on this machine, not just the one the dispatch would have picked
+/// — see `fill_simd`'s module doc comment for why that matters (rnabioco/
+/// escapepod-rs#328).
+#[allow(clippy::too_many_arguments)]
+fn dp_step_with_dwell_penalty_with_backend(
+    current_scores: &mut [f32],
+    current_traceback: &mut [i32],
+    previous_scores: &[f32],
+    current_level: f32,
+    current_signal: &[f32],
+    prev_band_offset: usize,
+    penalty_table: &[f32],
+    target: f32,
     _weight: f32,
     buf: &mut StepBuffers,
+    backend: DpBackend,
 ) {
     let len = current_scores.len();
     buf.prepare(len);
@@ -284,92 +415,96 @@ pub(super) fn dp_step_with_dwell_penalty(
     // Bound the inner loop: check up to 2*target (covers the full quadratic
     // region plus some logarithmic), clamped to [8, DWELL_TABLE_SIZE].
     let max_check = ((2.0 * target).ceil() as usize).clamp(8, DWELL_TABLE_SIZE);
+    let prev_len = previous_scores.len();
 
+    // `max_check <= DWELL_TABLE_SIZE == penalty_table.len()` for every real
+    // caller (the table is always built by `build_dwell_penalty_table`), so
+    // `penalty_table[dwell_idx]` below never needs the `dwell_penalty(..)`
+    // fallback the untransposed form carried for an out-of-range index.
+    debug_assert!(
+        max_check <= penalty_table.len(),
+        "max_check {max_check} exceeds penalty_table.len() {} \
+         (expected DWELL_TABLE_SIZE = {DWELL_TABLE_SIZE}); \
+         penalty_table[dwell_idx] would be out of bounds",
+        penalty_table.len(),
+    );
+
+    // Candidate score/traceback per `band_pos`, min-reduced across the
+    // `dwell_idx`-outer sweep below. Starts at the same "no valid
+    // transition" sentinel the untransposed form writes as its default.
+    let cand = &mut buf.cand[..len];
+    let cand_tb = &mut buf.cand_tb[..len];
+    cand.fill(INVALID_PENALTY + previous_scores[prev_len - 1]);
+    cand_tb.fill(-1);
+
+    // The `dwell_idx`-outer sweep itself — dispatched to a register-blocked
+    // SIMD kernel when `backend` and this machine allow it, and to a scalar
+    // sweep otherwise. `lo(dwell_idx) = dwell_idx + zero_offset_shift` and
+    // `hi(dwell_idx) = min(len, (prev_len - prev_band_offset) + dwell_idx +
+    // 1)` — see the doc comment above for the derivation of both bounds and
+    // `fill_simd`'s module doc comment for how the SIMD kernels use them.
+    // `prev_band_offset <= prev_len` always holds for a real forward pass
+    // (see the invariant restated in the property tests' `random_case`
+    // below), so `prev_len - prev_band_offset` is always representable.
+    fill_simd::run_dwell_sweep(
+        cum,
+        previous_scores,
+        penalty_table,
+        cand,
+        cand_tb,
+        len,
+        max_check,
+        prev_band_offset,
+        backend,
+    );
+
+    // Scalar tail pass: applies the three steps that carry a
+    // `current_scores[band_pos - 1]` / `current_traceback[band_pos - 1]`
+    // dependency and so cannot join the `dwell_idx`-outer sweep above —
+    // the early-stay guard, the baseline-Viterbi fallback beyond
+    // `max_check`, and the "no valid transition" stay-fallback — in the
+    // same order the untransposed form applied them.
     for band_pos in 0..len {
-        // Past end of previous band by more than max_check — just stay
-        if band_pos as i32 + prev_band_offset as i32 - previous_scores.len() as i32
-            >= max_check as i32
-        {
+        // Past end of previous band by more than max_check — just stay.
+        // Implied by `hi(dwell_idx)` for every `dwell_idx <= max_check - 1`
+        // above (see the doc comment), so this is the one guard the vector
+        // loop above never needed but this tail pass still must apply,
+        // since it is what writes `current_scores`/`current_traceback` for
+        // such a `band_pos`.
+        if band_pos as i32 + prev_band_offset as i32 - prev_len as i32 >= max_check as i32 {
             current_scores[band_pos] =
                 current_scores[band_pos - 1] + score(current_level, current_signal[band_pos]);
             current_traceback[band_pos] = current_traceback[band_pos - 1] + 1;
             continue;
         }
 
-        // Default: invalid score
-        current_scores[band_pos] = INVALID_PENALTY + previous_scores[previous_scores.len() - 1];
-        current_traceback[band_pos] = -1;
+        let mut best_score = cand[band_pos];
+        let mut best_tb = cand_tb[band_pos];
 
-        if band_pos == 0 && prev_band_offset == 0 {
-            continue;
-        }
-
-        // Try dwell transitions with explicit penalty (bounded to max_check)
-        let check_limit = band_pos.min(max_check - 1);
-        // The reference implementation breaks out of its accumulator loop
-        // before adding dwell_idx == band_pos's own score when
-        // prev_band_offset == 0 (no earlier base to reach past position 0).
-        // That only overlaps check_limit == band_pos (band_pos <=
-        // max_check - 1), in which case band_pos >= 1 is guaranteed (the
-        // band_pos == 0 && prev_band_offset == 0 case already `continue`d
-        // above), so the subtraction below can't underflow.
-        let truncate_for_zero_offset = prev_band_offset == 0 && check_limit == band_pos;
-        let effective_upper = if truncate_for_zero_offset {
-            check_limit - 1
-        } else {
-            check_limit
-        };
-
-        for dwell_idx in 0..=effective_upper {
-            // band_pos - dwell_idx never underflows: dwell_idx <=
-            // effective_upper <= check_limit <= band_pos.
-            let running_pos_score = (cum[band_pos + 1] - cum[band_pos - dwell_idx]) as f32;
-
-            let dwell_offset =
-                (band_pos as i32 - dwell_idx as i32 - 1 + prev_band_offset as i32) as usize;
-            if dwell_offset >= previous_scores.len() {
-                continue;
-            }
-
-            let pen = if dwell_idx < penalty_table.len() {
-                penalty_table[dwell_idx]
-            } else {
-                dwell_penalty(dwell_idx, target, _weight)
-            };
-
-            let pos_score = previous_scores[dwell_offset] + running_pos_score + pen;
-
-            if pos_score < current_scores[band_pos] {
-                current_scores[band_pos] = pos_score;
-                current_traceback[band_pos] = dwell_idx as i32;
-            }
-        }
-
-        // For positions beyond the check range, also consider baseline Viterbi
-        // path shifted by max_check (no additional penalty since log penalty
-        // is negligible for dwells >> target). band_pos >= max_check here
-        // implies check_limit == max_check - 1 with no truncation (the
-        // truncation case requires check_limit == band_pos <= max_check - 1),
-        // so effective_upper == max_check - 1 and the window sum below
-        // matches what the loop above would have accumulated through its
-        // final iteration.
+        // For positions beyond the check range, also consider baseline
+        // Viterbi path shifted by max_check (no additional penalty since
+        // log penalty is negligible for dwells >> target). Same window sum
+        // the untransposed form's final `dwell_idx == max_check - 1`
+        // iteration would have produced.
         if band_pos >= max_check {
             let running_pos_score = (cum[band_pos + 1] - cum[band_pos - (max_check - 1)]) as f32;
             let pos_score = base_scores[band_pos - max_check] + running_pos_score;
 
-            if pos_score < current_scores[band_pos] {
-                current_scores[band_pos] = pos_score;
-                current_traceback[band_pos] =
-                    base_traceback[band_pos - max_check] + max_check as i32;
+            if pos_score < best_score {
+                best_score = pos_score;
+                best_tb = base_traceback[band_pos - max_check] + max_check as i32;
             }
         }
 
         // Fallback: if no valid transition from previous base was found, stay
-        if current_scores[band_pos] >= INVALID_PENALTY && band_pos > 0 {
-            current_scores[band_pos] =
+        if best_score >= INVALID_PENALTY && band_pos > 0 {
+            best_score =
                 current_scores[band_pos - 1] + score(current_level, current_signal[band_pos]);
-            current_traceback[band_pos] = current_traceback[band_pos - 1] + 1;
+            best_tb = current_traceback[band_pos - 1] + 1;
         }
+
+        current_scores[band_pos] = best_score;
+        current_traceback[band_pos] = best_tb;
     }
 }
 
@@ -454,6 +589,124 @@ fn dp_step_with_dwell_penalty_reference(
         }
 
         if band_pos >= max_check {
+            let pos_score = base_scores[band_pos - max_check] + running_pos_score;
+
+            if pos_score < current_scores[band_pos] {
+                current_scores[band_pos] = pos_score;
+                current_traceback[band_pos] =
+                    base_traceback[band_pos - max_check] + max_check as i32;
+            }
+        }
+
+        if current_scores[band_pos] >= INVALID_PENALTY && band_pos > 0 {
+            current_scores[band_pos] =
+                current_scores[band_pos - 1] + score(current_level, current_signal[band_pos]);
+            current_traceback[band_pos] = current_traceback[band_pos - 1] + 1;
+        }
+    }
+}
+
+/// Immediate pre-transpose body of [`dp_step_with_dwell_penalty`]: the #356
+/// prefix-sum rewrite (an O(1) window-sum lookup via `cum`, replacing
+/// [`dp_step_with_dwell_penalty_reference`]'s O(max_check) running
+/// accumulator), but still `band_pos`-outer / `dwell_idx`-inner, unchanged
+/// from production before the loop transpose documented on
+/// [`dp_step_with_dwell_penalty`] above. Kept only as the exact-equality
+/// baseline for the property tests below — unlike the tolerance-based
+/// comparison against [`dp_step_with_dwell_penalty_reference`] (which
+/// exists because #356's prefix sum is *not* bit-identical to the running
+/// accumulator it replaced), the loop transpose has no excuse for any
+/// disagreement with this function at all: same operations, same
+/// association, same visitation order, just addressed by a different pair
+/// of nested loops.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn dp_step_with_dwell_penalty_prefix_scalar(
+    current_scores: &mut [f32],
+    current_traceback: &mut [i32],
+    previous_scores: &[f32],
+    current_level: f32,
+    current_signal: &[f32],
+    prev_band_offset: usize,
+    penalty_table: &[f32],
+    target: f32,
+    _weight: f32,
+    buf: &mut StepBuffers,
+) {
+    let len = current_scores.len();
+    buf.prepare(len);
+
+    let base_scores = &mut buf.base_scores[..len];
+    let base_traceback = &mut buf.base_traceback[..len];
+
+    dp_step_buffered(
+        base_scores,
+        base_traceback,
+        previous_scores,
+        current_level,
+        current_signal,
+        prev_band_offset,
+        &mut buf.viterbi_buf,
+    );
+
+    let cum = &mut buf.cum_sq_err[..=len];
+    cum[0] = 0.0;
+    for i in 0..len {
+        cum[i + 1] = cum[i] + score(current_level, current_signal[i]) as f64;
+    }
+
+    let max_check = ((2.0 * target).ceil() as usize).clamp(8, DWELL_TABLE_SIZE);
+
+    for band_pos in 0..len {
+        if band_pos as i32 + prev_band_offset as i32 - previous_scores.len() as i32
+            >= max_check as i32
+        {
+            current_scores[band_pos] =
+                current_scores[band_pos - 1] + score(current_level, current_signal[band_pos]);
+            current_traceback[band_pos] = current_traceback[band_pos - 1] + 1;
+            continue;
+        }
+
+        current_scores[band_pos] = INVALID_PENALTY + previous_scores[previous_scores.len() - 1];
+        current_traceback[band_pos] = -1;
+
+        if band_pos == 0 && prev_band_offset == 0 {
+            continue;
+        }
+
+        let check_limit = band_pos.min(max_check - 1);
+        let truncate_for_zero_offset = prev_band_offset == 0 && check_limit == band_pos;
+        let effective_upper = if truncate_for_zero_offset {
+            check_limit - 1
+        } else {
+            check_limit
+        };
+
+        for dwell_idx in 0..=effective_upper {
+            let running_pos_score = (cum[band_pos + 1] - cum[band_pos - dwell_idx]) as f32;
+
+            let dwell_offset =
+                (band_pos as i32 - dwell_idx as i32 - 1 + prev_band_offset as i32) as usize;
+            if dwell_offset >= previous_scores.len() {
+                continue;
+            }
+
+            let pen = if dwell_idx < penalty_table.len() {
+                penalty_table[dwell_idx]
+            } else {
+                dwell_penalty(dwell_idx, target, _weight)
+            };
+
+            let pos_score = previous_scores[dwell_offset] + running_pos_score + pen;
+
+            if pos_score < current_scores[band_pos] {
+                current_scores[band_pos] = pos_score;
+                current_traceback[band_pos] = dwell_idx as i32;
+            }
+        }
+
+        if band_pos >= max_check {
+            let running_pos_score = (cum[band_pos + 1] - cum[band_pos - (max_check - 1)]) as f32;
             let pos_score = base_scores[band_pos - max_check] + running_pos_score;
 
             if pos_score < current_scores[band_pos] {
@@ -631,6 +884,36 @@ mod prefix_sum_property_tests {
         (scores, tb)
     }
 
+    /// [`run_prefix_sum`], with the `dwell_idx`-sweep backend pinned rather
+    /// than left to [`DpBackend::best_for`] — what the backend-sweeping exact-
+    /// equality tests below use, so a bug in a kernel this machine's dispatch
+    /// wouldn't otherwise reach still gets caught (rnabioco/escapepod-rs#328:
+    /// an AVX2 kernel returned wrong values for part of its input while an
+    /// AVX-512 machine's *dispatch* never reached it at all).
+    fn run_prefix_sum_with_backend(
+        c: &Case,
+        buf: &mut StepBuffers,
+        backend: DpBackend,
+    ) -> (Vec<f32>, Vec<i32>) {
+        let mut scores = vec![0.0f32; c.len];
+        let mut tb = vec![0i32; c.len];
+        let penalty_table = build_dwell_penalty_table(c.target, c.weight);
+        dp_step_with_dwell_penalty_with_backend(
+            &mut scores,
+            &mut tb,
+            &c.previous_scores,
+            c.current_level,
+            &c.current_signal,
+            c.prev_band_offset,
+            &penalty_table,
+            c.target,
+            c.weight,
+            buf,
+            backend,
+        );
+        (scores, tb)
+    }
+
     #[test]
     fn prefix_sum_matches_reference_dwell_penalty_scores() {
         let mut rng = StdRng::seed_from_u64(0x353_356);
@@ -701,6 +984,136 @@ mod prefix_sum_property_tests {
                 assert!(
                     diff <= SCORE_TOL,
                     "trial {trial} pos {i}: reference={r} prefix_sum={n} diff={diff}"
+                );
+            }
+        }
+    }
+
+    fn run_prefix_scalar(c: &Case, buf: &mut StepBuffers) -> (Vec<f32>, Vec<i32>) {
+        let mut scores = vec![0.0f32; c.len];
+        let mut tb = vec![0i32; c.len];
+        let penalty_table = build_dwell_penalty_table(c.target, c.weight);
+        dp_step_with_dwell_penalty_prefix_scalar(
+            &mut scores,
+            &mut tb,
+            &c.previous_scores,
+            c.current_level,
+            &c.current_signal,
+            c.prev_band_offset,
+            &penalty_table,
+            c.target,
+            c.weight,
+            buf,
+        );
+        (scores, tb)
+    }
+
+    /// Exact-equality counterpart to `prefix_sum_matches_reference_dwell_penalty_scores`
+    /// above, but comparing the production (transposed, `dwell_idx`-outer)
+    /// [`dp_step_with_dwell_penalty`] against
+    /// [`dp_step_with_dwell_penalty_prefix_scalar`] — the immediate
+    /// pre-transpose body, still `band_pos`-outer. Both compute the exact
+    /// same operations in the exact same association and visitation order
+    /// (see the transpose derivation on `dp_step_with_dwell_penalty`'s doc
+    /// comment), so unlike the `SCORE_TOL`-bounded comparison above, this
+    /// one has no excuse for any disagreement at all — `assert_eq!`, not a
+    /// tolerance, on both `current_scores` *and* `current_traceback`.
+    ///
+    /// Run under *every* `DpBackend::available()` reports on this machine
+    /// (not just the one `DpBackend::best_for` would pick): the register-
+    /// blocked SIMD kernels in `fill_simd` are a separate implementation of
+    /// this same sweep, and rnabioco/escapepod-rs#328 found a kernel that was
+    /// wrong only for part of its input while this machine's own dispatch
+    /// never reached it at all — sweeping every backend the CPU can run,
+    /// regardless of which one is fastest here, is what catches that.
+    #[test]
+    fn transposed_matches_prefix_scalar_exactly() {
+        for backend in DpBackend::available() {
+            let mut rng = StdRng::seed_from_u64(0x2a_7005e);
+            let mut buf_scalar = StepBuffers::new(256);
+            let mut buf_transposed = StepBuffers::new(256);
+
+            for trial in 0..2000 {
+                let case = random_case(&mut rng);
+                let (scalar_scores, scalar_tb) = run_prefix_scalar(&case, &mut buf_scalar);
+                let (transposed_scores, transposed_tb) =
+                    run_prefix_sum_with_backend(&case, &mut buf_transposed, backend);
+
+                assert_eq!(
+                    scalar_scores, transposed_scores,
+                    "backend={backend:?} trial {trial}: current_scores differ (len={}, \
+                     prev_len={}, prev_band_offset={}, target={}, weight={})",
+                    case.len, case.prev_len, case.prev_band_offset, case.target, case.weight,
+                );
+                assert_eq!(
+                    scalar_tb, transposed_tb,
+                    "backend={backend:?} trial {trial}: current_traceback differs (len={}, \
+                     prev_len={}, prev_band_offset={}, target={}, weight={})",
+                    case.len, case.prev_len, case.prev_band_offset, case.target, case.weight,
+                );
+            }
+        }
+    }
+
+    /// Same exact-equality contract as
+    /// [`transposed_matches_prefix_scalar_exactly`], but at `len` and
+    /// `prev_len` in `1..=10` — the range where `lo`/`hi`'s edge behavior
+    /// (an empty candidate range, `band_pos == 0`, `check_limit == band_pos`
+    /// truncation) is most likely to be exercised, mirroring
+    /// `prefix_sum_truncation_edge_case_matches_reference`'s bias toward the
+    /// same region for the (tolerance-based) #356 comparison. This range is
+    /// also where a block never gets a fully-covering `dwell_idx` at all
+    /// (`full_coverage_range` returning `None`, `fill_simd`'s all-scalar
+    /// fallback) and where the trailing-remainder-shorter-than-a-block path
+    /// fires — both otherwise rare, so run under every available backend for
+    /// the same reason as above.
+    #[test]
+    fn transposed_matches_prefix_scalar_small_lengths() {
+        for backend in DpBackend::available() {
+            let mut rng = StdRng::seed_from_u64(0x2a_7005e ^ 0x5ca1e);
+            let mut buf_scalar = StepBuffers::new(64);
+            let mut buf_transposed = StepBuffers::new(64);
+
+            for trial in 0..2000 {
+                let len = rng.random_range(1..=10);
+                let prev_len = rng.random_range(1..=10);
+                let prev_band_offset = if rng.random_bool(0.5) {
+                    0
+                } else {
+                    rng.random_range(0..=prev_len)
+                };
+                let case = Case {
+                    len,
+                    prev_len,
+                    prev_band_offset,
+                    current_level: rng.random_range(-2.0..2.0),
+                    current_signal: (0..len).map(|_| rng.random_range(-3.0..3.0)).collect(),
+                    previous_scores: (0..prev_len)
+                        .map(|_| {
+                            if rng.random_bool(0.1) {
+                                INVALID_PENALTY + rng.random_range(0.0..5.0)
+                            } else {
+                                rng.random_range(0.0..20.0)
+                            }
+                        })
+                        .collect(),
+                    target: rng.random_range(1.0..10.0),
+                    weight: rng.random_range(0.1..1.0),
+                };
+
+                let (scalar_scores, scalar_tb) = run_prefix_scalar(&case, &mut buf_scalar);
+                let (transposed_scores, transposed_tb) =
+                    run_prefix_sum_with_backend(&case, &mut buf_transposed, backend);
+
+                assert_eq!(
+                    scalar_scores, transposed_scores,
+                    "backend={backend:?} trial {trial}: current_scores differ (len={len}, \
+                     prev_len={prev_len}, prev_band_offset={prev_band_offset})",
+                );
+                assert_eq!(
+                    scalar_tb, transposed_tb,
+                    "backend={backend:?} trial {trial}: current_traceback differs (len={len}, \
+                     prev_len={prev_len}, prev_band_offset={prev_band_offset})",
                 );
             }
         }
