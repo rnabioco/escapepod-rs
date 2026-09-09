@@ -4,6 +4,62 @@
 
 ### Performance
 
+- **The waveform classify path's dwell-penalty DP dropped its dominant
+  remaining cost — ~25% faster end-to-end, with a documented, informed
+  correctness tradeoff** (#356). #353/#355 found that ~75% of
+  `dp_step_with_dwell_penalty`'s cycles were in its `dwell_idx` inner loop: a
+  `running_pos_score` accumulator that restarted at `0.0` for every
+  `band_pos` and re-summed up to `max_check` (≤256) prior `score(...)` terms
+  from scratch — the same signal position re-added to a fresh accumulator up
+  to `max_check` times as `band_pos` advanced, an O(len·max_check) chain of
+  strictly-dependent float adds. `StepBuffers::cum_sq_err` is now a prefix
+  sum (`f64`, not `f32` — see below) built once per call (O(len)), so any
+  window sum becomes an O(1) subtraction with no cross-iteration dependency.
+
+  **Real-dataset A/B** (55,446-read production sample,
+  `charging_tcn_sup6_rna004@v0.1.0`, `--device cpu --threads 4`, interleaved
+  warm reps): 471.5s → 351.1s, **~25.5% faster**.
+
+  **Not bit-identical, and this one took two tries to get right.** A first
+  `f32`-cumsum version passed 2,000 randomized property-test trials (band
+  widths up to 150) but measured real production disagreement up to 0.556 in
+  `p_charged` for 3 of 55,446 reads — the property test's band widths were
+  too small to expose it, but `cum[band_pos] - cum[band_pos - dwell_idx]` is
+  catastrophic cancellation once `band_pos` gets large: both operands carry
+  O(band_pos) accumulated rounding error, so the subtraction's error grows
+  with band depth, not window size. Switching `cum_sq_err` to `f64`
+  accumulation (cheap — this is O(len) additions once per call, not the
+  O(len·max_check) cost being fixed) bounds that: the property test (now
+  covering band widths up to 3000, and manually confirmed flat at 20,000)
+  caps at ~9.8e-4 regardless of depth. But real-dataset disagreement didn't
+  fully go away — because this is a genuine dynamic program (one base's
+  `current_scores` becomes the next base's `previous_scores`), even that
+  tightly-bounded per-step noise can still occasionally flip an
+  already-near-tied traceback decision after compounding across hundreds of
+  bases, producing a different boundary map for that one read. Post-`f64`-fix
+  on the same real sample: 43 of 55,446 reads (0.08%) show any `p_charged`
+  difference, 10 exceed 0.02, worst is 0.304 — and exactly 1 read's discrete
+  `cl >= 200` call flips (200 → 197, a literal hairline tie). This is a
+  structural property of changing summation order inside a DP that feeds a
+  discrete decision and a downstream classifier, not a bug fixable by a
+  cleverer sum, and not achievable to eliminate short of bit-identical
+  reproduction of the original's operation order — which would forfeit the
+  speed win entirely. #331's CRF native-encoder work validated to "0 of
+  20,000 calls differ" at the same real-dataset scale; this change does not
+  clear that bar. Shipped anyway as a deliberate, informed tradeoff (a ~25%
+  real wall-clock win against a documented ~1-in-55,000 chance of a
+  borderline call flipping) — see `fill.rs`'s doc comment on
+  `dp_step_with_dwell_penalty` for the full writeup, kept next to the code it
+  describes.
+
+  Validated by property tests (`prefix_sum_property_tests` in `fill.rs`)
+  comparing the new implementation against
+  `dp_step_with_dwell_penalty_reference` (the pre-#356 form, kept under
+  `#[cfg(test)]`) across randomized band widths, `max_check`, and
+  `prev_band_offset`, including the `prev_band_offset == 0` boundary-break
+  edge case; the full existing resquiggle/waveform-chunk test suite passes
+  unchanged.
+
 - **The waveform classify path's banded-DP dwell-penalty refinement no longer
   heap-allocates scratch buffers on every base** (#353). Following up on
   #351's GPU-pipelining fix, `escpod classify --device gpu`'s remaining CPU

@@ -40,6 +40,30 @@ pub(super) struct StepBuffers {
     /// [`ViterbiBuffers`] on every call — is what makes that pass reuse
     /// scratch instead of heap-allocating twice per base.
     pub(super) viterbi_buf: ViterbiBuffers,
+    /// Prefix sum of per-position squared error, `cum[0] = 0`,
+    /// `cum[k] = cum[k-1] + score(level, signal[k-1])`. Length `len + 1`.
+    ///
+    /// Lets the `dwell_idx` inner loop read `sum(score(..)) over a window`
+    /// as one O(1) subtraction (`cum[hi] - cum[lo]`) instead of a serial
+    /// running accumulator — see rnabioco/escapepod-rs#356.
+    ///
+    /// **`f64`, not `f32`.** An `f32` cumsum, subtracted at two positions
+    /// `dwell_idx` apart, is a textbook catastrophic-cancellation trap: both
+    /// operands carry O(band_pos) accumulated rounding error (from summing
+    /// every position *since the start of the band*, not just the window),
+    /// so the error in their difference doesn't shrink with the window size
+    /// — it grows with how deep into the band `band_pos` is. A first `f32`
+    /// attempt at this measured real production-data disagreement up to
+    /// 0.556 in `p_charged` for 3 of 55,446 reads (bands with an unusually
+    /// long dwell somewhere gave `cum` more room to drift before the
+    /// subtraction) — real answer drift, not acceptable numerical noise, and
+    /// not something the property tests below caught because their band
+    /// widths (≤150, comparable to `max_check` itself) never gave `cum` room
+    /// to drift far from the window before the subtraction. `f64`'s ~52-bit
+    /// mantissa keeps that drift far below `f32` ULP for any realistic band
+    /// width, which is cheap here: this cumsum is O(len) additions once per
+    /// call, not the O(len·max_check) cost being fixed.
+    pub(super) cum_sq_err: Vec<f64>,
 }
 
 impl StepBuffers {
@@ -48,6 +72,7 @@ impl StepBuffers {
             base_scores: vec![0.0f32; capacity],
             base_traceback: vec![0i32; capacity],
             viterbi_buf: ViterbiBuffers::new(capacity),
+            cum_sq_err: vec![0.0f64; capacity + 1],
         }
     }
 
@@ -56,6 +81,9 @@ impl StepBuffers {
         if self.base_scores.len() < len {
             self.base_scores.resize(len, 0.0);
             self.base_traceback.resize(len, 0);
+        }
+        if self.cum_sq_err.len() < len + 1 {
+            self.cum_sq_err.resize(len + 1, 0.0);
         }
         self.base_scores[..len].fill(0.0);
         self.base_traceback[..len].fill(0);
