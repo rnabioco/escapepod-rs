@@ -718,11 +718,25 @@ pub fn classify_reads_gpu(
 
             // Fewer than `batch` valid reads left at the end of this
             // superbatch: score them on the CPU rather than pad a GPU call —
-            // same rule as before, see the doc comment above.
-            for (read, chunk) in carry.drain(..) {
-                let logit = cpu_fallback.logit(&chunk, spec)?;
-                calls.push(call_from_logit(read, spec, logit));
-            }
+            // same rule as before, see the doc comment above. Up to
+            // `batch - 1` reads can land here, each ~6.6 ms through the
+            // batch-1 CPU tract plan, so scoring them one at a time on this
+            // (producer) thread could block it for the better part of a
+            // second with the rest of the rayon pool *and* the GPU both
+            // idle. `cpu_fallback` (`WaveformNet`) is `Sync` — the same plan
+            // handle `classify_reads` above already calls from inside a
+            // `par_iter` closure — so fanning this out is bit-identical: it
+            // changes which thread calls `logit`, never what it computes.
+            // `calls` only gets its final order from the `sort_by_key` at
+            // the very end, so which thread appends first does not matter.
+            let tail: Vec<ReadCall> = carry
+                .into_par_iter()
+                .map(|(read, chunk)| -> Result<ReadCall> {
+                    let logit = cpu_fallback.logit(&chunk, spec)?;
+                    Ok(call_from_logit(read, spec, logit))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            calls.extend(tail);
         }
 
         drop(tx);

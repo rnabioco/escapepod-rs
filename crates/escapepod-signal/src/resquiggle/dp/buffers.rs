@@ -64,6 +64,23 @@ pub(super) struct StepBuffers {
     /// width, which is cheap here: this cumsum is O(len) additions once per
     /// call, not the O(len·max_check) cost being fixed.
     pub(super) cum_sq_err: Vec<f64>,
+    /// Best dwell-transition candidate found so far for each `band_pos`,
+    /// filled by the `dwell_idx`-outer sweep in `dp_step_with_dwell_penalty`
+    /// (see that function's doc comment for the loop transpose this backs).
+    /// Reset to the "no valid transition" sentinel
+    /// (`INVALID_PENALTY + previous_scores[last]`) at the start of every
+    /// call, then min-reduced in ascending `dwell_idx` order — the same
+    /// order the pre-transpose `band_pos`-outer form considered candidates
+    /// in for a fixed `band_pos`, just spread across outer-loop iterations
+    /// instead of one inner loop, so tie-breaking is unchanged. The scalar
+    /// tail pass reads this back to apply the steps that carry a
+    /// `current_scores[band_pos - 1]` dependency and so cannot be part of
+    /// the `dwell_idx`-outer sweep.
+    pub(super) cand: Vec<f32>,
+    /// Traceback counterpart to [`cand`](Self::cand): the `dwell_idx` (as
+    /// `i32`) that produced the current best score at each `band_pos`, or
+    /// `-1` if nothing has beaten the sentinel yet.
+    pub(super) cand_tb: Vec<i32>,
 }
 
 impl StepBuffers {
@@ -73,10 +90,18 @@ impl StepBuffers {
             base_traceback: vec![0i32; capacity],
             viterbi_buf: ViterbiBuffers::new(capacity),
             cum_sq_err: vec![0.0f64; capacity + 1],
+            cand: vec![0.0f32; capacity],
+            cand_tb: vec![0i32; capacity],
         }
     }
 
-    /// Ensure buffers are at least `len` elements and zero them.
+    /// Ensure buffers are at least `len` elements.
+    ///
+    /// Does not zero `base_scores`/`base_traceback`: `dp_step_with_dwell_penalty`
+    /// (`fill.rs`) writes every element of both, for the full `0..len` range,
+    /// via `dp_step_buffered` before anything reads them (that function's
+    /// three phases cover `0..len` completely), so a pre-fill here was dead
+    /// work on every call.
     pub(super) fn prepare(&mut self, len: usize) {
         if self.base_scores.len() < len {
             self.base_scores.resize(len, 0.0);
@@ -85,8 +110,10 @@ impl StepBuffers {
         if self.cum_sq_err.len() < len + 1 {
             self.cum_sq_err.resize(len + 1, 0.0);
         }
-        self.base_scores[..len].fill(0.0);
-        self.base_traceback[..len].fill(0);
+        if self.cand.len() < len {
+            self.cand.resize(len, 0.0);
+            self.cand_tb.resize(len, 0);
+        }
         self.viterbi_buf.prepare(len);
     }
 }
