@@ -155,6 +155,54 @@ pub fn dp_step_buffered(
 /// checks a bounded number of dwell transitions with explicit penalties.
 /// For positions beyond the check horizon, falls back to baseline Viterbi
 /// scores, preserving O(max_check · B) complexity instead of O(B²).
+///
+/// This is the actual hot loop behind rnabioco/escapepod-rs#353 ("banded-DP
+/// refinement dominates CPU cost in the waveform classify path"): that issue's
+/// own profiling (LTO-inlined, `release-with-debug`) misattributed the cost to
+/// `DpContext::step`/`RefineAlgo::Viterbi` — every shipped `waveform_model`
+/// bundle actually resolves `RefineSettings::move_table_refinement`'s default
+/// (`RefineAlgo::DwellPenalty`, see [`RefineAlgo::default`](super::super::types::RefineAlgo)),
+/// so this function, not [`dp_step_buffered`], is where the cycles go.
+/// Re-profiling with the `profiling` cargo profile (LTO off, so perf doesn't
+/// merge this symbol into its caller) on the same input attributes ~75% of
+/// wall-clock cycles here directly, confirmed by name rather than inferred.
+///
+/// One real fix already landed: the internal baseline-Viterbi pass below used
+/// to go through [`dp_step`], which heap-allocates a fresh `ViterbiBuffers` on
+/// every call — once per base, per refinement iteration. Routing it through
+/// [`dp_step_buffered`] with `buf.viterbi_buf` (a scratch buffer `StepBuffers`
+/// now owns and reuses) removed that allocation churn: ~4% end-to-end wall
+/// time on a real bundle + real POD5/BAM (a 55,446-read production sample,
+/// `--device cpu --threads 4`, bit-identical output, `release`-profile,
+/// interleaved A/B reps to control for page-cache warming per
+/// `benchmarks/README.md`'s methodology).
+///
+/// That 4% is a small slice of the ~75%, not the story — the dominant cost is
+/// the `dwell_idx` loop's `running_pos_score` accumulator below. It restarts
+/// at `0.0` for every `band_pos` and re-sums up to `max_check` (≤256) prior
+/// `score(...)` terms from scratch, so the same signal position is
+/// re-added to a fresh accumulator up to `max_check` times as `band_pos`
+/// advances — O(len · max_check) additions, each strictly dependent on the
+/// previous (a serial reduction chain), which is what actually burns the
+/// cycles this issue found. A prefix sum over `score(current_level,
+/// current_signal[i])` (built once, O(len)) turns
+/// `running_pos_score(band_pos, dwell_idx)` into
+/// `cum[band_pos] - cum[band_pos - dwell_idx - 1]` — an O(1) lookup with no
+/// cross-iteration dependency, which is what would let the `dwell_idx` loop
+/// autovectorize the way `dp_step_buffered`'s phases 1–2 already do. Two
+/// details a rewrite must preserve, found while reading this function for
+/// this note, not yet implemented: (1) `previous_scores[dwell_offset]` and
+/// `penalty_table[dwell_idx]` are each read over a *contiguous* window as
+/// `dwell_idx` sweeps `0..=check_limit` (the former descending, the latter
+/// ascending) — no gather needed; (2) when `prev_band_offset == 0`, the
+/// current early `break` at `dwell_idx == band_pos` must still exclude that
+/// index's own score from the accumulated sum (it fires before the `+=`), so
+/// the cumsum lookup's effective upper bound needs the same off-by-one in
+/// that boundary case, not just a truncated loop count. Left as a follow-up
+/// rather than done here — a numerically-different (not bit-identical, per
+/// float non-associativity) implementation deserves its own validation pass
+/// (property test against this scalar form, not just the existing exact-value
+/// unit tests) before it replaces this one.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dp_step_with_dwell_penalty(
     current_scores: &mut [f32],
@@ -174,14 +222,18 @@ pub(super) fn dp_step_with_dwell_penalty(
     let base_scores = &mut buf.base_scores[..len];
     let base_traceback = &mut buf.base_traceback[..len];
 
-    // Compute baseline Viterbi scores (no penalty) for fallback beyond check range
-    dp_step(
+    // Compute baseline Viterbi scores (no penalty) for fallback beyond check
+    // range. Uses the buffered form directly (not the `dp_step` convenience
+    // wrapper) since this runs once per base per refinement iteration and
+    // `dp_step` would heap-allocate a fresh `ViterbiBuffers` on every call.
+    dp_step_buffered(
         base_scores,
         base_traceback,
         previous_scores,
         current_level,
         current_signal,
         prev_band_offset,
+        &mut buf.viterbi_buf,
     );
 
     // Bound the inner loop: check up to 2*target (covers the full quadratic

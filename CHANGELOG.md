@@ -4,6 +4,30 @@
 
 ### Performance
 
+- **The waveform classify path's banded-DP dwell-penalty refinement no longer
+  heap-allocates scratch buffers on every base** (#353). Following up on
+  #351's GPU-pipelining fix, `escpod classify --device gpu`'s remaining CPU
+  cost profiled almost entirely into `resquiggle::dp` — but re-profiling with
+  the `profiling` cargo profile (LTO off, so `perf` doesn't merge the symbol
+  into its dispatcher) found the earlier writeup's algorithm wrong: every
+  shipped `waveform_model` bundle resolves the default `RefineAlgo::DwellPenalty`,
+  not `Viterbi`, so `dp_step_with_dwell_penalty` — not `dp_step_buffered` — is
+  where ~75% of cycles land. That function's internal baseline-Viterbi pass
+  went through the allocating `dp_step` convenience wrapper (a fresh
+  `ViterbiBuffers` — two `Vec<f32>` — on every call: once per base, per
+  refinement iteration) instead of the buffered form its own doc comment
+  recommends for hot loops. `StepBuffers` now owns and reuses that scratch.
+  Bit-identical output (same math, no allocation-dependent behavior); ~4%
+  end-to-end wall-clock on a real bundle + real POD5/BAM (55,446-read
+  production sample, `--device cpu --threads 4`, interleaved A/B reps). The
+  bulk of the remaining cost is a separate, larger fix (see #353's follow-up):
+  the `dwell_idx` inner loop re-sums up to `max_check` prior signal-error
+  terms from scratch for every band position — an O(len·max_check) serial
+  accumulator chain that a prefix-sum reformulation would turn into O(1)
+  lookups with no cross-iteration dependency, but that's a numerically
+  different (not bit-identical) implementation needing its own validation
+  pass, not attempted here.
+
 - **`escpod classify --device gpu` (the windowed TCN variant) no longer
   starves the GPU behind a fully-serial CPU prep phase** (#351).
   `waveform::classify_reads_gpu` used to prepare a whole 16,384-read
