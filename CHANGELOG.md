@@ -2,6 +2,97 @@
 
 ## Unreleased
 
+### Performance
+
+- **The dwell-penalty DP's inner-loop bound is halved, and its
+  baseline-Viterbi fallback pass stopped computing a tail nothing reads**
+  (#32). #359's loop transpose + AVX-512 kernel made the `dwell_idx` sweep
+  faster, but a flat `perf` profile (`-F 499`, no call graph — `--call-graph
+  dwarf` hangs report generation for 10+ minutes on this workload) of the
+  real production `escpod classify --device gpu` path still attributed ~72%
+  of all CPU cycles to it: `dwell_block_kernel_avx512` 27.55%,
+  `run_dwell_sweep` 18.23%, `dp_step_with_dwell_penalty` 14.55%,
+  `dp_step_buffered` 11.36%.
+
+  `max_check` bounded the sweep at `((2.0 * target).ceil() as
+  usize).clamp(8, DWELL_TABLE_SIZE)` — twice `target`, reasoned as covering
+  "the full quadratic region plus some logarithmic". But the
+  quadratic-penalty region is exactly `0..target`; every `dwell_idx >=
+  target` already sits in `dwell_penalty`'s logarithmic, near-negligible
+  half, and the baseline-Viterbi fallback pass just below (no dwell penalty
+  at all) exists specifically to stand in for whatever the sweep skips.
+  Halved to `(target.ceil() as usize).clamp(4, DWELL_TABLE_SIZE)` — in the
+  three places the formula appears in `fill.rs` (the production function
+  and both `#[cfg(test)]` baselines the property tests check it against),
+  which must stay byte-for-byte identical to each other for those tests to
+  keep validating scheduling/arithmetic equivalence rather than comparing
+  two different algorithms.
+
+  `resquiggle_dwell_dp` (criterion, rna, one node): 80bases/30dwell 0.975 ms
+  → **0.597 ms**, 150bases/50dwell 4.808 ms → **2.242 ms** — ~1.63x and
+  ~2.14x respectively, on top of #359's own transpose win.
+
+  Separately, and bit-identical: `dp_step_buffered`'s baseline-Viterbi
+  fallback pass used to compute the full `[0, len)` range unconditionally,
+  but the tail pass that consumes it only ever reads index `band_pos -
+  max_check` for `band_pos in max_check..len` — i.e. only the prefix `[0,
+  len - max_check)`. Its recurrence is strictly forward (each index depends
+  only on that index's own signal sample and the index before it, never
+  anything later), so narrowing both the destination and the
+  `current_signal` source to that prefix computes exactly the same values
+  at every index that's ever read, and the call is skipped outright when
+  `max_check >= len` leaves nothing to read.
+
+  **Not bit-identical, deliberately — the same kind of tradeoff #356
+  shipped for this same function, measured the same way.** A smaller
+  `max_check` means more `band_pos`s take the no-explicit-penalty fallback
+  instead of a dwell-penalty-scored candidate, which can flip an
+  already-close traceback decision. Real-data A/B (55,446-read production
+  sample, `charging_tcn_sup6_rna004@v0.1.0`, `--device cpu --threads 4`,
+  interleaved warm reps, against the bundle's own recommended operating
+  point, `cl >= 200`): 977 reads (1.76%) show any `p_charged` difference,
+  124 (0.22%) exceed 0.02, the worst observed is 0.767048 — and 14 reads'
+  (0.025%) discrete charged/uncharged calls flip. Both larger than #356's
+  own numbers (43 reads/0.08%, 10 exceed 0.02, worst 0.304, 1 flip) — a
+  bigger change to the sweep's own coverage than a summation-order fix, so
+  a bigger (still small) real-data footprint is the expected shape of this
+  tradeoff, not a sign either measurement is wrong. **Unlike #356's one
+  flip, most of these 14 are not hairline ties**: only 3 sit under
+  `|Δp_charged|` = 0.03, the other 11 show a real shift in the model's own
+  estimate (several above 0.1, one from 0.17 to 0.94) that happens to cross
+  0.7824 — because `max_check` changes which `band_pos`s get a scored
+  dwell candidate at all, not just the arithmetic of scores already being
+  computed, it can move a read's probability outright rather than only
+  perturb an already-near-tied one. Wall-clock/CPU on the same real run
+  (rep 2 of an interleaved warm pair, `/usr/bin/time -v`):
+  176.0s wall / 569.6s CPU → 160.8s wall / 498.6s CPU, **~8.7% faster wall,
+  ~12.5% less CPU** — smaller than the criterion win above because most of
+  this end-to-end run's time is I/O, BAM parsing and chunk assembly, not
+  the dwell-penalty DP alone. See `fill.rs`'s doc comment on
+  `dp_step_with_dwell_penalty` and `benchmarks/README.md` for the full
+  writeup.
+
+- **`escpod classify --device gpu`'s (windowed TCN) pipeline defaults
+  re-tuned for `--threads 16`**, following up on #351 (which tuned
+  `groups_in_flight`/`prep_chunk` at `--threads 4`). At `--threads 16` — the
+  deployment shape as of the GPU headroom investigation (16 cores feeding
+  one GPU, four such jobs packing one 64-core/4-GPU node) — the single-axis
+  defaults (`groups_in_flight=16`, varying `prep_chunk`) topped out at
+  `prep_chunk=4096` → 956 reads/s. Scaling `groups_in_flight` to match
+  `prep_chunk` (so a prep burst never exceeds the channel's buffer) unlocked
+  a further ~35%: `(prep_chunk=4096, groups_in_flight=64)` and
+  `(prep_chunk=8192, groups_in_flight=128)` both plateaued at **1289
+  reads/s** — reproduced, not a fluke. Pushing to the structural ceiling
+  (`prep_chunk=16384`, matching `SUPERBATCH`) regressed to 1180 reads/s: at
+  that size there is exactly one prep cycle per superbatch, so the GPU
+  consumer sits fully idle for the entire duration of that one giant prep
+  call, losing the overlap that makes the pipeline work. New defaults:
+  `groups_in_flight=64`, `prep_chunk=batch.saturating_mul(8).max(4096)` —
+  the smaller of the two plateaued `groups_in_flight` values (same
+  throughput, less memory), and a floor that keeps the existing `batch*8`
+  formula sound for larger `batch` while never dropping below the measured
+  plateau.
+
 ## 0.24.2 (2026-09-09)
 
 ### Performance

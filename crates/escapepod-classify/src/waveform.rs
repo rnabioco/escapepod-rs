@@ -624,11 +624,37 @@ pub fn classify_reads_gpu(
     // A30, `--threads 4`). Depth swept 2/8/16/32 at the default prep chunk
     // (below) plateaus and then regresses past 16: 315s / 242s / 222s / 240s,
     // CPU 194% / 256% / 278% / 257%. 16 is the plateau, not a guess.
+    //
+    // That whole sweep was run at `--threads 4`. Re-swept at `--threads 16`
+    // — the deployment shape as of the GPU headroom investigation (16 cores
+    // feeding one GPU, four such jobs packing one 64-core/4-GPU node) —
+    // `gif=16` alone tops out varying only `prep_chunk` (below): 956 reads/s
+    // at `prep_chunk=4096`, no further gain from `prep_chunk` alone. The
+    // specific finding that unlocked a
+    // further ~35% was that `groups_in_flight` has to scale *with*
+    // `prep_chunk`, not stay pinned at the `--threads 4` value while only
+    // `prep_chunk` varies — a prep burst produces `prep_chunk/batch` ready
+    // GPU groups at once, and if that exceeds the channel's buffer the
+    // producer blocks on `tx.send` exactly the way depth-2 did above.
+    // Scaling both together, `(prep_chunk=4096, gif=64)` and
+    // `(prep_chunk=8192, gif=128)` both plateaued at **1289 reads/s** — a
+    // real, reproduced plateau, not a fluke. Pushing to the *structural*
+    // ceiling, `prep_chunk=16384` (== `SUPERBATCH`, beyond which
+    // `.chunks(prep_chunk)` on a superbatch-sized slice always yields one
+    // chunk and further increases are a no-op), actually *regressed* to
+    // 1180 reads/s: at that size there is exactly one prep cycle per
+    // superbatch, so the GPU consumer sits fully idle for the entire
+    // duration of that one giant prep call, losing the overlap that makes
+    // this pipeline work in the first place. `64` — the smaller of the two
+    // plateaued `groups_in_flight` values, for the same throughput at less
+    // memory — is the new default; a shallower single-axis sweep (varying
+    // only `prep_chunk`, as the `--threads 4` sweep above did) would have
+    // undersold the real optimum by ~35%.
     let groups_in_flight: usize = std::env::var("ESCAPEPOD_WAVEFORM_GPU_GROUPS_IN_FLIGHT")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n: &usize| n > 0)
-        .unwrap_or(16);
+        .unwrap_or(64);
     // How many reads' worth of prep `rayon` load-balances per synchronous
     // `par_iter` call, independent of `batch` (the GPU's own fixed contract).
     // Tying this 1:1 to `batch` — the first version's choice — was a second
@@ -645,11 +671,22 @@ pub fn classify_reads_gpu(
     // guessing how far past it diminishing returns would go for a
     // differently-shaped bundle. All numbers bit-identical to the
     // fully-serial baseline at every point on the sweep (see the module doc).
+    //
+    // That sweep, too, was at `--threads 4` (`batch` defaults small enough
+    // there that `batch*8` already lands on the plateau). The `--threads 16`
+    // re-sweep above found the *old* `batch*8` default is no longer the
+    // right floor at that concurrency — 956 reads/s at `prep_chunk=4096`
+    // against 1289 at the same value paired with a wider `groups_in_flight`
+    // (see above) — so the floor is now pinned at 4096, the measured
+    // plateau's low end, while keeping `batch*8` as the formula for any
+    // `batch` large enough to exceed it. This never drops the default below
+    // what's measured to work, and still scales up sensibly for a larger
+    // `batch`.
     let prep_chunk: usize = std::env::var("ESCAPEPOD_WAVEFORM_GPU_PREP_CHUNK")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n: &usize| n > 0)
-        .unwrap_or(batch.saturating_mul(8));
+        .unwrap_or(batch.saturating_mul(8).max(4096));
 
     type Group<'r> = Vec<(&'r WaveformRead, Chunk)>;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Group>(groups_in_flight);

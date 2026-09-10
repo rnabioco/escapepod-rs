@@ -335,6 +335,60 @@ pub fn dp_step_buffered(
 /// `penalty_table.len()` is gone — and because landing it alone keeps the
 /// bit-identical claim easy to check before SIMD adds its own edge cases on
 /// top of it.
+///
+/// **#32: `max_check` halved, and not bit-identical either.** Even with the
+/// transpose and its SIMD kernels, a flat `perf` profile of the real
+/// production `escpod classify --device gpu` path still attributed ~72% of
+/// all CPU cycles to this function and the code it calls (`run_dwell_sweep`,
+/// `dwell_block_kernel_avx512`, and the fallback pass below) — the transpose
+/// made the sweep faster, it did not make it cheap. `max_check` bounded the
+/// sweep at `((2.0 * target).ceil()).clamp(8, DWELL_TABLE_SIZE)`: twice
+/// `target`, on the reasoning that it "covers the full quadratic region plus
+/// some logarithmic". But the quadratic region *is* `0..target` — every
+/// `dwell_idx >= target` is already in [`dwell_penalty`]'s logarithmic,
+/// near-negligible half — and the fallback pass just below (baseline
+/// Viterbi, no dwell penalty at all) exists specifically to stand in for
+/// whatever the sweep doesn't check. Halving the bound to
+/// `(target.ceil()).clamp(4, DWELL_TABLE_SIZE)` checks only the quadratic
+/// region explicitly and leans on that existing fallback for the rest,
+/// roughly halving the sweep's own cost. **This changes results**: a
+/// smaller `max_check` means more `band_pos`s take the no-explicit-penalty
+/// fallback instead of a dwell-penalty-scored candidate, which can flip an
+/// already-close traceback decision the same way #356's summation-order
+/// change could — see that entry above for why a DP feeding a discrete
+/// classifier can't fully absorb this kind of change without bounded call
+/// drift. Measured the same way #356 was (55,446-read production sample,
+/// `charging_tcn_sup6_rna004@v0.1.0`, `--device cpu --threads 4`,
+/// interleaved warm reps, compared against the bundle's own recommended
+/// operating point, `cl >= 200`): 977 reads (1.76%) show any `p_charged`
+/// difference, 124 (0.22%) exceed 0.02, the worst is 0.767 — and 14 reads'
+/// (0.025%) discrete charged/uncharged calls flip. Both larger than #356's
+/// own numbers (43 reads/0.08%, 10 exceed 0.02, worst 0.304, 1 flip) — this
+/// is a bigger change to the sweep's own coverage than a summation-order
+/// fix, so a bigger (though still small) real-data footprint is expected,
+/// not a sign either measurement is wrong. Shipped anyway as a deliberate,
+/// informed tradeoff; see `CHANGELOG.md` and `benchmarks/README.md` for the
+/// wall-clock side of the same measurement. This formula appears in
+/// exactly three places — here, and in both `#[cfg(test)]` baselines below
+/// ([`dp_step_with_dwell_penalty_reference`] and
+/// [`dp_step_with_dwell_penalty_prefix_scalar`]) — and all three must stay
+/// byte-for-byte identical to each other: the property tests below check
+/// scheduling/arithmetic equivalence *given* a `max_check` formula, not the
+/// formula's value, so a mismatch between them would make those tests
+/// compare two different algorithms instead.
+///
+/// **The baseline-Viterbi fallback pass no longer computes what nothing
+/// reads.** `dp_step_buffered` below used to run over the full `[0, len)`
+/// unconditionally, but the tail pass only ever reads index `band_pos
+/// minus max_check` of `base_scores`/`base_traceback`, for `band_pos in
+/// max_check..len` — i.e. only the prefix `[0, len - max_check)`. Since
+/// `dp_step_buffered`'s recurrence is strictly forward (each index depends
+/// only on `current_signal` at that index and the index before it, never
+/// anything later), narrowing the destination and the `current_signal`
+/// source to that prefix computes exactly the same values at every index
+/// that's ever read — dropping dead computation, not changing a result —
+/// and the call is skipped outright when `max_check >= len` leaves nothing
+/// to read at all. **Bit-identical**, unlike the halving above.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dp_step_with_dwell_penalty(
     current_scores: &mut [f32],
@@ -386,6 +440,19 @@ fn dp_step_with_dwell_penalty_with_backend(
     let len = current_scores.len();
     buf.prepare(len);
 
+    // Bound the inner loop: the quadratic-penalty region runs only `0..target`
+    // — the old `0..2*target` bound's upper half was already in the
+    // logarithmic (effectively negligible) part of the penalty, and the
+    // baseline-Viterbi fallback pass below (`dp_step_buffered`, added
+    // specifically to cover positions beyond `max_check`) already stands in
+    // for what this skips. Halved and re-floored from `[8,
+    // DWELL_TABLE_SIZE]` to `[4, DWELL_TABLE_SIZE]` by rnabioco/escapepod-rs#32.
+    // Not bit-identical to the pre-#32 formula: see the doc comment on
+    // [`dp_step_with_dwell_penalty`] and `CHANGELOG.md` for the measured
+    // real-data tradeoff.
+    let max_check = (target.ceil() as usize).clamp(4, DWELL_TABLE_SIZE);
+    let prev_len = previous_scores.len();
+
     let base_scores = &mut buf.base_scores[..len];
     let base_traceback = &mut buf.base_traceback[..len];
 
@@ -393,15 +460,30 @@ fn dp_step_with_dwell_penalty_with_backend(
     // range. Uses the buffered form directly (not the `dp_step` convenience
     // wrapper) since this runs once per base per refinement iteration and
     // `dp_step` would heap-allocate a fresh `ViterbiBuffers` on every call.
-    dp_step_buffered(
-        base_scores,
-        base_traceback,
-        previous_scores,
-        current_level,
-        current_signal,
-        prev_band_offset,
-        &mut buf.viterbi_buf,
-    );
+    //
+    // Only `base_scores[0..len - max_check)` / `base_traceback[..]` is ever
+    // read below — the tail pass reads index `band_pos - max_check` only for
+    // `band_pos in max_check..len`, i.e. only the prefix `[0, len -
+    // max_check)`. `dp_step_buffered`'s recurrence is strictly forward
+    // (`base_scores[i]`/`base_traceback[i]` depend only on
+    // `current_signal[i]`, `previous_scores`, and index `i-1` — never on
+    // anything past `i`), so narrowing both the destination and the
+    // `current_signal` source to that prefix produces exactly the same
+    // values at every index `0..needed` as computing the full `[0, len)` and
+    // only reading the prefix — this drops dead computation, not a computed
+    // value (rnabioco/escapepod-rs#32).
+    let needed = len.saturating_sub(max_check);
+    if needed > 0 {
+        dp_step_buffered(
+            &mut base_scores[..needed],
+            &mut base_traceback[..needed],
+            previous_scores,
+            current_level,
+            &current_signal[..needed],
+            prev_band_offset,
+            &mut buf.viterbi_buf,
+        );
+    }
 
     // Prefix sum of per-position squared error: cum[k] = sum of
     // score(level, signal[0..k]). cum[0] = 0 sentinel makes every window
@@ -411,11 +493,6 @@ fn dp_step_with_dwell_penalty_with_backend(
     for i in 0..len {
         cum[i + 1] = cum[i] + score(current_level, current_signal[i]) as f64;
     }
-
-    // Bound the inner loop: check up to 2*target (covers the full quadratic
-    // region plus some logarithmic), clamped to [8, DWELL_TABLE_SIZE].
-    let max_check = ((2.0 * target).ceil() as usize).clamp(8, DWELL_TABLE_SIZE);
-    let prev_len = previous_scores.len();
 
     // `max_check <= DWELL_TABLE_SIZE == penalty_table.len()` for every real
     // caller (the table is always built by `build_dwell_penalty_table`), so
@@ -539,7 +616,7 @@ fn dp_step_with_dwell_penalty_reference(
         prev_band_offset,
     );
 
-    let max_check = ((2.0 * target).ceil() as usize).clamp(8, DWELL_TABLE_SIZE);
+    let max_check = (target.ceil() as usize).clamp(4, DWELL_TABLE_SIZE);
 
     for band_pos in 0..len {
         if band_pos as i32 + prev_band_offset as i32 - previous_scores.len() as i32
@@ -655,7 +732,7 @@ fn dp_step_with_dwell_penalty_prefix_scalar(
         cum[i + 1] = cum[i] + score(current_level, current_signal[i]) as f64;
     }
 
-    let max_check = ((2.0 * target).ceil() as usize).clamp(8, DWELL_TABLE_SIZE);
+    let max_check = (target.ceil() as usize).clamp(4, DWELL_TABLE_SIZE);
 
     for band_pos in 0..len {
         if band_pos as i32 + prev_band_offset as i32 - previous_scores.len() as i32

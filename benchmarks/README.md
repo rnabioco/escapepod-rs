@@ -1,5 +1,126 @@
 # Benchmark Results
 
+## Dwell-penalty DP: still 72% of CPU post-transpose, `max_check` halved (2026-09-09)
+
+A flat `perf` profile (`-F 499`, no call graph — `--call-graph dwarf` hangs
+report generation for 10+ minutes on this workload and is not worth
+retrying, a known trap) on the real production `escpod classify --device
+gpu` path, taken *after* the transpose+AVX-512 work below, found the
+dwell-penalty DP is still ~72% of all CPU cycles:
+
+| symbol | % of cycles |
+|---|---:|
+| `dwell_block_kernel_avx512` | 27.55% |
+| `run_dwell_sweep` (SIMD dispatcher/tiler) | 18.23% |
+| `dp_step_with_dwell_penalty` (cumsum build + scalar tail pass) | 14.55% |
+| `dp_step_buffered` (baseline-Viterbi fallback pass) | 11.36% |
+
+Two follow-ups, both in `crates/escapepod-signal/src/resquiggle/dp/fill.rs`
+(rnabioco/escapepod-rs#32):
+
+- **Halve `max_check`.** The quadratic-penalty region only extends
+  `0..target`; `target..2*target` was already in the logarithmic
+  (negligible) part of the penalty, and the baseline-Viterbi fallback pass
+  (`dp_step_buffered`, added specifically to cover positions beyond
+  `max_check`) already stands in for what that half skipped.
+  `((2.0 * target).ceil() as usize).clamp(8, DWELL_TABLE_SIZE)` ->
+  `(target.ceil() as usize).clamp(4, DWELL_TABLE_SIZE)`, in the three
+  places that formula appears (the production function and both
+  `#[cfg(test)]` baselines it's checked against — all three kept
+  byte-for-byte identical). **Not bit-identical** — see `CHANGELOG.md` and
+  the doc comment on `dp_step_with_dwell_penalty` for the real-data
+  tradeoff.
+
+- **Trim `dp_step_buffered`'s dead computation (bit-identical).** The
+  fallback pass used to compute the full `[0, len)` baseline-Viterbi
+  scores/traceback unconditionally, but the tail pass only ever reads index
+  `band_pos - max_check` for `band_pos in max_check..len`, i.e. only the
+  prefix `[0, len - max_check)`. `dp_step_buffered`'s recurrence is strictly
+  forward, so narrowing both the destination and the `current_signal`
+  source to that prefix computes exactly the same values, just without the
+  dead tail — skipped outright when `max_check >= len`.
+
+`resquiggle_dwell_dp` (criterion, rna, one node, one run), post-transpose
+(#359, i.e. the table in the entry below) vs. post-#32-plus-trim:
+
+| shape | post-transpose (#359) | post-#32 + trim |
+|---|---:|---:|
+| 80bases_30dwell | 0.975 ms | **0.597 ms** |
+| 150bases_50dwell | 4.808 ms | **2.242 ms** |
+
+~1.63x and ~2.14x respectively — roughly in line with the ~2x expected from
+halving the sweep's own trip count (`target` is 30 and 50 in these two
+shapes, so `max_check` goes 60→30 and 100→50), plus a further sliver from
+`dp_step_buffered` no longer computing the tail nothing reads.
+
+### `escpod classify --device gpu` pipeline re-sweep at `--threads 16` (#351 follow-up)
+
+The #351 `groups_in_flight`/`prep_chunk` sweep (see the "Charging
+classifier" entries below) was run at `--threads 4`. Re-swept at `--threads
+16` — the deployment shape as of the GPU headroom investigation (16 cores
+feeding one GPU, four such jobs packing one 64-core/4-GPU node):
+
+- Single-axis (`groups_in_flight=16` fixed, varying `prep_chunk`) topped out
+  at `prep_chunk=4096` -> **956 reads/s**.
+- Scaling `groups_in_flight` to match `prep_chunk` unlocked a further ~35%:
+  `(prep_chunk=4096, gif=64)` and `(prep_chunk=8192, gif=128)` both
+  plateaued at **1289 reads/s** — reproduced, not a fluke.
+- Pushing to the structural ceiling `prep_chunk=16384` (== `SUPERBATCH`)
+  *regressed* to **1180 reads/s**: exactly one prep cycle per superbatch
+  means the GPU consumer sits fully idle for that entire one giant prep
+  call, losing the pipeline overlap.
+
+New defaults: `groups_in_flight=64`, `prep_chunk=batch.saturating_mul(8).max(4096)`.
+
+### #32 real-data validation (55,446-read production sample, `--device cpu --threads 4`)
+
+Interleaved A/B against the pre-#32 baseline (`escpod_after_transpose`,
+main's post-#359 dwell-DP code) — same methodology as #356: two reps per
+binary, rep 1 discarded as warm-up, rep 2 compared.
+
+`out.tsv` comparison (`p_charged`/`cl` per read, against the bundle's own
+recommended operating point `cl >= 200`):
+
+| metric | value |
+|---|---:|
+| reads compared (both sides called) | 55,446 |
+| any `p_charged` difference | 977 (1.76%) |
+| difference > 0.02 | 124 (0.22%) |
+| worst observed absolute difference | 0.767048 |
+| discrete charged/uncharged call flips | 14 (0.025%) |
+| no-call set differs between binaries | no (0 reads) |
+
+All larger than #356's own numbers for this same function (43 reads/0.08%,
+10 exceed 0.02, worst 0.304, 1 flip) — expected, not a red flag: halving
+`max_check` changes which `band_pos`s get an explicit dwell-penalty
+candidate at all, a bigger change to the sweep's coverage than a
+summation-order fix to arithmetic that was already being computed.
+
+**The 14 flips are not all hairline ties the way #356's one was.** Sorted by
+`|Δp_charged|`: 3 sit under 0.03 (204→198, 194→201, 205→198 — genuine
+near-threshold noise); the other 11 show a real shift in the model's own
+estimate that happens to land close enough to 0.7824 to cross it — several
+above 0.1, one (`cl` 44→239, `p_charged` 0.17→0.94) a near-total
+reclassification. `max_check` gates which `band_pos`s get a scored dwell
+candidate *at all* rather than the baseline-Viterbi fallback, so unlike
+#356's pure summation-order change, this one can genuinely move a read's
+probability, not just perturb an already-near-tied score by noise. The
+aggregate rate (14/55,446 = 0.025%) is the number to judge the tradeoff by;
+this note is so nobody mistakes "small count" for "small tie" when reading
+the list.
+
+Wall-clock/CPU, rep 2, `/usr/bin/time -v`:
+
+| binary | wall | user | sys | CPU total |
+|---|---:|---:|---:|---:|
+| before (pre-#32) | 176.01s | 562.24s | 7.37s | 569.61s |
+| after (#32 + trim) | 160.76s | 491.48s | 7.15s | 498.63s |
+
+**~8.7% faster wall, ~12.5% less CPU** on the full `escpod classify
+--device cpu --threads 4` run — smaller than the criterion win above
+because most of this end-to-end run's time is I/O, BAM parsing and chunk
+assembly, not the dwell-penalty DP in isolation.
+
 ## Dwell-penalty DP: a hand-written AVX2 kernel lost to the compiler (2026-09-09)
 
 A register-blocked AVX2 kernel for the `dwell_idx`-outer sweep in
