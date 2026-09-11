@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.24.3 (2026-09-11)
+
 ### Performance
 
 - **The dwell-penalty DP's inner-loop bound is halved, and its
