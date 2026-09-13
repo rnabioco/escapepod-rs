@@ -2553,9 +2553,11 @@ fn produce_cpu_crf_multi(
     class_tx: Option<&ClassTx>,
     pb: &indicatif::ProgressBar,
 ) -> anyhow::Result<()> {
-    // Every encoder is the CPU one: a multi-axis run pins the encoder stage to
-    // the CPU at load (see `run`), because the GPU pool routes reads from
-    // inside its worker threads and so cannot yet hold half a read's calls.
+    // This branch runs when `run`'s `gpu_encoders` collect did not come back
+    // `Some` — i.e. not every head's encoder loaded on the GPU. Per-head
+    // placement is a pure function of one `--device` flag and `Stage::CrfEncoder`
+    // (see `run`), so in practice that means none of them did, never a mix; the
+    // match below is the defensive check for that invariant, not what enforces it.
     let encoders: Vec<&CrfEncoder> = heads
         .iter()
         .map(|h| match &h.encoder {

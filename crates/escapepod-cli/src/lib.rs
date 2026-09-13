@@ -12,15 +12,16 @@
 //! the CLI's dependency tree:
 //!
 //! ```toml
-//! # Library only — no clap/noodles/etc.:
-//! escapepod-cli = { version = "0.5", default-features = false, features = ["signal"] }
+//! # Library only — no clap/noodles/etc. (use the current workspace version):
+//! escapepod-cli = { version = "0.24", default-features = false, features = ["signal"] }
 //! ```
 //!
-//! | Module       | Crate                                                            | Feature   |
-//! |--------------|------------------------------------------------------------------|-----------|
-//! | [`pod5`]     | [`escapepod-pod5`](https://crates.io/crates/escapepod-pod5)       | `pod5`    |
-//! | [`signal`]   | [`escapepod-signal`](https://crates.io/crates/escapepod-signal)  | `signal`  |
-//! | [`demux`]    | [`escapepod-demux`](https://crates.io/crates/escapepod-demux)    | `demux`   |
+//! | Module        | Crate                                                              | Feature    |
+//! |---------------|---------------------------------------------------------------------|-----------|
+//! | [`pod5`]      | [`escapepod-pod5`](https://crates.io/crates/escapepod-pod5)         | `pod5`     |
+//! | [`signal`]    | [`escapepod-signal`](https://crates.io/crates/escapepod-signal)     | `signal`   |
+//! | [`demux`]     | [`escapepod-demux`](https://crates.io/crates/escapepod-demux)       | `demux`    |
+//! | [`classify`]  | [`escapepod-classify`](https://crates.io/crates/escapepod-classify) | `classify` |
 //!
 //! The default `cli` feature enables `signal` (and `pod5` transitively).
 //!
