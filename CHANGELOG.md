@@ -33,6 +33,10 @@
   support, for callers who need a value first used in a later batch to
   survive too (`pore_type`/`end_reason` have no upfront registration step,
   so a genuinely new value can only be handled by predeclaring it).
+- **`Reader::read_count` re-walked every reads-table batch header on every
+  call**, unlike the signal footer's cache — called from `read_index`,
+  `read_columns`, `warm_index` and filter. Cached in a `OnceLock`, matching
+  the pattern the signal footer cache already uses.
 
 ## 0.24.3 (2026-09-11)
 

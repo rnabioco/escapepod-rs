@@ -1828,4 +1828,27 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn read_count_is_stable_across_calls() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        let options = WriterOptions::default();
+        let mut writer = Writer::create(path, options)?;
+        let run_info_idx = writer.add_run_info(create_test_run_info("read_count_test"))?;
+        for i in 1..=5u32 {
+            let read = create_test_read(run_info_idx, i, 100);
+            writer.add_read(read, &generate_test_signal(100, 0))?;
+        }
+        writer.finish()?;
+
+        let reader = Reader::open(path)?;
+        let first = reader.read_count()?;
+        let second = reader.read_count()?;
+        assert_eq!(first, 5);
+        assert_eq!(first, second);
+
+        Ok(())
+    }
 }
