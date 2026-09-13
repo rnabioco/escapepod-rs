@@ -8,6 +8,8 @@
   instead of `encode`, so the load-time shape probe still exercises the
   tract ONNX contract once a native kernel has loaded, rather than
   redundantly probing the native path `self_check` already checked.
+- Corrected a stale doc comment on `adapter_cnn::decode_adapter_end` claiming
+  the `valid_len` clamp is inert; it is load-bearing for short reads (#187).
 
 ## 0.24.3 (2026-09-11)
 
