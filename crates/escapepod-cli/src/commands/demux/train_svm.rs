@@ -38,15 +38,6 @@ pub struct TrainSvmArgs {
     )]
     pub power: f64,
 
-    /// SVM regularization parameter C
-    #[arg(
-        long,
-        default_value = "1.0",
-        value_name = "VALUE",
-        help_heading = "Advanced Options"
-    )]
-    pub c: f64,
-
     /// DTW window constraint (Sakoe-Chiba band)
     #[arg(long, value_name = "N", help_heading = "Advanced Options")]
     pub window: Option<usize>,
@@ -82,6 +73,12 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
     let mut timer = PhaseTimer::new();
     timer.phase("Train SVM");
     let profile = args.profile;
+
+    warn!(
+        "demux train-svm is experimental and less maintained than the CRF/GBM \
+         demux paths: the SVM fit is a label-only kernel-weighted-voting stub, \
+         not a real SMO fit (see escapepod_demux::train's module docs)."
+    );
 
     info!("{} SVM model from fingerprints", style::action("Training"));
 
@@ -121,17 +118,15 @@ pub fn run(args: TrainSvmArgs) -> anyhow::Result<()> {
     let config = TrainConfig {
         gamma: args.gamma,
         power: args.power,
-        c: args.c,
         window: args.window,
         thresholds,
     };
 
     info!(
-        "{} gamma={}, power={}, C={}",
+        "{} gamma={}, power={}",
         style::label("Config:"),
         config.gamma,
         config.power,
-        config.c
     );
 
     // The fit is currently label-only: the all-pairs DTW distance matrix and
