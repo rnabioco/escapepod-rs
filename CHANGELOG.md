@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- `downscale_normalize_into`'s `scratch.sel` retained its high-water-mark
+  capacity indefinitely after a huge outlier read: the `RETAIN_MAX` release
+  lived only in `normalize_downscale_into`, which production callers
+  (`run.rs`/`detect.rs`) never reach directly. Applied the same release to
+  the path they actually call.
+
 ## 0.24.3 (2026-09-11)
 
 ### Performance
