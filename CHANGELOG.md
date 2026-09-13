@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.25.0 (2026-09-13)
+
 ### Added
 
 - `escpod classify`'s output BAM `@PG` record now carries a `DS` field with
