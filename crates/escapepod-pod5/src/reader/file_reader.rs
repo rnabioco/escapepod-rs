@@ -316,7 +316,10 @@ impl Reader {
     /// There the previous behaviour is an empty footer whose every lookup
     /// misses, which is what each caller's fallback below is written against —
     /// so it is reproduced rather than turned into an error.
-    fn signal_footer_for_bulk(&self, signal_bytes: &[u8]) -> Result<Cow<'_, ArrowIpcFooter>> {
+    pub(crate) fn signal_footer_for_bulk(
+        &self,
+        signal_bytes: &[u8],
+    ) -> Result<Cow<'_, ArrowIpcFooter>> {
         match self.signal_ipc_footer() {
             Some(footer) => Ok(Cow::Borrowed(footer)),
             None => Ok(Cow::Owned(ArrowIpcFooter::parse(signal_bytes)?)),

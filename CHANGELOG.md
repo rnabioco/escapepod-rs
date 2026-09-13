@@ -16,6 +16,12 @@
   `pore_type` column beside it already used a checked lookup that falls back
   to a default; `end_reason` indexed the dictionary values array directly.
   Both columns now bounds-check the key and fall back to `EndReason::default()`.
+- **`filter`/`subset`/`merge` re-parsed each input's signal-table footer from
+  scratch instead of using the reader's cached, sidecar-seeded one**
+  (`operations/filter.rs`, `merge.rs`), so a `.p5s` sidecar never sped up
+  those paths the way it does every other signal fetch. They now go through
+  `Reader::signal_footer_for_bulk` (made `pub(crate)`), the same cached
+  accessor `get_signal`/`reads_by_ids` already use.
 
 ## 0.24.3 (2026-09-11)
 

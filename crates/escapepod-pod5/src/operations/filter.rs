@@ -206,7 +206,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
         .map(|path| {
             let reader = Reader::open(path)?;
             let signal_bytes = reader.signal_table_bytes()?;
-            let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+            let signal_footer = reader.signal_footer_for_bulk(signal_bytes)?.into_owned();
             let run_infos = reader.run_infos().to_vec();
 
             // Fast path: when only filtering by UUID, use reads_by_ids()
@@ -581,7 +581,7 @@ pub fn subset_files<P: AsRef<Path> + Sync>(
         .map(|path| -> Result<InputCtx<'_>> {
             let reader = Reader::open(path)?;
             let signal_bytes = reader.signal_table_bytes()?;
-            let signal_footer = ArrowIpcFooter::parse(signal_bytes)?;
+            let signal_footer = reader.signal_footer_for_bulk(signal_bytes)?.into_owned();
             let run_infos = reader.run_infos().to_vec();
             let groups = partition_reads_by_group(&reader, read_to_group)?;
             Ok((reader, signal_footer, run_infos, groups))
