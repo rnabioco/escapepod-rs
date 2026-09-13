@@ -29,6 +29,11 @@
   script's own `git diff --quiet HEAD` refreshes and rewrites the index file
   (git's stat-cache behavior), so watching it made the script trigger its own
   next rerun forever.
+- **`demux classify --reference` reported every read as confident with a
+  single-reference bank.** With no second-best distance to form a margin
+  from, the ratio-based confidence read the missing distance as infinitely
+  far away instead of as "no margin to test" — now `confidence = 0.0` and
+  `confident = false` below 2 references, with a warning.
 
 ## 0.24.3 (2026-09-11)
 
