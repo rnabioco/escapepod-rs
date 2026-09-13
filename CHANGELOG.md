@@ -22,6 +22,10 @@
 - `extract_levels` silently missed the k-mer table when a window straddled a
   multi-byte UTF-8 character (invalid UTF-8 despite the whole `&str` being
   valid); added a `debug_assert!` so the miss is no longer silent.
+- `KmerTable`'s RNA004 test fixture path resolved to `crates/data/kmer_models`
+  (one `.parent()` short of the repo root), so those tests silently never
+  ran. Fixed to `data/kmer_models` at the repo root; both now execute and
+  pass.
 
 ## 0.24.3 (2026-09-11)
 

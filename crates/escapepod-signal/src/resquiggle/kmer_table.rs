@@ -491,6 +491,8 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
+            .parent()
+            .unwrap()
             .join("data/kmer_models/rna004_9mer_levels_v1.txt.gz");
         if !path.exists() {
             eprintln!("skipping test: {:?} not found", path);
@@ -515,6 +517,8 @@ mod tests {
     #[test]
     fn test_fix_gauge_rna004() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
             .parent()
             .unwrap()
             .join("data/kmer_models/rna004_9mer_levels_v1.txt.gz");
