@@ -4,6 +4,28 @@
 
 ### Fixed
 
+- `downscale_normalize_into`'s `scratch.sel` retained its high-water-mark
+  capacity indefinitely after a huge outlier read: the `RETAIN_MAX` release
+  lived only in `normalize_downscale_into`, which production callers
+  (`run.rs`/`detect.rs`) never reach directly. Applied the same release to
+  the path they actually call.
+- `rough_rescale`'s disabled-clipping default bounded `clip_end` by
+  `signal.len()` instead of `levels.len()`; harmless only because every use
+  already re-clamps with `.min(levels.len())`. Fixed the invariant.
+- `rough_rescale`'s `!use_base_center` branch could panic on
+  `signal[start..end]` when a malformed `seq_to_signal_map` produced
+  `start > end`; now clamped so it falls through to the existing
+  empty-data error instead.
+- `adaptive_banded_dp` indexed `initial_map[1]` with only an `n_bases == 0`
+  guard, panicking on a length-1 `initial_map` with nonzero `n_bases`
+  (release builds are `panic = "abort"`). Guarded on `initial_map.len() < 2`.
+- `extract_levels` silently missed the k-mer table when a window straddled a
+  multi-byte UTF-8 character (invalid UTF-8 despite the whole `&str` being
+  valid); added a `debug_assert!` so the miss is no longer silent.
+- `KmerTable`'s RNA004 test fixture path resolved to `crates/data/kmer_models`
+  (one `.parent()` short of the repo root), so those tests silently never
+  ran. Fixed to `data/kmer_models` at the repo root; both now execute and
+  pass.
 - **`summary` and `inspect` no longer write raw ANSI to redirected stdout.**
   `summary`'s table colored unconditionally via `owo_colors`, with no
   TTY/`NO_COLOR` gate at all; `inspect` colored stdout output through

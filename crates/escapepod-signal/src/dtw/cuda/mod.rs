@@ -523,7 +523,7 @@ impl GpuDtwContext {
             adapter_end.push(a_e as i32);
         }
 
-        // Packed scalar params (cudarc 0.12 caps launches at 12 tuple args).
+        // Packed scalar params (cudarc 0.19 caps launches at 12 tuple args).
         let mut params = vec![0i32; ttest_fp_kernel::N_PARAMS];
         params[ttest_fp_kernel::P_N_READS] = bn as i32;
         params[ttest_fp_kernel::P_WW] = window_width as i32;
