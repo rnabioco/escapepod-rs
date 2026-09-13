@@ -319,7 +319,8 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
 pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
     let files = resolve_pod5_inputs(&input)?;
     let is_directory = files.len() > 1;
-    let target_id: uuid::Uuid = read_id.parse()?;
+    // Accepts the dash-less 32-hex form too, per the command's own help text.
+    let target_id: uuid::Uuid = escapepod_signal::parse_uuid_flexible(&read_id)?;
 
     for file_path in &files {
         let reader = match Reader::open(file_path) {

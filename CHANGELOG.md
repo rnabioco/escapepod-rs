@@ -10,6 +10,9 @@
   `style.rs`'s functions, which gate on *stderr*'s terminal status. A new
   `style::stdout` gate (plus `style::strip_ansi` for the table, whose cells
   are colored before their widths are known) checks stdout instead.
+- **`inspect read` rejected the dash-less 32-hex read ID its own help text
+  advertises.** Now parsed with `parse_uuid_flexible`, like every other
+  read-ID input in the CLI.
 
 ## 0.24.3 (2026-09-11)
 
