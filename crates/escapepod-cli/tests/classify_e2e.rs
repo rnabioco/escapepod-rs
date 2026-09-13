@@ -11,6 +11,7 @@ use noodles_bam as bam;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
+use noodles_sam::header::record::value::map::program::tag as pg_tag;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -168,31 +169,60 @@ fn classify_end_to_end_matches_golden() {
     );
 }
 
-/// `escpod signal classify` was the shipped spelling from 0.11.0 and still
-/// appears in pipeline scripts, so it must keep working — producing the *same*
-/// calls, not merely exiting zero — while telling the user where the command
-/// moved to.
+/// The `@PG` `DS` field carries the model identity that would otherwise only
+/// ever reach stdout (rnabioco/escapepod-rs#370) — checked against the
+/// fixture bundle's own `metadata.json` rather than merely asserted
+/// non-empty, since a field that round-trips the wrong bundle is exactly the
+/// failure this exists to catch.
 #[test]
-fn deprecated_signal_classify_alias_warns_and_forwards() {
+fn classify_bam_header_records_full_model_provenance() {
     let out_dir = tempfile::tempdir().unwrap();
-    let (plain_bam, plain_tsv) = (out_dir.path().join("g.bam"), out_dir.path().join("g.tsv"));
-    let (alias_bam, alias_tsv) = (out_dir.path().join("a.bam"), out_dir.path().join("a.tsv"));
+    let out_bam = out_dir.path().join("out.bam");
+    let out_tsv = out_dir.path().join("calls.tsv");
+    run_classifier(&["classify"], &out_bam, &out_tsv);
 
-    let plain_err = run_classifier(&["classify"], &plain_bam, &plain_tsv);
-    let alias_err = run_classifier(&["signal", "classify"], &alias_bam, &alias_tsv);
+    let meta: Json = serde_json::from_str(
+        &std::fs::read_to_string(fixtures().join("bundle/metadata.json")).unwrap(),
+    )
+    .unwrap();
 
+    let file = std::fs::File::open(&out_bam).unwrap();
+    let mut reader = bam::io::Reader::new(file);
+    let header = reader.read_header().unwrap();
+
+    let (_, pg) = header
+        .programs()
+        .as_ref()
+        .iter()
+        .find(|(id, _)| String::from_utf8_lossy(id.as_ref()) == "escpod-classify")
+        .expect("escpod-classify @PG record present");
+    let ds = pg
+        .other_fields()
+        .get(&pg_tag::DESCRIPTION)
+        .expect("@PG DS field present");
+    let ds: Json = serde_json::from_slice(ds.as_ref()).expect("DS field is valid JSON");
+
+    // model_id / model_version / scorer_sha256 round-trip the bundle's own
+    // metadata.json rather than some other value that merely parses as JSON.
+    assert_eq!(ds["model_id"], meta["model"]["id"]);
+    assert_eq!(ds["model_version"], meta["model"]["version"]);
+    assert_eq!(ds["scorer_sha256"], meta["gbm"]["sha256"]);
     assert_eq!(
-        std::fs::read_to_string(&plain_tsv).unwrap(),
-        std::fs::read_to_string(&alias_tsv).unwrap(),
-        "the alias must forward to the same runner, not a divergent copy"
+        ds["operating_point"]["probability"],
+        meta["operating_point"]["probability"]
+    );
+    assert_eq!(ds["operating_point"]["cl"], meta["operating_point"]["cl"]);
+    // The fixture bundle ships neither a calibration nor a basecaller nor an
+    // abstain block — `calibration` must still report `false` (it is not
+    // Option on the bundle), but the other two must be omitted rather than
+    // fabricated.
+    assert_eq!(ds["calibration"], Json::Bool(false));
+    assert!(
+        ds.get("basecaller").is_none(),
+        "fixture bundle carries no basecaller; DS must not invent one: {ds}"
     );
     assert!(
-        alias_err.contains("`escpod signal classify` is deprecated")
-            && alias_err.contains("use `escpod classify`"),
-        "the alias should name its replacement:\n{alias_err}"
-    );
-    assert!(
-        !plain_err.contains("deprecated"),
-        "the current spelling must not warn:\n{plain_err}"
+        ds.get("abstain_rule").is_none(),
+        "fixture bundle carries no abstain rule; DS must not invent one: {ds}"
     );
 }

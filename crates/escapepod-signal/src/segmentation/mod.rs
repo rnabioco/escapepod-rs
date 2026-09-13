@@ -55,10 +55,6 @@ pub mod ttest;
 pub use llr::{LlrTrace, detect_adapter};
 pub use normalize::{
     SignalPrepScratch, clip_outliers, downscale, downscale_normalize_into, mad_normalize,
-    mad_normalize_robust, mad_normalize_with_clipping, normalize_downscale_into,
-    normalize_dwell_times, normalize_dwell_times_mad, normalize_signal,
+    mad_normalize_robust, normalize_downscale_into, normalize_dwell_times, normalize_signal,
 };
-pub use ttest::{
-    SegmentationResult, compute_segment_means, find_changepoints, segment_signal,
-    segment_signal_with_dwell, windowed_ttest,
-};
+pub use ttest::{compute_segment_means, find_changepoints, segment_signal, windowed_ttest};

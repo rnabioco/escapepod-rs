@@ -1,10 +1,13 @@
 //! GPU/CPU parity for the batched LLR adapter detector.
 //!
-//! Gated on `--features gpu`; skips transparently without a CUDA device.
-//! Compares `GpuDtwContext::detect_adapter_batch` against the CPU demux path
-//! (`normalize_signal` → optional `downscale` → `detect_adapter` → scale back).
+//! Gated on `--features gpu-prep-experimental` (implies `gpu`):
+//! `detect_adapter_batch`/`detect_adapter_batch_block` are experimental prep
+//! kernels with no production caller. Skips transparently without a CUDA
+//! device. Compares `GpuDtwContext::detect_adapter_batch` against the CPU
+//! demux path (`normalize_signal` → optional `downscale` → `detect_adapter`
+//! → scale back).
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-prep-experimental")]
 
 use escapepod_signal::dtw::{GpuDtwContext, GpuDtwError};
 use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};

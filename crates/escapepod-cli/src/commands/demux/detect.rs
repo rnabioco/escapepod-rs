@@ -249,8 +249,7 @@ pub fn run(args: DetectArgs) -> anyhow::Result<()> {
              escapepod-models#16)."
         );
     };
-    // Resolved once, here, so the `--gpu` deprecation warning is emitted exactly
-    // once no matter which arm runs.
+    // Resolved once, here, so every arm sees the same device choice.
     let device = args.device.resolve();
     match method.as_str() {
         "llr" => {

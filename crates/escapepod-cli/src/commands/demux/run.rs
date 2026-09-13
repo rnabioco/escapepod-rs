@@ -1154,9 +1154,8 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     // advanced subcommands do (see `super::run`). Deliberately after `--info`,
     // which describes a model and is given no POD5 at all.
     args.input = crate::util::collect_pod5_inputs(&args.input)?;
-    // Resolved once, before anything is loaded: the deprecated `--gpu` alias
-    // warns exactly once, and every stage below asks the same question of the
-    // same answer.
+    // Resolved once, before anything is loaded, so every stage below asks the
+    // same question of the same answer.
     let device = args.device.resolve();
     let output_dir = match args.output_dir.clone() {
         Some(dir) => Some(dir),

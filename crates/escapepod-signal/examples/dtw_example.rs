@@ -4,12 +4,8 @@
 //! 1. Create and normalize barcode fingerprints
 //! 2. Compute DTW distances between fingerprints
 //! 3. Build a distance matrix for multiple fingerprints
-//! 4. Convert distances to a kernel matrix for classification
 
-use escapepod_signal::dtw::{
-    Fingerprint, NormMethod, distance_to_kernel, distance_to_kernel_auto, dtw_distance,
-    dtw_distance_matrix,
-};
+use escapepod_signal::dtw::{Fingerprint, NormMethod, dtw_distance, dtw_distance_matrix};
 use uuid::Uuid;
 
 fn main() {
@@ -79,27 +75,8 @@ fn main() {
     println!("{:.2}", distance_matrix);
     println!();
 
-    // Example 5: Kernel conversion for classification
-    println!("=== Example 5: Kernel Conversion ===");
-
-    // Convert distances to RBF kernel
-    let gamma = 0.1;
-    let power = 1.0;
-    let kernel = distance_to_kernel(&distance_matrix, gamma, power);
-
-    println!("RBF Kernel with gamma={}, power={}:", gamma, power);
-    println!("{:.4}", kernel);
-    println!();
-
-    // Auto-estimate gamma using median heuristic
-    let (kernel_auto, estimated_gamma) = distance_to_kernel_auto(&distance_matrix, 1.0);
-    println!("Auto-estimated gamma: {:.4}", estimated_gamma);
-    println!("Kernel with auto gamma:");
-    println!("{:.4}", kernel_auto);
-    println!();
-
-    // Example 6: Practical barcode classification scenario
-    println!("=== Example 6: Barcode Classification Scenario ===");
+    // Example 5: Practical barcode classification scenario
+    println!("=== Example 5: Barcode Classification Scenario ===");
 
     // Reference fingerprints for known barcodes
     let reference_barcodes = vec![

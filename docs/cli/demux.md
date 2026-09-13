@@ -791,7 +791,6 @@ escpod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
 | `-o, --output <FILE>` | Output JSON file for trained SVM model (required) |
 | `--gamma <VALUE>` | RBF kernel gamma parameter (default: 1.0) |
 | `--power <VALUE>` | Power to raise distances before exponential (default: 1.0) |
-| `--c <VALUE>` | SVM regularization parameter C (default: 1.0) |
 | `--window <N>` | DTW window constraint (Sakoe-Chiba band) |
 | `--thresholds <VALUES>` | Per-class confidence thresholds (comma-separated) |
 | `-h, --help` | Print help |
@@ -814,7 +813,7 @@ c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
 escpod demux train-svm -f fingerprints.csv -o model.json
 
 # Train with custom hyperparameters
-escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --c 10.0 --window 10
+escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
 
 # Use the trained SVM model for classification (--model auto-detects the JSON shape)
 escpod demux classify fingerprints.csv --model model.json -o classifications.csv
@@ -925,12 +924,11 @@ One opt-in Cargo feature, `gpu`, enables every GPU path. At run time
     downstream — see the troubleshooting table below.
 - **`cpu`** — CPU everywhere, device or no device.
 
-`--gpu` still works as a hidden, deprecated alias for `--device gpu` (it warns,
-including about the change in meaning); `--cpu` is an alias for `--device cpu`.
-Both conflict with `--device`. `--device` is accepted in **every** build,
-including the release artifacts that contain no GPU code — `--device gpu` there
-tells you the feature is not compiled in rather than failing on an unknown
-argument.
+`--cpu` is an alias for `--device cpu`; it conflicts with `--device`. (The old
+`--gpu` boolean was removed in favor of `--device gpu` — see the CHANGELOG.)
+`--device` is accepted in **every** build, including the release artifacts
+that contain no GPU code — `--device gpu` there tells you the feature is not
+compiled in rather than failing on an unknown argument.
 
 !!! tip "A CPU run that could have been a GPU run says so"
     Whenever a GPU-capable stage lands on the CPU, escpod logs a warning at
