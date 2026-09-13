@@ -16,6 +16,9 @@
   `signal[start..end]` when a malformed `seq_to_signal_map` produced
   `start > end`; now clamped so it falls through to the existing
   empty-data error instead.
+- `adaptive_banded_dp` indexed `initial_map[1]` with only an `n_bases == 0`
+  guard, panicking on a length-1 `initial_map` with nonzero `n_bases`
+  (release builds are `panic = "abort"`). Guarded on `initial_map.len() < 2`.
 
 ## 0.24.3 (2026-09-11)
 
