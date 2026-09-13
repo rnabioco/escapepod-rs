@@ -33,9 +33,6 @@ pub struct TrainConfig {
     /// Power to raise distances before exponential.
     pub power: f64,
 
-    /// SVM regularization parameter C.
-    pub c: f64,
-
     /// DTW window constraint (Sakoe-Chiba band).
     pub window: Option<usize>,
 
@@ -48,7 +45,6 @@ impl Default for TrainConfig {
         Self {
             gamma: 1.0,
             power: 1.0,
-            c: 1.0,
             window: None,
             thresholds: None,
         }
@@ -166,12 +162,12 @@ pub fn compute_distance_matrix_gpu_with_ctx(
 ///
 /// This used to call [`compute_distance_matrix`] first. It no longer does,
 /// because **the result was discarded unused**: the only consumer was
-/// [`distance_to_kernel_matrix`], whose output is passed to
-/// `train_binary_svm`/`train_multiclass_svm` as an ignored `_kernel_matrix`
-/// parameter. Ever since the real SMO fit was removed (see
-/// `TODO(svm-real-fit)` on [`train_multiclass_svm`]), the emitted model has
-/// depended only on `fingerprints`, `labels` and `config` — the O(N²) all-pairs
-/// DTW and the O(N²) RBF exponentiation were pure dead work.
+/// [`distance_to_kernel_matrix`], and neither [`train_svm`] nor
+/// [`fit_from_labels`] takes its output as a parameter. Ever since the real
+/// SMO fit was removed (see `TODO(svm-real-fit)` on [`fit_from_labels`]), the
+/// emitted model has depended only on `fingerprints`, `labels` and `config` —
+/// the O(N²) all-pairs DTW and the O(N²) RBF exponentiation were pure dead
+/// work.
 ///
 /// Verified by construction and by experiment: varying `--window`, `--gamma`
 /// and `--power` (the only inputs to those two matrices) changes nothing in the
@@ -213,9 +209,33 @@ pub fn train_svm_from_distances(
 }
 
 /// The fit as it actually stands: derive the OvO weight layout from the class
-/// labels and package the model. Deliberately takes no distance/kernel matrix,
-/// because the current `train_binary_svm`/`train_multiclass_svm` bodies ignore
-/// one (`TODO(svm-real-fit)`).
+/// labels and package the model. Deliberately takes no distance/kernel
+/// matrix — the SMO fit that would have consumed one is gone
+/// (`TODO(svm-real-fit)`), so there is nothing left to pass one to.
+///
+/// *Known limitation.* This does not currently produce a real SVM — it emits
+/// uniform per-pair weights and relies on the predictor's kernel-weighted
+/// voting fallback (`use_kernel_weighted: true`). Proper dual-coefficient
+/// extraction from linfa-svm would require either vendoring the SMO solver or
+/// a Cholesky factorization of each kernel submatrix (`TODO(svm-real-fit)`).
+/// An earlier version of this crate called
+/// `Svm::params().gaussian_kernel(1.0).fit(...)`, which re-applied RBF on top
+/// of the already-RBF-transformed kernel matrix (meaningless) and then threw
+/// the solver's output away; removed because it cost hours of
+/// single-threaded SMO for a result that was discarded.
+///
+/// One construction serves every `n_classes >= 2`: this used to be two
+/// functions (`train_binary_svm`, `train_multiclass_svm`) with two different
+/// `dual_coef` layouts — a single uniform row for the binary case, a per-pair
+/// OvO layout otherwise. The split was dead weight. Every reader of a
+/// `DtwSvmModel` checks `use_kernel_weighted` first
+/// (`SvmPredictor::decision_function`/`decision_function_into`,
+/// `svm::gpu`'s host-side coefficient table) and, since it is always `true`
+/// here, computes class scores from `training_labels` alone — `dual_coef`'s
+/// specific values are never read. `dual_coef` still comes out with the
+/// `n_classes - 1` rows of length `n_samples` each that
+/// `DtwSvmModel::validate` requires; there just used to be two ways to build
+/// it for a distinction nothing downstream can see.
 fn fit_from_labels(
     fingerprints: Vec<Vec<f64>>,
     labels: Vec<i32>,
@@ -263,88 +283,10 @@ fn fit_from_labels(
         .map(|&l| *label_to_idx.get(&l).unwrap())
         .collect();
 
-    if n_classes == 2 {
-        train_binary_svm(fingerprints, labels, &label_mapper, unique_labels, config)
-    } else {
-        train_multiclass_svm(
-            fingerprints,
-            labels,
-            &target_indices,
-            &label_mapper,
-            unique_labels,
-            config,
-        )
-    }
-}
-
-/// Train binary SVM classifier.
-///
-/// Same stub status as `train_multiclass_svm`: returns uniform-weighted
-/// kernel voting, not a real SVM. The previous SMO-fit-then-discard dance
-/// is removed here too; see that function for the full explanation and
-/// the `TODO(svm-real-fit)` tracking note.
-fn train_binary_svm(
-    fingerprints: Vec<Vec<f64>>,
-    labels: Vec<i32>,
-    label_mapper: &HashMap<usize, i32>,
-    classes: Vec<i32>,
-    config: &TrainConfig,
-) -> Result<DtwSvmModel, anyhow::Error> {
     let n_samples = fingerprints.len();
-    let support_indices: Vec<usize> = (0..n_samples).collect();
-    let n_classes = 2;
-    let dual_coef = vec![vec![1.0 / n_samples as f64; n_samples]];
-    let intercept = vec![0.0];
-
-    Ok(DtwSvmModel {
-        version: "1.0".to_string(),
-        training_fingerprints: fingerprints,
-        training_labels: labels,
-        support_indices,
-        dual_coef,
-        intercept,
-        classes,
-        kernel_params: KernelParams {
-            gamma: config.gamma,
-            power: config.power,
-        },
-        window: config.window,
-        penalty: 0.0,
-        label_mapper: label_mapper.clone(),
-        thresholds: config.thresholds.clone(),
-        prob_a: None,
-        prob_b: None,
-        n_classes,
-        noise_class: false,
-        use_kernel_weighted: true, // Use kernel-weighted voting since we can't extract real dual coefficients
-    })
-}
-
-/// Train multiclass SVM using One-vs-One decomposition.
-///
-/// *Known limitation.* This path does not currently produce a real SVM — it
-/// emits uniform per-sample weights and relies on the predictor's
-/// kernel-weighted voting fallback (`use_kernel_weighted: true`). Proper
-/// dual-coefficient extraction from linfa-svm requires either vendoring the
-/// SMO solver or a Cholesky factorization of each kernel submatrix; see
-/// `TODO(svm-real-fit)` in `fit_from_labels` for the tracking note. The old
-/// implementation here called `Svm::params().gaussian_kernel(1.0).fit(...)`
-/// which re-applied RBF on top of the already-RBF-transformed kernel matrix
-/// (meaningless) and then threw the solver's output away; removed because
-/// it cost hours of single-threaded SMO for a result that was discarded.
-fn train_multiclass_svm(
-    fingerprints: Vec<Vec<f64>>,
-    labels: Vec<i32>,
-    target_indices: &[usize],
-    label_mapper: &HashMap<usize, i32>,
-    classes: Vec<i32>,
-    config: &TrainConfig,
-) -> Result<DtwSvmModel, anyhow::Error> {
-    let n_samples = fingerprints.len();
-    let n_classes = classes.len();
     let n_pairs = n_classes * (n_classes - 1) / 2;
 
-    // Kernel-weighted voting weights: every sample in the OvO pair gets a
+    // Kernel-weighted voting weights: every sample in an OvO pair gets a
     // uniform contribution. Because `svm::decision_function` adds a
     // class-scores subtraction `scores[i] - scores[j]` in kernel-weighted
     // mode, these weights translate into a nearest-neighbour-like
@@ -382,20 +324,20 @@ fn train_multiclass_svm(
         support_indices,
         dual_coef: all_dual_coef,
         intercept: intercepts,
-        classes,
+        classes: unique_labels,
         kernel_params: KernelParams {
             gamma: config.gamma,
             power: config.power,
         },
         window: config.window,
         penalty: 0.0,
-        label_mapper: label_mapper.clone(),
+        label_mapper,
         thresholds: config.thresholds.clone(),
         prob_a: None,
         prob_b: None,
         n_classes,
         noise_class: false,
-        use_kernel_weighted: true,
+        use_kernel_weighted: true, // Predictor and GPU path both check this first and never read `dual_coef`'s values when it's true.
     })
 }
 

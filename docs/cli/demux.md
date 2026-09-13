@@ -791,7 +791,6 @@ escpod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
 | `-o, --output <FILE>` | Output JSON file for trained SVM model (required) |
 | `--gamma <VALUE>` | RBF kernel gamma parameter (default: 1.0) |
 | `--power <VALUE>` | Power to raise distances before exponential (default: 1.0) |
-| `--c <VALUE>` | SVM regularization parameter C (default: 1.0) |
 | `--window <N>` | DTW window constraint (Sakoe-Chiba band) |
 | `--thresholds <VALUES>` | Per-class confidence thresholds (comma-separated) |
 | `-h, --help` | Print help |
@@ -814,7 +813,7 @@ c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
 escpod demux train-svm -f fingerprints.csv -o model.json
 
 # Train with custom hyperparameters
-escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --c 10.0 --window 10
+escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
 
 # Use the trained SVM model for classification (--model auto-detects the JSON shape)
 escpod demux classify fingerprints.csv --model model.json -o classifications.csv

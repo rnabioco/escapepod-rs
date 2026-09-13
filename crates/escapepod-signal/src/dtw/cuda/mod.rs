@@ -2,17 +2,20 @@
 //! primitives for the demux signal chain (SVB16 decode, t-test fingerprint,
 //! LLR adapter detect).
 //!
-//! Enabled via the `gpu` feature. Compiles CUDA kernels at runtime using
-//! NVRTC (no `nvcc` / CUDA toolkit required at build time — only the CUDA
-//! driver and libnvrtc at runtime).
+//! The DTW + SVM path is enabled via the `gpu` feature and compiles CUDA
+//! kernels at runtime using NVRTC (no `nvcc` / CUDA toolkit required at
+//! build time — only the CUDA driver and libnvrtc at runtime).
 //!
-//! ## Why the prep kernels are experimental (not in the default pipeline)
+//! ## Why the prep kernels are gated behind `gpu-prep-experimental`
 //!
 //! The DTW distance matrix below is a genuine GPU win — dense, regular, f32
-//! work. The signal-processing *prep* kernels ([`GpuDtwContext::decode_svb16_batch`],
-//! [`GpuDtwContext::fingerprint_batch`], [`GpuDtwContext::detect_adapter_batch`] /
-//! [`GpuDtwContext::detect_adapter_batch_block`]) are parity-validated against
-//! their CPU references but are **not** wired into `escpod demux`, because
+//! work. The signal-processing *prep* kernels (`GpuDtwContext::decode_svb16_batch`,
+//! `GpuDtwContext::fingerprint_batch`, `GpuDtwContext::detect_adapter_batch` /
+//! `GpuDtwContext::detect_adapter_batch_block`) are parity-validated against
+//! their CPU references but have **no production caller** anywhere in the
+//! workspace — only `tests/gpu_{svb16,llr_detect}.rs`,
+//! `escapepod-demux/tests/gpu_fingerprint.rs` and
+//! `escapepod-demux/examples/gpu_detect_timing.rs` exercise them — because
 //! measurement shows prep belongs on the CPU:
 //!
 //! - Prep cost splits ~detect **85%** / fingerprint **12.5%** / decode **2.8%**.
@@ -25,10 +28,16 @@
 //! - The real prep speed-up is CPU-side: `--downscale 10` (the WarpDemuX
 //!   default) cuts detect ~5.3× with ~98–99.9% barcode agreement.
 //!
-//! These kernels are kept as validated, reusable primitives — useful on
-//! few-core GPU hosts or future fast-f64 cards, and as the record of the
-//! measurement. The [`GpuDtwContext`] DTW + SVM classify path remains the
-//! production GPU usage.
+//! Every production `GpuDtwContext::new()` call site (escapepod-demux's
+//! `train.rs`, `svm/gpu.rs`, `classify.rs`; escapepod-cli's `demux/run.rs`,
+//! `demux/classify.rs`) previously paid the NVRTC compile cost for these
+//! prep kernels on every context init despite never calling them. The
+//! `gpu-prep-experimental` feature (implies `gpu`, not implied by it) keeps
+//! them compiled in as validated, reusable primitives — useful on few-core
+//! GPU hosts or future fast-f64 cards, and as the record of the measurement —
+//! without a plain `gpu` build paying for them. The [`GpuDtwContext`] DTW +
+//! SVM classify path remains the production GPU usage and is unaffected by
+//! this gate.
 //!
 //! ## Typical use
 //!
@@ -46,10 +55,14 @@
 //! ```
 
 mod kernel;
+#[cfg(feature = "gpu-prep-experimental")]
 mod llr_detect_block_kernel;
+#[cfg(feature = "gpu-prep-experimental")]
 mod llr_detect_kernel;
+#[cfg(feature = "gpu-prep-experimental")]
 mod svb16_kernel;
 mod svm_kernels;
+#[cfg(feature = "gpu-prep-experimental")]
 mod ttest_fp_kernel;
 
 pub use svm_kernels::{
@@ -112,9 +125,13 @@ pub struct GpuDtwContext {
     // functions are loaded from a module handle, so we hold each module.
     dtw_module: Arc<CudaModule>,
     svm_module: Arc<CudaModule>,
+    #[cfg(feature = "gpu-prep-experimental")]
     svb16_module: Arc<CudaModule>,
+    #[cfg(feature = "gpu-prep-experimental")]
     ttest_fp_module: Arc<CudaModule>,
+    #[cfg(feature = "gpu-prep-experimental")]
     llr_module: Arc<CudaModule>,
+    #[cfg(feature = "gpu-prep-experimental")]
     llr_block_module: Arc<CudaModule>,
 }
 
@@ -129,15 +146,25 @@ impl GpuDtwContext {
     /// at startup — escapepod-demux's GPU classify path needs them, and
     /// keeping the load here means downstream callers don't have to learn
     /// a second NVRTC compile cycle.
+    ///
+    /// Under plain `gpu` this is the full set of kernels compiled — the three
+    /// experimental prep modules (SVB16 decode, t-test fingerprint, LLR
+    /// adapter detect) are only added when `gpu-prep-experimental` is also
+    /// enabled, since no production caller needs them (see the module docs).
     pub fn new_on_device(ordinal: usize) -> Result<Self, GpuDtwError> {
         let ctx = CudaContext::new(ordinal)?;
         let stream = ctx.default_stream();
 
         let dtw_module = ctx.load_module(compile_ptx(kernel::KERNEL_SRC)?)?;
         let svm_module = ctx.load_module(compile_ptx(SVM_KERNEL_SRC)?)?;
+
+        #[cfg(feature = "gpu-prep-experimental")]
         let svb16_module = ctx.load_module(compile_ptx(svb16_kernel::KERNEL_SRC)?)?;
+        #[cfg(feature = "gpu-prep-experimental")]
         let ttest_fp_module = ctx.load_module(compile_ptx(ttest_fp_kernel::KERNEL_SRC)?)?;
+        #[cfg(feature = "gpu-prep-experimental")]
         let llr_module = ctx.load_module(compile_ptx(llr_detect_kernel::KERNEL_SRC)?)?;
+        #[cfg(feature = "gpu-prep-experimental")]
         let llr_block_module =
             ctx.load_module(compile_ptx(llr_detect_block_kernel::KERNEL_SRC)?)?;
 
@@ -146,9 +173,13 @@ impl GpuDtwContext {
             stream,
             dtw_module,
             svm_module,
+            #[cfg(feature = "gpu-prep-experimental")]
             svb16_module,
+            #[cfg(feature = "gpu-prep-experimental")]
             ttest_fp_module,
+            #[cfg(feature = "gpu-prep-experimental")]
             llr_module,
+            #[cfg(feature = "gpu-prep-experimental")]
             llr_block_module,
         })
     }
@@ -178,16 +209,25 @@ impl GpuDtwContext {
             &self.dtw_module
         } else if module == SVM_MODULE_NAME {
             &self.svm_module
-        } else if module == svb16_kernel::MODULE_NAME {
-            &self.svb16_module
-        } else if module == ttest_fp_kernel::MODULE_NAME {
-            &self.ttest_fp_module
-        } else if module == llr_detect_kernel::MODULE_NAME {
-            &self.llr_module
-        } else if module == llr_detect_block_kernel::MODULE_NAME {
-            &self.llr_block_module
         } else {
-            return Err(GpuDtwError::KernelMissing(kernel_name));
+            #[cfg(feature = "gpu-prep-experimental")]
+            {
+                if module == svb16_kernel::MODULE_NAME {
+                    &self.svb16_module
+                } else if module == ttest_fp_kernel::MODULE_NAME {
+                    &self.ttest_fp_module
+                } else if module == llr_detect_kernel::MODULE_NAME {
+                    &self.llr_module
+                } else if module == llr_detect_block_kernel::MODULE_NAME {
+                    &self.llr_block_module
+                } else {
+                    return Err(GpuDtwError::KernelMissing(kernel_name));
+                }
+            }
+            #[cfg(not(feature = "gpu-prep-experimental"))]
+            {
+                return Err(GpuDtwError::KernelMissing(kernel_name));
+            }
         };
         module.load_function(kernel_name).map_err(GpuDtwError::from)
     }
@@ -330,6 +370,7 @@ impl GpuDtwContext {
     /// This host method dtoh's the decoded signal for testing/standalone use;
     /// the fused pipeline keeps the decoded signal on-device and feeds it
     /// straight into the detect/fingerprint kernels.
+    #[cfg(feature = "gpu-prep-experimental")]
     pub fn decode_svb16_batch(
         &self,
         reads: &[(&[u8], usize)],
@@ -418,6 +459,7 @@ impl GpuDtwContext {
     /// Reads are length-sorted and split into memory-bounded sub-batches so
     /// rectangular scratch (`max_len` slots/read) tracks each sub-batch rather
     /// than the global maximum.
+    #[cfg(feature = "gpu-prep-experimental")]
     pub fn fingerprint_batch(
         &self,
         reads: &[(&[i16], usize, usize)],
@@ -478,6 +520,7 @@ impl GpuDtwContext {
         Ok(result)
     }
 
+    #[cfg(feature = "gpu-prep-experimental")]
     #[allow(clippy::too_many_arguments)]
     fn fingerprint_subbatch(
         &self,
@@ -595,6 +638,7 @@ impl GpuDtwContext {
     /// the downscaled domain). `(0, 0)` means no adapter detected. Reads are
     /// split into memory-bounded sub-batches (scratch is jagged at the full
     /// read length, since LLR scans the whole read).
+    #[cfg(feature = "gpu-prep-experimental")]
     pub fn detect_adapter_batch(
         &self,
         signals: &[&[i16]],
@@ -609,6 +653,7 @@ impl GpuDtwContext {
     /// `best_split` across a CUDA block and z-score normalizes via a parallel
     /// reduction. Same result as the thread-per-read detector (LLR is affine-
     /// invariant), but built for throughput rather than simplicity.
+    #[cfg(feature = "gpu-prep-experimental")]
     pub fn detect_adapter_batch_block(
         &self,
         signals: &[&[i16]],
@@ -619,6 +664,7 @@ impl GpuDtwContext {
         self.detect_adapter_batch_impl(signals, min_adapter, border_trim, downscale, true)
     }
 
+    #[cfg(feature = "gpu-prep-experimental")]
     fn detect_adapter_batch_impl(
         &self,
         signals: &[&[i16]],
@@ -661,6 +707,7 @@ impl GpuDtwContext {
         Ok(result)
     }
 
+    #[cfg(feature = "gpu-prep-experimental")]
     #[allow(clippy::too_many_arguments)]
     fn detect_subbatch(
         &self,

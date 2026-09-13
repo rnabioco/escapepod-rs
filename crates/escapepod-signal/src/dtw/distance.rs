@@ -34,23 +34,6 @@ pub fn dtw_distance(a: &[f32], b: &[f32], window: Option<usize>) -> f32 {
     dtw_distance_bounded_penalty(a, b, window, f32::INFINITY, 0.0)
 }
 
-/// Compute DTW distance with a warping penalty.
-///
-/// Matches `dtaidistance`'s `penalty` parameter (used by WarpDemuX): a fixed
-/// cost added to the two non-diagonal (expansion / compression) transitions of
-/// the DP recurrence, so the alignment is biased toward the diagonal:
-///
-/// `D[i,j] = (a_i - b_j)^2 + min(D[i-1,j-1], D[i-1,j] + penalty^2, D[i,j-1] + penalty^2)`
-///
-/// `penalty` matches dtaidistance's parameter: it is given in the *non-squared*
-/// distance space, so each warping step contributes `penalty^2` to this DP's
-/// squared cumulative cost (the final distance is `sqrt(D[n,m])`). Verified
-/// against `dtaidistance.dtw.distance(..., penalty=p, use_c=True)`. `penalty ==
-/// 0.0` is bit-identical to [`dtw_distance`].
-pub fn dtw_distance_penalty(a: &[f32], b: &[f32], window: Option<usize>, penalty: f32) -> f32 {
-    dtw_distance_bounded_penalty(a, b, window, f32::INFINITY, penalty)
-}
-
 /// Compute DTW distance with early abandonment.
 ///
 /// If the minimum distance in any row exceeds `upper_bound`, returns `f32::INFINITY`
@@ -72,7 +55,7 @@ pub fn dtw_distance_bounded(a: &[f32], b: &[f32], window: Option<usize>, upper_b
 }
 
 /// Core DTW with both early abandonment and a warping `penalty`. See
-/// [`dtw_distance_bounded`] and [`dtw_distance_penalty`]. The penalty is added
+/// [`dtw_distance_bounded`]. The penalty is added
 /// to the expansion (`prev[j]`) and compression (`curr[j-1]`) neighbors before
 /// the `min`; with `penalty == 0.0` (`x + 0.0 == x` for finite and ±INF) the
 /// arithmetic is identical to the no-penalty path.
@@ -388,17 +371,15 @@ impl DtwBatchScratch {
 /// per-lane body is the same fused recurrence, and on the (square-distance +
 /// `+INF`) value domain here the `<`-fold and `f32::min` select equal bits.
 ///
-/// Dispatch: the default path is the AVX2 baseline — the 16-lane block feeds
-/// two independent `ymm` chains per step, which (measured) beats a single
-/// 512-bit `zmm` chain. The DP carries a serial `left` dependency along each
-/// row, so throughput is bound by how many *independent* lane-chains stay in
-/// flight; 2×`ymm` exposes more instruction-level parallelism than 1×`zmm`.
-/// AVX-512 was ~22% slower on Cascade Lake (rna, where 512-bit ops also
+/// Dispatch: the AVX2 baseline — the 16-lane block feeds two independent
+/// `ymm` chains per step, which (measured) beats a single 512-bit `zmm`
+/// chain. The DP carries a serial `left` dependency along each row, so
+/// throughput is bound by how many *independent* lane-chains stay in flight;
+/// 2×`ymm` exposes more instruction-level parallelism than 1×`zmm`. A 512-bit
+/// `zmm` variant was ~22% slower on Cascade Lake (rna, where 512-bit ops also
 /// downclock) and still ~11% slower on Emerald Rapids (gpu node, ~no
 /// frequency penalty) — i.e. the loss is mostly ILP/port throughput, not just
-/// downclocking. The AVX-512 kernel is therefore **opt-in** via
-/// `ESCAPEPOD_DTW_AVX512=1` and off by default. The choice is a single cached
-/// CPUID + env probe, so the same binary serves every node.
+/// downclocking — so it is not offered as a dispatch target.
 pub fn dtw_distances_batch_unconstrained(
     query: &[f32],
     train_blocks: &[f32],
@@ -407,57 +388,10 @@ pub fn dtw_distances_batch_unconstrained(
     out: &mut Vec<f64>,
     scratch: &mut DtwBatchScratch,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if use_avx512() {
-            // SAFETY: `use_avx512()` returned true, so `avx512f` is supported
-            // on this CPU; that is the only requirement of the target-feature
-            // function.
-            unsafe {
-                dtw_batch_avx512(query, train_blocks, train_len, n_train, out, scratch);
-            }
-            return;
-        }
-    }
     dtw_batch_kernel(query, train_blocks, train_len, n_train, out, scratch);
 }
 
-/// Cached dispatch decision: AVX-512 is used only when the CPU supports
-/// `avx512f` *and* the caller opted in via `ESCAPEPOD_DTW_AVX512=1`. Off by
-/// default because the 512-bit path measured slower than the AVX2 baseline on
-/// every cluster CPU tested (Cascade Lake −22%, Emerald Rapids −11%).
-/// `is_x86_feature_detected!` caches its own CPUID probe; the `OnceLock` also
-/// folds in the env check so neither runs per call.
-#[cfg(target_arch = "x86_64")]
-fn use_avx512() -> bool {
-    use std::sync::OnceLock;
-    static USE: OnceLock<bool> = OnceLock::new();
-    *USE.get_or_init(|| {
-        std::env::var_os("ESCAPEPOD_DTW_AVX512").is_some_and(|v| v == "1")
-            && std::arch::is_x86_feature_detected!("avx512f")
-    })
-}
-
-/// AVX-512 entry point: identical body to the baseline, but compiled with
-/// `avx512f` enabled so the inlined kernel autovectorizes to 512-bit `zmm`
-/// (16 lanes per register). Only ever reached via [`use_avx512`].
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dtw_batch_avx512(
-    query: &[f32],
-    train_blocks: &[f32],
-    train_len: usize,
-    n_train: usize,
-    out: &mut Vec<f64>,
-    scratch: &mut DtwBatchScratch,
-) {
-    dtw_batch_kernel(query, train_blocks, train_len, n_train, out, scratch);
-}
-
-/// The lane-parallel DTW body, shared by the baseline and AVX-512 entry points.
-/// `#[inline(always)]` so that when it is inlined into the `avx512f` wrapper it
-/// is recompiled with that feature and the `for lane in 0..DTW_LANES` loop
-/// lowers to `zmm`; inlined into the baseline it stays at AVX2 (`ymm`).
+/// The lane-parallel DTW body.
 #[inline(always)]
 fn dtw_batch_kernel(
     query: &[f32],
@@ -782,58 +716,6 @@ where
         .expect("Failed to create distance matrix")
 }
 
-/// Compute DTW distance matrix with block-based parallelization.
-///
-/// This divides the distance matrix into blocks and computes them in parallel,
-/// which can be more efficient for very large matrices.
-///
-/// # Arguments
-///
-/// * `queries` - Slice of query sequences
-/// * `references` - Slice of reference sequences
-/// * `window` - Optional Sakoe-Chiba band width
-/// * `block_size` - Size of blocks for parallel computation
-///
-/// # Returns
-///
-/// A 2D array where `result[i, j]` is the DTW distance between `queries[i]` and `references[j]`.
-pub fn dtw_distance_matrix_blocked(
-    queries: &[Vec<f32>],
-    references: &[Vec<f32>],
-    window: Option<usize>,
-    block_size: usize,
-) -> Array2<f32> {
-    let n_queries = queries.len();
-    let n_refs = references.len();
-    let bs = block_size.max(1);
-
-    // One row-major result buffer written in place: no per-block `Array2` to
-    // allocate and no separate reassembly pass. Rows are partitioned into
-    // contiguous blocks of `bs` rows so each rayon task owns a disjoint slice
-    // of `data`; within a task the columns are still walked in cache-friendly
-    // blocks of `bs`.
-    let stride = n_refs.max(1);
-    let mut data = vec![0.0f32; n_queries * n_refs];
-    data.par_chunks_mut(bs * stride)
-        .enumerate()
-        .for_each(|(blk, rows)| {
-            let i_start = blk * bs;
-            let n_rows = rows.len() / stride;
-            for j_start in (0..n_refs).step_by(bs) {
-                let j_end = (j_start + bs).min(n_refs);
-                for r in 0..n_rows {
-                    let q = queries[i_start + r].as_slice();
-                    let row = &mut rows[r * n_refs..(r + 1) * n_refs];
-                    for j in j_start..j_end {
-                        row[j] = dtw_distance(q, references[j].as_slice(), window);
-                    }
-                }
-            }
-        });
-
-    Array2::from_shape_vec((n_queries, n_refs), data).expect("Failed to create distance matrix")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,31 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dtw_distance_matrix_blocked() {
-        let queries = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![2.0, 3.0, 4.0],
-            vec![3.0, 4.0, 5.0],
-        ];
-        let references = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![2.0, 3.0, 4.0],
-            vec![3.0, 4.0, 5.0],
-        ];
-
-        let matrix1 = dtw_distance_matrix(&queries, &references, None);
-        let matrix2 = dtw_distance_matrix_blocked(&queries, &references, None, 2);
-
-        // Both methods should produce the same result
-        assert_eq!(matrix1.shape(), matrix2.shape());
-        for i in 0..3 {
-            for j in 0..3 {
-                assert_eq!(matrix1[[i, j]], matrix2[[i, j]]);
-            }
-        }
-    }
-
-    #[test]
     fn test_dtw_alignment_stretch() {
         // Test that DTW can handle sequences of different lengths
         let a = vec![1.0, 2.0, 3.0];
@@ -965,35 +822,6 @@ mod tests {
         // The actual distance would be 40, so bound of 5 should cause abandonment
         let bounded = dtw_distance_bounded(&a, &b, None, 5.0);
         assert!(bounded.is_infinite());
-    }
-
-    #[test]
-    fn test_dtw_penalty_zero_matches_unpenalized() {
-        // penalty == 0.0 must be bit-identical to the no-penalty path.
-        let a = vec![1.0, 2.0, 3.0, 2.5, 4.0];
-        let b = vec![1.0, 1.5, 3.0, 4.0];
-        assert_eq!(
-            dtw_distance(&a, &b, None),
-            dtw_distance_penalty(&a, &b, None, 0.0)
-        );
-        assert_eq!(
-            dtw_distance(&a, &b, Some(2)),
-            dtw_distance_penalty(&a, &b, Some(2), 0.0)
-        );
-    }
-
-    #[test]
-    fn test_dtw_penalty_forced_warp() {
-        // Aligning [0,0,0] to [0] forces two compression steps, each charged
-        // `penalty^2` in the squared cumulative: D = 2*penalty^2, distance =
-        // sqrt(2)*penalty. Matches dtaidistance: distance([0,0,0],[0],penalty=p).
-        let a = vec![0.0, 0.0, 0.0];
-        let b = vec![0.0];
-        assert!(dtw_distance_penalty(&a, &b, None, 0.0).abs() < 1e-6);
-        // dtaidistance penalty=0.1 -> sqrt(2 * 0.1^2) = 0.14142...
-        let d = dtw_distance_penalty(&a, &b, None, 0.1);
-        let expected = (2.0f32 * 0.1 * 0.1).sqrt();
-        assert!((d - expected).abs() < 1e-6, "expected {expected}, got {d}");
     }
 
     #[test]
@@ -1083,9 +911,8 @@ mod tests {
 
                     let blocks = pack_training_blocks(&training, train_len);
 
-                    // Check both the public dispatcher (which uses the AVX-512
-                    // kernel on a capable node) and the baseline kernel directly
-                    // (so the non-AVX-512 path is covered on the same machine).
+                    // Check both the public dispatcher and the baseline kernel
+                    // directly.
                     let mut got_dispatch = Vec::new();
                     dtw_distances_batch_unconstrained(
                         &query,
@@ -1105,38 +932,12 @@ mod tests {
                         &mut scratch,
                     );
 
-                    // Also exercise the AVX-512 kernel directly when the host
-                    // supports it (the public dispatcher keeps it opt-in, so it
-                    // wouldn't otherwise run in the default test config).
-                    #[cfg(target_arch = "x86_64")]
-                    let mut got_avx512 = Vec::new();
-                    #[cfg(target_arch = "x86_64")]
-                    if std::arch::is_x86_feature_detected!("avx512f") {
-                        // SAFETY: gated by the runtime feature check above.
-                        unsafe {
-                            dtw_batch_avx512(
-                                &query,
-                                &blocks,
-                                train_len,
-                                n_train,
-                                &mut got_avx512,
-                                &mut scratch,
-                            );
-                        }
-                    } else {
-                        got_avx512 = got_baseline.clone();
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let got_avx512 = got_baseline.clone();
-
                     assert_eq!(got_dispatch.len(), n_train);
                     assert_eq!(got_baseline.len(), n_train);
-                    assert_eq!(got_avx512.len(), n_train);
                     for (k, &w) in want.iter().enumerate() {
                         for (path, &g) in [
                             ("dispatch", &got_dispatch[k]),
                             ("baseline", &got_baseline[k]),
-                            ("avx512", &got_avx512[k]),
                         ] {
                             assert_eq!(
                                 (w as f64).to_bits(),

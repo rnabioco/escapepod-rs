@@ -288,37 +288,6 @@ pub fn mad_normalize_robust(signal: &[f32]) -> Vec<f32> {
     signal.iter().map(|&x| (x - med) / scale).collect()
 }
 
-/// Normalize signal using MAD with optional outlier clipping.
-///
-/// Clips values beyond `clip_sigma` MAD units from the median before normalizing.
-///
-/// # Arguments
-/// * `signal` - The raw signal values to normalize
-/// * `clip_sigma` - Number of MAD units to clip at (e.g., 5.0)
-///
-/// # Returns
-/// A new vector containing the normalized and clipped signal values. When MAD
-/// is zero (constant signal) there is nothing to clip and no scale to divide
-/// by, so this returns `signal - median`; see [`mad_normalize`].
-pub fn mad_normalize_with_clipping(signal: &[f32], clip_sigma: f32) -> Vec<f32> {
-    let (med, mad_val) = median_and_mad(signal);
-
-    if mad_val == 0.0 {
-        return signal.iter().map(|&x| x - med).collect();
-    }
-
-    let lower_bound = med - clip_sigma * mad_val;
-    let upper_bound = med + clip_sigma * mad_val;
-
-    signal
-        .iter()
-        .map(|&x| {
-            let clipped = x.max(lower_bound).min(upper_bound);
-            (clipped - med) / mad_val
-        })
-        .collect()
-}
-
 /// Clip signal outliers using median ± threshold × MAD, without normalizing.
 ///
 /// This matches WarpDemuX's outlier clipping behavior where extreme values are
@@ -399,46 +368,6 @@ pub fn normalize_dwell_times(dwell_times: &[f32]) -> Vec<f32> {
 
     // Z-score normalize
     log_dwells.iter().map(|&x| (x - mean) / std).collect()
-}
-
-/// Normalize dwell times using MAD (robust to outliers).
-///
-/// Uses log-transform followed by MAD normalization instead of z-score.
-/// This is more robust to extreme dwell time outliers.
-///
-/// # Arguments
-/// * `dwell_times` - Raw dwell times in samples
-///
-/// # Returns
-/// A new vector containing the normalized dwell times.
-/// Returns empty vector if input is empty.
-/// If MAD is zero, returns zeros.
-///
-/// # Example
-/// ```
-/// use escapepod_signal::segmentation::normalize_dwell_times_mad;
-///
-/// let dwells = vec![30.0, 45.0, 32.0, 500.0, 28.0];  // 500 is outlier
-/// let normalized = normalize_dwell_times_mad(&dwells);
-/// ```
-pub fn normalize_dwell_times_mad(dwell_times: &[f32]) -> Vec<f32> {
-    if dwell_times.is_empty() {
-        return Vec::new();
-    }
-
-    // Log transform (add small epsilon to avoid log(0))
-    let log_dwells: Vec<f32> = dwell_times.iter().map(|&d| (d.max(1.0)).ln()).collect();
-
-    // Compute median and MAD
-    let (med, mad_val) = median_and_mad(&log_dwells);
-
-    if mad_val < 1e-6 {
-        // All dwells are essentially identical
-        return vec![0.0; dwell_times.len()];
-    }
-
-    // MAD normalize
-    log_dwells.iter().map(|&x| (x - med) / mad_val).collect()
 }
 
 /// Downscale signal by averaging consecutive samples.
@@ -524,19 +453,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mad_normalize_with_clipping() {
-        let signal = vec![1.0, 2.0, 3.0, 4.0, 100.0]; // 100.0 is an outlier
-        let normalized = mad_normalize_with_clipping(&signal, 2.0);
-
-        // The outlier should be clipped before normalization
-        assert_eq!(normalized.len(), 5);
-        // All values should be within [-2, 2] range
-        for &val in &normalized {
-            assert!((-2.0..=2.0).contains(&val));
-        }
-    }
-
-    #[test]
     fn test_normalize_signal_short() {
         let signal: Vec<i16> = vec![100, 200, 300];
         let result = normalize_signal(&signal);
@@ -595,9 +511,6 @@ mod tests {
     fn test_mad_normalize_constant_signal() {
         let signal = vec![5.0, 5.0, 5.0, 5.0];
         assert_eq!(mad_normalize(&signal), vec![0.0, 0.0, 0.0, 0.0]);
-
-        let clipped = mad_normalize_with_clipping(&signal, 5.0);
-        assert_eq!(clipped, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     /// The whole-pipeline entry point takes raw i16 and is the one demux
@@ -739,24 +652,6 @@ mod tests {
         for &val in &normalized {
             assert_eq!(val, 0.0);
         }
-    }
-
-    #[test]
-    fn test_normalize_dwell_times_mad() {
-        // Include an outlier
-        let dwells = vec![30.0, 45.0, 32.0, 500.0, 28.0]; // 500 is extreme outlier
-        let normalized = normalize_dwell_times_mad(&dwells);
-
-        assert_eq!(normalized.len(), 5);
-
-        // The outlier should still have the highest value
-        let max_idx = normalized
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap();
-        assert_eq!(max_idx, 3); // Index of 500.0
     }
 
     #[test]

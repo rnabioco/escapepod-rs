@@ -142,6 +142,14 @@ gpu = [
     "dep:ort",
     "escapepod-signal/gpu",
 ]
+# Forwards to escapepod-signal's `gpu-prep-experimental` — the three GPU prep
+# kernels (SVB16 decode, t-test fingerprint, LLR adapter detect) that have no
+# production caller in this crate either; only `tests/gpu_fingerprint.rs` and
+# `examples/gpu_detect_timing.rs` exercise them. Deliberately a separate
+# opt-in rather than folded into `gpu` above — this does not split the atomic
+# `gpu` flag any finer (its production legs are untouched), it adds one more
+# flag for the same non-production primitives escapepod-signal gates.
+gpu-prep-experimental = ["escapepod-signal/gpu-prep-experimental"]
 # Build `DtwSvmModel` JSON files from labeled fingerprints. Pulls no crate of
 # its own: the fit is the labels-only stub `train.rs` describes, and the
 # `linfa`/`linfa-svm` dependencies this feature used to enable were compiled

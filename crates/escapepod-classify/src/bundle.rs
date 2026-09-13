@@ -1100,6 +1100,11 @@ pub struct ChargingBundle {
     pub classes: [String; 2],
     /// The model itself — see [`ChargingScorer`].
     pub scorer: ChargingScorer,
+    /// sha256 of whichever file backs `scorer` (the GBM JSON, the feature
+    /// network's ONNX, or the waveform model's ONNX) — the same digest
+    /// already verified by `verify_sha256` at load, carried past the
+    /// `Result<()>` it returned from rather than re-hashed (#370).
+    pub scorer_sha256: String,
     pub anchor: AnchorBlock,
     /// The column feature space, for the variants that read one.
     pub features: Option<FeatureSpace>,
@@ -1919,7 +1924,7 @@ impl ChargingBundle {
         #[cfg(feature = "cuda")]
         let mut waveform_onnx_path: Option<PathBuf> = None;
 
-        let (scorer, waveform, kmer) = match variant {
+        let (scorer, waveform, kmer, scorer_sha256) = match variant {
             Variant::Gbm | Variant::FeatureNn => {
                 let f = meta
                     .features
@@ -1928,7 +1933,7 @@ impl ChargingBundle {
                 let space = feature_space
                     .as_ref()
                     .expect("checked above for the column variants");
-                let scorer = match variant {
+                let (scorer, scorer_sha256) = match variant {
                     Variant::Gbm => {
                         let g = meta.gbm.as_ref().expect("the probe saw a `gbm` block");
                         let gbm_path = dir.join(&g.file);
@@ -1944,7 +1949,7 @@ impl ChargingBundle {
                                 f.order.len()
                             );
                         }
-                        ChargingScorer::Gbm(gbm)
+                        (ChargingScorer::Gbm(gbm), g.sha256.clone())
                     }
                     _ => {
                         let fm = meta
@@ -1963,7 +1968,7 @@ impl ChargingBundle {
                 } else {
                     ""
                 })?;
-                (scorer, None, kmer)
+                (scorer, None, kmer, scorer_sha256)
             }
             Variant::Waveform => {
                 let wm = meta
@@ -1998,8 +2003,8 @@ impl ChargingBundle {
                 {
                     waveform_onnx_path = Some(dir.join(&wm.file));
                 }
-                let scorer = Self::load_waveform_model(&dir, wm, &spec)?;
-                (scorer, Some(spec), kmer)
+                let (scorer, scorer_sha256) = Self::load_waveform_model(&dir, wm, &spec)?;
+                (scorer, Some(spec), kmer, scorer_sha256)
             }
         };
 
@@ -2053,6 +2058,7 @@ impl ChargingBundle {
             model_version: meta.model.version,
             classes: [c0, c1],
             scorer,
+            scorer_sha256,
             anchor: meta.anchor,
             features: feature_space,
             waveform,
@@ -2114,7 +2120,7 @@ impl ChargingBundle {
         fm: &FeatureModelBlock,
         order: &[String],
         columns: &[(usize, usize)],
-    ) -> Result<ChargingScorer> {
+    ) -> Result<(ChargingScorer, String)> {
         let n_val = check_feature_fold(order, columns, &fm.input.channels, fm.input.n_offsets)?;
         let path = dir.join(&fm.file);
         verify_sha256(&path, &fm.sha256, "feature model")?;
@@ -2125,7 +2131,7 @@ impl ChargingBundle {
             &fm.standardisation.mu,
             &fm.standardisation.sd,
         )?;
-        Ok(ChargingScorer::FeatureNn(net))
+        Ok((ChargingScorer::FeatureNn(net), fm.sha256.clone()))
     }
 
     /// The loaded windowed graph, or an error naming why there is none.
@@ -2168,11 +2174,12 @@ impl ChargingBundle {
         dir: &Path,
         wm: &WaveformModelBlock,
         spec: &WaveformSpec,
-    ) -> Result<ChargingScorer> {
+    ) -> Result<(ChargingScorer, String)> {
         let path = dir.join(&wm.file);
         verify_sha256(&path, &wm.sha256, "waveform model")?;
-        Ok(ChargingScorer::Waveform(
-            crate::waveform_net::WaveformNet::load(&path, spec)?,
+        Ok((
+            ChargingScorer::Waveform(crate::waveform_net::WaveformNet::load(&path, spec)?),
+            wm.sha256.clone(),
         ))
     }
 
@@ -2187,7 +2194,7 @@ impl ChargingBundle {
         _dir: &Path,
         _wm: &WaveformModelBlock,
         _spec: &WaveformSpec,
-    ) -> Result<ChargingScorer> {
+    ) -> Result<(ChargingScorer, String)> {
         bail!(
             "this bundle is the windowed raw-signal variant (`waveform_model`), but \
              escapepod-classify was built without the `waveform-onnx` feature — rebuild \
@@ -2204,7 +2211,7 @@ impl ChargingBundle {
         _fm: &FeatureModelBlock,
         _order: &[String],
         _columns: &[(usize, usize)],
-    ) -> Result<ChargingScorer> {
+    ) -> Result<(ChargingScorer, String)> {
         bail!(
             "this bundle is the per-base-feature ONNX variant (`feature_model`), but \
              escapepod-classify was built without the `fnn-onnx` feature — rebuild with \
