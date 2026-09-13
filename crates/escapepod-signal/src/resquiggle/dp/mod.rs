@@ -7,7 +7,7 @@
 //! - [`buffers`]: reusable scratch buffers ([`ViterbiBuffers`], `StepBuffers`).
 //! - [`fill`]: forward pass and per-base step implementations plus the dwell
 //!   penalty model.
-//! - `fill_simd`: register-blocked AVX2/AVX-512 kernels for the dwell-penalty
+//! - `fill_simd`: register-blocked AVX-512 kernels for the dwell-penalty
 //!   step's `dwell_idx`-outer sweep, dispatched from `fill`.
 //! - [`traceback`]: optimal path reconstruction ([`banded_traceback`]).
 
