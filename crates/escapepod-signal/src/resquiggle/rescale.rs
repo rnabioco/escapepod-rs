@@ -61,11 +61,13 @@ pub fn rough_rescale(
         } => (quantiles.as_slice(), *clip_bases, *use_base_center),
     };
 
-    // Compute clipping bounds
+    // Compute clipping bounds. The disabled-clipping default bounds `levels`,
+    // not `signal` — using `signal.len()` here is only harmless today because
+    // every use of `clip_end` below re-clamps with `.min(levels.len())`.
     let (clip_start, clip_end) = if clip_bases > 0 && levels.len() > clip_bases * 2 {
         (clip_bases, levels.len() - clip_bases)
     } else {
-        (0, signal.len())
+        (0, levels.len())
     };
 
     // Compute normalized signal values
@@ -79,8 +81,14 @@ pub fn rough_rescale(
             .take(clip_end - clip_start)
             .collect::<Vec<f32>>()
     } else if !seq_to_signal_map.is_empty() {
-        let start = seq_to_signal_map[0];
-        let end = seq_to_signal_map[seq_to_signal_map.len() - 1].min(signal.len());
+        let start = seq_to_signal_map[0].min(signal.len());
+        // Also floored at `start`: `seq_to_signal_map` is not guaranteed
+        // monotonic on malformed input, and `start > end` panics on the slice
+        // below instead of falling through to the empty-data error the rest
+        // of this function already returns for degenerate input.
+        let end = seq_to_signal_map[seq_to_signal_map.len() - 1]
+            .min(signal.len())
+            .max(start);
         signal[start..end]
             .iter()
             .map(|&val| (val - shift) / scale)
@@ -610,6 +618,25 @@ mod tests {
 
         let (_, scale) = theil_sen(&x, &y, 0.0, 1.0, 0, None).unwrap();
         assert!((scale - 0.5).abs() < 1e-5, "expected ~0.5, got {scale}");
+    }
+
+    /// A malformed (non-monotonic) `seq_to_signal_map` must not panic on the
+    /// `signal[start..end]` slice in the `!use_base_center` branch: it should
+    /// fall through to the same empty-data error the rest of this function
+    /// already returns for degenerate input.
+    #[test]
+    fn rough_rescale_start_after_end_does_not_panic() {
+        let signal: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let levels = vec![0.5f32];
+        let seq_to_signal_map = vec![8usize, 3usize]; // start(8) > end(3)
+        let algo = RoughRescaleAlgo::LeastSquares {
+            quantiles: vec![0.5],
+            clip_bases: 0,
+            use_base_center: false,
+        };
+
+        let result = rough_rescale(1.0, 0.0, &seq_to_signal_map, &levels, &signal, &algo);
+        assert!(result.is_err());
     }
 
     #[test]

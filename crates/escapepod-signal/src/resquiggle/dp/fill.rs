@@ -327,8 +327,8 @@ pub fn dp_step_buffered(
 /// — not a tolerance; if any case turns up where that doesn't hold, the fix
 /// is to find the bug, not to widen the assertion.
 ///
-/// **Still scalar.** The register-blocked SIMD kernels that read this
-/// transposed shape are a separate, later change. This one lands alone
+/// **Still scalar here.** The register-blocked SIMD kernels that read this
+/// transposed shape landed separately, in `fill_simd.rs` (#359). This one lands alone
 /// because it already wins on its own — the two guards leave the inner
 /// loop, the iterations the `dwell_offset` guard used to `continue` past
 /// are never visited at all instead of merely skipped, and the branch on
