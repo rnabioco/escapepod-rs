@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tract-onnx = "0.23.6"
 uuid = { version = "1", features = ["v4"] }
 # Compression
-zstd = "0.13"
+zstd = "0.14"
 
 # `cargo bench` uses [profile.bench], which by default does NOT inherit from
 # [profile.release]. Pin it here so microbenchmarks measure the same codegen

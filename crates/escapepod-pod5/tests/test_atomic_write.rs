@@ -121,6 +121,7 @@ fn an_error_mid_write_leaves_nothing_at_the_destination() {
         predefined_dictionaries: Some(PredefinedDictionaries {
             pore_types: Some(vec!["known_pore".to_string()]),
             end_reasons: None,
+            run_infos: None,
         }),
         ..Default::default()
     };

@@ -142,7 +142,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         .map(|path| {
             let reader = Reader::open(path)?;
             let signal_bytes = reader.signal_table_bytes()?;
-            let footer = ArrowIpcFooter::parse(signal_bytes)?;
+            let footer = reader.signal_footer_for_bulk(signal_bytes)?.into_owned();
             let run_infos = reader.run_infos().to_vec();
             // collect_all_reads resolves columns once per batch (see
             // ReadsBatchView), versus reads()'s per-row resolution. This
