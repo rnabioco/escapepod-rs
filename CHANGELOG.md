@@ -22,6 +22,17 @@
   those paths the way it does every other signal fetch. They now go through
   `Reader::signal_footer_for_bulk` (made `pub(crate)`), the same cached
   accessor `get_signal`/`reads_by_ids` already use.
+- **`Writer::flush_read_batch` built the reads table's `run_info` dictionary
+  fresh and empty for every batch**, so two read-batches referencing
+  different run infos wrote different dictionaries for the same field —
+  arrow-ipc's `FileWriter` rejects that outright
+  ("Dictionary replacement detected..."). `run_info`'s dictionary is now
+  seeded from every run info registered so far (`self.run_infos`), matching
+  the `pore_type`/`end_reason` columns. `PredefinedDictionaries` gained a
+  `run_infos` field, mirroring its existing `pore_types`/`end_reasons`
+  support, for callers who need a value first used in a later batch to
+  survive too (`pore_type`/`end_reason` have no upfront registration step,
+  so a genuinely new value can only be handled by predeclaring it).
 
 ## 0.24.3 (2026-09-11)
 
