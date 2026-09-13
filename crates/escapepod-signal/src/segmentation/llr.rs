@@ -86,129 +86,10 @@ impl LlrTrace {
         sum_sq_diff / n - mean * mean
     }
 
-    /// Compute LLR gains for all candidate split points in a range.
-    ///
-    /// For each candidate position i, computes the gain from splitting at i:
-    /// gain = n * log(var(start, end)) - (n_head * log(var(start, i)) + n_tail * log(var(i, end)))
-    ///
-    /// # Arguments
-    /// * `start` - Start index of the range to search
-    /// * `end` - End index of the range to search
-    /// * `min_obs` - Minimum observations required in head segment
-    /// * `border_trim` - Minimum observations required in tail segment
-    ///
-    /// # Returns
-    /// A vector of LLR gain values, one per signal sample. Only positions in the
-    /// searchable range [start + min_obs, end - border_trim) will have non-zero values.
-    pub fn compute_gains(
-        &self,
-        start: usize,
-        end: usize,
-        min_obs: usize,
-        border_trim: usize,
-    ) -> Vec<f64> {
-        let mut gains = vec![0.0; self.cumsum.len()];
-
-        let var_full = self.variance(start, end);
-        if var_full <= 0.0 {
-            return gains;
-        }
-
-        let var_summed = ((end - start) as f64) * var_full.ln();
-
-        let search_start = start + min_obs;
-        let search_end = end.saturating_sub(border_trim);
-
-        for i in (search_start..search_end).step_by(self.stride) {
-            let var_head = self.variance(start, i);
-            let var_tail = self.variance(i, end);
-
-            if var_head > 0.0 && var_tail > 0.0 {
-                let var_summed_head = ((i - start) as f64) * var_head.ln();
-                let var_summed_tail = ((end - i) as f64) * var_tail.ln();
-                gains[i] = var_summed - (var_summed_head + var_summed_tail);
-            }
-        }
-
-        gains
-    }
-
-    /// Compute LLR gains with early stopping when derivative becomes negative.
-    ///
-    /// Stops computation early if the mean derivative over a window becomes negative,
-    /// indicating we've likely passed the true boundary.
-    ///
-    /// # Arguments
-    /// * `start` - Start index of the range to search
-    /// * `end` - End index of the range to search
-    /// * `min_obs` - Minimum observations required in head segment
-    /// * `border_trim` - Minimum observations required in tail segment
-    /// * `early_stop_window` - Window size for computing derivative (e.g., 500)
-    /// * `early_stop_stride` - How often to check for early stopping (e.g., 100)
-    ///
-    /// # Returns
-    /// A vector of LLR gain values. Computation stops early if the derivative condition is met.
-    pub fn compute_gains_with_early_stop(
-        &self,
-        start: usize,
-        end: usize,
-        min_obs: usize,
-        border_trim: usize,
-        early_stop_window: usize,
-        early_stop_stride: usize,
-    ) -> Vec<f64> {
-        let mut gains = vec![0.0; self.cumsum.len()];
-
-        let var_full = self.variance(start, end);
-        if var_full <= 0.0 {
-            return gains;
-        }
-
-        let var_summed = ((end - start) as f64) * var_full.ln();
-
-        let search_start = start + min_obs;
-        let search_end = end.saturating_sub(border_trim);
-
-        for i in (search_start..search_end).step_by(self.stride) {
-            // Check for early stopping
-            if i >= search_start + early_stop_window
-                && (i - search_start).is_multiple_of(early_stop_stride)
-            {
-                // Compute mean derivative over the window
-                let window_start = i - early_stop_window;
-                let mut derivative_sum = 0.0;
-                let mut count = 0;
-
-                for j in (window_start..i).step_by(self.stride) {
-                    if j + self.stride < i && gains[j + self.stride] > 0.0 {
-                        derivative_sum += gains[j + self.stride] - gains[j];
-                        count += 1;
-                    }
-                }
-
-                if count > 0 && derivative_sum / (count as f64) < 0.0 {
-                    break; // Early stop: derivative is negative
-                }
-            }
-
-            let var_head = self.variance(start, i);
-            let var_tail = self.variance(i, end);
-
-            if var_head > 0.0 && var_tail > 0.0 {
-                let var_summed_head = ((i - start) as f64) * var_head.ln();
-                let var_summed_tail = ((end - i) as f64) * var_tail.ln();
-                gains[i] = var_summed - (var_summed_head + var_summed_tail);
-            }
-        }
-
-        gains
-    }
-
     /// Find the single best split point based on maximum LLR gain.
     ///
     /// Argmax is tracked inline during the scan — no gains vector is
-    /// materialized. Ties prefer the earlier position, matching the previous
-    /// `compute_gains`-based implementation.
+    /// materialized. Ties prefer the earlier position.
     ///
     /// # Arguments
     /// * `start` - Start index of the range to search
@@ -400,33 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_gains() {
-        // Create a signal with a clear boundary: low values with noise, then high values with noise
-        let mut signal = Vec::new();
-        // Add noise to avoid zero variance
-        for i in 0..50 {
-            signal.push(50.0 + (i % 3) as f32);
-        }
-        for i in 0..50 {
-            signal.push(100.0 + (i % 3) as f32);
-        }
-
-        let trace = LlrTrace::new(&signal, 1);
-        let gains = trace.compute_gains(0, 100, 10, 10);
-
-        // Find the maximum gain
-        let max_gain_pos = gains
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(pos, _)| pos)
-            .unwrap();
-
-        // The maximum gain should be near position 50 (the boundary)
-        assert!((40..=60).contains(&max_gain_pos));
-    }
-
-    #[test]
     fn test_best_split() {
         // Create a signal with noise to have non-zero variance
         let mut signal = Vec::new();
@@ -489,26 +343,5 @@ mod tests {
 
         assert_eq!(trace1.stride, 1);
         assert_eq!(trace2.stride, 2);
-    }
-
-    #[test]
-    fn test_early_stop_functionality() {
-        // Create a signal with noise to have non-zero variance
-        let mut signal = Vec::new();
-        for i in 0..50 {
-            signal.push(50.0 + (i % 3) as f32);
-        }
-        for i in 0..50 {
-            signal.push(100.0 + (i % 3) as f32);
-        }
-
-        let trace = LlrTrace::new(&signal, 1);
-
-        // Compute with early stopping
-        let gains_early = trace.compute_gains_with_early_stop(0, 100, 10, 10, 20, 10);
-
-        // Should have some non-zero gains
-        let max_gain = gains_early.iter().cloned().fold(0.0f64, f64::max);
-        assert!(max_gain > 0.0);
     }
 }

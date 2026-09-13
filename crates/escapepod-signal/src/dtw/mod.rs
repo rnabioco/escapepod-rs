@@ -1,13 +1,12 @@
 //! Dynamic Time Warping (DTW) distance computation for barcode fingerprint comparison.
 //!
-//! This module provides DTW distance computation with Sakoe-Chiba band constraints,
-//! parallel distance matrix computation, and kernel conversion for classification.
+//! This module provides DTW distance computation with Sakoe-Chiba band constraints
+//! and parallel distance matrix computation.
 //!
 //! Inspired by WarpDemuX for nanopore barcode demultiplexing.
 
 mod distance;
 mod fingerprint;
-mod kernel;
 
 #[cfg(feature = "gpu")]
 pub mod cuda;
@@ -15,11 +14,9 @@ pub mod cuda;
 pub use distance::{
     DTW_LANES, DtwBatchScratch, DtwScratch, dtw_distance, dtw_distance_bounded,
     dtw_distance_bounded_penalty, dtw_distance_bounded_penalty_into, dtw_distance_matrix,
-    dtw_distance_matrix_blocked, dtw_distance_penalty, dtw_distances_batch,
-    dtw_distances_batch_unconstrained, pack_training_blocks,
+    dtw_distances_batch, dtw_distances_batch_unconstrained, pack_training_blocks,
 };
 pub use fingerprint::{Fingerprint, NormMethod, normalize_fingerprint};
-pub use kernel::{distance_to_kernel, distance_to_kernel_auto};
 
 #[cfg(feature = "gpu")]
 pub use cuda::{
