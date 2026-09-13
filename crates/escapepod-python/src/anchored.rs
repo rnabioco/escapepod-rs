@@ -84,10 +84,15 @@ impl AnchoredReads {
     /// `count_arm_bases > 0` selects the counting anchor; `0` the aligner's
     /// mapping. This is the feature-space choice and has no default here on
     /// purpose — the caller's recipe knows it, this function cannot guess it.
+    ///
+    /// `motif_offset` has no default for the same reason: it is a per-bundle
+    /// recipe value, not a constant -- the feature-grid variants anchor at
+    /// +3, but a `waveform_model` bundle anchors at +2, and a silent default
+    /// would anchor a bundle-less corpus one base off with no error.
     #[new]
     #[pyo3(signature = (
-        bam_path, ref_fasta, offsets, count_arm_bases,
-        motif = "CCAGGC", motif_offset = 3,
+        bam_path, ref_fasta, offsets, count_arm_bases, motif_offset,
+        motif = "CCAGGC",
         common_arm = "GGCTTCTTCTTGCTCTT",
         min_mapq = 1, min_orientation_votes = 50, orientation = None,
     ))]
@@ -97,8 +102,8 @@ impl AnchoredReads {
         ref_fasta: PathBuf,
         offsets: Vec<i32>,
         count_arm_bases: u32,
-        motif: &str,
         motif_offset: usize,
+        motif: &str,
         common_arm: &str,
         min_mapq: u8,
         min_orientation_votes: usize,

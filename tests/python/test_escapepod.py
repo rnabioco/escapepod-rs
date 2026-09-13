@@ -1282,11 +1282,13 @@ class TestAnchoredReads:
         assert (ar.orientation == "reversed") == (r > t)
 
     def test_orientation_override_and_validation(self):
+        anchor, offsets = self._recipe()
         ar = escapepod.AnchoredReads(
             str(CLASSIFY_FIXTURES / "trna_mappings_padded.bam"),
             str(CLASSIFY_FIXTURES / "trna_reference.fa"),
-            self._recipe()[1],
+            offsets,
             24,
+            anchor["motif_offset"],
             orientation="time",
         )
         assert ar.orientation == "time"
@@ -1294,8 +1296,9 @@ class TestAnchoredReads:
             escapepod.AnchoredReads(
                 str(CLASSIFY_FIXTURES / "trna_mappings_padded.bam"),
                 str(CLASSIFY_FIXTURES / "trna_reference.fa"),
-                self._recipe()[1],
+                offsets,
                 24,
+                anchor["motif_offset"],
                 orientation="sideways",
             )
 

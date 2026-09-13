@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking
+
+- `AnchoredReads(...)`'s `motif_offset` no longer defaults to 3; every caller
+  must pass it explicitly. A `waveform_model` bundle anchors at +2, and the
+  old default silently anchored a bundle-less corpus one base off with no
+  error.
+
 ### Fixed
 
 - `CrfEncoder::probe_output_contract` now calls `encode_tract` directly
