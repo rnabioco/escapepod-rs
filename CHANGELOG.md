@@ -18,6 +18,13 @@
   SAFETY comment says `self.device` instead of "device 0"; a tautological
   `debug_assert!` in `crf/refchain.rs` (always true once the preceding
   `TooShort` check passes) is removed.
+- `escapepod-classify`'s native bidirectional-LSTM loader
+  (`fnn_lstm::NativeBiLstm::from_proto`) now runs a numeric self-check
+  against tract on one random input of the bundle's real shape before
+  trusting the native kernel — the same guard
+  `escapepod_demux::crf::encoder_native::self_check` applies to the CRF
+  encoder, against a recognizer that matches a graph's shape but not its
+  semantics.
 
 ## 0.24.3 (2026-09-11)
 
