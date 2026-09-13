@@ -34,6 +34,17 @@
   from, the ratio-based confidence read the missing distance as infinitely
   far away instead of as "no margin to test" — now `confidence = 0.0` and
   `confident = false` below 2 references, with a warning.
+- **`resquiggle`'s BAM/writer decoders used one worker each.** The same trap
+  `escpod classify` documents and avoids: `MultithreadedReader`/
+  `MultithreadedWriter::new` are one-worker constructors regardless of the
+  name. Sized from the rayon pool now, the same way `classify` does.
+- **`resquiggle` resolved POD5 reads by scanning every batch of every input
+  file**, the shape that made `classify` ~60x slower on a large file (#334).
+  Now resolves through the reader's read index (sidecar-aware) restricted to
+  the reads the BAM actually names, and refines in `(file, first signal row)`
+  storage order before writing back out in the original BAM order. Verified
+  bit-identical output on `data/drna/yeast_trna_reads.pod5` +
+  `data/drna/yeast_trna_mappings.bam`.
 
 ## 0.24.3 (2026-09-11)
 

@@ -1,6 +1,6 @@
 //! Resquiggle command: refine signal-to-base mapping using banded DP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail};
@@ -10,8 +10,12 @@ use rayon::prelude::*;
 use tracing::{info, warn};
 
 // Basecaller tag decoders shared with `escpod classify` (the
-// `experimental` feature implies `classify` for exactly this coupling).
+// `experimental` feature implies `classify` for exactly this coupling), plus
+// the same POD5 read index `classify` uses to avoid #334's full-table scan:
+// indexed lookup by wanted id, reads then processed in `(file, first signal
+// row)` storage order rather than BAM order.
 use escapepod_classify::bam_tags::int_tag as get_int_tag;
+use escapepod_classify::pipeline::{Pod5Index, Pod5ReadInfo};
 use escapepod_signal::mapping::seq_to_signal_from_moves;
 use escapepod_signal::parse_uuid_flexible;
 use escapepod_signal::resquiggle::{
@@ -261,67 +265,66 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
         info!("applied MAD normalization to kmer levels");
     }
 
-    // --- Phase 2: Index all POD5 reads ---
+    // --- Phase 2: scan the BAM for wanted read IDs, then index only those ---
+    //
+    // Building the POD5 index from every read the files hold (a full
+    // reads-table scan, discarding rows the BAM never asks about) is the
+    // shape that made `classify` ~60x slower on a large file (#334): the fix
+    // there — and here — is an indexed lookup restricted to the ids a caller
+    // actually wants, which is knowable only after a first look at the BAM.
     let pod5_files = resolve_pod5_inputs(input)?;
-    let pod5_spinner = create_spinner("Indexing")?;
-    pod5_spinner.set_message(format!(
-        "POD5 data from {} ({})",
-        input.display(),
-        if pod5_files.len() > 1 {
-            format!("{} files", pod5_files.len())
-        } else {
-            "1 file".to_string()
-        }
-    ));
-
-    let mut pod5_reads: HashMap<uuid::Uuid, Pod5ReadInfo> = HashMap::new();
-    let mut pod5_readers: Vec<escapepod_signal::Reader> = Vec::new();
-
-    for (reader_idx, path) in pod5_files.iter().enumerate() {
-        let reader = escapepod_signal::Reader::open(path)?;
-        // Iterate by Arrow batch and resolve columns once per batch.
-        for batch_result in reader.read_batches()? {
-            let batch = batch_result?;
-            let view = escapepod_signal::ReadsBatchView::new(&batch, false)?;
-            pod5_reads.reserve(view.num_rows());
-            for row in 0..view.num_rows() {
-                let read = view.read(row)?;
-                pod5_reads.insert(
-                    read.read_id,
-                    Pod5ReadInfo {
-                        reader_idx,
-                        calibration_scale: read.calibration_scale,
-                        calibration_offset: read.calibration_offset,
-                        signal_rows: read.signal_rows,
-                    },
-                );
+    let scan_spinner = create_spinner("Scanning")?;
+    scan_spinner.set_message(format!("BAM read IDs from {}", bam.display()));
+    let mut wanted: HashSet<uuid::Uuid> = HashSet::new();
+    {
+        // Worker count comes from the global rayon pool, configured from
+        // `--threads` above (see the `reader_workers` comment below) — this
+        // pass only reads each record's name, so it is cheap regardless.
+        let file = std::fs::File::open(bam)?;
+        let threads = rayon::current_num_threads().max(1);
+        let reader_workers = std::num::NonZero::new(threads.div_ceil(4)).expect("at least one");
+        let decoder = bgzf::io::MultithreadedReader::with_worker_count(reader_workers, file);
+        let mut reader = bam::io::Reader::from(decoder);
+        reader.read_header()?;
+        for result in reader.records() {
+            let record = result?;
+            if let Some(name) = record.name()
+                && let Ok(name_str) = name.to_str()
+                && let Ok(uuid) = parse_uuid_flexible(name_str)
+            {
+                wanted.insert(uuid);
             }
         }
-        pod5_readers.push(reader);
     }
-    pod5_spinner.finish_with_message(format!(
-        "{} reads indexed from POD5",
-        style::count(pod5_reads.len())
+    scan_spinner.finish_with_message(format!(
+        "{} distinct read ID(s) in BAM",
+        style::count(wanted.len())
     ));
+
+    let pod5_index = Pod5Index::build(&pod5_files, &wanted)?;
     info!(
         "{} reads indexed from {} POD5 file(s)",
-        pod5_reads.len(),
+        pod5_index.reads().len(),
         pod5_files.len()
     );
 
-    // Create signal extractors (one per reader) for parallel on-demand extraction
-    let signal_extractors: Vec<_> = pod5_readers
-        .iter()
-        .map(|r| r.signal_extractor())
-        .collect::<escapepod_signal::Result<_>>()?;
+    // One signal extractor per file, for parallel on-demand extraction.
+    let signal_extractors = pod5_index.extractors()?;
 
-    // --- Phase 3: Stream BAM, refine in parallel, write asynchronously ---
+    // --- Phase 3: scan the BAM again, refine matched reads in storage order,
+    //     write back out in original BAM order ---
     let bam_total = count_bam_records(bam)?;
     info!("BAM contains {} records", bam_total);
 
     let file = std::fs::File::open(bam)?;
-    // Worker count comes from the global rayon pool, configured from `--threads` above.
-    let decoder = bgzf::io::MultithreadedReader::new(file);
+    // `MultithreadedReader::new` / `MultithreadedWriter::new` are ONE worker
+    // each, whatever the name suggests (the same trap `escpod classify`
+    // documents and avoids). The writer's deflate is the more expensive side,
+    // so it gets the pool's full width and the reader a quarter of it.
+    let threads = rayon::current_num_threads().max(1);
+    let reader_workers = std::num::NonZero::new(threads.div_ceil(4)).expect("at least one");
+    let writer_workers = std::num::NonZero::new(threads).expect("at least one");
+    let decoder = bgzf::io::MultithreadedReader::with_worker_count(reader_workers, file);
     let mut bam_reader = bam::io::Reader::from(decoder);
     let mut header = bam_reader.read_header()?;
 
@@ -361,7 +364,7 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
     header.programs_mut().add("escpod-resquiggle", pg)?;
 
     let ctx = RefineContext::new(
-        &pod5_reads,
+        pod5_index.reads(),
         &signal_extractors,
         &kmer_table,
         &settings,
@@ -374,7 +377,7 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
     let output_path = output.to_path_buf();
     let writer_handle = std::thread::spawn(move || -> anyhow::Result<usize> {
         let output_file = std::fs::File::create(&output_path)?;
-        let encoder = bgzf::io::MultithreadedWriter::new(output_file);
+        let encoder = bgzf::io::MultithreadedWriter::with_worker_count(writer_workers, output_file);
         let mut writer = bam::io::Writer::from(encoder);
         writer.write_header(&header_clone)?;
 
@@ -392,8 +395,13 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
         Ok(count)
     });
 
-    // Stream BAM records, filter against POD5 index, and process in chunks
-    // Each chunk entry carries the pre-parsed UUID to avoid double parsing.
+    // Scan the BAM, keeping only records whose read matched the POD5 index.
+    // `orig_index` remembers each record's encounter position so the eventual
+    // write can restore it after refinement below reorders this same `Vec` by
+    // POD5 storage key — not optional here either (#334): a coordinate-sorted
+    // BAM against a reference groups reads by identity, unrelated to where
+    // their signal sits on disk, so BAM order is not merely uninformative
+    // about POD5 layout but structured against it.
     const CHUNK_SIZE: usize = 10_000;
     // Batch progress updates: tens of millions of BAM records × per-record
     // set_position is pure overhead (atomic store + draw-throttle check);
@@ -401,9 +409,8 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
     const PROGRESS_STRIDE: usize = 1_000;
     let progress_bar = create_progress_bar(bam_total, "Processing")?;
     let log_interval: usize = if progress_bar.is_hidden() { 10_000 } else { 0 };
-    let mut chunk: Vec<(uuid::Uuid, RecordBuf)> = Vec::with_capacity(CHUNK_SIZE);
+    let mut pending: Vec<PendingRead> = Vec::new();
     let mut total_bam: usize = 0;
-    let mut matched: usize = 0;
 
     loop {
         let mut record_buf = RecordBuf::default();
@@ -417,7 +424,7 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
             let name_bytes: &[u8] = name.as_ref();
             let name_str = name_bytes.to_str().ok()?;
             let uuid = parse_uuid_flexible(name_str).ok()?;
-            if pod5_reads.contains_key(&uuid) {
+            if pod5_index.reads().contains_key(&uuid) {
                 Some(uuid)
             } else {
                 None
@@ -430,34 +437,66 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
         if log_interval > 0 && total_bam.is_multiple_of(log_interval) {
             info!(
                 "processed {} / {} records ({} matched)",
-                total_bam, bam_total, matched
+                total_bam,
+                bam_total,
+                pending.len()
             );
         }
 
-        let read_id = match read_id {
-            Some(id) => id,
-            None => continue,
-        };
-        matched += 1;
-        chunk.push((read_id, record_buf));
-
-        if chunk.len() >= CHUNK_SIZE {
-            refine_and_send_chunk(&mut chunk, &ctx, &tx)?;
-            chunk = Vec::with_capacity(CHUNK_SIZE);
+        if let Some(uuid) = read_id {
+            let orig_index = pending.len();
+            pending.push(PendingRead {
+                orig_index,
+                uuid,
+                record: record_buf,
+            });
         }
     }
 
-    // Flush remaining records
-    if !chunk.is_empty() {
-        refine_and_send_chunk(&mut chunk, &ctx, &tx)?;
-    }
-    drop(tx);
-
     progress_bar.finish_with_message(format!(
         "{} matched / {} scanned",
-        style::count(matched),
+        style::count(pending.len()),
         style::count(total_bam)
     ));
+
+    // Refine in POD5 storage order (locality for the signal reads below),
+    // then restore BAM encounter order before writing — same output either
+    // way, since a read that fails refinement is still written unrefined.
+    pending.sort_by_key(|p| pod5_index.storage_key(&p.uuid));
+    let refine_bar = create_progress_bar(pending.len() as u64, "Refining")?;
+    for group in pending.chunks_mut(CHUNK_SIZE) {
+        group
+            .par_iter_mut()
+            .for_each(|p| match refine_single_read(p.uuid, &mut p.record, &ctx) {
+                Ok(true) => {
+                    ctx.refined_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    ctx.error_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let reason = format!("{}", e);
+                    ctx.skip_reasons
+                        .lock()
+                        .unwrap()
+                        .entry(reason)
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                }
+            });
+        refine_bar.inc(group.len() as u64);
+    }
+    refine_bar.finish_and_clear();
+    pending.sort_by_key(|p| p.orig_index);
+
+    let mut records_out: Vec<RecordBuf> = pending.into_iter().map(|p| p.record).collect();
+    while !records_out.is_empty() {
+        let take = records_out.len().min(CHUNK_SIZE);
+        let chunk: Vec<RecordBuf> = records_out.drain(..take).collect();
+        tx.send(chunk)?;
+    }
+    drop(tx);
 
     // Wait for writer to finish
     let written = writer_handle
@@ -517,44 +556,16 @@ impl<'a> RefineContext<'a> {
     }
 }
 
-/// Refine a chunk of BAM records in parallel and send to the writer thread.
-fn refine_and_send_chunk(
-    chunk: &mut Vec<(uuid::Uuid, RecordBuf)>,
-    ctx: &RefineContext<'_>,
-    tx: &std::sync::mpsc::SyncSender<Vec<RecordBuf>>,
-) -> anyhow::Result<()> {
-    chunk.par_iter_mut().for_each(|(read_id, record)| {
-        match refine_single_read(*read_id, record, ctx) {
-            Ok(true) => {
-                ctx.refined_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(false) => {}
-            Err(e) => {
-                ctx.error_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let reason = format!("{}", e);
-                ctx.skip_reasons
-                    .lock()
-                    .unwrap()
-                    .entry(reason)
-                    .and_modify(|c| *c += 1)
-                    .or_insert(1);
-            }
-        }
-    });
-    // Extract just the RecordBufs for the writer
-    let records: Vec<RecordBuf> = std::mem::take(chunk).into_iter().map(|(_, r)| r).collect();
-    tx.send(records)?;
-    Ok(())
-}
-
-/// POD5 read metadata needed for refinement.
-struct Pod5ReadInfo {
-    reader_idx: usize,
-    calibration_scale: f32,
-    calibration_offset: f32,
-    signal_rows: Vec<u64>,
+/// One BAM record matched to a POD5 read, pending refinement.
+///
+/// `orig_index` is the record's position as encountered in the BAM. Refining
+/// in POD5 storage order (see the scan in `run_resquiggle`) reorders the
+/// `Vec` this lives in; sorting back on `orig_index` afterward is what
+/// restores that original order for the write.
+struct PendingRead {
+    orig_index: usize,
+    uuid: uuid::Uuid,
+    record: RecordBuf,
 }
 
 /// Refine a single BAM record's signal-to-base mapping.
