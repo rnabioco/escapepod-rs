@@ -16,6 +16,8 @@
 - **`repack` no longer writes its status lines to stdout.** They are its only
   output — no data product — so they now go through `tracing::info!` like
   every other command's status output.
+- **`merge --profile`'s report ignored `-q`.** Gated on
+  `tracing::enabled!(Level::INFO)`, matching `subset`'s own summary block.
 
 ## 0.24.3 (2026-09-11)
 
