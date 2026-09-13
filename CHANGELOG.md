@@ -13,6 +13,9 @@
 - **`inspect read` rejected the dash-less 32-hex read ID its own help text
   advertises.** Now parsed with `parse_uuid_flexible`, like every other
   read-ID input in the CLI.
+- **`repack` no longer writes its status lines to stdout.** They are its only
+  output — no data product — so they now go through `tracing::info!` like
+  every other command's status output.
 
 ## 0.24.3 (2026-09-11)
 
