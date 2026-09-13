@@ -1,11 +1,13 @@
 //! GPU/CPU parity for the batched t-test fingerprint extractor.
 //!
-//! Gated on `--features gpu`; skips transparently without a CUDA device.
-//! Compares `GpuDtwContext::fingerprint_batch` against the CPU reference
-//! `extract_fingerprint_from_signal` on the demux path
+//! Gated on `--features gpu-prep-experimental` (forwards to
+//! escapepod-signal's feature of the same name): `fingerprint_batch` is an
+//! experimental prep kernel with no production caller. Skips transparently
+//! without a CUDA device. Compares `GpuDtwContext::fingerprint_batch` against
+//! the CPU reference `extract_fingerprint_from_signal` on the demux path
 //! (`keep_last = Some(25)`, z-score, no dwell).
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-prep-experimental")]
 
 use escapepod_demux::extract_fingerprint_from_signal;
 use escapepod_signal::dtw::{GpuDtwContext, GpuDtwError, NormMethod};

@@ -1,9 +1,11 @@
 //! GPU/CPU parity tests for the batched SVB16 decoder.
 //!
-//! Compiled only with `--features gpu`. Skips gracefully (printing a message)
-//! when no CUDA device / NVRTC is available, mirroring `gpu_dtw.rs`.
+//! Compiled only with `--features gpu-prep-experimental` (implies `gpu`):
+//! `decode_svb16_batch` is an experimental prep kernel with no production
+//! caller. Skips gracefully (printing a message) when no CUDA device / NVRTC
+//! is available, mirroring `gpu_dtw.rs`.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-prep-experimental")]
 
 use escapepod_signal::compression::svb16;
 use escapepod_signal::dtw::{GpuDtwContext, GpuDtwError};
