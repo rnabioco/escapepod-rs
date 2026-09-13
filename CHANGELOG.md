@@ -11,6 +11,11 @@
   `ParsedBatch::parse`). Arrow IPC buffer order is fixed by the schema, so the
   four non-empty buffers are now taken from their known positions (1, 3, 4, 6)
   rather than matched by size.
+- **`ReadsBatchView::read`/`append_columns` could panic on a corrupt file's
+  out-of-range `end_reason` dictionary key** (`arrow_helpers.rs`). The
+  `pore_type` column beside it already used a checked lookup that falls back
+  to a default; `end_reason` indexed the dictionary values array directly.
+  Both columns now bounds-check the key and fall back to `EndReason::default()`.
 
 ## 0.24.3 (2026-09-11)
 
