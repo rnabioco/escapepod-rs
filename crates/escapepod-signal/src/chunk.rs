@@ -984,7 +984,16 @@ fn base_onehot(seq: &[u8]) -> Vec<f32> {
 /// fall inside it, a k-mer window spans exactly `2 * context + 1` — so
 /// deriving these from the k-mer window disagrees with the reference on every
 /// chunk (leech#186).
-fn signal_kmer_inputs(
+///
+/// `pub` so a caller that stores these two chunk-local values regardless of
+/// [`SeqEncoding`] (leech's training format always writes the map and the
+/// context sequence, even for a chunk cut with [`SeqEncoding::None`] or
+/// [`SeqEncoding::BaseOneHot`]) can compute them without a second copy of the
+/// window arithmetic: `sig_start`/`sig_end` are `focus - left`/`focus + right`
+/// from the *same* [`Chunk::focus_signal_pos`] and `spec.signal_context` that
+/// [`cut_chunk`] itself used, so nothing here is re-derived independently of
+/// the chunk it goes with.
+pub fn signal_kmer_inputs(
     read: &ProcessedRead,
     sig_start: i64,
     sig_end: i64,

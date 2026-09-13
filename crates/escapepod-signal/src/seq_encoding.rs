@@ -41,6 +41,8 @@
 
 use std::ops::Range;
 
+use rayon::prelude::*;
+
 /// The value [`sequence_to_int`] gives a base that is not `A`/`C`/`G`/`T`/`U`.
 ///
 /// Negative rather than a fifth channel: an ambiguity code is *absence of
@@ -338,6 +340,116 @@ pub fn encode_signal_kmer_into(
     }
 }
 
+/// `B` rows of [`encode_signal_kmer`]'s two ragged arguments, packed CSR-style
+/// for [`encode_signal_kmer_batch`]: each argument is one flat buffer plus
+/// `B + 1` row offsets, rather than `Vec<Vec<_>>` or a padded 2D array.
+///
+/// `seq_ints` and `seq_to_signal` grow at different rates per row (`n_bases +
+/// before + after` against `n_bases + 1`), so they need independent offsets —
+/// a single shared offset array would silently misalign one of the two the
+/// first time a batch mixes reads with different base counts. This is also
+/// why a padded 2D array is the wrong default here: the pad value has to be
+/// chosen so it neither collides with a real base index nor forces every
+/// caller to also carry a "how many are real" length per row, which is
+/// exactly what an offsets array already *is*.
+///
+/// A caller marshalling from Python (numpy arrays, or a per-chunk list) packs
+/// the flat buffers once; that replaces the "one pyo3 call and one
+/// `(channels, L)` allocation per chunk" pattern this batch form exists to
+/// remove.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalKmerBatch<'a> {
+    /// Every row's `seq_ints`, concatenated: row `i` is
+    /// `seq_ints[seq_ints_offsets[i]..seq_ints_offsets[i + 1]]`.
+    pub seq_ints: &'a [i8],
+    /// `seq_ints`'s row boundaries, `len() == rows + 1`.
+    pub seq_ints_offsets: &'a [usize],
+    /// Every row's `seq_to_signal`, concatenated the same way.
+    pub seq_to_signal: &'a [i64],
+    /// `seq_to_signal`'s row boundaries, `len() == rows + 1`.
+    pub seq_to_signal_offsets: &'a [usize],
+}
+
+impl<'a> SignalKmerBatch<'a> {
+    /// Number of rows. Both offsets arrays must agree on this — see
+    /// [`encode_signal_kmer_batch_into`]'s panic conditions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.seq_ints_offsets.len().saturating_sub(1)
+    }
+
+    /// True when there are no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Row `i`'s `(seq_ints, seq_to_signal)`, sliced from the flat buffers.
+    fn row(&self, i: usize) -> (&'a [i8], &'a [i64]) {
+        (
+            &self.seq_ints[self.seq_ints_offsets[i]..self.seq_ints_offsets[i + 1]],
+            &self.seq_to_signal[self.seq_to_signal_offsets[i]..self.seq_to_signal_offsets[i + 1]],
+        )
+    }
+}
+
+/// [`encode_signal_kmer`] over a batch of rows, one `(rows * ctx.channels() *
+/// signal_len)` allocation rather than one per row.
+///
+/// Every row is bit-identical to calling [`encode_signal_kmer`] on it alone —
+/// this is the same per-row loop as [`encode_signal_kmer_batch_into`], just
+/// with the output buffer allocated here. See that function for the panic
+/// conditions on `batch`.
+#[must_use]
+pub fn encode_signal_kmer_batch(
+    batch: &SignalKmerBatch<'_>,
+    signal_len: usize,
+    ctx: KmerContext,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch.len() * ctx.channels() * signal_len];
+    encode_signal_kmer_batch_into(batch, signal_len, ctx, &mut out);
+    out
+}
+
+/// [`encode_signal_kmer_batch`] into a caller-owned buffer, one row per
+/// `ctx.channels() * signal_len` slice, computed in parallel with rayon.
+///
+/// `out` must be exactly `batch.len() * ctx.channels() * signal_len` long.
+/// Each row is independent — [`encode_signal_kmer_into`] zeroes its own slice
+/// before writing — so the rows can be handed to rayon's `par_chunks_mut`
+/// without any cross-row synchronisation.
+///
+/// # Panics
+///
+/// If `out` is not sized for `batch.len()` rows, or if `seq_ints_offsets` and
+/// `seq_to_signal_offsets` disagree on the row count — two ragged arguments
+/// with an unequal number of rows is a caller bug the same way a mis-sized
+/// buffer is in [`encode_signal_kmer_into`], not a case to silently truncate.
+pub fn encode_signal_kmer_batch_into(
+    batch: &SignalKmerBatch<'_>,
+    signal_len: usize,
+    ctx: KmerContext,
+    out: &mut [f32],
+) {
+    assert_eq!(
+        batch.seq_ints_offsets.len(),
+        batch.seq_to_signal_offsets.len(),
+        "seq_ints_offsets and seq_to_signal_offsets must describe the same number of rows"
+    );
+    let row_size = ctx.channels() * signal_len;
+    assert_eq!(
+        out.len(),
+        batch.len() * row_size,
+        "output buffer must be `rows * channels * signal_len` for the encoding to be laid out row-major"
+    );
+    out.par_chunks_mut(row_size)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let (seq_ints, seq_to_signal) = batch.row(i);
+            encode_signal_kmer_into(seq_ints, seq_to_signal, signal_len, ctx, dst);
+        });
+}
+
 #[cfg(test)]
 mod seq_encoding_tests {
     use super::*;
@@ -573,5 +685,129 @@ mod seq_encoding_tests {
         let ctx = KmerContext::new(1, 1);
         let mut buf = vec![0.0f32; 4 * 5]; // one block, not three
         encode_signal_kmer_into(&sequence_to_int(b"ACG"), &[0, 5], 5, ctx, &mut buf);
+    }
+
+    /// Pack rows of `(seq_ints, seq_to_signal)` CSR-style, as a caller
+    /// marshalling from numpy/pyo3 would.
+    fn pack(rows: &[(Vec<i8>, Vec<i64>)]) -> (Vec<i8>, Vec<usize>, Vec<i64>, Vec<usize>) {
+        let mut seq_ints = Vec::new();
+        let mut seq_ints_offsets = vec![0usize];
+        let mut seq_to_signal = Vec::new();
+        let mut seq_to_signal_offsets = vec![0usize];
+        for (ints, map) in rows {
+            seq_ints.extend_from_slice(ints);
+            seq_ints_offsets.push(seq_ints.len());
+            seq_to_signal.extend_from_slice(map);
+            seq_to_signal_offsets.push(seq_to_signal.len());
+        }
+        (
+            seq_ints,
+            seq_ints_offsets,
+            seq_to_signal,
+            seq_to_signal_offsets,
+        )
+    }
+
+    #[test]
+    fn batch_rows_are_bit_identical_to_the_single_row_function() {
+        // Deliberately varied: different base counts, different context
+        // widths worth of unknowns, an off-the-end map, an empty span — the
+        // same traps the single-row tests above pin, now mixed in one batch.
+        let ctx = KmerContext::new(1, 1);
+        let rows = [
+            (sequence_to_int(b"AACGG"), vec![0i64, 10, 20, 30]),
+            (sequence_to_int(b"ACG"), vec![0i64, 4]),
+            (sequence_to_int(b"NA"), vec![0i64, 10]),
+            (sequence_to_int(b"AC"), vec![0i64, 0, 10]),
+        ];
+        let signal_len = 30;
+        let (seq_ints, seq_ints_offsets, seq_to_signal, seq_to_signal_offsets) = pack(&rows);
+        let batch = SignalKmerBatch {
+            seq_ints: &seq_ints,
+            seq_ints_offsets: &seq_ints_offsets,
+            seq_to_signal: &seq_to_signal,
+            seq_to_signal_offsets: &seq_to_signal_offsets,
+        };
+        assert_eq!(batch.len(), rows.len());
+
+        let out = encode_signal_kmer_batch(&batch, signal_len, ctx);
+        let row_size = ctx.channels() * signal_len;
+        assert_eq!(out.len(), rows.len() * row_size);
+
+        for (i, (ints, map)) in rows.iter().enumerate() {
+            let expected = encode_signal_kmer(ints, map, signal_len, ctx);
+            assert_eq!(
+                out[i * row_size..(i + 1) * row_size],
+                expected[..],
+                "row {i} diverged from the single-row function"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_of_one_row_matches_the_single_row_call() {
+        let ctx = KmerContext::default();
+        let ints = sequence_to_int(b"AACGGTTTT");
+        let map = vec![0i64, 5, 12, 20, 30];
+        let (seq_ints, seq_ints_offsets, seq_to_signal, seq_to_signal_offsets) =
+            pack(&[(ints.clone(), map.clone())]);
+        let batch = SignalKmerBatch {
+            seq_ints: &seq_ints,
+            seq_ints_offsets: &seq_ints_offsets,
+            seq_to_signal: &seq_to_signal,
+            seq_to_signal_offsets: &seq_to_signal_offsets,
+        };
+        assert_eq!(
+            encode_signal_kmer_batch(&batch, 30, ctx),
+            encode_signal_kmer(&ints, &map, 30, ctx)
+        );
+    }
+
+    #[test]
+    fn empty_batch_is_empty_output() {
+        let ctx = KmerContext::default();
+        let batch = SignalKmerBatch {
+            seq_ints: &[],
+            seq_ints_offsets: &[0],
+            seq_to_signal: &[],
+            seq_to_signal_offsets: &[0],
+        };
+        assert!(batch.is_empty());
+        assert!(encode_signal_kmer_batch(&batch, 30, ctx).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "same number of rows")]
+    fn batch_rejects_offsets_with_different_row_counts() {
+        let ctx = KmerContext::new(0, 0);
+        let seq_ints = sequence_to_int(b"AC");
+        let seq_ints_offsets = [0usize, 1, 2];
+        let seq_to_signal = [0i64, 5, 10];
+        let seq_to_signal_offsets = [0usize, 2]; // one row, not two
+        let batch = SignalKmerBatch {
+            seq_ints: &seq_ints,
+            seq_ints_offsets: &seq_ints_offsets,
+            seq_to_signal: &seq_to_signal,
+            seq_to_signal_offsets: &seq_to_signal_offsets,
+        };
+        let _ = encode_signal_kmer_batch(&batch, 5, ctx);
+    }
+
+    #[test]
+    #[should_panic(expected = "row-major")]
+    fn batch_into_rejects_a_mis_sized_buffer() {
+        let ctx = KmerContext::new(0, 0);
+        let seq_ints = sequence_to_int(b"AC");
+        let seq_ints_offsets = [0usize, 1, 2];
+        let seq_to_signal = [0i64, 5, 5, 10];
+        let seq_to_signal_offsets = [0usize, 2, 4];
+        let batch = SignalKmerBatch {
+            seq_ints: &seq_ints,
+            seq_ints_offsets: &seq_ints_offsets,
+            seq_to_signal: &seq_to_signal,
+            seq_to_signal_offsets: &seq_to_signal_offsets,
+        };
+        let mut out = vec![0.0f32; ctx.channels() * 5]; // one row's worth, not two
+        encode_signal_kmer_batch_into(&batch, 5, ctx, &mut out);
     }
 }

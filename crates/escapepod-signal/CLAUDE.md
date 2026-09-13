@@ -2,16 +2,16 @@
 
 ## Purpose and layering
 - Signal algorithms (DTW, resquiggle, segmentation, chunk assembly, LSTM kernel, coordinate mapping, k-mer tables) over `escapepod-pod5`, which it depends on and re-exports as `pod5` plus the type surface.
-- Consumed by demux, classify, cli, python — and out-of-tree by **leech** (`rust/Cargo.toml` pins this crate by git tag). Leech-load-bearing but unused in-workspace: `rough_rescale_quantile`, `ref_to_signal`, `span_stats`, `extract_levels`, `banded_dp_with_penalty_table`, `sequence_bases_with_context`, `encode_signal_kmer`/`KmerContext`. Grep leech before deleting any `pub` item.
+- Consumed by demux, classify, cli, python — and out-of-tree by **leech** (`rust/Cargo.toml` pins this crate by git tag). Leech-load-bearing but unused in-workspace: `rough_rescale_quantile`, `ref_to_signal`, `span_stats`, `extract_levels`, `banded_dp_with_penalty_table`, `sequence_bases_with_context`, `encode_signal_kmer`/`KmerContext`, `encode_signal_kmer_batch[_into]`/`SignalKmerBatch` (#380). Grep leech before deleting any `pub` item.
 
 ## Module map
 - `dtw/` — `dtw_distance*`; lane-parallel `dtw_distances_batch` (SoA, `DTW_LANES=32`); `Fingerprint`; `cuda/` (`gpu`): `GpuDtwContext` DTW+SVM kernels, prep kernels experimental.
 - `resquiggle/` — `refine_signal_map` (rough rescale → banded DP → rescale loop); `dp/` fill + `fill_simd`; `adaptive_dp`; `bands`; `rescale`; `types` (`RefineSettings::move_table_refinement` is *the* shared preset); `kmer_table` (`KmerTable`, fishnet); `kmer_levels` (Remora/leech); `dp_raw_penalty` (leech parity DP).
 - `segmentation/` — `llr::detect_adapter`, `ttest::segment_signal`, `normalize::downscale_normalize_into` + MAD helpers.
-- `chunk.rs` — `process_read` → `read_rows` → `cut_chunk`; channel lists in `ChunkSpec`.
+- `chunk.rs` — `process_read` → `read_rows` → `cut_chunk`; channel lists in `ChunkSpec`; `signal_kmer_inputs` (pub, encoding-independent — a caller of `cut_chunk` recovers its `sig_start`/`sig_end` from `Chunk::focus_signal_pos` + `spec.signal_context`).
 - `features.rs` — `span_stats` + `SpanConfig` (fill/bounds/median named per call).
 - `lstm.rs` — `LstmWeights::from_onnx`, `run_scalar`/`run_avx2`/`run_*_batch::<N>`, `LstmBackend::best_for`, `tanh_slice`.
-- `mapping.rs` — `seq_to_signal_from_moves`, `ref_to_signal`. `seq_encoding.rs` — `base_to_int`, `KmerContext`, `encode_signal_kmer[_into]`.
+- `mapping.rs` — `seq_to_signal_from_moves`, `ref_to_signal`. `seq_encoding.rs` — `base_to_int`, `KmerContext`, `encode_signal_kmer[_into]`, `encode_signal_kmer_batch[_into]` (`SignalKmerBatch`, CSR-packed, rayon).
 - `stats.rs` — `median_via_select`, `median_and_mad[_with_scratch]`: every median/MAD routes here.
 
 ## Build, test, bench this crate alone
