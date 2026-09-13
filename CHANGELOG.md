@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Signal-table batch parsing identified buffers by matching their byte
+  length instead of their fixed schema position**, so an uncompressed read
+  whose signal happened to be exactly 4 bytes/row (2 i16 samples) collided
+  with the `samples: u32` column's size and swapped the two (`arrow_ipc.rs`,
+  `ParsedBatch::parse`). Arrow IPC buffer order is fixed by the schema, so the
+  four non-empty buffers are now taken from their known positions (1, 3, 4, 6)
+  rather than matched by size.
+
 ## 0.24.3 (2026-09-11)
 
 ### Performance

@@ -804,69 +804,43 @@ impl<'a> ParsedBatch<'a> {
         let metadata = slice_at(batch_bytes, metadata_start, actual_metadata_len)?;
         let buffer_infos = Self::parse_buffer_infos(metadata)?;
 
-        // We expect at least 7 buffers (some may be null/empty for validity)
-        // Find the non-empty buffers in order
-        let mut data_buffers: Vec<(usize, usize)> = Vec::new();
-        for (offset, length) in &buffer_infos {
-            if *length > 0 {
-                data_buffers.push((*offset, *length));
-            }
+        // Buffer order is fixed by the schema (see the doc comment above), not
+        // by size: an uncompressed batch whose signal data happens to be the
+        // same length as the samples column (e.g. 2 i16 samples/row = 4
+        // bytes/row) is ambiguous under a size match. Index by position.
+        if buffer_infos.len() < 7 {
+            return Err(Error::InvalidArrowIpc(format!(
+                "Expected 7 signal-table buffers, found {}",
+                buffer_infos.len()
+            )));
         }
 
-        // Expected layout for non-null signal table:
-        // - read_id data (16 * num_rows)
-        // - signal offsets (8 * (num_rows + 1))
-        // - signal data (variable)
-        // - samples data (4 * num_rows)
+        let (read_id_off, read_id_len) = buffer_infos[1];
+        let (signal_offsets_off, signal_offsets_len) = buffer_infos[3];
+        let (signal_data_off, signal_data_len) = buffer_infos[4];
+        let (samples_off, samples_len) = buffer_infos[6];
 
-        // Find buffers by expected sizes
+        let read_id_data = slice_at(body, read_id_off, read_id_len)?;
+        let signal_offsets = slice_at(body, signal_offsets_off, signal_offsets_len)?;
+        let signal_data = slice_at(body, signal_data_off, signal_data_len)?;
+        let samples_data = slice_at(body, samples_off, samples_len)?;
+
         let read_id_size = 16 * num_rows;
         let signal_offsets_size = 8 * (num_rows + 1);
         let samples_size = 4 * num_rows;
 
-        let mut read_id_data: &[u8] = &[];
-        let mut signal_offsets: &[u8] = &[];
-        let mut signal_data: &[u8] = &[];
-        let mut samples_data: &[u8] = &[];
-
-        // Match buffers by size
-        for (offset, length) in &buffer_infos {
-            let offset = *offset;
-            let length = *length;
-
-            if length == 0 {
-                continue;
-            }
-
-            let end = offset + length;
-            if end > body.len() {
-                continue;
-            }
-
-            let buf = &body[offset..end];
-
-            if length == read_id_size && read_id_data.is_empty() {
-                read_id_data = buf;
-            } else if length == signal_offsets_size && signal_offsets.is_empty() {
-                signal_offsets = buf;
-            } else if length == samples_size && samples_data.is_empty() {
-                samples_data = buf;
-            } else if signal_data.is_empty()
-                && !read_id_data.is_empty()
-                && !signal_offsets.is_empty()
-            {
-                // Signal data comes after offsets
-                signal_data = buf;
-            }
-        }
-
-        if read_id_data.is_empty() || signal_offsets.is_empty() || samples_data.is_empty() {
+        if read_id_data.len() != read_id_size
+            || signal_offsets.len() != signal_offsets_size
+            || samples_data.len() != samples_size
+        {
             return Err(Error::InvalidArrowIpc(format!(
-                "Could not locate all required buffers. Found: read_id={}, offsets={}, signal={}, samples={}",
+                "Unexpected signal-table buffer sizes. Found: read_id={} (want {}), offsets={} (want {}), samples={} (want {})",
                 read_id_data.len(),
+                read_id_size,
                 signal_offsets.len(),
-                signal_data.len(),
-                samples_data.len()
+                signal_offsets_size,
+                samples_data.len(),
+                samples_size
             )));
         }
 
@@ -1049,6 +1023,95 @@ mod tests {
         }
         writer.finish().expect("finish");
         path
+    }
+
+    /// `ParsedBatch::parse` must locate signal-table buffers by their fixed
+    /// schema position, not by matching their byte length: an uncompressed
+    /// read with exactly 2 i16 samples/row is 4 bytes/row, the same width as
+    /// the `samples: u32` column, so a size match cannot tell them apart.
+    #[test]
+    fn test_parse_uncompressed_batch_buffer_positions() {
+        use crate::types::{EndReason, ReadData, RunInfoData};
+        use crate::{Reader, Writer, WriterOptions};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("collide.pod5");
+
+        let mut writer = Writer::create(
+            &path,
+            WriterOptions {
+                signal_batch_size: 2,
+                compress_signal: false,
+                ..Default::default()
+            },
+        )
+        .expect("writer::create");
+
+        let run_idx = writer
+            .add_run_info(RunInfoData {
+                acquisition_id: "collide".into(),
+                acquisition_start_time: 1_609_459_200_000,
+                adc_max: 2047,
+                adc_min: -2048,
+                sample_rate: 4_000,
+                ..Default::default()
+            })
+            .expect("add_run_info");
+
+        let signals: [[i16; 2]; 2] = [[10, 20], [30, 40]];
+        let mut read_ids = Vec::new();
+        for (i, samples) in signals.iter().enumerate() {
+            let read_id = crate::Uuid::new_v4();
+            read_ids.push(read_id);
+            let read = ReadData {
+                read_id,
+                read_number: i as u32 + 1,
+                start_sample: i as u64 * 2,
+                channel: 1,
+                well: 1,
+                pore_type: "not_set".into(),
+                calibration_offset: 0.5,
+                calibration_scale: 0.95,
+                median_before: 200.0,
+                end_reason: EndReason::SignalPositive,
+                end_reason_forced: false,
+                run_info_index: run_idx,
+                num_minknow_events: 2,
+                tracked_scaling_scale: 1.0,
+                tracked_scaling_shift: 0.0,
+                predicted_scaling_scale: 1.0,
+                predicted_scaling_shift: 0.0,
+                num_reads_since_mux_change: 0,
+                time_since_mux_change: 0.0,
+                num_samples: 2,
+                open_pore_level: 220.0,
+                expected_open_pore_level: 0.0,
+                selected_read_level: 0.0,
+                signal_rows: Vec::new(),
+            };
+            writer.add_read(read, samples).expect("add_read");
+        }
+        writer.finish().expect("finish");
+
+        let reader = Reader::open(&path).expect("open");
+        let signal_bytes = reader.signal_table_bytes().expect("signal bytes");
+        let footer = ArrowIpcFooter::parse(signal_bytes).expect("parse footer");
+        assert_eq!(footer.total_rows, 2);
+
+        for (row, (expected_id, expected_samples)) in
+            read_ids.iter().zip(signals.iter()).enumerate()
+        {
+            let chunk = footer
+                .extract_signal_row(row as u64, signal_bytes)
+                .unwrap_or_else(|e| panic!("row {row}: {e}"));
+            assert_eq!(&chunk.read_id, expected_id.as_bytes(), "row {row} read_id");
+            assert_eq!(chunk.samples, 2, "row {row} samples");
+            let want: Vec<u8> = expected_samples
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect();
+            assert_eq!(chunk.signal, want.as_slice(), "row {row} signal bytes");
+        }
     }
 
     /// The parallel walk must answer exactly what the serial one would, and
