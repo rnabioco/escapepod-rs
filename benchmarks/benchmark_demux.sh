@@ -34,7 +34,7 @@
 #   Bench 1  Adapter detection: `escpod demux detect` vs `adapted detect --llr`
 #            (hyperfine, 3 runs each, one warm-up).
 #   Bench 2  End-to-end pipeline wall-clock:
-#              escpod:   detect -> fingerprint --warpdemux-compat -> classify --svm-model
+#              escpod:   detect -> fingerprint --warpdemux-compat -> classify --model
 #              WarpDemuX: `warpdemux demux -m WDX4_rna004_v1_0`
 #            Reports total wall-clock; with --gpu, adds a third escpod variant
 #            that passes `--device gpu` to classify. (The CPU arm passes
@@ -181,7 +181,7 @@ run_escpod_pipeline() {
     local outdir="$2"
     local extra="$3"
 
-    echo ">>> escpod ($tag): detect | fingerprint | classify --svm-model"
+    echo ">>> escpod ($tag): detect | fingerprint | classify --model"
     local t0
     t0=$(date +%s.%N)
     "$ESCAPEPOD_BIN" demux detect "$POD5_FILE" \
@@ -191,7 +191,7 @@ run_escpod_pipeline() {
         --warpdemux-compat \
         -o "$outdir/fingerprints.csv" -j $THREADS -q
     "$ESCAPEPOD_BIN" demux classify "$outdir/fingerprints.csv" \
-        --svm-model "$WDX_MODEL_JSON" \
+        --model "$WDX_MODEL_JSON" \
         --probabilities \
         $extra \
         -o "$outdir/classifications.csv"

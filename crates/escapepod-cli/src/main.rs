@@ -478,31 +478,6 @@ a wrong answer rather than an error.
 ")]
     Classify(commands::classify::ClassifyArgs),
 
-    /// Deprecated alias for `escpod classify`.
-    ///
-    /// Hidden rather than removed: `signal classify` was the shipped spelling
-    /// from 0.11.0, so existing pipeline scripts still name it. It warns and
-    /// forwards.
-    #[cfg(feature = "classify")]
-    #[command(hide = true)]
-    Signal {
-        #[command(subcommand)]
-        command: commands::signal::SignalCommand,
-    },
-
-    /// Deprecated alias for `escpod classify` (rebuild with `--features classify` to enable)
-    #[cfg(not(feature = "classify"))]
-    #[command(hide = true)]
-    Signal {
-        /// Signal subcommand and arguments (ignored; feature not enabled)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
-    },
-
     /// Classify reads against a model bundle (rebuild with `--features classify` to enable)
     #[cfg(not(feature = "classify"))]
     #[command(hide = true)]
@@ -692,13 +667,6 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         Commands::Classify(args) => args.threads,
         #[cfg(not(feature = "classify"))]
         Commands::Classify { .. } => None,
-
-        // The deprecated `escpod signal classify` alias parses the same args
-        // as `classify`, so it must reach the pool sizing the same way.
-        #[cfg(feature = "classify")]
-        Commands::Signal { command } => commands::signal::requested_threads(command),
-        #[cfg(not(feature = "classify"))]
-        Commands::Signal { .. } => None,
 
         // No `--threads` flag; these run on the default pool.
         Commands::View { .. }
@@ -970,13 +938,6 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "classify"))]
         Commands::Classify { .. } => feature_disabled("classify", "classify"),
 
-        // Deprecated alias; `commands::signal::run` warns, then forwards.
-        #[cfg(feature = "classify")]
-        Commands::Signal { command } => commands::signal::run(command),
-
-        #[cfg(not(feature = "classify"))]
-        Commands::Signal { .. } => feature_disabled("signal classify", "classify"),
-
         #[cfg(feature = "experimental")]
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
 
@@ -1222,34 +1183,20 @@ mod tests {
         );
     }
 
-    /// `escpod classify` is the command; `escpod signal classify` is the
-    /// hidden alias it briefly moved under. Both parse the same `ClassifyArgs`,
-    /// so both must reach the pool sizing — a deprecated path that silently
+    /// `escpod classify` must reach the pool sizing — a path that silently
     /// loses `-j` is the #155 bug wearing a different hat.
     #[cfg(feature = "classify")]
     #[test]
-    fn classify_and_its_deprecated_alias_forward_threads() {
+    fn classify_forwards_threads() {
+        let prefix = &["escpod", "classify"][..];
         let tail = [
             "in.pod5", "-b", "a.bam", "-r", "ref.fa", "-m", "bundle", "-o", "o.bam",
         ];
-        for prefix in [
-            &["escpod", "classify"][..],
-            &["escpod", "signal", "classify"],
-        ] {
-            assert_eq!(threads_for(&[prefix, &tail].concat()), None);
-            for flag in ["-t", "-j", "--threads"] {
-                let argv = [prefix, &tail, &[flag, "9"]].concat();
-                assert_eq!(threads_for(&argv), Some(9), "{prefix:?} dropped {flag}");
-            }
+        assert_eq!(threads_for(&[prefix, &tail].concat()), None);
+        for flag in ["-t", "-j", "--threads"] {
+            let argv = [prefix, &tail, &[flag, "9"]].concat();
+            assert_eq!(threads_for(&argv), Some(9), "classify dropped {flag}");
         }
-    }
-
-    /// The deprecated group is a namespace, not a command: `escpod signal`
-    /// alone is a usage error rather than a silent no-op.
-    #[cfg(feature = "classify")]
-    #[test]
-    fn signal_requires_a_subcommand() {
-        assert!(Cli::try_parse_from(["escpod", "signal"]).is_err());
     }
 
     /// clap's own consistency check over the whole command tree.
@@ -1265,24 +1212,19 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// `--device` and its two aliases are mutually exclusive, and `auto` is the
-    /// default when none of them is given.
+    /// `--device` and its `--cpu` alias are mutually exclusive, and `auto` is
+    /// the default when neither is given.
     #[test]
     fn device_aliases_conflict_with_device() {
         let base = [
             "escpod", "demux", "detect", "x.pod5", "-o", "b.csv", "--method", "llr",
         ];
-        for extra in [
-            ["--device", "cpu", "--gpu"].as_slice(),
-            ["--device", "gpu", "--cpu"].as_slice(),
-            ["--gpu", "--cpu"].as_slice(),
-        ] {
-            let argv: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
-            assert!(
-                Cli::try_parse_from(&argv).is_err(),
-                "expected a conflict for {extra:?}"
-            );
-        }
+        let extra = ["--device", "gpu", "--cpu"];
+        let argv: Vec<&str> = base.iter().copied().chain(extra).collect();
+        assert!(
+            Cli::try_parse_from(&argv).is_err(),
+            "expected a conflict for {extra:?}"
+        );
         // And the plain form parses, on the fused pipeline as well as a
         // subcommand — `demux`'s `args_conflicts_with_subcommands` makes those
         // two different parses of the same flattened struct.

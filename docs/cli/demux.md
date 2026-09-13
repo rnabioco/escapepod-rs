@@ -925,12 +925,11 @@ One opt-in Cargo feature, `gpu`, enables every GPU path. At run time
     downstream — see the troubleshooting table below.
 - **`cpu`** — CPU everywhere, device or no device.
 
-`--gpu` still works as a hidden, deprecated alias for `--device gpu` (it warns,
-including about the change in meaning); `--cpu` is an alias for `--device cpu`.
-Both conflict with `--device`. `--device` is accepted in **every** build,
-including the release artifacts that contain no GPU code — `--device gpu` there
-tells you the feature is not compiled in rather than failing on an unknown
-argument.
+`--cpu` is an alias for `--device cpu`; it conflicts with `--device`. (The old
+`--gpu` boolean was removed in favor of `--device gpu` — see the CHANGELOG.)
+`--device` is accepted in **every** build, including the release artifacts
+that contain no GPU code — `--device gpu` there tells you the feature is not
+compiled in rather than failing on an unknown argument.
 
 !!! tip "A CPU run that could have been a GPU run says so"
     Whenever a GPU-capable stage lands on the CPU, escpod logs a warning at

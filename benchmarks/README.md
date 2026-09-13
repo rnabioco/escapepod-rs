@@ -891,7 +891,7 @@ same `-j 16`.
 
 | Tool | Stages | Time | Speedup |
 |---|---|---:|---:|
-| `escpod` (CPU) | detect + fingerprint `--warpdemux-compat` + classify `--svm-model` | **3.43 s** | **5.5×** |
+| `escpod` (CPU) | detect + fingerprint `--warpdemux-compat` + classify `--model` | **3.43 s** | **5.5×** |
 | `escpod` (GPU, `--device gpu`) | same + batched GPU DTW | 3.33 s | 5.7× |
 | `warpdemux demux -m WDX4_rna004_v1_0` | full pipeline | 19.02 s | 1× |
 

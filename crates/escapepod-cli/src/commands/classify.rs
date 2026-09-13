@@ -1,7 +1,8 @@
 //! `escpod classify` — tRNA charging (aminoacylation) classification from
 //! POD5 + aligned BAM, writing the call as a `cl` tag on the BAM directly.
-//! (`escpod signal classify` remains as a hidden deprecated alias; see
-//! [`crate::commands::signal`].)
+//! (`escpod signal classify`, the deprecated alias this command was briefly
+//! spelled as between 0.11.0 and 0.18.1, was removed in favor of this
+//! top-level spelling.)
 //!
 //! Unlike `escpod demux`, which anchors on a signal-derived `adapter_end`,
 //! the charging model anchors on the CCA–aa junction, which only exists in

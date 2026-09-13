@@ -60,11 +60,6 @@ pub struct ClassifyArgs {
     #[arg(long, value_name = "NAME")]
     pub model_name: Option<String>,
 
-    /// Deprecated alias for `--model`. Kept for compatibility with existing
-    /// scripts; emits a warning when used.
-    #[arg(long, value_name = "FILE", hide = true)]
-    pub svm_model: Option<PathBuf>,
-
     /// Output classifications file
     #[arg(short, long, required = true, value_name = "FILE")]
     pub output: PathBuf,
@@ -109,10 +104,9 @@ pub struct ClassifyArgs {
     /// Where DTW runs. `auto` (the default) keeps it on the CPU, which is
     /// faster on a full node; `--device gpu` opts into the batched CUDA DTW.
     ///
-    /// Applies to all three classification modes: `--reference`, `--model`, and
-    /// `--svm-model`. Only the DTW distance step moves to GPU; SVM kernel /
-    /// decision / probability math stays on CPU. GBM models are CPU-only
-    /// entirely.
+    /// Applies to both classification modes: `--reference` and `--model`. Only
+    /// the DTW distance step moves to GPU; SVM kernel / decision / probability
+    /// math stays on CPU. GBM models are CPU-only entirely.
     #[command(flatten)]
     pub device: crate::device::DeviceArgs,
 
@@ -182,17 +176,6 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
     timer.phase("Classify");
     let profile = args.profile;
 
-    // Fold the deprecated --svm-model alias into --model, since the model
-    // loader now auto-detects the JSON shape. Emit a warning so scripts
-    // start migrating.
-    if let Some(p) = args.svm_model.take() {
-        warn!("--svm-model is deprecated; use --model (auto-detects SVM vs WarpDemux JSON).",);
-        if args.model.is_some() {
-            anyhow::bail!("Specify only one of --model / --svm-model (they are aliases now).");
-        }
-        args.model = Some(p);
-    }
-
     // Validate that exactly one input source was provided.
     #[cfg(feature = "demux-models")]
     if let Some(name) = args.model_name.take() {
@@ -220,8 +203,8 @@ pub fn run(mut args: ClassifyArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Resolved once, before the model is parsed, so `--gpu`'s deprecation
-    // warning is emitted exactly once whichever head runs.
+    // Resolved once, before the model is parsed, so every head sees the same
+    // device choice.
     let device = args.device.resolve();
 
     let result = if let Some(model_path) = args.model.take() {

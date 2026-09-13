@@ -57,12 +57,11 @@ impl fmt::Display for Device {
     }
 }
 
-/// The `--device` flag plus its two aliases, flattened into every command that
-/// has a GPU-capable stage.
+/// The `--device` flag plus its `--cpu` alias, flattened into every command
+/// that has a GPU-capable stage.
 ///
-/// `--gpu` is the old spelling and stays hidden but functional; `--cpu` is the
-/// symmetric convenience. Both conflict with `--device`, so there is never a
-/// question of which one won.
+/// `--cpu` conflicts with `--device`, so there is never a question of which
+/// one won.
 #[derive(Debug, Default, clap::Args)]
 pub struct DeviceArgs {
     /// Where GPU-capable stages run: `auto` (default), `cpu`, or `gpu`.
@@ -83,15 +82,10 @@ pub struct DeviceArgs {
         long,
         value_enum,
         value_name = "auto|cpu|gpu",
-        conflicts_with_all = ["gpu", "cpu"],
+        conflicts_with = "cpu",
         help_heading = "Advanced Options"
     )]
     pub device: Option<Device>,
-
-    /// Deprecated alias for `--device gpu`. Kept so existing scripts keep
-    /// working; emits a warning when used.
-    #[arg(long, hide = true, conflicts_with = "cpu")]
-    pub gpu: bool,
 
     /// Alias for `--device cpu`.
     #[arg(long, help_heading = "Advanced Options")]
@@ -99,20 +93,12 @@ pub struct DeviceArgs {
 }
 
 impl DeviceArgs {
-    /// The device this run asked for, folding in the two aliases.
+    /// The device this run asked for, folding in the `--cpu` alias.
     ///
     /// Call once per command, early — [`Stage`] placement and the CPU-cost
     /// warnings both hang off the result, and the point of the warnings is that
     /// they arrive at second one rather than after the run.
     pub fn resolve(&self) -> Device {
-        if self.gpu {
-            tracing::warn!(
-                "--gpu is deprecated; use `--device gpu`. Note the change in meaning: \
-                 `--device gpu` fails if the GPU is unusable instead of quietly \
-                 running on the CPU. Continuing as `--device gpu`."
-            );
-            return Device::Gpu;
-        }
         if self.cpu {
             return Device::Cpu;
         }
@@ -601,22 +587,14 @@ mod tests {
 
     #[test]
     fn aliases_map_onto_device() {
-        let gpu = DeviceArgs {
-            device: None,
-            gpu: true,
-            cpu: false,
-        };
-        assert_eq!(gpu.resolve(), Device::Gpu);
         let cpu = DeviceArgs {
             device: None,
-            gpu: false,
             cpu: true,
         };
         assert_eq!(cpu.resolve(), Device::Cpu);
         assert_eq!(DeviceArgs::default().resolve(), Device::Auto);
         let explicit = DeviceArgs {
             device: Some(Device::Cpu),
-            gpu: false,
             cpu: false,
         };
         assert_eq!(explicit.resolve(), Device::Cpu);

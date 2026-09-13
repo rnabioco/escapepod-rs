@@ -18,9 +18,9 @@ Ships in the default build — no extra Cargo feature.
 
     Between 0.11.0 and 0.18.1 this command was spelled `escpod signal
     classify`, grouped under a `signal` namespace to keep the two apart. Every
-    other tool here is one word, so the group has been retired; `escpod signal
-    classify` still works as a hidden deprecated alias that warns and forwards
-    here.
+    other tool here is one word, so the group was retired in 0.19.0; the
+    deprecated `escpod signal classify` alias has since been removed
+    entirely — use `escpod classify`.
 
 ## Usage
 
