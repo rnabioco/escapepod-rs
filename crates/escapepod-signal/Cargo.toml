@@ -47,4 +47,17 @@ default = []
 # GPU-accelerated DTW distance matrix (requires CUDA driver at runtime).
 # Exposes `dtw::cuda::GpuDtwContext` and `dtw_distance_matrix_gpu`. Demux
 # consumers wire these in through the `escapepod-demux` crate.
+#
+# Deliberately does NOT imply `gpu-prep-experimental` below: every production
+# `GpuDtwContext::new()` call site (escapepod-demux's `train.rs`, `svm/gpu.rs`,
+# `classify.rs`; escapepod-cli's `demux/run.rs`, `demux/classify.rs`) uses only
+# the DTW + SVM kernels this feature compiles.
 gpu = ["dep:cudarc", "dep:thiserror"]
+# Experimental GPU prep kernels (SVB16 decode, t-test fingerprint, LLR adapter
+# detect) — validated against their CPU references but with no production
+# caller: measurement showed prep belongs on the CPU (`dtw::cuda` module docs).
+# Plain `gpu` compiles only the DTW + SVM kernels; this feature additionally
+# NVRTC-compiles the three prep modules in `GpuDtwContext::new_on_device`, so a
+# production build no longer pays that compile cost on every context init.
+# Implies `gpu` (the prep kernels are launched through the same CUDA context).
+gpu-prep-experimental = ["gpu"]

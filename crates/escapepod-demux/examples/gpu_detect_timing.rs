@@ -3,14 +3,18 @@
 //! Decodes all reads from a POD5, then times single-thread CPU detect against
 //! the batched GPU detector on identical inputs. Reports throughput + speedup.
 //!
-//! Run: `cargo run --release --features gpu --example gpu_detect_timing -- <file.pod5> [max_reads] [downscale]`
+//! Exercises `GpuDtwContext::detect_adapter_batch`/`detect_adapter_batch_block`/
+//! `fingerprint_batch` — experimental prep kernels with no production caller —
+//! so this needs `gpu-prep-experimental`, not just `gpu`.
+//!
+//! Run: `cargo run --release --features gpu-prep-experimental --example gpu_detect_timing -- <file.pod5> [max_reads] [downscale]`
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(not(feature = "gpu-prep-experimental"))]
 fn main() {
-    eprintln!("build with --features gpu");
+    eprintln!("build with --features gpu-prep-experimental");
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-prep-experimental")]
 fn main() {
     use std::time::Instant;
 
