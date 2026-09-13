@@ -18,6 +18,17 @@
   every other command's status output.
 - **`merge --profile`'s report ignored `-q`.** Gated on
   `tracing::enabled!(Level::INFO)`, matching `subset`'s own summary block.
+- **The build script always reran (and re-shelled to `git` three times) on
+  every build.** `rerun-if-changed=../.git/HEAD` resolves to a path that
+  doesn't exist (this crate is two directories below the workspace root, and
+  a linked worktree's `.git` is a file besides), so cargo could never get a
+  timestamp for it and treated the build script as permanently stale. Now
+  resolved via `git rev-parse --git-path`, which finds the real location in
+  both a normal checkout and a worktree, and is simply omitted outside a git
+  checkout at all (e.g. a release tarball). Also drops the `index` watch: the
+  script's own `git diff --quiet HEAD` refreshes and rewrites the index file
+  (git's stat-cache behavior), so watching it made the script trigger its own
+  next rerun forever.
 
 ## 0.24.3 (2026-09-11)
 
