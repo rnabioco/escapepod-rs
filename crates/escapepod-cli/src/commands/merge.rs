@@ -121,8 +121,9 @@ pub fn run(
         );
     }
 
-    // Print profiling info if requested
-    if profile {
+    // Print profiling info if requested; gated on verbosity like `subset`'s
+    // report, so `-q merge --profile` doesn't print despite suppressed status.
+    if profile && tracing::enabled!(tracing::Level::INFO) {
         eprintln!();
         eprintln!("{}", style::action("Profile"));
         for (phase, duration) in phase_times.iter() {
