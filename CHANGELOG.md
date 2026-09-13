@@ -32,6 +32,10 @@
   `escapepod_demux::crf::encoder_native::self_check` applies to the CRF
   encoder, against a recognizer that matches a graph's shape but not its
   semantics.
+- `escapepod-python`'s `AnchoredReads.storage_order` and `.extract` now sort
+  read order via `Pod5Index::storage_key` instead of re-deriving it with
+  their own missing-read sentinel, so the two cannot silently disagree with
+  the Rust side's definition.
 
 ## 0.24.3 (2026-09-11)
 

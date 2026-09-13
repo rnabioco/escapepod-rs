@@ -327,20 +327,16 @@ impl AnchoredReads {
             .pod5
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("call index_pod5 first"))?;
-        let mut keyed: Vec<(usize, u64, String)> = read_ids
+        let mut keyed: Vec<((usize, u64), String)> = read_ids
             .into_iter()
             .filter_map(|s| {
                 let id = s.parse::<uuid::Uuid>().ok()?;
-                let info = idx.reads().get(&id)?;
-                Some((
-                    info.reader_idx,
-                    info.signal_rows.first().copied().unwrap_or(0),
-                    s,
-                ))
+                let key = idx.storage_key(&id)?;
+                Some((key, s))
             })
             .collect();
-        keyed.sort_unstable_by_key(|(f, r, _)| (*f, *r));
-        Ok(keyed.into_iter().map(|(_, _, s)| s).collect())
+        keyed.sort_unstable_by_key(|(k, _)| *k);
+        Ok(keyed.into_iter().map(|(_, s)| s).collect())
     }
 
     /// Read ids that anchored **and** have signal, in sorted order.
@@ -432,12 +428,7 @@ impl AnchoredReads {
         // into a near-sequential sweep; each row carries its input index, so
         // the output still comes back in the caller's order.
         let mut work: Vec<(usize, uuid::Uuid)> = ids.iter().copied().enumerate().collect();
-        work.sort_unstable_by_key(|(_, id)| {
-            idx.reads()
-                .get(id)
-                .map(|i| (i.reader_idx, i.signal_rows.first().copied().unwrap_or(0)))
-                .unwrap_or((usize::MAX, u64::MAX))
-        });
+        work.sort_unstable_by_key(|(_, id)| idx.storage_key(id));
 
         let rows: Vec<Row> = py.detach(|| {
             work.par_iter()

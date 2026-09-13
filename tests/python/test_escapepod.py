@@ -1471,6 +1471,21 @@ class TestAnchoredReads:
         out = ar.extract(ordered, left=600, right=400)
         assert out["read_id"] == [r for r in ordered if r in set(out["read_id"])]
 
+    def test_storage_order_matches_pod5_index_for_a_read_with_no_signal(self):
+        """`storage_order` and `extract` both key on `Pod5Index::storage_key`
+        rather than re-deriving it, so a read that anchored but has no
+        signal in this POD5 is dropped the same way on both sides instead of
+        risking a different sentinel.
+        """
+        g = self._golden()
+        ar = self._build(g["count_arm_bases"])
+        ar.index_pod5([str(CLASSIFY_FIXTURES / "trna_reads.pod5")])
+        with_signal = set(ar.read_ids_with_signal)
+        missing = [r for r in ar.read_ids if r not in with_signal]
+        assert missing, "fixture must anchor a read with no POD5 signal"
+        ordered = ar.storage_order(ar.read_ids)
+        assert set(ordered) == with_signal
+
     def test_storage_order_needs_an_index(self):
         ar = self._build(24)
         with pytest.raises(ValueError):
