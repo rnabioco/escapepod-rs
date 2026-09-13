@@ -3,6 +3,7 @@
 //! Generates a comprehensive summary of POD5 file(s) with statistics and QC metrics.
 
 use crate::progress::create_progress_bar;
+use crate::style;
 use crate::util::{format_bytes, format_duration_hours, format_number, resolve_pod5_inputs};
 use chrono::{TimeZone, Utc};
 use escapepod_signal::{Reader, ReadsBatchView, RunInfoData};
@@ -572,12 +573,21 @@ fn print_summary(
         }
     }
 
-    // Build and print the table
+    // Build and print the table. Cells above are colored unconditionally
+    // (widths are padded before coloring, so this is safe to do after the
+    // fact instead of threading a color flag through every cell): strip the
+    // ANSI back out when stdout isn't a color terminal, so redirecting it
+    // (`> out.txt`, `| less`) doesn't leave raw escapes in the data.
     let table = builder
         .build()
         .with(Style::rounded())
         .with(Width::wrap(79))
         .to_string();
+    let table = if style::stdout::use_color() {
+        table
+    } else {
+        style::strip_ansi(&table)
+    };
 
     println!("{}", table);
 }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`summary` and `inspect` no longer write raw ANSI to redirected stdout.**
+  `summary`'s table colored unconditionally via `owo_colors`, with no
+  TTY/`NO_COLOR` gate at all; `inspect` colored stdout output through
+  `style.rs`'s functions, which gate on *stderr*'s terminal status. A new
+  `style::stdout` gate (plus `style::strip_ansi` for the table, whose cells
+  are colored before their widths are known) checks stdout instead.
+
 ## 0.24.3 (2026-09-11)
 
 ### Performance

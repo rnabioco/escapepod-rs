@@ -1,6 +1,10 @@
 //! Inspect command implementation.
 
-use crate::style;
+// This module's `println!`s are the command's data product, so they colour
+// against stdout's own terminal status (`style::stdout`) rather than
+// stderr's — the three `warn!`s below are status lines and stay on the
+// stderr-gated `crate::style` explicitly.
+use crate::style::stdout as style;
 use crate::util::resolve_pod5_inputs;
 use escapepod_signal::{Reader, ReadsBatchView};
 use std::path::PathBuf;
@@ -33,7 +37,9 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
                 if is_directory {
                     warn!(
                         "skipping {} ({})",
-                        style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
+                        crate::style::path(
+                            file_path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
                         e
                     );
                     continue;
@@ -262,7 +268,9 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
                 if is_directory {
                     warn!(
                         "skipping {} ({})",
-                        style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
+                        crate::style::path(
+                            file_path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
                         e
                     );
                     continue;
@@ -278,7 +286,9 @@ pub fn reads(input: PathBuf) -> anyhow::Result<()> {
                 if is_directory {
                     warn!(
                         "cannot read {} ({})",
-                        style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
+                        crate::style::path(
+                            file_path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
                         e
                     );
                     continue;
