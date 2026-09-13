@@ -131,6 +131,31 @@ fn dtw_on_gpu(device: crate::device::Device) -> anyhow::Result<bool> {
     Ok(crate::device::place_and_report(device, crate::device::Stage::Dtw)?.is_gpu())
 }
 
+/// Confidence and confident-flag for one query's best/second-best DTW
+/// distance against a reference bank of `n_refs` barcodes.
+///
+/// A margin needs something to compare the best match against: with fewer
+/// than 2 references there is no second-best distance, and the loop above
+/// leaves `second_best_dist` at `f32::INFINITY` — which this must not read as
+/// "infinitely better than the best", the ratio-based confidence's silent
+/// failure mode.
+fn confidence_from_distances(
+    best_dist: f32,
+    second_best_dist: f32,
+    n_refs: usize,
+    min_ratio: f32,
+) -> (f64, bool) {
+    if n_refs < 2 {
+        return (0.0, false);
+    }
+    let ratio = if second_best_dist > 0.0 {
+        best_dist / second_best_dist
+    } else {
+        0.0
+    };
+    (1.0 - ratio as f64, ratio <= min_ratio)
+}
+
 /// Classification result for output.
 struct ClassifyResult {
     read_id: Uuid,
@@ -702,6 +727,12 @@ fn run_with_csv(
     if reference_fps.is_empty() {
         anyhow::bail!("No valid reference fingerprints found");
     }
+    if reference_fps.len() < 2 {
+        warn!(
+            "only 1 reference barcode loaded — a confidence margin needs at least 2 \
+             references, so every read will be reported as not confident"
+        );
+    }
 
     // Read query fingerprints
     let query_fps = read_query_fingerprints_f32(&args.fingerprints)?;
@@ -779,19 +810,18 @@ fn run_with_csv(
                 }
             };
 
-            let ratio = if second_best_dist > 0.0 {
-                best_dist / second_best_dist
-            } else {
-                0.0
-            };
-
-            let confident = ratio <= args.min_ratio;
+            let (confidence, confident) = confidence_from_distances(
+                best_dist,
+                second_best_dist,
+                reference_fps.len(),
+                args.min_ratio,
+            );
             let barcode_name = reference_fps[best_idx].barcode.clone();
 
             ClassifyResult {
                 read_id: *read_id,
                 barcode: barcode_name,
-                confidence: (1.0 - ratio) as f64,
+                confidence,
                 best_distance: best_dist as f64,
                 second_best_distance: second_best_dist as f64,
                 is_confident: confident,
@@ -1001,4 +1031,42 @@ where
         .join()
         .map_err(|e| anyhow::anyhow!("writer thread panicked: {:?}", e))??;
     Ok(counts)
+}
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::confidence_from_distances;
+
+    /// A single-reference bank has no second-best distance to form a margin
+    /// from, so every read must come back as not confident — not the
+    /// `second_best_dist = INF` fallthrough's confidence of 1.0.
+    #[test]
+    fn single_reference_bank_is_never_confident() {
+        let (confidence, confident) = confidence_from_distances(1.0, f32::INFINITY, 1, 0.8);
+        assert_eq!(confidence, 0.0);
+        assert!(!confident);
+    }
+
+    #[test]
+    fn zero_references_is_never_confident() {
+        let (confidence, confident) = confidence_from_distances(1.0, f32::INFINITY, 0, 0.8);
+        assert_eq!(confidence, 0.0);
+        assert!(!confident);
+    }
+
+    /// With 2+ references the ratio-based computation is unchanged.
+    #[test]
+    fn two_reference_bank_uses_the_ratio() {
+        let (confidence, confident) = confidence_from_distances(1.0, 2.0, 2, 0.8);
+        assert_eq!(confidence, 0.5);
+        assert!(confident);
+
+        let (confidence, confident) = confidence_from_distances(1.9, 2.0, 2, 0.8);
+        // f32 division, so only f32-precision-close to 0.05.
+        assert!(
+            (confidence - 0.05).abs() < 1e-6,
+            "confidence = {confidence}"
+        );
+        assert!(!confident);
+    }
 }

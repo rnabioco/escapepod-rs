@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`summary` and `inspect` no longer write raw ANSI to redirected stdout.**
+  `summary`'s table colored unconditionally via `owo_colors`, with no
+  TTY/`NO_COLOR` gate at all; `inspect` colored stdout output through
+  `style.rs`'s functions, which gate on *stderr*'s terminal status. A new
+  `style::stdout` gate (plus `style::strip_ansi` for the table, whose cells
+  are colored before their widths are known) checks stdout instead.
+- **`inspect read` rejected the dash-less 32-hex read ID its own help text
+  advertises.** Now parsed with `parse_uuid_flexible`, like every other
+  read-ID input in the CLI.
+- **`repack` no longer writes its status lines to stdout.** They are its only
+  output — no data product — so they now go through `tracing::info!` like
+  every other command's status output.
+- **`merge --profile`'s report ignored `-q`.** Gated on
+  `tracing::enabled!(Level::INFO)`, matching `subset`'s own summary block.
+- **The build script always reran (and re-shelled to `git` three times) on
+  every build.** `rerun-if-changed=../.git/HEAD` resolves to a path that
+  doesn't exist (this crate is two directories below the workspace root, and
+  a linked worktree's `.git` is a file besides), so cargo could never get a
+  timestamp for it and treated the build script as permanently stale. Now
+  resolved via `git rev-parse --git-path`, which finds the real location in
+  both a normal checkout and a worktree, and is simply omitted outside a git
+  checkout at all (e.g. a release tarball). Also drops the `index` watch: the
+  script's own `git diff --quiet HEAD` refreshes and rewrites the index file
+  (git's stat-cache behavior), so watching it made the script trigger its own
+  next rerun forever.
+- **`demux classify --reference` reported every read as confident with a
+  single-reference bank.** With no second-best distance to form a margin
+  from, the ratio-based confidence read the missing distance as infinitely
+  far away instead of as "no margin to test" — now `confidence = 0.0` and
+  `confident = false` below 2 references, with a warning.
+- **`resquiggle`'s BAM/writer decoders used one worker each.** The same trap
+  `escpod classify` documents and avoids: `MultithreadedReader`/
+  `MultithreadedWriter::new` are one-worker constructors regardless of the
+  name. Sized from the rayon pool now, the same way `classify` does.
+- **`resquiggle` resolved POD5 reads by scanning every batch of every input
+  file**, the shape that made `classify` ~60x slower on a large file (#334).
+  Now resolves through the reader's read index (sidecar-aware) restricted to
+  the reads the BAM actually names, and refines in `(file, first signal row)`
+  storage order before writing back out in the original BAM order. Verified
+  bit-identical output on `data/drna/yeast_trna_reads.pod5` +
+  `data/drna/yeast_trna_mappings.bam`.
+
 ## 0.24.3 (2026-09-11)
 
 ### Performance

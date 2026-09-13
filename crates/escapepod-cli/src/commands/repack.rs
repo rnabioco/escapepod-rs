@@ -11,7 +11,7 @@ use escapepod_signal::{Durability, RepackOptions, repack_files};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 pub fn run(
     inputs: Vec<PathBuf>,
@@ -42,7 +42,7 @@ pub fn run(
         }
     }
 
-    println!(
+    info!(
         "{} {} file(s) to {}",
         style::action("Repacking"),
         style::count(all_files.len()),
@@ -86,7 +86,7 @@ pub fn run(
 
     overall_bar.finish_with_message("done");
 
-    println!(
+    info!(
         "{} {} reads across {} file(s)",
         style::action("Repacked"),
         style::count(result.total_reads),

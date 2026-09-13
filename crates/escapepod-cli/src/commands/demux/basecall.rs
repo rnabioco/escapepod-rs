@@ -275,8 +275,9 @@ impl Gates {
         if !call.margin.is_none_or(|m| m >= self.min_margin) {
             return false;
         }
-        // The CRF gates are `requires = "ref_scores"`, so a run that sets one
-        // always has the scores to test it against.
+        // The CRF gates are `requires = "barcodes"`, not `ref_scores` — but
+        // setting either also flips `want_scores` on (see below), so a run
+        // that sets one always has the scores to test it against.
         let Some((logp, margin)) = scored.and_then(|s| s.call(call.index)) else {
             return true;
         };
