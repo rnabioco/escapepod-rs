@@ -10,8 +10,9 @@
 //! `load-dynamic`: onnxruntime is dlopened at runtime rather than linked at
 //! build time. Point `ORT_DYLIB_PATH` at a CUDA-enabled `libonnxruntime.so`
 //! and ensure a CUDA device + cuDNN are visible. If the CUDA EP cannot be
-//! initialized, onnxruntime falls back to CPU — which would be slow but
-//! correct.
+//! initialized, onnxruntime falls back to CPU — slow but correct — unless
+//! [`crate::require_cuda_ep`] has been called, which turns that same failure
+//! into a hard error instead.
 
 use std::path::Path;
 use std::sync::Mutex;

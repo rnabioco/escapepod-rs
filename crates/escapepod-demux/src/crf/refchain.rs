@@ -471,7 +471,6 @@ impl RefChains {
                 nodes.insert((j, &seq[..j]), base);
                 prev_base = base;
             }
-            debug_assert_eq!(n_base.pow(state_len.saturating_sub(seq.len()) as u32), 1);
             chains.finals.push(prev_base);
         }
 

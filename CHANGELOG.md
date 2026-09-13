@@ -10,6 +10,14 @@
   redundantly probing the native path `self_check` already checked.
 - Corrected a stale doc comment on `adapter_cnn::decode_adapter_end` claiming
   the `valid_len` clamp is inert; it is load-bearing for short reads (#187).
+- Fixed stale/misplaced doc comments in `escapepod-demux`: `cuda.rs` no
+  longer names the retired `cnn-gpu`/`crf-gpu` features; `adapter_cnn_gpu.rs`
+  now notes that CPU fallback on a failed CUDA EP is qualified by
+  `require_cuda_ep`; `crf/encoder_gpu.rs`'s `basecall_batch` doc comment,
+  previously attached to `ref_chains`, now sits on `basecall_batch`, and its
+  SAFETY comment says `self.device` instead of "device 0"; a tautological
+  `debug_assert!` in `crf/refchain.rs` (always true once the preceding
+  `TooShort` check passes) is removed.
 
 ## 0.24.3 (2026-09-11)
 
