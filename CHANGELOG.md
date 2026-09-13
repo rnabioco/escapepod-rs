@@ -2,12 +2,118 @@
 
 ## Unreleased
 
+### Added
+
+- `escpod classify`'s output BAM `@PG` record now carries a `DS` field with
+  full model provenance — `model_version`, the loaded scorer's sha256,
+  `basecaller`, `operating_point`, whether a calibration is shipped, and the
+  abstain rule — so which model/basecaller pairing produced a BAM no longer
+  depends on having kept that run's log (#370).
+
 ### Breaking
 
 - `AnchoredReads(...)`'s `motif_offset` no longer defaults to 3; every caller
   must pass it explicitly. A `waveform_model` bundle anchors at +2, and the
   old default silently anchored a bundle-less corpus one base off with no
   error.
+- **Three deprecated CLI aliases, scheduled for removal, are gone.** Each had
+  a replacement that has worked since the alias was introduced:
+  - `escpod signal classify` (deprecated since 0.19.0) — use `escpod classify`.
+  - `--gpu` (deprecated since 0.17.0) — use `--device gpu`.
+  - `demux classify --svm-model` — use `demux classify --model` (auto-detects
+    `DtwSvmModel` vs the legacy `WarpDemuxModel` JSON shape).
+- `escapepod-signal`'s public API surface is reduced: removed
+  `dtw::kernel` (`distance_to_kernel`/`distance_to_kernel_auto`) — demux has
+  its own equivalent (`svm::kernel::distances_to_kernel_into`), and the only
+  in-workspace caller was a demonstration in `examples/dtw_example.rs`, now
+  updated; removed `dtw::distance::dtw_distance_matrix_blocked` — superseded
+  by the parallel `dtw_distance_matrix` and exercised only by its own test;
+  removed `dtw::distance::dtw_distance_penalty` — a thin wrapper over
+  `dtw_distance_bounded_penalty` exercised only by in-crate tests; removed the
+  `ESCAPEPOD_DTW_AVX512` lever (`dtw::distance`'s AVX-512 batch DTW kernel) —
+  measured slower than the AVX2 baseline on every cluster CPU and referenced
+  nowhere else; removed `dtw::Fingerprint::{to_feature_vector,
+  to_interleaved_features, has_dwell_times}` — unused conversions superseded
+  by DTW distance directly on `Fingerprint::values`; removed
+  `segmentation::{mad_normalize_with_clipping, normalize_dwell_times_mad}` —
+  unused MAD-clipping/dwell-normalization variants; removed
+  `segmentation::LlrTrace::{compute_gains, compute_gains_with_early_stop}` —
+  superseded by `best_split`, which tracks the argmax inline instead of
+  materializing a gains vector; removed
+  `segmentation::{segment_signal_with_dwell, SegmentationResult}` — demux
+  derives dwell times itself from `segment_signal`'s `(start, end, mean)`
+  tuples; removed `seq_encoding::sequence_ints_with_context` — leech (the
+  out-of-tree, git-tag-pinned consumer) uses only the bases form
+  (`sequence_bases_with_context`) and composes `sequence_to_int` itself when
+  it needs ints. Verified against leech's checkout at
+  `~/devel/rnabioco/leech` (pinned to this crate at tag `v0.24.3`): none of
+  the removed items appear in its `rust/` sources or Python bindings, and
+  every item on `escapepod-signal/CLAUDE.md`'s leech-load-bearing exclusion
+  list (`rough_rescale_quantile`, `ref_to_signal`, `span_stats`,
+  `extract_levels`, `banded_dp_with_penalty_table`,
+  `sequence_bases_with_context`, `encode_signal_kmer`/`KmerContext`) is
+  confirmed still in use there and was left untouched.
+
+### Changed
+
+- `escapepod-demux::train`'s binary and multiclass SVM-fit code paths are
+  collapsed into one `fit_from_labels`, and the dead `demux train-svm --c`
+  flag is removed. Both fit paths used to build `DtwSvmModel` with
+  `use_kernel_weighted: true`, and every reader of that flag
+  (`SvmPredictor::decision_function`/`decision_function_into`, `svm::gpu`'s
+  host-side coefficient table) branches on it *before* looking at
+  `dual_coef`, computing class scores from `training_labels` alone — so the
+  binary path's single uniform `dual_coef` row and the multiclass path's
+  per-pair OvO layout were two constructions of a value nothing downstream
+  distinguishes; one construction, generalized to `n_classes >= 2`, replaces
+  both. `--c`/`TrainConfig.c` was stored and echoed back in the CLI's own
+  log line but never read by the fit — the `train` feature's SVM fit is a
+  label-only stub with no `linfa-svm` (or other) dependency left to feed a
+  regularization parameter to, so the flag could not have done anything
+  since that dependency was dropped. `demux train-svm` now also logs a
+  warning that the SVM fit is experimental and less maintained than the
+  CRF/GBM demux paths.
+- **`escapepod-signal`'s GPU prep kernels (SVB16 decode, t-test fingerprint,
+  LLR adapter detect) now require a new `gpu-prep-experimental` feature**,
+  which the existing `gpu` feature does not imply. Every production
+  `GpuDtwContext::new()` call site (escapepod-demux's `train.rs`,
+  `svm/gpu.rs`, `classify.rs`; escapepod-cli's `demux/run.rs`,
+  `demux/classify.rs`) NVRTC-compiled all six kernel modules on every call —
+  DTW, SVM, and three prep modules with no production caller anywhere in the
+  workspace — despite only ever using the DTW + SVM ones. `new_on_device`
+  now compiles just the DTW + SVM modules under plain `gpu`, and additionally
+  the three prep modules when `gpu-prep-experimental` is also enabled. Public
+  API used by production code (`GpuDtwContext` and its DTW/SVM methods) is
+  unaffected under plain `gpu`. `escapepod-demux` gained a same-named feature
+  forwarding to `escapepod-signal/gpu-prep-experimental` (kept separate from
+  its atomic `gpu` flag on purpose) for `tests/gpu_fingerprint.rs` and
+  `examples/gpu_detect_timing.rs`; `escapepod-signal`'s
+  `tests/gpu_{svb16,llr_detect}.rs` now require the same feature. Measured
+  on an A30: `GpuDtwContext::new()` drops from ~280ms to ~181ms warm (~35%),
+  ~1.12s to ~535ms cold.
+- **The ONNX-proto helper toolkit duplicated between the CRF barcode encoder
+  and the charging classifier's LSTM recognizer is now one module.**
+  Proto-walking primitives (`producer`/`consumers`/`sole_consumer`,
+  `attr`/`attr_int`/`attr_str`/`attr_ints`/`attr_tensor`,
+  `tensor_f32`/`tensor_i64`), the `LSTM`-node shape validator (forbidden
+  attributes, `input_forget`, `layout`, `W`/`R`/`B` dimensions, per-sequence
+  lengths, a zero `ConstantOfShape` initial state, peephole weights), and the
+  synthetic-graph builders both files' own tests used to construct one, were
+  ~90 near-identical lines apiece in `escapepod-demux/src/crf/encoder_native.rs`
+  and `escapepod-classify/src/fnn_lstm.rs`. They now live once, in
+  `escapepod_demux::onnx_graph` beside `onnx_rewrite`, as
+  `onnx_graph::LstmNode::parse` (taking a direction count and an optional
+  stacked-layer index so one function serves the CRF encoder's five
+  unidirectional layers and the charging network's single bidirectional one)
+  plus `onnx_graph::test_support` (gated on `test` or the new `test-support`
+  feature, since `cfg(test)` does not cross the crate boundary
+  `escapepod-classify`'s own tests need it to cross). The ort CUDA session
+  builder duplicated in `adapter_cnn_gpu.rs` and `crf/encoder_gpu.rs` is
+  similarly folded into `ort_ep::cuda_session`. Pure code motion — no
+  behavior change — verified by identical `cargo nextest`/`cargo test --doc`
+  pass counts before and after (demux 172/172, classify 137/137, doctests
+  4/4); net effect across the 9 touched files is 516 insertions(+), 584
+  deletions(-).
 
 ### Fixed
 
