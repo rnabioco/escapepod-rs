@@ -9,6 +9,13 @@
   lived only in `normalize_downscale_into`, which production callers
   (`run.rs`/`detect.rs`) never reach directly. Applied the same release to
   the path they actually call.
+- `rough_rescale`'s disabled-clipping default bounded `clip_end` by
+  `signal.len()` instead of `levels.len()`; harmless only because every use
+  already re-clamps with `.min(levels.len())`. Fixed the invariant.
+- `rough_rescale`'s `!use_base_center` branch could panic on
+  `signal[start..end]` when a malformed `seq_to_signal_map` produced
+  `start > end`; now clamped so it falls through to the existing
+  empty-data error instead.
 
 ## 0.24.3 (2026-09-11)
 
