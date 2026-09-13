@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- `CrfEncoder::probe_output_contract` now calls `encode_tract` directly
+  instead of `encode`, so the load-time shape probe still exercises the
+  tract ONNX contract once a native kernel has loaded, rather than
+  redundantly probing the native path `self_check` already checked.
+
 ## 0.24.3 (2026-09-11)
 
 ### Performance
