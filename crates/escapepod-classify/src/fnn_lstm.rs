@@ -43,12 +43,13 @@
 //! real graph shape.
 
 use anyhow::{Result, bail};
+use escapepod_demux::onnx_graph::{
+    LstmNode, attr, attr_int, attr_ints, attr_tensor, consumers, producer, sole_consumer,
+    tensor_f32, tensor_i64,
+};
 use escapepod_signal::lstm::{self, LstmBackend, LstmWeights};
 use std::collections::HashMap;
 use tract_onnx::pb;
-
-const ONNX_FLOAT: i32 = 1;
-const ONNX_INT64: i32 = 7;
 
 /// Which kernel scores a read. Re-exported so callers that logged
 /// `NativeBiLstm::backend()` before the recurrence moved need not learn a new
@@ -137,31 +138,6 @@ impl NativeBiLstm {
             .iter()
             .map(|t| (t.name.as_str(), t))
             .collect();
-        let producer = |name: &str| {
-            graph
-                .node
-                .iter()
-                .find(|n| n.output.iter().any(|o| o == name))
-        };
-        let consumers = |name: &str| -> Vec<&pb::NodeProto> {
-            graph
-                .node
-                .iter()
-                .filter(|n| n.input.iter().any(|i| i == name))
-                .collect()
-        };
-        let sole_consumer = |name: &str, op: &str| -> std::result::Result<&pb::NodeProto, String> {
-            let c = consumers(name);
-            match c.as_slice() {
-                [only] if only.op_type == op => Ok(only),
-                [only] => Err(format!("{name} feeds {} rather than {op}", only.op_type)),
-                _ => Err(format!(
-                    "{name} has {} consumers, expected one {op}",
-                    c.len()
-                )),
-            }
-        };
-
         // --- the LSTM itself ------------------------------------------------
         let lstms: Vec<&pb::NodeProto> =
             graph.node.iter().filter(|n| n.op_type == "LSTM").collect();
@@ -169,74 +145,13 @@ impl NativeBiLstm {
             [one] => *one,
             _ => return Err(format!("{} LSTM nodes", lstms.len())),
         };
-        if attr_str(lstm, "direction").unwrap_or("forward") != "bidirectional" {
-            return Err("LSTM is not bidirectional".into());
-        }
-        let h = attr_int(lstm, "hidden_size").ok_or("LSTM has no hidden_size")? as usize;
-        if h == 0 {
-            return Err("hidden_size is 0".into());
-        }
-        for forbidden in ["activations", "activation_alpha", "activation_beta", "clip"] {
-            if lstm.attribute.iter().any(|a| a.name == forbidden) {
-                return Err(format!("LSTM sets `{forbidden}`"));
-            }
-        }
-        if attr_int(lstm, "input_forget").unwrap_or(0) != 0 {
-            return Err("LSTM couples input and forget gates".into());
-        }
-        if attr_int(lstm, "layout").unwrap_or(0) != 0 {
-            return Err("LSTM uses batch-major layout".into());
-        }
-        let input_at = |i: usize| lstm.input.get(i).map(String::as_str).unwrap_or("");
-        if lstm.input.len() < 3 {
-            return Err("LSTM has fewer than 3 inputs".into());
-        }
+        let parsed = LstmNode::parse(lstm, graph, &init, 2, None)?;
+        let (h, n_in, w, r, b) = (parsed.hidden, parsed.n_in, parsed.w, parsed.r, parsed.b);
         let g = 4 * h;
-        let w_t = init.get(input_at(1)).ok_or("W is not an initializer")?;
-        let r_t = init.get(input_at(2)).ok_or("R is not an initializer")?;
-        let n_in = match w_t.dims.as_slice() {
-            [2, gg, n_in] if *gg as usize == g => *n_in as usize,
-            d => return Err(format!("W dims {d:?}, expected [2, {g}, n_in]")),
-        };
-        if r_t.dims != [2, g as i64, h as i64] {
-            return Err(format!("R dims {:?}, expected [2, {g}, {h}]", r_t.dims));
-        }
-        let w = tensor_f32(w_t)?;
-        let r = tensor_f32(r_t)?;
-        let b = match input_at(3) {
-            "" => vec![0.0f32; 2 * 8 * h],
-            name => {
-                let t = init.get(name).ok_or("B is not an initializer")?;
-                if t.dims != [2, 8 * h as i64] {
-                    return Err(format!("B dims {:?}, expected [2, {}]", t.dims, 8 * h));
-                }
-                tensor_f32(t)?
-            }
-        };
-        if !input_at(4).is_empty() {
-            return Err("LSTM has per-sequence lengths".into());
-        }
-        for (i, what) in [(5, "initial_h"), (6, "initial_c")] {
-            let name = input_at(i);
-            if name.is_empty() {
-                continue;
-            }
-            let p = producer(name).ok_or(format!("{what} has no producer"))?;
-            if p.op_type != "ConstantOfShape" {
-                return Err(format!("{what} comes from {}, not zeros", p.op_type));
-            }
-            if let Some(t) = attr_tensor(p, "value")
-                && tensor_f32(t)?.iter().any(|&v| v != 0.0)
-            {
-                return Err(format!("{what} is a non-zero constant"));
-            }
-        }
-        if !input_at(7).is_empty() {
-            return Err("LSTM has peephole weights".into());
-        }
 
         // --- the input: features[b, ch, off] -> X[off, b, ch] -------------
-        let x_src = producer(input_at(0)).ok_or("LSTM input has no producer")?;
+        let x_src = producer(graph, lstm.input.first().map(String::as_str).unwrap_or(""))
+            .ok_or("LSTM input has no producer")?;
         if x_src.op_type != "Transpose" || attr_ints(x_src, "perm") != Some(&[2, 0, 1]) {
             return Err("LSTM input is not Transpose(perm=[2,0,1]) of the graph input".into());
         }
@@ -267,20 +182,20 @@ impl NativeBiLstm {
         // --- the readout: Y -> [seq, b, 2H] -> mean & max over seq --------
         let y = lstm.output.first().map(String::as_str).unwrap_or("");
         for extra in lstm.output.iter().skip(1) {
-            if !extra.is_empty() && !consumers(extra).is_empty() {
+            if !extra.is_empty() && !consumers(graph, extra).is_empty() {
                 return Err(format!("LSTM output `{extra}` is consumed"));
             }
         }
-        let t1 = sole_consumer(y, "Transpose")?;
+        let t1 = sole_consumer(graph, y, "Transpose")?;
         if attr_ints(t1, "perm") != Some(&[0, 2, 1, 3]) {
             return Err("first readout Transpose is not perm=[0,2,1,3]".into());
         }
-        let rs = sole_consumer(&t1.output[0], "Reshape")?;
+        let rs = sole_consumer(graph, &t1.output[0], "Reshape")?;
         let shape_name = rs.input.get(1).map(String::as_str).unwrap_or("");
         let shape = match init.get(shape_name) {
             Some(t) => tensor_i64(t)?,
             None => {
-                let c = producer(shape_name).ok_or("Reshape shape has no producer")?;
+                let c = producer(graph, shape_name).ok_or("Reshape shape has no producer")?;
                 if c.op_type != "Constant" {
                     return Err(format!("Reshape shape comes from {}", c.op_type));
                 }
@@ -290,11 +205,11 @@ impl NativeBiLstm {
         if shape != [0, 0, -1] {
             return Err(format!("Reshape shape is {shape:?}, expected [0, 0, -1]"));
         }
-        let t2 = sole_consumer(&rs.output[0], "Transpose")?;
+        let t2 = sole_consumer(graph, &rs.output[0], "Transpose")?;
         if attr_ints(t2, "perm") != Some(&[1, 0, 2]) {
             return Err("second readout Transpose is not perm=[1,0,2]".into());
         }
-        let pooled = consumers(&t2.output[0]);
+        let pooled = consumers(graph, &t2.output[0]);
         let (mut mean, mut max) = (None, None);
         for n in &pooled {
             let slot = match n.op_type.as_str() {
@@ -310,8 +225,8 @@ impl NativeBiLstm {
             }
         }
         let (mean, max) = (mean.ok_or("no ReduceMean")?, max.ok_or("no ReduceMax")?);
-        let cat = sole_consumer(&mean.output[0], "Concat")?;
-        if !std::ptr::eq(cat, sole_consumer(&max.output[0], "Concat")?) {
+        let cat = sole_consumer(graph, &mean.output[0], "Concat")?;
+        if !std::ptr::eq(cat, sole_consumer(graph, &max.output[0], "Concat")?) {
             return Err("mean and max feed different Concats".into());
         }
         if attr_int(cat, "axis") != Some(1) || cat.input.len() != 2 {
@@ -323,7 +238,7 @@ impl NativeBiLstm {
         }
 
         // --- the head -------------------------------------------------------
-        let gemm = sole_consumer(&cat.output[0], "Gemm")?;
+        let gemm = sole_consumer(graph, &cat.output[0], "Gemm")?;
         if attr_f32(gemm, "alpha").unwrap_or(1.0) != 1.0
             || attr_f32(gemm, "beta").unwrap_or(1.0) != 1.0
             || attr_int(gemm, "transA").unwrap_or(0) != 0
@@ -765,72 +680,14 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 // ---- proto helpers ------------------------------------------------------------
-
-fn attr<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a pb::AttributeProto> {
-    node.attribute.iter().find(|a| a.name == name)
-}
-
-fn attr_int(node: &pb::NodeProto, name: &str) -> Option<i64> {
-    attr(node, name).map(|a| a.i)
-}
+//
+// producer/consumers/sole_consumer, attr/attr_int/attr_str/attr_ints/
+// attr_tensor and tensor_f32/tensor_i64 live in
+// `escapepod_demux::onnx_graph` — shared with `crf::encoder_native`, which
+// recognises the same shape of graph for the CRF barcode encoder.
 
 fn attr_f32(node: &pb::NodeProto, name: &str) -> Option<f32> {
     attr(node, name).map(|a| a.f)
-}
-
-fn attr_str<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a str> {
-    attr(node, name).and_then(|a| std::str::from_utf8(&a.s).ok())
-}
-
-fn attr_ints<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a [i64]> {
-    attr(node, name).map(|a| a.ints.as_slice())
-}
-
-fn attr_tensor<'a>(node: &'a pb::NodeProto, name: &str) -> Option<&'a pb::TensorProto> {
-    attr(node, name).and_then(|a| a.t.as_ref())
-}
-
-/// A float initializer's values, from whichever field the export used.
-fn tensor_f32(t: &pb::TensorProto) -> std::result::Result<Vec<f32>, String> {
-    if t.data_type != ONNX_FLOAT {
-        return Err(format!("`{}` is not float32", t.name));
-    }
-    let n: usize = t.dims.iter().map(|&d| d.max(0) as usize).product();
-    let v: Vec<f32> = if !t.float_data.is_empty() {
-        t.float_data.clone()
-    } else {
-        t.raw_data
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect()
-    };
-    if v.len() != n {
-        return Err(format!(
-            "`{}` holds {} values for dims {:?}",
-            t.name,
-            v.len(),
-            t.dims
-        ));
-    }
-    Ok(v)
-}
-
-fn tensor_i64(t: &pb::TensorProto) -> std::result::Result<Vec<i64>, String> {
-    if t.data_type != ONNX_INT64 {
-        return Err(format!("`{}` is not int64", t.name));
-    }
-    Ok(if !t.int64_data.is_empty() {
-        t.int64_data.clone()
-    } else {
-        t.raw_data
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|c| i64::from_le_bytes(*c))
-            .collect()
-    })
 }
 
 /// A graph input's static dimensions (`None` per symbolic axis), or `None`
@@ -858,100 +715,20 @@ fn value_dims(v: &pb::ValueInfoProto) -> Option<Vec<Option<usize>>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    // Synthetic-graph builders shared with `crf::encoder_native`'s own tests
+    // (same recognised-graph shape, one LSTM node instead of five) — see
+    // `escapepod_demux::onnx_graph::test_support`.
+    use escapepod_demux::onnx_graph::test_support::{
+        Rng, a_int, a_ints, a_tensor, f32_init, node, value_info,
+    };
+    use escapepod_demux::onnx_graph::{ONNX_FLOAT, ONNX_INT64};
     use tract_onnx::prelude::*;
-
-    /// A deterministic xorshift stream in `[-scale, scale)`.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self, scale: f32) -> f32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            ((self.0 as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0) * scale
-        }
-    }
-
-    fn f32_init(name: &str, dims: &[i64], rng: &mut Rng, scale: f32) -> pb::TensorProto {
-        let n: usize = dims.iter().map(|&d| d as usize).product();
-        pb::TensorProto {
-            name: name.into(),
-            dims: dims.to_vec(),
-            data_type: ONNX_FLOAT,
-            float_data: (0..n).map(|_| rng.next(scale)).collect(),
-            ..Default::default()
-        }
-    }
-
-    fn node(
-        op: &str,
-        inputs: &[&str],
-        outputs: &[&str],
-        attrs: Vec<pb::AttributeProto>,
-    ) -> pb::NodeProto {
-        pb::NodeProto {
-            op_type: op.into(),
-            name: format!("{op}_{}", outputs[0]),
-            input: inputs.iter().map(|s| s.to_string()).collect(),
-            output: outputs.iter().map(|s| s.to_string()).collect(),
-            attribute: attrs,
-            ..Default::default()
-        }
-    }
-
-    fn a_int(name: &str, i: i64) -> pb::AttributeProto {
-        pb::AttributeProto {
-            name: name.into(),
-            r#type: pb::attribute_proto::AttributeType::Int as i32,
-            i,
-            ..Default::default()
-        }
-    }
-
-    fn a_ints(name: &str, ints: &[i64]) -> pb::AttributeProto {
-        pb::AttributeProto {
-            name: name.into(),
-            r#type: pb::attribute_proto::AttributeType::Ints as i32,
-            ints: ints.to_vec(),
-            ..Default::default()
-        }
-    }
 
     fn a_str(name: &str, s: &str) -> pb::AttributeProto {
         pb::AttributeProto {
             name: name.into(),
             r#type: pb::attribute_proto::AttributeType::String as i32,
             s: s.as_bytes().to_vec(),
-            ..Default::default()
-        }
-    }
-
-    fn a_tensor(name: &str, t: pb::TensorProto) -> pb::AttributeProto {
-        pb::AttributeProto {
-            name: name.into(),
-            r#type: pb::attribute_proto::AttributeType::Tensor as i32,
-            t: Some(t),
-            ..Default::default()
-        }
-    }
-
-    fn value_info(name: &str, dims: &[i64]) -> pb::ValueInfoProto {
-        pb::ValueInfoProto {
-            name: name.into(),
-            r#type: Some(pb::TypeProto {
-                value: Some(pb::type_proto::Value::TensorType(pb::type_proto::Tensor {
-                    elem_type: ONNX_FLOAT,
-                    shape: Some(pb::TensorShapeProto {
-                        dim: dims
-                            .iter()
-                            .map(|&d| pb::tensor_shape_proto::Dimension {
-                                value: Some(pb::tensor_shape_proto::dimension::Value::DimValue(d)),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    }),
-                })),
-                ..Default::default()
-            }),
             ..Default::default()
         }
     }

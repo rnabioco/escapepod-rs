@@ -11,10 +11,12 @@
 //! rc.13 on any lockfile refresh, which would break the build unprompted.
 //! Bumping is a decision, not an accident.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ort::ep::{ArenaExtendStrategy, CUDA};
 use ort::execution_providers::ExecutionProviderDispatch;
+use ort::session::Session;
 
 /// Whether CUDA EP registration failure is fatal for every session built from
 /// here on. See [`require_cuda`].
@@ -123,4 +125,35 @@ pub(crate) fn cuda_providers_on(device_id: i32) -> [ExecutionProviderDispatch; 1
     } else {
         cuda
     }]
+}
+
+/// Build and commit a CUDA-backed session from the ONNX file at `path`,
+/// pinned to device ordinal `device` — the six-step `Session::builder()`
+/// chain `AdapterCnnGpu::load_with_config_on_device` and
+/// `CrfEncoderGpu::load_on_device` each built independently, until #240's fix
+/// for the first was never carried to the second.
+///
+/// One non-spinning intra-op thread, for a reason neither loader's graph
+/// needs restating twice: the graph runs on the device, so onnxruntime's
+/// intra-op pool has almost nothing to compute, but left at its default it is
+/// `available_parallelism()` threads wide *and spinning*, on top of rayon's
+/// own pool. Profiling `demux detect --method cnn --gpu` on 150k reads, 15
+/// pool threads accounted for ~35% of all CPU samples in the process, next to
+/// 4% for the preprocessing they were starving (#239). Measured warm, three
+/// interleaved reps: the default 16 threads spinning ran 7.34 s, 1 thread
+/// still spinning 7.42 s, 16 threads without spinning 7.37 s, and **1 thread
+/// without spinning 6.93 s** at 274% CPU against 340%. Both settings are
+/// needed and neither works alone; output was bit-identical across all four
+/// (150,001 of 150,001 boundaries, and the fused pipeline's classifications).
+///
+/// Inter-op threads are set to 1 too, though only meaningful under parallel
+/// execution mode, which neither caller enables — set anyway so the bound
+/// holds if that ever changes.
+pub(crate) fn cuda_session(path: impl AsRef<Path>, device: i32) -> Result<Session, ort::Error> {
+    Session::builder()?
+        .with_intra_threads(1)?
+        .with_inter_threads(1)?
+        .with_intra_op_spinning(false)?
+        .with_execution_providers(cuda_providers_on(device))?
+        .commit_from_file(path)
 }

@@ -99,6 +99,14 @@ pub mod adapter_cnn_gpu;
 #[cfg(any(feature = "cnn-detect", feature = "crf-decode"))]
 pub mod onnx_rewrite;
 
+/// Shared ONNX-proto helpers (producer/consumer lookups, attribute readers,
+/// tensor decoders, the `LSTM`-node validator, and test-only synthetic-graph
+/// builders) for this crate's and `escapepod-classify`'s native-kernel
+/// recognizers — one copy instead of two. Present under the same features as
+/// [`onnx_rewrite`] for the same reason: both ONNX features pull tract.
+#[cfg(any(feature = "cnn-detect", feature = "crf-decode"))]
+pub mod onnx_graph;
+
 pub use fingerprint::{
     BOUNDARY_PADDING_SAMPLES, BarcodeFingerprint, MAX_FINGERPRINT_WINDOW, ReadBoundaries,
     ReadFingerprint, compute_consensus_fingerprint, compute_std_dev_fingerprint,

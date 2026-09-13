@@ -120,42 +120,12 @@ impl AdapterCnnGpu {
         config: AdapterCnnConfig,
         device: i32,
     ) -> Result<Self, AdapterCnnError> {
-        let builder = Session::builder()
-            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
-            // The graph runs on the device, so onnxruntime's intra-op pool has
-            // nothing to compute — but left at its default it is
-            // `available_parallelism()` threads wide, spawned *on top of*
-            // rayon's, and it does not sit idle: profiling `demux detect
-            // --method cnn --gpu` on 150 k reads, 15 pool threads accounted for
-            // ~35% of all CPU samples in the process, next to 4% for the
-            // preprocessing they were starving.
-            //
-            // Both settings are needed and neither works alone (measured warm,
-            // three interleaved reps): the default 16 threads spinning ran
-            // 7.34 s, 1 thread still spinning 7.42 s, 16 threads without
-            // spinning 7.37 s, and **1 thread without spinning 6.93 s** at 274%
-            // CPU against 340%. One thread is what removes the per-op fan-out
-            // and join; disabling the spin is what stops that one thread
-            // burning a core between calls. Output is bit-identical across all
-            // four (150,001 of 150,001 boundaries), as are the fused pipeline's
-            // classifications.
-            //
-            // A graph the CUDA EP cannot place entirely on the device would run
-            // its leftovers single-threaded here. That is the right trade for
-            // this path — reads are the parallel axis, and the caller already
-            // has every core busy on decode and prep.
-            .with_intra_threads(1)
-            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
-            // Only meaningful under parallel execution mode, which we don't
-            // enable; set it anyway so the bound holds if that ever changes.
-            .with_inter_threads(1)
-            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
-            .with_intra_op_spinning(false)
-            .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
-        let session = builder
-            .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
-            .map_err(|e| AdapterCnnError::Load(e.to_string()))?
-            .commit_from_file(path)
+        // A graph the CUDA EP cannot place entirely on the device would run
+        // its leftovers single-threaded here (see `ort_ep::cuda_session` for
+        // why one non-spinning intra-op thread). That is the right trade for
+        // this path — reads are the parallel axis, and the caller already has
+        // every core busy on decode and prep.
+        let session = crate::ort_ep::cuda_session(path, device)
             .map_err(|e| AdapterCnnError::Load(e.to_string()))?;
         Ok(Self {
             session: Mutex::new(session),

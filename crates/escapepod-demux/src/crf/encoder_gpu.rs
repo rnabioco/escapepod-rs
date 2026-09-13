@@ -283,38 +283,18 @@ impl CrfEncoderGpu {
         let alphabet = meta.alphabet_bytes();
 
         // One non-spinning intra-op thread, exactly as `AdapterCnnGpu::load`
-        // does and for the same measured reason (#239/#240) — that fix landed
-        // on the CNN session and was never carried to this one.
+        // does and for the same measured reason — see `ort_ep::cuda_session`,
+        // which both loaders now share; that fix landed on the CNN session
+        // (#239/#240) and was never carried to this one until they merged.
         //
-        // The graph runs on the device, so the intra-op pool has almost nothing
-        // to compute; left at its default it is `available_parallelism()` wide
-        // *and spinning*, on top of rayon's pool. This path made that worse than
-        // the CNN one ever was: the pool width came from the CLI's `--threads`,
-        // and the fused pipeline builds one session per encoder worker, so
-        // `--threads 32` with 2 workers meant 64 spinning threads on a 32-core
-        // allocation — cores the decode and prep feeding this encoder needed,
-        // which is how a GPU ends up underfed by its own inference sessions.
-        // Scaling `--threads` up scaled the spin up with it.
-        //
-        // #240's numbers, measured on the CNN session (warm, three interleaved
-        // reps): 16 threads spinning 7.34 s, 1 thread spinning 7.42 s, 16
-        // without spinning 7.37 s, **1 without spinning 6.93 s** at 274% CPU
-        // against 340%. Both settings are needed; neither works alone.
-        let builder = Session::builder()
-            .map_err(|e| CrfError::Load(e.to_string()))?
-            .with_intra_threads(1)
-            .map_err(|e| CrfError::Load(e.to_string()))?
-            // Only meaningful under parallel execution mode, which we don't
-            // enable; set it anyway so the bound holds if that ever changes.
-            .with_inter_threads(1)
-            .map_err(|e| CrfError::Load(e.to_string()))?
-            .with_intra_op_spinning(false)
-            .map_err(|e| CrfError::Load(e.to_string()))?;
-        let session = builder
-            .with_execution_providers(crate::ort_ep::cuda_providers_on(device))
-            .map_err(|e| CrfError::Load(e.to_string()))?
-            .commit_from_file(onnx)
-            .map_err(|e| CrfError::Load(e.to_string()))?;
+        // Before they shared it, this path made the problem worse than the
+        // CNN session ever had it: the pool width came from the CLI's
+        // `--threads`, and the fused pipeline builds one session per encoder
+        // worker, so `--threads 32` with 2 workers meant 64 spinning threads
+        // on a 32-core allocation — cores the decode and prep feeding this
+        // encoder needed. Scaling `--threads` up scaled the spin up with it.
+        let session =
+            crate::ort_ep::cuda_session(onnx, device).map_err(|e| CrfError::Load(e.to_string()))?;
 
         // The lattice decode is the larger half of this path's host cost, so it
         // goes to the device too unless it cannot. `ESCAPEPOD_CRF_GPU_DECODE=0`
