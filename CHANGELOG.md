@@ -36,6 +36,9 @@
   read order via `Pod5Index::storage_key` instead of re-deriving it with
   their own missing-read sentinel, so the two cannot silently disagree with
   the Rust side's definition.
+- `escapepod.pyi`'s description of `ESCAPEPOD_AUTOINDEX_MAX` no longer calls
+  it a memory bound; it decides where an eagerly-built index's cost is paid,
+  never whether one exists, matching `escapepod_pod5::autoindex_max`'s doc.
 
 ## 0.24.3 (2026-09-11)
 

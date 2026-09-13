@@ -184,7 +184,9 @@ class Reader:
     Entering the context manager warms an in-memory read-id index so repeated
     ``reads(selection=...)`` lookups take an O(k) indexed path instead of
     re-scanning the reads table. Skipped for files above
-    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) to bound memory.
+    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) -- not a memory
+    guard, but a threshold against paying to build an index for a huge file
+    that turns out to only be iterated, never randomly accessed.
     """
 
     def __init__(self, path: Union[str, PathLike[str]]) -> None: ...
@@ -265,7 +267,9 @@ class DatasetReader:
     Entering the context manager warms an in-memory read-id index on each
     underlying file so repeated ``reads(selection=...)`` lookups take an O(k)
     indexed path instead of re-scanning. Per-file, skipped for files above
-    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) to bound memory.
+    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) -- not a memory
+    guard, but a threshold against paying to build an index for a huge file
+    that turns out to only be iterated, never randomly accessed.
     """
 
     def __init__(
