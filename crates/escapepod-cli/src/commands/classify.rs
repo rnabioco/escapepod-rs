@@ -237,6 +237,79 @@ fn waveform_gpu_batch() -> usize {
         .unwrap_or(128)
 }
 
+/// The `@PG` record's `DS` field: the bundle identity that is already
+/// `info!`-logged in [`run`] but otherwise dropped once the run's stdout is
+/// gone — the field the same run's aggregate charged fraction has nothing to
+/// show it was scored against `bundle.model_id` at all (#370). Attached to
+/// the output BAM itself rather than a sidecar, so provenance survives
+/// whatever survives the BAM.
+///
+/// Fields the bundle does not carry are omitted, not null: a bundle with no
+/// `basecaller`/`operating_point`/`abstain` block must not have one
+/// fabricated for it just to fill a slot.
+fn provenance_ds(bundle: &ChargingBundle) -> String {
+    let mut ds = serde_json::Map::new();
+    ds.insert(
+        "model_id".to_string(),
+        serde_json::Value::String(bundle.model_id.clone()),
+    );
+    if let Some(v) = &bundle.model_version {
+        ds.insert(
+            "model_version".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    ds.insert(
+        "scorer_sha256".to_string(),
+        serde_json::Value::String(bundle.scorer_sha256.clone()),
+    );
+    if let Some(bc) = &bundle.basecaller {
+        let mut bc_obj = serde_json::Map::new();
+        bc_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(bc.model.clone()),
+        );
+        if let Some(dv) = &bc.dorado_version {
+            bc_obj.insert(
+                "dorado_version".to_string(),
+                serde_json::Value::String(dv.clone()),
+            );
+        }
+        if let Some(sha) = &bc.model_sha256 {
+            bc_obj.insert(
+                "model_sha256".to_string(),
+                serde_json::Value::String(sha.clone()),
+            );
+        }
+        ds.insert("basecaller".to_string(), serde_json::Value::Object(bc_obj));
+    }
+    if let Some(op) = &bundle.operating_point {
+        let mut op_obj = serde_json::Map::new();
+        op_obj.insert(
+            "probability".to_string(),
+            serde_json::Value::from(op.probability),
+        );
+        if let Some(cl) = op.cl {
+            op_obj.insert("cl".to_string(), serde_json::Value::from(cl));
+        }
+        ds.insert(
+            "operating_point".to_string(),
+            serde_json::Value::Object(op_obj),
+        );
+    }
+    ds.insert(
+        "calibration".to_string(),
+        serde_json::Value::Bool(bundle.calibration.is_some()),
+    );
+    if let Some(ab) = &bundle.abstain {
+        ds.insert(
+            "abstain_rule".to_string(),
+            serde_json::Value::String(ab.rule.clone()),
+        );
+    }
+    serde_json::Value::Object(ds).to_string()
+}
+
 fn skip_label(reason: SkipReason) -> &'static str {
     match reason {
         SkipReason::Filtered => "unmapped/filtered",
@@ -566,6 +639,7 @@ fn finish(
                 bundle.model_id, bundle.classes[1]
             ),
         )
+        .insert(pg_tag::DESCRIPTION, provenance_ds(bundle))
         .build()?;
     out_header.programs_mut().add("escpod-classify", pg)?;
 
