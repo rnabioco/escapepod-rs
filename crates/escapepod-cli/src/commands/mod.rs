@@ -21,8 +21,6 @@ pub mod repack;
 pub mod resquiggle;
 #[cfg(feature = "experimental")]
 pub mod resquiggle_models;
-#[cfg(feature = "classify")]
-pub mod signal;
 pub mod subset;
 pub mod summary;
 pub mod view;

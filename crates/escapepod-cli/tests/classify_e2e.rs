@@ -226,32 +226,3 @@ fn classify_bam_header_records_full_model_provenance() {
         "fixture bundle carries no abstain rule; DS must not invent one: {ds}"
     );
 }
-
-/// `escpod signal classify` was the shipped spelling from 0.11.0 and still
-/// appears in pipeline scripts, so it must keep working — producing the *same*
-/// calls, not merely exiting zero — while telling the user where the command
-/// moved to.
-#[test]
-fn deprecated_signal_classify_alias_warns_and_forwards() {
-    let out_dir = tempfile::tempdir().unwrap();
-    let (plain_bam, plain_tsv) = (out_dir.path().join("g.bam"), out_dir.path().join("g.tsv"));
-    let (alias_bam, alias_tsv) = (out_dir.path().join("a.bam"), out_dir.path().join("a.tsv"));
-
-    let plain_err = run_classifier(&["classify"], &plain_bam, &plain_tsv);
-    let alias_err = run_classifier(&["signal", "classify"], &alias_bam, &alias_tsv);
-
-    assert_eq!(
-        std::fs::read_to_string(&plain_tsv).unwrap(),
-        std::fs::read_to_string(&alias_tsv).unwrap(),
-        "the alias must forward to the same runner, not a divergent copy"
-    );
-    assert!(
-        alias_err.contains("`escpod signal classify` is deprecated")
-            && alias_err.contains("use `escpod classify`"),
-        "the alias should name its replacement:\n{alias_err}"
-    );
-    assert!(
-        !plain_err.contains("deprecated"),
-        "the current spelling must not warn:\n{plain_err}"
-    );
-}
