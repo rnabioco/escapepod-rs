@@ -15,6 +15,7 @@ mod common;
 use std::collections::{HashMap, HashSet};
 
 use escapepod_pod5::operations::{FilterOptions, filter_files, subset_files};
+use escapepod_pod5::sidecar::{read_sidecar_file, sidecar_path, write_sidecar_file};
 use escapepod_pod5::{Reader, RepackOptions, Uuid, Writer, WriterOptions, repack_files};
 use tempfile::TempDir;
 
@@ -114,6 +115,75 @@ fn filter_selects_exact_read_subset() {
     assert_eq!(got_ids, keep, "filter produced the wrong read set");
     for id in &keep {
         assert_eq!(got[id], original[id], "signal mismatch for kept read {id}");
+    }
+}
+
+/// `filter_files` must resolve signal rows through the reader's cached,
+/// sidecar-seeded footer — not a fresh, from-scratch footer parse that
+/// ignores the sidecar entirely. Proved by poisoning a *middle* batch's row
+/// count in the sidecar (the reader only spot-checks the first and last
+/// batch, so a wrong middle one is trusted): a from-scratch parse of the real
+/// file is unaffected by it, while consulting the cache shifts every row
+/// after the poisoned batch by exactly the count it was short.
+#[test]
+fn filter_resolves_signal_through_the_cached_sidecar_geometry() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("geom.pod5");
+
+    let options = WriterOptions {
+        signal_batch_size: 5,
+        ..Default::default()
+    };
+    let mut writer = Writer::create(&path, options).unwrap();
+    let run = writer.add_run_info(make_run_info("geom_acq")).unwrap();
+    let mut ids = Vec::new();
+    let mut signals = HashMap::new();
+    for i in 0..22u32 {
+        let read = make_read(run, i + 1, 100);
+        let id = read.read_id;
+        ids.push(id);
+        let signal = sig(i as i16 * 5, 100);
+        writer.add_read(read, &signal).unwrap();
+        signals.insert(id, signal);
+    }
+    writer.finish().unwrap();
+
+    // 22 reads at 5 rows/batch: batches of 5,5,5,5,2 — index 2 is a genuine
+    // middle batch (neither first nor last).
+    let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
+    assert_eq!(truth, vec![5, 5, 5, 5, 2], "fixture geometry assumption");
+
+    let identity = Reader::open(&path).unwrap().sidecar_identity().unwrap();
+    Reader::open(&path)
+        .unwrap()
+        .build_and_write_index(sidecar_path(&path))
+        .unwrap();
+
+    let mut sc = read_sidecar_file(sidecar_path(&path), &identity)
+        .unwrap()
+        .unwrap();
+    let mut counts = truth.clone();
+    counts[2] = 3; // short by 2 rows; batch 0 and the last batch stay correct
+    sc.set_signal_batch_rows(counts);
+    write_sidecar_file(sidecar_path(&path), &identity, &sc).unwrap();
+
+    // Rows 15..19 (0-indexed) sit in the real batch 3 (rows 15..19) and batch
+    // 4 (rows 20..21). Under the poisoned geometry the cumulative offsets
+    // after batch 2 are short by 2, so each of these global row lookups lands
+    // 2 rows further into the same physical batch than the truth.
+    let targets: HashSet<Uuid> = (15..20).map(|i| ids[i]).collect();
+
+    let output = tmp.path().join("out.pod5");
+    filter_files(&[&path], &output, &targets, filter_opts(), None).unwrap();
+    let got = read_signals(&output);
+
+    for i in 15..20 {
+        assert_eq!(
+            got[&ids[i]],
+            signals[&ids[i + 2]],
+            "row {i} must resolve through the poisoned cached geometry \
+             (shifted by 2), not a fresh walk of the real file"
+        );
     }
 }
 

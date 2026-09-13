@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Signal-table batch parsing identified buffers by matching their byte
+  length instead of their fixed schema position**, so an uncompressed read
+  whose signal happened to be exactly 4 bytes/row (2 i16 samples) collided
+  with the `samples: u32` column's size and swapped the two (`arrow_ipc.rs`,
+  `ParsedBatch::parse`). Arrow IPC buffer order is fixed by the schema, so the
+  four non-empty buffers are now taken from their known positions (1, 3, 4, 6)
+  rather than matched by size.
+- **`ReadsBatchView::read`/`append_columns` could panic on a corrupt file's
+  out-of-range `end_reason` dictionary key** (`arrow_helpers.rs`). The
+  `pore_type` column beside it already used a checked lookup that falls back
+  to a default; `end_reason` indexed the dictionary values array directly.
+  Both columns now bounds-check the key and fall back to `EndReason::default()`.
+- **`filter`/`subset`/`merge` re-parsed each input's signal-table footer from
+  scratch instead of using the reader's cached, sidecar-seeded one**
+  (`operations/filter.rs`, `merge.rs`), so a `.p5s` sidecar never sped up
+  those paths the way it does every other signal fetch. They now go through
+  `Reader::signal_footer_for_bulk` (made `pub(crate)`), the same cached
+  accessor `get_signal`/`reads_by_ids` already use.
+- **`Writer::flush_read_batch` built the reads table's `run_info` dictionary
+  fresh and empty for every batch**, so two read-batches referencing
+  different run infos wrote different dictionaries for the same field —
+  arrow-ipc's `FileWriter` rejects that outright
+  ("Dictionary replacement detected..."). `run_info`'s dictionary is now
+  seeded from every run info registered so far (`self.run_infos`), matching
+  the `pore_type`/`end_reason` columns. `PredefinedDictionaries` gained a
+  `run_infos` field, mirroring its existing `pore_types`/`end_reasons`
+  support, for callers who need a value first used in a later batch to
+  survive too (`pore_type`/`end_reason` have no upfront registration step,
+  so a genuinely new value can only be handled by predeclaring it).
+- **`Reader::read_count` re-walked every reads-table batch header on every
+  call**, unlike the signal footer's cache — called from `read_index`,
+  `read_columns`, `warm_index` and filter. Cached in a `OnceLock`, matching
+  the pattern the signal footer cache already uses.
+
 ## 0.24.3 (2026-09-11)
 
 ### Performance

@@ -171,6 +171,7 @@ fn writer_predefined_dictionaries_enforce_pore_types() {
                 "analysis_config_change".to_string(),
                 "paused".to_string(),
             ]),
+            run_infos: None,
         }),
         ..WriterOptions::default()
     };
@@ -204,6 +205,7 @@ fn writer_predefined_dictionaries_enforce_end_reasons() {
         predefined_dictionaries: Some(PredefinedDictionaries {
             pore_types: Some(vec!["not_set".to_string()]),
             end_reasons: Some(vec!["unknown".to_string()]),
+            run_infos: None,
         }),
         ..WriterOptions::default()
     };

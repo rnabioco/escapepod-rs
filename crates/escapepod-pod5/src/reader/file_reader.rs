@@ -94,6 +94,8 @@ pub struct Reader {
     /// Cached read UUID index: UUID → (batch_idx, row_within_batch).
     /// Lazily built on first lookup via `.p5s` sidecar or column-projected scan.
     read_index: OnceLock<ReadIndex>,
+    /// Cached total read count (see [`Self::read_count`]).
+    read_count: OnceLock<usize>,
     /// Path to the POD5 file (for locating `.p5s` sidecar).
     file_path: Option<PathBuf>,
 }
@@ -241,6 +243,7 @@ impl Reader {
             run_info_cache,
             signal_ipc_footer: OnceLock::new(),
             read_index: OnceLock::new(),
+            read_count: OnceLock::new(),
             file_path: Some(file_path),
         };
         Ok(reader)
@@ -316,7 +319,10 @@ impl Reader {
     /// There the previous behaviour is an empty footer whose every lookup
     /// misses, which is what each caller's fallback below is written against —
     /// so it is reproduced rather than turned into an error.
-    fn signal_footer_for_bulk(&self, signal_bytes: &[u8]) -> Result<Cow<'_, ArrowIpcFooter>> {
+    pub(crate) fn signal_footer_for_bulk(
+        &self,
+        signal_bytes: &[u8],
+    ) -> Result<Cow<'_, ArrowIpcFooter>> {
         match self.signal_ipc_footer() {
             Some(footer) => Ok(Cow::Borrowed(footer)),
             None => Ok(Cow::Owned(ArrowIpcFooter::parse(signal_bytes)?)),
@@ -546,9 +552,15 @@ impl Reader {
     /// 2.96M-read POD5 this is microseconds versus tens of milliseconds
     /// for the previous full-scan implementation.
     pub fn read_count(&self) -> Result<usize> {
+        if let Some(&count) = self.read_count.get() {
+            return Ok(count);
+        }
+        // Compute outside the lock — may race with another thread, but
+        // get_or_init will discard the extra copy. Mirrors `read_index`.
         let bytes = self.reads_table_bytes()?;
         let footer = crate::arrow_ipc::ArrowIpcFooter::parse(bytes)?;
-        Ok(footer.total_rows as usize)
+        let count = footer.total_rows as usize;
+        Ok(*self.read_count.get_or_init(|| count))
     }
 
     /// Raw bytes of the reads table (Arrow IPC stream slice into the mmap).
