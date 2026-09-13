@@ -72,6 +72,8 @@ pub struct PredefinedDictionaries {
     pub pore_types: Option<Vec<String>>,
     /// End reason values. If None, end reasons are collected dynamically.
     pub end_reasons: Option<Vec<String>>,
+    /// Run info acquisition IDs. If None, collected from `add_run_info` calls.
+    pub run_infos: Option<Vec<String>>,
 }
 
 /// Internal structure to track a pending read.
@@ -110,6 +112,9 @@ pub struct Writer {
 
     // Run info
     run_infos: Vec<RunInfoData>,
+    // Predefined run_info acquisition IDs, for multi-batch dictionary
+    // consistency. `None` falls back to `run_infos`'s own acquisition IDs.
+    run_info_dict: Option<Vec<String>>,
 
     // Pending data (pre-allocated with capacity)
     pending_reads: Vec<PendingRead>,
@@ -200,6 +205,10 @@ impl Writer {
                     false,
                 )
             };
+        let run_info_dict = options
+            .predefined_dictionaries
+            .as_ref()
+            .and_then(|predef| predef.run_infos.clone());
 
         Ok(Self {
             file: Some(file),
@@ -210,6 +219,7 @@ impl Writer {
             end_reasons,
             end_reason_index,
             run_infos: Vec::with_capacity(4),
+            run_info_dict,
             // Pre-allocate pending buffers based on batch sizes
             pending_reads: Vec::with_capacity(options.read_batch_size as usize),
             pending_signal: Vec::with_capacity(options.signal_batch_size as usize),
@@ -251,6 +261,15 @@ impl Writer {
     pub fn add_run_info(&mut self, info: RunInfoData) -> Result<u32> {
         if self.finalized {
             return Err(Error::WriterFinalized);
+        }
+
+        if let Some(allowed) = &self.run_info_dict
+            && !allowed.contains(&info.acquisition_id)
+        {
+            return Err(Error::DictionaryValueNotFound {
+                value: info.acquisition_id,
+                dictionary_name: "run_info".to_string(),
+            });
         }
 
         let index = self.run_infos.len() as u32;
@@ -659,8 +678,16 @@ impl Writer {
         let mut end_reason_builder: StringDictionaryBuilder<Int16Type> =
             StringDictionaryBuilder::new_with_dictionary(num_reads, &end_reason_dict)?;
         let mut end_reason_forced_builder = BooleanBuilder::with_capacity(num_reads);
+        let run_info_dict = match &self.run_info_dict {
+            Some(predefined) => {
+                StringArray::from_iter_values(predefined.iter().map(String::as_str))
+            }
+            None => StringArray::from_iter_values(
+                self.run_infos.iter().map(|r| r.acquisition_id.as_str()),
+            ),
+        };
         let mut run_info_builder: StringDictionaryBuilder<Int16Type> =
-            StringDictionaryBuilder::new();
+            StringDictionaryBuilder::new_with_dictionary(num_reads, &run_info_dict)?;
         // V4 builders
         let mut open_pore_level_builder = Float32Builder::with_capacity(num_reads);
         // V5 builders
@@ -1671,5 +1698,157 @@ mod tests {
         // The indices must also still resolve: 25 reads x 4 chunks.
         let total: usize = sizes.iter().sum();
         assert_eq!(total, 100, "25 reads x 4 chunks");
+    }
+
+    /// `read_batch_size: 1` forces a `flush_read_batch` per read, so batch 2
+    /// introduces a run info, pore type and end reason none of which appeared
+    /// in batch 1. arrow-ipc's `FileWriter` errors on a dictionary whose
+    /// values differ from what was already written for that field, so every
+    /// dictionary-encoded reads column must be seeded consistently across
+    /// batches — including `run_info`, which used to build a fresh, empty
+    /// `StringDictionaryBuilder` per batch. `pore_type`/`end_reason` need
+    /// `PredefinedDictionaries` to survive a value first seen in a later
+    /// batch (they have no upfront registration step, unlike run infos), so
+    /// this declares all three; `run_info`'s own dictionary is additionally
+    /// seeded from `add_run_info`'s cumulative list even without that.
+    #[test]
+    fn dictionaries_stay_consistent_across_read_batches() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        let options = WriterOptions {
+            read_batch_size: 1,
+            signal_batch_size: 1,
+            predefined_dictionaries: Some(PredefinedDictionaries {
+                pore_types: Some(vec!["not_set".into(), "user_removed".into()]),
+                end_reasons: Some(vec![
+                    EndReason::SignalPositive.as_str().into(),
+                    EndReason::UnblockMuxChange.as_str().into(),
+                ]),
+                run_infos: Some(vec!["run_a".into(), "run_b".into()]),
+            }),
+            ..Default::default()
+        };
+        let mut writer = Writer::create(path, options)?;
+
+        let run_info_a = create_test_run_info("run_a");
+        let run_info_b = create_test_run_info("run_b");
+        let idx_a = writer.add_run_info(run_info_a)?;
+        let idx_b = writer.add_run_info(run_info_b)?;
+
+        let mut read1 = create_test_read(idx_a, 1, 100);
+        read1.pore_type = "not_set".into();
+        read1.end_reason = EndReason::SignalPositive;
+        writer.add_read(read1, &generate_test_signal(100, 0))?;
+
+        let mut read2 = create_test_read(idx_b, 2, 100);
+        read2.pore_type = "user_removed".into();
+        read2.end_reason = EndReason::UnblockMuxChange;
+        writer.add_read(read2, &generate_test_signal(100, 10))?;
+
+        writer.finish()?;
+
+        let reader = Reader::open(path)?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(reads.len(), 2);
+
+        let run_infos = reader.run_infos();
+        let mut by_number: HashMap<u32, _> = HashMap::new();
+        for r in &reads {
+            by_number.insert(r.read_number, r);
+        }
+
+        let r1 = by_number.get(&1).expect("read 1");
+        assert_eq!(
+            run_infos[r1.run_info_index as usize].acquisition_id,
+            "run_a"
+        );
+        assert_eq!(r1.pore_type.as_str(), "not_set");
+        assert_eq!(r1.end_reason, EndReason::SignalPositive);
+
+        let r2 = by_number.get(&2).expect("read 2");
+        assert_eq!(
+            run_infos[r2.run_info_index as usize].acquisition_id,
+            "run_b"
+        );
+        assert_eq!(r2.pore_type.as_str(), "user_removed");
+        assert_eq!(r2.end_reason, EndReason::UnblockMuxChange);
+
+        Ok(())
+    }
+
+    /// Without `PredefinedDictionaries`, `run_info`'s dictionary is still
+    /// seeded from `self.run_infos` — every run info registered via
+    /// `add_run_info` so far, not just the ones referenced by the batch being
+    /// flushed. Registering both runs before any read (the only valid order,
+    /// since `run_info_index` refers into `self.run_infos`) makes every
+    /// batch's dictionary identical even though batch 1 only *uses* run_a.
+    #[test]
+    fn run_info_dictionary_is_consistent_without_predefined_dictionaries() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        let options = WriterOptions {
+            read_batch_size: 1,
+            signal_batch_size: 1,
+            ..Default::default()
+        };
+        let mut writer = Writer::create(path, options)?;
+
+        let idx_a = writer.add_run_info(create_test_run_info("run_a"))?;
+        let idx_b = writer.add_run_info(create_test_run_info("run_b"))?;
+
+        let read1 = create_test_read(idx_a, 1, 100);
+        writer.add_read(read1, &generate_test_signal(100, 0))?;
+        let read2 = create_test_read(idx_b, 2, 100);
+        writer.add_read(read2, &generate_test_signal(100, 10))?;
+
+        writer.finish()?;
+
+        let reader = Reader::open(path)?;
+        let reads: Vec<_> = reader
+            .reads()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(reads.len(), 2);
+        let run_infos = reader.run_infos();
+        let mut by_number: HashMap<u32, _> = HashMap::new();
+        for r in &reads {
+            by_number.insert(r.read_number, r);
+        }
+        assert_eq!(
+            run_infos[by_number[&1].run_info_index as usize].acquisition_id,
+            "run_a"
+        );
+        assert_eq!(
+            run_infos[by_number[&2].run_info_index as usize].acquisition_id,
+            "run_b"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_count_is_stable_across_calls() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        let options = WriterOptions::default();
+        let mut writer = Writer::create(path, options)?;
+        let run_info_idx = writer.add_run_info(create_test_run_info("read_count_test"))?;
+        for i in 1..=5u32 {
+            let read = create_test_read(run_info_idx, i, 100);
+            writer.add_read(read, &generate_test_signal(100, 0))?;
+        }
+        writer.finish()?;
+
+        let reader = Reader::open(path)?;
+        let first = reader.read_count()?;
+        let second = reader.read_count()?;
+        assert_eq!(first, 5);
+        assert_eq!(first, second);
+
+        Ok(())
     }
 }
