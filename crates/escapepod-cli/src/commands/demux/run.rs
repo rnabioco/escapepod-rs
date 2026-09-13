@@ -1568,6 +1568,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
     let predefined = PredefinedDictionaries {
         pore_types: Some(pore_types),
         end_reasons: Some(end_reasons),
+        run_infos: None,
     };
 
     // ---- Stage C: one writer thread per barcode (sharded) ----

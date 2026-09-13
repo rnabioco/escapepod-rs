@@ -294,6 +294,7 @@ fn dictionary_columns_consistent_across_batches() {
                 EndReason::SignalNegative.as_str().into(),
                 EndReason::MuxChange.as_str().into(),
             ]),
+            run_infos: None,
         }),
         ..Default::default()
     };
