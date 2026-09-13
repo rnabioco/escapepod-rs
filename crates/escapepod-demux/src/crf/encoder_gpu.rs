@@ -751,8 +751,9 @@ impl CrfEncoderGpu {
         let ptr = tensor.data_ptr() as u64;
         // SAFETY: `ptr` is onnxruntime's own CUDA allocation for this output —
         // residency and shape are both checked immediately above, so it is
-        // `t_len * batch * n_score` f32 on device 0, the device the lattice
-        // context binds. `synchronize_outputs` has retired the producing stream.
+        // `t_len * batch * n_score` f32 on `self.device`, the device the
+        // lattice context binds. `synchronize_outputs` has retired the
+        // producing stream.
         // `outputs` owns the allocation and is alive across the call, and nothing
         // else aliases it while the session lock is held. The decode overwrites
         // it in place with the log-posteriors, which is sound because we are its
@@ -794,17 +795,6 @@ impl CrfEncoderGpu {
         }
     }
 
-    /// Encode on the GPU, then decode on the CPU across rayon workers.
-    ///
-    /// `prepped[i] == None` (a read with no usable window) yields `None` and
-    /// never reaches the device.
-    ///
-    /// Encode and decode alternate one device batch at a time rather than
-    /// encoding everything first. `batch_rows` bounds only the *device*-side
-    /// activations; the scores coming back are 1 MB per read, so holding a
-    /// whole caller batch would retain gigabytes of host memory for an Arrow
-    /// batch of a few thousand reads. Interleaving caps that at `batch_rows`
-    /// reads' worth regardless of how many reads are handed in.
     /// Build the constrained lattices for a reference panel — see
     /// [`CrfEncoder::ref_chains`](super::encoder::CrfEncoder::ref_chains).
     pub fn ref_chains(&self, seqs: &[&[u8]]) -> Result<RefChains, CrfError> {
@@ -977,6 +967,17 @@ impl CrfEncoderGpu {
         })
     }
 
+    /// Encode on the GPU, then decode on the CPU across rayon workers.
+    ///
+    /// `prepped[i] == None` (a read with no usable window) yields `None` and
+    /// never reaches the device.
+    ///
+    /// Encode and decode alternate one device batch at a time rather than
+    /// encoding everything first. `batch_rows` bounds only the *device*-side
+    /// activations; the scores coming back are 1 MB per read, so holding a
+    /// whole caller batch would retain gigabytes of host memory for an Arrow
+    /// batch of a few thousand reads. Interleaving caps that at `batch_rows`
+    /// reads' worth regardless of how many reads are handed in.
     pub fn basecall_batch(
         &self,
         prepped: &[Option<Vec<f32>>],

@@ -477,9 +477,11 @@ pub(crate) fn prep_adapter_signal(
 /// — p99 is 5706, so the prior holds for the bulk of the distribution, but it is
 /// a real ceiling and not an artefact of the model.
 ///
-/// `valid_len` is now always equal to the padded length (prep emits one fixed
-/// length), so the clamp is inert; it is kept for the same reason
-/// [`group_by_len`] is.
+/// The clamp is load-bearing, not inert: [`prep_adapter_signal`] fixes
+/// `valid_len` to the read's own pre-padding length *before* the tensor is
+/// resized to the model's fixed width, so a short read still carries a
+/// `valid_len` well short of `length_out` and the search must not run past
+/// it — see `decode_never_returns_a_boundary_past_the_read` (#187).
 pub(crate) fn decode_adapter_end(
     cfg: &AdapterCnnConfig,
     length_out: usize,

@@ -2,8 +2,43 @@
 
 ## Unreleased
 
+### Breaking
+
+- `AnchoredReads(...)`'s `motif_offset` no longer defaults to 3; every caller
+  must pass it explicitly. A `waveform_model` bundle anchors at +2, and the
+  old default silently anchored a bundle-less corpus one base off with no
+  error.
+
 ### Fixed
 
+- `CrfEncoder::probe_output_contract` now calls `encode_tract` directly
+  instead of `encode`, so the load-time shape probe still exercises the
+  tract ONNX contract once a native kernel has loaded, rather than
+  redundantly probing the native path `self_check` already checked.
+- Corrected a stale doc comment on `adapter_cnn::decode_adapter_end` claiming
+  the `valid_len` clamp is inert; it is load-bearing for short reads (#187).
+- Fixed stale/misplaced doc comments in `escapepod-demux`: `cuda.rs` no
+  longer names the retired `cnn-gpu`/`crf-gpu` features; `adapter_cnn_gpu.rs`
+  now notes that CPU fallback on a failed CUDA EP is qualified by
+  `require_cuda_ep`; `crf/encoder_gpu.rs`'s `basecall_batch` doc comment,
+  previously attached to `ref_chains`, now sits on `basecall_batch`, and its
+  SAFETY comment says `self.device` instead of "device 0"; a tautological
+  `debug_assert!` in `crf/refchain.rs` (always true once the preceding
+  `TooShort` check passes) is removed.
+- `escapepod-classify`'s native bidirectional-LSTM loader
+  (`fnn_lstm::NativeBiLstm::from_proto`) now runs a numeric self-check
+  against tract on one random input of the bundle's real shape before
+  trusting the native kernel — the same guard
+  `escapepod_demux::crf::encoder_native::self_check` applies to the CRF
+  encoder, against a recognizer that matches a graph's shape but not its
+  semantics.
+- `escapepod-python`'s `AnchoredReads.storage_order` and `.extract` now sort
+  read order via `Pod5Index::storage_key` instead of re-deriving it with
+  their own missing-read sentinel, so the two cannot silently disagree with
+  the Rust side's definition.
+- `escapepod.pyi`'s description of `ESCAPEPOD_AUTOINDEX_MAX` no longer calls
+  it a memory bound; it decides where an eagerly-built index's cost is paid,
+  never whether one exists, matching `escapepod_pod5::autoindex_max`'s doc.
 - `downscale_normalize_into`'s `scratch.sel` retained its high-water-mark
   capacity indefinitely after a huge outlier read: the `RETAIN_MAX` release
   lived only in `normalize_downscale_into`, which production callers

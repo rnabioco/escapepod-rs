@@ -7,9 +7,9 @@
 //! initialisation those paths pay, because under `auto` the answer is very often
 //! "no" and the run should not have stalled to find that out.
 //!
-//! Compiled whenever cudarc is in the graph — that is `cnn-gpu`, `crf-gpu` or
-//! `gpu`, since all three pull it in. A build with none of them has no device
-//! code at all, so the caller already knows the answer without asking.
+//! Compiled whenever cudarc is in the graph — that is the `gpu` feature, the
+//! only one that pulls it in. A build without it has no device code at all,
+//! so the caller already knows the answer without asking.
 
 use std::sync::OnceLock;
 

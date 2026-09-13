@@ -371,7 +371,7 @@ impl NativeBiLstm {
                 &b[d * 8 * h..(d + 1) * 8 * h],
             )
         });
-        Ok(Self {
+        let net = Self {
             seq: n_off,
             h,
             weights,
@@ -380,7 +380,9 @@ impl NativeBiLstm {
             n_cls,
             mean_first,
             backend: Backend::best_for(h),
-        })
+        };
+        self_check(&net, proto)?;
+        Ok(net)
     }
 
     /// How many reads [`Self::logits_batch`] scores per pass at full
@@ -679,6 +681,87 @@ impl NativeBiLstm {
             *o = acc;
         }
     }
+}
+
+/// One seeded pseudo-random input of the graph's own `[n_ch, n_off]` shape,
+/// scored through the lifted native weights and through a fresh tract plan of
+/// the same proto; the contract is agreement on the class *probability*
+/// (softmax of the logits), not the raw logit, within
+/// [`SELF_CHECK_TOLERANCE`] — the guard against a recognizer that matches a
+/// graph's shape but not its semantics, mirroring
+/// `escapepod_demux::crf::encoder_native::self_check`.
+///
+/// The same 1e-4 the module doc already declares as the contract between the
+/// native kernel and tract; every `from_proto` call in `tests` now runs this
+/// check, so the width-pin tests (`matches_tract_on_the_shipped_shape` and
+/// friends, agreeing with tract to within 2e-4 on the *logit*) are also its
+/// coverage on the real graph shape and pass at this tolerance on probability.
+const SELF_CHECK_TOLERANCE: f32 = 1e-4;
+
+fn self_check(net: &NativeBiLstm, proto: &pb::ModelProto) -> std::result::Result<(), String> {
+    use tract_onnx::prelude::*;
+    use tract_onnx::tract_core::framework::Framework;
+
+    let n_ch = net.weights[0].n_in;
+    let n_off = net.seq;
+
+    let mut rng_state = 0x9E3779B97F4A7C15u64;
+    let mut next = move || {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        ((rng_state as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0) * 1.5
+    };
+    let x: Vec<f32> = (0..n_ch * n_off).map(|_| next()).collect();
+
+    let plan = tract_onnx::onnx()
+        .model_for_proto_model(proto)
+        .map_err(|e| format!("self-check: cannot parse proto: {e}"))?
+        .with_input_fact(0, f32::fact([1, n_ch, n_off]).into())
+        .map_err(|e| format!("self-check: cannot pin input shape: {e}"))?
+        .into_optimized()
+        .map_err(|e| format!("self-check: cannot optimize: {e}"))?
+        .into_runnable()
+        .map_err(|e| format!("self-check: cannot plan: {e}"))?;
+    let t = Tensor::from_shape(&[1, n_ch, n_off], &x)
+        .map_err(|e| format!("self-check: cannot build input tensor: {e}"))?;
+    let out = plan
+        .run(tvec!(t.into()))
+        .map_err(|e| format!("self-check: tract inference failed: {e}"))?;
+    let view = out[0]
+        .to_plain_array_view::<f32>()
+        .map_err(|e| format!("self-check: tract output is not f32: {e}"))?;
+    let tract_logits: Vec<f32> = view.iter().copied().collect();
+    if tract_logits.len() != net.n_cls {
+        return Err(format!(
+            "self-check: tract emitted {} logits, expected {}",
+            tract_logits.len(),
+            net.n_cls
+        ));
+    }
+
+    let mut native_logits = vec![0.0f32; net.n_cls];
+    net.logits(&x, &mut native_logits)
+        .map_err(|e| format!("self-check: native inference failed: {e}"))?;
+
+    let max_diff = softmax(&tract_logits)
+        .iter()
+        .zip(softmax(&native_logits))
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    if max_diff > SELF_CHECK_TOLERANCE {
+        return Err(format!(
+            "self-check: native and tract disagree on P(class) by {max_diff:e}, past the {SELF_CHECK_TOLERANCE:e} tolerance"
+        ));
+    }
+    Ok(())
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|&v| (v - m).exp()).collect();
+    let s: f32 = exps.iter().sum();
+    exps.iter().map(|&v| v / s).collect()
 }
 
 // ---- proto helpers ------------------------------------------------------------
@@ -1278,5 +1361,18 @@ pub(crate) mod tests {
         let mut got = [0.0f32; 2];
         net.logits(&x, &mut got).unwrap();
         assert!(max_abs_diff(&got, &want) < 2e-4, "{got:?} vs {want:?}");
+    }
+
+    /// A recognizer that matches a graph's shape but not its semantics is
+    /// exactly what the self-check guards against: perturb one lifted weight
+    /// after recognition succeeded, and it must refuse.
+    #[test]
+    fn self_check_refuses_a_perturbed_weight() {
+        let (n_ch, n_off, h) = (4, 33, 16);
+        let proto = lstm_model(n_ch, n_off, h, 42);
+        let mut net = NativeBiLstm::from_proto(&proto, n_ch, n_off).expect("recognised");
+        net.head_w[0] += 50.0;
+        let err = self_check(&net, &proto).expect_err("perturbed weight must fail self-check");
+        assert!(err.contains("self-check"), "{err}");
     }
 }

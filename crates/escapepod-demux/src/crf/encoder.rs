@@ -819,9 +819,13 @@ impl CrfEncoder {
     /// One dummy forward pass asserting the time-major `[T, 1, n_score]`
     /// contract, so a mismatched export fails at load with a clear message
     /// instead of decoding noise for every read.
+    ///
+    /// Goes through [`Self::encode_tract`], not [`Self::encode`]: this probes
+    /// the ONNX graph's own contract, and `encode` takes the native path once
+    /// one is loaded, which would leave this checking the wrong thing.
     fn probe_output_contract(&self) -> Result<(), CrfError> {
         let dummy = vec![0f32; self.meta.signal.chunk];
-        self.encode(&dummy).map(|_| ())
+        self.encode_tract(&dummy).map(|_| ())
     }
 
     /// Metadata sidecar in effect.
