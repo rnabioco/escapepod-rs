@@ -65,6 +65,12 @@ uuid = { workspace = true }
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3"
+# `fnn_lstm`'s own tests build synthetic ONNX graphs via
+# `escapepod_demux::onnx_graph::test_support` — the same builders
+# `escapepod-demux`'s own LSTM-recognizer tests use. `test-support` exposes
+# them outside `cfg(test)`, which this dev-dependency edge is the only way to
+# reach (features unify across dependency kinds of the same package).
+escapepod-demux = { workspace = true, features = ["test-support"] }
 
 # The per-read charging path — the step `escpod classify` repeats once per
 # read, and the one thing in this crate a regression would show up in at

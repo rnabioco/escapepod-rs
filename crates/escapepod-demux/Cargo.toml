@@ -147,6 +147,13 @@ gpu = [
 # `linfa`/`linfa-svm` dependencies this feature used to enable were compiled
 # for every `--features train` build without a single `use` of them.
 train = []
+# Expose `onnx_graph::test_support`'s synthetic-graph builders outside
+# `cfg(test)`. `cfg(test)` never crosses a crate boundary, so
+# `escapepod-classify`'s own LSTM-recognizer tests (`fnn_lstm`) need this
+# feature, enabled only on its `[dev-dependencies]` edge to this crate, to
+# reach the same builders its own tests use — one copy instead of two. No
+# extra dependency: `onnx_graph` already needs `cnn-detect`/`crf-decode`.
+test-support = []
 
 [[example]]
 name = "crf_basecall_check"
