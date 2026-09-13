@@ -694,11 +694,15 @@ impl<'a> ReadsBatchView<'a> {
         };
 
         let end_reason = {
-            let key = self.end_reason_keys.value(row);
-            self.end_reason_values
-                .value(key as usize)
-                .parse()
-                .unwrap_or_default()
+            let key = self.end_reason_keys.value(row) as usize;
+            if key < self.end_reason_values.len() {
+                self.end_reason_values
+                    .value(key)
+                    .parse()
+                    .unwrap_or_default()
+            } else {
+                EndReason::default()
+            }
         };
 
         let run_info_index = self.run_info_keys.value(row) as u32;
@@ -793,13 +797,16 @@ impl<'a> ReadsBatchView<'a> {
                     .cloned()
                     .unwrap_or_default(),
             );
-            let ekey = self.end_reason_keys.value(row);
-            cols.end_reason.push(
-                self.end_reason_values
-                    .value(ekey as usize)
-                    .parse()
-                    .unwrap_or_default(),
-            );
+            let ekey = self.end_reason_keys.value(row) as usize;
+            cols.end_reason
+                .push(if ekey < self.end_reason_values.len() {
+                    self.end_reason_values
+                        .value(ekey)
+                        .parse()
+                        .unwrap_or_default()
+                } else {
+                    EndReason::default()
+                });
             cols.end_reason_forced
                 .push(self.end_reason_forced.value(row));
         }
@@ -1063,5 +1070,35 @@ mod tests {
                 .get_u32_or_u16("channel")
                 .is_err()
         );
+    }
+
+    /// An out-of-range `end_reason` dictionary key (as a corrupt file could
+    /// carry) must default like `pore_type` does, not panic. The safe
+    /// `DictionaryArray` constructors all validate keys against the values
+    /// array, so `new_unchecked` stands in for the corrupt-file bytes an
+    /// untrusted Arrow IPC reader could otherwise produce.
+    #[test]
+    fn out_of_range_end_reason_key_defaults_instead_of_panicking() {
+        let base = reads_batch(&[1, 2], false);
+        let idx = base.schema().index_of("end_reason").unwrap();
+        let end_reason_dict = base.column(idx).as_dictionary::<Int16Type>();
+        let values = end_reason_dict.values().clone();
+        assert_eq!(values.len(), 1, "fixture writes one distinct end_reason");
+
+        let bad_keys = Int16Array::from(vec![0i16, 99i16]);
+        let corrupt = unsafe { DictionaryArray::<Int16Type>::new_unchecked(bad_keys, values) };
+
+        let mut columns = base.columns().to_vec();
+        columns[idx] = Arc::new(corrupt);
+        let batch = RecordBatch::try_new(base.schema(), columns).unwrap();
+
+        let view = ReadsBatchView::new(&batch, false).unwrap();
+        assert_eq!(view.read(0).unwrap().end_reason, EndReason::SignalPositive);
+        assert_eq!(view.read(1).unwrap().end_reason, EndReason::default());
+
+        let mut cols = ReadColumns::default();
+        view.append_columns(&mut cols).unwrap();
+        assert_eq!(cols.end_reason[0], EndReason::SignalPositive);
+        assert_eq!(cols.end_reason[1], EndReason::default());
     }
 }
