@@ -96,6 +96,10 @@ impl SignalPrepScratch {
 /// 48-thread pool at once is a genuine RSS spike. This keeps two reusable
 /// buffers per worker and writes the downscaled output directly.
 ///
+/// This is the `factor == 1` fallback: production demux callers (`run.rs`,
+/// `detect.rs`) call [`downscale_normalize_into`] directly, which reaches
+/// this function only when no downscaling was requested.
+///
 /// # Panics
 /// Panics if `factor` is 0, matching [`downscale`].
 pub fn normalize_downscale_into(
@@ -244,6 +248,15 @@ pub fn downscale_normalize_into(
                 *v = (*v - med) / mad;
             }
         }
+    }
+
+    // Same RETAIN_MAX release as `normalize_downscale_into` (~111-121): this
+    // is the path production actually calls, and `scratch.sel` here tracks
+    // `out.len()` (not `scratch.cast`, which this branch never touches), so
+    // it needs the same high-water guard.
+    const RETAIN_MAX: usize = 1 << 20;
+    if scratch.sel.capacity() > RETAIN_MAX && scratch.sel.capacity() > 2 * out.len() {
+        scratch.sel = Vec::new();
     }
 }
 
@@ -654,6 +667,36 @@ mod tests {
 
         let zeros: Vec<i16> = vec![0; 64];
         assert!(normalize_signal(&zeros).iter().all(|v| v.is_finite()));
+    }
+
+    /// `downscale_normalize_into` (factor > 1) is the path production calls,
+    /// and `scratch.sel` there tracks `out.len()` (the downscaled length),
+    /// not the raw signal. A long-tail outlier read must not leave `sel`
+    /// pinned at that high-water mark for the rest of the worker's life.
+    #[test]
+    fn downscale_normalize_into_releases_high_water_scratch() {
+        let mut scratch = SignalPrepScratch::new();
+        let mut out = Vec::new();
+        let factor = 2usize;
+
+        // out.len() = 1_100_000 after downscaling, comfortably over RETAIN_MAX
+        // (1 << 20 == 1_048_576).
+        let big_signal: Vec<i16> = (0..2_200_000i32).map(|i| (i % 997) as i16).collect();
+        downscale_normalize_into(&big_signal, factor, &mut scratch, &mut out);
+        assert!(
+            scratch.sel.capacity() > (1 << 20),
+            "test setup didn't grow scratch.sel: {}",
+            scratch.sel.capacity()
+        );
+
+        let small_signal: Vec<i16> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        downscale_normalize_into(&small_signal, factor, &mut scratch, &mut out);
+
+        assert!(
+            scratch.sel.capacity() <= (1 << 20),
+            "scratch.sel retained {} after a huge outlier read; RETAIN_MAX release did not run",
+            scratch.sel.capacity()
+        );
     }
 
     #[test]

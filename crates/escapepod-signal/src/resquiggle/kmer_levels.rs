@@ -134,7 +134,9 @@ pub fn extract_levels(
         .collect();
 
     for pos in 0..=(seq_len - kmer_len) {
-        let kmer = std::str::from_utf8(&seq_upper[pos..pos + kmer_len]).unwrap_or("");
+        let window = &seq_upper[pos..pos + kmer_len];
+        debug_assert!(window.is_ascii(), "non-ASCII k-mer window at pos {pos}");
+        let kmer = std::str::from_utf8(window).unwrap_or("");
         if let Some(&level) = kmer_to_level.get(kmer) {
             levels[pos + cidx] = level;
         }
@@ -344,6 +346,16 @@ mod tests {
         // Shorter than k → all zeros, not an error.
         let levels = extract_levels("ACG", &table(), 5, None);
         assert_eq!(levels, vec![0.0; 3]);
+    }
+
+    /// A window straddling a multi-byte UTF-8 character is invalid UTF-8 even
+    /// though the whole `&str` is valid; that silently missed the table via
+    /// `unwrap_or("")` before the window's non-ASCII-ness was asserted.
+    #[test]
+    #[should_panic(expected = "non-ASCII k-mer window")]
+    fn non_ascii_kmer_window_is_caught_by_debug_assert() {
+        // "é" is 2 UTF-8 bytes; some 5-byte windows straddle it.
+        extract_levels("AAAAéAAAA", &table(), 5, None);
     }
 
     #[test]

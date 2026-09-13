@@ -34,7 +34,7 @@ pub fn adaptive_banded_dp(
     let n_bases = levels.len();
     let signal_len = signal.len();
 
-    if n_bases == 0 || signal_len == 0 {
+    if n_bases == 0 || signal_len == 0 || initial_map.len() < 2 {
         return vec![0; n_bases + 1];
     }
 
@@ -380,6 +380,26 @@ mod tests {
                 fixed_path[i]
             );
         }
+    }
+
+    #[test]
+    fn test_adaptive_dp_length_one_initial_map() {
+        // Regression: `initial_map[1]` was indexed with only an `n_bases == 0`
+        // guard, so a length-1 initial_map with a nonzero n_bases panicked.
+        let levels: Vec<f32> = vec![0.0, 1.0, -0.5];
+        let signal = vec![0.0f32; 30];
+        let initial_map = vec![5usize];
+
+        let path = adaptive_banded_dp(
+            &signal,
+            &levels,
+            10,
+            &initial_map,
+            &RefineAlgo::Viterbi,
+            None,
+        );
+
+        assert_eq!(path, vec![0; levels.len() + 1]);
     }
 
     #[test]
