@@ -19,6 +19,9 @@
 - `adaptive_banded_dp` indexed `initial_map[1]` with only an `n_bases == 0`
   guard, panicking on a length-1 `initial_map` with nonzero `n_bases`
   (release builds are `panic = "abort"`). Guarded on `initial_map.len() < 2`.
+- `extract_levels` silently missed the k-mer table when a window straddled a
+  multi-byte UTF-8 character (invalid UTF-8 despite the whole `&str` being
+  valid); added a `debug_assert!` so the miss is no longer silent.
 
 ## 0.24.3 (2026-09-11)
 
