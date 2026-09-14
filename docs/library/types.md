@@ -11,20 +11,26 @@ pub struct ReadData {
     /// Unique identifier for the read
     pub read_id: Uuid,
 
-    /// Sequential read number within the channel
+    /// Sequential read number within the run
     pub read_number: u32,
 
     /// Sample position where read started
     pub start_sample: u64,
 
-    /// Channel number (1-512 typically)
-    pub channel: u16,
+    /// Channel number (1-indexed). Widened to `u32` to hold either physical
+    /// width: POD5 V6 stores this as `uint32`, V3-V5 as `uint16`. escapepod
+    /// still *writes* the V5 narrow column, so a value above `u16::MAX`
+    /// is refused rather than truncated.
+    pub channel: u32,
 
-    /// Well number (1-4)
+    /// Well number (typically 1-4)
     pub well: u8,
 
-    /// Pore type string
-    pub pore_type: String,
+    /// Chemistry/pore-type identifier (e.g. `"dna_r10.4.1"`, `"rna_004"`).
+    /// A thin `Arc<str>` newtype, not a closed enum — POD5 leaves this
+    /// column open-vocabulary. `.as_str()` / `AsRef<str>` / `Display` borrow
+    /// the string; cloning is a refcount bump.
+    pub pore_type: PoreType,
 
     /// Calibration offset for converting ADC to pA
     pub calibration_offset: f32,
@@ -44,8 +50,22 @@ pub struct ReadData {
     /// Index into run info table
     pub run_info_index: u32,
 
-    /// Number of MinKNOW events
+    /// Number of MinKNOW events in this read
     pub num_minknow_events: u64,
+
+    /// Tracked scaling scale/shift (post-hoc rescaling MinKNOW recorded)
+    pub tracked_scaling_scale: f32,
+    pub tracked_scaling_shift: f32,
+
+    /// Predicted scaling scale/shift (MinKNOW's live estimate)
+    pub predicted_scaling_scale: f32,
+    pub predicted_scaling_shift: f32,
+
+    /// Number of reads since the channel's last mux change
+    pub num_reads_since_mux_change: u32,
+
+    /// Time since the last mux change, in seconds
+    pub time_since_mux_change: f32,
 
     /// Total number of signal samples
     pub num_samples: u64,
@@ -53,7 +73,13 @@ pub struct ReadData {
     /// Estimated open pore current level
     pub open_pore_level: f32,
 
-    /// Signal row indices (internal use)
+    /// Expected open pore current level for this read (POD5 V5+)
+    pub expected_open_pore_level: f32,
+
+    /// Selected pore level for this read (POD5 V5+)
+    pub selected_read_level: f32,
+
+    /// Signal row indices into the signal table (internal use)
     pub signal_rows: Vec<u64>,
 }
 ```
@@ -156,6 +182,10 @@ pub enum EndReason {
     DataServiceUnblockMuxChange,
     SignalPositive,
     SignalNegative,
+    ApiRequest,
+    DeviceDataError,
+    AnalysisConfigChange,
+    Paused,
 }
 ```
 
@@ -167,6 +197,10 @@ pub enum EndReason {
 | `DataServiceUnblockMuxChange` | Data service triggered unblock |
 | `SignalPositive` | Normal end, positive signal |
 | `SignalNegative` | Normal end, negative signal |
+| `ApiRequest` | Ended by an explicit API request |
+| `DeviceDataError` | Ended due to a device data error |
+| `AnalysisConfigChange` | Ended by an analysis configuration change |
+| `Paused` | Acquisition was paused |
 
 ## Error
 
@@ -180,20 +214,42 @@ pub enum Error {
     /// Invalid POD5 file signature
     InvalidSignature,
 
-    /// Invalid footer structure
+    /// File signature mismatch between start and end (truncated/corrupt)
+    SignatureMismatch,
+
+    /// Invalid or corrupted footer
     InvalidFooter(String),
+
+    /// FlatBuffer parsing error
+    FlatBuffer(String),
 
     /// Arrow error during IPC operations
     Arrow(arrow::error::ArrowError),
 
-    /// Compression/decompression error
+    /// Signal compression/decompression error
     Compression(String),
+    Decompression(String),
 
-    /// Missing required field
+    /// Invalid UUID format
+    InvalidUuid(String),
+
+    /// Unsupported POD5 schema version
+    UnsupportedVersion(String),
+
+    /// Missing required field, or invalid data in a field
     MissingField(String),
+    InvalidField { field: String, message: String },
 
-    /// Read not found
+    /// Read ID not found
     ReadNotFound(Uuid),
+
+    /// Batch index out of bounds
+    BatchIndexOutOfBounds { index: usize, max: usize },
+
+    // ...plus `.p5s`-sidecar-specific variants (`SidecarIndexMismatch`,
+    // `SidecarRowOutOfBounds`, `DictionaryValueNotFound`, `WriterFinalized`,
+    // `InvalidArrowIpc`, `InvalidSectionMarker`, `InvalidState`, `Parse`,
+    // `Zstd`) for failure modes specific to those subsystems.
 }
 ```
 
@@ -221,13 +277,33 @@ Configuration for file writing.
 
 ```rust linenums="1"
 pub struct WriterOptions {
-    /// Enable VBZ signal compression (default: true)
-    pub signal_compression: bool,
+    /// Maximum number of samples per signal chunk (default: 102400)
+    pub max_signal_chunk_size: u32,
 
-    /// Maximum samples per signal chunk (default: 102400)
-    pub signal_chunk_size: u32,
+    /// Number of signal chunks per Arrow batch (default: 100)
+    pub signal_batch_size: u32,
+
+    /// Number of reads per Arrow batch (default: 1000)
+    pub read_batch_size: u32,
+
+    /// Whether to compress signal data using VBZ (default: true)
+    pub compress_signal: bool,
+
+    /// Software name recorded in the footer (default: `"escapepod-rs <ver>"`)
+    pub software: String,
+
+    /// Predefined dictionary values for multi-batch consistency (default: `None`)
+    pub predefined_dictionaries: Option<PredefinedDictionaries>,
+
+    /// How hard to push bytes to stable storage before the staged file is
+    /// renamed into place (default: [`Durability::None`] — rename only)
+    pub durability: Durability,
 }
 ```
+
+`Durability` trades write cost for crash safety: `None` (default, rename
+only), `File` (`fsync` the staging file before rename), or `FileAndDir`
+(also `fsync` the parent directory, so the rename record itself is durable).
 
 ## UUID Handling
 

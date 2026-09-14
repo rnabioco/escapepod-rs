@@ -87,7 +87,7 @@ escpod filter -i mapped_reads.txt -o mapped.pod5 experiment.pod5
 Extract reads that exist in another file:
 
 ```bash
-escpod inspect reads reference.pod5 > reference_ids.txt
+escpod view --ids reference.pod5 > reference_ids.txt
 escpod filter -i reference_ids.txt -o matching.pod5 experiment.pod5
 ```
 

@@ -64,12 +64,17 @@ Compressed signal chunks:
 
 | Field | Type | Description |
 |-------|------|-------------|
+| read_id | FixedSizeBinary(16) | Read this chunk belongs to |
 | signal | VBZ binary | Compressed signal data |
 | samples | u32 | Number of samples |
 
 ### Run Info Table
 
-One row per unique acquisition:
+One row per unique acquisition. Partial list — the full schema also
+carries `experiment_name`, `flow_cell_id`, `flow_cell_product_code`,
+`protocol_name`, `protocol_run_id`, `protocol_start_time`, `sample_id`,
+`sequencing_kit`, `sequencer_position`, `sequencer_position_type`,
+`software`, `system_name`, and `system_type` (all `string`):
 
 | Field | Type | Description |
 |-------|------|-------------|

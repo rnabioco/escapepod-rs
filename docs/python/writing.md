@@ -109,7 +109,7 @@ Tuning options are keyword arguments on the constructor; all are optional:
 writer = escapepod.Writer(
     "out.pod5",
     compress_signal=True,        # VBZ-compress signal (default on)
-    signal_batch_size=None,      # reads per signal record batch
+    signal_batch_size=None,      # signal chunks per record batch
     read_batch_size=None,        # reads per reads record batch
     max_signal_chunk_size=None,  # max samples per signal chunk
     software="my-tool 1.0",      # writer software string

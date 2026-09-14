@@ -38,10 +38,14 @@ The default output includes:
 | `channel` | Channel number |
 | `well` | Well number (1-4) |
 | `read_number` | Sequential read number |
-| `start` | Start sample position |
+| `start_sample` | Start sample position |
 | `num_samples` | Total signal samples |
-| `median_before` | Median current before read |
 | `end_reason` | Why the read ended |
+
+`median_before` (and `pore_type`, `num_minknow_events`, `calibration_offset`,
+`calibration_scale`, `run_info`, `open_pore_level`,
+`expected_open_pore_level`, `selected_read_level`, `end_reason_forced`) are
+available but not shown by default — pull them in with `--include`.
 
 ## Examples
 

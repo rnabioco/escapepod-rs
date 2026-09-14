@@ -23,7 +23,7 @@ Every tagged version publishes `escpod` binaries on the
 | `escpod-<ver>-aarch64-apple-darwin.tar.gz` | dynamic | no |
 
 ```bash
-VER=v0.16.1
+VER=v0.26.0
 curl -L "https://github.com/rnabioco/escapepod-rs/releases/download/$VER/escpod-$VER-x86_64-unknown-linux-musl.tar.gz" | tar xz
 install -m755 escpod ~/.local/bin/
 escpod --version

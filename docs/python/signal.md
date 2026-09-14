@@ -40,6 +40,17 @@ table.get("AACGT")            # expected level for one kmer -> float
 levels = table.extract_levels("AACGTACGT...")  # per-base expected levels -> float32
 ```
 
+`extract_levels` centers each kmer on `table.dominant_base` — the position
+within the kmer this table assigns its level to, which is empirical and not
+necessarily the midpoint (3, not `k // 2 == 4`, on the RNA004 9-mer table).
+To center elsewhere — e.g. a caller inheriting leech's `k // 2` convention —
+use `extract_levels_at` with an explicit position instead:
+
+```python linenums="1"
+table.dominant_base                              # e.g. 3 for RNA004
+levels = table.extract_levels_at("AACGTACGT...", centre=table.k // 2)
+```
+
 ## Refining a signal-to-sequence map
 
 `refine_signal_map` refines a base-to-signal boundary assignment (a

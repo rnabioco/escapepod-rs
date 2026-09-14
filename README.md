@@ -74,7 +74,7 @@ publishes prebuilt binaries on the
 | `escpod-<ver>-{x86_64,aarch64}-apple-darwin.tar.gz` | macOS |
 
 ```bash
-VER=v0.16.1
+VER=v0.26.0
 curl -L "https://github.com/rnabioco/escapepod-rs/releases/download/$VER/escpod-$VER-x86_64-unknown-linux-musl.tar.gz" | tar xz
 ./escpod --version
 ```
@@ -163,6 +163,22 @@ from the [KleistLab](https://github.com/KleistLab):
   `scripts/export_adapter_cnn_to_onnx.py`) and accept ADAPTed's license
   terms separately.
 
+### Barcode CTC-CRF basecalling — bonito / SeqTagger
+
+- **[bonito](https://github.com/nanoporetech/bonito)** — Oxford Nanopore
+  Technologies. `escapepod-demux::crf` is a Rust port of bonito's `CTC_CRF`
+  decode (`bonito/crf/model.py`) — sparse lattice geometry, edge convention,
+  and the forward/backward-then-Viterbi decode — plus a native-kernel
+  recognizer for bonito-exported CRF encoder graphs (`crf::encoder_native`).
+- **[SeqTagger](https://github.com/novoalab/SeqTagger)** (Pryszcz\*,
+  Diensthuber\*, et al., *Genome Research* 2025) — Novoa lab. Origin of the
+  barcode CTC-CRF approach `escpod demux basecall` targets, and of the
+  `config.toml` export convention that motivated the `metadata.json` sidecar:
+  its standardisation constants silently mismatch the ones a given model was
+  actually trained with, so escapepod-rs refuses to trust the bonito config
+  and requires the sidecar instead. Training these models is now standalone
+  (rnabioco/leech), no longer via bonito.
+
 ### Signal-to-base resquiggle
 
 - **[fishnet](https://www.researchsquare.com/article/rs-8345719/v1)** by
@@ -186,6 +202,7 @@ from the [KleistLab](https://github.com/KleistLab):
 ### Citation
 
 If you use escapepod-rs in research, please also cite the upstream tools
-whose algorithms it implements (WarpDemuX, ADAPTed, fishnet, POD5).
+whose algorithms it implements (WarpDemuX, ADAPTed, fishnet, POD5, bonito,
+SeqTagger).
 
 If we've missed an acknowledgment, please open an issue.

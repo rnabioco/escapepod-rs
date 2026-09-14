@@ -67,7 +67,7 @@ command.
 
 ## escpod inspect reads
 
-List all read IDs in the file.
+List every read in the file as a fixed-width table.
 
 ### Usage
 
@@ -83,16 +83,22 @@ escpod inspect reads experiment.pod5
 
 Output:
 ```
-a1b2c3d4-e5f6-7890-abcd-ef1234567890
-b2c3d4e5-f6a7-8901-bcde-f12345678901
-c3d4e5f6-a7b8-9012-cdef-123456789012
+read_id                               channel  well    samples  end_reason
+----------------------------------------------------------------------------
+a1b2c3d4-e5f6-7890-abcd-ef1234567890        1     1    50000    signal_positive
+b2c3d4e5-f6a7-8901-bcde-f12345678901        1     1    75000    signal_positive
+c3d4e5f6-a7b8-9012-cdef-123456789012        2     1    62000    signal_positive
 ...
 ```
 
-This is useful for creating filter lists:
+`<INPUT>` may also be a directory, aggregating across every POD5 it contains.
+
+To build a bare read-ID list for `filter -i`/`bam-filter`, use
+[`escpod view --ids`](view.md) instead — `inspect reads` is for reading, not
+for piping:
 
 ```bash
-escpod inspect reads experiment.pod5 > all_reads.txt
+escpod view --ids experiment.pod5 > all_reads.txt
 ```
 
 ## escpod inspect read
@@ -120,16 +126,28 @@ escpod inspect read experiment.pod5 a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
 Output:
 ```
-Read: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-  Channel: 1
-  Well: 1
-  Read number: 42
-  Start sample: 1234567
-  Num samples: 50000
-  Median before: 210.5 pA
-  End reason: signal_positive
-  Calibration:
-    Offset: -240.5
-    Scale: 0.145
-  Run info: abc123-def456
+Read Details
+============
+
+read_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+read_number: 42
+channel: 1
+well: 1
+start_sample: 1234567
+num_samples: 50000
+num_minknow_events: 100
+
+pore_type: rna_004
+calibration_offset: -240.5
+calibration_scale: 0.145
+median_before: 210.5
+open_pore_level: 220.1
+expected_open_pore_level: 219.8
+selected_read_level: 220.0
+
+end_reason: signal_positive
+end_reason_forced: false
 ```
+
+`<INPUT>` may also be a directory; the search stops at the first file
+containing a match and prints its path first.
