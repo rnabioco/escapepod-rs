@@ -64,8 +64,10 @@ kmer levels using banded dynamic programming.
 | `--kmer-model <NAME>` | Named k-mer model resolved from the local cache, e.g. `dna_r10.4.1_e8.2_400bps` (see [K-mer models](#k-mer-models); mutually exclusive with `--kmer-table`) |
 | `-o, --output <FILE>` | Output BAM file (required) |
 | `--algo <ALGO>` | Refinement algorithm: `dwell-penalty` (default) or `viterbi` |
-| `--iterations <N>` | Number of refinement iterations (default: 1) |
+| `--iterations <N>` | Number of refinement iterations (default: 2) |
 | `--half-bandwidth <N>` | Half bandwidth for banded DP (default: 5) |
+| `--banding <ALGO>` | Banding algorithm: `adaptive` (default) or `fixed` — see [Banded Dynamic Programming](#banded-dynamic-programming) |
+| `--x-drop <N>` | Adaptive-banding early-termination threshold; DP bails out and returns the initial map once the best per-base score exceeds the global best by more than this (unset by default) |
 | `--rescale <ALGO>` | Rescale algorithm: `theil-sen` (default) or `least-squares` |
 | `--dwell-target <N>` | Target dwell time per base for dwell-penalty (default: 0 = auto from move table) |
 | `--dwell-weight <W>` | Dwell penalty weight (default: 0.5) |
@@ -312,12 +314,24 @@ The command runs in three phases:
 
 ### Banded Dynamic Programming
 
-The DP operates within a band around the initial move-table alignment to avoid
-exploring the entire signal x sequence space. The `--half-bandwidth` parameter
-controls how far from the initial alignment the DP can search.
+The DP operates within a band around an alignment to avoid exploring the
+entire signal x sequence space, and finds the lowest-cost path through that
+band — cost is the squared error between the measured signal and the
+expected kmer level at each position. `--banding` selects how the band is
+placed:
+
+- **`adaptive`** (default) — Suzuki & Kasahara (2017)-style banding. The band
+  center shifts during the forward pass to track wherever the DP's own
+  running optimum is, rather than staying pinned to the initial move-table
+  alignment; `--half-bandwidth` sets the band's half-width around that moving
+  center. `--x-drop` optionally cuts the search short: once the best
+  per-base score exceeds the global best by more than the threshold, the DP
+  bails out and returns the initial map instead of continuing.
+- **`fixed`** — a static Sakoe-Chiba band around the initial move-table
+  alignment, `--half-bandwidth` wide on each side and never re-centered.
 
 ```
-  Signal position ──▶
+  Signal position ──▶ (fixed banding, for illustration)
   0         10        20        30        40        50
   ├─────────┼─────────┼─────────┼─────────┼─────────┤
 
@@ -331,9 +345,6 @@ controls how far from the initial alignment the DP can search.
   ▓ = initial alignment from move table
   half_bandwidth = 5 in this example
 ```
-
-The DP finds the lowest-cost path through the band, where cost is the squared
-error between the measured signal and the expected kmer level at each position.
 
 ### Refinement (`--algo`)
 

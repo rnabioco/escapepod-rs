@@ -12,8 +12,8 @@ let writer = Writer::create("output.pod5", WriterOptions::default())?;
 
 // Custom options
 let options = WriterOptions {
-    signal_compression: true,
-    signal_chunk_size: 102_400,
+    compress_signal: true,
+    max_signal_chunk_size: 102_400,
     ..Default::default()
 };
 let writer = Writer::create("output.pod5", options)?;
@@ -59,7 +59,7 @@ let read = ReadData {
     start_sample: 0,
     channel: 1,
     well: 1,
-    pore_type: "not_set".to_string(),
+    pore_type: "not_set".into(),
     calibration_offset: -240.0,
     calibration_scale: 0.145,
     median_before: 210.5,
@@ -112,7 +112,7 @@ fn write_pod5_file() -> Result<(), escapepod_signal::Error> {
         let read = ReadData {
             read_id: Uuid::new_v4(),
             read_number: i + 1,
-            channel: ((i % 512) + 1) as u16,
+            channel: (i % 512) + 1,
             well: ((i % 4) + 1) as u8,
             run_info_index: run_idx,
             num_samples: 10000,
@@ -135,8 +135,13 @@ fn write_pod5_file() -> Result<(), escapepod_signal::Error> {
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `signal_compression` | `true` | Enable VBZ compression for signal |
-| `signal_chunk_size` | `102400` | Max samples per signal chunk |
+| `max_signal_chunk_size` | `102400` | Max samples per signal chunk |
+| `signal_batch_size` | `100` | Signal chunks per Arrow batch |
+| `read_batch_size` | `1000` | Reads per Arrow batch |
+| `compress_signal` | `true` | Enable VBZ compression for signal |
+| `software` | `"escapepod-rs <ver>"` | Software name recorded in the footer |
+| `predefined_dictionaries` | `None` | Fixed dictionary values for multi-batch consistency |
+| `durability` | `Durability::None` | Crash-safety level for the staged-file rename (see [Types](types.md)) |
 
 ## Signal Compression
 
@@ -163,9 +168,10 @@ for run_info in reader.run_infos() {
 }
 
 // Copy specific reads
-for read in reader.reads() {
+for read in reader.reads()? {
+    let read = read?;
     if should_include(&read) {
-        let signal = reader.get_signal(&read)?;
+        let signal = reader.get_signal(&read.signal_rows)?;
         writer.add_read(read, &signal)?;
     }
 }

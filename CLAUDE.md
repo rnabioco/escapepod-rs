@@ -43,8 +43,8 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 \
 # Use on a node with a visible GPU. `--device auto` (the default) places each
 # stage where it wins — GPU for CNN detect + CRF encoder, CPU for DTW — so a
 # GPU build usually needs no flag at all. `--device gpu` demands the device and
-# errors instead of falling back; `--device cpu` forces CPU. The old `--gpu` is
-# a hidden deprecated alias for `--device gpu`.
+# errors instead of falling back; `--device cpu` forces CPU. The old `--gpu`
+# flag was removed in 0.26.0 (#375) — use `--device gpu`.
 escpod demux reads.pod5 --model <bundle> --annotate
 escpod demux classify --model model.json reads.fp.csv --device gpu -o out.tsv
 
@@ -376,7 +376,7 @@ POD5 is a container format wrapping Apache Arrow IPC (Feather v2) tables:
 - `resquiggle`: Refine signal-to-base mapping using banded DP with POD5 signal and BAM move tables. Takes a k-mer level table via `--kmer-table <path>` or a named model via `--kmer-model <name>` (DNA + RNA; `dna_r10.4.1_e8.2_400bps`, `rna004`, …). Named models resolve from a local cache (`$ESCAPEPOD_KMER_CACHE` → `$XDG_CACHE_HOME/escapepod/kmer_models` → `~/.cache/…`) that is **never** populated at runtime — build with `--features models-download` and prefetch on a networked login node (`escpod resquiggle models fetch --all`) before submitting compute jobs (Alpine/Beevol compute nodes can't reach GitHub). Tables come from nanoporetech/kmer_models (MPL-2.0), pinned to a commit + sha256; the code path uses `ureq`/rustls so the static-musl release stays OpenSSL-free.
 - `classify`: tRNA charging (aminoacylation) classification from POD5 + aligned BAM (`escpod classify reads.pod5 -b aln.bam -r ref.fa -m bundle/ -o out.bam`). Writes `cl = round(P(charged)·255)` (uint8) directly onto the BAM — no modbase `ML`→`cl` round-trip — plus optional `--tsv`. `--orientation time|reversed` overrides the frame vote for small batches (< 50 informative reads); it is ignored (with a warning) by a `waveform_model` bundle, whose frame is declared rather than voted.
 
-  It was `escpod signal classify` from 0.11.0 through 0.18.1, grouped under a `signal` namespace so the *word* `classify` could not be confused with `escpod demux classify` (barcode DTW/GBM). Every other tool in the binary is one word, and the two were never ambiguous in use — `demux classify` is a demux stage over a fingerprint CSV, this takes a POD5 and a BAM — so the group is retired. `escpod signal classify` survives as a **hidden deprecated alias** (`commands::signal`) that warns and forwards to the same runner, so 0.11-era scripts keep working.
+  It was `escpod signal classify` from 0.11.0 through 0.18.1, grouped under a `signal` namespace so the *word* `classify` could not be confused with `escpod demux classify` (barcode DTW/GBM). Every other tool in the binary is one word, and the two were never ambiguous in use — `demux classify` is a demux stage over a fingerprint CSV, this takes a POD5 and a BAM — so the group is retired. The deprecated `escpod signal classify` alias survived as a hidden forwarder through 0.25.x and was removed entirely in 0.26.0 (#375); use `escpod classify`.
 - `demux`: Barcode demultiplexing workflow with subcommands:
   - `detect`: LLR-based adapter boundary detection
   - `fingerprint`: T-test segmentation for barcode fingerprints

@@ -460,33 +460,6 @@ Block-based parallel (for very large matrices):
   - Better cache locality
 ```
 
-### Early Stopping in LLR
-
-```
-Early Stopping Optimization
-───────────────────────────
-
-Monitor derivative of gain curve:
-  if mean_derivative(window) < 0:
-    stop_searching
-
-         gain
-           │     ╭─╮
-           │    ╱   ╲
-           │   ╱     ╲  ← derivative becomes negative
-           │  ╱       ╲
-           │ ╱         ╲
-           └──────────────────▶ position
-                 ▲
-                 │
-            Stop here (past peak)
-
-Benefits:
-  - Avoids unnecessary computation
-  - Useful for very long signals
-  - Configurable window and stride
-```
-
 ---
 
 ## Library API
@@ -499,10 +472,8 @@ use escapepod_signal::segmentation::{LlrTrace, detect_adapter};
 // Create trace from signal
 let trace = LlrTrace::new(&signal, stride);
 
-// Compute gains for a range
-let gains = trace.compute_gains(start, end, min_obs, border_trim);
-
-// Find best split
+// Find the best split point in a range — a single inline-argmax pass,
+// not a materialized gains vector (that API was removed in 0.25.0)
 let (position, gain) = trace.best_split(start, end, min_obs, border_trim)?;
 
 // Full adapter detection

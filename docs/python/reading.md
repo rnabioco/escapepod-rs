@@ -64,7 +64,7 @@ By default a requested ID that isn't in the file raises `KeyError`; pass
 ## Looking up specific reads
 
 ```python linenums="1"
-read = reader.get_read("<uuid>")                    # one read, KeyError if absent
+read = reader.get_read("<uuid>")                    # one read, ValueError if absent
 reads = reader.get_reads(["<uuid-1>", "<uuid-2>"])  # many reads
 reads = reader.get_reads(ids, missing_ok=True)      # skip absent IDs
 ```
@@ -88,9 +88,18 @@ reader.design()                    # {"key_columns": …, "value_columns": …,
                                    #  "rows": [...]} or None
 ```
 
-Unassigned reads are absent from the dict. A sidecar that does not match the
-POD5 (stale, or copied from another file) raises instead of returning wrong
-answers. The sidecar itself is a plain Arrow IPC table, so
+Numeric columns (e.g. a demux classifier's confidence/margin scores) live
+alongside the string annotations, under their own accessors — a separate
+Arrow type, so a separate pair of methods:
+
+```python
+reader.score_names()                # e.g. ["ldx_confidence", "ldx_crf_margin"]
+scores = reader.score("ldx_confidence")  # dict[read_id, float]
+```
+
+Unassigned/unscored reads are absent from the dict. A sidecar that does not
+match the POD5 (stale, or copied from another file) raises instead of
+returning wrong answers. The sidecar itself is a plain Arrow IPC table, so
 `pyarrow.ipc.open_file("reads.pod5.p5s").read_all()` works too.
 
 ## Accessing signal data
@@ -107,9 +116,16 @@ signal_pa = reader.get_signal_pa(read)  # numpy float32, picoamps (calibrated)
 
 `get_signal` returns raw ADC counts as `int16`. `get_signal_pa` applies the
 read's calibration (`(adc + offset) * scale`) and returns `float32` picoamps.
+Both take an optional `max_samples`, decoding only that many leading samples
+instead of the whole read (a read shorter than `max_samples` comes back
+whole) — cheaper than slicing after the fact when only a prefix is needed:
+
+```python linenums="1"
+prefix = reader.get_signal(read, max_samples=1000)  # first 1000 ADC samples
+```
 
 For many reads at once, the bulk variants decode in parallel and return
-`(read_id, signal)` tuples:
+`(read_id, signal)` tuples; they take the same `max_samples`:
 
 ```python linenums="1"
 reads = reader.reads()

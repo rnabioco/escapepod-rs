@@ -9,7 +9,9 @@
     cargo install --git https://github.com/rnabioco/escapepod-rs --features experimental
     ```
 
-Repack POD5 files to optimize storage and apply current compression settings.
+Repack POD5 files into fresh, consistently-sized batches using block-level
+signal copying — signal bytes are never decompressed or recompressed, so a
+repack is much faster than a decompress/recompress round trip.
 
 ## Usage
 
@@ -73,6 +75,7 @@ Repacked 50000 reads across 5 file(s)
 ## Notes
 
 - Output files retain the same names as input files
-- Signal data is decompressed and re-compressed during repacking
+- Signal data is copied at the compressed-block level — never decompressed
+  or re-compressed
 - Run info and all metadata is preserved
 - Safe for in-place repacking

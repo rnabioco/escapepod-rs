@@ -45,7 +45,7 @@ Signal data is stored separately and must be explicitly requested:
 
 ```rust linenums="1"
 // Get signal for a specific read
-let signal: Vec<i16> = reader.get_signal(&read)?;
+let signal: Vec<i16> = reader.get_signal(&read.signal_rows)?;
 
 // Signal is raw ADC values
 println!("Signal length: {}", signal.len());

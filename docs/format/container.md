@@ -77,21 +77,25 @@ The footer is a FlatBuffer containing:
 
 ```flatbuffers
 table Footer {
-    file_identifier: string;      // "POD5"
+    file_identifier: string;      // File UUID
     software: string;             // Writer software name
-    section_marker: [ubyte];      // 16-byte UUID
+    pod5_version: string;         // e.g. "0.3.44"
 
-    contents: EmbeddedFile;       // File manifest
-    reads: EmbeddedFile;          // Reads table location
-    run_info: EmbeddedFile;       // Run info location
-    signal: EmbeddedFile;         // Signal location
+    contents: [EmbeddedFile];     // one entry per embedded table/index
 }
 
 table EmbeddedFile {
-    offset: long;                 // Byte offset from start
-    length: long;                 // Length in bytes
+    offset: int64;                // Byte offset from start
+    length: int64;                // Length in bytes
+    format: Format;               // e.g. FeatherV2
+    content_type: ContentType;    // ReadsTable | SignalTable | RunInfoTable
+                                   // | ReadIdIndex | OtherIndex
 }
 ```
+
+There's no dedicated field per table — `contents` is one vector, and each
+entry's `content_type` says which table it is. A reader scans `contents`
+for the entry it wants rather than reading a fixed offset.
 
 ## Reading Algorithm
 
@@ -111,8 +115,11 @@ let footer_len = read_i64(&file[file_len - 8 - 16 - 8..]);
 let footer_start = file_len - 8 - 16 - 8 - footer_len;
 let footer = parse_footer(&file[footer_start..]);
 
-// Access tables via footer offsets
-let reads_data = &file[footer.reads.offset..][..footer.reads.length];
+// Find a table by scanning `contents` for its content type
+let reads_entry = footer.contents.iter()
+    .find(|e| e.content_type == ContentType::ReadsTable)
+    .unwrap();
+let reads_data = &file[reads_entry.offset..][..reads_entry.length];
 ```
 
 ## Memory Mapping
@@ -142,5 +149,4 @@ The format provides several integrity checks:
 
 1. **Signature validation** - File starts/ends with magic bytes
 2. **Section markers** - UUIDs at section boundaries
-3. **Footer checksum** - Optional CRC in footer
-4. **Arrow validation** - Schema consistency checks
+3. **Arrow validation** - Schema consistency checks

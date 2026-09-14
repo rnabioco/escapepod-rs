@@ -20,6 +20,7 @@ adapter detection, classification, and output — in one pass over the input:
 ```bash
 # Fetch a model bundle once (networked node; compute nodes can't reach GitHub)
 escpod demux models fetch crf_nbc16_rna004
+escpod demux models fetch --all      # every bundle in the manifest
 
 # Demux into per-barcode POD5 files
 escpod demux reads.pod5 --model ~/.cache/escapepod/demux_models/barcode_crf_nbc16_rna004@v0.3.1 -d out/
@@ -232,9 +233,9 @@ flowchart LR
 | [detect](#detect) | Detect adapter boundaries (LLR or CNN) |
 | [fingerprint](#fingerprint) | Extract signal fingerprints from adapter regions |
 | [classify](#classify) | Classify reads by barcode using DTW distance |
-| `basecall` | CTC-CRF barcode basecalling from a boundaries CSV; `--barcodes` assigns reads by edit distance |
+| [basecall](#basecall) | CTC-CRF barcode basecalling from a boundaries CSV; `--barcodes` assigns reads by edit distance |
 | [split](#split) | Split reads into separate POD5 files by barcode (CSV or `--sidecar`) |
-| `models` | List / fetch published model bundles (`list`, `path`, `fetch`) |
+| `models` | List / fetch published model bundles (`list`, `path`, `fetch [--all]`) |
 | [train](#train) | Train reference fingerprints from known samples |
 | [train-svm](#train-svm) | Train SVM model from fingerprints (requires `train` feature) |
 
@@ -307,6 +308,7 @@ escpod demux detect <FILES>... -o <OUTPUT>
 | `--method <cnn\|llr>` | Boundary detector; `cnn` is what the published models were trained against |
 | `--cnn-model <FILE>` / `--cnn-model-name <NAME>` | Boundary-CNN ONNX (explicit path, or a fetched bundle by name) |
 | `--device <auto\|cpu\|gpu>` | Where CNN detection runs (default `auto`, which prefers the GPU here) |
+| `--emit-llr-delta` | QC column comparing the CNN boundary against an LLR-detected one on the same read (`cnn-detect` builds only). Opt-in for I/O, not compute: LLR normalizes over the whole read, so the CNN path can no longer decode just its leading `max_obs_trace` samples — every read is decompressed in full while this is on |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -446,7 +448,9 @@ escpod demux fingerprint <FILES>... --boundaries <CSV> -o <OUTPUT>
 | `--segment-end <N>` | End sample offset within adapter region (default: 2000) |
 | `--num-segments <N>` | Number of fingerprint segments (default: 10) |
 | `--window-width <N>` | T-test window width (default: 5) |
-| `--normalize <METHOD>` | Normalization method: zscore, minmax, median, none (default: zscore) |
+| `--normalize <METHOD>` | Normalization method: zscore, minmax, median, mean, none (default: zscore) |
+| `--warpdemux-compat` | WarpDemuX-compatible mode: full adapter region, 110 t-test events (window=12, min_sep=6), keeps the last 25 segment means, mean normalization |
+| `--emit-dwell` | Append per-segment dwell time as a second feature channel (log1p + z-score), doubling the output width from N to 2N columns (`fp_0..N-1, dwell_0..N-1`). Opt-in: breaks binary compatibility with existing 25-wide WarpDemuX-compat models |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -609,6 +613,73 @@ escpod demux classify fingerprints.csv --reference reference.csv -o out.csv --mi
 
 ---
 
+## basecall
+
+CTC-CRF barcode basecalling from a boundaries CSV — the alternative to
+`fingerprint` + `classify` in the stepwise pipeline (`crf-decode` feature,
+in the default build). Decodes each read's barcode region with the CRF
+encoder + lattice decode; given `--barcodes`, it also matches the decoded
+sequence to the closest reference by edit distance, producing exactly the
+`barcode` column `escpod demux split` consumes.
+
+### Usage
+
+```bash
+escpod demux basecall <FILES>... --boundaries <CSV> --model <DIR> -o <OUTPUT>
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<FILES>` | Input POD5 file(s) or directory |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--boundaries <FILE>` | Detected boundaries CSV, from `escpod demux detect` (required) |
+| `--model <DIR>` | CRF encoder bundle directory (`metadata.json` + the ONNX graph it names) (required) |
+| `-o, --output <FILE>` | Output CSV of decoded sequences (required) |
+| `--barcodes <FILE>` | Barcode reference CSV (`name,sequence` columns). Assigns each read to its closest reference by edit distance, adding `barcode`/`confidence`-shaped columns; without it, only decoded sequences are emitted |
+| `--min-margin <N>` | Call a read `unclassified` when its edit-distance margin to the second-best reference is below this (default: 0, keeps every call including ties). Requires `--barcodes` |
+| `--ref-scores` | Also score every reference against the lattice itself, adding `crf_logp` (`log P(called barcode \| signal)`, a real probability — unlike the edit-distance `confidence`, which measures how far apart the references are rather than how sure the model is), `crf_margin` (the call's log-odds in nats against its best alternative), `crf_best`, and `mean_logpost`. ~+7.6% runtime; on GPU the decode is pulled back to the host to see the raw scores. Requires `--barcodes` |
+| `--min-crf-margin <NATS>` | Call a read `unclassified` when the lattice's log-odds for the called barcode against its best alternative are below this (implies `--ref-scores`). Continuous, unlike `--min-margin`'s handful of edit-distance values; ~0.7 nats is 2:1 odds, 2.3 is 10:1, 4.6 is 100:1. Requires `--barcodes` |
+| `--min-crf-prob <P>` | Call a read `unclassified` when `P(called barcode \| signal)` is below this (implies `--ref-scores`) — absolute confidence, not relative to the runner-up. Requires `--barcodes` |
+| `--boundary-margin <N>` | Overrule the bundle's declared `boundary.margin`; reads below it emit an empty sequence rather than a poor one |
+| `--clamp-max-shift <N>` | Overrule the bundle's declared `boundary.clamp_max_shift`: decode a read whose adapter ends before the model's chunk window, provided the shift needed is at most N (0 disables). Reaches reads `--boundary-margin` cannot, at lower accuracy — check calls it adds independently before relying on them |
+| `--device <auto\|cpu\|gpu>` | Where encoder inference runs (default `auto`, prefers GPU — the encoder is ~91% of this command's CPU cost) |
+| `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
+| `-h, --help` | Print help |
+
+### Output Format
+
+Headerless CSV. Every read that reached the decoder gets a row, including
+ones that could not be decoded (emitted as `unclassified` rather than
+dropped, so `demux split` cannot silently lose reads):
+
+```csv
+# Without --barcodes:
+read_id,adapter_end,decoded_len,sequence
+
+# With --barcodes:
+read_id,barcode,margin,best_dist,second_best_dist,adapter_end,decoded_len,sequence
+
+# With --barcodes --ref-scores (or a --min-crf-* gate, which implies it):
+read_id,barcode,margin,best_dist,second_best_dist,adapter_end,decoded_len,sequence,crf_logp,crf_margin,crf_best,mean_logpost
+```
+
+### Example
+
+```bash
+escpod demux detect *.pod5 -o boundaries.csv
+escpod demux basecall *.pod5 --boundaries boundaries.csv --model bundles/barcode_crf_ldx32_rna004 \
+    --barcodes barcodes.csv -o classifications.csv
+escpod demux split *.pod5 --classifications classifications.csv -d demuxed/
+```
+
+---
+
 ## split
 
 Split reads into separate POD5 files based on barcode classification.
@@ -635,7 +706,7 @@ escpod demux split <FILES>... --classifications <CSV> --output-dir <DIR>
 | `-d, --output-dir <DIR>` | Output directory for demuxed files (required) |
 | `--prefix <STR>` | Output file prefix (default: `barcode`) |
 | `--classified-only` | Drop unclassified reads instead of writing them to their own file |
-| `-f, --force` | Overwrite existing per-barcode output files |
+| `--force` | Overwrite existing per-barcode output files |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
 | `-h, --help` | Print help |
 
@@ -731,7 +802,7 @@ escpod demux train --assignments <CSV> -o <OUTPUT>
 | `--segment-end <N>` | End sample for fingerprint region (default: 2000) |
 | `--num-segments <N>` | Number of fingerprint segments (default: 10) |
 | `--window-width <N>` | T-test window width (default: 5) |
-| `--normalize <METHOD>` | Normalization method (default: zscore) |
+| `--normalize <METHOD>` | Normalization method: zscore, minmax, median, mean, none (default: zscore) |
 | `--min-adapter <N>` | Minimum adapter observations (default: 200) |
 | `--border-trim <N>` | Border trim size (default: 50) |
 | `-t, -j, --threads <N>` | Number of threads for parallel processing (default: 16, capped at available CPUs) |
@@ -793,6 +864,8 @@ escpod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
 | `--power <VALUE>` | Power to raise distances before exponential (default: 1.0) |
 | `--window <N>` | DTW window constraint (Sakoe-Chiba band) |
 | `--thresholds <VALUES>` | Per-class confidence thresholds (comma-separated) |
+| `--max-per-class <N>` | Randomly subsample each barcode class to at most N fingerprints before training — required for large datasets since the all-pairs DTW distance matrix is O(N²) memory. Balanced (same cap per class) and deterministic under `--seed` |
+| `--seed <N>` | RNG seed for `--max-per-class` subsampling (default: 42) |
 | `-h, --help` | Print help |
 
 ### Input Format
