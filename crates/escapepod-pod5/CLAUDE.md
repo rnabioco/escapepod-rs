@@ -5,7 +5,7 @@
 - Depends on nothing in the workspace. `escapepod-signal` re-exports the whole surface as `pod5`; `escapepod-python` consumes it through that re-export — grep `crates/escapepod-python` before calling anything unused.
 
 ## Module map
-- `reader/` — `Reader::open`; `ReaderCache` (one indexed reader per file per process); `ReadIndex`; `SignalExtractor`.
+- `reader/` — `Reader::open`; `ReaderCache` (one indexed reader per file per process); `ReadIndex`; `SignalExtractor`; `dataset.rs` `Dataset`/`DatasetCache`/`cached_dataset` (one file, a directory, or a mix, as one random-access-by-read-id collection; every file routes through `ReaderCache`/`cached_reader`, never a second per-file cache — rnabioco/escapepod-rs#384).
 - `writer/` — `Writer::create`; `atomic.rs` `AtomicFile` (temp + rename).
 - `arrow_ipc.rs` — `ArrowIpcFooter::parse_with_row_counts`, `extract_signal_rows` (zero-copy).
 - `arrow_helpers.rs` — `ReadsBatchView` (columns resolved once per batch), `ReadColumns`, `verify_index_row`.

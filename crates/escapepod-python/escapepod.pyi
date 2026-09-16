@@ -264,12 +264,15 @@ class DatasetReader:
             for read in ds:
                 signal = ds.get_signal(read)
 
-    Entering the context manager warms an in-memory read-id index on each
-    underlying file so repeated ``reads(selection=...)`` lookups take an O(k)
-    indexed path instead of re-scanning. Per-file, skipped for files above
-    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) -- not a memory
-    guard, but a threshold against paying to build an index for a huge file
-    that turns out to only be iterated, never randomly accessed.
+    Opening the dataset warms an in-memory read-id index on each underlying
+    file (every file is opened through the shared, process-wide reader cache)
+    so ``reads(selection=...)`` lookups take an O(k) indexed path instead of
+    re-scanning, from the very first call -- not just inside a ``with``
+    block. Per-file, skipped for files above ``ESCAPEPOD_AUTOINDEX_MAX`` reads
+    (default 5,000,000) -- not a memory guard, but a threshold against paying
+    to build an index for a huge file that turns out to only be iterated,
+    never randomly accessed. The context-manager protocol is kept for API
+    compatibility; entering it does no additional work.
     """
 
     def __init__(
