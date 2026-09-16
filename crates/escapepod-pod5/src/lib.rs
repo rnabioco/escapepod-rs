@@ -59,6 +59,7 @@ pub use reader::ReaderCache;
 pub use reader::SignalCalibration;
 pub use reader::SignalExtractor;
 pub use reader::autoindex_max;
+pub use reader::{Dataset, DatasetCache, cached_dataset, global_dataset_cache};
 pub use reader::{cached_reader, global_reader_cache};
 pub use types::{EndReason, PoreType, ReadData, RunInfoData, SignalType, Uuid};
 pub use writer::{

@@ -264,12 +264,25 @@ class DatasetReader:
             for read in ds:
                 signal = ds.get_signal(read)
 
-    Entering the context manager warms an in-memory read-id index on each
-    underlying file so repeated ``reads(selection=...)`` lookups take an O(k)
-    indexed path instead of re-scanning. Per-file, skipped for files above
-    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) -- not a memory
-    guard, but a threshold against paying to build an index for a huge file
-    that turns out to only be iterated, never randomly accessed.
+    Opening the dataset warms an in-memory read-id index on each underlying
+    file (every file is opened through the shared, process-wide reader cache)
+    so ``reads(selection=...)`` lookups take an O(k) indexed path instead of
+    re-scanning, from the very first call -- not just inside a ``with``
+    block. Per-file, skipped for files above ``ESCAPEPOD_AUTOINDEX_MAX`` reads
+    (default 5,000,000) -- not a memory guard, but a threshold against paying
+    to build an index for a huge file that turns out to only be iterated,
+    never randomly accessed. The context-manager protocol is kept for API
+    compatibility; entering it does no additional work.
+
+    Every underlying file is opened through the process-global, never-evicted
+    reader cache that also backs ``Reader``, so it is shared with -- and
+    outlives -- any single ``DatasetReader``: opening many ``DatasetReader``s
+    over a process's lifetime (e.g. one per run directory in a loop)
+    accumulates every file's reader in that cache rather than freeing it when
+    a ``DatasetReader`` is closed, exits its ``with`` block, or is
+    garbage-collected. There is currently no Python-side way to clear it; the
+    Rust-side escape hatch (``escapepod_signal::global_reader_cache().clear()``)
+    is not exposed here.
     """
 
     def __init__(

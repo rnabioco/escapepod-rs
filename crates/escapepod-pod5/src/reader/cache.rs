@@ -173,7 +173,10 @@ impl ReaderCache {
 /// …). Falling back rather than failing keeps the error where it belongs — in
 /// `Reader::open`, which produces a far better message than `canonicalize`
 /// would.
-fn cache_key(path: &Path) -> PathBuf {
+///
+/// `pub(super)` so [`super::dataset::DatasetCache`] can key on the same rule
+/// rather than a second, possibly-diverging canonicalization.
+pub(super) fn cache_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

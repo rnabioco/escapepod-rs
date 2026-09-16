@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 
 use escapepod_signal::RecordBatch;
 use numpy::PyArray1;
@@ -11,45 +9,21 @@ use crate::error::to_py_err;
 use crate::read_data::{PyReadData, PyRunInfo};
 use crate::reader::adc_to_pa;
 
-/// Recursively collect POD5 files under `path` into `out`.
-///
-/// A path that is an explicit file is included regardless of `suffix`
-/// (the user named it directly); directories are scanned for entries whose
-/// file name ends with `suffix`, descending into subdirectories only when
-/// `recursive` is set.
-fn collect_pod5(
-    path: &Path,
-    recursive: bool,
-    suffix: &str,
-    out: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
-    if path.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let p = entry?.path();
-            if p.is_dir() {
-                if recursive {
-                    collect_pod5(&p, recursive, suffix, out)?;
-                }
-            } else if p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(suffix))
-            {
-                out.push(p);
-            }
-        }
-    } else {
-        // Explicit file path — include it even if it doesn't match the pattern.
-        out.push(path.to_path_buf());
-    }
-    Ok(())
-}
-
 /// Reader over a collection of POD5 files as one logical dataset.
 ///
 /// Accepts a single file, a directory (scanned for `*.pod5`), or a list
 /// mixing files and directories, and presents the reads across every file
 /// as a single stream — the escapepod analogue of `pod5.DatasetReader`.
+///
+/// The directory scan, read-id routing, and bulk-decode logic all live in
+/// [`escapepod_signal::Dataset`] (escapepod-rs#384) — this type is a thin
+/// pyo3 marshalling layer over it, not a second implementation.
+///
+/// Every file is opened through the process-global, never-evicted reader
+/// cache (`escapepod_signal::cached_reader`), so opening many `DatasetReader`s
+/// over a process's lifetime accumulates every file's reader there rather
+/// than freeing it when a `DatasetReader` is closed or garbage-collected —
+/// see `crates/escapepod-python/CLAUDE.md`.
 ///
 /// Can be used as a context manager:
 ///
@@ -58,40 +32,27 @@ fn collect_pod5(
 ///             print(read.read_id)
 #[pyclass(name = "DatasetReader")]
 pub struct PyDatasetReader {
-    readers: Vec<(PathBuf, escapepod_signal::Reader)>,
-    /// Lazily built map from read UUID to the index of its owning reader,
-    /// used to route signal lookups to the file that holds the read.
-    id_index: OnceLock<HashMap<escapepod_signal::Uuid, usize>>,
+    dataset: escapepod_signal::Dataset,
 }
 
 impl PyDatasetReader {
-    /// Reader index → owning file for a given read, built once and cached.
-    fn id_index(&self) -> PyResult<&HashMap<escapepod_signal::Uuid, usize>> {
-        if let Some(map) = self.id_index.get() {
-            return Ok(map);
-        }
-        let mut map = HashMap::new();
-        for (i, (_, reader)) in self.readers.iter().enumerate() {
-            for id in reader.read_ids().map_err(to_py_err)? {
-                map.insert(id, i);
-            }
-        }
-        // Ignore the error case: another thread won the race and set it first,
-        // which is fine — either map is equivalent.
-        let _ = self.id_index.set(map);
-        Ok(self.id_index.get().unwrap())
-    }
-
-    /// Look up the reader that owns `read`, erroring if it belongs to no file
-    /// in this dataset.
+    /// Look up the reader that owns `read`. Raises `KeyError` if it belongs
+    /// to no file in this dataset, or surfaces the real error (e.g. an I/O
+    /// failure scanning one file's read ids while building the routing
+    /// index) rather than folding it into the same `KeyError` — the two are
+    /// different problems and reporting the wrong one is worse than the scan
+    /// this routing index replaced.
     fn owning_reader(&self, read: &PyReadData) -> PyResult<&escapepod_signal::Reader> {
-        let idx = self.id_index()?.get(&read.inner.read_id).ok_or_else(|| {
+        let found = self
+            .dataset
+            .owning_reader(&read.inner.read_id)
+            .map_err(to_py_err)?;
+        found.map(|r| r.as_ref()).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!(
                 "read {} is not part of this dataset",
                 read.inner.read_id
             ))
-        })?;
-        Ok(&self.readers[*idx].1)
+        })
     }
 }
 
@@ -124,85 +85,68 @@ impl PyDatasetReader {
         };
 
         let suffix = pattern.trim_start_matches('*');
-        let mut files = Vec::new();
-        for root in &roots {
-            collect_pod5(root, recursive, suffix, &mut files).map_err(|e| {
-                to_py_err(escapepod_signal::Error::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("scanning {}: {e}", root.display()),
-                )))
+
+        // No Python objects are captured past this point, so the scan, the
+        // per-file opens (routed through the process-global `ReaderCache` —
+        // see `Dataset::open_with`), and their index warm-ups all run with
+        // the GIL released.
+        let py = path.py();
+        let dataset = py
+            .detach(|| escapepod_signal::Dataset::open_with(&roots, recursive, suffix))
+            .map_err(|e| match e {
+                // `Dataset::open_with`'s one InvalidState case is "no files
+                // found" — a ValueError, as this raised directly before the
+                // logic moved into escapepod-pod5.
+                escapepod_signal::Error::InvalidState(msg) => {
+                    pyo3::exceptions::PyValueError::new_err(msg)
+                }
+                other => to_py_err(other),
             })?;
-        }
-        files.sort();
-        files.dedup();
 
-        if files.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "no POD5 files found matching '{pattern}' in: {roots:?}"
-            )));
-        }
-
-        let mut readers = Vec::with_capacity(files.len());
-        for file in files {
-            let reader = escapepod_signal::Reader::open(&file).map_err(to_py_err)?;
-            readers.push((file, reader));
-        }
-
-        Ok(Self {
-            readers,
-            id_index: OnceLock::new(),
-        })
+        Ok(Self { dataset })
     }
 
     /// Paths of the POD5 files in this dataset, in sorted order.
     #[getter]
     fn paths(&self) -> Vec<String> {
-        self.readers
-            .iter()
-            .map(|(p, _)| p.display().to_string())
+        self.dataset
+            .paths()
+            .into_iter()
+            .map(|p| p.display().to_string())
             .collect()
     }
 
     /// Number of POD5 files in the dataset.
     #[getter]
     fn file_count(&self) -> usize {
-        self.readers.len()
+        self.dataset.file_count()
     }
 
     /// Total number of reads across all files.
     #[getter]
     fn read_count(&self) -> PyResult<usize> {
-        let mut total = 0;
-        for (_, reader) in &self.readers {
-            total += reader.read_count().map_err(to_py_err)?;
-        }
-        Ok(total)
+        self.dataset.read_count().map_err(to_py_err)
     }
 
     /// All run info records across the dataset, deduplicated by acquisition id.
     #[getter]
     fn run_infos(&self) -> Vec<PyRunInfo> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for (_, reader) in &self.readers {
-            for ri in reader.run_infos() {
-                if seen.insert(ri.acquisition_id.clone()) {
-                    out.push(PyRunInfo { inner: ri.clone() });
-                }
-            }
-        }
-        out
+        self.dataset
+            .run_infos()
+            .into_iter()
+            .map(|inner| PyRunInfo { inner })
+            .collect()
     }
 
     /// All read IDs across the dataset as strings.
     fn read_ids(&self) -> PyResult<Vec<String>> {
-        let mut out = Vec::new();
-        for (_, reader) in &self.readers {
-            for id in reader.read_ids().map_err(to_py_err)? {
-                out.push(id.to_string());
-            }
-        }
-        Ok(out)
+        Ok(self
+            .dataset
+            .read_ids()
+            .map_err(to_py_err)?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect())
     }
 
     /// Reads across the dataset, optionally filtered by a selection of IDs.
@@ -371,27 +315,13 @@ impl PyDatasetReader {
     // -- Context manager / dunders -----------------------------------------
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        // Warm each underlying file's in-memory read-id index on entry so the
-        // build happens here, with the GIL released, rather than inside the
-        // first reads(selection=…) call that needs it (#97). Best-effort; the
-        // dataset's own id_index routing map is still built lazily.
-        //
-        // Still gated per file by read count: this is a *guess* that random
-        // access is coming, and a large file that is only iterated should not
-        // pay for an index nobody asked for. The gate is no longer what makes
-        // selection fast — reads_by_ids indexes on its own now, whatever the
-        // size (escapepod-rs#251) — so above the cap this only defers the
-        // build, it does not fall back to a scan.
-        let py = slf.py();
-        let cap = escapepod_signal::autoindex_max();
-        let readers = &slf.readers;
-        py.detach(|| {
-            for (_, reader) in readers {
-                if reader.read_count().unwrap_or(usize::MAX) <= cap {
-                    let _ = reader.read_index();
-                }
-            }
-        });
+        // Every file's per-file read-id index is already warm by the time
+        // this object exists: `Dataset::open_with` (called from `new`)
+        // routes every open through `cached_reader`, which performs exactly
+        // this warm-up (gated by the same read-count cap) before handing the
+        // reader back. Best-effort, as it always was; the dataset's own
+        // read-id -> owning-file routing map still builds lazily on first
+        // lookup.
         slf
     }
 
@@ -409,7 +339,7 @@ impl PyDatasetReader {
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
             "DatasetReader(files={}, reads={})",
-            self.readers.len(),
+            self.dataset.file_count(),
             self.read_count()?
         ))
     }
@@ -444,7 +374,11 @@ impl PyDatasetReader {
         match selection {
             None => {
                 let mut out = Vec::new();
-                for (_, reader) in &self.readers {
+                for i in 0..self.dataset.file_count() {
+                    let reader = self
+                        .dataset
+                        .reader_at(i)
+                        .expect("i is within 0..file_count");
                     for read in reader.reads().map_err(to_py_err)? {
                         out.push(read.map_err(to_py_err)?);
                     }
@@ -461,74 +395,51 @@ impl PyDatasetReader {
                     })
                     .collect::<PyResult<_>>()?;
 
-                let mut out = Vec::new();
-                let mut found = HashSet::new();
-                for (_, reader) in &self.readers {
-                    for read in reader.reads_by_ids(&target).map_err(to_py_err)? {
-                        found.insert(read.read_id);
-                        out.push(read);
+                let found_reads = self.dataset.reads_by_ids(&target).map_err(to_py_err)?;
+
+                if !missing_ok {
+                    let found: HashSet<_> = found_reads.iter().map(|r| r.read_id).collect();
+                    if found.len() != target.len() {
+                        let missing = target.len() - found.len();
+                        return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                            "{missing} of {} requested read id(s) not found in dataset \
+                             (pass missing_ok=True to ignore)",
+                            target.len()
+                        )));
                     }
                 }
-
-                if !missing_ok && found.len() != target.len() {
-                    let missing = target.len() - found.len();
-                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                        "{missing} of {} requested read id(s) not found in dataset \
-                         (pass missing_ok=True to ignore)",
-                        target.len()
-                    )));
-                }
-                Ok(out)
+                Ok(found_reads)
             }
         }
     }
 
-    /// Group reads by owning file, decode each file's signals in one bulk call,
-    /// then restore the caller's input order.
+    /// Group reads by owning file, decode each file's signals in one bulk
+    /// call via [`escapepod_signal::Dataset::decode_bulk`], then restore the
+    /// caller's input order.
     fn decode_bulk(
         &self,
         py: Python<'_>,
         reads: &[PyRef<'_, PyReadData>],
         max_samples: usize,
     ) -> PyResult<Vec<(String, Vec<i16>)>> {
-        let index = self.id_index()?;
+        let inner_reads: Vec<escapepod_signal::ReadData> =
+            reads.iter().map(|r| r.inner.clone()).collect();
 
-        // Bucket (original position, id, signal_rows) by owning reader.
-        let mut buckets: HashMap<usize, Vec<(usize, String, Vec<u64>)>> = HashMap::new();
-        for (pos, r) in reads.iter().enumerate() {
-            let idx = *index.get(&r.inner.read_id).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!(
-                    "read {} is not part of this dataset",
-                    r.inner.read_id
-                ))
-            })?;
-            buckets.entry(idx).or_default().push((
-                pos,
-                r.inner.read_id.to_string(),
-                r.inner.signal_rows.clone(),
-            ));
-        }
-
-        let mut ordered: Vec<Option<(String, Vec<i16>)>> = (0..reads.len()).map(|_| None).collect();
-        py.detach(|| -> PyResult<()> {
-            for (reader_idx, items) in &buckets {
-                let inputs: Vec<(usize, Vec<u64>)> = items
-                    .iter()
-                    .map(|(pos, _, rows)| (*pos, rows.clone()))
-                    .collect();
-                let results = self.readers[*reader_idx]
-                    .1
-                    .get_signal_bulk_prefix(&inputs, max_samples)
-                    .map_err(to_py_err)?;
-                // get_signal_bulk preserves input order, so zip back to (pos, id).
-                for ((pos, id, _), (_, sig)) in items.iter().zip(results) {
-                    ordered[*pos] = Some((id.clone(), sig));
+        let decoded = py
+            .detach(|| self.dataset.decode_bulk(&inner_reads, max_samples))
+            .map_err(|e| match e {
+                escapepod_signal::Error::ReadNotFound(uuid) => {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "read {uuid} is not part of this dataset"
+                    ))
                 }
-            }
-            Ok(())
-        })?;
+                other => to_py_err(other),
+            })?;
 
-        Ok(ordered.into_iter().map(|o| o.unwrap()).collect())
+        Ok(decoded
+            .into_iter()
+            .map(|(id, sig)| (id.to_string(), sig))
+            .collect())
     }
 }
 
@@ -566,10 +477,13 @@ impl PyDatasetReadIterator {
 
             // Advance to the next batch, crossing into the next file as needed.
             loop {
-                if self.reader_idx >= dataset.readers.len() {
+                if self.reader_idx >= dataset.dataset.file_count() {
                     return Ok(None);
                 }
-                let reader = &dataset.readers[self.reader_idx].1;
+                let reader = dataset
+                    .dataset
+                    .reader_at(self.reader_idx)
+                    .expect("reader_idx is within 0..file_count");
                 if !self.started {
                     self.num_batches = reader.read_batch_count().map_err(to_py_err)?;
                     self.batch_idx = 0;
@@ -583,7 +497,10 @@ impl PyDatasetReadIterator {
                 self.started = false;
             }
 
-            let reader = &dataset.readers[self.reader_idx].1;
+            let reader = dataset
+                .dataset
+                .reader_at(self.reader_idx)
+                .expect("reader_idx is within 0..file_count");
             let batch = reader.read_batch(self.batch_idx).map_err(to_py_err)?;
             self.batch_num_rows = batch.num_rows();
             self.current_batch = Some(batch);
