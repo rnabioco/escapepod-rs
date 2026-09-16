@@ -29,6 +29,7 @@ pixi run -e python-test test-compat    # tests/compat/ against reference pod5
 - `ANCHOR_SOURCES`/`MASK_SOURCES` (`anchored.rs:549-556`) hand-copy enum discriminant order; derive from the enums.
 - `adc_to_pa` (`reader.rs:14`) duplicates `classify::pipeline::signal_pa`; one `calibrate()` belongs in `escapepod-signal`.
 - `Writer`: exception path aborts, GC path finalises with `ResourceWarning` — both deliberate.
+- `DatasetReader` (`dataset.rs`) opens every file through the process-global, never-evicted `escapepod_signal::cached_reader` (escapepod-rs#384), not a private `Vec<Reader>` it used to own. Opening many `DatasetReader`s over a process's lifetime therefore accumulates every file's reader in that cache rather than freeing it on `__exit__`/GC the way it used to — a real lifetime change, intentional (it's what sharing the cache means), not a leak to fix. `escapepod_signal::global_reader_cache().clear()` is the Rust-side escape hatch; nothing here exposes it to Python yet.
 
 ## Known debt
 

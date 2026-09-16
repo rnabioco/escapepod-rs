@@ -273,6 +273,16 @@ class DatasetReader:
     to build an index for a huge file that turns out to only be iterated,
     never randomly accessed. The context-manager protocol is kept for API
     compatibility; entering it does no additional work.
+
+    Every underlying file is opened through the process-global, never-evicted
+    reader cache that also backs ``Reader``, so it is shared with -- and
+    outlives -- any single ``DatasetReader``: opening many ``DatasetReader``s
+    over a process's lifetime (e.g. one per run directory in a loop)
+    accumulates every file's reader in that cache rather than freeing it when
+    a ``DatasetReader`` is closed, exits its ``with`` block, or is
+    garbage-collected. There is currently no Python-side way to clear it; the
+    Rust-side escape hatch (``escapepod_signal::global_reader_cache().clear()``)
+    is not exposed here.
     """
 
     def __init__(

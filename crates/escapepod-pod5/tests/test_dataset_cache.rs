@@ -76,6 +76,43 @@ fn a_mixed_file_and_directory_input_dedupes_overlapping_files() {
 }
 
 #[test]
+fn different_spellings_of_the_same_file_dedupe_too() {
+    let tmp = TempDir::new().unwrap();
+    let (top, _) = fixture(&tmp, "top.pod5", "top_acq", N_READS);
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+
+    // "tmp/top.pod5" and "tmp/sub/../top.pod5" are different `PathBuf`s —
+    // unlike a leading "./", a ".." component is not normalized away by
+    // `Path` itself (resolving it needs the filesystem, since a symlink
+    // could make `a/../b` != `b`) — but the same file. `cached_reader` would
+    // hand both the same `Arc<Reader>`; `Dataset` must not double-count it
+    // just because the literal spelling differs. (The earlier "mixed
+    // file+directory" test only covers spellings that are already
+    // `PathBuf`-equal — e.g. a leading "./" *is* normalized away by `Path`,
+    // so that case is already handled by plain `Vec::dedup`.)
+    let via_parent = tmp.path().join("sub/../top.pod5");
+    assert_ne!(top, via_parent, "the two paths must be literally different");
+
+    let mut roots = vec![top.clone(), via_parent];
+
+    // ...and a symlink to it, on unix — the clearest case there is.
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("link.pod5");
+        std::os::unix::fs::symlink(&top, &link).unwrap();
+        roots.push(link);
+    }
+
+    let dataset = Dataset::open_with(&roots, true, ".pod5").unwrap();
+    assert_eq!(
+        dataset.file_count(),
+        1,
+        "every spelling of the same file must dedupe to one entry"
+    );
+    assert_eq!(dataset.read_count().unwrap(), N_READS, "not double-counted");
+}
+
+#[test]
 fn reads_by_ids_and_bulk_decode_match_a_direct_reader_read() {
     let tmp = TempDir::new().unwrap();
     fixture(&tmp, "a.pod5", "acq_a", N_READS);
@@ -176,6 +213,7 @@ fn cached_dataset_routes_file_opens_through_the_existing_reader_cache() {
 
     let via_dataset = dataset
         .owning_reader(&target_id)
+        .unwrap()
         .expect("the read must be routable to its owning file");
     let via_direct = cached_reader(&path).unwrap();
 

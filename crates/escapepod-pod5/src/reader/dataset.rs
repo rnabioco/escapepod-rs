@@ -28,9 +28,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use super::cache::cache_key;
 use super::cached_reader;
-use super::file_reader::Reader;
+use super::file_reader::{Reader, autoindex_max};
 use crate::error::{Error, Result};
 use crate::types::{ReadData, RunInfoData, Uuid};
+use crate::utils::pod5_assembler::deduplicate_run_infos;
 
 /// Suffix used to match files inside a scanned directory when the caller
 /// does not name one — `*.pod5` with the glob stripped to a plain suffix.
@@ -95,8 +96,11 @@ pub struct Dataset {
     files: Vec<(PathBuf, Arc<Reader>)>,
     /// Lazily built map from read UUID to the index of its owning file in
     /// [`Self::files`], used to route bulk signal decode and single-read
-    /// lookups to the file that holds a read.
-    id_index: OnceLock<HashMap<Uuid, usize>>,
+    /// lookups to the file that holds a read. A build **failure** is cached
+    /// too, by message rather than the `Error` itself (which is not
+    /// `Clone`), so a persistent error on one file does not repay a full
+    /// rescan of every file on each subsequent lookup.
+    id_index: OnceLock<std::result::Result<HashMap<Uuid, usize>, String>>,
 }
 
 impl Dataset {
@@ -129,8 +133,17 @@ impl Dataset {
                 ))
             })?;
         }
+        // Sort/dedup by literal spelling first (cheap, and keeps a stable
+        // "sorted" order for `paths()`), then collapse any spellings left
+        // over that name the *same* file under a different name — an
+        // explicit path and the same file reached via a directory scan, a
+        // symlink, a `./`, … `cached_reader` would hand them the same
+        // `Arc<Reader>` anyway; not deduping here double-counts the file in
+        // `read_count()`, `paths()`, `read_ids()`, and `reads_by_ids()`.
         files.sort();
         files.dedup();
+        let mut seen_canonical: HashSet<PathBuf> = HashSet::with_capacity(files.len());
+        files.retain(|f| seen_canonical.insert(cache_key(f)));
 
         if files.is_empty() {
             let roots: Vec<String> = roots
@@ -182,17 +195,16 @@ impl Dataset {
     }
 
     /// All run info records across the dataset, deduplicated by acquisition id.
+    ///
+    /// Shares [`deduplicate_run_infos`] with `merge`/`filter`'s multi-source
+    /// dedup, so the rule can't silently diverge between this path and theirs.
     pub fn run_infos(&self) -> Vec<RunInfoData> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for (_, reader) in &self.files {
-            for ri in reader.run_infos() {
-                if seen.insert(ri.acquisition_id.clone()) {
-                    out.push(ri.clone());
-                }
-            }
-        }
-        out
+        let per_file: Vec<&[RunInfoData]> = self
+            .files
+            .iter()
+            .map(|(_, reader)| reader.run_infos())
+            .collect();
+        deduplicate_run_infos(&per_file).0
     }
 
     /// All read IDs across every file.
@@ -217,14 +229,18 @@ impl Dataset {
         Ok(out)
     }
 
-    /// The shared reader that owns `id`, or `None` if `id` is not part of
-    /// this dataset (or its routing index could not be built).
+    /// The shared reader that owns `id`, or `Ok(None)` if `id` is simply not
+    /// part of this dataset.
     ///
     /// Builds (and caches) the dataset's read-id → owning-file index on first
     /// call; a [`Dataset`] obtained via [`cached_dataset`] already has it warm.
-    pub fn owning_reader(&self, id: &Uuid) -> Option<&Arc<Reader>> {
-        let idx = *self.id_index().ok()?.get(id)?;
-        Some(&self.files[idx].1)
+    /// A failure to build that index (e.g. an I/O error scanning one file's
+    /// read ids) is returned as `Err`, not folded into "not found" — a real
+    /// error and a read that genuinely isn't here are different problems,
+    /// and reporting the wrong one is worse than the scan it replaced.
+    pub fn owning_reader(&self, id: &Uuid) -> Result<Option<&Arc<Reader>>> {
+        let index = self.id_index()?;
+        Ok(index.get(id).map(|&idx| &self.files[idx].1))
     }
 
     /// Decode signal for many reads, one bulk call per owning file.
@@ -245,8 +261,11 @@ impl Dataset {
     ) -> Result<Vec<(Uuid, Vec<i16>)>> {
         let index = self.id_index()?;
 
-        // Bucket (original position, id, signal_rows) by owning file.
-        let mut buckets: HashMap<usize, Vec<(usize, Uuid, Vec<u64>)>> = HashMap::new();
+        // Bucket (original position, signal_rows) by owning file. No need to
+        // carry the read id through the bucket too — `reads[pos]` already
+        // has it when order is restored below — so `signal_rows` is cloned
+        // exactly once, into the shape `get_signal_bulk_prefix` wants.
+        let mut buckets: HashMap<usize, Vec<(usize, Vec<u64>)>> = HashMap::new();
         for (pos, r) in reads.iter().enumerate() {
             let idx = *index
                 .get(&r.read_id)
@@ -254,21 +273,17 @@ impl Dataset {
             buckets
                 .entry(idx)
                 .or_default()
-                .push((pos, r.read_id, r.signal_rows.clone()));
+                .push((pos, r.signal_rows.clone()));
         }
 
         let mut ordered: Vec<Option<(Uuid, Vec<i16>)>> = (0..reads.len()).map(|_| None).collect();
-        for (file_idx, items) in &buckets {
-            let inputs: Vec<(usize, Vec<u64>)> = items
-                .iter()
-                .map(|(pos, _, rows)| (*pos, rows.clone()))
-                .collect();
+        for (file_idx, inputs) in &buckets {
             let results = self.files[*file_idx]
                 .1
-                .get_signal_bulk_prefix(&inputs, max_samples)?;
-            // get_signal_bulk_prefix preserves input order, so zip back to (pos, id).
-            for ((pos, id, _), (_, signal)) in items.iter().zip(results) {
-                ordered[*pos] = Some((*id, signal));
+                .get_signal_bulk_prefix(inputs, max_samples)?;
+            // get_signal_bulk_prefix preserves input order, so zip back to pos.
+            for (pos, signal) in results {
+                ordered[pos] = Some((reads[pos].read_id, signal));
             }
         }
 
@@ -278,21 +293,45 @@ impl Dataset {
             .collect())
     }
 
-    /// The read-id → owning-file-index routing map, building it on first call.
+    /// The read-id → owning-file-index routing map, building it on first
+    /// call. A build failure is cached too (see the field doc), so a
+    /// persistent error doesn't repay a full rescan of every file on every
+    /// subsequent lookup — it costs one string clone instead.
     fn id_index(&self) -> Result<&HashMap<Uuid, usize>> {
-        if let Some(map) = self.id_index.get() {
-            return Ok(map);
+        if self.id_index.get().is_none() {
+            let built = self.build_id_index().map_err(|e| e.to_string());
+            // Ignore whether we won the publish race: if another thread beat
+            // us to it, its result is read back below and is equivalent
+            // enough — the same trade `ReaderCache::get` makes for a
+            // redundant `Reader::open`. Either way, `get()` below is now
+            // guaranteed `Some` — ours if we won, theirs if we lost — so
+            // there is no outcome where this read has nothing to unwrap.
+            let _ = self.id_index.set(built);
         }
+        self.id_index
+            .get()
+            .expect("just ensured above that an entry is present")
+            .as_ref()
+            .map_err(|msg| Error::InvalidState(msg.clone()))
+    }
+
+    /// Scan every file's read ids into a routing map, reusing an
+    /// already-warm per-file `ReadIndex` when one is resident
+    /// (`Reader::read_index_if_built` — warmed by `ReaderCache`, or loaded
+    /// near-instantly from a `.p5s` sidecar) instead of paying for a second
+    /// full-table scan via [`Reader::read_ids`].
+    fn build_id_index(&self) -> Result<HashMap<Uuid, usize>> {
         let mut map = HashMap::new();
         for (i, (_, reader)) in self.files.iter().enumerate() {
-            for id in reader.read_ids()? {
-                map.insert(id, i);
+            if let Some(index) = reader.read_index_if_built() {
+                map.extend(index.uuids().map(|id| (id, i)));
+            } else {
+                for id in reader.read_ids()? {
+                    map.insert(id, i);
+                }
             }
         }
-        // Ignore the error case: another thread won the race and set it
-        // first, which is fine — either map is equivalent.
-        let _ = self.id_index.set(map);
-        Ok(self.id_index.get().unwrap())
+        Ok(map)
     }
 }
 
@@ -442,8 +481,25 @@ impl DatasetCache {
 /// Build the dataset's read-id routing index now, before the dataset is
 /// shared, so concurrent first lookups find it built.
 ///
-/// Best-effort by design: see property (3) on [`DatasetCache::get`].
+/// Respects [`autoindex_max`]: above that many total reads across every file
+/// in the dataset, warming is skipped — mirroring
+/// [`ReaderCache::get`](super::ReaderCache::get)'s identical per-file gate,
+/// for the identical reason. Warming is a *guess* that random access is
+/// coming, and a huge dataset that is only ever iterated should not pay to
+/// build a routing index nobody asked for; skipping only defers the build to
+/// the first lookup that genuinely demands one. Best-effort otherwise: see
+/// property (3) on [`DatasetCache::get`].
 fn warm_id_index(dataset: &Dataset) {
+    let reads = dataset.read_count().unwrap_or(usize::MAX);
+    if reads > autoindex_max() {
+        tracing::debug!(
+            files = dataset.file_count(),
+            reads,
+            "not warming the dataset's read-id routing index for a large dataset; the \
+             first lookup that needs it will build it"
+        );
+        return;
+    }
     if let Err(e) = dataset.id_index() {
         tracing::warn!(
             error = %e,

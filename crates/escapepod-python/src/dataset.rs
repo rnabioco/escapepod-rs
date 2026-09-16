@@ -19,6 +19,12 @@ use crate::reader::adc_to_pa;
 /// [`escapepod_signal::Dataset`] (escapepod-rs#384) — this type is a thin
 /// pyo3 marshalling layer over it, not a second implementation.
 ///
+/// Every file is opened through the process-global, never-evicted reader
+/// cache (`escapepod_signal::cached_reader`), so opening many `DatasetReader`s
+/// over a process's lifetime accumulates every file's reader there rather
+/// than freeing it when a `DatasetReader` is closed or garbage-collected —
+/// see `crates/escapepod-python/CLAUDE.md`.
+///
 /// Can be used as a context manager:
 ///
 ///     with DatasetReader("run_dir/") as ds:
@@ -30,18 +36,23 @@ pub struct PyDatasetReader {
 }
 
 impl PyDatasetReader {
-    /// Look up the reader that owns `read`, erroring if it belongs to no file
-    /// in this dataset.
+    /// Look up the reader that owns `read`. Raises `KeyError` if it belongs
+    /// to no file in this dataset, or surfaces the real error (e.g. an I/O
+    /// failure scanning one file's read ids while building the routing
+    /// index) rather than folding it into the same `KeyError` — the two are
+    /// different problems and reporting the wrong one is worse than the scan
+    /// this routing index replaced.
     fn owning_reader(&self, read: &PyReadData) -> PyResult<&escapepod_signal::Reader> {
-        self.dataset
+        let found = self
+            .dataset
             .owning_reader(&read.inner.read_id)
-            .map(|r| r.as_ref())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!(
-                    "read {} is not part of this dataset",
-                    read.inner.read_id
-                ))
-            })
+            .map_err(to_py_err)?;
+        found.map(|r| r.as_ref()).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!(
+                "read {} is not part of this dataset",
+                read.inner.read_id
+            ))
+        })
     }
 }
 
