@@ -8,7 +8,7 @@
 - `dtw/` — `dtw_distance*`; lane-parallel `dtw_distances_batch` (SoA, `DTW_LANES=32`); `Fingerprint`; `cuda/` (`gpu`): `GpuDtwContext` DTW+SVM kernels, prep kernels experimental.
 - `resquiggle/` — `refine_signal_map` (rough rescale → banded DP → rescale loop); `dp/` fill + `fill_simd`; `adaptive_dp`; `bands`; `rescale`; `types` (`RefineSettings::move_table_refinement` is *the* shared preset); `kmer_table` (`KmerTable`, fishnet); `kmer_levels` (Remora/leech); `dp_raw_penalty` (leech parity DP).
 - `segmentation/` — `llr::detect_adapter`, `ttest::segment_signal`, `normalize::downscale_normalize_into` + MAD helpers.
-- `chunk.rs` — `process_read` → `read_rows` → `cut_chunk`; channel lists in `ChunkSpec`; `signal_kmer_inputs` (pub, encoding-independent — a caller of `cut_chunk` recovers its `sig_start`/`sig_end` from `Chunk::focus_signal_pos` + `spec.signal_context`).
+- `chunk.rs` — `process_read` → `read_rows` → `cut_chunk`; channel lists in `ChunkSpec`; `signal_kmer_inputs` (pub, encoding-independent — a caller of `cut_chunk` recovers `sig_start`/`sig_end` from `Chunk::focus_signal_pos` + `spec.signal_context`, but must then run that pair through `placed_window` before calling `signal_kmer_inputs`: `place_window` centre-crops when the requested width exceeds `spec.signal_len`, and the raw pair only equals the placed window when it doesn't — rnabioco/escapepod-rs#388).
 - `features.rs` — `span_stats` + `SpanConfig` (fill/bounds/median named per call).
 - `lstm.rs` — `LstmWeights::from_onnx`, `run_scalar`/`run_avx2`/`run_*_batch::<N>`, `LstmBackend::best_for`, `tanh_slice`.
 - `mapping.rs` — `seq_to_signal_from_moves`, `ref_to_signal`. `seq_encoding.rs` — `base_to_int`, `KmerContext`, `encode_signal_kmer[_into]`, `encode_signal_kmer_batch[_into]` (`SignalKmerBatch`, CSR-packed, rayon).
@@ -55,7 +55,7 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 - `normalize.rs:101-170` `normalize_downscale_into` reachable only at factor 1 (`:217-221`) — fold into `downscale_normalize_into`.
 - `dp/fill.rs:437` `_weight`, `dp/mod.rs:42` `dwell_weight` dead in production; `DpContext` Option+unwrap → enum; `fill.rs:74-92` `dp_step` test-only.
 - `lstm.rs:593-607` unreachable tail (`h%8==0 ⇒ g%32==0`); `lstm.rs:394-502` `run_avx2` vs `::<1>` bench-gated (`charging`, `ESCAPEPOD_LSTM_BATCH=1`).
-- `fingerprint.rs:190-212` re-implements `median_and_mad_with_scratch`; `chunk.rs:963-977` re-spells the alphabet, `:579-582` allocates a String per read, `:922` ignores `encode_signal_kmer_into`.
+- `fingerprint.rs:190-212` re-implements `median_and_mad_with_scratch`; `chunk.rs:993-1007` re-spells the alphabet, `:580` allocates a String per read, `:952` ignores `encode_signal_kmer_into`.
 - **Scheduled removal, minor bump, leech re-verify:** `dtw/kernel.rs`; `dtw_distance_matrix_blocked` (`distance.rs:785-835`); `dtw_distance_penalty`; `Fingerprint::{to_feature_vector,to_interleaved_features,has_dwell_times}`; `mad_normalize_with_clipping`, `normalize_dwell_times_mad`; `llr.rs:103-205` gains fns; `ttest.rs:343-423` `segment_signal_with_dwell`/`SegmentationResult`; `sequence_ints_with_context`; `ESCAPEPOD_DTW_AVX512` (`distance.rs:410-455`).
 - GPU prep kernels (`cuda/mod.rs:323-756` + four `*_kernel.rs`) will be feature-gated and compiled lazily; today `new_on_device:132-154` NVRTC-compiles all six modules on every production `GpuDtwContext::new()`.
 
