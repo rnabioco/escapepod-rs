@@ -831,18 +831,43 @@ fn signal_residual(read: &ProcessedRead, expected: &[f32]) -> Vec<f32> {
 // Chunk cutting
 // ---------------------------------------------------------------------------
 
+/// The window [`place_window`] actually lays out, after its centre-crop:
+/// `(start, end)` unchanged when the requested width (`end - start`) is no
+/// wider than `len`, or shifted to `(start + crop, start + crop + len)` for
+/// `crop = (requested - len) / 2` when it is wider. Unclamped against `src`'s
+/// bounds, same as the `start`/`end` passed in — a caller that needs
+/// bounds-checked indices clamps as [`place_window`] does.
+///
+/// `pub` so a caller that needs to know *where* a window landed, not just
+/// copy it — [`cut_chunk`]'s [`SeqEncoding::SignalKmer`] arm, which must feed
+/// [`signal_kmer_inputs`] this placed origin rather than the raw request, or
+/// a caller outside this crate mirroring the same window arithmetic — shares
+/// this one-line crop instead of re-deriving it (rnabioco/escapepod-rs#388:
+/// two of `place_window`'s callers once used this formula independently and
+/// silently drifted apart).
+pub fn placed_window(start: i64, end: i64, len: usize) -> (i64, i64) {
+    let requested = (end - start).max(0) as usize;
+    if requested <= len {
+        (start, end)
+    } else {
+        let crop = ((requested - len) / 2) as i64;
+        (start + crop, start + crop + len as i64)
+    }
+}
+
 /// Copy one per-sample channel's window into `dst`, zero elsewhere.
 ///
 /// `dst` is `spec.signal_len` long. When the requested window is no wider than
 /// that it is placed at its own left edge (so a window that underflows the
 /// signal keeps its alignment and pads on the left); when it is wider it is
-/// centre-cropped down to `signal_len`.
+/// centre-cropped down to `signal_len` — see [`placed_window`] for the crop.
 fn place_window(src: &[f32], start: i64, end: i64, len: usize, dst: &mut [f32]) {
     dst.fill(0.0);
     if len == 0 {
         return;
     }
     let requested = (end - start).max(0) as usize;
+    let (start, end) = placed_window(start, end, len);
     if requested <= len {
         let lo = start.max(0);
         let hi = end.min(src.len() as i64);
@@ -856,8 +881,7 @@ fn place_window(src: &[f32], start: i64, end: i64, len: usize, dst: &mut [f32]) 
         let n = ((hi - lo) as usize).min(len - off);
         dst[off..off + n].copy_from_slice(&src[lo as usize..lo as usize + n]);
     } else {
-        let crop = (requested - len) / 2;
-        let lo = (start + crop as i64).max(0) as usize;
+        let lo = start.max(0) as usize;
         let hi = (lo + len).min(src.len());
         if hi <= lo {
             return;
@@ -916,7 +940,13 @@ pub fn cut_chunk(
             (base_onehot(&bases), 4, width)
         }
         SeqEncoding::SignalKmer { ctx } => {
-            let (map, bases) = signal_kmer_inputs(read, sig_start, sig_end, spec.signal_len, ctx)?;
+            // `place_window` (above) may have centre-cropped this same
+            // window down to `spec.signal_len`; `signal_kmer_inputs` must be
+            // told that placed origin, not the raw pre-crop request, or its
+            // `map` indexes a position `signal` never placed anything at
+            // (rnabioco/escapepod-rs#388).
+            let (eff_start, eff_end) = placed_window(sig_start, sig_end, spec.signal_len);
+            let (map, bases) = signal_kmer_inputs(read, eff_start, eff_end, spec.signal_len, ctx)?;
             let ints = sequence_to_int(&bases);
             (
                 encode_signal_kmer(&ints, &map, spec.signal_len, ctx),
@@ -989,10 +1019,15 @@ fn base_onehot(seq: &[u8]) -> Vec<f32> {
 /// [`SeqEncoding`] (leech's training format always writes the map and the
 /// context sequence, even for a chunk cut with [`SeqEncoding::None`] or
 /// [`SeqEncoding::BaseOneHot`]) can compute them without a second copy of the
-/// window arithmetic: `sig_start`/`sig_end` are `focus - left`/`focus + right`
-/// from the *same* [`Chunk::focus_signal_pos`] and `spec.signal_context` that
-/// [`cut_chunk`] itself used, so nothing here is re-derived independently of
-/// the chunk it goes with.
+/// window arithmetic — **but** `sig_start`/`sig_end` must be the window
+/// [`place_window`] actually placed, not the raw request. `focus - left`/
+/// `focus + right` from [`Chunk::focus_signal_pos`] and `spec.signal_context`
+/// is that placed window only while it is no wider than `spec.signal_len`;
+/// once it is wider, `place_window` centre-crops, and the placed origin is
+/// [`placed_window`]`(focus - left, focus + right, spec.signal_len)`.
+/// Passing the raw, pre-crop pair here reports `map` positions against an
+/// origin `crop` samples away from where the signal actually landed in the
+/// chunk's `signal` array (rnabioco/escapepod-rs#388).
 pub fn signal_kmer_inputs(
     read: &ProcessedRead,
     sig_start: i64,
@@ -1254,6 +1289,87 @@ mod tests {
         assert_eq!(
             enc,
             vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    fn signal_kmer_spec(
+        signal_context: (i64, i64),
+        signal_len: usize,
+        ctx: KmerContext,
+    ) -> ChunkSpec {
+        ChunkSpec {
+            signal_context,
+            signal_len,
+            base_justify: BaseJustify::Start,
+            signal_channels: vec![SignalChannel::Current],
+            seq_encoding: SeqEncoding::SignalKmer { ctx },
+            ..ChunkSpec::default()
+        }
+    }
+
+    /// rnabioco/escapepod-rs#388: when the requested window is wider than
+    /// `signal_len`, `place_window` centre-crops it before copying — so
+    /// `cut_chunk`'s `SignalKmer` arm must key `signal_kmer_inputs` off that
+    /// same cropped origin, not the raw pre-crop request, or the emitted
+    /// `sequence` tensor names a position `signal` never placed anything at.
+    ///
+    /// Deliberately checks `c.sequence` — what `cut_chunk` itself produced —
+    /// rather than calling `signal_kmer_inputs` a second time with an
+    /// independently recomputed window, which would pass even with the bug
+    /// still in `cut_chunk` (it would just be testing `signal_kmer_inputs`
+    /// and `placed_window` in isolation, not the call site that wires them
+    /// together).
+    #[test]
+    fn signal_kmer_sequence_matches_the_cropped_signal_window() {
+        let r = read();
+        let ctx = KmerContext::new(1, 1);
+        // Base 2 ('G') starts at sample 5; requested window [1, 9) is width
+        // 8, three samples wider than signal_len=5 -> centre-cropped by 1 to
+        // [2, 7) before place_window copies it.
+        let spec = signal_kmer_spec((4, 4), 5, ctx);
+        let rows = read_rows(&r, &spec);
+        let c = cut_chunk(&r, &rows, &spec, 2).unwrap();
+
+        assert_eq!(c.focus_signal_pos, 5);
+        assert_eq!(c.signal, vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(c.sequence_rows, ctx.channels());
+        assert_eq!(c.sequence_cols, spec.signal_len);
+
+        // Base 2's own-identity row (k-mer offset `before`, base 'G' = 2)
+        // must be hot exactly where its real sample landed in `signal`
+        // (index 3, == r.signal[5]) — not index 4, which is what `5 -
+        // sig_start(1)` gives a caller that skips the crop (the pre-fix bug:
+        // it names a position one past where the real sample is).
+        let row = 4 * ctx.before + 2;
+        assert_eq!(
+            &c.sequence[row * spec.signal_len..(row + 1) * spec.signal_len],
+            &[0.0, 0.0, 0.0, 1.0, 0.0]
+        );
+    }
+
+    /// Regression: the narrower-or-equal (pad/underflow) branch never crops
+    /// (`placed_window` returns the raw request unchanged), so this fix must
+    /// leave its `sequence` tensor untouched.
+    #[test]
+    fn signal_kmer_sequence_is_unaffected_when_the_window_is_not_cropped() {
+        let r = read();
+        let ctx = KmerContext::new(1, 1);
+        // Base 1 ('C') starts at sample 2; requested window [0, 5) is
+        // exactly signal_len=5 wide, so this stays on the narrower-or-equal
+        // branch (no crop).
+        let spec = signal_kmer_spec((2, 3), 5, ctx);
+        let rows = read_rows(&r, &spec);
+        let c = cut_chunk(&r, &rows, &spec, 1).unwrap();
+
+        assert_eq!(c.signal, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        // Base 1's own-identity row (k-mer offset `before`, base 'C' = 1)
+        // spans samples [2, 5) — the base's whole span, since the window
+        // isn't cropped and nothing pokes outside it.
+        let row = 4 * ctx.before + 1;
+        assert_eq!(
+            &c.sequence[row * spec.signal_len..(row + 1) * spec.signal_len],
+            &[0.0, 0.0, 1.0, 1.0, 1.0]
         );
     }
 }
