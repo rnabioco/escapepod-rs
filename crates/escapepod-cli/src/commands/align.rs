@@ -174,8 +174,8 @@ pub struct AlignArgs {
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
-    /// Panel scoring can run on a CUDA GPU (a `gpu` build); tracebacks and
-    /// output stay on the CPU either way, and the output is identical
+    /// Panel scoring runs on a CUDA GPU under `auto` when a `gpu` build sees
+    /// one; tracebacks and output stay on the CPU, and the output is identical
     #[command(flatten)]
     pub device: crate::device::DeviceArgs,
 }
@@ -973,8 +973,8 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     if let Some(r) = gpu_result {
         let stats = r.context("scoring on the GPU")?;
         info!(
-            "GPU scored {} of {} reads{} in {:.1} s (packing, transfers and kernel); the other {} \
-             (longer than {} nt, or outside the i16 bound) were scored on the CPU",
+            "GPU scored {} of {} reads{} ({:.1} s waiting on the device); the other {} (longer \
+             than {} nt, or outside the i16 bound) were scored on the CPU",
             style::count(stats.scored),
             style::count(stats.queries),
             if opts.both_strands {
@@ -1181,7 +1181,9 @@ mod gpu {
         pub(super) queries: u64,
         /// Of those, scored on the device.
         pub(super) scored: u64,
-        /// Seconds the thread spent in `score_batch` (upload, kernel, download).
+        /// Seconds the thread spent blocked on the device (uploads, and
+        /// whatever of a kernel and its download was not hidden behind the
+        /// next batch's packing).
         pub(super) device_secs: f64,
     }
 
@@ -1253,23 +1255,52 @@ mod gpu {
             device_secs: 0.0,
         };
         let mut buf = Vec::new();
-        for batch in rx {
-            let mut codes: Vec<Vec<u8>> = batch
-                .iter()
-                .map(|rec| {
-                    letters(rec, &mut buf);
-                    buf.iter().map(|&b| encode_base(b)).collect()
-                })
-                .collect();
-            if both_strands {
-                let rev: Vec<Vec<u8>> = codes.iter().map(|c| reverse_complement_codes(c)).collect();
-                codes.extend(rev);
+        let (mut wait_in, mut prep, mut wait_gpu, mut wait_out) = (0.0, 0.0, 0.0, 0.0);
+        // One batch in flight on the device while the next is encoded and
+        // packed here, so the kernel is not idle between batches.
+        let mut in_flight: Option<(Vec<InRecord>, escapepod_align::cuda::PendingBatch)> = None;
+        let mut t = Instant::now();
+        let mut rx = rx.into_iter();
+        loop {
+            let next = rx.next();
+            wait_in += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            let prepared = next.as_ref().map(|batch| {
+                let mut codes: Vec<Vec<u8>> = batch
+                    .iter()
+                    .map(|rec| {
+                        letters(rec, &mut buf);
+                        buf.iter().map(|&b| encode_base(b)).collect()
+                    })
+                    .collect();
+                if both_strands {
+                    let rev: Vec<Vec<u8>> =
+                        codes.iter().map(|c| reverse_complement_codes(c)).collect();
+                    codes.extend(rev);
+                }
+                let queries: Vec<&[u8]> = codes.iter().map(Vec::as_slice).collect();
+                stats.queries += queries.len() as u64;
+                scorer.prepare(&queries)
+            });
+            prep += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            // Collect the batch before this one, then queue this one: the
+            // download waits for its own kernel only.
+            let done = match in_flight.take() {
+                Some((batch, pending)) => Some((batch, scorer.finish(pending)?)),
+                None => None,
+            };
+            if let (Some(batch), Some(prepared)) = (next, prepared) {
+                in_flight = Some((batch, scorer.submit(prepared)?));
             }
-            let queries: Vec<&[u8]> = codes.iter().map(Vec::as_slice).collect();
-            let t0 = Instant::now();
-            let matrix = scorer.score_batch(&queries)?;
-            stats.device_secs += t0.elapsed().as_secs_f64();
-            stats.queries += queries.len() as u64;
+            wait_gpu += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            let Some((batch, matrix)) = done else {
+                if in_flight.is_none() {
+                    break;
+                }
+                continue;
+            };
             stats.scored += matrix.n_scored() as u64;
             let scores = BatchScores {
                 matrix,
@@ -1278,7 +1309,18 @@ mod gpu {
             if tx.send((batch, Some(Arc::new(scores)))).is_err() {
                 break;
             }
+            wait_out += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            if in_flight.is_none() {
+                break;
+            }
         }
+        stats.device_secs = wait_gpu;
+        debug!(
+            "GPU thread: {wait_in:.1} s waiting for the reader, {prep:.1} s encoding and \
+             packing, {wait_gpu:.1} s waiting on the device, {wait_out:.1} s waiting for the \
+             workers"
+        );
         Ok(stats)
     }
 

@@ -272,17 +272,23 @@ impl GpuScorer {
     /// Score every query (codes from [`crate::alphabet`]) against every
     /// reference: row `k` of the result is query `k`, in panel order, or
     /// unscored when [`GpuScorer::scores_len`] says no.
+    ///
+    /// [`GpuScorer::prepare`], [`GpuScorer::submit`] and
+    /// [`GpuScorer::finish`] in one call. A caller with a stream of batches
+    /// does better with the three apart: prepare batch *k + 1* while batch
+    /// *k*'s kernel runs, so the device is not idle while the host packs.
     pub fn score_batch(&mut self, queries: &[&[u8]]) -> Result<ScoreMatrix, GpuError> {
+        let prepared = self.prepare(queries);
+        let pending = self.submit(prepared)?;
+        self.finish(pending)
+    }
+
+    /// The host half of a batch: decide what the GPU scores and pack it.
+    /// Touches no device state, so it can overlap a running kernel.
+    pub fn prepare(&self, queries: &[&[u8]]) -> PreparedBatch {
         let n = queries.len();
         let scored: Vec<bool> = queries.iter().map(|q| self.scores_len(q.len())).collect();
         let mut work: Vec<i32> = (0..n as i32).filter(|&k| scored[k as usize]).collect();
-        if work.is_empty() {
-            return Ok(ScoreMatrix::from_parts(
-                self.n_refs,
-                vec![0; n * self.n_refs],
-                scored,
-            ));
-        }
         // Longest first: a long read starts early rather than finishing last.
         work.sort_by_key(|&k| std::cmp::Reverse(queries[k as usize].len()));
 
@@ -311,16 +317,36 @@ impl GpuScorer {
             }
             at += q.len().div_ceil(STRIPE_ROWS) * stripe_words;
         }
+        PreparedBatch {
+            scored,
+            work,
+            qwords,
+            qoff,
+            qlen,
+        }
+    }
 
+    /// Upload a prepared batch and queue its kernel; returns without waiting
+    /// for it. Launches are ordered on the scorer's one stream (they share
+    /// its scratch), so a second `submit` queues behind the first.
+    pub fn submit(&mut self, batch: PreparedBatch) -> Result<PendingBatch, GpuError> {
+        let n = batch.scored.len();
         let s = &self.stream;
-        let qwords_dev = s.clone_htod(&qwords)?;
-        let qoff_dev = s.clone_htod(&qoff)?;
-        let qlen_dev = s.clone_htod(&qlen)?;
-        let order_dev = s.clone_htod(&work)?;
-        let mut out_dev = s.alloc_zeros::<i16>(n * self.n_refs)?;
+        let mut out_dev = s.alloc_zeros::<i16>((n * self.n_refs).max(1))?;
+        if batch.work.is_empty() {
+            return Ok(PendingBatch {
+                out_dev,
+                scored: batch.scored,
+                inputs: None,
+            });
+        }
+        let qwords_dev = s.clone_htod(&batch.qwords)?;
+        let qoff_dev = s.clone_htod(&batch.qoff)?;
+        let qlen_dev = s.clone_htod(&batch.qlen)?;
+        let order_dev = s.clone_htod(&batch.work)?;
         let mut counters_dev = s.alloc_zeros::<i32>(self.n_groups)?;
 
-        let n_work = work.len() as i32;
+        let n_work = batch.work.len() as i32;
         let n_refs = self.n_refs as i32;
         let words_per_lane = self.words_per_lane as i32;
         let (ma, mi, o, e) = (
@@ -359,9 +385,55 @@ impl GpuScorer {
         // forms from these same arguments (`qoff`/`qlen` per query, `order`
         // `n_work` long, the panel `n_groups * words_per_lane * lanes`, the
         // scratch `max_ref_len` words per launched thread, `out` a row per
-        // query), and the shared memory is the panel slice it copies.
+        // query), and the shared memory is the panel slice it copies. The
+        // input buffers live in the returned `PendingBatch` until `finish`.
         unsafe { b.launch(cfg) }?;
-        let scores = s.clone_dtoh(&out_dev)?;
-        Ok(ScoreMatrix::from_parts(self.n_refs, scores, scored))
+        Ok(PendingBatch {
+            out_dev,
+            scored: batch.scored,
+            inputs: Some(DeviceInputs {
+                _qwords: qwords_dev,
+                _qoff: qoff_dev,
+                _qlen: qlen_dev,
+                _order: order_dev,
+                _counters: counters_dev,
+            }),
+        })
     }
+
+    /// Wait for a submitted batch's kernel and bring its scores back.
+    pub fn finish(&self, pending: PendingBatch) -> Result<ScoreMatrix, GpuError> {
+        let n = pending.scored.len();
+        let mut scores = self.stream.clone_dtoh(&pending.out_dev)?;
+        scores.truncate(n * self.n_refs);
+        drop(pending.inputs);
+        Ok(ScoreMatrix::from_parts(self.n_refs, scores, pending.scored))
+    }
+}
+
+/// A batch packed for the device by [`GpuScorer::prepare`].
+pub struct PreparedBatch {
+    scored: Vec<bool>,
+    /// Query indices to score, longest first.
+    work: Vec<i32>,
+    qwords: Vec<u32>,
+    qoff: Vec<u64>,
+    qlen: Vec<i32>,
+}
+
+/// A batch whose kernel has been queued by [`GpuScorer::submit`]; hand it to
+/// [`GpuScorer::finish`].
+pub struct PendingBatch {
+    out_dev: CudaSlice<i16>,
+    scored: Vec<bool>,
+    /// Kept alive until the kernel that reads them has finished.
+    inputs: Option<DeviceInputs>,
+}
+
+struct DeviceInputs {
+    _qwords: CudaSlice<u32>,
+    _qoff: CudaSlice<u64>,
+    _qlen: CudaSlice<i32>,
+    _order: CudaSlice<i32>,
+    _counters: CudaSlice<i32>,
 }

@@ -67,7 +67,8 @@ pub struct DeviceArgs {
     /// Where GPU-capable stages run: `auto` (default), `cpu`, or `gpu`.
     ///
     /// `auto` uses the GPU only for the stages that are measurably faster on it
-    /// — CNN/TCN adapter detection (~7x) and the CTC-CRF encoder (~4x) — and
+    /// — CNN/TCN adapter detection (~7x), the CTC-CRF encoder (~4x) and
+    /// `align`'s panel scoring (~2.6x wall, ~4x less CPU) — and
     /// only when the corresponding Cargo feature is compiled in and a CUDA
     /// device is visible. DTW classification stays on the CPU under `auto`
     /// because the CPU is faster there (113 s on 64 cores vs 132 s on an A30).
@@ -240,10 +241,16 @@ impl Stage {
 
 /// What `escpod align` pays for scoring on the CPU when a GPU is there — and
 /// so, through [`Stage::auto_prefers_gpu`], whether `auto` places it on the
-/// GPU at all. Decided by the interleaved CPU-vs-GPU measurement in
-/// `benchmarks/README.md` (#401's rule: the GPU arm must win on wall at equal
-/// or lower CPU).
-const ALIGN_CPU_COST: Option<&str> = None;
+/// GPU at all.
+///
+/// Decided by #401's rule — the GPU arm must win on wall at equal or lower
+/// CPU — on the interleaved measurement in `benchmarks/README.md`: 3.3 M reads
+/// on one gpu node (`-c 16`, A30), 184 s and 2,900 CPU-s scoring on the CPU
+/// against ~70 s and ~705 CPU-s on the GPU, output byte-identical. It wins on
+/// both, so `auto` takes it. Should that change (a much smaller panel, say),
+/// `None` here is the whole of turning it off.
+const ALIGN_CPU_COST: Option<&str> =
+    Some("~2.6x the wall and ~4x the CPU of scoring on the GPU end-to-end");
 
 /// Why a GPU-capable stage ended up on the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

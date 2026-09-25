@@ -51,7 +51,7 @@ reverse-strand record is refused.
 | `--read-ids <FILE>` | Align only the reads named in FILE, one per line (like `samtools view -N`); the rest are not written |
 | `--batch-size <N>` | Reads per batch (default `50000`); memory is proportional to it |
 | `-t, --threads <N>` | Threads for parallel processing |
-| `--device <auto\|cpu\|gpu>` | No stage of `align` has a GPU path yet: `auto`/`cpu` run on the CPU, `gpu` is refused rather than silently ignored |
+| `--device <auto\|cpu\|gpu>` | Where panel scoring runs (a `gpu` build only; tracebacks and output are always on the CPU, and the output is identical either way). `auto` (default) scores on a visible CUDA GPU, else on the CPU; `cpu` forces the CPU; `gpu` requires the GPU and fails rather than falling back. See [GPU scoring](#gpu-scoring) |
 
 ## Scoring
 
@@ -174,6 +174,24 @@ aligns in ~2 minutes on 16 cores (`-t 32`, ~28 k reads/s, ~3,300 CPU-seconds)
 in under 3 GiB — against a 12 h / 160 GB budget for the bwa step it replaces.
 On Cascade Lake the AVX-512 and AVX2 kernels are within a few percent of each
 other; scalar is ~32× the CPU. Details and reproduction in
+`benchmarks/README.md`.
+
+### GPU scoring
+
+In a binary built with `--features gpu`, scoring every read against every
+reference can run on a CUDA GPU: one GPU thread per (read, reference) pair, a
+whole `--batch-size` batch per kernel launch. Only the scores come from the
+device — the tie set, the tracebacks, `MD`/`NM` and the records are the CPU
+path's own code — so `--device gpu` and `--device cpu` write the same records
+byte for byte (tested, and checked on a 490 k-read sample). Reads over 4,096 nt
+are scored on the CPU inside the same run, and a panel with a reference over
+3,072 nt cannot use the GPU (`auto` then stays on the CPU and says so).
+
+On a gpu node (`-c 16`, one A30), the 3.3 M-read sample takes ~70 s and ~700
+CPU-seconds with GPU scoring against 184 s and ~2,900 CPU-seconds on the same
+16 cores without it, so `--device auto` uses the GPU when one is visible. Nothing
+CUDA is needed to build; at run time the GPU path needs the CUDA driver and
+NVRTC (`pixi run install-gpu` sets both up). Details in
 `benchmarks/README.md`.
 
 ## Replacing bwa in a pipeline
