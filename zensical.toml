@@ -24,6 +24,7 @@ nav = [
     { "subset" = "cli/subset.md" },
     { "demux" = "cli/demux.md" },
     { "classify" = "cli/classify.md" },
+    { "align" = "cli/align.md" },
     { "index" = "cli/index-command.md" },
   ] },
   { "Experimental" = [
