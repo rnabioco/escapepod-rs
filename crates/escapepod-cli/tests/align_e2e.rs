@@ -311,12 +311,27 @@ fn fastq_input_matches_ubam_input() {
             .collect();
         text.push_str(&format!("@{} comment\n{seq}\n+\n{qual}\n", name(r)));
     }
-    std::fs::write(&fq, text).unwrap();
+    std::fs::write(&fq, &text).unwrap();
+    // And the same reads gzipped: the format is sniffed from content.
+    let fq_gz = dir.path().join("reads.fastq.gz");
+    let mut gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(&fq_gz).unwrap(),
+        flate2::Compression::fast(),
+    );
+    std::io::Write::write_all(&mut gz, text.as_bytes()).unwrap();
+    gz.finish().unwrap();
 
     let reference = fixtures().join("trna_reference.fa");
-    let (a, b) = (dir.path().join("bam.bam"), dir.path().join("fq.bam"));
+    let (a, b, c) = (
+        dir.path().join("bam.bam"),
+        dir.path().join("fq.bam"),
+        dir.path().join("fqgz.bam"),
+    );
     align(&input_bam(), &reference, &a, &[]);
     align(&fq, &reference, &b, &[]);
+    align(&fq_gz, &reference, &c, &[]);
+    let (_, from_gz) = read_bam(&c);
+    assert_eq!(read_bam(&b).1, from_gz, "gzip changed the result");
     let (_, from_bam) = read_bam(&a);
     let (_, from_fq) = read_bam(&b);
     assert_eq!(from_bam.len(), from_fq.len());
@@ -533,4 +548,20 @@ fn device_gpu_is_refused_not_ignored() {
     assert!(!o.status.success());
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(stderr.contains("--device gpu"), "{stderr}");
+}
+
+#[test]
+fn output_to_stdout() {
+    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
+        .arg("align")
+        .arg(input_bam())
+        .arg("-r")
+        .arg(fixtures().join("trna_reference.fa"))
+        .args(["-o", "-"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mut r = bam::io::Reader::new(std::io::Cursor::new(o.stdout));
+    let header = r.read_header().unwrap();
+    assert_eq!(r.record_bufs(&header).count(), 60);
 }
