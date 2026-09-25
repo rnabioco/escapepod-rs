@@ -1,6 +1,6 @@
 //! Signal table Arrow schema definition.
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Metadata, Schema};
 
 /// Extension type name for VBZ-compressed signal data.
 pub const VBZ_EXTENSION_NAME: &str = "minknow.vbz";
@@ -15,7 +15,7 @@ pub fn signal_schema() -> Schema {
                 "minknow.uuid".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<Metadata>(),
         ),
         // signal: VBZ-compressed or uncompressed signal data
         // When compressed: LargeBinary with minknow.vbz extension
@@ -26,7 +26,7 @@ pub fn signal_schema() -> Schema {
                 VBZ_EXTENSION_NAME.to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<Metadata>(),
         ),
         // samples: number of samples in this chunk
         Field::new("samples", DataType::UInt32, false),
@@ -45,7 +45,7 @@ pub fn signal_schema_uncompressed() -> Schema {
                 "minknow.uuid".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<Metadata>(),
         ),
         Field::new(
             "signal",
