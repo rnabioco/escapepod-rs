@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## 0.29.0 (2026-09-25)
+
+### Added
+
+- **`escpod align`: all-against-all alignment of reads to a small reference
+  panel (tRNA), and the `escapepod-align` crate behind it** (#395). Every read
+  is scored against every reference with an affine-gap local or overlap
+  (`--mode semiglobal`) DP, the best reference is the primary, and references
+  that tie with it are reported in `XA` (and, with `--secondary`, as 0x100
+  records) with MAPQ 0 — isodecoder ambiguity as output, rather than bwa's 99%
+  MAPQ-0 reads. Takes dorado's uBAM (or FASTA/FASTQ, plain or gzip), writes an
+  input-ordered BAM with every input tag carried byte for byte (`mv`, `ns`,
+  `ts`, `MM`/`ML`, `RG`, …), and writes `MD`/`NM` exactly as `samtools calmd`
+  would — reference `N` included, measured and pinned by a golden — so it
+  replaces the aa-tRNA-seq pipeline's `bwa mem` + `samtools calmd` steps
+  without the FASTQ-comment tag round trip or the `-H` header hack. There is
+  no seed index: memory is one batch of reads, not the 78–90 GiB bwa `-k 6`
+  held on this panel. Scoring runs on inter-sequence AVX2/AVX-512BW kernels
+  (one lane per reference, exact i16), the winners' tracebacks on a second
+  pair whose lanes each carry their own read and reference, every kernel
+  tested for equality against a scalar Gotoh that is itself pinned against
+  parasail; `ESCAPEPOD_ALIGN_BACKEND=scalar|avx2|avx512` caps the choice.
+  `--scoring M,X,O,E` (a gap of length k scores `O + (k-1)·E`; default
+  `2,-1,-10,-1`), `--min-score`, `--max-ties`, `--strand forward|both`,
+  `--read-ids`, `--batch-size`, and `--device` (see the next entry). The `escapepod-align` crate is std-only and has no I/O.
+
+- **`escpod align` scores on a CUDA GPU** (#401). In a `--features gpu` build,
+  `--device` now places `align`'s panel scoring (`Stage::Align`): a CUDA kernel
+  in `escapepod-align` (feature `gpu`, cudarc/NVRTC like the DTW kernel, nothing
+  CUDA needed at build time) scores a whole batch of reads against every
+  reference, one GPU thread per (read, reference) pair, with the panel in shared
+  memory at 4 bits a base and each read walked in 16-row register stripes. Only
+  the scores come from the device: the tie set, the tracebacks, `MD`/`NM` and
+  the records are the CPU path's own code (`Aligner::map_reads_scored`), so
+  `--device gpu` output is byte-identical to `--device cpu`, and the kernel is
+  tested for equality against the scalar oracle. Reads over 4,096 nt are scored
+  on the CPU inside the same run; a panel with a reference over 3,072 nt cannot
+  use the GPU. On one gpu node (`-c 16`, A30) a 3.3 M-read sample aligns in
+  ~70 s and ~700 CPU-seconds against 184 s and ~2,900 on the CPU, so
+  `--device auto` uses the GPU when one is visible; `--device gpu` is no longer
+  refused.
+
 ## 0.28.0 (2026-09-25)
 
 ### Breaking
