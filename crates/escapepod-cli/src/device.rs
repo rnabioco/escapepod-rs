@@ -523,6 +523,27 @@ pub fn note_cpu_only(device: Device, what: &str, detail: &str) {
     }
 }
 
+/// Refuse `--device gpu` for a command that has no GPU stage at all in this
+/// release — as opposed to [`note_cpu_only`], which covers a CPU-only stage
+/// *inside* a command that also has GPU stages, and so only warns.
+///
+/// A command with nothing to place still takes `--device`, so the flag exists
+/// from its first release and a script that passes it keeps working once a GPU
+/// stage lands; until then `gpu` is a requirement this binary cannot meet, and
+/// it says so rather than running on the CPU as if it had been honoured.
+/// `auto` and `cpu` are accepted silently.
+pub fn no_gpu_stage(device: Device, what: &str) -> anyhow::Result<()> {
+    if device == Device::Gpu {
+        anyhow::bail!(
+            "--device gpu cannot run {what}: this command has no GPU stage in this \
+             release (not compiled in, whatever the build's features). Use `--device \
+             auto` or `--device cpu`."
+        );
+    }
+    tracing::debug!("{what} runs on the CPU");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +604,14 @@ mod tests {
             assert!(err.contains(stage.feature()), "{err}");
             assert!(err.contains("--device gpu"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_command_without_gpu_stages_refuses_only_gpu() {
+        assert!(no_gpu_stage(Device::Auto, "x").is_ok());
+        assert!(no_gpu_stage(Device::Cpu, "x").is_ok());
+        let err = no_gpu_stage(Device::Gpu, "x").unwrap_err().to_string();
+        assert!(err.contains("--device gpu"), "{err}");
     }
 
     #[test]

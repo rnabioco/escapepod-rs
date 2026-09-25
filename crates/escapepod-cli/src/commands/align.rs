@@ -1,0 +1,985 @@
+//! `escpod align` — all-vs-all alignment of reads to a small reference panel
+//! (tRNA), writing an input-ordered BAM with every input tag carried through.
+//!
+//! The DP, the kernels and the winner/tie rules live in `escapepod_align`;
+//! this command is I/O and orchestration:
+//!
+//! ```text
+//! reader thread ──batches──▶ rayon over reads ──encoded records──▶ writer thread
+//!   (BAM / FASTA / FASTQ)      (score panel, tie set,              (BGZF, input order)
+//!                               traceback winners, build record)
+//! ```
+//!
+//! Memory is O(`--batch-size`): at most two batches wait on either channel.
+//!
+//! # Where the per-read work runs
+//!
+//! Everything that scales with a read's tag payload runs inside the rayon
+//! pool, not on the two I/O threads: the reader hands over raw
+//! `bam::Record`s (just the bytes), the workers decode them to `RecordBuf`,
+//! align, rewrite and *encode* the output record (through a `bam::io::Writer`
+//! over a `Vec<u8>`, which writes the uncompressed BAM record), and the writer
+//! thread only appends those bytes to the BGZF stream. A dorado uBAM record
+//! carries ~5 kB of `mv`/`MM`/`ML` for a ~130 nt read, so decoding and
+//! re-encoding it on one thread would cap the whole command well below the
+//! kernels' rate.
+//!
+//! # Output rules
+//!
+//! * Records in input order (`@HD SO:unsorted`); `@SQ` from the reference in
+//!   file order; the input's `@RG`, `@PG`, `@CO` copied; one `@PG` for this run
+//!   chained to the last.
+//! * Every input tag is copied byte for byte. `NM`, `MD`, `AS`, `XS`, `XA` are
+//!   the aligner's and replace any the input carried.
+//! * MAPQ is 60 for a unique best hit and 0 for a tie. `XA` lists the other tie
+//!   members (`ref,±pos,CIGAR,NM;`, bwa's format); `--secondary` also writes
+//!   them as 0x100 records, which carry `SEQ`/`QUAL` as `*` and only the
+//!   alignment tags plus `RG` (minimap2's convention), so the move table and
+//!   modification calls are not duplicated per tie.
+//! * A read below `--min-score` is written unmapped (flag 4) with its tags,
+//!   never dropped. Of the input flags only QC-fail (0x200) and duplicate
+//!   (0x400) survive; everything else is the aligner's to set.
+
+use anyhow::{Context, bail};
+use clap::Args;
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::time::Instant;
+
+use rayon::prelude::*;
+use tracing::{info, warn};
+
+use noodles_bam as bam;
+use noodles_bgzf as bgzf;
+use noodles_sam as sam;
+use sam::alignment::RecordBuf;
+use sam::alignment::io::Write as _;
+use sam::alignment::record::cigar::Op;
+use sam::alignment::record::cigar::op::Kind;
+use sam::alignment::record::data::field::Tag;
+use sam::alignment::record::{Flags, MappingQuality};
+use sam::alignment::record_buf::data::field::Value;
+use sam::header::record::value::Map;
+use sam::header::record::value::map::header::{Version, tag as hd_tag};
+use sam::header::record::value::map::{self, Program, ReferenceSequence, program::tag as pg_tag};
+
+use escapepod_align::{
+    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, Panel, ReadMapping, Scoring, sam as align_sam,
+};
+
+use crate::progress::create_spinner;
+use crate::style;
+
+#[derive(Args)]
+pub struct AlignArgs {
+    /// Reads: an unaligned BAM (dorado's uBAM), or FASTA/FASTQ, plain or gzip.
+    /// Forward-strand aligned BAM records are accepted too; their alignment is
+    /// discarded and they are aligned afresh
+    #[arg(value_name = "READS")]
+    pub reads: PathBuf,
+
+    /// Reference panel FASTA, plain or gzip
+    #[arg(short, long, value_name = "FASTA")]
+    pub reference: PathBuf,
+
+    /// Output BAM (`-` for stdout), records in input order
+    #[arg(short, long, value_name = "BAM")]
+    pub output: PathBuf,
+
+    /// `local` (Smith-Waterman, overhangs soft-clipped) or `semiglobal`
+    /// (overlap: leading/trailing gaps of either sequence free)
+    #[arg(long, default_value = "local", value_parser = parse_mode, value_name = "MODE")]
+    pub mode: Mode,
+
+    /// MATCH,MISMATCH,GAP_OPEN,GAP_EXTEND. A gap of length k scores
+    /// GAP_OPEN + (k-1)*GAP_EXTEND. bwa's `-A1 -B1 -O1 -E1` is `1,-1,-2,-1`
+    #[arg(
+        long,
+        default_value = "2,-1,-10,-1",
+        value_parser = parse_scoring,
+        allow_hyphen_values = true,
+        value_name = "M,X,O,E"
+    )]
+    pub scoring: Scoring,
+
+    /// A read whose best score is below this is written unmapped
+    #[arg(
+        long,
+        default_value_t = 0,
+        allow_hyphen_values = true,
+        value_name = "N"
+    )]
+    pub min_score: i32,
+
+    /// At most this many tied references besides the primary go into `XA`
+    /// (and `--secondary`); default all. MAPQ is 0 for any tie regardless
+    #[arg(long, value_name = "N")]
+    pub max_ties: Option<usize>,
+
+    /// Also write each tied reference as a secondary (0x100) record
+    #[arg(long)]
+    pub secondary: bool,
+
+    /// `forward` (direct RNA reads are sense) or `both` (also score the
+    /// reverse complement; a reverse winner gets flag 16 with SEQ/QUAL
+    /// reversed, per-base tags copied verbatim)
+    #[arg(long, value_enum, default_value_t = StrandArg::Forward)]
+    pub strand: StrandArg,
+
+    /// Align only the reads named in FILE (one name per line), like
+    /// `samtools view -N`; the rest are not written
+    #[arg(long, value_name = "FILE")]
+    pub read_ids: Option<PathBuf>,
+
+    /// Reads per batch; memory is proportional to it
+    #[arg(long, default_value_t = 50_000, value_name = "N")]
+    pub batch_size: usize,
+
+    /// Number of threads for parallel processing
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// No stage of `align` runs on a GPU yet; `--device gpu` is refused
+    #[command(flatten)]
+    pub device: crate::device::DeviceArgs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum StrandArg {
+    Forward,
+    Both,
+}
+
+fn parse_mode(s: &str) -> Result<Mode, String> {
+    s.parse()
+}
+
+fn parse_scoring(s: &str) -> Result<Scoring, String> {
+    s.parse()
+        .map_err(|e: escapepod_align::AlignError| e.to_string())
+}
+
+/// Tags this command owns: any the input carried are replaced (or, on an
+/// unmapped record, removed).
+const OWNED_TAGS: [Tag; 5] = [
+    Tag::EDIT_DISTANCE,
+    Tag::MISMATCHED_POSITIONS,
+    Tag::ALIGNMENT_SCORE,
+    Tag::new(b'X', b'S'),
+    Tag::new(b'X', b'A'),
+];
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+/// One input read, as the reader thread hands it over.
+enum InRecord {
+    /// Raw BAM bytes, decoded by the worker.
+    Bam(bam::Record),
+    /// A FASTA/FASTQ read already built as an unmapped record.
+    Buf(RecordBuf),
+}
+
+/// What the reader thread skipped rather than batched.
+#[derive(Default, Debug)]
+struct ReadCounts {
+    /// Secondary/supplementary input records (not reads).
+    not_primary: u64,
+    /// Not in `--read-ids`.
+    filtered: u64,
+}
+
+enum InputFormat {
+    Bam,
+    Fasta,
+    Fastq,
+}
+
+/// Sniff the input: BGZF/gzip whose payload starts with `BAM\1`, or a
+/// FASTA/FASTQ (plain or gzip) by its first character.
+fn sniff(path: &Path) -> anyhow::Result<InputFormat> {
+    let mut head = [0u8; 2];
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let n = f.read(&mut head)?;
+    let gz = n == 2 && head == [0x1f, 0x8b];
+    let mut reader: Box<dyn BufRead> = if gz {
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(
+            File::open(path)?,
+        )))
+    } else {
+        Box::new(BufReader::new(File::open(path)?))
+    };
+    let buf = reader.fill_buf()?;
+    if buf.starts_with(b"BAM\x01") {
+        if !gz {
+            bail!("{}: uncompressed BAM is not supported", path.display());
+        }
+        return Ok(InputFormat::Bam);
+    }
+    match buf.iter().find(|b| !b.is_ascii_whitespace()) {
+        Some(b'>') => Ok(InputFormat::Fasta),
+        Some(b'@') => Ok(InputFormat::Fastq),
+        _ => bail!(
+            "{}: not a BAM, FASTA or FASTQ file (plain or gzip)",
+            path.display()
+        ),
+    }
+}
+
+/// Open a FASTA/FASTQ, transparently gunzipping.
+fn open_text(path: &Path) -> anyhow::Result<Box<dyn BufRead + Send>> {
+    let mut head = [0u8; 2];
+    let n = File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .read(&mut head)?;
+    let f = File::open(path)?;
+    Ok(if n == 2 && head == [0x1f, 0x8b] {
+        Box::new(BufReader::with_capacity(
+            1 << 20,
+            flate2::read::MultiGzDecoder::new(f),
+        ))
+    } else {
+        Box::new(BufReader::with_capacity(1 << 20, f))
+    })
+}
+
+/// A minimal FASTA/FASTQ record reader: multi-line FASTA, four-line FASTQ.
+struct FastxReader {
+    inner: Box<dyn BufRead + Send>,
+    fastq: bool,
+    line: Vec<u8>,
+    /// A FASTA header read while finishing the previous record.
+    pending_header: Option<Vec<u8>>,
+    line_no: u64,
+}
+
+/// `(name, sequence, qualities)` — qualities as raw Phred (not +33).
+type FastxRecord = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+impl FastxReader {
+    fn new(inner: Box<dyn BufRead + Send>, fastq: bool) -> Self {
+        Self {
+            inner,
+            fastq,
+            line: Vec::new(),
+            pending_header: None,
+            line_no: 0,
+        }
+    }
+
+    /// Next line without its terminator; `None` at EOF.
+    fn next_line(&mut self) -> std::io::Result<Option<&[u8]>> {
+        self.line.clear();
+        if self.inner.read_until(b'\n', &mut self.line)? == 0 {
+            return Ok(None);
+        }
+        self.line_no += 1;
+        while matches!(self.line.last(), Some(b'\n' | b'\r')) {
+            self.line.pop();
+        }
+        Ok(Some(&self.line))
+    }
+
+    fn name_of(header: &[u8]) -> Vec<u8> {
+        header
+            .split(|b| b.is_ascii_whitespace())
+            .next()
+            .unwrap_or_default()
+            .to_vec()
+    }
+
+    fn next_record(&mut self) -> anyhow::Result<Option<FastxRecord>> {
+        if self.fastq {
+            let header = loop {
+                match self.next_line()? {
+                    None => return Ok(None),
+                    Some([]) => continue,
+                    Some(l) => break l.to_vec(),
+                }
+            };
+            let Some(h) = header.strip_prefix(b"@") else {
+                bail!("FASTQ line {}: expected '@'", self.line_no);
+            };
+            let name = Self::name_of(h);
+            let seq = self
+                .next_line()?
+                .context("FASTQ truncated after header")?
+                .to_vec();
+            match self.next_line()? {
+                Some(l) if l.starts_with(b"+") => {}
+                _ => bail!("FASTQ line {}: expected '+'", self.line_no),
+            }
+            let qual = self
+                .next_line()?
+                .context("FASTQ truncated before quality")?
+                .to_vec();
+            if qual.len() != seq.len() {
+                bail!(
+                    "FASTQ line {}: {} quality values for {} bases",
+                    self.line_no,
+                    qual.len(),
+                    seq.len()
+                );
+            }
+            let qual = qual.iter().map(|q| q.saturating_sub(33)).collect();
+            Ok(Some((name, seq, Some(qual))))
+        } else {
+            let header = match self.pending_header.take() {
+                Some(h) => h,
+                None => loop {
+                    match self.next_line()? {
+                        None => return Ok(None),
+                        Some([]) => continue,
+                        Some(l) => break l.to_vec(),
+                    }
+                },
+            };
+            let Some(h) = header.strip_prefix(b">") else {
+                bail!("FASTA line {}: expected '>'", self.line_no);
+            };
+            let name = Self::name_of(h);
+            let mut seq = Vec::new();
+            while let Some(l) = self.next_line()? {
+                if l.starts_with(b">") {
+                    self.pending_header = Some(l.to_vec());
+                    break;
+                }
+                seq.extend(l.iter().filter(|b| !b.is_ascii_whitespace()));
+            }
+            Ok(Some((name, seq, None)))
+        }
+    }
+}
+
+/// A FASTX sequence as BAM can hold it: upper case, U as T, anything outside
+/// the BAM alphabet as N.
+fn normalise_seq(seq: &[u8]) -> Vec<u8> {
+    seq.iter()
+        .map(|&b| match b.to_ascii_uppercase() {
+            b'U' => b'T',
+            u if b"=ACMGRSVTWYHKDBN".contains(&u) => u,
+            _ => b'N',
+        })
+        .collect()
+}
+
+fn fastx_to_record(name: Vec<u8>, seq: Vec<u8>, qual: Option<Vec<u8>>) -> RecordBuf {
+    let mut b = RecordBuf::builder()
+        .set_name(name)
+        .set_flags(Flags::UNMAPPED)
+        .set_sequence(normalise_seq(&seq).into());
+    if let Some(q) = qual {
+        b = b.set_quality_scores(q.into());
+    }
+    b.build()
+}
+
+/// Load the reference panel (FASTA, plain or gzip), in file order.
+fn load_reference(path: &Path) -> anyhow::Result<Panel> {
+    let mut r = FastxReader::new(open_text(path)?, false);
+    let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen = HashSet::new();
+    while let Some((name, seq, _)) = r.next_record()? {
+        let name = String::from_utf8(name)
+            .with_context(|| format!("{}: non-UTF-8 reference name", path.display()))?;
+        if !seen.insert(name.clone()) {
+            bail!("{}: duplicate reference name {name:?}", path.display());
+        }
+        refs.push((name, seq));
+    }
+    Panel::new(refs).with_context(|| format!("reading reference {}", path.display()))
+}
+
+fn load_read_ids(path: &Path) -> anyhow::Result<HashSet<Vec<u8>>> {
+    let text = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let ids: HashSet<Vec<u8>> = text
+        .split(|&b| b == b'\n')
+        .filter_map(|l| {
+            let l = l.trim_ascii();
+            (!l.is_empty() && !l.starts_with(b"#")).then(|| {
+                l.split(|b| b.is_ascii_whitespace())
+                    .next()
+                    .unwrap()
+                    .to_vec()
+            })
+        })
+        .collect();
+    if ids.is_empty() {
+        bail!("no read names in {}", path.display());
+    }
+    Ok(ids)
+}
+
+/// The reader thread's body: batch input records until EOF.
+fn read_batches(
+    mut source: Source,
+    wanted: Option<HashSet<Vec<u8>>>,
+    batch_size: usize,
+    tx: SyncSender<Vec<InRecord>>,
+) -> anyhow::Result<ReadCounts> {
+    let mut counts = ReadCounts::default();
+    let mut batch = Vec::with_capacity(batch_size);
+    let keep = |name: Option<&[u8]>, counts: &mut ReadCounts| match &wanted {
+        None => true,
+        Some(w) => {
+            let ok = name.is_some_and(|n| w.contains(n));
+            if !ok {
+                counts.filtered += 1;
+            }
+            ok
+        }
+    };
+    loop {
+        let rec = match &mut source {
+            Source::Bam(r) => {
+                let mut rec = bam::Record::default();
+                if r.read_record(&mut rec)? == 0 {
+                    break;
+                }
+                let flags = rec.flags();
+                if flags.is_secondary() || flags.is_supplementary() {
+                    counts.not_primary += 1;
+                    continue;
+                }
+                if !flags.is_unmapped() && flags.is_reverse_complemented() {
+                    bail!(
+                        "input record {} is aligned to the reverse strand; `escpod align` \
+                         takes unaligned reads (or forward-strand alignments, whose SEQ is \
+                         the read as sequenced)",
+                        rec.name()
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "*".into())
+                    );
+                }
+                if !keep(rec.name().map(|n| n.as_ref()), &mut counts) {
+                    continue;
+                }
+                InRecord::Bam(rec)
+            }
+            Source::Fastx(r) => {
+                let Some((name, seq, qual)) = r.next_record()? else {
+                    break;
+                };
+                if !keep(Some(&name), &mut counts) {
+                    continue;
+                }
+                InRecord::Buf(fastx_to_record(name, seq, qual))
+            }
+        };
+        batch.push(rec);
+        if batch.len() >= batch_size {
+            let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+            if tx.send(full).is_err() {
+                // The consumer stopped (it failed); its error is the one to report.
+                return Ok(counts);
+            }
+        }
+    }
+    if !batch.is_empty() {
+        let _ = tx.send(batch);
+    }
+    Ok(counts)
+}
+
+enum Source {
+    Bam(bam::io::Reader<bgzf::io::MultithreadedReader<File>>),
+    Fastx(FastxReader),
+}
+
+// ---------------------------------------------------------------------------
+// Output records
+// ---------------------------------------------------------------------------
+
+/// An integer tag in the smallest BAM type that holds it, as htslib writes.
+fn int_value(v: i64) -> Value {
+    if let Ok(x) = u8::try_from(v) {
+        Value::UInt8(x)
+    } else if let Ok(x) = i8::try_from(v) {
+        Value::Int8(x)
+    } else if let Ok(x) = u16::try_from(v) {
+        Value::UInt16(x)
+    } else if let Ok(x) = i16::try_from(v) {
+        Value::Int16(x)
+    } else if let Ok(x) = u32::try_from(v) {
+        Value::UInt32(x)
+    } else {
+        Value::Int32(v as i32)
+    }
+}
+
+fn sam_cigar(hit: &Hit, read_len: usize) -> sam::alignment::record_buf::Cigar {
+    let a = &hit.alignment;
+    let mut ops = Vec::with_capacity(a.ops.len() + 2);
+    if a.query_start > 0 {
+        ops.push(Op::new(Kind::SoftClip, a.query_start));
+    }
+    for &(op, len) in &a.ops {
+        let kind = match op {
+            CigarOp::Match => Kind::Match,
+            CigarOp::Ins => Kind::Insertion,
+            CigarOp::Del => Kind::Deletion,
+        };
+        ops.push(Op::new(kind, len as usize));
+    }
+    if read_len > a.query_end {
+        ops.push(Op::new(Kind::SoftClip, read_len - a.query_end));
+    }
+    ops.into()
+}
+
+/// bwa's `XA:Z:` entry: `ref,±pos,CIGAR,NM;`.
+fn xa_entry(panel: &Panel, hit: &Hit, read_len: usize) -> String {
+    let a = &hit.alignment;
+    format!(
+        "{},{}{},{},{};",
+        panel.get(hit.reference).name,
+        if hit.reverse { '-' } else { '+' },
+        a.ref_start + 1,
+        align_sam::cigar_string(&a.ops, read_len, a.query_start, a.query_end),
+        hit.nm
+    )
+}
+
+fn position(p0: usize) -> noodles_core::Position {
+    noodles_core::Position::try_from(p0 + 1).expect("1-based position is non-zero")
+}
+
+/// Which way a read went, for the summary.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Unique,
+    Tied,
+    Unmapped,
+}
+
+/// Rewrite one input record into its output record(s).
+fn build_records(
+    mut rec: RecordBuf,
+    m: &ReadMapping,
+    panel: &Panel,
+    secondary: bool,
+) -> (Vec<RecordBuf>, Outcome) {
+    let kept_flags = rec.flags() & (Flags::QC_FAIL | Flags::DUPLICATE);
+    for t in &OWNED_TAGS {
+        rec.data_mut().remove(t);
+    }
+    *rec.mate_reference_sequence_id_mut() = None;
+    *rec.mate_alignment_start_mut() = None;
+    *rec.template_length_mut() = 0;
+
+    let Some(primary) = m.primary() else {
+        *rec.flags_mut() = kept_flags | Flags::UNMAPPED;
+        *rec.reference_sequence_id_mut() = None;
+        *rec.alignment_start_mut() = None;
+        *rec.mapping_quality_mut() = MappingQuality::new(0);
+        *rec.cigar_mut() = Default::default();
+        return (vec![rec], Outcome::Unmapped);
+    };
+
+    let read_len = rec.sequence().len();
+    let score = m.best_score.expect("mapped reads have a score");
+    let unique = m.n_tied == 1;
+    let mut flags = kept_flags;
+    if primary.reverse {
+        flags |= Flags::REVERSE_COMPLEMENTED;
+        let rc = escapepod_align::alphabet::reverse_complement(rec.sequence().as_ref());
+        *rec.sequence_mut() = rc.into();
+        let mut q: Vec<u8> = rec.quality_scores().as_ref().to_vec();
+        q.reverse();
+        *rec.quality_scores_mut() = q.into();
+    }
+    *rec.flags_mut() = flags;
+    *rec.reference_sequence_id_mut() = Some(primary.reference);
+    *rec.alignment_start_mut() = Some(position(primary.alignment.ref_start));
+    *rec.mapping_quality_mut() = MappingQuality::new(if unique { 60 } else { 0 });
+    *rec.cigar_mut() = sam_cigar(primary, read_len);
+
+    let data = rec.data_mut();
+    data.insert(Tag::EDIT_DISTANCE, int_value(primary.nm as i64));
+    data.insert(
+        Tag::MISMATCHED_POSITIONS,
+        Value::String(primary.md.clone().into()),
+    );
+    data.insert(Tag::ALIGNMENT_SCORE, int_value(score as i64));
+    if let Some(xs) = m.suboptimal {
+        data.insert(Tag::new(b'X', b'S'), int_value(xs as i64));
+    }
+    let others = &m.hits[1..];
+    if !others.is_empty() {
+        let xa: String = others
+            .iter()
+            .map(|h| xa_entry(panel, h, read_len))
+            .collect();
+        data.insert(Tag::new(b'X', b'A'), Value::String(xa.into()));
+    }
+
+    let mut out = Vec::with_capacity(1 + if secondary { others.len() } else { 0 });
+    if secondary {
+        let rg = rec.data().get(&Tag::READ_GROUP).cloned();
+        for h in others {
+            let mut sec_flags = Flags::SECONDARY | kept_flags;
+            if h.reverse {
+                sec_flags |= Flags::REVERSE_COMPLEMENTED;
+            }
+            let mut d = sam::alignment::record_buf::Data::default();
+            d.insert(Tag::EDIT_DISTANCE, int_value(h.nm as i64));
+            d.insert(
+                Tag::MISMATCHED_POSITIONS,
+                Value::String(h.md.clone().into()),
+            );
+            d.insert(Tag::ALIGNMENT_SCORE, int_value(score as i64));
+            if let Some(rg) = &rg {
+                d.insert(Tag::READ_GROUP, rg.clone());
+            }
+            let mut b = RecordBuf::builder()
+                .set_flags(sec_flags)
+                .set_reference_sequence_id(h.reference)
+                .set_alignment_start(position(h.alignment.ref_start))
+                .set_mapping_quality(MappingQuality::new(0).expect("0 is a valid MAPQ"))
+                .set_cigar(sam_cigar(h, read_len))
+                .set_data(d);
+            if let Some(n) = rec.name() {
+                b = b.set_name(n.to_vec());
+            }
+            out.push(b.build());
+        }
+    }
+    out.insert(0, rec);
+    (
+        out,
+        if unique {
+            Outcome::Unique
+        } else {
+            Outcome::Tied
+        },
+    )
+}
+
+/// Everything a worker needs, shared read-only across the pool.
+struct Job<'a> {
+    aligner: &'a Aligner,
+    opts: MapOptions,
+    in_header: &'a sam::Header,
+    out_header: &'a sam::Header,
+    secondary: bool,
+}
+
+/// One read, start to finish on a worker: decode, align, rewrite, encode.
+fn process(ctx: &Job<'_>, rec: InRecord) -> anyhow::Result<(Vec<u8>, Outcome)> {
+    let rec = match rec {
+        InRecord::Bam(raw) => RecordBuf::try_from_alignment_record(ctx.in_header, &raw)?,
+        InRecord::Buf(r) => r,
+    };
+    let mapping = ctx.aligner.map_read(rec.sequence().as_ref(), &ctx.opts);
+    let (records, outcome) = build_records(rec, &mapping, ctx.aligner.panel(), ctx.secondary);
+    let mut w = bam::io::Writer::from(Vec::with_capacity(8 << 10));
+    for r in &records {
+        w.write_alignment_record(ctx.out_header, r)?;
+    }
+    Ok((w.into_inner(), outcome))
+}
+
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
+
+fn build_header(panel: &Panel, input: &sam::Header) -> anyhow::Result<sam::Header> {
+    let mut hd = Map::<map::Header>::new(Version::new(1, 6));
+    hd.other_fields_mut()
+        .insert(hd_tag::SORT_ORDER, "unsorted".into());
+    let mut b = sam::Header::builder().set_header(hd);
+    for r in panel.references() {
+        let len = std::num::NonZero::new(r.seq.len()).expect("panel refuses empty references");
+        b = b.add_reference_sequence(r.name.clone(), Map::<ReferenceSequence>::new(len));
+    }
+    let mut header = b.build();
+    *header.read_groups_mut() = input.read_groups().clone();
+    *header.programs_mut() = input.programs().clone();
+    *header.comments_mut() = input.comments().to_vec();
+    let cl: Vec<String> = std::env::args().collect();
+    let pg = Map::<Program>::builder()
+        .insert(pg_tag::NAME, "escpod")
+        .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
+        .insert(pg_tag::COMMAND_LINE, cl.join(" "))
+        .build()?;
+    header.programs_mut().add("escpod", pg)?;
+    Ok(header)
+}
+
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Summary {
+    reads: u64,
+    unique: u64,
+    tied: u64,
+    unmapped: u64,
+}
+
+pub fn run(args: AlignArgs) -> anyhow::Result<()> {
+    let started = Instant::now();
+    crate::device::no_gpu_stage(args.device.resolve(), "read alignment (`escpod align`)")?;
+    if args.batch_size == 0 {
+        bail!("--batch-size must be at least 1");
+    }
+
+    // --- Reference panel + kernel ------------------------------------------
+    let panel = load_reference(&args.reference)?;
+    info!(
+        "reference: {} sequences, {} bases (longest {}) from {}",
+        style::count(panel.len()),
+        style::count(panel.total_len()),
+        panel.max_len(),
+        style::path(args.reference.display()),
+    );
+    if panel.len() > 10_000 || panel.max_len() > 1_000 {
+        warn!(
+            "`escpod align` scores every read against every reference with no seeding; \
+             it is built for small panels (<= ~10k references of <= ~1 kb) and runs \
+             proportionally slower beyond that"
+        );
+    }
+    if let Err(v) = Backend::cap_from_env() {
+        warn!(
+            "{}={v}: not a kernel name (scalar|avx2|avx512), ignored",
+            escapepod_align::simd::BACKEND_ENV
+        );
+    }
+    let aligner = Aligner::new(panel, args.scoring, args.mode)?;
+    info!(
+        "{} mode, scoring {} (match,mismatch,gap_open,gap_extend), {} strand{}, kernel {} ({} lanes)",
+        args.mode.name(),
+        args.scoring,
+        match args.strand {
+            StrandArg::Forward => "forward",
+            StrandArg::Both => "both",
+        },
+        if args.strand == StrandArg::Both {
+            "s"
+        } else {
+            ""
+        },
+        aligner.backend().name(),
+        aligner.backend().lanes(),
+    );
+    let opts = MapOptions {
+        min_score: args.min_score,
+        max_ties: args.max_ties,
+        both_strands: args.strand == StrandArg::Both,
+    };
+
+    // --- Input -------------------------------------------------------------
+    let wanted = args.read_ids.as_deref().map(load_read_ids).transpose()?;
+    if let Some(w) = &wanted {
+        info!(
+            "aligning only the {} reads named in --read-ids",
+            style::count(w.len())
+        );
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let (source, in_header) = match sniff(&args.reads)? {
+        InputFormat::Bam => {
+            let workers = std::num::NonZero::new(threads.div_ceil(4)).expect("at least one");
+            let file = File::open(&args.reads)?;
+            let mut r = bam::io::Reader::from(bgzf::io::MultithreadedReader::with_worker_count(
+                workers, file,
+            ));
+            let h = r
+                .read_header()
+                .with_context(|| format!("reading BAM header of {}", args.reads.display()))?;
+            (Source::Bam(r), h)
+        }
+        InputFormat::Fasta => (
+            Source::Fastx(FastxReader::new(open_text(&args.reads)?, false)),
+            sam::Header::default(),
+        ),
+        InputFormat::Fastq => (
+            Source::Fastx(FastxReader::new(open_text(&args.reads)?, true)),
+            sam::Header::default(),
+        ),
+    };
+    let out_header = build_header(aligner.panel(), &in_header)?;
+
+    // --- Output ------------------------------------------------------------
+    let sink: Box<dyn Write + Send> = if args.output.as_os_str() == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(
+            File::create(&args.output)
+                .with_context(|| format!("creating {}", args.output.display()))?,
+        )
+    };
+    let writer_workers = std::num::NonZero::new(threads).expect("at least one");
+    let mut writer = bam::io::Writer::from(bgzf::io::MultithreadedWriter::with_worker_count(
+        writer_workers,
+        sink,
+    ));
+    writer.write_header(&out_header)?;
+
+    // --- Pipeline ----------------------------------------------------------
+    let (in_tx, in_rx) = sync_channel::<Vec<InRecord>>(2);
+    let (out_tx, out_rx) = sync_channel::<Vec<Vec<u8>>>(2);
+    let batch_size = args.batch_size;
+    let reader = std::thread::Builder::new()
+        .name("escpod-align-reader".into())
+        .spawn(move || read_batches(source, wanted, batch_size, in_tx))?;
+    let writer_thread = std::thread::Builder::new()
+        .name("escpod-align-writer".into())
+        .spawn(move || write_batches(writer, out_rx))?;
+
+    let spinner = create_spinner("aligning")?;
+    let ctx = Job {
+        aligner: &aligner,
+        opts,
+        in_header: &in_header,
+        out_header: &out_header,
+        secondary: args.secondary,
+    };
+    let mut summary = Summary::default();
+    let compute = align_batches(&ctx, in_rx, out_tx, &mut summary, &spinner, started);
+    spinner.finish_and_clear();
+
+    // Join both threads before deciding which error to report: a failed
+    // compute stage drops its channels, which unblocks both.
+    let read_result = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    let write_result = writer_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+    compute?;
+    let counts = read_result.with_context(|| format!("reading {}", args.reads.display()))?;
+    write_result.with_context(|| format!("writing {}", args.output.display()))?;
+
+    // --- Summary -----------------------------------------------------------
+    if counts.not_primary > 0 {
+        info!(
+            "skipped {} secondary/supplementary input records (not reads)",
+            style::count(counts.not_primary)
+        );
+    }
+    if counts.filtered > 0 {
+        info!(
+            "skipped {} reads not named in --read-ids",
+            style::count(counts.filtered)
+        );
+    }
+    let wall = started.elapsed().as_secs_f64();
+    let mapped = summary.unique + summary.tied;
+    let pct = |n: u64| 100.0 * n as f64 / summary.reads.max(1) as f64;
+    info!(
+        "{} reads: {} mapped ({:.1}%) — {} unique, {} tied — {} unmapped; {:.1} s ({:.0} reads/s)",
+        style::count(summary.reads),
+        style::count(mapped),
+        pct(mapped),
+        style::count(summary.unique),
+        style::count(summary.tied),
+        style::count(summary.unmapped),
+        wall,
+        summary.reads as f64 / wall.max(1e-9),
+    );
+    if args.output.as_os_str() != "-" {
+        info!("wrote {}", style::path(args.output.display()));
+    }
+    Ok(())
+}
+
+fn align_batches(
+    ctx: &Job<'_>,
+    in_rx: Receiver<Vec<InRecord>>,
+    out_tx: SyncSender<Vec<Vec<u8>>>,
+    summary: &mut Summary,
+    spinner: &indicatif::ProgressBar,
+    started: Instant,
+) -> anyhow::Result<()> {
+    for batch in in_rx {
+        let results: Vec<anyhow::Result<(Vec<u8>, Outcome)>> =
+            batch.into_par_iter().map(|r| process(ctx, r)).collect();
+        let mut encoded = Vec::with_capacity(results.len());
+        for r in results {
+            let (bytes, outcome) = r?;
+            summary.reads += 1;
+            match outcome {
+                Outcome::Unique => summary.unique += 1,
+                Outcome::Tied => summary.tied += 1,
+                Outcome::Unmapped => summary.unmapped += 1,
+            }
+            encoded.push(bytes);
+        }
+        if out_tx.send(encoded).is_err() {
+            // The writer stopped; its error is reported after the join.
+            break;
+        }
+        let secs = started.elapsed().as_secs_f64().max(1e-9);
+        spinner.set_message(format!(
+            "{} reads ({:.0}/s)",
+            style::count(summary.reads),
+            summary.reads as f64 / secs
+        ));
+    }
+    Ok(())
+}
+
+/// The writer thread's body: append pre-encoded records to the BGZF stream.
+fn write_batches(
+    writer: bam::io::Writer<bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>>,
+    rx: Receiver<Vec<Vec<u8>>>,
+) -> anyhow::Result<()> {
+    let mut bgzf = writer.into_inner();
+    for batch in rx {
+        for bytes in batch {
+            bgzf.write_all(&bytes)?;
+        }
+    }
+    bgzf.finish()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int_tags_take_the_smallest_type() {
+        assert_eq!(int_value(3), Value::UInt8(3));
+        assert_eq!(int_value(-3), Value::Int8(-3));
+        assert_eq!(int_value(300), Value::UInt16(300));
+        assert_eq!(int_value(-300), Value::Int16(-300));
+        assert_eq!(int_value(70_000), Value::UInt32(70_000));
+    }
+
+    #[test]
+    fn fastx_sequences_fit_bam() {
+        assert_eq!(normalise_seq(b"acguNx*"), b"ACGTNNN".to_vec());
+    }
+
+    #[test]
+    fn fasta_reader_joins_lines() {
+        let text = b">a desc\nACG\nTT\n\n>b\nGG\n".to_vec();
+        let mut r = FastxReader::new(Box::new(std::io::Cursor::new(text)), false);
+        let (n, s, q) = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            (n.as_slice(), s.as_slice(), q),
+            (&b"a"[..], &b"ACGTT"[..], None)
+        );
+        let (n, s, _) = r.next_record().unwrap().unwrap();
+        assert_eq!((n.as_slice(), s.as_slice()), (&b"b"[..], &b"GG"[..]));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn fastq_reader_decodes_phred() {
+        let text = b"@r1 x=1\nACGT\n+\nII#!\n".to_vec();
+        let mut r = FastxReader::new(Box::new(std::io::Cursor::new(text)), true);
+        let (n, s, q) = r.next_record().unwrap().unwrap();
+        assert_eq!(n, b"r1");
+        assert_eq!(s, b"ACGT");
+        assert_eq!(q.unwrap(), vec![40, 40, 2, 0]);
+    }
+}
