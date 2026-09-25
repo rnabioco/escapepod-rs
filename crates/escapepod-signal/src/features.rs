@@ -206,14 +206,17 @@ impl SpanConfig {
 /// interleaved record so callers can lay the numbers out however their model's
 /// feature vector is ordered without this module knowing about it.
 ///
-/// `median` and `range` are optional because neither can come from the prefix
-/// sums: each needs its own pass over the span, and the median needs a select
-/// or a sort on top of that. A consumer that only wants `dwell`/`mean`/`sd`
-/// should not pay for them, so they are computed only when a buffer is
-/// supplied. Build with [`SpanStatsOut::new`] plus
+/// `median`, `range`, `skew` and `kurtosis` are optional because none of them
+/// can come from the prefix sums: each needs its own pass over the span (the
+/// median needs a select or a sort on top of that). A consumer that only wants
+/// `dwell`/`mean`/`sd` should not pay for them, so they are computed only when
+/// a buffer is supplied. Build with [`SpanStatsOut::new`] plus
 /// [`with_median`](SpanStatsOut::with_median) /
-/// [`with_range`](SpanStatsOut::with_range) rather than a struct literal, so a
-/// future output does not churn every call site.
+/// [`with_range`](SpanStatsOut::with_range) /
+/// [`with_skew`](SpanStatsOut::with_skew) /
+/// [`with_kurtosis`](SpanStatsOut::with_kurtosis) rather than a struct
+/// literal, so a future output does not churn every call site.
+#[non_exhaustive]
 pub struct SpanStatsOut<'a> {
     /// Number of samples in the span.
     pub dwell: &'a mut [f32],
@@ -228,6 +231,19 @@ pub struct SpanStatsOut<'a> {
     /// single-sample span; `NaN` if the span contains one, matching `np.ptp`
     /// and the `mean` for the same span.
     pub range: Option<&'a mut [f32]>,
+    /// Population skewness of the span, after normalisation: the third
+    /// standardised central moment, `m_3 / m_2^{3/2}` (`scipy.stats.skew` at
+    /// its defaults). `0.0`, not scipy's `NaN`, for a span with zero variance
+    /// (constant, or a single sample) — the analogue of `sd` reading `0.0` on
+    /// a constant span, though that clamp is on the prefix-sum variance, which
+    /// cancellation can leave a hair above zero, while this one is on the
+    /// exact two-pass moment. `NaN` if the span itself contains one.
+    pub skew: Option<&'a mut [f32]>,
+    /// Fisher (excess) kurtosis of the span, after normalisation: the fourth
+    /// standardised central moment minus 3, `m_4 / m_2^2 - 3`
+    /// (`scipy.stats.kurtosis` at its defaults; a Gaussian span reads `0.0`).
+    /// Same degenerate-span and `NaN` rules as `skew`.
+    pub kurtosis: Option<&'a mut [f32]>,
 }
 
 impl<'a> SpanStatsOut<'a> {
@@ -239,6 +255,8 @@ impl<'a> SpanStatsOut<'a> {
             sd,
             median: None,
             range: None,
+            skew: None,
+            kurtosis: None,
         }
     }
 
@@ -251,6 +269,18 @@ impl<'a> SpanStatsOut<'a> {
     /// Also compute the per-span range into `range`.
     pub fn with_range(mut self, range: &'a mut [f32]) -> Self {
         self.range = Some(range);
+        self
+    }
+
+    /// Also compute the per-span skewness into `skew`.
+    pub fn with_skew(mut self, skew: &'a mut [f32]) -> Self {
+        self.skew = Some(skew);
+        self
+    }
+
+    /// Also compute the per-span excess kurtosis into `kurtosis`.
+    pub fn with_kurtosis(mut self, kurtosis: &'a mut [f32]) -> Self {
+        self.kurtosis = Some(kurtosis);
         self
     }
 }
@@ -328,8 +358,8 @@ fn median_numpy(vals: &mut [f32]) -> f32 {
     }
 }
 
-/// Reduce each span to `(dwell, mean, sd)`, optionally also `median` and
-/// `range`.
+/// Reduce each span to `(dwell, mean, sd)`, optionally also `median`, `range`,
+/// `skew` and `kurtosis`.
 ///
 /// A span that does not resolve -- negative, empty, or past the end under the
 /// default [`SpanBounds::Skip`] -- gets `cfg.fill` in *every* requested output.
@@ -338,9 +368,23 @@ fn median_numpy(vals: &mut [f32]) -> f32 {
 ///
 /// Cost is one pass over the spanned region plus O(1) per span, not one pass
 /// per span, so many short spans are as cheap as a few long ones. Requesting
-/// `median` or `range` adds one gather per resolved span (and, for the median,
-/// a select or a sort over it); neither perturbs `dwell`/`mean`/`sd`, which
-/// come from the prefix sums either way.
+/// `median`, `range`, `skew` or `kurtosis` adds one gather per resolved span
+/// (and, for the median, a select or a sort over it); none of them perturbs
+/// `dwell`/`mean`/`sd`, which come from the prefix sums either way.
+///
+/// `skew` and `kurtosis` are the third and fourth standardised central moments
+/// of the span's (normalised) samples -- `scipy.stats.skew`/`kurtosis` at
+/// their defaults (population moments, Fisher excess kurtosis so a Gaussian
+/// span reads `0.0`). Both are computed two-pass in `f64` from the same gather
+/// `median`/`range` already share (mean, then centred power sums), never from
+/// prefix sums of cubes/quartics, which lose precision to catastrophic
+/// cancellation. A span with zero variance (a constant span, hence any
+/// single-sample span) reads `(0.0, 0.0)` rather than scipy's `NaN`, and a
+/// `NaN` inside the span propagates to both. Note the asymmetry with
+/// `mean`/`sd`: those come from prefix sums over the whole covered region, so
+/// a `NaN` anywhere in it poisons them for every span after it, while the
+/// per-span outputs (`median`, `range`, `skew`, `kurtosis`) are `NaN` only
+/// for the span that holds it.
 ///
 /// ```
 /// use escapepod_signal::features::{SpanConfig, SpanScratch, SpanStatsOut, span_stats};
@@ -374,21 +418,30 @@ pub fn span_stats(
         sd,
         mut median,
         mut range,
+        mut skew,
+        mut kurtosis,
     } = out;
     debug_assert_eq!(dwell.len(), spans.len());
     debug_assert_eq!(mean.len(), spans.len());
     debug_assert_eq!(sd.len(), spans.len());
     debug_assert!(median.as_deref().is_none_or(|m| m.len() == spans.len()));
     debug_assert!(range.as_deref().is_none_or(|r| r.len() == spans.len()));
+    debug_assert!(skew.as_deref().is_none_or(|s| s.len() == spans.len()));
+    debug_assert!(kurtosis.as_deref().is_none_or(|k| k.len() == spans.len()));
     let fill = cfg.fill.value();
     dwell.fill(fill);
     mean.fill(fill);
     sd.fill(fill);
-    if let Some(m) = median.as_deref_mut() {
-        m.fill(fill);
-    }
-    if let Some(r) = range.as_deref_mut() {
-        r.fill(fill);
+    for buf in [
+        median.as_deref_mut(),
+        range.as_deref_mut(),
+        skew.as_deref_mut(),
+        kurtosis.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        buf.fill(fill);
     }
     if signal.is_empty() || spans.is_empty() {
         return;
@@ -437,7 +490,7 @@ pub fn span_stats(
         scratch.cumsum_sq.push(acc_sq);
     }
 
-    let per_span = median.is_some() || range.is_some();
+    let per_span = median.is_some() || range.is_some() || skew.is_some() || kurtosis.is_some();
     for (i, s) in spans.iter().enumerate() {
         let Some((a, b)) = resolve_span(s, n_sig, cfg.bounds) else {
             continue;
@@ -464,7 +517,17 @@ pub fn span_stats(
                 .iter()
                 .map(|&v| ((v as f64 - centre) / scale) as f32),
         );
-        // Range first: it reads the gather in order, the median reorders it.
+        // Range and the moments read the gather as gathered; the median
+        // reorders it, so it goes last.
+        if skew.is_some() || kurtosis.is_some() {
+            let (sk, ku) = span_moments(buf);
+            if let Some(s) = skew.as_deref_mut() {
+                s[i] = sk;
+            }
+            if let Some(k) = kurtosis.as_deref_mut() {
+                k[i] = ku;
+            }
+        }
         if let Some(r) = range.as_deref_mut() {
             r[i] = span_range(buf);
         }
@@ -475,6 +538,33 @@ pub fn span_stats(
             };
         }
     }
+}
+
+/// Population skewness and Fisher (excess) kurtosis of `vals` -- the third and
+/// fourth standardised central moments, `scipy.stats.skew` / `kurtosis` at
+/// their defaults -- accumulated two-pass in f64. `(0.0, 0.0)` for a span
+/// with zero variance (constant, or a single sample); `NaN` propagates.
+fn span_moments(vals: &[f32]) -> (f32, f32) {
+    let n = vals.len() as f64;
+    let mean = vals.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let (mut m2, mut m3, mut m4) = (0.0f64, 0.0f64, 0.0f64);
+    for &v in vals {
+        let d = v as f64 - mean;
+        let d2 = d * d;
+        m2 += d2;
+        m3 += d2 * d;
+        m4 += d2 * d2;
+    }
+    m2 /= n;
+    m3 /= n;
+    m4 /= n;
+    if m2 <= 0.0 {
+        return (0.0, 0.0); // NaN fails this test and falls through as NaN
+    }
+    (
+        (m3 / (m2 * m2.sqrt())) as f32,
+        (m4 / (m2 * m2) - 3.0) as f32,
+    )
 }
 
 #[cfg(test)]
@@ -506,9 +596,11 @@ mod tests {
         sd: Vec<f32>,
         median: Vec<f32>,
         range: Vec<f32>,
+        skew: Vec<f32>,
+        kurtosis: Vec<f32>,
     }
 
-    /// Every output, including the two optional ones.
+    /// Every output, including the four optional ones.
     fn run_full(signal: &[f32], spans: &[[i64; 2]], cfg: SpanConfig) -> Outs {
         let n = spans.len();
         let mut o = Outs {
@@ -517,6 +609,8 @@ mod tests {
             sd: vec![0.0; n],
             median: vec![0.0; n],
             range: vec![0.0; n],
+            skew: vec![0.0; n],
+            kurtosis: vec![0.0; n],
         };
         let mut scratch = SpanScratch::default();
         span_stats(
@@ -526,7 +620,9 @@ mod tests {
             &mut scratch,
             SpanStatsOut::new(&mut o.dwell, &mut o.mean, &mut o.sd)
                 .with_median(&mut o.median)
-                .with_range(&mut o.range),
+                .with_range(&mut o.range)
+                .with_skew(&mut o.skew)
+                .with_kurtosis(&mut o.kurtosis),
         );
         o
     }
@@ -778,6 +874,8 @@ mod tests {
             sd: vec![0.0; n],
             median: vec![0.0; n],
             range: vec![0.0; n],
+            skew: vec![0.0; n],
+            kurtosis: vec![0.0; n],
         };
         let mut b = Outs {
             dwell: vec![0.0; n],
@@ -785,6 +883,8 @@ mod tests {
             sd: vec![0.0; n],
             median: vec![0.0; n],
             range: vec![0.0; n],
+            skew: vec![0.0; n],
+            kurtosis: vec![0.0; n],
         };
         for o in [&mut a, &mut b] {
             span_stats(
@@ -794,7 +894,9 @@ mod tests {
                 &mut scratch,
                 SpanStatsOut::new(&mut o.dwell, &mut o.mean, &mut o.sd)
                     .with_median(&mut o.median)
-                    .with_range(&mut o.range),
+                    .with_range(&mut o.range)
+                    .with_skew(&mut o.skew)
+                    .with_kurtosis(&mut o.kurtosis),
             );
         }
         // to_bits, not ==: NaN never equals itself, and these are mostly NaN.
@@ -803,6 +905,8 @@ mod tests {
         assert_eq!(bits(&a.sd), bits(&b.sd));
         assert_eq!(bits(&a.median), bits(&b.median));
         assert_eq!(bits(&a.range), bits(&b.range));
+        assert_eq!(bits(&a.skew), bits(&b.skew));
+        assert_eq!(bits(&a.kurtosis), bits(&b.kurtosis));
     }
 
     #[test]
@@ -1155,5 +1259,209 @@ mod tests {
         );
         assert_eq!((o.dwell[0], o.mean[0]), (2.0, 0.5));
         assert_eq!((o.dwell[1], o.mean[1]), (2.0, 8.5));
+    }
+
+    // ---- skew / kurtosis ---------------------------------------------------
+
+    /// The four vectors from the issue: hand-computed population skewness and
+    /// Fisher excess kurtosis, i.e. `scipy.stats.skew`/`kurtosis` at their
+    /// defaults.
+    #[test]
+    fn skew_and_kurtosis_are_the_population_moments() {
+        let cases: [(&[f32], f32, f32); 4] = [
+            (&[3.0, 9.0], 0.0, -2.0),
+            (&[2.0, 3.0, 4.0], 0.0, -1.5),
+            (&[6.0, 7.0, 8.0, 9.0], 0.0, -1.36),
+            // m = 4, d = [-3, -2, -1, 6]: m2 = 12.5, m3 = 45, m4 = 348.5.
+            (
+                &[1.0, 2.0, 3.0, 10.0],
+                (45.0 / 12.5f64.powf(1.5)) as f32,
+                (348.5 / (12.5f64 * 12.5) - 3.0) as f32,
+            ),
+        ];
+        for (vals, want_skew, want_kurt) in cases {
+            let n = vals.len() as i64;
+            let o = run_full(vals, &[[0, n]], SpanConfig::default());
+            assert!(
+                (o.skew[0] - want_skew).abs() < 1e-6,
+                "{vals:?}: skew {} vs {want_skew}",
+                o.skew[0]
+            );
+            assert!(
+                (o.kurtosis[0] - want_kurt).abs() < 1e-6,
+                "{vals:?}: kurtosis {} vs {want_kurt}",
+                o.kurtosis[0]
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_spans_read_zero_not_nan() {
+        // A constant span, and a single-sample span (also constant, trivially).
+        let sig = [5.0f32, 5.0, 5.0, 5.0];
+        let o = run_full(&sig, &[[0, 4], [0, 1]], SpanConfig::default());
+        for i in 0..2 {
+            assert_eq!(o.skew[i], 0.0, "span {i}");
+            assert_eq!(o.kurtosis[i], 0.0, "span {i}");
+        }
+
+        // A NaN inside the span propagates, like mean.
+        let nan_sig = [1.0f32, f32::NAN, 3.0, 2.0];
+        let o = run_full(&nan_sig, &[[0, 4]], SpanConfig::default());
+        assert!(o.skew[0].is_nan());
+        assert!(o.kurtosis[0].is_nan());
+
+        // An unresolved span gets the fill, whichever fill that is -- a value
+        // other than zero, so the fill cannot be mistaken for the clamp.
+        let o = run_full(&sig, &[[-1, -1]], SpanConfig::default());
+        assert!(o.skew[0].is_nan() && o.kurtosis[0].is_nan());
+        let o = run_full(
+            &sig,
+            &[[-1, -1]],
+            SpanConfig::default().with_fill(SpanFill::Value(-7.0)),
+        );
+        assert_eq!((o.skew[0], o.kurtosis[0]), (-7.0, -7.0));
+    }
+
+    /// Asking for `skew`/`kurtosis` must not perturb `dwell`/`mean`/`sd`/
+    /// `median`/`range`, which come from the prefix sums or the shared gather
+    /// either way.
+    #[test]
+    fn moment_outputs_perturb_nothing() {
+        let sig = pseudo_signal(3_000);
+        let spans = mixed_spans();
+        for norm in [
+            Normalization::None,
+            Normalization::MedianMad { mad_floor: 1e-3 },
+        ] {
+            let cfg = SpanConfig::new(norm);
+            let without = run(&sig, &spans, cfg);
+            let with = run_full(&sig, &spans, cfg);
+            assert_eq!(bits(&without.0), bits(&with.dwell), "dwell, {norm:?}");
+            assert_eq!(bits(&without.1), bits(&with.mean), "mean, {norm:?}");
+            assert_eq!(bits(&without.2), bits(&with.sd), "sd, {norm:?}");
+
+            // And within run_full itself, the median/range values (already
+            // exercised bit-for-bit elsewhere) are unaffected by skew/kurtosis
+            // sharing their gather.
+            let n = spans.len();
+            let mut scratch = SpanScratch::default();
+            let (mut d2, mut m2, mut s2, mut md2, mut rg2) = (
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+            );
+            span_stats(
+                &sig,
+                &spans,
+                cfg,
+                &mut scratch,
+                SpanStatsOut::new(&mut d2, &mut m2, &mut s2)
+                    .with_median(&mut md2)
+                    .with_range(&mut rg2),
+            );
+            assert_eq!(
+                bits(&d2),
+                bits(&with.dwell),
+                "dwell vs median+range only, {norm:?}"
+            );
+            assert_eq!(
+                bits(&m2),
+                bits(&with.mean),
+                "mean vs median+range only, {norm:?}"
+            );
+            assert_eq!(
+                bits(&s2),
+                bits(&with.sd),
+                "sd vs median+range only, {norm:?}"
+            );
+            assert_eq!(bits(&md2), bits(&with.median), "median, {norm:?}");
+            assert_eq!(bits(&rg2), bits(&with.range), "range, {norm:?}");
+        }
+    }
+
+    /// Skew and kurtosis are taken over the *normalised* levels, the same way
+    /// mean/median/range already are, so `MedianMad` normalisation (an affine
+    /// transform per span) must not change them beyond float error: skewness
+    /// is scale- and shift-invariant, and so is excess kurtosis.
+    #[test]
+    fn moments_are_invariant_to_median_mad_normalisation() {
+        let sig = pseudo_signal(4_000);
+        let spans = mixed_spans();
+        let raw = run_full(&sig, &spans, SpanConfig::default());
+        let z = run_full(
+            &sig,
+            &spans,
+            SpanConfig::new(Normalization::MedianMad { mad_floor: 1e-3 }),
+        );
+        for (i, (&rs, &zs)) in raw.skew.iter().zip(&z.skew).enumerate() {
+            if rs.is_nan() {
+                assert!(zs.is_nan(), "skew[{i}] NaN pattern");
+                continue;
+            }
+            assert!(
+                (rs - zs).abs() < 1e-5,
+                "skew[{i}]: raw {rs} vs normalised {zs}"
+            );
+        }
+        for (i, (&rk, &zk)) in raw.kurtosis.iter().zip(&z.kurtosis).enumerate() {
+            if rk.is_nan() {
+                assert!(zk.is_nan(), "kurtosis[{i}] NaN pattern");
+                continue;
+            }
+            assert!(
+                (rk - zk).abs() < 1e-5,
+                "kurtosis[{i}]: raw {rk} vs normalised {zk}"
+            );
+        }
+    }
+
+    /// The obvious per-span loop as the oracle, over many spans of mixed
+    /// offset and length in one call -- the shape `read_rows` uses -- so a
+    /// cross-span defect (scratch bleeding into a shorter following span, an
+    /// offset slip) cannot hide behind the single-span vectors above.
+    #[test]
+    fn moments_match_the_per_span_oracle() {
+        let sig = pseudo_signal(20_000);
+        let spans = mixed_spans();
+        let o = run_full(&sig, &spans, SpanConfig::default());
+        let mut checked = 0;
+        for (i, sp) in spans.iter().enumerate() {
+            let (a, b) = (sp[0], sp[1]);
+            if a < 0 || b <= a || b > sig.len() as i64 {
+                assert!(o.skew[i].is_nan() && o.kurtosis[i].is_nan(), "span {i}");
+                continue;
+            }
+            let seg: Vec<f64> = sig[a as usize..b as usize]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            let n = seg.len() as f64;
+            let mu = seg.iter().sum::<f64>() / n;
+            let moment = |k: i32| seg.iter().map(|v| (v - mu).powi(k)).sum::<f64>() / n;
+            let (m2, m3, m4) = (moment(2), moment(3), moment(4));
+            let (want_skew, want_kurt) = if m2 > 0.0 {
+                (m3 / m2.powf(1.5), m4 / (m2 * m2) - 3.0)
+            } else {
+                (0.0, 0.0)
+            };
+            assert!(
+                (o.skew[i] as f64 - want_skew).abs() < 1e-5,
+                "skew[{i}]: {} vs {want_skew}",
+                o.skew[i]
+            );
+            assert!(
+                (o.kurtosis[i] as f64 - want_kurt).abs() < 1e-5,
+                "kurtosis[{i}]: {} vs {want_kurt}",
+                o.kurtosis[i]
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 10,
+            "the span set must exercise many resolved spans"
+        );
     }
 }

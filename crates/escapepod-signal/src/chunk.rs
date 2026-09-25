@@ -193,6 +193,19 @@ pub enum FeatureChannel {
     LevelStd,
     /// `max - min` of the level over the span.
     LevelRange,
+    /// Population skewness of the level over the span: the third standardised
+    /// central moment, `scipy.stats.skew` at its defaults. `0.0`, not `NaN`,
+    /// for a span with zero variance (constant, or a single sample). Scale-
+    /// free, so a near-constant span with one flickering sample reads an
+    /// extreme value rather than a small one — the definition's answer, and
+    /// the reason a consumer standardises the row per channel.
+    LevelSkew,
+    /// Fisher (excess) kurtosis of the level over the span: the fourth
+    /// standardised central moment minus 3, `scipy.stats.kurtosis` at its
+    /// defaults (a Gaussian span reads `0.0`). `0.0`, not `NaN`, for a span
+    /// with zero variance; a single flicker in an otherwise constant span of
+    /// `n` samples reads about `n - 2`, by the same scale-freedom.
+    LevelKurtosis,
     /// Expected level of the base's k-mer, from the level table.
     KmerExpected,
     /// `level_mean - kmer_expected`.
@@ -202,6 +215,26 @@ pub enum FeatureChannel {
 }
 
 impl FeatureChannel {
+    /// Every row this crate can compute, in declaration order: the one table
+    /// a hint or a test enumerates from, so a new variant cannot be left out
+    /// of either.
+    pub const ALL: &[FeatureChannel] = &[
+        Self::Dwell,
+        Self::DwellLog,
+        Self::DwellMean,
+        Self::DwellStd,
+        Self::DwellRatio,
+        Self::LevelMean,
+        Self::LevelMedian,
+        Self::LevelStd,
+        Self::LevelRange,
+        Self::LevelSkew,
+        Self::LevelKurtosis,
+        Self::KmerExpected,
+        Self::KmerResidual,
+        Self::KmerResidualAbs,
+    ];
+
     /// Parse the name a config file uses.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
@@ -214,6 +247,8 @@ impl FeatureChannel {
             "level_median" => Self::LevelMedian,
             "level_std" => Self::LevelStd,
             "level_range" => Self::LevelRange,
+            "level_skew" => Self::LevelSkew,
+            "level_kurtosis" => Self::LevelKurtosis,
             "kmer_expected" => Self::KmerExpected,
             "kmer_residual" => Self::KmerResidual,
             "kmer_residual_abs" => Self::KmerResidualAbs,
@@ -232,6 +267,8 @@ impl FeatureChannel {
             Self::LevelMedian => "level_median",
             Self::LevelStd => "level_std",
             Self::LevelRange => "level_range",
+            Self::LevelSkew => "level_skew",
+            Self::LevelKurtosis => "level_kurtosis",
             Self::KmerExpected => "kmer_expected",
             Self::KmerResidual => "kmer_residual",
             Self::KmerResidualAbs => "kmer_residual_abs",
@@ -683,21 +720,45 @@ pub fn read_rows(read: &ProcessedRead, spec: &ChunkSpec) -> ReadRows {
     let need_mean = wants(FeatureChannel::LevelMean)
         || wants(FeatureChannel::KmerResidual)
         || wants(FeatureChannel::KmerResidualAbs);
+    let want_median = wants(FeatureChannel::LevelMedian);
+    let want_range = wants(FeatureChannel::LevelRange);
+    let want_skew = wants(FeatureChannel::LevelSkew);
+    let want_kurtosis = wants(FeatureChannel::LevelKurtosis);
     let need_spans = need_mean
-        || wants(FeatureChannel::LevelMedian)
+        || want_median
         || wants(FeatureChannel::LevelStd)
-        || wants(FeatureChannel::LevelRange);
+        || want_range
+        || want_skew
+        || want_kurtosis;
 
-    let (mut mean, mut median, mut sd, mut range) = (
-        vec![0.0f32; n_bases],
-        vec![0.0f32; n_bases],
-        vec![0.0f32; n_bases],
-        vec![0.0f32; n_bases],
+    // `mean`/`sd` come from the prefix sums together; each per-span output is
+    // allocated and requested only when a row names it, since every one of
+    // them is an extra gather per base (and, for the median, a sort).
+    let opt = |want: bool| vec![0.0f32; if want { n_bases } else { 0 }];
+    let (mut mean, mut sd) = (vec![0.0f32; n_bases], vec![0.0f32; n_bases]);
+    let (mut median, mut range, mut skew, mut kurtosis) = (
+        opt(want_median),
+        opt(want_range),
+        opt(want_skew),
+        opt(want_kurtosis),
     );
     if need_spans && n_bases > 0 {
         let spans = base_spans(read);
         let mut dwell_scratch = vec![0.0f32; n_bases];
         let mut scratch = SpanScratch::default();
+        let mut out = SpanStatsOut::new(&mut dwell_scratch, &mut mean, &mut sd);
+        if want_median {
+            out = out.with_median(&mut median);
+        }
+        if want_range {
+            out = out.with_range(&mut range);
+        }
+        if want_skew {
+            out = out.with_skew(&mut skew);
+        }
+        if want_kurtosis {
+            out = out.with_kurtosis(&mut kurtosis);
+        }
         span_stats(
             &read.signal,
             &spans,
@@ -714,9 +775,7 @@ pub fn read_rows(read: &ProcessedRead, spec: &ChunkSpec) -> ReadRows {
                 median: MedianConvention::SortPartialCmp,
             },
             &mut scratch,
-            SpanStatsOut::new(&mut dwell_scratch, &mut mean, &mut sd)
-                .with_median(&mut median)
-                .with_range(&mut range),
+            out,
         );
     }
 
@@ -779,6 +838,8 @@ pub fn read_rows(read: &ProcessedRead, spec: &ChunkSpec) -> ReadRows {
             FeatureChannel::LevelMedian => median.clone(),
             FeatureChannel::LevelStd => sd.clone(),
             FeatureChannel::LevelRange => range.clone(),
+            FeatureChannel::LevelSkew => skew.clone(),
+            FeatureChannel::LevelKurtosis => kurtosis.clone(),
             FeatureChannel::KmerExpected => expected.clone(),
             FeatureChannel::KmerResidual => {
                 mean.iter().zip(&expected).map(|(&o, &e)| o - e).collect()
@@ -1101,22 +1162,10 @@ mod tests {
 
     #[test]
     fn channel_names_round_trip() {
-        for c in [
-            FeatureChannel::Dwell,
-            FeatureChannel::DwellLog,
-            FeatureChannel::DwellMean,
-            FeatureChannel::DwellStd,
-            FeatureChannel::DwellRatio,
-            FeatureChannel::LevelMean,
-            FeatureChannel::LevelMedian,
-            FeatureChannel::LevelStd,
-            FeatureChannel::LevelRange,
-            FeatureChannel::KmerExpected,
-            FeatureChannel::KmerResidual,
-            FeatureChannel::KmerResidualAbs,
-        ] {
+        for &c in FeatureChannel::ALL {
             assert_eq!(FeatureChannel::from_name(c.name()), Some(c));
         }
+        assert!(FeatureChannel::ALL.contains(&FeatureChannel::LevelKurtosis));
         for c in [SignalChannel::Current, SignalChannel::KmerResidual] {
             assert_eq!(SignalChannel::from_name(c.name()), Some(c));
         }
@@ -1184,6 +1233,34 @@ mod tests {
             assert!((resid[i] - (mean[i] - exp[i])).abs() < 1e-6);
             assert_eq!(abs[i], resid[i].abs());
         }
+    }
+
+    /// `level_skew`/`level_kurtosis` are exactly `span_stats`'s skew/kurtosis
+    /// over each base's span -- the toy read's four spans are `[0,2)`, `[2,5)`,
+    /// `[5,6)` and `[6,10)` of `0..10`, i.e. the issue's two-point, three-point,
+    /// single-sample and four-point vectors.
+    #[test]
+    fn level_moment_rows_are_span_stats_moments() {
+        let r = read();
+        let rows = read_rows(
+            &r,
+            &spec_with(vec![
+                FeatureChannel::LevelSkew,
+                FeatureChannel::LevelKurtosis,
+            ]),
+        );
+        let (skew, kurt) = (&rows.feature_rows[0], &rows.feature_rows[1]);
+        for (i, &s) in skew.iter().enumerate() {
+            assert!(s.abs() < 1e-7, "skew[{i}] = {s}");
+        }
+        let want_kurt = [-2.0f32, -1.5, 0.0, -1.36];
+        for (i, (&k, &w)) in kurt.iter().zip(&want_kurt).enumerate() {
+            assert!((k - w).abs() < 1e-6, "kurtosis[{i}]: {k} vs {w}");
+        }
+
+        // Asking for LevelSkew alone yields exactly one row.
+        let rows = read_rows(&r, &spec_with(vec![FeatureChannel::LevelSkew]));
+        assert_eq!(rows.feature_rows.len(), 1);
     }
 
     /// The rolling window pads its edges by repeating, so the first base's
