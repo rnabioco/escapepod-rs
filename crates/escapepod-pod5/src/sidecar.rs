@@ -57,7 +57,7 @@ use arrow::array::{
     Array, ArrayRef, DictionaryArray, FixedSizeBinaryBuilder, Float32Array, Int32Builder,
     StringArray, UInt32Array,
 };
-use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+use arrow::datatypes::{DataType, Field, Int32Type, Metadata, Schema};
 use arrow::ipc::CompressionType;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
@@ -865,7 +865,7 @@ impl Sidecar {
 /// The `.p5s` version gate, shared by [`read_sidecar_file`] and
 /// [`read_sidecar_metadata`] so the two can never disagree about whether a
 /// sidecar is loadable.
-fn check_version(metadata: &HashMap<String, String>, p5s_path: &Path) -> Result<()> {
+fn check_version(metadata: &Metadata, p5s_path: &Path) -> Result<()> {
     // Checked before the version, so the message names the shape rather than a
     // number. A collection genuinely is a `.p5s` this build reads — just not
     // through this reader — and "version 3 unsupported" would say the opposite.
@@ -896,7 +896,7 @@ fn check_version(metadata: &HashMap<String, String>, p5s_path: &Path) -> Result<
 /// Returns the provenance it had to read anyway, so a caller that wants it
 /// does not parse the same three keys a second time.
 fn check_identity(
-    metadata: &HashMap<String, String>,
+    metadata: &Metadata,
     p5s_path: &Path,
     expect: &Pod5Identity,
 ) -> Result<SidecarProvenance> {

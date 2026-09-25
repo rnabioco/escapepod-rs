@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use arrow::datatypes::{DataType, Field, Schema};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Extension type name for MinKNOW UUIDs.
@@ -55,7 +56,7 @@ pub fn reads_schema() -> Schema {
                 UUID_EXTENSION_NAME.to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<HashMap<String, String>>(),
         ),
         Field::new(
             "signal",
