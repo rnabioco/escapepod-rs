@@ -1583,21 +1583,11 @@ fn waveform_spec(
         "features",
         sigchunk::FeatureChannel::from_name,
         || {
-            [
-                "dwell",
-                "dwell_log",
-                "dwell_mean",
-                "dwell_std",
-                "dwell_ratio",
-                "level_mean",
-                "level_median",
-                "level_std",
-                "level_range",
-                "kmer_expected",
-                "kmer_residual",
-                "kmer_residual_abs",
-            ]
-            .join(", ")
+            sigchunk::FeatureChannel::ALL
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>()
+                .join(", ")
         },
     )?;
     let signal_channels = resolve_channels(
@@ -2659,6 +2649,27 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(err.contains("dwell_kurtosis"), "{err}");
+            // The hint lists what `from_name` accepts, derived rather than typed.
+            assert!(
+                err.contains("level_skew") && err.contains("level_kurtosis"),
+                "{err}"
+            );
+        }
+
+        /// `level_skew`/`level_kurtosis` resolve through `FeatureChannel::from_name`
+        /// like every other row — no code change needed here, just a name the
+        /// runtime now knows (rnabioco/escapepod-rs#396).
+        #[test]
+        fn level_moment_rows_resolve() {
+            use escapepod_signal::chunk::FeatureChannel as F;
+            let spec = spec_of(&block(|v| {
+                let o = v["channels"]["features"]["order"].as_array_mut().unwrap();
+                o[7] = "level_skew".into();
+                o[8] = "level_kurtosis".into();
+            }))
+            .unwrap();
+            assert_eq!(spec.chunk.feature_channels[7], F::LevelSkew);
+            assert_eq!(spec.chunk.feature_channels[8], F::LevelKurtosis);
         }
 
         /// Two statements of the tensor's height, from different parts of the
