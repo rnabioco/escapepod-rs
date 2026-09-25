@@ -24,6 +24,7 @@ These commands are in the default build — no extra Cargo features required.
 | [demux](demux.md) | Barcode demultiplexing — DTW-SVM, GBM, or CTC-CRF, end to end |
 | [index](index-command.md) | Build the `.p5s` sidecar caches (read index + signal batch geometry) |
 | [classify](classify.md) | Read-level classification against a model bundle (tRNA charging) |
+| [align](align.md) | All-against-all alignment of reads to a small reference panel (tRNA), ties reported explicitly |
 
 Additional commands — `repack`, `resquiggle`, and
 [`annotate`](../experimental/annotate.md) — need `--features experimental`;

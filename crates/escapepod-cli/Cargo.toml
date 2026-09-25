@@ -27,6 +27,8 @@ escapepod-pod5 = { workspace = true, optional = true }
 escapepod-signal = { workspace = true, optional = true }
 escapepod-demux = { workspace = true, optional = true }
 escapepod-classify = { workspace = true, optional = true }
+# All-vs-all tRNA read aligner (`escpod align`); std-only, so free to link.
+escapepod-align = { workspace = true, optional = true }
 
 # CLI-only dependencies. All optional and rolled into the `cli` feature so the
 # library surface stays lean.
@@ -120,6 +122,7 @@ cli = [
     "crf-decode",
     "demux-models",
     "model-fetch",
+    "dep:escapepod-align",
     "dep:anyhow",
     "dep:arrow",
     "dep:bstr",

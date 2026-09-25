@@ -457,6 +457,22 @@ POD5 per stage; prefer the fused form unless you want the intermediate files.
         args: Vec<String>,
     },
 
+    /// Align reads to a small reference panel (tRNA), all against all
+    #[command(after_help = "\
+Examples:
+  escpod align reads.ubam -r trna.fa -o aligned.bam
+  escpod align reads.fq.gz -r trna.fa -o aligned.bam --mode semiglobal
+  escpod align reads.ubam -r trna.fa -o aligned.bam --scoring 1,-1,-2,-1 --secondary
+
+Every read is scored against every reference (affine-gap local or overlap DP,
+AVX2/AVX-512), the best-scoring reference is the primary, and references tied
+with it are reported in XA (MAPQ 0) rather than hidden. Output is in input
+order with every input tag carried through (mv, ns, ts, MM/ML, RG, ...); MD and
+NM match `samtools calmd`. Built for small panels (<= ~10k references of
+<= ~1 kb): there is no seed index, so memory is one batch of reads.
+")]
+    Align(commands::align::AlignArgs),
+
     /// Classify reads against a model bundle (tRNA charging) from POD5 +
     /// aligned BAM
     #[cfg(feature = "classify")]
@@ -647,6 +663,8 @@ fn requested_threads(command: &Commands) -> Option<usize> {
 
         Commands::Index { threads, .. } => *threads,
 
+        Commands::Align(args) => args.threads,
+
         #[cfg(feature = "experimental")]
         Commands::Annotate { threads, .. } => *threads,
         #[cfg(not(feature = "experimental"))]
@@ -810,7 +828,8 @@ fn main() -> anyhow::Result<()> {
     } else {
         format!(
             "warn,escpod={level},escapepod_cli={level},escapepod_demux={level},\
-             escapepod_signal={level},escapepod_pod5={level},escapepod_classify={level}"
+             escapepod_signal={level},escapepod_pod5={level},escapepod_classify={level},\
+             escapepod_align={level}"
         )
     };
     tracing_subscriber::fmt()
@@ -931,6 +950,8 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(not(feature = "demux"))]
         Commands::Demux { .. } => feature_disabled("demux", "demux"),
+
+        Commands::Align(args) => commands::align::run(args),
 
         #[cfg(feature = "classify")]
         Commands::Classify(args) => commands::classify::run(args),

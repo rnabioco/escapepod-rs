@@ -2,12 +2,12 @@
 
 ## Purpose and layering
 - Builds `escpod` (`[[bin]] required-features = ["cli"]`) plus an umbrella library (`escapepod_cli::{pod5,signal,demux,classify}`) for `default-features = false` consumers — none exist in the workspace.
-- Depends on `escapepod-signal` (re-exports `pod5`), `escapepod-demux`, `escapepod-classify`. BAM I/O (noodles) lives here, not in the libraries.
+- Depends on `escapepod-signal` (re-exports `pod5`), `escapepod-demux`, `escapepod-classify`, `escapepod-align`. BAM/FASTA/FASTQ I/O (noodles, hand-rolled FASTX) lives here, not in the libraries.
 
 ## Module map
 - `main.rs` — clap tree, `EscpodFormatter`, `-q/-v` → `EnvFilter`, `requested_threads`, signal/SIGPIPE handlers, dispatch, arg-parse unit tests.
 - `lib.rs` re-exports; `build.rs` `ESCPOD_VERSION`; `progress.rs` bars (hidden below INFO); `commands/profile.rs` `PhaseTimer`; `style.rs` ANSI gated on stderr TTY + `NO_COLOR`; `threads.rs` the one rayon `init`; `device.rs` `--device` + `Stage` placement; `util.rs` input/output resolution, BAI; `test_env.rs` env lock for tests.
-- `commands/`: `view inspect summary merge filter bam_filter subset index classify`, `signal` (deprecated alias), and under `experimental`: `repack annotate resquiggle resquiggle_models`.
+- `commands/`: `view inspect summary merge filter bam_filter subset index classify align`, `signal` (deprecated alias), and under `experimental`: `repack annotate resquiggle resquiggle_models`.
 - `commands/demux/` — see `commands/demux/CLAUDE.md`.
 
 ## Feature flags
@@ -36,7 +36,7 @@ pixi run cargo build --release -p escapepod-cli
 pixi run cargo build -p escapepod-cli --no-default-features --features cli   # system allocator A/B
 pixi run -e dev cargo nextest run -p escapepod-cli && pixi run cargo test --doc -p escapepod-cli
 ```
-`tests/`: `classify_e2e` (golden parity + alias warning), `dir_inputs`, `thread_pool` (spawns the binary) — all read `../escapepod-classify/tests/fixtures/`, no `ext/`. `main.rs` unit tests pin parsing; `cli_definition_is_internally_consistent` is clap's `debug_assert` and the only thing that catches a bad `#[command(flatten)]`.
+`tests/`: `classify_e2e` (golden parity + alias warning), `align_e2e` (fixture BAM as input: assignment, tag passthrough, ties/XA/secondaries, unmapped, FASTQ ≡ uBAM, `--strand both`, align → classify golden parity), `dir_inputs`, `thread_pool` (spawns the binary) — all read `../escapepod-classify/tests/fixtures/`, no `ext/`. `main.rs` unit tests pin parsing; `cli_definition_is_internally_consistent` is clap's `debug_assert` and the only thing that catches a bad `#[command(flatten)]`.
 
 ## Invariants and traps
 - `requested_threads` is an exhaustive match on purpose — the #155 tripwire.

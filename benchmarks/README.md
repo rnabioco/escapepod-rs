@@ -1,5 +1,77 @@
 # Benchmark Results
 
+## `escpod align`: all-vs-all tRNA alignment, first numbers (2026-09-25)
+
+`escpod align` (#395) scores every read against every reference of the
+sacCer3 dual-adapter panel (164 references, 138–200 nt, 24,790 bases) and
+traces the winners. The cost is `reads × references × lengths` and nothing
+else, so any real sample measures it; these are dorado uBAMs from
+`aa-tRNA-seq-pipeline-runs/results/2025-06-09/outs/bam/rebasecall/` (M4:
+3,296,074 reads, 1.5 GB; M1: 489,795 reads, mean length 122 nt, max ~400 kb),
+default scoring (`2,-1,-10,-1`, local), aligned against
+`sacCer3-mature-tRNAs-dual-adapt-v2.fa`. `srun -p rna -c 32 --mem=32G`
+(Gold 6240R, 16 cores + HT), `-t 32`, release build of `a3047cb`,
+`benchmarks/benchmark_align.sh` (arms interleaved, input paged in first,
+output to node-local scratch):
+
+| sample | kernel | wall (s) | CPU (s) | MaxRSS (MiB) | reads/s |
+|---|---|---:|---:|---:|---:|
+| M4, 3.30 M reads | avx512 | 117.0 / 117.6 | 3,256 / 3,264 | 2,746 / 2,717 | 28,172 / 28,023 |
+| M4 | avx2 | 114.1 / 113.2 | 3,407 / 3,402 | 2,339 / 2,349 | 28,895 / 29,120 |
+| M1, 0.49 M reads | avx512 | 19.0 / 19.5 | 483 / 480 | 2,356 / 2,329 | 25,779 / 25,156 |
+| M1 | avx2 | 16.8 / 17.0 | 499 / 500 | 2,229 / 2,203 | 29,120 / 28,778 |
+| M1 | scalar | 484.8 / 484.8 | 15,273 / 15,274 | 1,497 / 1,484 | 1,010 / 1,010 |
+
+(Two reps each, `rep 1 / rep 2`.) The step it replaces — `bwa mem -k 6`
++ `samtools calmd` in aa-tRNA-seq-pipeline — is budgeted 160 GB and 12 h per
+sample and measured at 78–90 GiB RSS; this is ~2 minutes and under 3 GiB for a
+3.3 M-read sample, and memory is set by `--batch-size`, not by the reads.
+
+**AVX-512 does not beat AVX2 here, and that is the port count, not the
+kernel.** On Cascade Lake, 512-bit integer ops issue on ports 0 and 5 only
+(port 1's 512-bit path is fused off), while 256-bit ops use 0, 1 and 5: 32
+lanes × 2 ports against 16 lanes × 3 is 64 against 48 lane-ops per cycle
+before the AVX-512 frequency licence, and the kernel is ALU-bound (11 vector
+ops per cell against 3 loads and 2 stores, ~5–7 cycles per 32-lane cell
+measured). AVX-512 still spends ~4% less CPU; AVX2 finishes ~3% sooner on wall,
+most likely because the licence also slows the BGZF threads sharing the cores.
+The dispatch keeps preferring AVX-512 (CPU is the shared currency on a busy
+node); `ESCAPEPOD_ALIGN_BACKEND=avx2` is the lever. Scalar is 32× the SIMD CPU.
+
+**How it got here (M1, CPU seconds / wall seconds, output byte-identical at
+every step):**
+
+| change | CPU (s) | wall (s) |
+|---|---:|---:|
+| first version: SIMD scoring, scalar traceback for every winner | 1,019 | 40.1 |
+| tie sets traced by an inter-sequence SIMD kernel (one lane per tied reference) | 550 | 26.6 |
+| one *pairs* kernel for all tracebacks (each lane its own read and reference; a chunk's winners share lanes) | ~470 | 24.0 |
+| no barrier between batches; chunks capped at 16 kb; writer reorders | ~470 | 18.8 |
+
+The first profile was 65% scalar traceback. About 5% of M1's reads are
+adapter-only and tie with **all 164** references (another 2% with 81), and
+each tie got its own scalar DP at ~45 instructions per cell. Then the unique
+winners' scalar tracebacks were 19% of CPU; the pairs kernel took all
+tracebacks to ~5%, and the score kernel is now ~77% of cycles. The last row is
+wall only: a per-batch `par_iter` waited at every batch for its slowest chunk,
+and reads of 50–400 kb make chunks of 0.5–6 s where a typical one is
+milliseconds — `-v`'s busy counter showed 16 of 32 threads working on average.
+
+Not done, and where the next measurable wins are: the panel's last lane group
+holds 4 references in 32 lanes (a 16-lane tail group would save ~5% of the
+score kernel); and the score kernel's 11 ops per cell have no obvious fat left.
+An 8-bit first pass (SWIPE's trick) does not apply at the default scoring —
+a tRNA read's local score passes 255.
+
+Reproduce:
+
+```bash
+srun -p rna -c 32 --mem=32G -- benchmarks/benchmark_align.sh \
+    --reads .../rebasecall/M4/M4.rbc.bam \
+    --reference .../resources/ref/sacCer3-mature-tRNAs-dual-adapt-v2.fa \
+    --backend avx512 --backend avx2 --reps 2
+```
+
 ## Dwell-penalty DP: still 72% of CPU post-transpose, `max_check` halved (2026-09-09)
 
 A flat `perf` profile (`-F 499`, no call graph — `--call-graph dwarf` hangs
