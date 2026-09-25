@@ -158,110 +158,167 @@ impl Aligner {
 
     /// Align one read (letters, as they will be written to SAM).
     pub fn map_read(&self, read: &[u8], opts: &MapOptions) -> ReadMapping {
-        let unmapped = |best_score, n_tied, suboptimal| ReadMapping {
-            best_score,
-            n_tied,
-            suboptimal,
-            hits: Vec::new(),
-        };
-        let fwd = encode(read);
-        if fwd.is_empty() {
-            return unmapped(None, 0, None);
-        }
-        let mut fwd_scores = Vec::new();
-        self.score_all(&fwd, &mut fwd_scores);
-        let (rev, rev_scores) = if opts.both_strands {
-            let rev = alphabet::reverse_complement_codes(&fwd);
-            let mut s = Vec::new();
-            self.score_all(&rev, &mut s);
-            (rev, s)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        self.map_reads(&[read], opts)
+            .pop()
+            .expect("one mapping per read")
+    }
 
-        // Candidates in tie order: reference order, forward before reverse.
-        let candidates = || {
-            (0..self.panel.len()).flat_map(|r| {
-                let f = std::iter::once((r, false, fwd_scores[r]));
-                let b = rev_scores.get(r).map(|&s| (r, true, s));
-                f.chain(b)
+    /// Align several reads, one [`ReadMapping`] each, in order.
+    ///
+    /// Equivalent to [`Aligner::map_read`] on each, and the way to call it
+    /// when there are many: every read's panel is scored on its own, but the
+    /// winners of all of them are traced together, so the traceback kernels'
+    /// lanes fill with pairs from different reads (see
+    /// `simd::align_pairs`). A few dozen reads per call is enough to fill
+    /// them.
+    pub fn map_reads(&self, reads: &[&[u8]], opts: &MapOptions) -> Vec<ReadMapping> {
+        /// One read after scoring, before tracing.
+        struct Scored {
+            fwd: Vec<u8>,
+            rev: Vec<u8>,
+            best: Option<i32>,
+            n_tied: usize,
+            suboptimal: Option<i32>,
+            /// The tie-set members to trace, `(panel index, reverse)`; empty
+            /// when the read is unmapped before any traceback.
+            take: Vec<(usize, bool)>,
+        }
+
+        let mut scores = Vec::new();
+        let mut rev_scores = Vec::new();
+        let scored: Vec<Scored> = reads
+            .iter()
+            .map(|read| {
+                let fwd = encode(read);
+                if fwd.is_empty() {
+                    return Scored {
+                        fwd,
+                        rev: Vec::new(),
+                        best: None,
+                        n_tied: 0,
+                        suboptimal: None,
+                        take: Vec::new(),
+                    };
+                }
+                self.score_all(&fwd, &mut scores);
+                let rev = if opts.both_strands {
+                    let rev = alphabet::reverse_complement_codes(&fwd);
+                    self.score_all(&rev, &mut rev_scores);
+                    rev
+                } else {
+                    rev_scores.clear();
+                    Vec::new()
+                };
+                // Candidates in tie order: reference order, forward before reverse.
+                let candidates = || {
+                    (0..self.panel.len()).flat_map(|r| {
+                        let f = std::iter::once((r, false, scores[r]));
+                        let b = rev_scores.get(r).map(|&s| (r, true, s));
+                        f.chain(b)
+                    })
+                };
+                let best = candidates()
+                    .map(|(_, _, s)| s)
+                    .max()
+                    .expect("non-empty panel");
+                let ties: Vec<(usize, bool)> = candidates()
+                    .filter(|&(_, _, s)| s == best)
+                    .map(|(r, rv, _)| (r, rv))
+                    .collect();
+                let suboptimal = candidates()
+                    .filter(|&(_, _, s)| s != best)
+                    .map(|(_, _, s)| s)
+                    .max();
+                let n_tied = ties.len();
+                let take = if best < opts.min_score {
+                    Vec::new()
+                } else {
+                    let k = opts
+                        .max_ties
+                        .map_or(n_tied, |k| n_tied.min(k.saturating_add(1)));
+                    ties.into_iter().take(k).collect()
+                };
+                Scored {
+                    fwd,
+                    rev,
+                    best: Some(best),
+                    n_tied,
+                    suboptimal,
+                    take,
+                }
             })
-        };
-        let best = candidates()
-            .map(|(_, _, s)| s)
-            .max()
-            .expect("non-empty panel");
-        let ties: Vec<(usize, bool)> = candidates()
-            .filter(|&(_, _, s)| s == best)
-            .map(|(r, rv, _)| (r, rv))
             .collect();
-        let suboptimal = candidates()
-            .filter(|&(_, _, s)| s != best)
-            .map(|(_, _, s)| s)
-            .max();
-        if best < opts.min_score {
-            return unmapped(Some(best), ties.len(), suboptimal);
-        }
 
-        let take = opts
-            .max_ties
-            .map_or(ties.len(), |k| ties.len().min(k.saturating_add(1)));
-        let rev_letters = if ties[..take].iter().any(|&(_, rv)| rv) {
-            alphabet::reverse_complement(read)
-        } else {
-            Vec::new()
-        };
-        // Trace the taken ties, forward and reverse separately (different
-        // query codes), each batch through the SIMD traceback kernels.
-        let taken = &ties[..take];
-        let mut alignments: Vec<Option<Alignment>> = vec![None; take];
-        for reverse in [false, true] {
-            let slots: Vec<usize> = (0..take).filter(|&k| taken[k].1 == reverse).collect();
-            if slots.is_empty() {
-                continue;
-            }
-            let codes: &[u8] = if reverse { &rev } else { &fwd };
-            let refs: Vec<&[u8]> = slots
-                .iter()
-                .map(|&k| &self.panel.get(taken[k].0).codes[..])
-                .collect();
-            let traced = simd::align_many(self.backend, codes, &refs, &self.scoring, self.mode);
-            for (k, a) in slots.into_iter().zip(traced) {
-                alignments[k] = Some(a);
-            }
-        }
-        let mut hits = Vec::with_capacity(take);
-        for (&(r, reverse), alignment) in taken.iter().zip(alignments) {
-            let alignment = alignment.expect("every taken tie was traced");
-            debug_assert_eq!(alignment.score, best, "traceback disagrees with the kernel");
-            if alignment.is_empty() {
-                // Only a local score of zero traces to nothing, and then every
-                // tie does: the read aligns nowhere.
-                return unmapped(Some(best), ties.len(), suboptimal);
-            }
-            let reference = self.panel.get(r);
-            let letters: &[u8] = if reverse { &rev_letters } else { read };
-            let (md, nm) = sam::md_nm(
-                letters,
-                &reference.seq,
-                alignment.query_start,
-                alignment.ref_start,
-                &alignment.ops,
-            );
-            hits.push(Hit {
-                reference: r,
-                reverse,
-                alignment,
-                md,
-                nm,
-            });
-        }
-        ReadMapping {
-            best_score: Some(best),
-            n_tied: ties.len(),
-            suboptimal,
-            hits,
-        }
+        // Trace every taken tie of every read in one batch.
+        let pairs: Vec<(&[u8], &[u8])> = scored
+            .iter()
+            .flat_map(|sc| {
+                sc.take.iter().map(move |&(r, reverse)| {
+                    let q: &[u8] = if reverse { &sc.rev } else { &sc.fwd };
+                    (q, &self.panel.get(r).codes[..])
+                })
+            })
+            .collect();
+        let mut traced =
+            simd::align_pairs(self.backend, &pairs, &self.scoring, self.mode).into_iter();
+
+        scored
+            .iter()
+            .zip(reads)
+            .map(|(sc, &read)| {
+                let alignments: Vec<Alignment> = traced.by_ref().take(sc.take.len()).collect();
+                let unmapped = ReadMapping {
+                    best_score: sc.best,
+                    n_tied: sc.n_tied,
+                    suboptimal: sc.suboptimal,
+                    hits: Vec::new(),
+                };
+                if sc.take.is_empty() || alignments[0].is_empty() {
+                    // Below --min-score, or a local score of zero: every tie
+                    // then traces to nothing, and the read aligns nowhere.
+                    return unmapped;
+                }
+                let rev_letters = if sc.take.iter().any(|&(_, rv)| rv) {
+                    alphabet::reverse_complement(read)
+                } else {
+                    Vec::new()
+                };
+                let hits = sc
+                    .take
+                    .iter()
+                    .zip(alignments)
+                    .map(|(&(r, reverse), alignment)| {
+                        debug_assert_eq!(
+                            Some(alignment.score),
+                            sc.best,
+                            "traceback disagrees with the kernel"
+                        );
+                        let reference = self.panel.get(r);
+                        let letters: &[u8] = if reverse { &rev_letters } else { read };
+                        let (md, nm) = sam::md_nm(
+                            letters,
+                            &reference.seq,
+                            alignment.query_start,
+                            alignment.ref_start,
+                            &alignment.ops,
+                        );
+                        Hit {
+                            reference: r,
+                            reverse,
+                            alignment,
+                            md,
+                            nm,
+                        }
+                    })
+                    .collect();
+                ReadMapping {
+                    best_score: sc.best,
+                    n_tied: sc.n_tied,
+                    suboptimal: sc.suboptimal,
+                    hits,
+                }
+            })
+            .collect()
     }
 }
 
@@ -297,6 +354,32 @@ mod tests {
         );
         assert_eq!(capped.n_tied, 2);
         assert_eq!(capped.hits.len(), 1);
+    }
+
+    /// Tracing many reads' winners together must not change any of them.
+    #[test]
+    fn batched_mapping_equals_one_at_a_time() {
+        let reads: Vec<&[u8]> = vec![
+            b"ACGTACGTACGT",
+            b"CCCCACGTACGTACGTAAAA",
+            b"TTTTTTTTTTTT",
+            b"",
+            b"GGGGACGTACGTACGTTTTT",
+            b"NNNN",
+        ];
+        for backend in Backend::available() {
+            for mode in [Mode::Local, Mode::SemiGlobal] {
+                let a = Aligner::with_backend(panel(), Scoring::default(), mode, backend).unwrap();
+                let opts = MapOptions {
+                    both_strands: true,
+                    ..MapOptions::default()
+                };
+                let batched = a.map_reads(&reads, &opts);
+                for (r, b) in reads.iter().zip(&batched) {
+                    assert_eq!(&a.map_read(r, &opts), b, "{}", backend.name());
+                }
+            }
+        }
     }
 
     #[test]

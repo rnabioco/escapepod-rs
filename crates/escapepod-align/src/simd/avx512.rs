@@ -6,8 +6,8 @@
 
 use std::arch::x86_64::*;
 
-use super::{Gaps, Group, LaneEnds};
-use crate::alphabet::N_CODES;
+use super::{Gaps, Group, LaneEnds, PairGroup, Scores};
+use crate::alphabet::{N_CODES, WILDCARD};
 use crate::scalar::{E_EXTENDED, F_EXTENDED, SRC_DEL, SRC_DIAG, SRC_INS};
 use crate::scoring::Mode;
 
@@ -106,20 +106,20 @@ unsafe fn kernel<const LOCAL: bool>(
     }
 }
 
-/// The score kernel plus a traceback byte per cell and lane, and each lane's
-/// end cell in the scalar path's scan order (see `super::align_many`).
+/// Traceback DP over up to 32 independent (read, reference) pairs: the score
+/// recurrence plus a traceback byte per cell and lane, and each lane's end
+/// cell in the scalar path's scan order (see `super::align_pairs`).
 ///
 /// # Safety
 ///
-/// As [`score_group`], and `tb` must hold `(query.len() + 1) * (g.len + 1) *
-/// 32` bytes; `query.len()` must be below `i16::MAX`.
+/// The CPU must support AVX-512F and AVX-512BW; `hbuf`/`ebuf` must hold
+/// `g.rows * 32` elements and `tb` `(g.rows + 1) * (g.cols + 1) * 32` bytes;
+/// `g.rows` and `g.cols` must be below `i16::MAX`.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw")]
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn trace_group(
-    query: &[u8],
-    g: &Group,
-    gaps: Gaps,
+pub(super) unsafe fn trace_pairs(
+    g: &PairGroup,
+    sc: Scores,
     mode: Mode,
     hbuf: &mut [i16],
     ebuf: &mut [i16],
@@ -128,33 +128,35 @@ pub(super) unsafe fn trace_group(
 ) {
     match mode {
         // SAFETY: forwarded from this function's contract.
-        Mode::Local => unsafe { trace_kernel::<true>(query, g, gaps, hbuf, ebuf, tb, ends) },
-        Mode::SemiGlobal => unsafe { trace_kernel::<false>(query, g, gaps, hbuf, ebuf, tb, ends) },
+        Mode::Local => unsafe { pairs_kernel::<true>(g, sc, hbuf, ebuf, tb, ends) },
+        Mode::SemiGlobal => unsafe { pairs_kernel::<false>(g, sc, hbuf, ebuf, tb, ends) },
     }
 }
 
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn trace_kernel<const LOCAL: bool>(
-    query: &[u8],
-    g: &Group,
-    gaps: Gaps,
+unsafe fn pairs_kernel<const LOCAL: bool>(
+    g: &PairGroup,
+    sc: Scores,
     hbuf: &mut [i16],
     ebuf: &mut [i16],
     tb: &mut [u8],
     ends: &mut LaneEnds,
 ) {
-    let n = query.len();
-    let rows = n + 1;
+    let (n, m) = (g.rows, g.cols);
+    let stride = n + 1;
     assert!(hbuf.len() >= n * W && ebuf.len() >= n * W);
-    assert!(tb.len() >= rows * (g.len + 1) * W);
-    assert!(n < i16::MAX as usize && g.len < i16::MAX as usize);
-    assert_eq!(g.lens.len(), W);
-    assert!(g.prof.len() >= g.len * N_CODES * W);
+    assert!(tb.len() >= stride * (m + 1) * W);
+    assert!(n < i16::MAX as usize && m < i16::MAX as usize);
+    assert!(g.qlens.len() == W && g.rlens.len() == W);
+    assert!(g.qt.len() >= n * W && g.rt.len() >= m * W);
     let zero = _mm512_setzero_si512();
     let neg = _mm512_set1_epi16(i16::MIN);
-    let vo = _mm512_set1_epi16(gaps.open);
-    let ve = _mm512_set1_epi16(gaps.extend);
+    let wild = _mm512_set1_epi16(WILDCARD as i16);
+    let vm = _mm512_set1_epi16(sc.match_score);
+    let vx = _mm512_set1_epi16(sc.mismatch);
+    let vo = _mm512_set1_epi16(sc.open);
+    let ve = _mm512_set1_epi16(sc.extend);
     let (t_diag, t_ins, t_del) = (
         _mm512_set1_epi16(SRC_DIAG as i16),
         _mm512_set1_epi16(SRC_INS as i16),
@@ -166,35 +168,38 @@ unsafe fn trace_kernel<const LOCAL: bool>(
     );
     let hp = hbuf.as_mut_ptr() as *mut __m512i;
     let ep = ebuf.as_mut_ptr() as *mut __m512i;
-    let pp = g.prof.as_ptr();
+    let qp = g.qt.as_ptr() as *const __m512i;
+    let rp = g.rt.as_ptr() as *const __m512i;
     let tp = tb.as_mut_ptr();
-    // SAFETY: offsets stay inside the buffers whose sizes are asserted above;
-    // a traceback row is 32 bytes at `((j+1) * rows + i+1) * 32`, `j < g.len`,
-    // `i < n`.
+    // SAFETY: every offset stays inside the buffers whose sizes are asserted
+    // above; a traceback row is 32 bytes at `((j+1) * stride + i+1) * 32`.
     unsafe {
         for i in 0..n {
             _mm512_storeu_si512(hp.add(i), zero);
             _mm512_storeu_si512(ep.add(i), neg);
         }
-        let lens = _mm512_loadu_si512(g.lens.as_ptr() as *const __m512i);
+        let qlens = _mm512_loadu_si512(g.qlens.as_ptr() as *const __m512i);
+        let rlens = _mm512_loadu_si512(g.rlens.as_ptr() as *const __m512i);
         let mut best = if LOCAL { zero } else { neg };
         let mut bi = zero;
         let mut bj = zero;
-        for j in 0..g.len {
-            let pj = pp.add(j * N_CODES * W);
+        for j in 0..m {
+            let rv = _mm512_loadu_si512(rp.add(j));
+            let rwild = _mm512_cmpeq_epi16_mask(rv, wild);
             let jv = _mm512_set1_epi16(j as i16 + 1);
-            let valid = _mm512_cmpgt_epi16_mask(lens, _mm512_set1_epi16(j as i16));
-            let tcol = tp.add((j + 1) * rows * W);
+            let jvalid = _mm512_cmpgt_epi16_mask(rlens, _mm512_set1_epi16(j as i16));
+            let jlast = _mm512_cmpeq_epi16_mask(rlens, jv);
+            let tcol = tp.add((j + 1) * stride * W);
             let mut hdiag = zero;
             let mut hup = zero;
             let mut f = neg;
-            // Semi-global: the first maximum of this column, for lanes whose
-            // last column it is.
-            let mut colmax = neg;
-            let mut colarg = zero;
-            for (i, &c) in query.iter().enumerate() {
+            for i in 0..n {
+                let qv = _mm512_loadu_si512(qp.add(i));
+                let i0 = _mm512_set1_epi16(i as i16);
                 let iv = _mm512_set1_epi16(i as i16 + 1);
-                let s = _mm512_loadu_si512(pj.add(c as usize * W) as *const __m512i);
+                let same =
+                    _mm512_cmpeq_epi16_mask(qv, rv) | rwild | _mm512_cmpeq_epi16_mask(qv, wild);
+                let s = _mm512_mask_blend_epi16(same, vx, vm);
                 let hleft = _mm512_loadu_si512(hp.add(i));
                 let e_ext = _mm512_adds_epi16(_mm512_loadu_si512(ep.add(i)), ve);
                 let e = _mm512_max_epi16(_mm512_adds_epi16(hleft, vo), e_ext);
@@ -222,28 +227,16 @@ unsafe fn trace_kernel<const LOCAL: bool>(
                 );
                 _mm512_storeu_si512(hp.add(i), h);
                 hup = h;
-                if LOCAL {
-                    let up = _mm512_cmpgt_epi16_mask(h, best) & valid;
-                    best = _mm512_mask_mov_epi16(best, up, h);
-                    bi = _mm512_mask_mov_epi16(bi, up, iv);
-                    bj = _mm512_mask_mov_epi16(bj, up, jv);
+                // Candidate end cells, in the scalar scan order.
+                let ivalid = _mm512_cmpgt_epi16_mask(qlens, i0);
+                let cand = if LOCAL {
+                    ivalid & jvalid
                 } else {
-                    let up = _mm512_cmpgt_epi16_mask(h, colmax);
-                    colmax = _mm512_mask_mov_epi16(colmax, up, h);
-                    colarg = _mm512_mask_mov_epi16(colarg, up, iv);
-                }
-            }
-            if !LOCAL {
-                let last = _mm512_cmpeq_epi16_mask(lens, jv);
-                // A lane's last column: its first maximum over the column.
-                let up = _mm512_cmpgt_epi16_mask(colmax, best) & last;
-                best = _mm512_mask_mov_epi16(best, up, colmax);
-                bi = _mm512_mask_mov_epi16(bi, up, colarg);
-                bj = _mm512_mask_mov_epi16(bj, up, jv);
-                // Any other valid column: its last row.
-                let up = _mm512_cmpgt_epi16_mask(hup, best) & valid & !last;
-                best = _mm512_mask_mov_epi16(best, up, hup);
-                bi = _mm512_mask_mov_epi16(bi, up, _mm512_set1_epi16(n as i16));
+                    (_mm512_cmpeq_epi16_mask(qlens, iv) & jvalid) | (jlast & ivalid)
+                };
+                let up = _mm512_cmpgt_epi16_mask(h, best) & cand;
+                best = _mm512_mask_mov_epi16(best, up, h);
+                bi = _mm512_mask_mov_epi16(bi, up, iv);
                 bj = _mm512_mask_mov_epi16(bj, up, jv);
             }
         }

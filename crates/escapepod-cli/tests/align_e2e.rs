@@ -456,3 +456,81 @@ fn align_then_classify_reproduces_golden_calls() {
     );
     assert!(compared > 0, "no read kept the fixture's alignment");
 }
+
+fn revcomp(s: &[u8]) -> Vec<u8> {
+    s.iter()
+        .rev()
+        .map(|b| match b {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => b'N',
+        })
+        .collect()
+}
+
+/// `--strand both`: reverse-complemented reads (FASTA, so no qualities) find
+/// their reference on the reverse strand, and SAM gets them back in reference
+/// orientation — which is the original read.
+#[test]
+fn reverse_strand_reads_map_with_flag_16() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, input) = read_bam(&input_bam());
+    let fa = dir.path().join("rc.fa");
+    let mut text = String::new();
+    for r in &input {
+        let rc = String::from_utf8(revcomp(r.sequence().as_ref())).unwrap();
+        text.push_str(&format!(">{}\n{rc}\n", name(r)));
+    }
+    std::fs::write(&fa, text).unwrap();
+    let reference = fixtures().join("trna_reference.fa");
+    let (fwd, both) = (dir.path().join("fwd.bam"), dir.path().join("both.bam"));
+    align(&input_bam(), &reference, &fwd, &[]);
+    align(&fa, &reference, &both, &["--strand", "both"]);
+    let (_, fwd) = read_bam(&fwd);
+    let (_, both) = read_bam(&both);
+    for (f, b) in fwd.iter().zip(&both) {
+        assert!(b.flags().is_reverse_complemented(), "{}", name(b));
+        assert_eq!(b.reference_sequence_id(), f.reference_sequence_id());
+        assert_eq!(b.sequence(), f.sequence(), "{}: SEQ not restored", name(b));
+        assert_eq!(int_tag(b, *b"AS"), int_tag(f, *b"AS"), "{}", name(b));
+    }
+}
+
+#[test]
+fn read_ids_select_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, input) = read_bam(&input_bam());
+    let ids = dir.path().join("ids.txt");
+    let wanted: Vec<String> = input.iter().step_by(7).map(name).collect();
+    std::fs::write(&ids, wanted.join("\n") + "\n").unwrap();
+    let out = dir.path().join("out.bam");
+    align(
+        &input_bam(),
+        &fixtures().join("trna_reference.fa"),
+        &out,
+        &["--read-ids", ids.to_str().unwrap()],
+    );
+    let (_, recs) = read_bam(&out);
+    let got: Vec<String> = recs.iter().map(name).collect();
+    assert_eq!(got, wanted);
+}
+
+#[test]
+fn device_gpu_is_refused_not_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
+        .arg("align")
+        .arg(input_bam())
+        .arg("-r")
+        .arg(fixtures().join("trna_reference.fa"))
+        .arg("-o")
+        .arg(dir.path().join("out.bam"))
+        .args(["--device", "gpu"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("--device gpu"), "{stderr}");
+}

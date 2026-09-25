@@ -5,9 +5,10 @@
 //! this command is I/O and orchestration:
 //!
 //! ```text
-//! reader thread ──batches──▶ rayon over reads ──encoded records──▶ writer thread
-//!   (BAM / FASTA / FASTQ)      (score panel, tie set,              (BGZF, input order)
-//!                               traceback winners, build record)
+//! reader thread ──batches──▶ rayon over chunks of reads ──encoded records──▶ writer thread
+//!   (BAM / FASTA / FASTQ)      (score panel per read, tie set,         (BGZF, input order)
+//!                               trace the chunk's winners together,
+//!                               build and encode records)
 //! ```
 //!
 //! Memory is O(`--batch-size`): at most two batches wait on either channel.
@@ -668,19 +669,37 @@ struct Job<'a> {
     secondary: bool,
 }
 
-/// One read, start to finish on a worker: decode, align, rewrite, encode.
-fn process(ctx: &Job<'_>, rec: InRecord) -> anyhow::Result<(Vec<u8>, Outcome)> {
-    let rec = match rec {
-        InRecord::Bam(raw) => RecordBuf::try_from_alignment_record(ctx.in_header, &raw)?,
-        InRecord::Buf(r) => r,
-    };
-    let mapping = ctx.aligner.map_read(rec.sequence().as_ref(), &ctx.opts);
-    let (records, outcome) = build_records(rec, &mapping, ctx.aligner.panel(), ctx.secondary);
-    let mut w = bam::io::Writer::from(Vec::with_capacity(8 << 10));
-    for r in &records {
-        w.write_alignment_record(ctx.out_header, r)?;
-    }
-    Ok((w.into_inner(), outcome))
+/// Reads per unit of rayon work. The winners of a chunk's reads are traced
+/// together, so this is also how full the traceback kernels' lanes get.
+const CHUNK: usize = 64;
+
+/// Each read's output records, BAM-encoded, and how it went.
+type Encoded = Vec<(Vec<u8>, Outcome)>;
+
+/// A chunk of reads, start to finish on a worker: decode, align, rewrite,
+/// encode.
+fn process_chunk(ctx: &Job<'_>, chunk: Vec<InRecord>) -> anyhow::Result<Encoded> {
+    let records = chunk
+        .into_iter()
+        .map(|rec| match rec {
+            InRecord::Bam(raw) => Ok(RecordBuf::try_from_alignment_record(ctx.in_header, &raw)?),
+            InRecord::Buf(r) => Ok(r),
+        })
+        .collect::<anyhow::Result<Vec<RecordBuf>>>()?;
+    let seqs: Vec<&[u8]> = records.iter().map(|r| r.sequence().as_ref()).collect();
+    let mappings = ctx.aligner.map_reads(&seqs, &ctx.opts);
+    records
+        .into_iter()
+        .zip(&mappings)
+        .map(|(rec, mapping)| {
+            let (out, outcome) = build_records(rec, mapping, ctx.aligner.panel(), ctx.secondary);
+            let mut w = bam::io::Writer::from(Vec::with_capacity(8 << 10));
+            for r in &out {
+                w.write_alignment_record(ctx.out_header, r)?;
+            }
+            Ok((w.into_inner(), outcome))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -899,18 +918,23 @@ fn align_batches(
     started: Instant,
 ) -> anyhow::Result<()> {
     for batch in in_rx {
-        let results: Vec<anyhow::Result<(Vec<u8>, Outcome)>> =
-            batch.into_par_iter().map(|r| process(ctx, r)).collect();
-        let mut encoded = Vec::with_capacity(results.len());
+        let n = batch.len();
+        let results: Vec<anyhow::Result<Encoded>> = batch
+            .into_par_iter()
+            .chunks(CHUNK)
+            .map(|chunk| process_chunk(ctx, chunk))
+            .collect();
+        let mut encoded = Vec::with_capacity(n);
         for r in results {
-            let (bytes, outcome) = r?;
-            summary.reads += 1;
-            match outcome {
-                Outcome::Unique => summary.unique += 1,
-                Outcome::Tied => summary.tied += 1,
-                Outcome::Unmapped => summary.unmapped += 1,
+            for (bytes, outcome) in r? {
+                summary.reads += 1;
+                match outcome {
+                    Outcome::Unique => summary.unique += 1,
+                    Outcome::Tied => summary.tied += 1,
+                    Outcome::Unmapped => summary.unmapped += 1,
+                }
+                encoded.push(bytes);
             }
-            encoded.push(bytes);
         }
         if out_tx.send(encoded).is_err() {
             // The writer stopped; its error is reported after the join.
