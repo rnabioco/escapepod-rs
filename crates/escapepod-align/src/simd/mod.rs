@@ -158,6 +158,7 @@ pub fn fits_i16(n: usize, max_ref_len: usize, scoring: &Scoring) -> bool {
 
 /// One lane-width group of references.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct Group {
     /// Longest reference in the group: the number of columns walked.
     pub(crate) len: usize,
@@ -220,6 +221,7 @@ impl Profile {
 
 /// Gap scores as the kernels take them.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct Gaps {
     pub(crate) open: i16,
     pub(crate) extend: i16,
@@ -248,6 +250,7 @@ pub(crate) struct LaneEnds {
 /// kernel: `qt[i * lanes + lane]` is lane `lane`'s read code at row `i`,
 /// `rt[j * lanes + lane]` its reference code at column `j`. Rows and columns
 /// past a lane's own lengths are padding the kernel masks out.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct PairGroup {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
@@ -259,6 +262,7 @@ pub(crate) struct PairGroup {
 
 /// All four scores as the pairs kernels take them.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct Scores {
     pub(crate) match_score: i16,
     pub(crate) mismatch: i16,
@@ -366,20 +370,7 @@ pub(crate) fn align_pairs(
                     end_i: [0; 32],
                     end_j: [0; 32],
                 };
-                match backend {
-                    Backend::Scalar => unreachable!("scalar pairs were traced above"),
-                    // SAFETY: `backend.supported()` holds (a `Backend` reaches
-                    // here only through `Aligner`, which checks it); the
-                    // buffers were sized above for this group.
-                    #[cfg(target_arch = "x86_64")]
-                    Backend::Avx2 => unsafe {
-                        avx2::trace_pairs(&g, scores, mode, hbuf, ebuf, tb, &mut ends)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    Backend::Avx512 => unsafe {
-                        avx512::trace_pairs(&g, scores, mode, hbuf, ebuf, tb, &mut ends)
-                    },
-                }
+                run_trace_pairs(backend, &g, scores, mode, hbuf, ebuf, tb, &mut ends);
                 let stride = rows + 1;
                 for (lane, &k) in chunk.iter().enumerate() {
                     let (bi, bj) = (ends.end_i[lane] as usize, ends.end_j[lane] as usize);
@@ -425,20 +416,7 @@ pub(crate) fn score_profile(
         }
         let mut best = [0i16; 32];
         for g in &profile.groups {
-            match backend {
-                Backend::Scalar => unreachable!("scalar has no profile"),
-                // SAFETY: `backend.supported()` was checked by the caller
-                // (debug-asserted above); the buffers hold `query.len() *
-                // lanes` elements and the profile was built for `lanes`.
-                #[cfg(target_arch = "x86_64")]
-                Backend::Avx2 => unsafe {
-                    avx2::score_group(query, g, gaps, mode, hbuf, ebuf, &mut best)
-                },
-                #[cfg(target_arch = "x86_64")]
-                Backend::Avx512 => unsafe {
-                    avx512::score_group(query, g, gaps, mode, hbuf, ebuf, &mut best)
-                },
-            }
+            run_score_group(backend, query, g, gaps, mode, hbuf, ebuf, &mut best);
             for (lane, &ri) in g.refs.iter().enumerate() {
                 if ri != usize::MAX {
                     out[ri] = best[lane] as i32;
@@ -446,6 +424,86 @@ pub(crate) fn score_profile(
             }
         }
     });
+}
+
+/// One score kernel call, dispatched on `backend`.
+///
+/// Split out, with a stub below for other architectures, so the code around
+/// it compiles identically everywhere: on aarch64 there are no SIMD backends,
+/// a profile is never built, and this is never reached.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn run_score_group(
+    backend: Backend,
+    query: &[u8],
+    g: &Group,
+    gaps: Gaps,
+    mode: Mode,
+    hbuf: &mut [i16],
+    ebuf: &mut [i16],
+    best: &mut [i16; 32],
+) {
+    match backend {
+        Backend::Scalar => unreachable!("scalar has no profile"),
+        // SAFETY: a SIMD `Backend` reaches here only through `Aligner`, which
+        // refuses one the CPU does not support; the caller sized the buffers
+        // for `query.len() * lanes` and the profile for `lanes`.
+        Backend::Avx2 => unsafe { avx2::score_group(query, g, gaps, mode, hbuf, ebuf, best) },
+        Backend::Avx512 => unsafe { avx512::score_group(query, g, gaps, mode, hbuf, ebuf, best) },
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn run_score_group(
+    _backend: Backend,
+    _query: &[u8],
+    _g: &Group,
+    _gaps: Gaps,
+    _mode: Mode,
+    _hbuf: &mut [i16],
+    _ebuf: &mut [i16],
+    _best: &mut [i16; 32],
+) {
+    unreachable!("no SIMD score kernels on this architecture")
+}
+
+/// One pairs traceback kernel call, dispatched on `backend` (see
+/// [`run_score_group`] for the stub).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn run_trace_pairs(
+    backend: Backend,
+    g: &PairGroup,
+    scores: Scores,
+    mode: Mode,
+    hbuf: &mut [i16],
+    ebuf: &mut [i16],
+    tb: &mut [u8],
+    ends: &mut LaneEnds,
+) {
+    match backend {
+        Backend::Scalar => unreachable!("scalar pairs are traced by scalar::align"),
+        // SAFETY: as in `run_score_group`; the caller sized `hbuf`/`ebuf` for
+        // `g.rows * lanes` and `tb` for `(g.rows + 1) * (g.cols + 1) * lanes`.
+        Backend::Avx2 => unsafe { avx2::trace_pairs(g, scores, mode, hbuf, ebuf, tb, ends) },
+        Backend::Avx512 => unsafe { avx512::trace_pairs(g, scores, mode, hbuf, ebuf, tb, ends) },
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn run_trace_pairs(
+    _backend: Backend,
+    _g: &PairGroup,
+    _scores: Scores,
+    _mode: Mode,
+    _hbuf: &mut [i16],
+    _ebuf: &mut [i16],
+    _tb: &mut [u8],
+    _ends: &mut LaneEnds,
+) {
+    unreachable!("no SIMD traceback kernels on this architecture")
 }
 
 /// Scalar panel scoring: the oracle, one reference at a time.
@@ -535,6 +593,7 @@ mod tests {
     /// Every available SIMD backend against the scalar oracle, by equality,
     /// on reads drawn from the panel (so real maxima exist) and unrelated
     /// random reads (so the zero floor and negative semi-global cells do).
+    #[cfg(target_arch = "x86_64")]
     fn simd_matches_scalar_random(backend: Backend, seed: u64) {
         let mut rng = Rng(seed);
         // 37 references: more than one group at both widths, and a ragged last group.
