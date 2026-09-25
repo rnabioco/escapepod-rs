@@ -879,6 +879,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "escapepod-align"
+version = "0.27.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "escapepod-classify"
 version = "0.27.1"
 dependencies = [
@@ -913,6 +920,7 @@ dependencies = [
  "clap",
  "csv",
  "ctrlc",
+ "escapepod-align",
  "escapepod-classify",
  "escapepod-demux",
  "escapepod-pod5",

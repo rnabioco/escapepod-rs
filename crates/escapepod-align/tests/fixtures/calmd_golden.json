@@ -1,0 +1,178 @@
+{
+ "generator": "gen_calmd_golden.py",
+ "samtools": "samtools 1.23.1",
+ "reference": {
+  "name": "t1",
+  "seq": "ACGTANCGTAGCNATCGGACRTACGTacgtnacgtAAAAGGUU"
+ },
+ "records": [
+  {
+   "name": "n_under_read_base",
+   "pos": 1,
+   "cigar": "10M",
+   "seq": "ACGTAACGTA",
+   "md": "5N4",
+   "nm": 1
+  },
+  {
+   "name": "n_under_read_n",
+   "pos": 1,
+   "cigar": "10M",
+   "seq": "ACGTANCGTA",
+   "md": "5N4",
+   "nm": 1
+  },
+  {
+   "name": "read_n_over_ref_base",
+   "pos": 1,
+   "cigar": "10M",
+   "seq": "ACNTACCGTA",
+   "md": "2G2N4",
+   "nm": 2
+  },
+  {
+   "name": "mismatch_beside_n",
+   "pos": 1,
+   "cigar": "10M",
+   "seq": "ACGTAATGTA",
+   "md": "5N0C3",
+   "nm": 2
+  },
+  {
+   "name": "mismatch_both_sides_of_n",
+   "pos": 3,
+   "cigar": "8M",
+   "seq": "GAACGTAG",
+   "md": "1T1N0C0G0T0A0",
+   "nm": 6
+  },
+  {
+   "name": "n_inside_deletion",
+   "pos": 1,
+   "cigar": "4M3D4M",
+   "seq": "ACGTGTAG",
+   "md": "4^ANC4",
+   "nm": 3
+  },
+  {
+   "name": "n_at_deletion_edge",
+   "pos": 1,
+   "cigar": "5M2D4M",
+   "seq": "ACGTAGTAG",
+   "md": "5^NC4",
+   "nm": 2
+  },
+  {
+   "name": "insertion_beside_n",
+   "pos": 1,
+   "cigar": "5M1I5M",
+   "seq": "ACGTAGACGTA",
+   "md": "5N4",
+   "nm": 2
+  },
+  {
+   "name": "two_ns_one_read",
+   "pos": 4,
+   "cigar": "12M",
+   "seq": "TACCGTAGCCAT",
+   "md": "2N6N2",
+   "nm": 2
+  },
+  {
+   "name": "alignment_starts_on_n",
+   "pos": 6,
+   "cigar": "2S6M",
+   "seq": "GGACGTAG",
+   "md": "0N5",
+   "nm": 1
+  },
+  {
+   "name": "alignment_ends_on_n",
+   "pos": 8,
+   "cigar": "6M3S",
+   "seq": "GTAGCATTT",
+   "md": "5N0",
+   "nm": 1
+  },
+  {
+   "name": "iupac_r_vs_a",
+   "pos": 19,
+   "cigar": "5M",
+   "seq": "ACATA",
+   "md": "2R2",
+   "nm": 1
+  },
+  {
+   "name": "iupac_r_vs_c",
+   "pos": 19,
+   "cigar": "5M",
+   "seq": "ACCTA",
+   "md": "2R2",
+   "nm": 1
+  },
+  {
+   "name": "lowercase_ref_match",
+   "pos": 27,
+   "cigar": "4M",
+   "seq": "ACGT",
+   "md": "4",
+   "nm": 0
+  },
+  {
+   "name": "lowercase_ref_mismatch",
+   "pos": 27,
+   "cigar": "4M",
+   "seq": "ACTT",
+   "md": "2G1",
+   "nm": 1
+  },
+  {
+   "name": "lowercase_n_vs_a",
+   "pos": 27,
+   "cigar": "9M",
+   "seq": "ACGTAACGT",
+   "md": "4N4",
+   "nm": 1
+  },
+  {
+   "name": "all_match",
+   "pos": 1,
+   "cigar": "5M",
+   "seq": "ACGTA",
+   "md": "5",
+   "nm": 0
+  },
+  {
+   "name": "deletion_then_mismatch",
+   "pos": 1,
+   "cigar": "3M2D3M",
+   "seq": "ACGTCG",
+   "md": "3^TA0N2",
+   "nm": 3
+  },
+  {
+   "name": "lowercase_deletion",
+   "pos": 27,
+   "cigar": "2M2D2M",
+   "seq": "ACAA",
+   "md": "2^GT0N1",
+   "nm": 3
+  },
+  {
+   "name": "ref_u_vs_t",
+   "pos": 40,
+   "cigar": "4M",
+   "seq": "GGTT",
+   "md": "4",
+   "nm": 0
+  },
+  {
+   "name": "ref_u_vs_c",
+   "pos": 40,
+   "cigar": "4M",
+   "seq": "GGCT",
+   "md": "2U1",
+   "nm": 1
+  }
+ ]
+}
