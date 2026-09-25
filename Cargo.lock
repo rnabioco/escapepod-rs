@@ -924,6 +924,7 @@ dependencies = [
 name = "escapepod-align"
 version = "0.28.0"
 dependencies = [
+ "cudarc",
  "serde_json",
 ]
 

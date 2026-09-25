@@ -82,6 +82,59 @@ impl ReadMapping {
     }
 }
 
+/// Panel scores for a batch of queries, computed ahead of [`Aligner::map_reads_scored`]:
+/// row `k` is query `k` against every reference in panel order, or absent
+/// when that query was left for the CPU (see `cuda::GpuScorer::score_batch`).
+///
+/// Plain data, compiled in every build, so a caller can carry one through a
+/// pipeline without caring whether a GPU produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreMatrix {
+    n_refs: usize,
+    /// `scores[k * n_refs + r]`; rows of unscored queries are zero.
+    scores: Vec<i16>,
+    scored: Vec<bool>,
+}
+
+impl ScoreMatrix {
+    /// Assemble from a row-major `scores` of `scored.len()` rows.
+    ///
+    /// # Panics
+    /// If `scores` is not `scored.len() * n_refs` long.
+    pub fn from_parts(n_refs: usize, scores: Vec<i16>, scored: Vec<bool>) -> Self {
+        assert_eq!(scores.len(), scored.len() * n_refs, "row-major matrix");
+        Self {
+            n_refs,
+            scores,
+            scored,
+        }
+    }
+
+    /// Number of queries (rows), scored or not.
+    pub fn len(&self) -> usize {
+        self.scored.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scored.is_empty()
+    }
+
+    /// References per row.
+    pub fn n_refs(&self) -> usize {
+        self.n_refs
+    }
+
+    /// How many rows carry scores.
+    pub fn n_scored(&self) -> usize {
+        self.scored.iter().filter(|&&s| s).count()
+    }
+
+    /// Query `k`'s scores, or `None` when it was not scored.
+    pub fn row(&self, k: usize) -> Option<&[i16]> {
+        self.scored[k].then(|| &self.scores[k * self.n_refs..(k + 1) * self.n_refs])
+    }
+}
+
 /// A panel prepared for one scoring, one mode, and one kernel.
 ///
 /// Cheap to share across threads (`&Aligner` is all [`Aligner::map_read`]
@@ -156,6 +209,19 @@ impl Aligner {
         }
     }
 
+    /// `row` widened into `out` when the caller has it, else
+    /// [`Aligner::score_all`].
+    fn score_or_take(&self, query: &[u8], row: Option<&[i16]>, out: &mut Vec<i32>) {
+        match row {
+            Some(row) => {
+                assert_eq!(row.len(), self.panel.len(), "one score per reference");
+                out.clear();
+                out.extend(row.iter().map(|&s| i32::from(s)));
+            }
+            None => self.score_all(query, out),
+        }
+    }
+
     /// Align one read (letters, as they will be written to SAM).
     pub fn map_read(&self, read: &[u8], opts: &MapOptions) -> ReadMapping {
         self.map_reads(&[read], opts)
@@ -172,6 +238,27 @@ impl Aligner {
     /// `simd::align_pairs`). A few dozen reads per call is enough to fill
     /// them.
     pub fn map_reads(&self, reads: &[&[u8]], opts: &MapOptions) -> Vec<ReadMapping> {
+        self.map_reads_scored(reads, opts, |_, _| None)
+    }
+
+    /// [`Aligner::map_reads`], with some or all of the panel scores already
+    /// computed elsewhere (the CUDA score kernel, `cuda::GpuScorer`).
+    ///
+    /// `prescored(k, reverse)` is read `k`'s score against every reference,
+    /// in panel order, for the forward strand or (with
+    /// [`MapOptions::both_strands`]) the reverse complement; `None` scores
+    /// that one here, with this aligner's kernel. Everything after the scores
+    /// — the tie set, the tracebacks, `MD`/`NM` — is the same code as
+    /// [`Aligner::map_reads`], so equal scores give an equal result, field
+    /// for field. The scores are the caller's contract: they must be exactly
+    /// what [`Aligner::score_all`] would compute (`GpuScorer` is pinned to the
+    /// scalar oracle by equality).
+    pub fn map_reads_scored<'s>(
+        &self,
+        reads: &[&[u8]],
+        opts: &MapOptions,
+        prescored: impl Fn(usize, bool) -> Option<&'s [i16]>,
+    ) -> Vec<ReadMapping> {
         /// One read after scoring, before tracing.
         struct Scored {
             fwd: Vec<u8>,
@@ -188,7 +275,8 @@ impl Aligner {
         let mut rev_scores = Vec::new();
         let scored: Vec<Scored> = reads
             .iter()
-            .map(|read| {
+            .enumerate()
+            .map(|(k, read)| {
                 let fwd = encode(read);
                 if fwd.is_empty() {
                     return Scored {
@@ -200,10 +288,10 @@ impl Aligner {
                         take: Vec::new(),
                     };
                 }
-                self.score_all(&fwd, &mut scores);
+                self.score_or_take(&fwd, prescored(k, false), &mut scores);
                 let rev = if opts.both_strands {
                     let rev = alphabet::reverse_complement_codes(&fwd);
-                    self.score_all(&rev, &mut rev_scores);
+                    self.score_or_take(&rev, prescored(k, true), &mut rev_scores);
                     rev
                 } else {
                     rev_scores.clear();
@@ -380,6 +468,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Scores handed in from outside take exactly the path computed ones do,
+    /// and a `None` row is scored here.
+    #[test]
+    fn prescored_rows_equal_computed_ones() {
+        let reads: Vec<&[u8]> = vec![b"ACGTACGTACGT", b"CCCCACGTACGTACGTAAAA", b"", b"NNNN"];
+        let a = Aligner::new(panel(), Scoring::default(), Mode::Local).unwrap();
+        let opts = MapOptions {
+            both_strands: true,
+            ..MapOptions::default()
+        };
+        let n = a.panel().len();
+        let (mut scores, mut scored) = (Vec::new(), Vec::new());
+        for rev in [false, true] {
+            for (k, r) in reads.iter().enumerate() {
+                let mut q = encode(r);
+                if rev {
+                    q = alphabet::reverse_complement_codes(&q);
+                }
+                let mut row = Vec::new();
+                a.score_all(&q, &mut row);
+                scores.extend(row.iter().map(|&s| s as i16));
+                // Leave one row for the aligner to score itself.
+                scored.push(k != 1);
+            }
+        }
+        let m = ScoreMatrix::from_parts(n, scores, scored);
+        assert_eq!(m.n_scored(), 6);
+        let got = a.map_reads_scored(&reads, &opts, |k, rev| {
+            m.row(k + if rev { reads.len() } else { 0 })
+        });
+        assert_eq!(got, a.map_reads(&reads, &opts));
     }
 
     #[test]

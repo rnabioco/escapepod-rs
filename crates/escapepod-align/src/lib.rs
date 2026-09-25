@@ -30,11 +30,18 @@
 //!   `samtools calmd` including at reference ambiguity codes.
 //! * [`Aligner`] — the panel plus the dispatch plus winner selection: what a
 //!   caller actually uses.
+//! * `cuda` (feature `gpu`) — the same score, one CUDA thread per (read,
+//!   reference) pair, for a batch of reads at once; its [`ScoreMatrix`] goes
+//!   back into [`Aligner::map_reads_scored`], which does everything after
+//!   scoring exactly as the CPU path does.
 //!
-//! This crate does no I/O and depends on nothing but `std`; reading BAM,
-//! FASTA and FASTQ is `escapepod-cli`'s job (`escpod align`).
+//! This crate does no I/O and depends on nothing but `std` (plus cudarc under
+//! `gpu`); reading BAM, FASTA and FASTQ is `escapepod-cli`'s job
+//! (`escpod align`).
 
 pub mod alphabet;
+#[cfg(feature = "gpu")]
+pub mod cuda;
 mod error;
 mod mapper;
 mod panel;
@@ -44,7 +51,7 @@ mod scoring;
 pub mod simd;
 
 pub use error::AlignError;
-pub use mapper::{Aligner, Hit, MapOptions, ReadMapping};
+pub use mapper::{Aligner, Hit, MapOptions, ReadMapping, ScoreMatrix};
 pub use panel::{Panel, Reference};
 pub use scalar::{Alignment, CigarOp};
 pub use scoring::{Mode, Scoring};
