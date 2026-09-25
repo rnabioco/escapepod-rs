@@ -732,7 +732,7 @@ fn build_header(panel: &Panel, input: &sam::Header) -> anyhow::Result<sam::Heade
         .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
         .insert(pg_tag::COMMAND_LINE, cl.join(" "))
         .build()?;
-    header.programs_mut().add("escpod", pg)?;
+    header.programs_mut().add("escpod-align", pg)?;
     Ok(header)
 }
 

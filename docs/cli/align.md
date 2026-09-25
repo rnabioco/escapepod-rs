@@ -99,7 +99,7 @@ parasail's `sw_trace`/`sg_trace` choices, and pinned against them.
 Records come out in **input order** (`@HD SO:unsorted`) — sort with
 `samtools sort` if something downstream needs coordinate order. The header is
 `@SQ` from the reference in file order, the input's `@RG`, `@PG` and `@CO`
-copied through, and one `@PG ID:escpod` for this run, chained to the last.
+copied through, and one `@PG ID:escpod-align` for this run, chained to the last.
 
 **Every input tag is copied byte for byte** — `mv`, `ns`, `ts`, `MM`/`ML`,
 `RG`, `qs`, `du`, `ch`, `st`, and the rest. `NM`, `MD`, `AS`, `XS` and `XA` are

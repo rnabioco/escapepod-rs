@@ -124,7 +124,7 @@ fn align_fixture_reproduces_reference_assignment() {
             .to_string(),
         "tRNA-Ala-GGC-1-1"
     );
-    assert!(out_h.programs().as_ref().contains_key(&b"escpod"[..]));
+    assert!(out_h.programs().as_ref().contains_key(&b"escpod-align"[..]));
     for (i, o) in input.iter().zip(&output) {
         // Input order is preserved record for record.
         assert_eq!(name(i), name(o));
