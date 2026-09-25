@@ -167,6 +167,15 @@ implementation, which is itself tested against parasail.
 `ESCAPEPOD_ALIGN_BACKEND=scalar|avx2|avx512` caps the kernel choice, for A/B
 measurements; the run's second log line names the kernel in use.
 
+### Performance
+
+A 3.3 M-read dorado uBAM against the 164-reference sacCer3 dual-adapter panel
+aligns in ~2 minutes on 16 cores (`-t 32`, ~28 k reads/s, ~3,300 CPU-seconds)
+in under 3 GiB — against a 12 h / 160 GB budget for the bwa step it replaces.
+On Cascade Lake the AVX-512 and AVX2 kernels are within a few percent of each
+other; scalar is ~32× the CPU. Details and reproduction in
+`benchmarks/README.md`.
+
 ## Replacing bwa in a pipeline
 
 The aa-tRNA-seq alignment step today is:

@@ -26,6 +26,10 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **Read-level models** - `escpod classify` scores reads against a model
   bundle from POD5 + aligned BAM (tRNA charging today), writing calls onto the
   BAM
+- **tRNA read alignment** - `escpod align` aligns reads to a small reference
+  panel all against all (AVX2/AVX-512), reports isodecoder ties explicitly,
+  and carries every uBAM tag through, with `MD`/`NM` as `samtools calmd`
+  writes them
 - **`.p5s` sidecar** - Barcode assignments, experimental designs, and a read
   index live in a small Arrow file *beside* the POD5 — raw sequencer output is
   never modified, and per-barcode subsets are materialized on demand instead
@@ -90,7 +94,7 @@ On a CPU-only box that binary needs none of them — `--device auto` (the
 default) just falls back.
 
 To build instead — the default build ships the stable commands plus the full
-demux tree, `classify`, and `index`:
+demux tree, `classify`, `align`, and `index`:
 
 ```bash
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
