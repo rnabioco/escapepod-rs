@@ -211,6 +211,10 @@ demux-models = ["demux"]
 # (113.0 s on 64 cores vs 132.4 s on an A30 for 1.22M reads, +~2.2 GB RSS) —
 # the wins are CNN detection and the CRF encoder. See benchmarks/README.md.
 #
+# `escapepod-align/gpu` is the fifth leg: `escpod align`'s panel scoring, a
+# cudarc/NVRTC kernel like DTW (same `cudarc` pin, no onnxruntime), placed by
+# `--device` as `Stage::Align`.
+#
 # `escapepod-classify/cuda` is the fourth leg: the windowed charging
 # classifier's TCN, batched through `tract-cuda` rather than `ort` (no LSTM in
 # that graph, so tract-cuda's Conv kernel is enough — see
@@ -226,6 +230,7 @@ gpu = [
     "crf-decode",
     "escapepod-demux/gpu",
     "escapepod-classify/cuda",
+    "escapepod-align/gpu",
 ]
 # Training support for demux SVM models (implies `demux`).
 train = ["demux", "escapepod-demux/train"]

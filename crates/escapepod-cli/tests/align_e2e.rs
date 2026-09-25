@@ -532,6 +532,9 @@ fn read_ids_select_reads() {
     assert_eq!(got, wanted);
 }
 
+/// `--device gpu` is a requirement: a build without the `gpu` feature, or a
+/// host without a CUDA device, refuses it by name rather than running on the
+/// CPU. The only way it can succeed is a `gpu` build on a GPU host.
 #[test]
 fn device_gpu_is_refused_not_ignored() {
     let dir = tempfile::tempdir().unwrap();
@@ -545,9 +548,79 @@ fn device_gpu_is_refused_not_ignored() {
         .args(["--device", "gpu"])
         .output()
         .unwrap();
-    assert!(!o.status.success());
     let stderr = String::from_utf8_lossy(&o.stderr);
-    assert!(stderr.contains("--device gpu"), "{stderr}");
+    let gpu_build = cfg!(feature = "gpu");
+    if o.status.success() {
+        assert!(
+            gpu_build,
+            "--device gpu ran in a build without the gpu feature:\n{stderr}"
+        );
+        assert!(stderr.contains("on GPU"), "{stderr}");
+    } else {
+        assert!(stderr.contains("--device gpu"), "{stderr}");
+    }
+}
+
+/// The GPU scores and the CPU scores feed the same winner selection,
+/// tracebacks and record building, so the records must be identical — over
+/// the flag combinations that change what is scored (both strands, the
+/// semi-global mode) and what is written (secondaries, a tie cap).
+#[cfg(feature = "gpu")]
+#[test]
+fn device_gpu_output_is_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |device: &str, out: &Path, extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_escpod"))
+            .arg("align")
+            .arg(input_bam())
+            .arg("-r")
+            .arg(fixtures().join("trna_reference.fa"))
+            .arg("-o")
+            .arg(out)
+            .args(["--device", device])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let flag_sets: [&[&str]; 4] = [
+        &[],
+        &["--strand", "both", "--secondary"],
+        &["--mode", "semiglobal", "--max-ties", "1"],
+        &[
+            "--scoring",
+            "1,-1,-2,-1",
+            "--strand",
+            "both",
+            "--batch-size",
+            "7",
+        ],
+    ];
+    for (k, extra) in flag_sets.iter().enumerate() {
+        let (cpu_out, gpu_out) = (
+            dir.path().join(format!("cpu{k}.bam")),
+            dir.path().join(format!("gpu{k}.bam")),
+        );
+        let g = run("gpu", &gpu_out, extra);
+        let stderr = String::from_utf8_lossy(&g.stderr);
+        if !g.status.success() {
+            assert!(
+                stderr.contains("--device gpu cannot run"),
+                "GPU run failed for a reason other than a missing device:\n{stderr}"
+            );
+            eprintln!("[align_e2e] skipping device_gpu_output_is_byte_identical: {stderr}");
+            return;
+        }
+        assert!(stderr.contains("on GPU"), "{stderr}");
+        let c = run("cpu", &cpu_out, extra);
+        assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+        let (_, cpu) = read_bam(&cpu_out);
+        let (_, gpu) = read_bam(&gpu_out);
+        assert!(!cpu.is_empty());
+        assert_eq!(cpu.len(), gpu.len(), "flags {extra:?}");
+        for (a, b) in cpu.iter().zip(&gpu) {
+            assert_eq!(a, b, "flags {extra:?}, read {}", name(a));
+        }
+    }
 }
 
 #[test]

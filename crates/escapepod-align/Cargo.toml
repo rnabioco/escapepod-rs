@@ -12,8 +12,22 @@ categories = ["algorithms", "science"]
 
 # A leaf crate on purpose: std only, no noodles, no git dependencies, so it
 # stays `cargo publish`-able. All BAM/FASTA/FASTQ I/O lives in escapepod-cli,
-# the same split escapepod-classify keeps.
+# the same split escapepod-classify keeps. The one optional dependency is
+# cudarc, for the `gpu` feature below.
 [dependencies]
+cudarc = { workspace = true, optional = true }
+
+[features]
+default = []
+# The CUDA score kernel (`cuda::GpuScorer`): one thread per (read, reference)
+# pair, NVRTC-compiled at run time. cudarc's `dynamic-loading` means nothing
+# CUDA is needed to build; at run time it needs the CUDA driver and libnvrtc.
+# escapepod-cli's atomic `gpu` feature forwards here.
+gpu = ["dep:cudarc"]
 
 [dev-dependencies]
 serde_json = "1"
+
+[[example]]
+name = "gpu_score_probe"
+required-features = ["gpu"]

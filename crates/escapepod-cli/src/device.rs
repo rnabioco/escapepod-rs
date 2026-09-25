@@ -67,7 +67,8 @@ pub struct DeviceArgs {
     /// Where GPU-capable stages run: `auto` (default), `cpu`, or `gpu`.
     ///
     /// `auto` uses the GPU only for the stages that are measurably faster on it
-    /// — CNN/TCN adapter detection (~7x) and the CTC-CRF encoder (~4x) — and
+    /// — CNN/TCN adapter detection (~7x), the CTC-CRF encoder (~4x) and
+    /// `align`'s panel scoring (~2.6x wall, ~4x less CPU) — and
     /// only when the corresponding Cargo feature is compiled in and a CUDA
     /// device is visible. DTW classification stays on the CPU under `auto`
     /// because the CPU is faster there (113 s on 64 cores vs 132 s on an A30).
@@ -127,6 +128,10 @@ pub enum Stage {
     /// feature forwards to it, so `feature()`/`compiled_in()` report the same
     /// umbrella name every other stage does.
     WaveformTcn,
+    /// `escpod align`'s panel scoring — every read against every reference —
+    /// via the CUDA score kernel in `escapepod_align::cuda`. Winner selection,
+    /// tracebacks and `MD`/`NM` stay on the CPU whatever the placement.
+    Align,
 }
 
 impl Stage {
@@ -137,6 +142,7 @@ impl Stage {
             Self::CrfEncoder => "CTC-CRF encoder inference",
             Self::Dtw => "DTW distance",
             Self::WaveformTcn => "windowed charging classifier (TCN) inference",
+            Self::Align => "read alignment scoring (`escpod align`)",
         }
     }
 
@@ -148,7 +154,9 @@ impl Stage {
     /// future stage whose feature *does* differ has somewhere to say so.
     pub const fn feature(self) -> &'static str {
         match self {
-            Self::CnnDetect | Self::CrfEncoder | Self::Dtw | Self::WaveformTcn => "gpu",
+            Self::CnnDetect | Self::CrfEncoder | Self::Dtw | Self::WaveformTcn | Self::Align => {
+                "gpu"
+            }
         }
     }
 
@@ -160,7 +168,7 @@ impl Stage {
         match self {
             // One feature now covers all four: `gpu` is atomic, so a
             // build either has every device path or none of them.
-            Self::CnnDetect | Self::CrfEncoder | Self::Dtw | Self::WaveformTcn => {
+            Self::CnnDetect | Self::CrfEncoder | Self::Dtw | Self::WaveformTcn | Self::Align => {
                 cfg!(feature = "gpu")
             }
         }
@@ -184,6 +192,7 @@ impl Stage {
             // classify_reads_gpu` routes anything short of one full batch to
             // the CPU scorer instead of paying a padded GPU call for it.
             Self::WaveformTcn => Some("~11x slower than GPU at production batch sizes"),
+            Self::Align => ALIGN_CPU_COST,
         }
     }
 
@@ -225,9 +234,23 @@ impl Stage {
         match self {
             Self::CnnDetect | Self::CrfEncoder | Self::WaveformTcn => true,
             Self::Dtw => false,
+            Self::Align => ALIGN_CPU_COST.is_some(),
         }
     }
 }
+
+/// What `escpod align` pays for scoring on the CPU when a GPU is there — and
+/// so, through [`Stage::auto_prefers_gpu`], whether `auto` places it on the
+/// GPU at all.
+///
+/// Decided by #401's rule — the GPU arm must win on wall at equal or lower
+/// CPU — on the interleaved measurement in `benchmarks/README.md`: 3.3 M reads
+/// on one gpu node (`-c 16`, A30), 184 s and 2,900 CPU-s scoring on the CPU
+/// against ~70 s and ~705 CPU-s on the GPU, output byte-identical. It wins on
+/// both, so `auto` takes it. Should that change (a much smaller panel, say),
+/// `None` here is the whole of turning it off.
+const ALIGN_CPU_COST: Option<&str> =
+    Some("~2.6x the wall and ~4x the CPU of scoring on the GPU end-to-end");
 
 /// Why a GPU-capable stage ended up on the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,27 +546,6 @@ pub fn note_cpu_only(device: Device, what: &str, detail: &str) {
     }
 }
 
-/// Refuse `--device gpu` for a command that has no GPU stage at all in this
-/// release — as opposed to [`note_cpu_only`], which covers a CPU-only stage
-/// *inside* a command that also has GPU stages, and so only warns.
-///
-/// A command with nothing to place still takes `--device`, so the flag exists
-/// from its first release and a script that passes it keeps working once a GPU
-/// stage lands; until then `gpu` is a requirement this binary cannot meet, and
-/// it says so rather than running on the CPU as if it had been honoured.
-/// `auto` and `cpu` are accepted silently.
-pub fn no_gpu_stage(device: Device, what: &str) -> anyhow::Result<()> {
-    if device == Device::Gpu {
-        anyhow::bail!(
-            "--device gpu cannot run {what}: this command has no GPU stage in this \
-             release (not compiled in, whatever the build's features). Use `--device \
-             auto` or `--device cpu`."
-        );
-    }
-    tracing::debug!("{what} runs on the CPU");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +557,7 @@ mod tests {
             Stage::CrfEncoder,
             Stage::Dtw,
             Stage::WaveformTcn,
+            Stage::Align,
         ] {
             assert_eq!(
                 place(Device::Cpu, stage).unwrap(),
@@ -582,6 +585,7 @@ mod tests {
             Stage::CrfEncoder,
             Stage::Dtw,
             Stage::WaveformTcn,
+            Stage::Align,
         ] {
             assert!(place(Device::Auto, stage).is_ok());
         }
@@ -596,6 +600,7 @@ mod tests {
             Stage::CrfEncoder,
             Stage::Dtw,
             Stage::WaveformTcn,
+            Stage::Align,
         ] {
             if stage.compiled_in() {
                 continue;
@@ -604,14 +609,6 @@ mod tests {
             assert!(err.contains(stage.feature()), "{err}");
             assert!(err.contains("--device gpu"), "{err}");
         }
-    }
-
-    #[test]
-    fn a_command_without_gpu_stages_refuses_only_gpu() {
-        assert!(no_gpu_stage(Device::Auto, "x").is_ok());
-        assert!(no_gpu_stage(Device::Cpu, "x").is_ok());
-        let err = no_gpu_stage(Device::Gpu, "x").unwrap_err().to_string();
-        assert!(err.contains("--device gpu"), "{err}");
     }
 
     #[test]
@@ -638,6 +635,7 @@ mod tests {
             Stage::CrfEncoder,
             Stage::Dtw,
             Stage::WaveformTcn,
+            Stage::Align,
         ] {
             assert_eq!(stage.auto_prefers_gpu(), stage.cpu_cost().is_some());
         }

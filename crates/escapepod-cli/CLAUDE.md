@@ -19,7 +19,7 @@
 | `experimental` | `repack annotate resquiggle`; implies `classify` |
 | `model-fetch` | ureq/sha2/zip; `models-download` = `resquiggle models fetch`, implies `experimental`+`model-fetch` |
 | `demux-models` | ≡ `demux` today |
-| `gpu` | every GPU path → `escapepod-demux/gpu`, `escapepod-classify/cuda` |
+| `gpu` | every GPU path → `escapepod-demux/gpu`, `escapepod-classify/cuda`, `escapepod-align/gpu` |
 | `train` | → `escapepod-demux/train` |
 
 Planned: `experimental` ≡ `classify` — fold or split; drop the `demux-models` alias; `models-download` must stop dragging in `classify`.
@@ -36,12 +36,13 @@ pixi run cargo build --release -p escapepod-cli
 pixi run cargo build -p escapepod-cli --no-default-features --features cli   # system allocator A/B
 pixi run -e dev cargo nextest run -p escapepod-cli && pixi run cargo test --doc -p escapepod-cli
 ```
-`tests/`: `classify_e2e` (golden parity + alias warning), `align_e2e` (fixture BAM as input: assignment, tag passthrough, ties/XA/secondaries, unmapped, FASTQ ≡ uBAM, `--strand both`, align → classify golden parity), `dir_inputs`, `thread_pool` (spawns the binary) — all read `../escapepod-classify/tests/fixtures/`, no `ext/`. `main.rs` unit tests pin parsing; `cli_definition_is_internally_consistent` is clap's `debug_assert` and the only thing that catches a bad `#[command(flatten)]`.
+`tests/`: `classify_e2e` (golden parity + alias warning), `align_e2e` (fixture BAM as input: assignment, tag passthrough, ties/XA/secondaries, unmapped, FASTQ ≡ uBAM, `--strand both`, align → classify golden parity; under `gpu`, `device_gpu_output_is_byte_identical` — `--device gpu` ≡ `--device cpu` record for record over four flag sets, skipping where there is no device), `dir_inputs`, `thread_pool` (spawns the binary) — all read `../escapepod-classify/tests/fixtures/`, no `ext/`. `main.rs` unit tests pin parsing; `cli_definition_is_internally_consistent` is clap's `debug_assert` and the only thing that catches a bad `#[command(flatten)]`.
 
 ## Invariants and traps
 - `requested_threads` is an exhaustive match on purpose — the #155 tripwire.
 - `threads::init` has one call site, before dispatch; an earlier `par_iter` pins the pool silently.
 - `device.rs` uses `cfg!` not `#[cfg]` so a musl build can say the feature is missing.
+- `align`'s GPU stage (`Stage::Align`) scores only: its thread hands `(batch, Arc<ScoreMatrix>)` to the dispatcher, and every chunk goes through `Aligner::map_reads_scored` — never a second tie/traceback path, which is what keeps `--device gpu` byte-identical to `--device cpu`. Without `gpu`, `commands/align.rs`'s `mod gpu` has an uninhabited `GpuScorer` stand-in so the pipeline compiles one way.
 - `collect_pod5_inputs` dedupes but keeps argument order — `merge`/`repack`/`index` output order depends on it.
 - `experimental` stubs exist so `escpod repack` errors with a rebuild hint, not "unknown subcommand".
 - `build.rs` must name the real `HEAD` path (`git rev-parse --git-path HEAD`): a nonexistent `rerun-if-changed` target reruns the script every build.

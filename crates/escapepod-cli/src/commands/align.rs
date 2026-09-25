@@ -16,6 +16,30 @@
 //! is no barrier between batches — see [`dispatch`] for the measurement that
 //! removed it.
 //!
+//! # With the scoring on a GPU
+//!
+//! When `--device` places [`Stage::Align`](crate::device::Stage::Align) on the
+//! GPU, one more thread sits between the reader and the dispatcher:
+//!
+//! ```text
+//! reader ──batches──▶ GPU thread ──(batch, score matrix)──▶ dispatcher ──▶ rayon pool ──▶ writer
+//!                     (encode every read, one kernel
+//!                      launch per batch: all reads ×
+//!                      all references)
+//! ```
+//!
+//! It takes the reader's batches off the same bounded channel, scores a whole
+//! batch in one launch, and hands the batch on with its `[reads × references]`
+//! matrix behind an `Arc`. Each chunk carries the `Arc` and its offset into
+//! the batch, and its worker passes its rows to
+//! `Aligner::map_reads_scored` instead of scoring — everything after the
+//! scores (the tie set, the pairs-kernel tracebacks, `MD`/`NM`, the records)
+//! is the CPU path's own code, so the output is byte-identical. A read the
+//! kernel does not take (over `escapepod_align::cuda::MAX_READ_LEN`, or
+//! outside the `i16` bound) comes back unscored, and its worker scores it on
+//! the CPU. The GPU thread works on batch *k + 1* while the pool finishes
+//! batch *k*; the channel after it holds two, so memory stays O(`--batch-size`).
+//!
 //! # Where the per-read work runs
 //!
 //! Everything that scales with a read's tag payload runs inside the rayon
@@ -71,8 +95,11 @@ use sam::header::record::value::Map;
 use sam::header::record::value::map::header::{Version, tag as hd_tag};
 use sam::header::record::value::map::{self, Program, ReferenceSequence, program::tag as pg_tag};
 
+use std::sync::Arc;
+
 use escapepod_align::{
-    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, Panel, ReadMapping, Scoring, sam as align_sam,
+    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, Panel, ReadMapping, ScoreMatrix, Scoring,
+    sam as align_sam,
 };
 
 use crate::progress::create_spinner;
@@ -147,7 +174,8 @@ pub struct AlignArgs {
     #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
     pub threads: Option<usize>,
 
-    /// No stage of `align` runs on a GPU yet; `--device gpu` is refused
+    /// Panel scoring runs on a CUDA GPU under `auto` when a `gpu` build sees
+    /// one; tracebacks and output stay on the CPU, and the output is identical
     #[command(flatten)]
     pub device: crate::device::DeviceArgs,
 }
@@ -683,9 +711,33 @@ const CHUNK_BASES: usize = 64 * 256;
 /// Each read's output records, BAM-encoded, and how it went.
 type Encoded = Vec<(Vec<u8>, Outcome)>;
 
+/// One batch's panel scores from the GPU: the forward strand of every read,
+/// then (with `--strand both`) every reverse complement.
+struct BatchScores {
+    matrix: ScoreMatrix,
+    reads: usize,
+}
+
+impl BatchScores {
+    /// Read `k`'s row for one strand, `None` if the GPU left it to the CPU.
+    fn row(&self, k: usize, reverse: bool) -> Option<&[i16]> {
+        self.matrix.row(if reverse { self.reads + k } else { k })
+    }
+}
+
+/// A batch as the dispatcher receives it: scored on the GPU, or not.
+type Batch = (Vec<InRecord>, Option<Arc<BatchScores>>);
+
+/// A chunk's share of its batch's scores: the matrix and the chunk's first read.
+type ChunkScores = Option<(Arc<BatchScores>, usize)>;
+
 /// A chunk of reads, start to finish on a worker: decode, align, rewrite,
 /// encode.
-fn process_chunk(ctx: &Job<'_>, chunk: Vec<InRecord>) -> anyhow::Result<Encoded> {
+fn process_chunk(
+    ctx: &Job<'_>,
+    chunk: Vec<InRecord>,
+    scores: ChunkScores,
+) -> anyhow::Result<Encoded> {
     let records = chunk
         .into_iter()
         .map(|rec| match rec {
@@ -694,7 +746,12 @@ fn process_chunk(ctx: &Job<'_>, chunk: Vec<InRecord>) -> anyhow::Result<Encoded>
         })
         .collect::<anyhow::Result<Vec<RecordBuf>>>()?;
     let seqs: Vec<&[u8]> = records.iter().map(|r| r.sequence().as_ref()).collect();
-    let mappings = ctx.aligner.map_reads(&seqs, &ctx.opts);
+    let mappings = match &scores {
+        Some((batch, first)) => ctx
+            .aligner
+            .map_reads_scored(&seqs, &ctx.opts, |k, reverse| batch.row(first + k, reverse)),
+        None => ctx.aligner.map_reads(&seqs, &ctx.opts),
+    };
     records
         .into_iter()
         .zip(&mappings)
@@ -750,7 +807,10 @@ struct Summary {
 
 pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let started = Instant::now();
-    crate::device::no_gpu_stage(args.device.resolve(), "read alignment (`escpod align`)")?;
+    let device = args.device.resolve();
+    // Decided and reported before anything is read, so a missing feature or
+    // device is the first line of the run, not a surprise at the end of it.
+    let placement = crate::device::place_and_report(device, crate::device::Stage::Align)?;
     if args.batch_size == 0 {
         bail!("--batch-size must be at least 1");
     }
@@ -798,6 +858,11 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         min_score: args.min_score,
         max_ties: args.max_ties,
         both_strands: args.strand == StrandArg::Both,
+    };
+    let gpu_scorer = if placement.is_gpu() {
+        gpu::start(&aligner, device)?
+    } else {
+        None
     };
 
     // --- Input -------------------------------------------------------------
@@ -863,6 +928,20 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let reader = std::thread::Builder::new()
         .name("escpod-align-reader".into())
         .spawn(move || read_batches(source, wanted, batch_size, in_tx))?;
+    // With a GPU, its thread sits between the reader and the dispatcher; the
+    // channel after it is as shallow as the one before, for the same memory
+    // bound.
+    let (batches, gpu_thread): (Box<dyn Iterator<Item = Batch>>, _) = match gpu_scorer {
+        Some(scorer) => {
+            let (tx, rx) = sync_channel::<Batch>(2);
+            let both = opts.both_strands;
+            let t = std::thread::Builder::new()
+                .name("escpod-align-gpu".into())
+                .spawn(move || gpu::score_batches(scorer, in_rx, tx, both))?;
+            (Box::new(rx.into_iter()), Some(t))
+        }
+        None => (Box::new(in_rx.into_iter().map(|b| (b, None))), None),
+    };
     let spinner = create_spinner("aligning")?;
     let writer_spinner = spinner.clone();
     let writer_thread = std::thread::Builder::new()
@@ -876,9 +955,12 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         out_header: &out_header,
         secondary: args.secondary,
     };
-    let busy = dispatch(&ctx, in_rx, res_tx, permit_rx);
-    // Join both threads before deciding which error to report: a failed stage
+    let busy = dispatch(&ctx, batches, res_tx, permit_rx);
+    // Join every thread before deciding which error to report: a failed stage
     // drops its channel ends, which unblocks the others.
+    let gpu_result = gpu_thread
+        .map(|t| t.join().map_err(|_| anyhow::anyhow!("GPU thread panicked")))
+        .transpose()?;
     let read_result = reader
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
@@ -886,6 +968,25 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
     spinner.finish_and_clear();
+    // A GPU failure ends the input early, and the writer then finishes a
+    // truncated file without complaint: report it first.
+    if let Some(r) = gpu_result {
+        let stats = r.context("scoring on the GPU")?;
+        info!(
+            "GPU scored {} of {} {} ({:.1} s waiting on the device); the other {} (longer \
+             than {} nt, or outside the i16 bound) were scored on the CPU",
+            style::count(stats.scored),
+            style::count(stats.queries),
+            if opts.both_strands {
+                "read strands"
+            } else {
+                "reads"
+            },
+            stats.device_secs,
+            style::count(stats.queries - stats.scored),
+            gpu::MAX_READ_LEN,
+        );
+    }
     let summary = write_result.with_context(|| format!("writing {}", args.output.display()))?;
     let counts = read_result.with_context(|| format!("reading {}", args.reads.display()))?;
     debug!(
@@ -968,25 +1069,28 @@ fn cut_chunks(batch: Vec<InRecord>) -> Vec<Vec<InRecord>> {
 /// of later chunks are done does the dispatcher wait for it.
 fn dispatch(
     ctx: &Job<'_>,
-    in_rx: Receiver<Vec<InRecord>>,
+    batches: impl Iterator<Item = Batch>,
     res_tx: Sender<(u64, anyhow::Result<Encoded>)>,
     permit_rx: Receiver<()>,
 ) -> std::time::Duration {
     let busy_ns = AtomicU64::new(0);
     rayon::in_place_scope(|scope| {
         let mut seq = 0u64;
-        'batches: for batch in in_rx {
+        'batches: for (batch, scores) in batches {
+            let mut first = 0usize;
             for chunk in cut_chunks(batch) {
                 if permit_rx.recv().is_err() {
                     // The writer stopped; its error is reported after the join.
                     break 'batches;
                 }
+                let chunk_scores = scores.as_ref().map(|s| (Arc::clone(s), first));
+                first += chunk.len();
                 let tx = res_tx.clone();
                 let busy_ns = &busy_ns;
                 let this = seq;
                 scope.spawn(move |_| {
                     let t0 = Instant::now();
-                    let r = process_chunk(ctx, chunk);
+                    let r = process_chunk(ctx, chunk, chunk_scores);
                     busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let _ = tx.send((this, r));
                 });
@@ -1045,6 +1149,190 @@ fn write_in_order(
     }
     bgzf.finish()?;
     Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// GPU scoring
+// ---------------------------------------------------------------------------
+
+/// The GPU stage: building the scorer, and the thread that feeds it.
+///
+/// Without the `gpu` feature `place_and_report` never returns a GPU placement
+/// (it errors under `--device gpu` and reports the CPU under `auto`), so
+/// [`gpu::start`] is unreachable there and its stand-in only has to exist.
+mod gpu {
+    use super::*;
+
+    #[cfg(feature = "gpu")]
+    pub(super) use escapepod_align::cuda::{GpuScorer, MAX_READ_LEN};
+
+    /// Stand-in so the pipeline compiles identically without the feature;
+    /// uninhabited, so nothing can construct one.
+    #[cfg(not(feature = "gpu"))]
+    pub(super) enum GpuScorer {}
+
+    #[cfg(not(feature = "gpu"))]
+    pub(super) const MAX_READ_LEN: usize = 0;
+
+    /// What the GPU thread did, for the summary.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(super) struct GpuStats {
+        /// Queries sent (reads, times two with `--strand both`).
+        pub(super) queries: u64,
+        /// Of those, scored on the device.
+        pub(super) scored: u64,
+        /// Seconds the thread spent blocked on the device (uploads, and
+        /// whatever of a kernel and its download was not hidden behind the
+        /// next batch's packing).
+        pub(super) device_secs: f64,
+    }
+
+    /// Build the scorer for a GPU placement. `Ok(None)` is a fall-back to the
+    /// CPU under `--device auto` (said in the log); under `--device gpu` the
+    /// same failure is an error.
+    #[cfg(feature = "gpu")]
+    pub(super) fn start(
+        aligner: &Aligner,
+        device: crate::device::Device,
+    ) -> anyhow::Result<Option<GpuScorer>> {
+        let t0 = Instant::now();
+        match GpuScorer::new(aligner.panel(), *aligner.scoring(), aligner.mode()) {
+            Ok(s) => {
+                let (lanes, groups, blocks) = s.geometry();
+                info!(
+                    "GPU: {} — {groups} reference group{} x {blocks} blocks of {lanes} threads, \
+                     kernel ready in {:.1} s; reads over {MAX_READ_LEN} nt are scored on the CPU",
+                    s.device_name(),
+                    if groups == 1 { "" } else { "s" },
+                    t0.elapsed().as_secs_f64(),
+                );
+                Ok(Some(s))
+            }
+            Err(e) if device == crate::device::Device::Gpu => Err(anyhow::anyhow!(
+                "--device gpu cannot run read alignment scoring: {e}"
+            )),
+            Err(e) => {
+                warn!(
+                    "read alignment scoring cannot use the GPU ({e}); scoring on the CPU instead"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    pub(super) fn start(
+        _aligner: &Aligner,
+        _device: crate::device::Device,
+    ) -> anyhow::Result<Option<GpuScorer>> {
+        unreachable!("a build without `gpu` never places a stage on the GPU")
+    }
+
+    /// The letters of one input read, as the worker will see them.
+    #[cfg(feature = "gpu")]
+    fn letters(rec: &InRecord, out: &mut Vec<u8>) {
+        out.clear();
+        match rec {
+            InRecord::Bam(r) => out.extend(r.sequence().iter()),
+            InRecord::Buf(r) => out.extend_from_slice(r.sequence().as_ref()),
+        }
+    }
+
+    /// The GPU thread's body: score each batch whole, pass it on with its
+    /// matrix. Ends when the reader does, or when the dispatcher stops
+    /// taking batches (its error is the one reported).
+    #[cfg(feature = "gpu")]
+    pub(super) fn score_batches(
+        mut scorer: GpuScorer,
+        rx: Receiver<Vec<InRecord>>,
+        tx: SyncSender<Batch>,
+        both_strands: bool,
+    ) -> anyhow::Result<GpuStats> {
+        use escapepod_align::alphabet::{encode_base, reverse_complement_codes};
+        let mut stats = GpuStats {
+            queries: 0,
+            scored: 0,
+            device_secs: 0.0,
+        };
+        let mut buf = Vec::new();
+        let (mut wait_in, mut prep, mut wait_gpu, mut wait_out) = (0.0, 0.0, 0.0, 0.0);
+        // One batch in flight on the device while the next is encoded and
+        // packed here, so the kernel is not idle between batches.
+        let mut in_flight: Option<(Vec<InRecord>, escapepod_align::cuda::PendingBatch)> = None;
+        let mut t = Instant::now();
+        let mut rx = rx.into_iter();
+        loop {
+            let next = rx.next();
+            wait_in += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            let prepared = next.as_ref().map(|batch| {
+                let mut codes: Vec<Vec<u8>> = batch
+                    .iter()
+                    .map(|rec| {
+                        letters(rec, &mut buf);
+                        buf.iter().map(|&b| encode_base(b)).collect()
+                    })
+                    .collect();
+                if both_strands {
+                    let rev: Vec<Vec<u8>> =
+                        codes.iter().map(|c| reverse_complement_codes(c)).collect();
+                    codes.extend(rev);
+                }
+                let queries: Vec<&[u8]> = codes.iter().map(Vec::as_slice).collect();
+                stats.queries += queries.len() as u64;
+                scorer.prepare(&queries)
+            });
+            prep += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            // Collect the batch before this one, then queue this one: the
+            // download waits for its own kernel only.
+            let done = match in_flight.take() {
+                Some((batch, pending)) => Some((batch, scorer.finish(pending)?)),
+                None => None,
+            };
+            if let (Some(batch), Some(prepared)) = (next, prepared) {
+                in_flight = Some((batch, scorer.submit(prepared)?));
+            }
+            wait_gpu += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            let Some((batch, matrix)) = done else {
+                if in_flight.is_none() {
+                    break;
+                }
+                continue;
+            };
+            stats.scored += matrix.n_scored() as u64;
+            let scores = BatchScores {
+                matrix,
+                reads: batch.len(),
+            };
+            if tx.send((batch, Some(Arc::new(scores)))).is_err() {
+                break;
+            }
+            wait_out += t.elapsed().as_secs_f64();
+            t = Instant::now();
+            if in_flight.is_none() {
+                break;
+            }
+        }
+        stats.device_secs = wait_gpu;
+        debug!(
+            "GPU thread: {wait_in:.1} s waiting for the reader, {prep:.1} s encoding and \
+             packing, {wait_gpu:.1} s waiting on the device, {wait_out:.1} s waiting for the \
+             workers"
+        );
+        Ok(stats)
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    pub(super) fn score_batches(
+        scorer: GpuScorer,
+        _rx: Receiver<Vec<InRecord>>,
+        _tx: SyncSender<Batch>,
+        _both_strands: bool,
+    ) -> anyhow::Result<GpuStats> {
+        match scorer {}
+    }
 }
 
 #[cfg(test)]

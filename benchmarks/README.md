@@ -1,5 +1,76 @@
 # Benchmark Results
 
+## `escpod align --device gpu`: CUDA panel scoring (2026-09-25)
+
+`escpod align` phase 2 (#401) moves the one stage worth moving — scoring every
+read against every reference, ~77% of phase 1's cycles — onto a CUDA kernel
+(`escapepod_align::cuda`, one GPU thread per (read, reference) pair, a whole
+`--batch-size` batch per launch); the tie set, the tracebacks, `MD`/`NM` and
+the records stay on the CPU and are the CPU path's own code. Same sample,
+panel and scoring as the phase 1 numbers below (M4, 3,296,074 reads, 164
+references, local, `2,-1,-10,-1`). Both arms on **one gpu node** —
+`sbatch -p gpu -A gpu_rbi -c 16 --gres=gpu:1` (compgpu01: Xeon Gold 6326, Ice
+Lake, AVX-512; one A30), `-t 16`, the same `--features gpu` release build of
+`36cd69e` for both (`--device cpu` against `--device gpu`, avx512 kernel),
+arms interleaved, input paged in first, output to node-local scratch:
+
+| arm | wall (s) | CPU (s) | MaxRSS (MiB) | reads/s |
+|---|---:|---:|---:|---:|
+| `--device cpu` | 183.8 / 184.2 | 2,898 / 2,900 | 1,967 / 1,951 | 17,930 / 17,895 |
+| `--device gpu` | 69.2 / 69.0 | 685 / 682 | 3,079 / 3,066 | 47,659 / 47,790 |
+
+(`rep 1 / rep 2`.) **The GPU arm wins on wall (2.66×) at a quarter of the
+CPU (4.2× less), so `--device auto` places `align`'s scoring on the GPU**
+(`device::ALIGN_CPU_COST`); it is also under phase 1's bar of ~117 s and
+~3,300 CPU-s on a whole rna node (`-c 32`). It holds ~1.1 GB more RSS — most
+likely the CUDA context and the batches the GPU thread holds (one on the
+device, two queued for the dispatcher). The output is byte-identical: `align_e2e::device_gpu_output_is_byte_identical`
+over four flag sets, and `samtools view | md5sum` of M1 (0.49 M reads) equal
+between the arms at the defaults and at `--strand both --secondary --mode
+semiglobal`. 3,295,084 of the 3,296,074 reads were scored on the GPU; the
+other 990 are over 4,096 nt and were scored on the CPU in the same run.
+
+**The kernel** (`examples/gpu_score_probe.rs`, `score_batch` alone on M1's
+reads): 2.4e11 cells/s on the A30 — ~20 integer ops per DP cell against
+Ampere's 64 INT32 lanes per SM per clock, so it is ALU-bound, as the CPU
+kernels are. `__launch_bounds__(256, 4)` (64 registers, four blocks per SM)
+took M1 from 6.4 s to 5.9 s; forcing 56 or 40 registers spills and loses. The
+164-reference panel fills 164 of 192 threads per block. A 400 kb read on the
+GPU is the one thing it does badly — one block owns a read serially, and
+giving it M1's 175 reads over 4,096 nt took the kernel from 6 s to 17.5 s —
+hence the cap.
+
+**Why the GPU is not busy the whole run.** With scoring gone from the CPU a
+batch costs the workers ~4× less, and the run is bound by the CPU side, not by
+the device: M4's GPU thread spends 12.8 s of 69 s waiting on the device. The
+GPU thread packs batch *k + 1* while batch *k*'s kernel runs (before that
+overlap utilisation dipped to 60–80% at every batch boundary while the host
+packed; the wall did not move, since the device was not the bottleneck), so `nvidia-smi` shows
+~100% while there is work and 0% while the CPU side is stalled — "spiky". The
+stalls are the very long reads: M1 without its 52 reads over 20 kb runs in
+7.5 s instead of 14.3 s. Those reads fall to the CPU, where phase 1's score
+kernel is slow on a read that long (4.9 s for a 395 kb read on one core,
+2e9 cells/s: its per-row state is 50 MB, streamed once per reference column),
+and the chunk holding one blocks the ordered writer until the permit window
+(two batches) fills. Tried: splitting that read's scoring over the six lane
+groups on six threads (no faster: its chunk still took 3.4–3.9 s), and a
+larger window (4 batches: 14.3 → 12.6 s for +0.7 GB; 8: 11.5 s for +2 GB — not
+taken). The fix that should work is a row-tiled CPU score kernel for reads far
+longer than the panel, which helps both arms; it is a phase 1 kernel change and
+not part of this one.
+
+Reproduce:
+
+```bash
+sbatch -p gpu -A gpu_rbi -c 16 --gres=gpu:1 --mem=48G --wrap \
+  "benchmarks/benchmark_align.sh --reads .../rebasecall/M4/M4.rbc.bam \
+     --reference .../sacCer3-mature-tRNAs-dual-adapt-v2.fa \
+     --backend avx512 --device cpu --device gpu --reps 2 --threads 16"
+```
+
+(`SBATCH_PARTITION`/`SBATCH_ACCOUNT` in the environment override `#SBATCH`
+lines in a script, so give `-p`/`-A` on the command line.)
+
 ## `escpod align`: all-vs-all tRNA alignment, first numbers (2026-09-25)
 
 `escpod align` (#395) scores every read against every reference of the
