@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.28.0 (2026-09-25)
+
+### Breaking
+
+- **`escapepod_signal::features::SpanStatsOut` is `#[non_exhaustive]`** (#396).
+  An out-of-crate struct literal (leech's `features_stats.rs` builds one) no
+  longer compiles; use `SpanStatsOut::new(dwell, mean, sd)` plus
+  `.with_median(..)`/`.with_range(..)`/`.with_skew(..)`/`.with_kurtosis(..)`,
+  which the struct's doc has asked for since the optional outputs appeared.
+  Every future output is then an addition rather than a break.
+
+### Added
+
+- **`level_skew` and `level_kurtosis` per-base rows** (#396).
+  `escapepod_signal::features::span_stats` gains `skew`/`kurtosis` outputs
+  (`SpanStatsOut::with_skew`/`with_kurtosis`) and `chunk::FeatureChannel`
+  gains `LevelSkew`/`LevelKurtosis` (`"level_skew"`/`"level_kurtosis"`): the
+  third and fourth standardised central moments of a base's signal span,
+  population convention and Fisher excess kurtosis, i.e. `scipy.stats.skew`/
+  `kurtosis` at their defaults. `level_mean`/`level_std` describe a span by
+  its first two moments, which a stall does not change; skew and kurtosis
+  read the tail asymmetry and tail weight it does move. Both are computed
+  two-pass in `f64` from the per-span gather `median`/`range` already share,
+  never from prefix sums of cubes and quartics. A span with zero variance
+  (constant, or a single sample) reads `0.0` for both rather than scipy's
+  `NaN`; a `NaN` inside the span propagates to both. `escapepod-python`'s
+  `span_statistics`/`span_statistics_batch` gain matching `skew=False,
+  kurtosis=False` keyword flags, appended after `median`/`range` in that
+  fixed order. A `waveform_model` bundle naming the two rows resolves them
+  with no change to the classify runtime, and the load error's list of known
+  rows is now derived from `FeatureChannel::ALL` rather than typed by hand.
+  leech's uptake — its channel list has to become recorded data first — is
+  rnabioco/leech#358.
+
+### Build / Tooling
+
+- **arrow and parquet 60.0.0** (from 59.3.0, #399, #400), with the POD5
+  schema and `.p5s` sidecar code adjusted to the new API. No change to the
+  bytes written or the files read.
+
 ## 0.27.1 (2026-09-17)
 
 ### Fixed
