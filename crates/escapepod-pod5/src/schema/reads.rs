@@ -1,7 +1,7 @@
 //! Reads table Arrow schema definition.
 
 use crate::error::{Error, Result};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Metadata, Schema};
 use std::sync::Arc;
 
 /// Extension type name for MinKNOW UUIDs.
@@ -55,7 +55,7 @@ pub fn reads_schema() -> Schema {
                 UUID_EXTENSION_NAME.to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<Metadata>(),
         ),
         Field::new(
             "signal",
