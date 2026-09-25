@@ -167,10 +167,17 @@ fn span_config(
 /// The optional knobs, all keyword-only and all defaulting to the historical
 /// behaviour:
 ///
-/// - `median=True` / `range=True` append a fourth and fifth output array, in
-///   that order. Neither is computed unless asked for -- the median needs its
-///   own pass and a select over each span, which a caller wanting only
-///   `dwell`/`mean`/`sd` should not pay for.
+/// - `median=True` / `range=True` / `skew=True` / `kurtosis=True` append
+///   further output arrays in that fixed order (`median, range, skew,
+///   kurtosis`, each only if requested) -- e.g. `skew=True` alone still
+///   appends after `dwell, mean, sd` since `median`/`range` are absent. None
+///   is computed unless asked for -- the median needs its own pass and a
+///   select over each span, which a caller wanting only `dwell`/`mean`/`sd`
+///   should not pay for. `skew`/`kurtosis` are the population skewness and
+///   Fisher (excess) kurtosis of each span, after the same normalisation as
+///   `mean` -- `scipy.stats.skew`/`kurtosis` at their defaults. A span with
+///   zero variance (constant, or a single sample) reads `0.0` for both rather
+///   than `NaN`.
 /// - `fill` is the value written for an unresolved span: `None` (the default)
 ///   means `NaN`, and any float is used verbatim -- pass `0.0` when the arrays
 ///   feed a network that a `NaN` would poison.
@@ -190,6 +197,8 @@ fn span_config(
     *,
     median=false,
     range=false,
+    skew=false,
+    kurtosis=false,
     fill=None,
     bounds="skip",
     median_convention="select",
@@ -202,6 +211,8 @@ fn span_statistics<'py>(
     mad_floor: Option<f32>,
     median: bool,
     range: bool,
+    skew: bool,
+    kurtosis: bool,
     fill: Option<f32>,
     bounds: &str,
     median_convention: &str,
@@ -213,6 +224,8 @@ fn span_statistics<'py>(
     let (mut d, mut m, mut s) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
     let mut med = vec![0.0f32; if median { n } else { 0 }];
     let mut rng = vec![0.0f32; if range { n } else { 0 }];
+    let mut skw = vec![0.0f32; if skew { n } else { 0 }];
+    let mut kurt = vec![0.0f32; if kurtosis { n } else { 0 }];
     let mut scratch = SpanScratch::default();
     let mut out = SpanStatsOut::new(&mut d, &mut m, &mut s);
     if median {
@@ -220,6 +233,12 @@ fn span_statistics<'py>(
     }
     if range {
         out = out.with_range(&mut rng);
+    }
+    if skew {
+        out = out.with_skew(&mut skw);
+    }
+    if kurtosis {
+        out = out.with_kurtosis(&mut kurt);
     }
     span_stats(sig, sp, cfg, &mut scratch, out);
 
@@ -233,6 +252,12 @@ fn span_statistics<'py>(
     }
     if range {
         cols.push(PyArray1::from_vec(py, rng));
+    }
+    if skew {
+        cols.push(PyArray1::from_vec(py, skw));
+    }
+    if kurtosis {
+        cols.push(PyArray1::from_vec(py, kurt));
     }
     PyTuple::new(py, cols)
 }
@@ -254,8 +279,10 @@ fn spans_as_pairs<'a>(spans: &'a PyReadonlyArray2<'a, i64>) -> PyResult<&'a [[i6
 /// The batch is laid out flat so nothing is copied: `signal` is every read's
 /// samples concatenated, `read_offsets` is the `n_reads + 1` boundaries into
 /// it, and `spans` is `(n_reads * spans_per_read, 2)` with indices **relative
-/// to each read's own start**. Returns three `(n_reads, spans_per_read)`
-/// arrays.
+/// to each read's own start**. Returns `(n_reads, spans_per_read)` arrays for
+/// `dwell, mean, sd`, plus one more per requested optional output, in the
+/// fixed order `median, range, skew, kurtosis` -- the same knobs as
+/// [`span_statistics`], applied per read.
 ///
 /// This is the shape that makes per-read feature extraction worth doing in
 /// Rust: the work is embarrassingly parallel and entirely numeric, so it scales
@@ -270,6 +297,8 @@ fn spans_as_pairs<'a>(spans: &'a PyReadonlyArray2<'a, i64>) -> PyResult<&'a [[i6
     *,
     median=false,
     range=false,
+    skew=false,
+    kurtosis=false,
     fill=None,
     bounds="skip",
     median_convention="select",
@@ -284,6 +313,8 @@ fn span_statistics_batch<'py>(
     mad_floor: Option<f32>,
     median: bool,
     range: bool,
+    skew: bool,
+    kurtosis: bool,
     fill: Option<f32>,
     bounds: &str,
     median_convention: &str,
@@ -322,6 +353,8 @@ fn span_statistics_batch<'py>(
     );
     let mut med = vec![0.0f32; if median { total } else { 0 }];
     let mut rng = vec![0.0f32; if range { total } else { 0 }];
+    let mut skw = vec![0.0f32; if skew { total } else { 0 }];
+    let mut kurt = vec![0.0f32; if kurtosis { total } else { 0 }];
 
     // An unrequested optional output is `None` for every read rather than a
     // zero-length buffer, so the rayon zip below keeps one arm per read either
@@ -335,6 +368,8 @@ fn span_statistics_batch<'py>(
     }
     let mut med_rows = per_read(&mut med, median, spans_per_read, n_reads);
     let mut rng_rows = per_read(&mut rng, range, spans_per_read, n_reads);
+    let mut skew_rows = per_read(&mut skw, skew, spans_per_read, n_reads);
+    let mut kurt_rows = per_read(&mut kurt, kurtosis, spans_per_read, n_reads);
 
     py.detach(|| {
         d.par_chunks_mut(spans_per_read)
@@ -342,8 +377,10 @@ fn span_statistics_batch<'py>(
             .zip(s.par_chunks_mut(spans_per_read))
             .zip(med_rows.par_iter_mut())
             .zip(rng_rows.par_iter_mut())
+            .zip(skew_rows.par_iter_mut())
+            .zip(kurt_rows.par_iter_mut())
             .enumerate()
-            .for_each(|(i, ((((dw, mn), sd), md), rg))| {
+            .for_each(|(i, ((((((dw, mn), sd), md), rg), sk), ku))| {
                 let read = &sig[offs[i] as usize..offs[i + 1] as usize];
                 let rs = &sp[i * spans_per_read..(i + 1) * spans_per_read];
                 // Scratch is per-task, not shared: rayon may run any number of
@@ -356,10 +393,16 @@ fn span_statistics_batch<'py>(
                 if let Some(row) = rg.take() {
                     out = out.with_range(row);
                 }
+                if let Some(row) = sk.take() {
+                    out = out.with_skew(row);
+                }
+                if let Some(row) = ku.take() {
+                    out = out.with_kurtosis(row);
+                }
                 span_stats(read, rs, cfg, &mut scratch, out);
             });
     });
-    drop((med_rows, rng_rows));
+    drop((med_rows, rng_rows, skew_rows, kurt_rows));
 
     let reshape = |v: Vec<f32>| -> PyResult<Bound<'py, PyArray2<f32>>> {
         PyArray1::from_vec(py, v).reshape([n_reads, spans_per_read])
@@ -370,6 +413,12 @@ fn span_statistics_batch<'py>(
     }
     if range {
         cols.push(reshape(rng)?);
+    }
+    if skew {
+        cols.push(reshape(skw)?);
+    }
+    if kurtosis {
+        cols.push(reshape(kurt)?);
     }
     PyTuple::new(py, cols)
 }

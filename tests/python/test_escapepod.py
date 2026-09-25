@@ -1730,6 +1730,102 @@ class TestSignalBindings:
         np.testing.assert_array_equal(bmed[0], med2)
         np.testing.assert_array_equal(brng[0], rng)
 
+    def test_span_statistics_skew_kurtosis(self):
+        """Population skewness and Fisher excess kurtosis, scipy's defaults.
+
+        There is no scipy in this env, so the reference is plain numpy in
+        float64, matching escapepod-signal's own two-pass definition:
+        `skew = m3 / m2**1.5`, `kurtosis = m4 / m2**2 - 3`.
+        """
+
+        def ref_moments(x):
+            x = np.asarray(x, dtype=np.float64)
+            d = x - x.mean()
+            m2 = (d**2).mean()
+            m3 = (d**3).mean()
+            m4 = (d**4).mean()
+            return m3 / m2**1.5, m4 / m2**2 - 3
+
+        rng = np.random.RandomState(2)
+        sig = rng.randn(30).astype(np.float32) * 5.0 + 50.0
+        spans = np.array([[0, 30]], dtype=np.int64)
+        _, _, _, skew, kurt = escapepod.span_statistics(
+            sig, spans, skew=True, kurtosis=True
+        )
+        want_skew, want_kurt = ref_moments(sig)
+        assert skew[0] == pytest.approx(want_skew, rel=1e-5)
+        assert kurt[0] == pytest.approx(want_kurt, rel=1e-5)
+
+        # The issue's worked vector.
+        vec = np.array([1.0, 2.0, 3.0, 10.0], dtype=np.float32)
+        one = np.array([[0, 4]], dtype=np.int64)
+        _, _, _, vskew, vkurt = escapepod.span_statistics(
+            vec, one, skew=True, kurtosis=True
+        )
+        # m = 4, d = [-3, -2, -1, 6]: m2 = 12.5, m3 = 45, m4 = 348.5.
+        assert vskew[0] == pytest.approx(45 / 12.5**1.5, rel=1e-6)
+        assert vkurt[0] == pytest.approx(348.5 / 12.5**2 - 3, rel=1e-6)
+
+        # A constant span and a 1-sample span read 0.0, not NaN.
+        const_sig = np.full(5, 7.0, dtype=np.float32)
+        deg_spans = np.array([[0, 5], [0, 1]], dtype=np.int64)
+        _, _, _, dskew, dkurt = escapepod.span_statistics(
+            const_sig, deg_spans, skew=True, kurtosis=True
+        )
+        assert dskew[0] == 0.0 and dkurt[0] == 0.0
+        assert dskew[1] == 0.0 and dkurt[1] == 0.0
+
+        # An unresolved span is NaN by default, and the fill verbatim otherwise.
+        bad = np.array([[-1, -1]], dtype=np.int64)
+        _, _, _, uskew, ukurt = escapepod.span_statistics(
+            const_sig, bad, skew=True, kurtosis=True
+        )
+        assert np.isnan(uskew[0]) and np.isnan(ukurt[0])
+        _, _, _, fskew, fkurt = escapepod.span_statistics(
+            const_sig, bad, skew=True, kurtosis=True, fill=0.0
+        )
+        assert fskew[0] == 0.0 and fkurt[0] == 0.0
+
+        # Tuple length/order for every combination of the four optional flags.
+        sig2 = np.arange(10, dtype=np.float32)
+        spans2 = np.array([[0, 4]], dtype=np.int64)
+        only_skew = escapepod.span_statistics(sig2, spans2, skew=True)
+        assert len(only_skew) == 4, "dwell, mean, sd, skew"
+        assert only_skew[3] == pytest.approx(ref_moments(sig2[0:4])[0], rel=1e-5)
+
+        everything = escapepod.span_statistics(
+            sig2, spans2, median=True, range=True, skew=True, kurtosis=True
+        )
+        assert len(everything) == 7, "dwell, mean, sd, median, range, skew, kurtosis"
+        _, _, _, _, _, esk, eku = everything
+        want_sk, want_ku = ref_moments(sig2[0:4])
+        assert esk[0] == pytest.approx(want_sk, rel=1e-5)
+        assert eku[0] == pytest.approx(want_ku, rel=1e-5)
+
+        # The batch path agrees with the per-read call under the same flags.
+        offsets = np.array([0, len(sig)], dtype=np.int64)
+        _, _, _, bskew, bkurt = escapepod.span_statistics_batch(
+            sig, offsets, spans, 1, skew=True, kurtosis=True
+        )
+        assert bskew.shape == (1, 1)
+        np.testing.assert_array_equal(bskew[0], skew)
+        np.testing.assert_array_equal(bkurt[0], kurt)
+
+        # ...and with every optional output on, both entry points lay the
+        # columns out in the documented order.
+        per_read = escapepod.span_statistics(
+            sig, spans, median=True, range=True, skew=True, kurtosis=True
+        )
+        batch = escapepod.span_statistics_batch(
+            sig, offsets, spans, 1, median=True, range=True, skew=True, kurtosis=True
+        )
+        assert len(per_read) == len(batch) == 7
+        for col_single, col_batch in zip(per_read, batch):
+            np.testing.assert_array_equal(col_batch[0], col_single)
+        assert per_read[3][0] == pytest.approx(np.median(sig))
+        assert per_read[4][0] == pytest.approx(np.ptp(sig))
+        assert per_read[5][0] == skew[0] and per_read[6][0] == kurt[0]
+
     def test_span_statistics_batch_matches_per_read(self):
         """The batched, parallel path must agree with the single-read one."""
         rng = np.random.RandomState(0)

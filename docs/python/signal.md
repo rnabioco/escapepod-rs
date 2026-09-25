@@ -126,17 +126,24 @@ dwell, mean, sd = escapepod.span_statistics(
     norm,                      # float32 signal
     spans,                     # (n, 2) int array of [start, end) indices
     mad_floor=None,            # float -> per-read median/MAD normalise first
-    median=False,              # append a 4th array: per-span median
-    range=False,               # append a 5th array: per-span range
+    median=False,              # append an array: per-span median
+    range=False,               # append an array: per-span range
+    skew=False,                # append an array: per-span skewness
+    kurtosis=False,            # append an array: per-span excess kurtosis
     fill=None,                 # value for an unresolved span (None -> NaN)
     bounds="skip",             # or "clamp": intersect the span with the signal
     median_convention="select",  # or "sort", which reproduces numpy.median exactly
 )
 ```
 
-A span that does not resolve comes back as `fill` in every output. `median`
-and `range` are off by default because each needs its own pass — a caller
-wanting only `dwell`/`mean`/`sd` should not pay for them.
+A span that does not resolve comes back as `fill` in every output. The
+optional outputs are appended after `dwell`, `mean`, `sd` in the fixed order
+`median, range, skew, kurtosis`, each only if requested, and are off by
+default because each needs its own pass over the span — a caller wanting only
+`dwell`/`mean`/`sd` should not pay for them. `skew` and `kurtosis` are the
+population skewness and Fisher excess kurtosis (`scipy.stats.skew`/`kurtosis`
+at their defaults); a constant or single-sample span reads `0.0` for both
+rather than `NaN`.
 
 ### Many reads at once
 
