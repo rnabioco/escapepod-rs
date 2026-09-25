@@ -973,14 +973,14 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     if let Some(r) = gpu_result {
         let stats = r.context("scoring on the GPU")?;
         info!(
-            "GPU scored {} of {} reads{} ({:.1} s waiting on the device); the other {} (longer \
+            "GPU scored {} of {} {} ({:.1} s waiting on the device); the other {} (longer \
              than {} nt, or outside the i16 bound) were scored on the CPU",
             style::count(stats.scored),
             style::count(stats.queries),
             if opts.both_strands {
-                " x 2 strands"
+                "read strands"
             } else {
-                ""
+                "reads"
             },
             stats.device_secs,
             style::count(stats.queries - stats.scored),
