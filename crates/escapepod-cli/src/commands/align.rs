@@ -5,13 +5,16 @@
 //! this command is I/O and orchestration:
 //!
 //! ```text
-//! reader thread ──batches──▶ rayon over chunks of reads ──encoded records──▶ writer thread
-//!   (BAM / FASTA / FASTQ)      (score panel per read, tie set,         (BGZF, input order)
-//!                               trace the chunk's winners together,
-//!                               build and encode records)
+//! reader thread ──batches──▶ dispatcher ──chunks──▶ rayon pool ──numbered chunks──▶ writer thread
+//!   (BAM / FASTA / FASTQ)    (cuts ≤ 64 reads /    (score panel, tie set,       (reorders, BGZF,
+//!                             ≤ 16 kb per chunk)    trace winners together,      input order)
+//!                                                   build + encode records)
 //! ```
 //!
-//! Memory is O(`--batch-size`): at most two batches wait on either channel.
+//! Memory is O(`--batch-size`): two batches may wait for the dispatcher, and
+//! chunks worth two more may be in flight (spawned, not yet written). There
+//! is no barrier between batches — see [`dispatch`] for the measurement that
+//! removed it.
 //!
 //! # Where the per-read work runs
 //!
@@ -43,15 +46,16 @@
 
 use anyhow::{Context, bail};
 use clap::Args;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::time::Instant;
 
-use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
@@ -673,6 +677,9 @@ struct Job<'a> {
 /// together, so this is also how full the traceback kernels' lanes get.
 const CHUNK: usize = 64;
 
+/// Bases per unit of rayon work, so one very long read makes its own chunk.
+const CHUNK_BASES: usize = 64 * 256;
+
 /// Each read's output records, BAM-encoded, and how it went.
 type Encoded = Vec<(Vec<u8>, Outcome)>;
 
@@ -843,16 +850,25 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
 
     // --- Pipeline ----------------------------------------------------------
     let (in_tx, in_rx) = sync_channel::<Vec<InRecord>>(2);
-    let (out_tx, out_rx) = sync_channel::<Vec<Vec<u8>>>(2);
+    let (res_tx, res_rx) = channel::<(u64, anyhow::Result<Encoded>)>();
+    // Chunks in flight — spawned and not yet written — are capped at two
+    // batches' worth of reads: the memory bound, and the distance a slow
+    // chunk can fall behind before the dispatcher waits for it.
+    let max_in_flight = (2 * args.batch_size).div_ceil(CHUNK).max(2);
+    let (permit_tx, permit_rx) = sync_channel::<()>(max_in_flight);
+    for _ in 0..max_in_flight {
+        permit_tx.send(()).expect("receiver is alive");
+    }
     let batch_size = args.batch_size;
     let reader = std::thread::Builder::new()
         .name("escpod-align-reader".into())
         .spawn(move || read_batches(source, wanted, batch_size, in_tx))?;
+    let spinner = create_spinner("aligning")?;
+    let writer_spinner = spinner.clone();
     let writer_thread = std::thread::Builder::new()
         .name("escpod-align-writer".into())
-        .spawn(move || write_batches(writer, out_rx))?;
+        .spawn(move || write_in_order(writer, res_rx, permit_tx, &writer_spinner, started))?;
 
-    let spinner = create_spinner("aligning")?;
     let ctx = Job {
         aligner: &aligner,
         opts,
@@ -860,21 +876,24 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         out_header: &out_header,
         secondary: args.secondary,
     };
-    let mut summary = Summary::default();
-    let compute = align_batches(&ctx, in_rx, out_tx, &mut summary, &spinner, started);
-    spinner.finish_and_clear();
-
-    // Join both threads before deciding which error to report: a failed
-    // compute stage drops its channels, which unblocks both.
+    let busy = dispatch(&ctx, in_rx, res_tx, permit_rx);
+    // Join both threads before deciding which error to report: a failed stage
+    // drops its channel ends, which unblocks the others.
     let read_result = reader
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
     let write_result = writer_thread
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
-    compute?;
+    spinner.finish_and_clear();
+    let summary = write_result.with_context(|| format!("writing {}", args.output.display()))?;
     let counts = read_result.with_context(|| format!("reading {}", args.reads.display()))?;
-    write_result.with_context(|| format!("writing {}", args.output.display()))?;
+    debug!(
+        "workers were busy {:.1} s of {:.1} s x {} threads",
+        busy.as_secs_f64(),
+        started.elapsed().as_secs_f64(),
+        threads
+    );
 
     // --- Summary -----------------------------------------------------------
     if counts.not_primary > 0 {
@@ -909,60 +928,123 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn align_batches(
+/// Cut a batch into chunks of at most [`CHUNK`] reads or [`CHUNK_BASES`]
+/// bases, whichever comes first — so a read of hundreds of kilobases (they
+/// occur: up to ~400 kb in a real tRNA sample) is a chunk of its own rather
+/// than the tail that sixty-three short reads wait behind.
+fn cut_chunks(batch: Vec<InRecord>) -> Vec<Vec<InRecord>> {
+    let mut chunks = Vec::new();
+    let mut cur = Vec::with_capacity(CHUNK);
+    let mut bases = 0usize;
+    for rec in batch {
+        let len = match &rec {
+            InRecord::Bam(r) => r.sequence().len(),
+            InRecord::Buf(r) => r.sequence().len(),
+        };
+        if !cur.is_empty() && (cur.len() >= CHUNK || bases + len > CHUNK_BASES) {
+            chunks.push(std::mem::replace(&mut cur, Vec::with_capacity(CHUNK)));
+            bases = 0;
+        }
+        bases += len;
+        cur.push(rec);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// The dispatcher, on the calling thread: cut each batch into chunks and
+/// spawn every chunk onto the rayon pool as soon as a permit allows, numbering
+/// them so the writer can restore input order. Returns the workers' total busy
+/// time.
+///
+/// There is deliberately no barrier between batches. Read lengths in a real
+/// sample run to hundreds of kilobases, and a chunk holding one costs seconds
+/// where a typical chunk costs milliseconds; waiting for each batch to finish
+/// before starting the next left half the pool idle behind such stragglers
+/// (measured: 16 of 32 threads busy on average). Now a slow chunk only holds
+/// back the *writing* of what follows it, and only once two batches' worth
+/// of later chunks are done does the dispatcher wait for it.
+fn dispatch(
     ctx: &Job<'_>,
     in_rx: Receiver<Vec<InRecord>>,
-    out_tx: SyncSender<Vec<Vec<u8>>>,
-    summary: &mut Summary,
+    res_tx: Sender<(u64, anyhow::Result<Encoded>)>,
+    permit_rx: Receiver<()>,
+) -> std::time::Duration {
+    let busy_ns = AtomicU64::new(0);
+    rayon::in_place_scope(|scope| {
+        let mut seq = 0u64;
+        'batches: for batch in in_rx {
+            for chunk in cut_chunks(batch) {
+                if permit_rx.recv().is_err() {
+                    // The writer stopped; its error is reported after the join.
+                    break 'batches;
+                }
+                let tx = res_tx.clone();
+                let busy_ns = &busy_ns;
+                let this = seq;
+                scope.spawn(move |_| {
+                    let t0 = Instant::now();
+                    let r = process_chunk(ctx, chunk);
+                    busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let _ = tx.send((this, r));
+                });
+                seq += 1;
+            }
+        }
+        drop(res_tx);
+    });
+    std::time::Duration::from_nanos(busy_ns.load(Ordering::Relaxed))
+}
+
+/// The writer thread's body: take encoded chunks as workers finish them,
+/// append them to the BGZF stream in input order, and return a permit for
+/// each chunk written.
+fn write_in_order(
+    writer: bam::io::Writer<bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>>,
+    rx: Receiver<(u64, anyhow::Result<Encoded>)>,
+    permits: SyncSender<()>,
     spinner: &indicatif::ProgressBar,
     started: Instant,
-) -> anyhow::Result<()> {
-    for batch in in_rx {
-        let n = batch.len();
-        let results: Vec<anyhow::Result<Encoded>> = batch
-            .into_par_iter()
-            .chunks(CHUNK)
-            .map(|chunk| process_chunk(ctx, chunk))
-            .collect();
-        let mut encoded = Vec::with_capacity(n);
-        for r in results {
-            for (bytes, outcome) in r? {
+) -> anyhow::Result<Summary> {
+    let mut bgzf = writer.into_inner();
+    let mut summary = Summary::default();
+    let mut pending: BTreeMap<u64, Encoded> = BTreeMap::new();
+    let mut next = 0u64;
+    let mut last_report = Instant::now();
+    for (seq, result) in rx {
+        pending.insert(seq, result?);
+        while let Some(encoded) = pending.remove(&next) {
+            for (bytes, outcome) in encoded {
+                bgzf.write_all(&bytes)?;
                 summary.reads += 1;
                 match outcome {
                     Outcome::Unique => summary.unique += 1,
                     Outcome::Tied => summary.tied += 1,
                     Outcome::Unmapped => summary.unmapped += 1,
                 }
-                encoded.push(bytes);
             }
+            next += 1;
+            // The dispatcher may be gone already (it stops at end of input);
+            // a permit nobody will take is not an error.
+            let _ = permits.try_send(());
         }
-        if out_tx.send(encoded).is_err() {
-            // The writer stopped; its error is reported after the join.
-            break;
+        if last_report.elapsed().as_millis() >= 500 {
+            last_report = Instant::now();
+            let secs = started.elapsed().as_secs_f64().max(1e-9);
+            spinner.set_message(format!(
+                "{} reads ({:.0}/s)",
+                style::count(summary.reads),
+                summary.reads as f64 / secs
+            ));
         }
-        let secs = started.elapsed().as_secs_f64().max(1e-9);
-        spinner.set_message(format!(
-            "{} reads ({:.0}/s)",
-            style::count(summary.reads),
-            summary.reads as f64 / secs
-        ));
     }
-    Ok(())
-}
-
-/// The writer thread's body: append pre-encoded records to the BGZF stream.
-fn write_batches(
-    writer: bam::io::Writer<bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>>,
-    rx: Receiver<Vec<Vec<u8>>>,
-) -> anyhow::Result<()> {
-    let mut bgzf = writer.into_inner();
-    for batch in rx {
-        for bytes in batch {
-            bgzf.write_all(&bytes)?;
-        }
+    if !pending.is_empty() {
+        bail!("{} chunks were aligned but never written", pending.len());
     }
     bgzf.finish()?;
-    Ok(())
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -976,6 +1058,17 @@ mod tests {
         assert_eq!(int_value(300), Value::UInt16(300));
         assert_eq!(int_value(-300), Value::Int16(-300));
         assert_eq!(int_value(70_000), Value::UInt32(70_000));
+    }
+
+    #[test]
+    fn long_reads_get_chunks_of_their_own() {
+        let read =
+            |len: usize| InRecord::Buf(fastx_to_record(b"r".to_vec(), vec![b'A'; len], None));
+        let mut batch: Vec<InRecord> = (0..100).map(|_| read(100)).collect();
+        batch.insert(10, read(300_000));
+        let sizes: Vec<usize> = cut_chunks(batch).iter().map(Vec::len).collect();
+        // 10 short, the giant alone, then the other 90 in chunks of <= CHUNK.
+        assert_eq!(sizes, vec![10, 1, CHUNK, 90 - CHUNK]);
     }
 
     #[test]
