@@ -31,6 +31,12 @@
 //!   one 4-byte load and one store per column per stripe, 0.5 B of traffic per
 //!   cell at `R = 16`.
 //!
+//! * **`__launch_bounds__(256, 4)`** caps the kernel at 64 registers, so four
+//!   blocks of up to 256 threads fit an SM. Left to itself the JIT took 88
+//!   (three 192-thread blocks on an A30); at 64 the stripe state still lives in
+//!   registers and M1's 0.49 M reads score in 5.9 s instead of 6.4 s
+//!   (`examples/gpu_score_probe.rs`). Tighter (56, 40) spills and loses.
+//!
 //! The values are exactly the scalar oracle's: the arithmetic is `int` with
 //! the same `NEG = i32::MIN / 4` sentinel, and the only narrowing — the packed
 //! boundary and the `i16` result — is of values `fits_i16` has bounded.
@@ -127,7 +133,7 @@ __device__ __forceinline__ void stripe(
     }
 }
 
-extern "C" __global__ void align_score_kernel(
+extern "C" __global__ void __launch_bounds__(256, 4) align_score_kernel(
     const unsigned int* __restrict__ qwords,
     const unsigned long long* __restrict__ qoff,
     const int* __restrict__ qlen,

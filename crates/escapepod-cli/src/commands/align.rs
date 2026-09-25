@@ -973,7 +973,8 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     if let Some(r) = gpu_result {
         let stats = r.context("scoring on the GPU")?;
         info!(
-            "GPU scored {} of {} reads{} in {:.1} s of kernel time ({} longer than {} nt, or              outside the i16 bound, scored on the CPU)",
+            "GPU scored {} of {} reads{} in {:.1} s (packing, transfers and kernel); the other {} \
+             (longer than {} nt, or outside the i16 bound) were scored on the CPU",
             style::count(stats.scored),
             style::count(stats.queries),
             if opts.both_strands {
@@ -1197,7 +1198,8 @@ mod gpu {
             Ok(s) => {
                 let (lanes, groups, blocks) = s.geometry();
                 info!(
-                    "GPU: {} — {groups} reference group{} x {blocks} blocks of {lanes} threads,                      kernel ready in {:.1} s; reads over {MAX_READ_LEN} nt are scored on the CPU",
+                    "GPU: {} — {groups} reference group{} x {blocks} blocks of {lanes} threads, \
+                     kernel ready in {:.1} s; reads over {MAX_READ_LEN} nt are scored on the CPU",
                     s.device_name(),
                     if groups == 1 { "" } else { "s" },
                     t0.elapsed().as_secs_f64(),

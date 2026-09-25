@@ -257,6 +257,12 @@ impl GpuScorer {
         (self.lanes, self.n_groups, self.grid_x)
     }
 
+    /// Registers per thread the driver compiled the kernel to — what bounds
+    /// its occupancy (the shared-memory panel is a few KB per block).
+    pub fn registers(&self) -> Option<i32> {
+        self.func.num_regs().ok()
+    }
+
     /// Whether [`GpuScorer::score_batch`] scores a query of `len` bases (the
     /// rest come back unscored, for the CPU).
     pub fn scores_len(&self, len: usize) -> bool {
