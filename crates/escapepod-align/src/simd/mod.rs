@@ -54,7 +54,7 @@ use std::cell::RefCell;
 
 use crate::alphabet::N_CODES;
 use crate::panel::Panel;
-use crate::scalar;
+use crate::scalar::{self, Alignment};
 use crate::scoring::{Mode, Scoring};
 
 /// Which kernel scores the panel. Ordered slowest to fastest, so a cap is a
@@ -178,25 +178,27 @@ pub(crate) struct Profile {
 
 impl Profile {
     pub(crate) fn build(panel: &Panel, scoring: &Scoring, lanes: usize) -> Self {
-        let mut order: Vec<usize> = (0..panel.len()).collect();
+        let codes: Vec<&[u8]> = panel.references().iter().map(|r| &r.codes[..]).collect();
+        Self::from_codes(&codes, scoring, lanes)
+    }
+
+    /// Lay out `refs` (codes); a lane's `refs` entry is its index in `refs`.
+    pub(crate) fn from_codes(refs: &[&[u8]], scoring: &Scoring, lanes: usize) -> Self {
+        let mut order: Vec<usize> = (0..refs.len()).collect();
         // Longest first, stable: groups of similar length waste little padding.
-        order.sort_by_key(|&i| std::cmp::Reverse(panel.get(i).codes.len()));
+        order.sort_by_key(|&i| std::cmp::Reverse(refs[i].len()));
         let groups = order
             .chunks(lanes)
             .map(|chunk| {
-                let len = chunk
-                    .iter()
-                    .map(|&i| panel.get(i).codes.len())
-                    .max()
-                    .unwrap_or(0);
+                let len = chunk.iter().map(|&i| refs[i].len()).max().unwrap_or(0);
                 let mut lens = vec![0i16; lanes];
-                let mut refs = vec![usize::MAX; lanes];
+                let mut idx = vec![usize::MAX; lanes];
                 // Padding scores as a mismatch; it is masked out, never read.
                 let mut prof = vec![scoring.mismatch as i16; len * N_CODES * lanes];
                 for (lane, &ri) in chunk.iter().enumerate() {
-                    let codes = &panel.get(ri).codes;
+                    let codes = refs[ri];
                     lens[lane] = codes.len() as i16;
-                    refs[lane] = ri;
+                    idx[lane] = ri;
                     for (j, &r) in codes.iter().enumerate() {
                         for c in 0..N_CODES {
                             prof[(j * N_CODES + c) * lanes + lane] =
@@ -207,7 +209,7 @@ impl Profile {
                 Group {
                     len,
                     lens,
-                    refs,
+                    refs: idx,
                     prof,
                 }
             })
@@ -226,6 +228,117 @@ pub(crate) struct Gaps {
 thread_local! {
     /// Per-thread `H` and `E` rows, reused across reads and groups.
     static SCRATCH: RefCell<(Vec<i16>, Vec<i16>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// Per-thread traceback bytes for [`align_many`].
+    static TRACE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Largest traceback buffer [`align_many`] allocates per thread (bytes); a
+/// read whose group would need more is traced by the scalar path instead.
+const MAX_TRACE_BYTES: usize = 16 << 20;
+
+/// Per-lane result of a traceback kernel: best score and its 1-based end cell
+/// (`i == 0` when nothing scored, as in [`scalar::walk`]).
+pub(crate) struct LaneEnds {
+    pub(crate) best: [i16; 32],
+    pub(crate) end_i: [i16; 32],
+    pub(crate) end_j: [i16; 32],
+}
+
+/// Full alignments (with tracebacks) of `query` against each of `refs`, in
+/// `refs` order — identical, field for field, to [`scalar::align`] on each.
+///
+/// This is what makes a large tie set affordable. A read that is nothing but
+/// adapter ties with every reference of an adapter-flanked panel (164 on the
+/// sacCer3 dual-adapter panel, ~5% of one sample's reads), and tracing those
+/// one reference at a time cost twice what scoring the whole panel did. The
+/// kernels here run the same DP inter-sequence, write the scalar path's
+/// traceback byte per lane, track each lane's end cell in the scalar path's
+/// scan order, and hand every lane to the same [`scalar::walk`] — so the
+/// result is the oracle's by construction and pinned by equality in tests.
+///
+/// Falls back to [`scalar::align`] per reference for the scalar backend, a
+/// single reference, a read too long for i16 positions or the i16 value bound,
+/// or a traceback buffer over [`MAX_TRACE_BYTES`].
+pub(crate) fn align_many(
+    backend: Backend,
+    query: &[u8],
+    refs: &[&[u8]],
+    scoring: &Scoring,
+    mode: Mode,
+) -> Vec<Alignment> {
+    let n = query.len();
+    let max_len = refs.iter().map(|r| r.len()).max().unwrap_or(0);
+    let lanes = backend.lanes();
+    let scalar_all = || {
+        refs.iter()
+            .map(|r| scalar::align(query, r, scoring, mode))
+            .collect()
+    };
+    if backend == Backend::Scalar
+        || refs.len() < 2
+        || n == 0
+        || n >= 32_000
+        || !fits_i16(n, max_len, scoring)
+        || (n + 1) * (max_len + 1) * lanes > MAX_TRACE_BYTES
+    {
+        return scalar_all();
+    }
+    debug_assert!(backend.supported());
+    let profile = Profile::from_codes(refs, scoring, lanes);
+    let gaps = Gaps {
+        open: scoring.gap_open as i16,
+        extend: scoring.gap_extend as i16,
+    };
+    let rows = n + 1;
+    let mut out: Vec<Option<Alignment>> = vec![None; refs.len()];
+    SCRATCH.with(|s| {
+        TRACE.with(|t| {
+            let (hbuf, ebuf) = &mut *s.borrow_mut();
+            let tb = &mut *t.borrow_mut();
+            if hbuf.len() < n * lanes {
+                hbuf.resize(n * lanes, 0);
+                ebuf.resize(n * lanes, 0);
+            }
+            for g in &profile.groups {
+                let need = rows * (g.len + 1) * lanes;
+                if tb.len() < need {
+                    tb.resize(need, 0);
+                }
+                let mut ends = LaneEnds {
+                    best: [0; 32],
+                    end_i: [0; 32],
+                    end_j: [0; 32],
+                };
+                match backend {
+                    Backend::Scalar => unreachable!("scalar returned above"),
+                    // SAFETY: `backend.supported()` holds (it is only ever
+                    // constructed through a supported check); the buffers were
+                    // sized above for this group and read length.
+                    #[cfg(target_arch = "x86_64")]
+                    Backend::Avx2 => unsafe {
+                        avx2::trace_group(query, g, gaps, mode, hbuf, ebuf, tb, &mut ends)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    Backend::Avx512 => unsafe {
+                        avx512::trace_group(query, g, gaps, mode, hbuf, ebuf, tb, &mut ends)
+                    },
+                }
+                for (lane, &ri) in g.refs.iter().enumerate() {
+                    if ri == usize::MAX {
+                        continue;
+                    }
+                    let (bi, bj) = (ends.end_i[lane] as usize, ends.end_j[lane] as usize);
+                    let tb = &*tb;
+                    out[ri] = Some(scalar::walk(ends.best[lane] as i32, bi, bj, |i, j| {
+                        tb[(j * rows + i) * lanes + lane]
+                    }));
+                }
+            }
+        })
+    });
+    out.into_iter()
+        .map(|a| a.expect("every reference is in one lane"))
+        .collect()
 }
 
 /// Score `query` (codes) against every reference in `profile` with a SIMD
@@ -480,6 +593,47 @@ mod tests {
                                 "{} {} {scoring} {fasta}",
                                 backend.name(),
                                 mode.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The traceback kernels against [`scalar::align`], field for field: same
+    /// score, same end cell, same start, same CIGAR — on every backend.
+    #[test]
+    fn traceback_kernels_match_scalar() {
+        let mut rng = Rng(0x5eed_0003);
+        let panel = random_panel(&mut rng, 37);
+        let refs: Vec<&[u8]> = panel.references().iter().map(|r| &r.codes[..]).collect();
+        for backend in Backend::available() {
+            for scoring in schemes() {
+                for mode in [Mode::Local, Mode::SemiGlobal] {
+                    for t in 0..12 {
+                        let read = if t % 4 == 3 {
+                            let len = 1 + rng.below(250);
+                            random_seq(&mut rng, len, 0.02)
+                        } else {
+                            let r = &panel.get(rng.below(panel.len())).seq;
+                            let (lead, tail) = (rng.below(20), rng.below(20));
+                            let mut read = random_seq(&mut rng, lead, 0.0);
+                            read.extend(mutate(&mut rng, r));
+                            read.extend(random_seq(&mut rng, tail, 0.0));
+                            read
+                        };
+                        let q = encode(&read);
+                        let got = align_many(backend, &q, &refs, &scoring, mode);
+                        for (k, (a, r)) in got.iter().zip(&refs).enumerate() {
+                            let want = scalar::align(&q, r, &scoring, mode);
+                            assert_eq!(
+                                a,
+                                &want,
+                                "{} {} {scoring} ref {k} read {}",
+                                backend.name(),
+                                mode.name(),
+                                String::from_utf8_lossy(&read)
                             );
                         }
                     }

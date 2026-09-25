@@ -162,16 +162,17 @@ pub fn score(query: &[u8], reference: &[u8], scoring: &Scoring, mode: Mode) -> i
     best
 }
 
-// Traceback byte, one per cell.
-const SRC_MASK: u8 = 0b11;
-const SRC_STOP: u8 = 0;
-const SRC_DIAG: u8 = 1;
-const SRC_INS: u8 = 2;
-const SRC_DEL: u8 = 3;
+// Traceback byte, one per cell. Shared with the SIMD traceback kernels, which
+// write the same byte per lane and are walked by the same [`walk`].
+pub(crate) const SRC_MASK: u8 = 0b11;
+pub(crate) const SRC_STOP: u8 = 0;
+pub(crate) const SRC_DIAG: u8 = 1;
+pub(crate) const SRC_INS: u8 = 2;
+pub(crate) const SRC_DEL: u8 = 3;
 /// `E[i][j]` extended `E[i][j-1]` (rather than opening from `H[i][j-1]`).
-const E_EXTENDED: u8 = 0b100;
+pub(crate) const E_EXTENDED: u8 = 0b100;
 /// `F[i][j]` extended `F[i-1][j]`.
-const F_EXTENDED: u8 = 0b1000;
+pub(crate) const F_EXTENDED: u8 = 0b1000;
 
 /// Best alignment of `query` against `reference`, with its traceback.
 ///
@@ -192,69 +193,118 @@ pub fn align(query: &[u8], reference: &[u8], scoring: &Scoring, mode: Mode) -> A
     if n == 0 || m == 0 {
         return empty;
     }
-    let (o, e) = (scoring.gap_open, scoring.gap_extend);
-    let local = mode == Mode::Local;
     let rows = n + 1;
     // Column-major: trace[j * rows + i].
     let mut trace = vec![0u8; rows * (m + 1)];
+    let (best, best_i, best_j) = match mode {
+        Mode::Local => fill::<true>(query, reference, scoring, &mut trace),
+        Mode::SemiGlobal => fill::<false>(query, reference, scoring, &mut trace),
+    };
+    walk(best, best_i, best_j, |i, j| trace[j * rows + i])
+}
+
+/// The traceback DP: fills `trace` (column-major, `rows = n + 1`) and returns
+/// the best score and its 1-based end cell.
+///
+/// Monomorphised per mode and written without data-dependent branches in the
+/// cell (selects, and a per-column substitution row indexed by read code),
+/// because it runs once per traced winner — for a read with a unique best hit
+/// it is the only per-read cost besides scoring the panel.
+fn fill<const LOCAL: bool>(
+    query: &[u8],
+    reference: &[u8],
+    scoring: &Scoring,
+    trace: &mut [u8],
+) -> (i32, usize, usize) {
+    let n = query.len();
+    let m = reference.len();
+    let rows = n + 1;
+    let (o, e) = (scoring.gap_open, scoring.gap_extend);
     let mut hcol = vec![0i32; rows];
     let mut ecol = vec![NEG; rows];
-    let mut best = if local { 0 } else { NEG };
+    let mut best = if LOCAL { 0 } else { NEG };
     let (mut best_i, mut best_j) = (0usize, 0usize);
+    let mut prof = [0i32; crate::alphabet::N_CODES];
 
     for j in 1..=m {
         let rj = reference[j - 1];
-        let col = &mut trace[j * rows..(j + 1) * rows];
+        for (c, p) in prof.iter_mut().enumerate() {
+            *p = scoring.substitution(c as u8, rj);
+        }
+        let col = &mut trace[j * rows + 1..(j + 1) * rows];
         let mut hdiag = 0;
         let mut hup = 0;
         let mut f = NEG;
-        for i in 1..=n {
-            let hleft = hcol[i];
+        let last_col = j == m;
+        for (k, ((cell, &q), (hl, el))) in col
+            .iter_mut()
+            .zip(query)
+            .zip(hcol[1..].iter_mut().zip(ecol[1..].iter_mut()))
+            .enumerate()
+        {
+            let hleft = *hl;
             let e_open = hleft + o;
-            let e_ext = ecol[i] + e;
+            let e_ext = *el + e;
             let ev = e_open.max(e_ext);
             let f_open = hup + o;
             let f_ext = f + e;
             f = f_open.max(f_ext);
-            let hd = hdiag + scoring.substitution(query[i - 1], rj);
+            let hd = hdiag + prof[q as usize];
             let mut h = hd.max(ev).max(f);
-            if local {
+            if LOCAL {
                 h = h.max(0);
             }
-            let src = if local && h == 0 {
-                SRC_STOP
-            } else if h == hd {
-                SRC_DIAG
-            } else if h == f {
-                SRC_INS
-            } else {
-                SRC_DEL
-            };
-            let mut t = src;
-            if ev == e_ext {
-                t |= E_EXTENDED;
+            let mut t = if h == f { SRC_INS } else { SRC_DEL };
+            t = if h == hd { SRC_DIAG } else { t };
+            if LOCAL {
+                t = if h == 0 { SRC_STOP } else { t };
             }
-            if f == f_ext {
-                t |= F_EXTENDED;
-            }
-            col[i] = t;
-            ecol[i] = ev;
+            t |= if ev == e_ext { E_EXTENDED } else { 0 };
+            t |= if f == f_ext { F_EXTENDED } else { 0 };
+            *cell = t;
+            *el = ev;
             hdiag = hleft;
-            hcol[i] = h;
+            *hl = h;
             hup = h;
             // First maximum of a column-major scan: smallest j, then smallest i.
-            let candidate = local || i == n || j == m;
+            let candidate = LOCAL || last_col;
             if candidate && h > best {
                 best = h;
-                best_i = i;
+                best_i = k + 1;
                 best_j = j;
             }
         }
+        if !LOCAL && !last_col && hup > best {
+            best = hup;
+            best_i = n;
+            best_j = j;
+        }
     }
+    (best, best_i, best_j)
+}
 
-    if best_i == 0 {
+/// Follow traceback bytes from the end cell `(best_i, best_j)` (1-based DP
+/// coordinates; `best_i == 0` means nothing aligned) back to the start.
+///
+/// `trace(i, j)` is the byte of cell `(i, j)`; how the bytes are laid out is
+/// the caller's business, so the scalar DP and the SIMD kernels (one byte per
+/// lane, interleaved) share this walk and cannot disagree on it.
+pub(crate) fn walk(
+    best: i32,
+    best_i: usize,
+    best_j: usize,
+    trace: impl Fn(usize, usize) -> u8,
+) -> Alignment {
+    if best_i == 0 || best_j == 0 {
         // Local mode with no positive cell: nothing aligns.
-        return empty;
+        return Alignment {
+            score: 0,
+            query_start: 0,
+            query_end: 0,
+            ref_start: 0,
+            ref_end: 0,
+            ops: Vec::new(),
+        };
     }
 
     #[derive(PartialEq)]
@@ -267,7 +317,7 @@ pub fn align(query: &[u8], reference: &[u8], scoring: &Scoring, mode: Mode) -> A
     let mut state = State::H;
     let mut rev_ops: Vec<CigarOp> = Vec::new();
     while i > 0 && j > 0 {
-        let t = trace[j * rows + i];
+        let t = trace(i, j);
         match state {
             State::H => match t & SRC_MASK {
                 SRC_STOP => break,

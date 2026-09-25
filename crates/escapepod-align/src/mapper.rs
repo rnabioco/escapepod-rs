@@ -19,7 +19,7 @@ use crate::AlignError;
 use crate::alphabet::{self, encode};
 use crate::panel::Panel;
 use crate::sam;
-use crate::scalar::{self, Alignment};
+use crate::scalar::Alignment;
 use crate::scoring::{Mode, Scoring};
 use crate::simd::{self, Backend, Profile};
 
@@ -211,21 +211,36 @@ impl Aligner {
         } else {
             Vec::new()
         };
+        // Trace the taken ties, forward and reverse separately (different
+        // query codes), each batch through the SIMD traceback kernels.
+        let taken = &ties[..take];
+        let mut alignments: Vec<Option<Alignment>> = vec![None; take];
+        for reverse in [false, true] {
+            let slots: Vec<usize> = (0..take).filter(|&k| taken[k].1 == reverse).collect();
+            if slots.is_empty() {
+                continue;
+            }
+            let codes: &[u8] = if reverse { &rev } else { &fwd };
+            let refs: Vec<&[u8]> = slots
+                .iter()
+                .map(|&k| &self.panel.get(taken[k].0).codes[..])
+                .collect();
+            let traced = simd::align_many(self.backend, codes, &refs, &self.scoring, self.mode);
+            for (k, a) in slots.into_iter().zip(traced) {
+                alignments[k] = Some(a);
+            }
+        }
         let mut hits = Vec::with_capacity(take);
-        for &(r, reverse) in &ties[..take] {
-            let reference = self.panel.get(r);
-            let (codes, letters): (&[u8], &[u8]) = if reverse {
-                (&rev, &rev_letters)
-            } else {
-                (&fwd, read)
-            };
-            let alignment = scalar::align(codes, &reference.codes, &self.scoring, self.mode);
+        for (&(r, reverse), alignment) in taken.iter().zip(alignments) {
+            let alignment = alignment.expect("every taken tie was traced");
             debug_assert_eq!(alignment.score, best, "traceback disagrees with the kernel");
             if alignment.is_empty() {
                 // Only a local score of zero traces to nothing, and then every
                 // tie does: the read aligns nowhere.
                 return unmapped(Some(best), ties.len(), suboptimal);
             }
+            let reference = self.panel.get(r);
+            let letters: &[u8] = if reverse { &rev_letters } else { read };
             let (md, nm) = sam::md_nm(
                 letters,
                 &reference.seq,
