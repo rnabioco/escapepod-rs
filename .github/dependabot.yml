@@ -18,5 +18,10 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      # arrow and parquet are released in lockstep upstream (same version
+      # number each cut); bumping one without the other leaves duplicate
+      # arrow-schema/arrow-array versions in Cargo.lock (#399).
+      arrow:
+        patterns: ["arrow*", "parquet"]
       cargo-minor-patch:
         update-types: ["minor", "patch"]
