@@ -193,7 +193,8 @@ things keep the long ones from holding up the run:
 - A read of 16 kb or more (which already gets a unit of work of its own) has
   its panel scored across all threads, one group of references per thread,
   instead of on one — so the output writer, which must emit records in input
-  order, is not left waiting on it.
+  order, is not left waiting on it. With `--max-read-len 0`, input with many
+  reads of 16 kb or more close together can still stall the writer.
 
 Both give the same scores as before, so the output is identical. With
 `--device gpu`, reads over 4,096 nt are left to the CPU and take the same

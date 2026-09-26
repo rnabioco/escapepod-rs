@@ -264,6 +264,12 @@ impl Aligner {
         }
     }
 
+    /// The SIMD profile, for tests that look inside it.
+    #[cfg(test)]
+    pub(crate) fn profile_for_tests(&self) -> &Profile {
+        self.profile.as_ref().expect("a SIMD backend has a profile")
+    }
+
     fn score_simd(&self, query: &[u8], kernel: Kernel, out: &mut [i32]) {
         let p = self
             .profile

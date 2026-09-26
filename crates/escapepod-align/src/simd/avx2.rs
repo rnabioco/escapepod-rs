@@ -298,14 +298,15 @@ unsafe fn transposed<const LOCAL: bool>(
     let l = g.len;
     assert!(hbuf.len() >= l * W && fbuf.len() >= l * W);
     assert_eq!(g.lens.len(), W);
-    assert!(g.tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
+    let tprof = g.tprof();
+    assert!(tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
     let zero = _mm256_setzero_si256();
     let neg = _mm256_set1_epi16(i16::MIN);
     let vo = _mm256_set1_epi16(gaps.open);
     let ve = _mm256_set1_epi16(gaps.extend);
     let hp = hbuf.as_mut_ptr() as *mut __m256i;
     let fp = fbuf.as_mut_ptr() as *mut __m256i;
-    let tp = g.tprof.as_ptr();
+    let tp = tprof.as_ptr();
     let ends = g.ends.as_ptr();
     // SAFETY: as in the AVX-512 kernel — every offset stays inside buffers
     // whose sizes are asserted above, and query codes are `< N_CODES`.

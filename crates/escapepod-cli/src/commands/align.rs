@@ -877,6 +877,11 @@ fn score_across_pool(aligner: &Aligner, codes: &[u8]) -> Option<Vec<i16>> {
     if !escapepod_align::simd::fits_i16(codes.len(), panel.max_len(), aligner.scoring()) {
         return None;
     }
+    // Known hazard, left as is: while this chunk's task waits here for its
+    // groups, rayon's work-stealing may run an unrelated, later chunk on the
+    // waiting thread — possibly another long read's — which delays this
+    // chunk (and so the ordered writer) until that one finishes, and counts
+    // the stolen chunk's time twice in `-v`'s workers-busy total.
     let units: Vec<Vec<(usize, i32)>> = (0..aligner.score_groups(codes.len()))
         .into_par_iter()
         .map(|g| {

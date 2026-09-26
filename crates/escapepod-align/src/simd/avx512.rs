@@ -286,14 +286,15 @@ unsafe fn transposed<const LOCAL: bool>(
     let l = g.len;
     assert!(hbuf.len() >= l * W && fbuf.len() >= l * W);
     assert_eq!(g.lens.len(), W);
-    assert!(g.tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
+    let tprof = g.tprof();
+    assert!(tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
     let zero = _mm512_setzero_si512();
     let neg = _mm512_set1_epi16(i16::MIN);
     let vo = _mm512_set1_epi16(gaps.open);
     let ve = _mm512_set1_epi16(gaps.extend);
     let hp = hbuf.as_mut_ptr() as *mut __m512i;
     let fp = fbuf.as_mut_ptr() as *mut __m512i;
-    let tp = g.tprof.as_ptr();
+    let tp = tprof.as_ptr();
     let ends = g.ends.as_ptr();
     // SAFETY: every offset below is `< l` vectors into buffers of at least
     // `l * W` i16 (asserted above), `< l` into `ends`, or `< N_CODES * l`

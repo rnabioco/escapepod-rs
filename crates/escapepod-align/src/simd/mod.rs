@@ -80,6 +80,7 @@ mod avx2;
 mod avx512;
 
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use crate::alphabet::N_CODES;
 use crate::panel::Panel;
@@ -222,11 +223,40 @@ pub(crate) struct Group {
     pub(crate) refs: Vec<usize>,
     /// `prof[(j * N_CODES + c) * lanes + lane]` = `s(c, ref_lane[j])`.
     pub(crate) prof: Vec<i16>,
-    /// The transposed kernel's profile: `tprof[(c * len + j) * lanes + lane]`
-    /// = `s(c, ref_lane[j])`, and `i16::MIN` past the lane's end.
-    pub(crate) tprof: Vec<i16>,
+    /// The transposed kernel's profile, built from `prof` the first time that
+    /// kernel runs on this group (see [`Group::tprof`]) — at the defaults of
+    /// `escpod align` it never does, and the copy would double the profile.
+    tprof: OnceLock<Vec<i16>>,
     /// `ends[j]`: bit `lane` set when column `j` is that lane's last.
     pub(crate) ends: Vec<u32>,
+}
+
+impl Group {
+    /// The transposed kernel's profile: `tprof[(c * len + j) * lanes + lane]`
+    /// = `s(c, ref_lane[j])`, and `i16::MIN` past the lane's end (no padding
+    /// cell can take the diagonal). The same substitution scores as `prof`,
+    /// transposed; built once, on first use, by whichever thread gets there.
+    pub(crate) fn tprof(&self) -> &[i16] {
+        self.tprof.get_or_init(|| {
+            let (len, lanes) = (self.len, self.lens.len());
+            let mut t = vec![i16::MIN; N_CODES * len * lanes];
+            for (lane, &n) in self.lens.iter().enumerate() {
+                for j in 0..n as usize {
+                    for c in 0..N_CODES {
+                        t[(c * len + j) * lanes + lane] =
+                            self.prof[(j * N_CODES + c) * lanes + lane];
+                    }
+                }
+            }
+            t
+        })
+    }
+
+    /// Whether [`Group::tprof`] has been built.
+    #[cfg(test)]
+    pub(crate) fn tprof_built(&self) -> bool {
+        self.tprof.get().is_some()
+    }
 }
 
 /// A panel laid out for one lane width under one scoring.
@@ -255,8 +285,6 @@ impl Profile {
                 let mut idx = vec![usize::MAX; lanes];
                 // Padding scores as a mismatch; it is masked out, never read.
                 let mut prof = vec![scoring.mismatch as i16; len * N_CODES * lanes];
-                // Padding is −∞ here: no padding cell can take the diagonal.
-                let mut tprof = vec![i16::MIN; N_CODES * len * lanes];
                 let mut ends = vec![0u32; len];
                 for (lane, &ri) in chunk.iter().enumerate() {
                     let codes = refs[ri];
@@ -269,7 +297,6 @@ impl Profile {
                         for c in 0..N_CODES {
                             let s = scoring.substitution(c as u8, r) as i16;
                             prof[(j * N_CODES + c) * lanes + lane] = s;
-                            tprof[(c * len + j) * lanes + lane] = s;
                         }
                     }
                 }
@@ -278,7 +305,7 @@ impl Profile {
                     lens,
                     refs: idx,
                     prof,
-                    tprof,
+                    tprof: OnceLock::new(),
                     ends,
                 }
             })
@@ -1037,6 +1064,47 @@ mod tests {
             let low = a.with_transposed_min_len(Some(10));
             assert_eq!(low.kernel_for(9), Some(Kernel::RowMajor));
             assert_eq!(low.kernel_for(10), Some(Kernel::Transposed));
+        }
+    }
+
+    /// The transposed profile is built only when the transposed kernel runs:
+    /// never for reads below the threshold, nor with the switch off, and on
+    /// first use for a long read — which then scores as before.
+    #[test]
+    fn row_major_scoring_does_not_build_tprof() {
+        let mut rng = Rng(0x5eed_0006);
+        let panel = random_panel(&mut rng, 37);
+        let short = encode(&chimeric_read(&mut rng, &panel, 300));
+        let long = encode(&chimeric_read(
+            &mut rng,
+            &panel,
+            TRANSPOSED_MIN_READ_LEN + 50,
+        ));
+        for backend in Backend::available() {
+            if backend == Backend::Scalar {
+                continue;
+            }
+            let built = |a: &Aligner| a.profile_for_tests().groups.iter().any(Group::tprof_built);
+            let mut out = Vec::new();
+            let a = Aligner::with_backend(panel.clone(), Scoring::default(), Mode::Local, backend)
+                .unwrap();
+            let off = a.clone().with_transposed_min_len(None);
+            a.score_all(&short, &mut out);
+            assert!(!built(&a), "{}: short read built tprof", backend.name());
+            off.score_all(&long, &mut out);
+            assert!(
+                !built(&off),
+                "{}: switched-off aligner built tprof",
+                backend.name()
+            );
+            let row = out.clone();
+            a.score_all(&long, &mut out);
+            assert!(
+                a.profile_for_tests().groups.iter().all(Group::tprof_built),
+                "{}: long read did not build tprof",
+                backend.name()
+            );
+            assert_eq!(out, row, "{}", backend.name());
         }
     }
 
