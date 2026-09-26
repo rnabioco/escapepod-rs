@@ -220,6 +220,11 @@ pub struct WaveformNetGpu {
     /// (`resolve_inputs`, shared with it verbatim).
     inputs: Vec<WaveformTensor>,
     batch: usize,
+    /// The cuBLAS/cuBLASLt pairing resolved for this load (#416) — kept
+    /// rather than only logged, so a caller can attach it to a run's own
+    /// provenance record (#425) instead of it existing solely as a
+    /// `tracing::debug!` line no default-level run captures.
+    pairing: crate::cuda_libs::CublasPairing,
 }
 
 impl std::fmt::Debug for WaveformNetGpu {
@@ -349,6 +354,7 @@ impl WaveformNetGpu {
             plan,
             inputs,
             batch,
+            pairing,
         };
         net.probe(spec)?;
         Ok(net)
@@ -357,6 +363,14 @@ impl WaveformNetGpu {
     /// The fixed batch size this scorer was compiled for.
     pub fn batch_size(&self) -> usize {
         self.batch
+    }
+
+    /// The cuBLAS/cuBLASLt pairing this scorer's graph was moved onto CUDA
+    /// with (#416) — the provenance an after-the-fact audit needs to know
+    /// whether a run could have hit that bug, since it is otherwise only
+    /// ever `tracing::debug!`'d at load and then lost (#425).
+    pub fn cublas_pairing(&self) -> &crate::cuda_libs::CublasPairing {
+        &self.pairing
     }
 
     /// Run one zeroed chunk through a full batch and insist on exactly one

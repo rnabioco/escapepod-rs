@@ -535,6 +535,26 @@ pub fn classify_reads(
     Ok((calls, stats))
 }
 
+/// Run-level summary of the GPU/CPU parity check [`classify_reads_gpu`] runs
+/// periodically against real reads (#416): how many GPU groups were actually
+/// scored, how many of those were cross-checked against the CPU scorer, and
+/// the worst `|ΔP|` any checked group showed.
+///
+/// `groups_scored == 0` means the run had too few reads to fill even one GPU
+/// batch — every read went through the CPU-fallback tail instead, and
+/// `gpu.logits()` was never actually called. This is the caller's signal
+/// that the run was not, in fact, GPU-scored at all despite a GPU scorer
+/// having loaded successfully (#425): `checked_batches`/`worst_abs_dp` stay
+/// at their defaults in that case, which would otherwise be indistinguishable
+/// from a run that genuinely checked one batch and found zero divergence.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GpuParitySummary {
+    pub groups_scored: usize,
+    pub checked_batches: usize,
+    pub worst_abs_dp: f64,
+}
+
 /// Classify every anchored read on the GPU-batched scorer, falling back to
 /// the CPU scorer for whatever does not fill a full batch.
 ///
@@ -592,13 +612,23 @@ pub fn classify_reads(
 /// overlap alone — see their doc comments for the sweep that found them; the
 /// first cut of this fix (both at their most conservative plausible values)
 /// only reached 315.2s.
+///
+/// # Run-level GPU/CPU parity summary (#425)
+///
+/// [`GpuParitySummary`] carries what [`crate::waveform_net_gpu::check_parity`]
+/// found across the whole run — how many groups were checked and the worst
+/// `|ΔP|` seen — out to the caller instead of only `tracing::debug!`ing each
+/// batch's number and losing it. This is the run's single most direct
+/// evidence that its GPU calls can be trusted (#416), and a caller (`escpod
+/// classify`) attaches it to the output BAM's own provenance record rather
+/// than leaving it to whatever log capture happened to be in place.
 #[cfg(feature = "cuda")]
 pub fn classify_reads_gpu(
     bundle: &ChargingBundle,
     anchored: &HashMap<Uuid, WaveformRead>,
     pod5: &Pod5Index,
     gpu: &crate::waveform_net_gpu::WaveformNetGpu,
-) -> Result<(Vec<ReadCall>, ClassifyStats)> {
+) -> Result<(Vec<ReadCall>, ClassifyStats, GpuParitySummary)> {
     let spec = bundle.waveform_spec()?;
     let cpu_fallback = bundle.waveform_net()?;
     let extractors = pod5.extractors()?;
@@ -700,42 +730,68 @@ pub fn classify_reads_gpu(
     let mut stats = ClassifyStats::default();
     let mut calls: Vec<ReadCall> = Vec::with_capacity(reads.len());
 
+    // Shared with the GPU thread below rather than returned from it (#425):
+    // threading it through `gpu_handle`'s return type would force the outer
+    // `std::thread::scope` closure to change shape too, reindenting the
+    // whole pipeline body below it for a value nothing reads until after
+    // `gpu_handle.join()`. `Mutex` rather than an atomic pair: it is
+    // touched at most once per `parity_every` groups (default every 64), so
+    // the lock is not on any hot path.
+    let parity = std::sync::Arc::new(std::sync::Mutex::new(GpuParitySummary::default()));
+
     let gpu_calls = std::thread::scope(|scope| -> Result<Vec<ReadCall>> {
         // The only thread that calls `gpu.logits()`, so GPU calls stay
         // sequential exactly as before — only now overlapped with the next
-        // group's CPU prep instead of blocking it.
-        let gpu_handle = scope.spawn(move || -> Result<Vec<ReadCall>> {
-            let mut out = Vec::new();
-            let mut n_group = 0usize;
-            while let Ok(group) = rx.recv() {
-                let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
-                let logits = gpu.logits(&refs, spec)?;
-                // The GPU's answers are checked against the CPU's on real
-                // reads before any of them is kept (#416): the first group
-                // always, then one in every `parity_every`. A disagreement
-                // ends the GPU run with `GpuRefused` — the caller decides
-                // whether that means a CPU rerun or an error.
-                if n_group.is_multiple_of(parity_every) {
-                    let cpu: Vec<f64> = refs
-                        .par_iter()
-                        .map(|c| cpu_fallback.logit(c, spec))
-                        .collect::<Result<_>>()?;
-                    let worst = crate::waveform_net_gpu::check_parity(
-                        &logits,
-                        &cpu,
-                        &format!("GPU/CPU parity check on real batch {n_group}"),
-                    )?;
-                    tracing::debug!(
-                        "GPU/CPU parity on batch {n_group}: max |dP| = {worst:.2e} over {} reads",
-                        refs.len()
-                    );
+        // group's CPU prep instead of blocking it. The clone lives inside
+        // the `spawn` argument itself (rather than as its own `let` above
+        // it) so only the clone, never the outer `parity`, is captured by
+        // `move`.
+        let gpu_handle = scope.spawn({
+            let parity = std::sync::Arc::clone(&parity);
+            move || -> Result<Vec<ReadCall>> {
+                let mut out = Vec::new();
+                let mut n_group = 0usize;
+                while let Ok(group) = rx.recv() {
+                    let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
+                    let logits = gpu.logits(&refs, spec)?;
+                    // The GPU's answers are checked against the CPU's on real
+                    // reads before any of them is kept (#416): the first group
+                    // always, then one in every `parity_every`. A disagreement
+                    // ends the GPU run with `GpuRefused` — the caller decides
+                    // whether that means a CPU rerun or an error. The count
+                    // and worst `|ΔP|` are kept rather than only logged
+                    // (#425), so a caller can attach this run's own evidence
+                    // to its output.
+                    if n_group.is_multiple_of(parity_every) {
+                        let cpu: Vec<f64> = refs
+                            .par_iter()
+                            .map(|c| cpu_fallback.logit(c, spec))
+                            .collect::<Result<_>>()?;
+                        let worst = crate::waveform_net_gpu::check_parity(
+                            &logits,
+                            &cpu,
+                            &format!("GPU/CPU parity check on real batch {n_group}"),
+                        )?;
+                        tracing::debug!(
+                            "GPU/CPU parity on batch {n_group}: max |dP| = {worst:.2e} over {} reads",
+                            refs.len()
+                        );
+                        let mut p = parity.lock().expect("gpu parity mutex poisoned");
+                        p.checked_batches += 1;
+                        p.worst_abs_dp = p.worst_abs_dp.max(worst);
+                    }
+                    n_group += 1;
+                    for ((read, _), logit) in group.iter().zip(logits) {
+                        out.push(call_from_logit(read, spec, logit));
+                    }
                 }
-                n_group += 1;
-                for ((read, _), logit) in group.iter().zip(logits) {
-                    out.push(call_from_logit(read, spec, logit));
-                }
+                // However many groups were actually scored — 0 if the whole
+                // run was smaller than one GPU batch, the caller's signal
+                // that this run never actually called `gpu.logits()` despite
+                // loading a GPU scorer (#425).
+                parity.lock().expect("gpu parity mutex poisoned").groups_scored = n_group;
+                Ok(out)
             }
-            Ok(out)
         });
 
         'outer: for slice in reads.chunks(SUPERBATCH) {
@@ -810,10 +866,17 @@ pub fn classify_reads_gpu(
             .map_err(|_| anyhow::anyhow!("GPU scoring thread panicked"))?
     })?;
 
+    // The spawned thread's own clone is dropped by the time `join()` above
+    // returns, so this is the last strong reference — never a race.
+    let parity = std::sync::Arc::into_inner(parity)
+        .expect("gpu thread already joined; no other clone outlives it")
+        .into_inner()
+        .expect("gpu parity mutex poisoned");
+
     calls.extend(gpu_calls);
     calls.sort_by_key(|c| c.read_id);
     stats.no_calls.sort_by_key(|n| n.read_id);
-    Ok((calls, stats))
+    Ok((calls, stats, parity))
 }
 
 #[cfg(test)]

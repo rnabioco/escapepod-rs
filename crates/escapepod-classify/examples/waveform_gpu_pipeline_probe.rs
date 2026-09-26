@@ -225,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let scoring = Instant::now();
-    let (calls, stats) =
+    let (calls, stats, _parity) =
         escapepod_classify::waveform::classify_reads_gpu(&bundle, &scan.anchored, &pod5, &gpu)?;
     let elapsed = scoring.elapsed();
 

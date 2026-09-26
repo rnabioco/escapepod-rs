@@ -62,6 +62,89 @@ tags, junction not aligned, query outside move table, non-UUID read name.
 form for plotting or thresholding outside a BAM reader, and the place the skip
 `reason` is recorded per read rather than only in the summary.
 
+## Provenance (`@PG` `DS`)
+
+The output BAM's `@PG` record for `escpod-classify` carries the real invoked
+command line (`CL`), and a `DS` field holding a JSON object with everything
+an after-the-fact audit of the calls needs — since none of it otherwise
+survives past the run's own stdout/stderr:
+
+```json
+{
+  "model_id": "charging_tcn_sup6_rna004",
+  "model_version": "0.1.0",
+  "scorer_sha256": "…",
+  "positive_class": "charged",
+  "basecaller": {"model": "rna004_sup@v6.0.0", "dorado_version": "2.1.1+d66c17c"},
+  "operating_point": {"probability": 0.82, "cl": 209},
+  "calibration": false,
+  "abstain_rule": "…",
+  "device": {
+    "requested": "gpu",
+    "cublas_path": "/opt/conda/envs/gpu/lib/libcublas.so.12",
+    "cublas_version": "12.9.1",
+    "cublaslt_path": "/opt/conda/envs/gpu/lib/libcublasLt.so.12",
+    "cublaslt_version": "12.9.1",
+    "cublas_repaired": false,
+    "gpu_batches_scored": 434,
+    "parity_checked_batches": 7,
+    "parity_worst_abs_dp": 0.000013
+  }
+}
+```
+
+Every field the bundle or the run does not carry is omitted, never
+fabricated: a bundle with no `basecaller`/`operating_point`/`abstain` block
+has no such key, and `calibration` alone is always present (`false` when the
+bundle ships none) because it is not optional on the bundle itself.
+`positive_class` (`bundle.classes[1]`) says which class `cl` and
+`operating_point.probability` are a probability *of* — the one thing the
+`@PG` `CL` string used to carry before it was replaced with the real argv
+below.
+
+`device` is #425's addition, and its own fields follow the same omit-rather-
+than-fabricate rule, plus one more: **`requested` is always the device that
+actually scored these reads, never merely the one a GPU scorer loaded for.**
+Two cases report `"cpu"` despite a GPU scorer having loaded successfully:
+
+- A `--device auto` run that hit a GPU refusal (see the `#416`/`#420`
+  warnings below) and fell back to rescoring the whole run on the CPU. Here
+  the cuBLAS/cuBLASLt fields are still present — the pairing loaded and
+  agreed fine; a real-batch parity *divergence* is what triggered the
+  fallback, and that is worth recording, not discarding — but none of the
+  `gpu_batches_scored`/`parity_*` fields are, since the check that caught the
+  divergence is what ended the run rather than a summary of it.
+- A run smaller than one GPU batch: every read is scored by
+  `classify_reads_gpu`'s own CPU-fallback tail, `gpu.logits()` is never
+  actually called, and none of `device`'s GPU fields are present at all.
+
+The remaining fields, present only when `requested == "gpu"`:
+
+- **`cublas_path`** / **`cublas_version`** / **`cublaslt_path`** /
+  **`cublaslt_version`** / **`cublas_repaired`** — the cuBLAS/cuBLASLt
+  pairing `ensure_cublas_pairing()` resolved before the graph moved onto CUDA
+  (rnabioco/escapepod-rs#416): which physical library file each resolved to,
+  its release, and whether escpod had to reload cuBLAS against the sibling
+  cuBLASLt shipped beside it to make the two agree. The paths matter as much
+  as the versions — #416's root cause was a mismatched *pair of files*, and
+  two runs can report identical version strings while having resolved
+  different files.
+- **`gpu_batches_scored`** — how many GPU batches this run actually scored
+  (`gpu.logits()` calls), independent of how many of those were cross-checked.
+- **`parity_checked_batches`** / **`parity_worst_abs_dp`** — how many of
+  those batches were also cross-checked against the CPU scorer on real reads
+  (the first, then one in every `ESCAPEPOD_WAVEFORM_GPU_PARITY_EVERY`,
+  default 64) and the worst `|ΔP(charged)|` any of them showed. This is a
+  *sample*, not a census: at the default cadence, `parity_checked_batches`
+  is roughly `gpu_batches_scored / 64` — the two together say how much of
+  the run that coverage represents, which `parity_checked_batches` alone
+  cannot.
+
+This is exactly the evidence an incident like #416 needs and, before this,
+could only be reconstructed from a caller's own log retention or Slurm
+accounting — neither of which escpod controls, and neither of which is
+guaranteed to still exist by the time someone asks.
+
 ## Getting a model bundle
 
 Bundles come from
@@ -279,7 +362,10 @@ on its default library path — see the warning below.
 
     A refused GPU is an error under `--device gpu` and a warning plus a
     whole-run CPU fallback under `--device auto` — never a GPU run whose
-    answers were not checked.
+    answers were not checked. Both the pairing that was resolved and the
+    parity summary these two guards compute are recorded in the output BAM's
+    own [`@PG` `DS` provenance](#provenance-pg-ds) (#425) — an after-the-fact
+    audit no longer depends on a caller's own log capture.
 
 ## Notes
 
