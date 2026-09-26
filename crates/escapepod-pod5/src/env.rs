@@ -11,7 +11,11 @@
 //! way to notice a typo'd override was never applied.
 //!
 //! [`flag`] and [`positive_usize`] are the one parse for each shape, in the
-//! lowest crate every other one already depends on. A caller whose knob's
+//! lowest crate every other one already depends on. [`usize_allow_zero`] is
+//! the same parse for the rarer knob where `0` is a meaningful setting
+//! rather than a typo — `ESCAPEPOD_AUTOINDEX_MAX=0` disables speculative
+//! index warm-up, and routing it through [`positive_usize`] silently turned
+//! that off (rnabioco/escapepod-rs#421). A caller whose knob's
 //! *default* is "on" (`ESCAPEPOD_CRF_GPU_DECODE`, `ESCAPEPOD_CRF_GPU_ZEROCOPY`
 //! — `=0` opts out of an on-by-default behaviour) does not fit [`flag`]'s
 //! fixed off-when-unset contract and is deliberately left alone; backend-name
@@ -102,6 +106,37 @@ pub fn positive_usize(name: &str) -> Option<usize> {
             warn_once(
                 name,
                 format_args!("{trimmed:?} is not a positive integer; ignoring it"),
+            );
+            None
+        }
+    }
+}
+
+/// A non-negative-integer `ESCAPEPOD_*` knob: [`positive_usize`] with `0`
+/// accepted as a value.
+///
+/// For the knob where `0` *means* something — a threshold where `0` is
+/// "never", not a count or a size where `0` would be nonsense. Same contract
+/// otherwise: `None` when unset or empty (the caller supplies its default),
+/// and a value that does not parse as a `usize` (not an integer, negative)
+/// warns once per name and returns `None`.
+///
+/// Reach for [`positive_usize`] unless `0` has a documented meaning; this one
+/// exists because `ESCAPEPOD_AUTOINDEX_MAX=0` does (rnabioco/escapepod-rs#421).
+// Same home as `flag` above.
+#[allow(clippy::disallowed_methods)]
+pub fn usize_allow_zero(name: &str) -> Option<usize> {
+    let v = std::env::var(name).ok()?;
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            warn_once(
+                name,
+                format_args!("{trimmed:?} is not a non-negative integer; ignoring it"),
             );
             None
         }
@@ -245,5 +280,23 @@ mod tests {
                 "{v:?} should not parse"
             );
         }
+    }
+
+    #[test]
+    fn usize_allow_zero_unset_empty_zero_value_garbage() {
+        const NAME: &str = "ESCAPEPOD_TEST_ALLOW_ZERO";
+        let read = |value: Option<&str>| with_var(NAME, value, || usize_allow_zero(NAME));
+        assert_eq!(read(None), None, "unset falls back to the caller's default");
+        assert_eq!(
+            read(Some("")),
+            None,
+            "empty falls back to the caller's default"
+        );
+        // The whole point: `0` is a value here, not a rejected typo.
+        assert_eq!(read(Some("0")), Some(0));
+        assert_eq!(read(Some("7")), Some(7));
+        assert_eq!(read(Some(" 7 ")), Some(7));
+        assert_eq!(read(Some("abc")), None, "garbage warns and falls back");
+        assert_eq!(read(Some("-1")), None, "negative warns and falls back");
     }
 }
