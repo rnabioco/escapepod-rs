@@ -2,6 +2,105 @@
 
 ## Unreleased
 
+## 0.30.0 (2026-09-26)
+
+### Added
+
+- **`escpod align --sort coordinate` writes a coordinate-sorted BAM itself**,
+  so the `samtools sort` pass after it goes away (#417). The order is exactly
+  `samtools sort`'s — reference, position, forward before reverse, then input
+  order, unmapped reads last — and the header differs from the unsorted
+  output only in `SO:coordinate` and the `@PG CL`. It is a per-reference
+  bucket sort over the records the workers already encode, with no merge:
+  past `--sort-memory` (default 4G) the largest buckets spill to one unlinked
+  temporary file in `--tmp-dir` (default beside the output), and peak memory
+  is the budget plus the largest single reference's records. The default
+  stays `--sort unsorted`; no `.bai` is written.
+
+### Changed
+
+- **Setting `ESCAPEPOD_FNN_TRACT`, `ESCAPEPOD_WAVEFORM_HOIST`,
+  `ESCAPEPOD_WAVEFORM_GPU_HOIST`, `ESCAPEPOD_CRF_TRACT` or
+  `ESCAPEPOD_CRF_DEBUG_RECOGNIZER` to `0` or `false` now turns it off
+  (previously on).** Each used to test `var_os(..).is_some()`, so any set
+  value — including `=0` — counted as "on", the opposite of what every other
+  `ESCAPEPOD_*` switch and this repo's own documentation say `=1`/`=0` mean.
+  All five, plus every other boolean switch and positive-integer knob, now
+  route through the new `escapepod_pod5::env::flag`/`positive_usize`, which
+  also warns once on a value that does not parse instead of silently falling
+  back to the default with no trace.
+- **`escpod align` no longer stalls on very long reads.** A tRNA sample's
+  handful of 50–400 kb reads used to take seconds each on one thread while the
+  in-order writer — and, once the permit window filled, the whole pool —
+  waited for them. Reads of 1,024 nt or more are now scored by a
+  reference-major ("transposed") layout of the SIMD score kernel, whose state
+  is one panel row (cache-resident at any read length) instead of one read
+  column (50 MB per lane group for a 395 kb read): 2.3× faster on that read on
+  one core. A read of 16 kb or more also has its panel scored across the pool,
+  one lane group per task: 0.29 s wall for that read, against 3.15 s. On a
+  490 k-read sample: 19.2 → 15.2 s wall on 16 rna cores (avx512), and
+  11.1 → 7.7 s with `--device gpu` on an A30 — within 0.2 s of the same run
+  without its long reads. Output is byte-identical;
+  `ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY=1` restores the old path for A/B
+  measurement. `escapepod_align::Aligner` gains `score_groups`/`score_group`
+  (per-lane-group scoring for a caller with threads to spare), `kernel_for`
+  and `with_transposed_min_len` (#415).
+- **`escpod align` no longer aligns reads longer than 1,000 nt by default.**
+  New `--max-read-len <N>` (default `1000`, measured on SEQ; `0` = no limit,
+  which restores the previous output exactly). A longer read is not scored on
+  the CPU or the GPU and not traced, but it is still written — in input order,
+  unmapped (flag 4), every input tag copied, no `NM`/`MD`/`AS`/`XS`/`XA` —
+  the same way a read below `--min-score` is; under `--strand both` neither
+  strand is scored. The run reports how many reads were skipped. On a
+  490 k-read tRNA sample 687 reads (0.14%) are over the limit, and skipping
+  them takes the run from 15.1 to 13.3 s on 16 rna cores and from 7.6 to
+  6.5 s with `--device gpu`. **Default output changes** for any input with
+  reads over 1,000 nt: those reads were previously aligned (#415).
+
+### Fixed
+
+- **A bgzipped or concatenated `.gz` k-mer table, boundaries CSV, or reference
+  CSV no longer reads as truncated after its first gzip member.**
+  `flate2::read::GzDecoder` stops at the end of the first member; switched to
+  `MultiGzDecoder` in `escapepod-signal`'s `KmerTable::from_file` and
+  `load_kmer_table`, and in `escpod demux`'s boundaries-CSV reader
+  (`crates/escapepod-cli/src/commands/demux/utils.rs`), so every member of a
+  multi-member `.gz` input is read (#409).
+- **`escpod align --read-ids` now accepts the same UUID spellings `escpod
+  filter` does.** The ID list and each record's name are canonicalised
+  through `parse_uuid_flexible` when they parse as a UUID (dashed or the
+  compact 32-hex-char form), falling back to raw bytes for a non-UUID name
+  (a FASTQ read name). Previously a dashless ID list matched raw bytes
+  against dashed read names and silently selected nothing (#409).
+- **`escpod resquiggle`'s output `@PG` `CL` field now records the real
+  argv**, as `escpod align`'s does, instead of a hand-reconstructed subset of
+  flags that always omitted both `--kmer-table` and `--kmer-model` (#409).
+- **`escpod classify --device gpu` no longer returns wrong charging
+  probabilities on nodes with a host CUDA toolkit in the `ldconfig` cache.**
+  cudarc opens the unversioned `libcublas.so` first; a CUDA runtime
+  environment does not ship that name, so the host's cuBLAS (12.8 on
+  compgpu03) was loaded and paired with the environment's cuBLASLt (12.9).
+  That mix raises no error and computes wrong GEMMs — the TCN's GPU output
+  correlated 0.009 with the CPU's (13.1% charged against 1.5%). The GPU
+  loader now checks which release each loaded file belongs to and reloads
+  cuBLAS against its own cuBLASLt, or refuses the GPU when it cannot (#416).
+- **The windowed charging classifier's GPU path now checks itself against
+  the CPU on real reads.** The first GPU batch of every run, and one in every
+  64 after it (`ESCAPEPOD_WAVEFORM_GPU_PARITY_EVERY`), is re-scored on the
+  CPU; a read off by more than 1e-3 in P(charged) refuses the GPU —
+  an error under `--device gpu`, a warning and a whole-run CPU fallback under
+  `--device auto`.
+- **`ESCAPEPOD_AUTOINDEX_MAX=0` skips read-index warm-up again.** 0.29.x's
+  move of the knob onto `env::positive_usize` (#412) rejected `0` as a typo
+  and fell back to the 5,000,000 default, so `=0` — the documented way to
+  turn off speculative warm-up in `ReaderCache`, `DatasetCache` and the Python
+  `Reader` context manager — quietly warmed every file again. It now reads
+  through the new `escapepod_pod5::env::usize_allow_zero`, which accepts `0`
+  and otherwise keeps `positive_usize`'s contract (unset/empty → default, a
+  value that does not parse warns once and falls back). The Python `Reader`
+  gains a read-only `index_resident` property, so the skip is now asserted,
+  not just its read ids (#421).
+
 ## 0.29.0 (2026-09-25)
 
 ### Added
