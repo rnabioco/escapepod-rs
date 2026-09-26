@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let gpu = bundle.waveform_net_gpu(batch)?;
-    let (gpu_calls, gpu_stats) =
+    let (gpu_calls, gpu_stats, _parity) =
         waveform::classify_reads_gpu(&bundle, &scan.anchored, &pod5, &gpu)?;
     println!(
         "gpu:  {} calls, {} no-calls (batch {batch})",

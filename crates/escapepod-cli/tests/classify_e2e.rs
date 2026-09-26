@@ -173,7 +173,9 @@ fn classify_end_to_end_matches_golden() {
 /// ever reach stdout (rnabioco/escapepod-rs#370) — checked against the
 /// fixture bundle's own `metadata.json` rather than merely asserted
 /// non-empty, since a field that round-trips the wrong bundle is exactly the
-/// failure this exists to catch.
+/// failure this exists to catch. Also pins `device` (rnabioco/escapepod-rs#425)
+/// and that `@PG` `CL` is the real invoked argv rather than the old
+/// hand-templated string (rnabioco/escapepod-rs#409's precedent).
 #[test]
 fn classify_bam_header_records_full_model_provenance() {
     let out_dir = tempfile::tempdir().unwrap();
@@ -196,6 +198,15 @@ fn classify_bam_header_records_full_model_provenance() {
         .iter()
         .find(|(id, _)| String::from_utf8_lossy(id.as_ref()) == "escpod-classify")
         .expect("escpod-classify @PG record present");
+    let cl = pg
+        .other_fields()
+        .get(&pg_tag::COMMAND_LINE)
+        .expect("@PG CL field present");
+    let cl = String::from_utf8_lossy(cl.as_ref());
+    assert!(
+        cl.contains("classify") && cl.contains(&fixtures().join("bundle").display().to_string()),
+        "@PG CL should be the real invoked argv, not a hand-templated string: {cl}"
+    );
     let ds = pg
         .other_fields()
         .get(&pg_tag::DESCRIPTION)
@@ -212,6 +223,10 @@ fn classify_bam_header_records_full_model_provenance() {
         meta["operating_point"]["probability"]
     );
     assert_eq!(ds["operating_point"]["cl"], meta["operating_point"]["cl"]);
+    // The class `cl`/`operating_point.probability` are stated on — dropped
+    // silently by an earlier draft of #425 along with the old hand-templated
+    // `@PG CL` string that used to be the only place it was recorded.
+    assert_eq!(ds["positive_class"], meta["classes"][1]);
     // The fixture bundle ships neither a calibration nor a basecaller nor an
     // abstain block — `calibration` must still report `false` (it is not
     // Option on the bundle), but the other two must be omitted rather than
@@ -225,6 +240,54 @@ fn classify_bam_header_records_full_model_provenance() {
         ds.get("abstain_rule").is_none(),
         "fixture bundle carries no abstain rule; DS must not invent one: {ds}"
     );
+    // The fixture bundle is `gbm` — no GPU path at all (`note_cpu_only`), so
+    // `device.requested` reports the device that actually ran the classifier
+    // (always CPU here) regardless of what `--device` this test happened to
+    // pass, and none of the GPU-only fields are fabricated to fill a slot.
+    assert_eq!(ds["device"]["requested"], "cpu");
+    for key in [
+        "cublas_path",
+        "cublas_version",
+        "cublaslt_path",
+        "cublaslt_version",
+        "cublas_repaired",
+        "gpu_batches_scored",
+        "parity_checked_batches",
+        "parity_worst_abs_dp",
+    ] {
+        assert!(
+            ds["device"].get(key).is_none(),
+            "device.{key} must be omitted under CPU, not present: {ds}"
+        );
+    }
+}
+
+/// `--device cpu` explicitly, rather than relying on the default: the exact
+/// case rnabioco/escapepod-rs#425's acceptance criteria names.
+#[test]
+fn classify_device_cpu_flag_records_requested_cpu() {
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_bam = out_dir.path().join("out.bam");
+    let out_tsv = out_dir.path().join("calls.tsv");
+    run_classifier(&["classify", "--device", "cpu"], &out_bam, &out_tsv);
+
+    let file = std::fs::File::open(&out_bam).unwrap();
+    let mut reader = bam::io::Reader::new(file);
+    let header = reader.read_header().unwrap();
+    let (_, pg) = header
+        .programs()
+        .as_ref()
+        .iter()
+        .find(|(id, _)| String::from_utf8_lossy(id.as_ref()) == "escpod-classify")
+        .expect("escpod-classify @PG record present");
+    let ds = pg
+        .other_fields()
+        .get(&pg_tag::DESCRIPTION)
+        .expect("@PG DS field present");
+    let ds: Json = serde_json::from_slice(ds.as_ref()).expect("DS field is valid JSON");
+    assert_eq!(ds["device"]["requested"], "cpu");
+    assert!(ds["device"].get("cublas_version").is_none());
+    assert!(ds["device"].get("parity_checked_batches").is_none());
 }
 
 /// `escpod classify` now shares `escpod align`'s reference FASTA reader

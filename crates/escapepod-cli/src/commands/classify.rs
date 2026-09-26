@@ -164,7 +164,7 @@ fn run_waveform(
     geometry: &HashMap<String, escapepod_classify::RefGeometry>,
     gpu: bool,
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] device: Device,
-) -> anyhow::Result<(Vec<ReadCall>, ClassifyStats, u64)> {
+) -> anyhow::Result<(Vec<ReadCall>, ClassifyStats, u64, DeviceProvenance)> {
     if args.orientation != OrientationArg::Auto {
         // Not silently ignored: the flag exists to override a *vote*, and this
         // variant does not vote — its frame is the one the model was trained
@@ -209,25 +209,62 @@ fn run_waveform(
         pod5.n_files()
     );
 
-    let (calls, stats) = if gpu {
+    let (calls, stats, device_prov) = if gpu {
         #[cfg(feature = "gpu")]
         {
             // Both the load (cuBLAS pairing) and the run (per-batch GPU/CPU
             // parity on real reads) can refuse the GPU with `GpuRefused`
             // (#416). `--device gpu` makes that an error; `auto` only allowed
             // the GPU, so it falls back to the CPU scorer for the whole run.
-            let result = bundle
-                .waveform_net_gpu(waveform_gpu_batch())
-                .and_then(|net| waveform::classify_reads_gpu(bundle, &scan.anchored, &pod5, &net));
-            match result {
-                Ok(v) => v,
+            // Nested rather than chained with `.and_then`/`.map`: `pairing`
+            // has to survive a `classify_reads_gpu` failure too (the
+            // fallback arm below), which a `Result`-flattening chain would
+            // have dropped along with the error (#425).
+            match bundle.waveform_net_gpu(waveform_gpu_batch()) {
+                Ok(net) => {
+                    let pairing = net.cublas_pairing().clone();
+                    match waveform::classify_reads_gpu(bundle, &scan.anchored, &pod5, &net) {
+                        // `groups_scored == 0`: every read landed in the
+                        // CPU-fallback tail and `gpu.logits()` was never
+                        // actually called (the run was smaller than one GPU
+                        // batch) — report the device that actually scored
+                        // these reads, not the one that merely loaded (#425).
+                        Ok((calls, stats, parity)) if parity.groups_scored > 0 => {
+                            (calls, stats, DeviceProvenance::gpu(&pairing, parity))
+                        }
+                        Ok((calls, stats, _parity)) => (calls, stats, DeviceProvenance::cpu()),
+                        Err(e)
+                            if device != Device::Gpu
+                                && e
+                                    .downcast_ref::<escapepod_classify::waveform_net_gpu::GpuRefused>()
+                                    .is_some() =>
+                        {
+                            warn!(
+                                "{e:#}; --device {device}: scoring every read on the CPU instead"
+                            );
+                            let (calls, stats) =
+                                waveform::classify_reads(bundle, &scan.anchored, &pod5)?;
+                            // The pairing loaded and agreed fine — a
+                            // real-batch parity divergence is what triggered
+                            // this fallback, not a bad pairing — so it is
+                            // still worth recording rather than discarded: a
+                            // #416-class event should leave more evidence
+                            // behind, not less.
+                            (calls, stats, DeviceProvenance::cpu_gpu_refused(&pairing))
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 Err(e)
                     if device != Device::Gpu
                         && e.downcast_ref::<escapepod_classify::waveform_net_gpu::GpuRefused>()
                             .is_some() =>
                 {
+                    // Refused before a pairing was even resolved (the
+                    // load-time check itself failed) — nothing to attach.
                     warn!("{e:#}; --device {device}: scoring every read on the CPU instead");
-                    waveform::classify_reads(bundle, &scan.anchored, &pod5)?
+                    let (calls, stats) = waveform::classify_reads(bundle, &scan.anchored, &pod5)?;
+                    (calls, stats, DeviceProvenance::cpu())
                 }
                 Err(e) => return Err(e),
             }
@@ -237,9 +274,10 @@ fn run_waveform(
             unreachable!("place_and_report only returns Placement::Gpu when Stage::compiled_in()")
         }
     } else {
-        waveform::classify_reads(bundle, &scan.anchored, &pod5)?
+        let (calls, stats) = waveform::classify_reads(bundle, &scan.anchored, &pod5)?;
+        (calls, stats, DeviceProvenance::cpu())
     };
-    Ok((calls, stats, scan.records_scanned))
+    Ok((calls, stats, scan.records_scanned, device_prov))
 }
 
 /// The GPU scorer's fixed batch size — a hardware-tuning knob, not a routine
@@ -253,6 +291,136 @@ fn waveform_gpu_batch() -> usize {
     escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_BATCH").unwrap_or(128)
 }
 
+/// Replace any byte the SAM header-value grammar refuses (§ 1.3, `[ -~]+` —
+/// noodles-sam's own `is_valid_value`, which every `@PG` field including
+/// `DS` is checked against at write time) with `?`.
+///
+/// Every other field `provenance_ds` writes comes from the bundle's own
+/// schema-controlled `metadata.json` — plain ASCII identifiers by
+/// construction. `DeviceProvenance`'s cuBLAS fields are the one exception:
+/// they can carry [`escapepod_classify::cuda_libs::release_of`]'s
+/// unversioned fallback, which embeds a filesystem path this crate does not
+/// control. Without this, an unusual byte in that path would fail
+/// `writer.write_header` at the very end of [`finish`] — after the BAM scan,
+/// POD5 indexing and the whole classification pass have already run — rather
+/// than degrade the one field that can't be trusted.
+#[cfg(feature = "gpu")]
+fn sam_header_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() && (' '..='~').contains(&c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Which device actually scored a run, and — when the GPU was involved at
+/// all — the cuBLAS/cuBLASLt pairing and GPU/CPU parity evidence #425
+/// attaches to the output BAM. #416 showed a mismatched pairing returns
+/// wrong GPU probabilities with no error, so "GPU or CPU", "which physical
+/// libraries were paired", and "was the running parity check clean" are
+/// exactly the facts an after-the-fact audit needs and, before this, could
+/// only ever recover from a caller's own log capture (if it kept one) or
+/// Slurm accounting (if the run is still recent enough).
+///
+/// `requested` is always the *actual* device, never the flag: a GPU run
+/// smaller than one GPU batch (every read scored by
+/// [`waveform::classify_reads_gpu`]'s own CPU-fallback tail,
+/// `GpuParitySummary::groups_scored == 0`) or one that fell back after a
+/// [`escapepod_classify::waveform_net_gpu::GpuRefused`] (`auto` only)
+/// reports `cpu` here, because that is what scored the reads — even though a
+/// GPU scorer loaded successfully in both cases. The `cublas_*` fields are
+/// independent of that: a pairing that loaded and was then made moot by a
+/// real-batch parity refusal is still worth keeping ([`Self::cpu_gpu_refused`]),
+/// since a #416-class event is exactly what this record exists to catch.
+struct DeviceProvenance {
+    requested: &'static str,
+    cublas_path: Option<String>,
+    cublas_version: Option<String>,
+    cublaslt_path: Option<String>,
+    cublaslt_version: Option<String>,
+    cublas_repaired: Option<bool>,
+    gpu_batches_scored: Option<usize>,
+    parity_checked_batches: Option<usize>,
+    parity_worst_abs_dp: Option<f64>,
+}
+
+impl DeviceProvenance {
+    fn cpu() -> Self {
+        Self {
+            requested: "cpu",
+            cublas_path: None,
+            cublas_version: None,
+            cublaslt_path: None,
+            cublaslt_version: None,
+            cublas_repaired: None,
+            gpu_batches_scored: None,
+            parity_checked_batches: None,
+            parity_worst_abs_dp: None,
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu(
+        pairing: &escapepod_classify::cuda_libs::CublasPairing,
+        parity: waveform::GpuParitySummary,
+    ) -> Self {
+        Self {
+            requested: "gpu",
+            // The denominator `parity_checked_batches` is a fraction of:
+            // only 1 in `ESCAPEPOD_WAVEFORM_GPU_PARITY_EVERY` real GPU
+            // batches (default 64) is ever cross-checked against the CPU
+            // scorer, so `parity_checked_batches` alone cannot say how much
+            // of the run that coverage represents.
+            gpu_batches_scored: Some(parity.groups_scored),
+            parity_checked_batches: Some(parity.checked_batches),
+            parity_worst_abs_dp: Some(parity.worst_abs_dp),
+            ..Self::pairing_only(pairing)
+        }
+    }
+
+    /// The GPU scorer loaded and its cuBLAS/cuBLASLt pairing resolved fine,
+    /// but a real-batch parity check caught a divergence mid-run (a
+    /// #416-class event, not a load-time pairing failure) and the whole run
+    /// was rescored on the CPU — `requested` is `cpu` (that is what actually
+    /// scored these reads), but the pairing that was resolved is kept rather
+    /// than silently discarded, and no parity fields are set (the check that
+    /// caught the divergence is what ended the GPU run, not a summary of it).
+    #[cfg(feature = "gpu")]
+    fn cpu_gpu_refused(pairing: &escapepod_classify::cuda_libs::CublasPairing) -> Self {
+        Self {
+            requested: "cpu",
+            ..Self::pairing_only(pairing)
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn pairing_only(pairing: &escapepod_classify::cuda_libs::CublasPairing) -> Self {
+        Self {
+            requested: "cpu", // overwritten by every caller of this helper
+            // `sam_header_safe`, not a plain `.clone()`: `cublas_version`/
+            // `lt_version` fall back to `release_of`'s `"(unversioned, in
+            // {path})"` when a loaded library's file name carries no
+            // parseable version, embedding a filesystem path this crate
+            // never controls. The rest of `CublasPairing` is a diagnostic
+            // type with no such constraint (its `Display` is fine for
+            // `tracing::debug!`) — only the copies that reach a SAM header
+            // value need to hold to that grammar.
+            cublas_path: Some(sam_header_safe(&pairing.cublas_path.display().to_string())),
+            cublas_version: Some(sam_header_safe(&pairing.cublas_version)),
+            cublaslt_path: Some(sam_header_safe(&pairing.lt_path.display().to_string())),
+            cublaslt_version: Some(sam_header_safe(&pairing.lt_version)),
+            cublas_repaired: Some(pairing.repaired),
+            gpu_batches_scored: None,
+            parity_checked_batches: None,
+            parity_worst_abs_dp: None,
+        }
+    }
+}
+
 /// The `@PG` record's `DS` field: the bundle identity that is already
 /// `info!`-logged in [`run`] but otherwise dropped once the run's stdout is
 /// gone — the field the same run's aggregate charged fraction has nothing to
@@ -262,8 +430,9 @@ fn waveform_gpu_batch() -> usize {
 ///
 /// Fields the bundle does not carry are omitted, not null: a bundle with no
 /// `basecaller`/`operating_point`/`abstain` block must not have one
-/// fabricated for it just to fill a slot.
-fn provenance_ds(bundle: &ChargingBundle) -> String {
+/// fabricated for it just to fill a slot. Same rule for `device`'s
+/// GPU-only fields (#425): omitted entirely under `requested == "cpu"`.
+fn provenance_ds(bundle: &ChargingBundle, device: &DeviceProvenance) -> String {
     let mut ds = serde_json::Map::new();
     ds.insert(
         "model_id".to_string(),
@@ -278,6 +447,14 @@ fn provenance_ds(bundle: &ChargingBundle) -> String {
     ds.insert(
         "scorer_sha256".to_string(),
         serde_json::Value::String(bundle.scorer_sha256.clone()),
+    );
+    // The class `cl`/`operating_point.probability` are stated on — the old
+    // hand-templated `@PG` `CL` string used to be the only place this was
+    // recorded, and #425 replaces that string with the real argv, so this
+    // is where it now lives instead of being dropped entirely.
+    ds.insert(
+        "positive_class".to_string(),
+        serde_json::Value::String(bundle.classes[1].clone()),
     );
     if let Some(bc) = &bundle.basecaller {
         let mut bc_obj = serde_json::Map::new();
@@ -323,6 +500,54 @@ fn provenance_ds(bundle: &ChargingBundle) -> String {
             serde_json::Value::String(ab.rule.clone()),
         );
     }
+    let mut dev = serde_json::Map::new();
+    dev.insert(
+        "requested".to_string(),
+        serde_json::Value::String(device.requested.to_string()),
+    );
+    if let Some(v) = &device.cublas_path {
+        dev.insert(
+            "cublas_path".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(v) = &device.cublas_version {
+        dev.insert(
+            "cublas_version".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(v) = &device.cublaslt_path {
+        dev.insert(
+            "cublaslt_path".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(v) = &device.cublaslt_version {
+        dev.insert(
+            "cublaslt_version".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(v) = device.cublas_repaired {
+        dev.insert("cublas_repaired".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = device.gpu_batches_scored {
+        dev.insert("gpu_batches_scored".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = device.parity_checked_batches {
+        dev.insert(
+            "parity_checked_batches".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = device.parity_worst_abs_dp {
+        dev.insert(
+            "parity_worst_abs_dp".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    ds.insert("device".to_string(), serde_json::Value::Object(dev));
     serde_json::Value::Object(ds).to_string()
 }
 
@@ -455,9 +680,9 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         // real datasets and dozens of synthetic ones. Root cause still
         // unknown; flagged there for anyone who hits it again.
         let placement = crate::device::place_and_report(device, crate::device::Stage::WaveformTcn)?;
-        let (calls, stats, records) =
+        let (calls, stats, records, device_prov) =
             run_waveform(&args, &bundle, &geometry, placement.is_gpu(), device)?;
-        return finish(&args, &bundle, calls, stats, records);
+        return finish(&args, &bundle, calls, stats, records, device_prov);
     }
     crate::device::note_cpu_only(
         device,
@@ -525,7 +750,16 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     );
 
     let (calls, stats) = classify_reads(&bundle, &scan.anchored, &pod5, orientation)?;
-    finish(&args, &bundle, calls, stats, scan.records_scanned)
+    // GBM / feature-network bundles have no GPU path at all (see
+    // `note_cpu_only` above) — always CPU, never the `--device` flag's value.
+    finish(
+        &args,
+        &bundle,
+        calls,
+        stats,
+        scan.records_scanned,
+        DeviceProvenance::cpu(),
+    )
 }
 
 /// Report, write the TSV, and write the `cl`-tagged BAM.
@@ -538,6 +772,7 @@ fn finish(
     calls: Vec<ReadCall>,
     stats: ClassifyStats,
     records_scanned: u64,
+    device: DeviceProvenance,
 ) -> anyhow::Result<()> {
     if stats.no_signal > 0 {
         warn!(
@@ -646,17 +881,19 @@ fn finish(
     let decoder = bgzf::io::MultithreadedReader::with_worker_count(reader_workers, file);
     let mut reader = bam::io::Reader::from(decoder);
     let mut out_header = reader.read_header()?;
+    // The real invoked argv, mirroring `align`/`resquiggle` (#409) — the
+    // `cl` scale note this used to stand in for belongs in the DS blob (it's
+    // implicit in `operating_point.cl`/the docs), not in place of the actual
+    // command line an audit would otherwise have to reconstruct. Named
+    // `argv`, not `cl`: this function's `cl` is already the charging-call
+    // byte (see the tagging loop below), and `cl_tag`/`cl_by_id` are already
+    // that name's established meaning here.
+    let argv: Vec<String> = std::env::args().collect();
     let pg = Map::<Program>::builder()
         .insert(pg_tag::NAME, "escpod")
         .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
-        .insert(
-            pg_tag::COMMAND_LINE,
-            format!(
-                "escpod classify --model {} (cl = round(P({}) * 255))",
-                bundle.model_id, bundle.classes[1]
-            ),
-        )
-        .insert(pg_tag::DESCRIPTION, provenance_ds(bundle))
+        .insert(pg_tag::COMMAND_LINE, argv.join(" "))
+        .insert(pg_tag::DESCRIPTION, provenance_ds(bundle, &device))
         .build()?;
     out_header.programs_mut().add("escpod-classify", pg)?;
 
@@ -695,4 +932,193 @@ fn finish(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fixture bundle `classify_e2e.rs`'s end-to-end tests already load
+    /// from `../escapepod-classify/tests/fixtures/bundle` — reused here so
+    /// this pins `provenance_ds`'s JSON shape without needing a GPU, a real
+    /// `CublasPairing`, or a real `waveform::GpuParitySummary` run: `device`
+    /// is plain data by the time `provenance_ds` sees it, so a run-level
+    /// `DeviceProvenance` value is all either case needs (#425).
+    fn fixture_bundle() -> ChargingBundle {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("escapepod-classify/tests/fixtures/bundle");
+        ChargingBundle::load(&dir).unwrap()
+    }
+
+    const GPU_FIELDS: [&str; 5] = [
+        "cublas_path",
+        "cublas_version",
+        "cublaslt_path",
+        "cublaslt_version",
+        "cublas_repaired",
+    ];
+    const PARITY_FIELDS: [&str; 3] = [
+        "gpu_batches_scored",
+        "parity_checked_batches",
+        "parity_worst_abs_dp",
+    ];
+
+    #[test]
+    fn provenance_ds_carries_the_positive_class() {
+        let bundle = fixture_bundle();
+        let ds = provenance_ds(&bundle, &DeviceProvenance::cpu());
+        let v: serde_json::Value = serde_json::from_str(&ds).unwrap();
+        assert_eq!(v["positive_class"], bundle.classes[1]);
+    }
+
+    #[test]
+    fn provenance_ds_cpu_device_carries_no_gpu_fields() {
+        let bundle = fixture_bundle();
+        let ds = provenance_ds(&bundle, &DeviceProvenance::cpu());
+        let v: serde_json::Value = serde_json::from_str(&ds).unwrap();
+        assert_eq!(v["device"]["requested"], "cpu");
+        for key in GPU_FIELDS.iter().chain(&PARITY_FIELDS) {
+            assert!(
+                v["device"].get(key).is_none(),
+                "device.{key} must be omitted, not null, under --device cpu: {v}"
+            );
+        }
+    }
+
+    /// A GPU run's provenance, from a hand-built `DeviceProvenance` — the
+    /// mocked `CublasPairing`/parity-summary input the acceptance criteria
+    /// ask for. This does not need the `gpu` feature: `DeviceProvenance`
+    /// itself is plain data, and only its constructors (which pull the real
+    /// types in) are feature-gated.
+    #[test]
+    fn provenance_ds_gpu_device_carries_pairing_and_parity() {
+        let bundle = fixture_bundle();
+        let device = DeviceProvenance {
+            requested: "gpu",
+            cublas_path: Some("/opt/cuda-12.8/lib64/libcublas.so.12".to_string()),
+            cublas_version: Some("12.8.93".to_string()),
+            cublaslt_path: Some("/opt/cuda-12.8/lib64/libcublasLt.so.12".to_string()),
+            cublaslt_version: Some("12.8.93".to_string()),
+            cublas_repaired: Some(false),
+            gpu_batches_scored: Some(400),
+            parity_checked_batches: Some(12),
+            parity_worst_abs_dp: Some(1.3e-4),
+        };
+        let ds = provenance_ds(&bundle, &device);
+        let v: serde_json::Value = serde_json::from_str(&ds).unwrap();
+        assert_eq!(v["device"]["requested"], "gpu");
+        assert_eq!(
+            v["device"]["cublas_path"],
+            "/opt/cuda-12.8/lib64/libcublas.so.12"
+        );
+        assert_eq!(v["device"]["cublas_version"], "12.8.93");
+        assert_eq!(
+            v["device"]["cublaslt_path"],
+            "/opt/cuda-12.8/lib64/libcublasLt.so.12"
+        );
+        assert_eq!(v["device"]["cublaslt_version"], "12.8.93");
+        assert_eq!(v["device"]["cublas_repaired"], false);
+        assert_eq!(v["device"]["gpu_batches_scored"], 400);
+        assert_eq!(v["device"]["parity_checked_batches"], 12);
+        assert_eq!(v["device"]["parity_worst_abs_dp"], 1.3e-4);
+    }
+
+    /// `DeviceProvenance::gpu`/`cpu_gpu_refused` themselves, against a real
+    /// (if fictitious) `CublasPairing` — not just a hand-built
+    /// `DeviceProvenance` — closing the gap the mocked-input test above
+    /// leaves: a field renamed inside either constructor would still pass
+    /// every test that only builds `DeviceProvenance` by hand.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn device_provenance_constructors_map_pairing_fields_correctly() {
+        use escapepod_classify::cuda_libs::CublasPairing;
+
+        let pairing = CublasPairing {
+            cublas_path: std::path::PathBuf::from("/opt/cuda-12.8/lib64/libcublas.so.12"),
+            cublas_version: "12.8.93".to_string(),
+            lt_path: std::path::PathBuf::from("/opt/cuda-12.8/lib64/libcublasLt.so.12"),
+            lt_version: "12.8.93".to_string(),
+            repaired: true,
+        };
+        let parity = waveform::GpuParitySummary {
+            groups_scored: 40,
+            checked_batches: 1,
+            worst_abs_dp: 2.5e-5,
+        };
+
+        let gpu = DeviceProvenance::gpu(&pairing, parity);
+        assert_eq!(gpu.requested, "gpu");
+        assert_eq!(
+            gpu.cublas_path.as_deref(),
+            Some("/opt/cuda-12.8/lib64/libcublas.so.12")
+        );
+        assert_eq!(gpu.cublas_version.as_deref(), Some("12.8.93"));
+        assert_eq!(
+            gpu.cublaslt_path.as_deref(),
+            Some("/opt/cuda-12.8/lib64/libcublasLt.so.12")
+        );
+        assert_eq!(gpu.cublaslt_version.as_deref(), Some("12.8.93"));
+        assert_eq!(gpu.cublas_repaired, Some(true));
+        assert_eq!(gpu.gpu_batches_scored, Some(40));
+        assert_eq!(gpu.parity_checked_batches, Some(1));
+        assert_eq!(gpu.parity_worst_abs_dp, Some(2.5e-5));
+
+        let refused = DeviceProvenance::cpu_gpu_refused(&pairing);
+        assert_eq!(refused.requested, "cpu");
+        assert_eq!(refused.cublas_version.as_deref(), Some("12.8.93"));
+        assert_eq!(refused.gpu_batches_scored, None);
+        assert_eq!(refused.parity_checked_batches, None);
+        assert_eq!(refused.parity_worst_abs_dp, None);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn sam_header_safe_replaces_bytes_the_sam_grammar_refuses() {
+        assert_eq!(sam_header_safe("12.8.93"), "12.8.93");
+        assert_eq!(
+            sam_header_safe("(unversioned, in /opt/lib)"),
+            "(unversioned, in /opt/lib)"
+        );
+        // Tab, newline and DEL (0x7F) are all outside SAM's `[ -~]+` — one
+        // rogue byte in a path escpod does not control must not corrupt the
+        // rest of the value or crash the writer, just degrade to `?`.
+        assert_eq!(sam_header_safe("a\tb\nc"), "a?b?c");
+        assert_eq!(sam_header_safe("caf\u{e9}"), "caf?"); // non-ASCII (é)
+    }
+
+    /// A pathological `CublasPairing` — an embedded control character, as
+    /// `release_of`'s unversioned fallback could in principle carry from an
+    /// unusual filesystem path — must not reach `provenance_ds` unsanitized
+    /// (rnabioco/escapepod-rs#426 review finding): `write_header` validates
+    /// every `@PG` field byte-for-byte against the same SAM grammar, and a
+    /// value that fails it errors out at the very end of a full run.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn device_provenance_sanitizes_a_pathological_pairing() {
+        use escapepod_classify::cuda_libs::CublasPairing;
+
+        let pairing = CublasPairing {
+            cublas_path: std::path::PathBuf::from("/opt/lib\ncublas.so"),
+            cublas_version: "(unversioned, in /opt/weird\tdir)".to_string(),
+            lt_path: std::path::PathBuf::from("/opt/lib/libcublasLt.so.12"),
+            lt_version: "12.8.93".to_string(),
+            repaired: false,
+        };
+        let dp = DeviceProvenance::cpu_gpu_refused(&pairing);
+        for v in [
+            dp.cublas_path.as_deref(),
+            dp.cublas_version.as_deref(),
+            dp.cublaslt_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                v.bytes().all(|b| (b' '..=b'~').contains(&b)),
+                "every byte of {v:?} must be within the SAM header-value grammar"
+            );
+        }
+    }
 }
