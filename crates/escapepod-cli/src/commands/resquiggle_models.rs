@@ -85,12 +85,18 @@ fn known_names() -> String {
 /// → `$HOME/.cache/escapepod/kmer_models`. Per the XDG spec, an empty
 /// `XDG_CACHE_HOME` is treated as unset.
 pub fn cache_dir() -> Result<PathBuf> {
+    // `*_CACHE` path variables (and the standard XDG_CACHE_HOME/HOME they
+    // fall back to) are a different shape from a flag/knob and keep their
+    // own parse (root CLAUDE.md's env-switch table).
+    #[allow(clippy::disallowed_methods)]
     if let Some(d) = std::env::var_os("ESCAPEPOD_KMER_CACHE").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(d));
     }
+    #[allow(clippy::disallowed_methods)]
     if let Some(d) = std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(d).join("escapepod").join("kmer_models"));
     }
+    #[allow(clippy::disallowed_methods)]
     if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         return Ok(PathBuf::from(h)
             .join(".cache")

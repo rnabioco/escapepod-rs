@@ -34,6 +34,9 @@ impl Rng {
     }
 }
 
+// Test-only bundle-path knob (weights are not redistributable, so this test
+// skips itself when unset), not the runtime switch/knob shape.
+#[allow(clippy::disallowed_methods)]
 fn load_bundle() -> Option<String> {
     match std::env::var("ESCAPEPOD_CRF_BUNDLE") {
         Ok(dir) => Some(dir),

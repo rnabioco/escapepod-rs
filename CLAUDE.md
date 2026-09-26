@@ -289,6 +289,22 @@ hence on, the opposite of every place that documents `=1` to enable something.
 Backend-name caps (`*_BACKEND`) and path variables (`*_CACHE`) are a different
 shape and keep their own parse.
 
+### Use this, not your own
+
+Recurring needs that already have one home. `clippy.toml`'s
+`disallowed-methods` enforces the env-var and BGZF-worker rows for CI; the
+rest are conventions with no lint behind them yet.
+
+| Need | Use |
+|---|---|
+| Reference FASTA (gzip, duplicate names refused) | `escapepod_align::fasta::read_fasta` |
+| `ESCAPEPOD_*` switches/knobs | `escapepod_pod5::env::{flag, positive_usize}` (see above) |
+| Gzip input, possibly multi-member/bgzipped | `flate2::read::MultiGzDecoder`, never `GzDecoder` |
+| BGZF reader worker count | `noodles_bgzf::io::MultithreadedReader::with_worker_count`, sized from the rayon pool — `::new` is one worker |
+| `@PG` `CL` on a written BAM | the real argv, as `align.rs` does — not a hand-rebuilt command line |
+| Skipping a GPU test without a device | return early with a message naming the missing device, don't `panic`/`unwrap` |
+| Reading a POD5's reads by id | `Pod5Index` sorted on `storage_key` (`(file, first signal row)`), never BAM/HashMap order (#334) |
+
 ## Architecture
 
 ### Workspace Structure

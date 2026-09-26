@@ -1,5 +1,8 @@
 use std::process::Command;
 
+// Build script reading cargo-provided build metadata, not a runtime
+// ESCAPEPOD_* switch.
+#[allow(clippy::disallowed_methods)]
 fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     let profile = std::env::var("PROFILE").unwrap_or_default();

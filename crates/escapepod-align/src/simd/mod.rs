@@ -129,6 +129,9 @@ impl Backend {
     /// `Err(value)` when it names no kernel (the caller decides whether to
     /// warn; this crate does not log).
     pub fn cap_from_env() -> Result<Option<Backend>, String> {
+        // `*_BACKEND` caps are a name, not a flag/knob shape, and keep their
+        // own parse (root CLAUDE.md's env-switch table).
+        #[allow(clippy::disallowed_methods)]
         match std::env::var(BACKEND_ENV) {
             Err(_) => Ok(None),
             Ok(v) => Self::from_name(v.trim()).map(Some).ok_or(v),

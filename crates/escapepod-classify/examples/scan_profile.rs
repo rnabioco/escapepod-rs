@@ -27,12 +27,22 @@ fn main() -> anyhow::Result<()> {
     let ref_fa = args.next().expect("usage: scan_profile <bam> <ref.fa>");
     let geometry = junction_positions(Path::new(&ref_fa), MOTIF, 3, COMMON_ARM)?;
 
+    // Same worker count `scan_bam` uses (`pipeline::bgzf_workers`, not `pub`
+    // to this example): half the rayon pool, so (a)/(b) are a fair baseline
+    // against (c) rather than measuring a single-worker decoder that
+    // `MultithreadedReader::new` would silently give them.
+    let bgzf_workers = std::num::NonZero::new(rayon::current_num_threads().div_ceil(2).max(1))
+        .expect("at least one");
+
     // (a) decode only: BGZF + RecordBuf materialisation, nothing else.
     let t = Instant::now();
     let mut n = 0u64;
     {
         let file = std::fs::File::open(&bam_path)?;
-        let mut reader = bam::io::Reader::from(bgzf::io::MultithreadedReader::new(file));
+        let mut reader = bam::io::Reader::from(bgzf::io::MultithreadedReader::with_worker_count(
+            bgzf_workers,
+            file,
+        ));
         let header = reader.read_header()?;
         let mut rec = RecordBuf::default();
         while reader.read_record_buf(&header, &mut rec)? != 0 {
@@ -46,7 +56,10 @@ fn main() -> anyhow::Result<()> {
     let mut anchored = 0u64;
     {
         let file = std::fs::File::open(&bam_path)?;
-        let mut reader = bam::io::Reader::from(bgzf::io::MultithreadedReader::new(file));
+        let mut reader = bam::io::Reader::from(bgzf::io::MultithreadedReader::with_worker_count(
+            bgzf_workers,
+            file,
+        ));
         let header = reader.read_header()?;
         let names: Vec<String> = header
             .reference_sequences()

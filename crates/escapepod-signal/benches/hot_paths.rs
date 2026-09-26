@@ -35,6 +35,8 @@ use escapepod_signal::resquiggle::types::RefineAlgo;
 /// Read ESCAPEPOD_BENCH_THREADS and pre-configure the rayon global pool.
 /// No-op if the env var isn't set or rayon has already been initialized.
 fn configure_rayon() {
+    // Bench-only knob, not the runtime switch/knob shape.
+    #[allow(clippy::disallowed_methods)]
     if let Some(n) = std::env::var("ESCAPEPOD_BENCH_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -45,6 +47,8 @@ fn configure_rayon() {
     }
 }
 
+// Bench-only knob, not the runtime switch/knob shape.
+#[allow(clippy::disallowed_methods)]
 fn bench_sample_size(default: usize) -> usize {
     std::env::var("ESCAPEPOD_BENCH_SAMPLES")
         .ok()

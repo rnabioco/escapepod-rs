@@ -26,7 +26,10 @@ use std::sync::OnceLock;
 /// env var settles the question outright; `None` leaves it to the caller's
 /// own terminal check.
 fn color_env_override() -> Option<bool> {
+    // CLICOLOR_FORCE/NO_COLOR/CLICOLOR are third-party CLI conventions, not
+    // ESCAPEPOD_* switches, and keep their own parse.
     // Force-on wins over everything.
+    #[allow(clippy::disallowed_methods)]
     if matches!(
         std::env::var("CLICOLOR_FORCE").as_deref(),
         Ok(v) if v != "0" && !v.is_empty()
@@ -34,10 +37,12 @@ fn color_env_override() -> Option<bool> {
         return Some(true);
     }
     // NO_COLOR: any value, including empty, disables color.
+    #[allow(clippy::disallowed_methods)]
     if std::env::var_os("NO_COLOR").is_some() {
         return Some(false);
     }
     // CLICOLOR=0 disables.
+    #[allow(clippy::disallowed_methods)]
     if matches!(std::env::var("CLICOLOR").as_deref(), Ok("0")) {
         return Some(false);
     }

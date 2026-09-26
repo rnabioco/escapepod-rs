@@ -262,12 +262,18 @@ fn known_models() -> String {
 /// → `$HOME/.cache/escapepod/demux_models`. Per the XDG spec, an empty
 /// `XDG_CACHE_HOME` is treated as unset.
 pub fn cache_dir() -> Result<PathBuf> {
+    // `*_CACHE` path variables (and the standard XDG_CACHE_HOME/HOME they
+    // fall back to) are a different shape from a flag/knob and keep their
+    // own parse (root CLAUDE.md's env-switch table).
+    #[allow(clippy::disallowed_methods)]
     if let Some(d) = std::env::var_os("ESCAPEPOD_DEMUX_MODEL_CACHE").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(d));
     }
+    #[allow(clippy::disallowed_methods)]
     if let Some(d) = std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(d).join("escapepod").join("demux_models"));
     }
+    #[allow(clippy::disallowed_methods)]
     if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         return Ok(PathBuf::from(h)
             .join(".cache")
@@ -571,6 +577,9 @@ fn encode_path_segment(s: &str) -> String {
 ///
 /// `GITHUB_TOKEN` then `GH_TOKEN` — the two names CI and the `gh` CLI already
 /// use, so a machine that can `gh release download` can usually fetch too.
+// GITHUB_TOKEN/GH_TOKEN are the gh CLI's own convention vars, not
+// ESCAPEPOD_* switches/knobs.
+#[allow(clippy::disallowed_methods)]
 #[cfg(feature = "model-fetch")]
 fn github_token() -> Option<String> {
     ["GITHUB_TOKEN", "GH_TOKEN"]

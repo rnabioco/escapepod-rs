@@ -43,6 +43,10 @@ fn warn_once(name: &str, message: std::fmt::Arguments<'_>) {
 /// (case-insensitive). Anything else is not a value this ever meant to
 /// carry — warns once per name and counts as off, the same as an unset
 /// variable, so a typo cannot silently turn a switch on.
+// This module is the one home `clippy.toml`'s `disallowed-methods` sends
+// every other `ESCAPEPOD_*` switch/knob to; the raw `std::env::var` calls
+// below are that parse, not a copy of it.
+#[allow(clippy::disallowed_methods)]
 pub fn flag(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -77,6 +81,8 @@ pub fn flag(name: &str) -> bool {
 /// knob this guards is a count or a size, and `0` is never a valid one)
 /// warns once per name and also returns `None`, so a mistyped override
 /// falls back to the default instead of silently doing so with no trace.
+// Same home as `flag` above.
+#[allow(clippy::disallowed_methods)]
 pub fn positive_usize(name: &str) -> Option<usize> {
     let v = std::env::var(name).ok()?;
     let trimmed = v.trim();
@@ -113,6 +119,9 @@ mod tests {
 
     /// Runs `f` with `name` set to `value` (or removed, if `None`),
     /// restoring whatever the variable held before on the way out.
+    // Test-only raw env access: saving/restoring the ambient value to test
+    // `flag`/`positive_usize` themselves, not a second parse of a switch.
+    #[allow(clippy::disallowed_methods)]
     fn with_var<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(name).ok();

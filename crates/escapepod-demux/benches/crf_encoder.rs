@@ -23,6 +23,8 @@ use std::hint::black_box;
 
 use escapepod_demux::crf::{CrfEncoder, CrfScratch};
 
+// Bench-only knob, not the runtime switch/knob shape.
+#[allow(clippy::disallowed_methods)]
 fn bench_sample_size(default: usize) -> usize {
     std::env::var("ESCAPEPOD_BENCH_SAMPLES")
         .ok()
@@ -55,6 +57,9 @@ impl Rng {
 }
 
 fn bench_encoder(c: &mut Criterion) {
+    // Bench-only bundle-path knob (weights are not redistributable, so this
+    // group skips itself when unset), not the runtime switch/knob shape.
+    #[allow(clippy::disallowed_methods)]
     let Ok(dir) = std::env::var("ESCAPEPOD_CRF_BUNDLE") else {
         eprintln!(
             "skipping the `crf_encoder` group: set ESCAPEPOD_CRF_BUNDLE to a \

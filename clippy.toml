@@ -1,0 +1,12 @@
+# Guardrails against re-duplicating a shared helper this workspace already
+# has one of (rnabioco/escapepod-rs#413, following #409-#412). Each entry
+# names the one home; a genuinely new legitimate use gets a narrow
+# `#[allow(clippy::disallowed_methods)]` with a one-line reason, not a
+# blanket allow.
+
+disallowed-methods = [
+    { path = "flate2::gz::read::GzDecoder::new", reason = "single-member decoder silently truncates bgzip/concatenated files; use flate2::read::MultiGzDecoder" },
+    { path = "std::env::var", reason = "use escapepod_pod5::env::{flag, positive_usize} for ESCAPEPOD_* switches/knobs; allowed only in escapepod-pod5/src/env.rs and the documented exceptions (*_BACKEND caps, *_CACHE paths, ESCAPEPOD_CRF_GPU_DECODE/ZEROCOPY, bench-only knobs, third-party/cargo-provided vars)" },
+    { path = "std::env::var_os", reason = "use escapepod_pod5::env::{flag, positive_usize} for ESCAPEPOD_* switches/knobs; allowed only in escapepod-pod5/src/env.rs and the documented exceptions (*_BACKEND caps, *_CACHE paths, ESCAPEPOD_CRF_GPU_DECODE/ZEROCOPY, bench-only knobs, third-party/cargo-provided vars)" },
+    { path = "noodles_bgzf::io::MultithreadedReader::new", reason = "one worker no matter the name; use with_worker_count sized from the rayon pool" },
+]

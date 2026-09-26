@@ -59,6 +59,8 @@ fn resolve(requested: Option<usize>, env: Option<&str>, available: usize) -> any
 /// Build the global rayon pool. Call once, from `main`, before dispatch.
 pub fn init(requested: Option<usize>) -> anyhow::Result<()> {
     let available = std::thread::available_parallelism().map_or(1, Into::into);
+    // rayon's own convention var, not an ESCAPEPOD_* switch/knob.
+    #[allow(clippy::disallowed_methods)]
     let env = std::env::var("RAYON_NUM_THREADS").ok();
     let width = resolve(requested, env.as_deref(), available)?;
 

@@ -42,6 +42,9 @@ use escapepod_pod5::{
 
 const DEFAULT_SAMPLES_PER_READ: usize = 4_000;
 
+// Bench-only knobs (`ESCAPEPOD_BENCH_*`), not the runtime switch/knob shape
+// `escapepod_pod5::env` covers.
+#[allow(clippy::disallowed_methods)]
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()

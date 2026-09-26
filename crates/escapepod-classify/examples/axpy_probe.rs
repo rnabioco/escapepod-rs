@@ -374,6 +374,8 @@ fn main() {
 
     assert!(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"));
     let avx512 = is_x86_feature_detected!("avx512f");
+    // Bench-only knob for this profiling example, not an ESCAPEPOD_* switch.
+    #[allow(clippy::disallowed_methods)]
     let ghz: f64 = std::env::var("PROBE_GHZ")
         .ok()
         .and_then(|s| s.parse().ok())

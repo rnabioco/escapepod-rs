@@ -64,6 +64,8 @@ const SAMPLES_PER_BASE: i64 = 30;
 /// The junction sits far enough in that every negative offset resolves.
 const Q_JUNCTION: usize = 60;
 
+// Bench-only knob, not the runtime switch/knob shape.
+#[allow(clippy::disallowed_methods)]
 fn bench_sample_size(default: usize) -> usize {
     std::env::var("ESCAPEPOD_BENCH_SAMPLES")
         .ok()
@@ -305,6 +307,9 @@ fn bench_finalize(c: &mut Criterion) {
 fn bench_scorer(c: &mut Criterion) {
     use escapepod_classify::{ChargingBundle, ChargingScorer};
 
+    // Bench-only bundle-path knob (weights are not redistributable, so this
+    // group skips itself when unset), not the runtime switch/knob shape.
+    #[allow(clippy::disallowed_methods)]
     let Ok(dir) = std::env::var("ESCAPEPOD_CHARGING_BUNDLE") else {
         eprintln!(
             "skipping the `scorer` group: set ESCAPEPOD_CHARGING_BUNDLE to a \
@@ -406,6 +411,9 @@ fn bench_waveform_scorer(c: &mut Criterion) {
     use escapepod_classify::{ChargingBundle, ChargingScorer, WaveformTensor};
     use escapepod_signal::chunk::Chunk;
 
+    // Bench-only bundle-path knob (weights are not redistributable, so this
+    // group skips itself when unset), not the runtime switch/knob shape.
+    #[allow(clippy::disallowed_methods)]
     let Ok(dir) = std::env::var("ESCAPEPOD_CHARGING_BUNDLE") else {
         eprintln!(
             "skipping the `waveform` group: set ESCAPEPOD_CHARGING_BUNDLE to a \
