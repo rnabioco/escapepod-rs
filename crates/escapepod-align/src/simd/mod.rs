@@ -239,6 +239,7 @@ impl Group {
     /// = `s(c, ref_lane[j])`, and `i16::MIN` past the lane's end (no padding
     /// cell can take the diagonal). The same substitution scores as `prof`,
     /// transposed; built once, on first use, by whichever thread gets there.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn tprof(&self) -> &[i16] {
         self.tprof.get_or_init(|| {
             let (len, lanes) = (self.len, self.lens.len());
