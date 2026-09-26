@@ -180,10 +180,7 @@ fn probe_header_footer(file: &File) -> Result<()> {
 /// already holds the same entries in memory. The threshold decides where an
 /// index comes from and how loudly, never whether one exists.
 pub fn autoindex_max() -> usize {
-    std::env::var("ESCAPEPOD_AUTOINDEX_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5_000_000)
+    crate::env::positive_usize("ESCAPEPOD_AUTOINDEX_MAX").unwrap_or(5_000_000)
 }
 
 impl Reader {

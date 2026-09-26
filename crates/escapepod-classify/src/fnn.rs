@@ -110,7 +110,7 @@ impl FeatureNet {
         // is the escape hatch that keeps both paths measurable from one
         // binary — and a way back to the general runtime if a bundle ever
         // disagrees with its own kernel.
-        let native = if std::env::var_os("ESCAPEPOD_FNN_TRACT").is_some() {
+        let native = if escapepod_signal::pod5::env::flag("ESCAPEPOD_FNN_TRACT") {
             None
         } else {
             crate::fnn_lstm::NativeBiLstm::from_proto(&proto, n_ch, n_off)

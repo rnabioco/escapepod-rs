@@ -498,24 +498,16 @@ const AMBIGUITY_OFFSET: usize = 23;
 
 /// Records by name (the header's first token), sequence uppercased.
 fn read_fasta(path: &Path) -> std::collections::HashMap<String, Vec<u8>> {
-    let text = std::fs::read_to_string(path).expect("the fixture reference reads");
-    let mut out = std::collections::HashMap::new();
-    let mut name = String::new();
-    let mut seq: Vec<u8> = Vec::new();
-    for line in text.lines() {
-        if let Some(header) = line.strip_prefix('>') {
-            if !name.is_empty() {
-                out.insert(std::mem::take(&mut name), std::mem::take(&mut seq));
-            }
-            name = header.split_whitespace().next().unwrap_or("").to_string();
-        } else {
-            seq.extend(line.trim().bytes().map(|b| b.to_ascii_uppercase()));
-        }
-    }
-    if !name.is_empty() {
-        out.insert(name, seq);
-    }
-    out
+    let file = std::fs::File::open(path).expect("the fixture reference reads");
+    let records = escapepod_align::fasta::read_fasta(std::io::BufReader::new(file))
+        .expect("the fixture reference parses");
+    records
+        .into_iter()
+        .map(|(name, mut seq)| {
+            seq.make_ascii_uppercase();
+            (name, seq)
+        })
+        .collect()
 }
 
 /// Bit-exact equality of the three tensors.

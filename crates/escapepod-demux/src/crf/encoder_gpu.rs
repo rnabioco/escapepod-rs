@@ -170,10 +170,7 @@ fn resolve_batch_rows(workers_on_device: usize) -> usize {
     /// Below this, splitting costs more in per-call overhead than the memory is
     /// worth; a device that cannot host this many rows needs fewer workers.
     const MIN_ROWS: usize = 64;
-    std::env::var("ESCAPEPOD_CRF_GPU_BATCH_ROWS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_CRF_GPU_BATCH_ROWS")
         .unwrap_or_else(|| (DEVICE_ROW_BUDGET / workers_on_device.max(1)).max(MIN_ROWS))
 }
 

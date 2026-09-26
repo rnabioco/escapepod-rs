@@ -15,6 +15,16 @@ pub enum AlignError {
     EmptyReference(String),
     /// A requested kernel this machine (or this build) cannot run.
     BackendUnavailable(&'static str),
+    /// [`crate::fasta::read_fasta`] could not read another line.
+    FastaIo(String),
+    /// A FASTA header (`>` line) with nothing but whitespace after it.
+    EmptyReferenceName(usize),
+    /// A FASTA header name that is not valid UTF-8.
+    NonUtf8ReferenceName(usize),
+    /// The same reference name given twice.
+    DuplicateReferenceName(String),
+    /// Sequence data before any `>` header.
+    FastaContentBeforeHeader(usize),
 }
 
 impl fmt::Display for AlignError {
@@ -29,6 +39,22 @@ impl fmt::Display for AlignError {
             Self::EmptyReference(name) => write!(f, "reference {name:?} has no bases"),
             Self::BackendUnavailable(name) => {
                 write!(f, "the {name} kernel cannot run on this machine")
+            }
+            Self::FastaIo(e) => write!(f, "reading FASTA: {e}"),
+            Self::EmptyReferenceName(line) => {
+                write!(f, "FASTA line {line}: empty reference name")
+            }
+            Self::NonUtf8ReferenceName(line) => {
+                write!(f, "FASTA line {line}: non-UTF-8 reference name")
+            }
+            Self::DuplicateReferenceName(name) => {
+                write!(f, "duplicate reference name {name:?}")
+            }
+            Self::FastaContentBeforeHeader(line) => {
+                write!(
+                    f,
+                    "FASTA line {line}: sequence data before the first '>' header"
+                )
             }
         }
     }

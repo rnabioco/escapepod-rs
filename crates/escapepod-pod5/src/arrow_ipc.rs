@@ -25,12 +25,7 @@ const ROW_COUNT_PARALLEL_MIN: usize = 16;
 fn footer_walk_forced_serial() -> bool {
     use std::sync::OnceLock;
     static FORCED: OnceLock<bool> = OnceLock::new();
-    *FORCED.get_or_init(|| {
-        matches!(
-            std::env::var("ESCAPEPOD_POD5_FOOTER_SERIAL").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+    *FORCED.get_or_init(|| crate::env::flag("ESCAPEPOD_POD5_FOOTER_SERIAL"))
 }
 
 /// Read a little-endian `i32` at `off`, returning an error instead of panicking

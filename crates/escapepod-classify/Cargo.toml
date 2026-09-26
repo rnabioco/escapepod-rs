@@ -12,10 +12,18 @@ categories = ["science"]
 
 [dependencies]
 anyhow = { workspace = true }
+# The one reference FASTA reader (`fasta::read_fasta`, rnabioco/escapepod-rs#410)
+# and its `AlignError`; a leaf, std-only crate, so this adds nothing to the
+# dependency graph beyond itself.
+escapepod-align = { workspace = true }
 # GBM runtime (tree walk + heads) — the model format `escpod` already runs.
 escapepod-demux = { workspace = true }
 # k-mer level primitives (extract_levels, load_kmer_table) and the POD5 surface.
 escapepod-signal = { workspace = true }
+# Transparent gzip for a reference FASTA (rnabioco/escapepod-rs#410): opened
+# here, then handed to `escapepod_align::fasta::read_fasta`, which is
+# std-only and does not decompress anything itself.
+flate2 = "1"
 # BAM reading for the pipeline (record types + the scan loop); writing the
 # cl-tagged output BAM stays in the CLI.
 noodles-bam = "0.95"

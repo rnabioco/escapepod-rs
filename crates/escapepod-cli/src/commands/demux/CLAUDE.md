@@ -44,7 +44,7 @@
 | `ESCAPEPOD_DEMUX_FILLERS` | reader shards (cap 32) | 2 | no / CHANGELOG |
 | `ESCAPEPOD_CRF_GPU_BLOCK` | reads per encoder handoff | 4096 | no / CHANGELOG |
 | `ESCAPEPOD_CRF_GPU_WORKERS` | encoder sessions | 2×devices (≤8) | test skips if set / CHANGELOG |
-| `ESCAPEPOD_CRF_GPU_TRACE=1` | stage trace | off | no / CHANGELOG |
+| `ESCAPEPOD_CRF_GPU_TRACE` | stage trace (`1/true/yes/on`) | off | no / CHANGELOG |
 | `ESCAPEPOD_DEMUX_MODEL_CACHE` | cache dir (then XDG, HOME) | `~/.cache/escapepod/demux_models` | yes / root CLAUDE.md |
 | `GITHUB_TOKEN`/`GH_TOKEN` | `models fetch` auth | none | no / no |
 

@@ -47,11 +47,7 @@ fn resolve_batch_elems() -> usize {
     const BYTES_PER_ELEM: usize = 5500;
     const FALLBACK: usize = 4_194_304;
 
-    if let Some(n) = std::env::var("ESCAPEPOD_CNN_GPU_BATCH_ELEMS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
+    if let Some(n) = escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_CNN_GPU_BATCH_ELEMS") {
         return n;
     }
     match cuda_total_mem_bytes() {

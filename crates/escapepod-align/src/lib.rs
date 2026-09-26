@@ -30,19 +30,26 @@
 //!   `samtools calmd` including at reference ambiguity codes.
 //! * [`Aligner`] — the panel plus the dispatch plus winner selection: what a
 //!   caller actually uses.
+//! * [`fasta`] — the one reference FASTA parser (rnabioco/escapepod-rs#410):
+//!   takes an already-open `BufRead`, so this crate stays free of file I/O
+//!   and gzip; a caller's own tiny `open` helper decompresses first when the
+//!   file starts with the gzip magic.
 //! * `cuda` (feature `gpu`) — the same score, one CUDA thread per (read,
 //!   reference) pair, for a batch of reads at once; its [`ScoreMatrix`] goes
 //!   back into [`Aligner::map_reads_scored`], which does everything after
 //!   scoring exactly as the CPU path does.
 //!
-//! This crate does no I/O and depends on nothing but `std` (plus cudarc under
-//! `gpu`); reading BAM, FASTA and FASTQ is `escapepod-cli`'s job
-//! (`escpod align`).
+//! This crate depends on nothing but `std` (plus cudarc under `gpu`) and does
+//! no file I/O of its own; reading BAM and FASTQ, and opening a (possibly
+//! gzipped) FASTA file before handing it to [`fasta::read_fasta`], is
+//! `escapepod-cli`'s job (`escpod align`) — `escapepod-classify` does the same
+//! for its own reference-FASTA callers.
 
 pub mod alphabet;
 #[cfg(feature = "gpu")]
 pub mod cuda;
 mod error;
+pub mod fasta;
 mod mapper;
 mod panel;
 pub mod sam;

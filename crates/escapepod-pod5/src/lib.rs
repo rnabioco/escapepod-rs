@@ -31,6 +31,7 @@ pub mod utils;
 
 // Public modules
 pub mod compression;
+pub mod env;
 pub mod error;
 pub mod merge;
 pub mod operations;

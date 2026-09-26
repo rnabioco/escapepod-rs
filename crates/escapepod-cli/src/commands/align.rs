@@ -413,17 +413,8 @@ fn fastx_to_record(name: Vec<u8>, seq: Vec<u8>, qual: Option<Vec<u8>>) -> Record
 
 /// Load the reference panel (FASTA, plain or gzip), in file order.
 fn load_reference(path: &Path) -> anyhow::Result<Panel> {
-    let mut r = FastxReader::new(open_text(path)?, false);
-    let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut seen = HashSet::new();
-    while let Some((name, seq, _)) = r.next_record()? {
-        let name = String::from_utf8(name)
-            .with_context(|| format!("{}: non-UTF-8 reference name", path.display()))?;
-        if !seen.insert(name.clone()) {
-            bail!("{}: duplicate reference name {name:?}", path.display());
-        }
-        refs.push((name, seq));
-    }
+    let refs = escapepod_align::fasta::read_fasta(open_text(path)?)
+        .with_context(|| format!("reading reference {}", path.display()))?;
     Panel::new(refs).with_context(|| format!("reading reference {}", path.display()))
 }
 

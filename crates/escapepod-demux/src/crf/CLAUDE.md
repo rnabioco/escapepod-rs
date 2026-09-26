@@ -41,7 +41,7 @@ Encoder changes are held to `benchmarks/benchmark_demux_crf.sh` + `evaluate_demu
 ## Env levers
 | var | effect | default | tested / documented |
 |---|---|---|---|
-| `ESCAPEPOD_CRF_TRACT` | set: force tract | native if recognised | parity test / CHANGELOG |
+| `ESCAPEPOD_CRF_TRACT` | `1/true/yes/on` (via `escapepod_pod5::env::flag`): force tract | native if recognised | parity test / CHANGELOG |
 | `ESCAPEPOD_CRF_DEBUG_RECOGNIZER` | echo refusal to stderr | off | no / no — deleting, `-v` shows it |
 | `ESCAPEPOD_CRF_GPU_DECODE` | `0`: CPU decode | GPU if kernels load | no / CHANGELOG |
 | `ESCAPEPOD_CRF_GPU_ZEROCOPY` | `0`: copy scores to host | on with GPU decode | no / CHANGELOG |

@@ -65,9 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{} file(s), footer walk {}",
         paths.len(),
-        match std::env::var("ESCAPEPOD_POD5_FOOTER_SERIAL").as_deref() {
-            Ok("1") | Ok("true") => "SERIAL",
-            _ => "parallel",
+        if escapepod_pod5::env::flag("ESCAPEPOD_POD5_FOOTER_SERIAL") {
+            "SERIAL"
+        } else {
+            "parallel"
         }
     );
 

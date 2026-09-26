@@ -30,14 +30,8 @@ fn main() {
     let batch: usize = args.get(3).map_or(50_000, |s| s.parse().unwrap());
     let mode: Mode = args.get(4).map_or(Mode::Local, |s| s.parse().unwrap());
 
-    let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
-    for line in std::fs::read_to_string(&args[1]).unwrap().lines() {
-        if let Some(h) = line.strip_prefix('>') {
-            refs.push((h.split_whitespace().next().unwrap().to_string(), Vec::new()));
-        } else {
-            refs.last_mut().unwrap().1.extend(line.trim().bytes());
-        }
-    }
+    let file = std::fs::File::open(&args[1]).unwrap();
+    let refs = escapepod_align::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
     let panel = Panel::new(refs).unwrap();
     let reads: Vec<Vec<u8>> = std::io::BufReader::new(std::fs::File::open(&args[2]).unwrap())
         .lines()

@@ -64,11 +64,7 @@ fn resolve_pod5_inputs(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::
 /// GPU utilization batch size, matching `commands/classify.rs`'s
 /// `waveform_gpu_batch()` convention (same env var, same default).
 fn waveform_gpu_batch() -> usize {
-    std::env::var("ESCAPEPOD_WAVEFORM_GPU_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(128)
+    escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_BATCH").unwrap_or(128)
 }
 
 /// Spawn `nvidia-smi dmon` writing SM-utilization samples to `log_path`,

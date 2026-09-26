@@ -87,10 +87,8 @@ use escapepod_signal::{Reader, ReadsBatchView, SignalExtractor, Uuid};
 
 thread_local! {
     /// Worker count for the fetch phase, set once from `--threads`.
-    static THREADS: usize = std::env::var("ESCAPEPOD_PROBE_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    static THREADS: usize =
+        escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_PROBE_THREADS").unwrap_or(1);
 }
 
 /// Order-independent per-read digest: a sum over reads cannot notice which
