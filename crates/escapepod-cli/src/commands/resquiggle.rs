@@ -328,38 +328,14 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
     let mut bam_reader = bam::io::Reader::from(decoder);
     let mut header = bam_reader.read_header()?;
 
-    // Add @PG record with resquiggle parameters
-    let normalize_str = match &args.normalize {
-        Some(NormalizeMode::Mad) => " --normalize mad",
-        None => "",
-    };
-    let dwell_str = match &settings.refinement_algo {
-        RefineAlgo::DwellPenalty { target, weight } => {
-            format!(" --dwell-target {} --dwell-weight {}", target, weight)
-        }
-        RefineAlgo::Viterbi => String::new(),
-    };
-    let rna_str = if args.rna { " --rna" } else { "" };
-    let command_line = format!(
-        "escpod resquiggle --algo {} --iterations {} --half-bandwidth {} --rescale {}{}{}{}",
-        match &settings.refinement_algo {
-            RefineAlgo::Viterbi => "viterbi",
-            RefineAlgo::DwellPenalty { .. } => "dwell-penalty",
-        },
-        settings.n_refinement_iters,
-        settings.half_bandwidth,
-        match &settings.rescale_algo {
-            RescaleAlgo::TheilSen { .. } => "theil-sen",
-            RescaleAlgo::LeastSquares { .. } => "least-squares",
-        },
-        dwell_str,
-        normalize_str,
-        rna_str,
-    );
+    // Add @PG record with the real argv (as `align.rs` does), so `CL` names
+    // whichever of --kmer-table/--kmer-model was actually passed instead of
+    // a hand-reconstructed subset of flags that omitted both.
+    let cl: Vec<String> = std::env::args().collect();
     let pg = Map::<Program>::builder()
         .insert(pg_tag::NAME, "escpod")
         .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
-        .insert(pg_tag::COMMAND_LINE, command_line)
+        .insert(pg_tag::COMMAND_LINE, cl.join(" "))
         .build()?;
     header.programs_mut().add("escpod-resquiggle", pg)?;
 

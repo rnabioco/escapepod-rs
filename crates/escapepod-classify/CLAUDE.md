@@ -74,7 +74,7 @@ cargo run -p escapepod-classify --example verify_feature_model --features fnn-on
 - `waveform_net.rs:235-298` / `waveform_net_gpu.rs:275-369`: duplicated open/pin/probe.
 - `window::BaseJustify` duplicates `signal::chunk::BaseJustify`.
 - `anchor::ref_to_query`: second CIGAR walk beside `signal::mapping::ref_to_signal`.
-- `fnn_lstm.rs:686-773, 780-874` → `demux::onnx_graph`; `(backend, n)` match at `400-514` → `signal::lstm::run_batch`.
+- `fnn_lstm.rs` `(backend, n)` match at `400-514` → `signal::lstm::run_batch`.
 
 ## Do not
 

@@ -49,7 +49,6 @@ Encoder changes are held to `benchmarks/benchmark_demux_crf.sh` + `evaluate_demu
 | `ESCAPEPOD_CRF_GPU_WORKERS` | workers per device (read in CLI `run.rs`) | 2 | no / CHANGELOG |
 
 ## Known debt
-- `encoder_native.rs:1361–1452, 887–973` — proto toolkit + LSTM-node checks duplicate `classify/fnn_lstm.rs:140–163, 172–236, 686–751`; moving to `onnx_graph` beside `onnx_rewrite`.
 - `encoder_native.rs:375–553` — `(backend, n)` match duplicates `fnn_lstm::logits_batch`; moving to `escapepod_signal::lstm::run_batch`.
 - `encoder_native.rs:197–298` — `encode_into` is `encode_batch_into` at n=1; bit-identity already pinned.
 - `encoder_native.rs:1190–1201` + `encoder.rs:791–800` — `self_check` builds a tract plan `load` rebuilds.

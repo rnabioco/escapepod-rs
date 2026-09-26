@@ -41,7 +41,7 @@
 //!   minimum-norm fit while this returns the signal unchanged.
 
 use anyhow::{Result, bail};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -64,7 +64,7 @@ pub fn load_kmer_table(path: &Path) -> Result<(HashMap<String, f64>, usize)> {
         .map_err(|e| anyhow::anyhow!("cannot open kmer table {}: {}", path.display(), e))?;
     let is_gz = path.to_string_lossy().ends_with(".gz");
     let reader: Box<dyn BufRead> = if is_gz {
-        Box::new(BufReader::new(GzDecoder::new(file)))
+        Box::new(BufReader::new(MultiGzDecoder::new(file)))
     } else {
         Box::new(BufReader::new(file))
     };
@@ -382,6 +382,40 @@ mod tests {
         let path = dir.path().join("empty.tsv");
         std::fs::write(&path, "# only a comment\nkmer\tlevel_mean\n").unwrap();
         assert!(load_kmer_table(&path).is_err());
+    }
+
+    /// A `.gz` k-mer table is not necessarily a single gzip member — a
+    /// bgzipped or concatenated file is several. `GzDecoder` stops after the
+    /// first, silently truncating the table; `MultiGzDecoder` reads every
+    /// member (rnabioco/escapepod-rs#409).
+    #[test]
+    fn multi_member_gzip_is_fully_read() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("levels.tsv.gz");
+
+        let mut bytes = Vec::new();
+        let mut enc = GzEncoder::new(&mut bytes, Compression::default());
+        enc.write_all(b"kmer\tlevel_mean\nAAAAA\t0.95838\n")
+            .unwrap();
+        enc.finish().unwrap();
+        let mut enc = GzEncoder::new(&mut bytes, Compression::default());
+        enc.write_all(b"CCCCC\t-0.5\n").unwrap();
+        enc.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (map, k) =
+            load_kmer_table(&path).expect("both gzip members should be read as one table");
+        assert_eq!(k, 5);
+        assert_eq!(map["AAAAA"], 0.95838);
+        assert_eq!(
+            map.get("CCCCC"),
+            Some(&-0.5),
+            "second gzip member was not read"
+        );
     }
 
     #[test]

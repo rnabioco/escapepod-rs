@@ -56,8 +56,6 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 - `dp/fill.rs:437` `_weight`, `dp/mod.rs:42` `dwell_weight` dead in production; `DpContext` Option+unwrap → enum; `fill.rs:74-92` `dp_step` test-only.
 - `lstm.rs:593-607` unreachable tail (`h%8==0 ⇒ g%32==0`); `lstm.rs:394-502` `run_avx2` vs `::<1>` bench-gated (`charging`, `ESCAPEPOD_LSTM_BATCH=1`).
 - `fingerprint.rs:190-212` re-implements `median_and_mad_with_scratch`; `chunk.rs:993-1007` re-spells the alphabet, `:580` allocates a String per read, `:952` ignores `encode_signal_kmer_into`.
-- **Scheduled removal, minor bump, leech re-verify:** `dtw/kernel.rs`; `dtw_distance_matrix_blocked` (`distance.rs:785-835`); `dtw_distance_penalty`; `Fingerprint::{to_feature_vector,to_interleaved_features,has_dwell_times}`; `mad_normalize_with_clipping`, `normalize_dwell_times_mad`; `llr.rs:103-205` gains fns; `ttest.rs:343-423` `segment_signal_with_dwell`/`SegmentationResult`; `sequence_ints_with_context`; `ESCAPEPOD_DTW_AVX512` (`distance.rs:410-455`).
-- GPU prep kernels (`cuda/mod.rs:323-756` + four `*_kernel.rs`) will be feature-gated and compiled lazily; today `new_on_device:132-154` NVRTC-compiles all six modules on every production `GpuDtwContext::new()`.
 
 ## Do not
 - Bump `target-cpu`/`target-feature`: SIGILL on rna and Alpine.

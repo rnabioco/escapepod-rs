@@ -4,7 +4,7 @@
 //! Kmer table loading and level extraction.
 
 use anyhow::{Result, bail};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -52,7 +52,7 @@ impl KmerTable {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
         let reader: Box<dyn BufRead> = if is_gz {
-            Box::new(BufReader::new(GzDecoder::new(file)))
+            Box::new(BufReader::new(MultiGzDecoder::new(file)))
         } else {
             Box::new(BufReader::new(file))
         };
@@ -532,5 +532,43 @@ mod tests {
         // After MAD normalization, median should be ~0 and MAD ~1
         let median = median_f32(&table.levels).unwrap();
         assert!(median.abs() < 1e-5, "median after fix_gauge: {}", median);
+    }
+
+    /// A `.gz` k-mer table is not necessarily a single gzip member — a
+    /// bgzipped or concatenated file is several. `GzDecoder` stops after the
+    /// first, silently truncating the table; `MultiGzDecoder` reads every
+    /// member (rnabioco/escapepod-rs#409).
+    #[test]
+    fn multi_member_gzip_is_fully_read() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("levels.txt.gz");
+
+        let mut bytes = Vec::new();
+        let mut enc = GzEncoder::new(&mut bytes, Compression::default());
+        enc.write_all(b"A\t1.0\nC\t2.0\n").unwrap();
+        enc.finish().unwrap();
+        let mut enc = GzEncoder::new(&mut bytes, Compression::default());
+        enc.write_all(b"G\t3.0\nT\t4.0\n").unwrap();
+        enc.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let table =
+            KmerTable::from_file(&path).expect("both gzip members should be read as one table");
+        assert_eq!(table.get(b"A").unwrap(), 1.0);
+        assert_eq!(table.get(b"C").unwrap(), 2.0);
+        assert_eq!(
+            table.get(b"G").unwrap(),
+            3.0,
+            "second gzip member was not read"
+        );
+        assert_eq!(
+            table.get(b"T").unwrap(),
+            4.0,
+            "second gzip member was not read"
+        );
     }
 }
