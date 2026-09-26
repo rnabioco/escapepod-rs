@@ -291,6 +291,32 @@ fn waveform_gpu_batch() -> usize {
     escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_BATCH").unwrap_or(128)
 }
 
+/// Replace any byte the SAM header-value grammar refuses (§ 1.3, `[ -~]+` —
+/// noodles-sam's own `is_valid_value`, which every `@PG` field including
+/// `DS` is checked against at write time) with `?`.
+///
+/// Every other field `provenance_ds` writes comes from the bundle's own
+/// schema-controlled `metadata.json` — plain ASCII identifiers by
+/// construction. `DeviceProvenance`'s cuBLAS fields are the one exception:
+/// they can carry [`escapepod_classify::cuda_libs::release_of`]'s
+/// unversioned fallback, which embeds a filesystem path this crate does not
+/// control. Without this, an unusual byte in that path would fail
+/// `writer.write_header` at the very end of [`finish`] — after the BAM scan,
+/// POD5 indexing and the whole classification pass have already run — rather
+/// than degrade the one field that can't be trusted.
+#[cfg(feature = "gpu")]
+fn sam_header_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() && (' '..='~').contains(&c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// Which device actually scored a run, and — when the GPU was involved at
 /// all — the cuBLAS/cuBLASLt pairing and GPU/CPU parity evidence #425
 /// attaches to the output BAM. #416 showed a mismatched pairing returns
@@ -375,10 +401,18 @@ impl DeviceProvenance {
     fn pairing_only(pairing: &escapepod_classify::cuda_libs::CublasPairing) -> Self {
         Self {
             requested: "cpu", // overwritten by every caller of this helper
-            cublas_path: Some(pairing.cublas_path.display().to_string()),
-            cublas_version: Some(pairing.cublas_version.clone()),
-            cublaslt_path: Some(pairing.lt_path.display().to_string()),
-            cublaslt_version: Some(pairing.lt_version.clone()),
+            // `sam_header_safe`, not a plain `.clone()`: `cublas_version`/
+            // `lt_version` fall back to `release_of`'s `"(unversioned, in
+            // {path})"` when a loaded library's file name carries no
+            // parseable version, embedding a filesystem path this crate
+            // never controls. The rest of `CublasPairing` is a diagnostic
+            // type with no such constraint (its `Display` is fine for
+            // `tracing::debug!`) — only the copies that reach a SAM header
+            // value need to hold to that grammar.
+            cublas_path: Some(sam_header_safe(&pairing.cublas_path.display().to_string())),
+            cublas_version: Some(sam_header_safe(&pairing.cublas_version)),
+            cublaslt_path: Some(sam_header_safe(&pairing.lt_path.display().to_string())),
+            cublaslt_version: Some(sam_header_safe(&pairing.lt_version)),
             cublas_repaired: Some(pairing.repaired),
             gpu_batches_scored: None,
             parity_checked_batches: None,
@@ -850,12 +884,15 @@ fn finish(
     // The real invoked argv, mirroring `align`/`resquiggle` (#409) — the
     // `cl` scale note this used to stand in for belongs in the DS blob (it's
     // implicit in `operating_point.cl`/the docs), not in place of the actual
-    // command line an audit would otherwise have to reconstruct.
-    let cl: Vec<String> = std::env::args().collect();
+    // command line an audit would otherwise have to reconstruct. Named
+    // `argv`, not `cl`: this function's `cl` is already the charging-call
+    // byte (see the tagging loop below), and `cl_tag`/`cl_by_id` are already
+    // that name's established meaning here.
+    let argv: Vec<String> = std::env::args().collect();
     let pg = Map::<Program>::builder()
         .insert(pg_tag::NAME, "escpod")
         .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
-        .insert(pg_tag::COMMAND_LINE, cl.join(" "))
+        .insert(pg_tag::COMMAND_LINE, argv.join(" "))
         .insert(pg_tag::DESCRIPTION, provenance_ds(bundle, &device))
         .build()?;
     out_header.programs_mut().add("escpod-classify", pg)?;
@@ -1034,5 +1071,54 @@ mod tests {
         assert_eq!(refused.gpu_batches_scored, None);
         assert_eq!(refused.parity_checked_batches, None);
         assert_eq!(refused.parity_worst_abs_dp, None);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn sam_header_safe_replaces_bytes_the_sam_grammar_refuses() {
+        assert_eq!(sam_header_safe("12.8.93"), "12.8.93");
+        assert_eq!(
+            sam_header_safe("(unversioned, in /opt/lib)"),
+            "(unversioned, in /opt/lib)"
+        );
+        // Tab, newline and DEL (0x7F) are all outside SAM's `[ -~]+` — one
+        // rogue byte in a path escpod does not control must not corrupt the
+        // rest of the value or crash the writer, just degrade to `?`.
+        assert_eq!(sam_header_safe("a\tb\nc"), "a?b?c");
+        assert_eq!(sam_header_safe("caf\u{e9}"), "caf?"); // non-ASCII (é)
+    }
+
+    /// A pathological `CublasPairing` — an embedded control character, as
+    /// `release_of`'s unversioned fallback could in principle carry from an
+    /// unusual filesystem path — must not reach `provenance_ds` unsanitized
+    /// (rnabioco/escapepod-rs#426 review finding): `write_header` validates
+    /// every `@PG` field byte-for-byte against the same SAM grammar, and a
+    /// value that fails it errors out at the very end of a full run.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn device_provenance_sanitizes_a_pathological_pairing() {
+        use escapepod_classify::cuda_libs::CublasPairing;
+
+        let pairing = CublasPairing {
+            cublas_path: std::path::PathBuf::from("/opt/lib\ncublas.so"),
+            cublas_version: "(unversioned, in /opt/weird\tdir)".to_string(),
+            lt_path: std::path::PathBuf::from("/opt/lib/libcublasLt.so.12"),
+            lt_version: "12.8.93".to_string(),
+            repaired: false,
+        };
+        let dp = DeviceProvenance::cpu_gpu_refused(&pairing);
+        for v in [
+            dp.cublas_path.as_deref(),
+            dp.cublas_version.as_deref(),
+            dp.cublaslt_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                v.bytes().all(|b| (b' '..=b'~').contains(&b)),
+                "every byte of {v:?} must be within the SAM header-value grammar"
+            );
+        }
     }
 }
