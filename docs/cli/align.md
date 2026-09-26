@@ -41,7 +41,10 @@ reverse-strand record is refused.
 | Option | Description |
 |--------|-------------|
 | `-r, --reference <FASTA>` | Reference panel, plain or gzip. Names are the header's first word; order is kept |
-| `-o, --output <BAM>` | Output BAM, records in input order; `-` for stdout |
+| `-o, --output <BAM>` | Output BAM, records in input order (or coordinate order with `--sort coordinate`); `-` for stdout |
+| `--sort <unsorted\|coordinate>` | Record order (default `unsorted`) — see [Sorted output](#sorted-output) |
+| `--sort-memory <SIZE>` | With `--sort coordinate`, records held in memory before spilling to a temporary file (default `4G`; `K`/`M`/`G`/`T`, binary) |
+| `--tmp-dir <DIR>` | With `--sort coordinate`, where the spill file goes (default: the output's directory; `$TMPDIR` for `-o -`) |
 | `--mode <MODE>` | `local` (default) or `semiglobal` — see [Modes](#modes) |
 | `--scoring <M,X,O,E>` | Match, mismatch, gap open, gap extend (default `2,-1,-10,-1`) — see [Scoring](#scoring) |
 | `--min-score <N>` | A read whose best score is below this is written unmapped (default `0`) |
@@ -96,8 +99,9 @@ parasail's `sw_trace`/`sg_trace` choices, and pinned against them.
 
 ## Output
 
-Records come out in **input order** (`@HD SO:unsorted`) — sort with
-`samtools sort` if something downstream needs coordinate order. The header is
+Records come out in **input order** (`@HD SO:unsorted`) by default, or
+coordinate-sorted with `--sort coordinate` (see [Sorted output](#sorted-output)).
+The header is
 `@SQ` from the reference in file order, the input's `@RG`, `@PG` and `@CO`
 copied through, and one `@PG ID:escpod-align` for this run, chained to the last.
 
@@ -131,6 +135,27 @@ written **unmapped** (flag 4) with its tags intact. Reads are never dropped
 winner gets flag 16 with `SEQ` reverse-complemented and `QUAL` reversed, as
 SAM requires; per-base tags (`mv`, `MM`/`ML`) are copied verbatim, as `bwa -C`
 does. The tie order is reference order, forward before reverse.
+
+### Sorted output
+
+`--sort coordinate` writes `@HD SO:coordinate` and the records in exactly
+`samtools sort`'s order: by reference (`@SQ` order), then position, then
+forward before reverse strand, then input order — so the output is record for
+record what `samtools sort` of the unsorted output gives (tested on the
+fixtures, and checked on a 1.1 M-read sample). Unmapped reads come last, in
+input order; `--secondary` records sort by their own coordinates. Nothing else
+in the header changes but the `@PG CL`. `samtools index` takes the file as it
+is; no `.bai` is written.
+
+It is a bucket sort — one bucket per reference, which is cheap because the
+panel is small — so there is no separate sort pass and no merge. A sorted file
+cannot be written until the last read is aligned, so the records are held
+until then; with `-o -` the output starts once the input ends. Past
+`--sort-memory` (default 4 GiB) the largest buckets are appended to one
+temporary file in `--tmp-dir`, and at the end each reference's records are read
+back and ordered on their own: peak memory is about the budget plus the
+largest single reference's records, not the sample. The temporary file is
+unlinked as soon as it is created, so nothing is left behind on any exit.
 
 ### `MD` and `NM` at ambiguity codes
 
@@ -207,18 +232,21 @@ samtools view -u -N ids.txt reads.ubam \
 samtools calmd -Qb aln.bam ref.fa > aln.calmd.bam
 ```
 
-`escpod align` does all of it but the sort in one process — the tags ride
-through without the FASTQ-comment round trip, the uBAM's `@RG` lines are
-copied without the `-H` header hack, and `MD` is written at alignment time:
+`escpod align` does all of it in one process — the tags ride through without
+the FASTQ-comment round trip, the uBAM's `@RG` lines are copied without the
+`-H` header hack, `MD` is written at alignment time, and `--sort coordinate`
+replaces the sort:
 
 ```bash
-escpod align reads.ubam -r ref.fa -o aln.bam --read-ids ids.txt --scoring 1,-1,-2,-1
-samtools view -u -F 2324 aln.bam | samtools sort -o aln.sorted.bam   # if needed
+escpod align reads.ubam -r ref.fa -o aln.bam --read-ids ids.txt --scoring 1,-1,-2,-1 \
+    --sort coordinate
+samtools index aln.bam
 ```
 
-`escpod classify` reads the unsorted output directly. The `-F 2324` filter is
-only needed to reproduce the old output's contents exactly (primary, forward,
-mapped records); stamping sample/barcode read groups stays pipeline plumbing.
+`escpod classify` reads either order. Unmapped reads are written, never
+dropped; `samtools view -F 2324` reproduces the old output's contents exactly
+(primary, forward, mapped records) if that is wanted, and a filtered sorted
+file stays sorted. Stamping sample/barcode read groups stays pipeline plumbing.
 
 The scoring scheme is the pipeline's call, judged by charging-call agreement:
 `--scoring 1,-1,-2,-1` is bwa `-x ont2d`'s penalties, but bwa also clips, bands
@@ -235,6 +263,9 @@ escpod align calls.ubam -r trna.fa -o aligned.bam -t 32
 
 # FASTQ, overlap mode, gap-lenient scores
 escpod align reads.fq.gz -r trna.fa -o aligned.bam --mode semiglobal --scoring 1,-1,-2,-1
+
+# Coordinate-sorted, ready for samtools index
+escpod align calls.ubam -r trna.fa -o aligned.bam --sort coordinate
 
 # Ties as secondary records, at most 5 per read
 escpod align calls.ubam -r trna.fa -o aligned.bam --secondary --max-ties 5
