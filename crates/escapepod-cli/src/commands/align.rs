@@ -40,6 +40,21 @@
 //! the CPU. The GPU thread works on batch *k + 1* while the pool finishes
 //! batch *k*; the channel after it holds two, so memory stays O(`--batch-size`).
 //!
+//! # Long reads
+//!
+//! A tRNA sample's median read is ~130 nt, but real ones carry a few reads of
+//! 50–400 kb. Two things keep them from stalling the pipeline. The aligner
+//! scores any read of `simd::TRANSPOSED_MIN_READ_LEN` or more with its
+//! reference-major kernel, whose state is one reference row per lane group
+//! rather than one read column, so it stays in cache at any read length. And
+//! a read of [`SPLIT_MIN_BASES`] or more — one that [`cut_chunks`] already
+//! gives a chunk of its own — has its panel scored across the pool, one lane
+//! group per rayon task ([`score_across_pool`]), and the row handed to
+//! `Aligner::map_reads_scored` exactly as a GPU row is. Without that, the
+//! chunk holding such a read ran for seconds on one thread while the ordered
+//! writer waited for it and, once the permit window filled, the whole pool
+//! with it. [`ROW_MAJOR_ONLY_ENV`] turns both off, for A/B measurement.
+//!
 //! # Where the per-read work runs
 //!
 //! Everything that scales with a read's tag payload runs inside the rayon
@@ -102,6 +117,7 @@ use escapepod_align::{
     Aligner, Backend, CigarOp, Hit, MapOptions, Mode, Panel, ReadMapping, ScoreMatrix, Scoring,
     sam as align_sam,
 };
+use rayon::prelude::*;
 
 use crate::progress::create_spinner;
 use crate::style;
@@ -702,7 +718,16 @@ struct Job<'a> {
     in_header: &'a sam::Header,
     out_header: &'a sam::Header,
     secondary: bool,
+    /// Score a read of [`SPLIT_MIN_BASES`] or more across the pool.
+    split_long: bool,
+    /// Read strands scored that way, for `-v`.
+    split_strands: AtomicU64,
 }
+
+/// `=1` puts every read back on the row-major score kernel and on one
+/// thread per chunk — `escpod align` as it was before the long-read path
+/// (#415). An A/B lever: the output is the same either way.
+const ROW_MAJOR_ONLY_ENV: &str = "ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY";
 
 /// Reads per unit of rayon work. The winners of a chunk's reads are traced
 /// together, so this is also how full the traceback kernels' lanes get.
@@ -710,6 +735,10 @@ const CHUNK: usize = 64;
 
 /// Bases per unit of rayon work, so one very long read makes its own chunk.
 const CHUNK_BASES: usize = 64 * 256;
+
+/// A read at least this long is always a chunk of its own (see
+/// [`cut_chunks`]), and has its panel scored across the pool.
+const SPLIT_MIN_BASES: usize = CHUNK_BASES;
 
 /// Each read's output records, BAM-encoded, and how it went.
 type Encoded = Vec<(Vec<u8>, Outcome)>;
@@ -749,12 +778,41 @@ fn process_chunk(
         })
         .collect::<anyhow::Result<Vec<RecordBuf>>>()?;
     let seqs: Vec<&[u8]> = records.iter().map(|r| r.sequence().as_ref()).collect();
-    let mappings = match &scores {
-        Some((batch, first)) => ctx
-            .aligner
-            .map_reads_scored(&seqs, &ctx.opts, |k, reverse| batch.row(first + k, reverse)),
-        None => ctx.aligner.map_reads(&seqs, &ctx.opts),
+    let gpu_row = |k: usize, reverse: bool| {
+        scores
+            .as_ref()
+            .and_then(|(batch, first)| batch.row(first + k, reverse))
     };
+    // A long read's strands the GPU did not score, scored here across the
+    // pool: [forward, reverse] per read.
+    let pooled: Vec<[Option<Vec<i16>>; 2]> = seqs
+        .iter()
+        .enumerate()
+        .map(|(k, seq)| {
+            if !ctx.split_long || seq.len() < SPLIT_MIN_BASES {
+                return [None, None];
+            }
+            let fwd = escapepod_align::alphabet::encode(seq);
+            let mut out = [None, None];
+            if gpu_row(k, false).is_none() {
+                out[0] = score_across_pool(ctx.aligner, &fwd);
+            }
+            if ctx.opts.both_strands && gpu_row(k, true).is_none() {
+                let rev = escapepod_align::alphabet::reverse_complement_codes(&fwd);
+                out[1] = score_across_pool(ctx.aligner, &rev);
+            }
+            let n = out.iter().filter(|r| r.is_some()).count() as u64;
+            ctx.split_strands.fetch_add(n, Ordering::Relaxed);
+            out
+        })
+        .collect();
+    let mappings = ctx
+        .aligner
+        .map_reads_scored(&seqs, &ctx.opts, |k, reverse| {
+            pooled[k][usize::from(reverse)]
+                .as_deref()
+                .or_else(|| gpu_row(k, reverse))
+        });
     records
         .into_iter()
         .zip(&mappings)
@@ -767,6 +825,30 @@ fn process_chunk(
             Ok((w.into_inner(), outcome))
         })
         .collect()
+}
+
+/// One read strand's panel scores (codes in), computed one lane group per
+/// rayon task — the row `Aligner::score_all` would give, as `i16` for
+/// `map_reads_scored`. `None` outside the `i16` bound, where the aligner's
+/// own scalar fallback must score it.
+fn score_across_pool(aligner: &Aligner, codes: &[u8]) -> Option<Vec<i16>> {
+    let panel = aligner.panel();
+    if !escapepod_align::simd::fits_i16(codes.len(), panel.max_len(), aligner.scoring()) {
+        return None;
+    }
+    let units: Vec<Vec<(usize, i32)>> = (0..aligner.score_groups(codes.len()))
+        .into_par_iter()
+        .map(|g| {
+            let mut unit = Vec::new();
+            aligner.score_group(codes, g, &mut unit);
+            unit
+        })
+        .collect();
+    let mut row = vec![0i16; panel.len()];
+    for (r, s) in units.into_iter().flatten() {
+        row[r] = i16::try_from(s).expect("fits_i16 bounds every score");
+    }
+    Some(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +922,15 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             escapepod_align::simd::BACKEND_ENV
         );
     }
-    let aligner = Aligner::new(panel, args.scoring, args.mode)?;
+    let row_major_only = escapepod_signal::pod5::env::flag(ROW_MAJOR_ONLY_ENV);
+    let mut aligner = Aligner::new(panel, args.scoring, args.mode)?;
+    if row_major_only {
+        aligner = aligner.with_transposed_min_len(None);
+        info!(
+            "{ROW_MAJOR_ONLY_ENV} is set: every read on the row-major kernel, long reads on \
+             one thread each"
+        );
+    }
     info!(
         "{} mode, scoring {} (match,mismatch,gap_open,gap_extend), {} strand{}, kernel {} ({} lanes)",
         args.mode.name(),
@@ -957,6 +1047,8 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         in_header: &in_header,
         out_header: &out_header,
         secondary: args.secondary,
+        split_long: !row_major_only,
+        split_strands: AtomicU64::new(0),
     };
     let busy = dispatch(&ctx, batches, res_tx, permit_rx);
     // Join every thread before deciding which error to report: a failed stage
@@ -993,10 +1085,13 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let summary = write_result.with_context(|| format!("writing {}", args.output.display()))?;
     let counts = read_result.with_context(|| format!("reading {}", args.reads.display()))?;
     debug!(
-        "workers were busy {:.1} s of {:.1} s x {} threads",
+        "workers were busy {:.1} s of {:.1} s x {} threads; {} read strands of {}+ nt \
+         scored across the pool",
         busy.as_secs_f64(),
         started.elapsed().as_secs_f64(),
-        threads
+        threads,
+        ctx.split_strands.load(Ordering::Relaxed),
+        SPLIT_MIN_BASES,
     );
 
     // --- Summary -----------------------------------------------------------

@@ -666,3 +666,89 @@ fn output_to_stdout() {
     let header = r.read_header().unwrap();
     assert_eq!(r.record_bufs(&header).count(), 60);
 }
+
+/// Reads far longer than the panel take the reference-major score kernel and
+/// have their panel scored across the pool; the scalar backend takes neither
+/// path. The fixture reads plus two synthetic long ones (a fixture read —
+/// adapter and tRNA — followed by random sequence, ~40 kb and ~20 kb, in one
+/// batch) must come out record for record the same either way, over flag
+/// sets that change what is scored, with enough threads for the split to be
+/// real.
+#[test]
+fn long_read_alignment_matches_scalar_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, input) = read_bam(&input_bam());
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut random = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x % 4) as usize] as char
+            })
+            .collect()
+    };
+    let mut text = String::new();
+    for (k, r) in input.iter().enumerate() {
+        let seq = String::from_utf8(r.sequence().as_ref().to_vec()).unwrap();
+        text.push_str(&format!(">{}\n{seq}\n", name(r)));
+        if k == 10 || k == 11 {
+            let tail = if k == 10 { 40_000 } else { 20_000 };
+            text.push_str(&format!(">long_{k}\n{seq}{}\n", random(tail)));
+        }
+    }
+    let fa = dir.path().join("reads.fa");
+    std::fs::write(&fa, &text).unwrap();
+    let reference = fixtures().join("trna_reference.fa");
+    let run = |backend: Option<&str>, out: &Path, extra: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_escpod"));
+        c.args(["-v", "align"])
+            .arg(&fa)
+            .arg("-r")
+            .arg(&reference)
+            .arg("-o")
+            .arg(out)
+            .args(["-t", "4"])
+            .args(extra)
+            .env_remove("ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY");
+        match backend {
+            Some(b) => c.env("ESCAPEPOD_ALIGN_BACKEND", b),
+            None => c.env_remove("ESCAPEPOD_ALIGN_BACKEND"),
+        };
+        let o = c.output().unwrap();
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "{stderr}");
+        stderr
+    };
+    let flag_sets: [&[&str]; 2] = [&[], &["--strand", "both", "--mode", "semiglobal"]];
+    for (k, extra) in flag_sets.iter().enumerate() {
+        let (fast, oracle) = (
+            dir.path().join(format!("default{k}.bam")),
+            dir.path().join(format!("scalar{k}.bam")),
+        );
+        let stderr = run(None, &fast, extra);
+        let strands = if extra.contains(&"both") { 4 } else { 2 };
+        assert!(
+            stderr.contains(&format!("{strands} read strands of")),
+            "the long reads were not scored across the pool:\n{stderr}"
+        );
+        run(Some("scalar"), &oracle, extra);
+        let (_, got) = read_bam(&fast);
+        let (_, want) = read_bam(&oracle);
+        assert_eq!(got.len(), input.len() + 2, "flags {extra:?}");
+        assert_eq!(got.len(), want.len(), "flags {extra:?}");
+        for (a, b) in got.iter().zip(&want) {
+            assert_eq!(a, b, "flags {extra:?}, read {}", name(a));
+        }
+        let long: Vec<&RecordBuf> = got
+            .iter()
+            .filter(|r| name(r).starts_with("long_"))
+            .collect();
+        assert_eq!(long.len(), 2);
+        assert!(
+            long.iter().all(|r| !r.flags().is_unmapped()),
+            "flags {extra:?}"
+        );
+    }
+}
