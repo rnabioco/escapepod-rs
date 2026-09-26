@@ -167,6 +167,28 @@ implementation, which is itself tested against parasail.
 `ESCAPEPOD_ALIGN_BACKEND=scalar|avx2|avx512` caps the kernel choice, for A/B
 measurements; the run's second log line names the kernel in use.
 
+### Long reads
+
+A tRNA sample's median read is ~130 nt, but a real one carries a handful of
+reads of 50–400 kb, and each costs as much as thousands of ordinary reads.
+Two things keep them from holding up the run:
+
+- Reads of 1,024 nt or more are scored by a second layout of the same SIMD
+  kernel, which walks the read row by row across the references instead of
+  reference column by column down the read. Its working set is one row of
+  the panel, so it stays in cache at any read length, where the default
+  layout's grows with the read — 2.3× faster on a 395 kb read, and never
+  slower from ~1 kb up. Below 1,024 nt nothing changes.
+- A read of 16 kb or more (which already gets a unit of work of its own) has
+  its panel scored across all threads, one group of references per thread,
+  instead of on one — so the output writer, which must emit records in input
+  order, is not left waiting on it.
+
+Both give the same scores as before, so the output is identical. With
+`--device gpu`, reads over 4,096 nt are left to the CPU and take the same
+path. `ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY=1` turns both off — every read on the
+original layout and one thread per unit of work — for A/B measurements only.
+
 ### Performance
 
 A 3.3 M-read dorado uBAM against the 164-reference sacCer3 dual-adapter panel
