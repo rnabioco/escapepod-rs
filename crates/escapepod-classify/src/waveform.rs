@@ -684,6 +684,16 @@ pub fn classify_reads_gpu(
         escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_PREP_CHUNK")
             .unwrap_or(batch.saturating_mul(8).max(4096));
 
+    // One GPU group in every `parity_every` is re-scored on the CPU and
+    // compared (`waveform_net_gpu::check_parity`); group 0 always is. At the
+    // default batch of 128 that is ~0.85 s of one core's CPU scoring per
+    // 8,192 reads — about 1.5% of the CPU path's own cost — for a check that
+    // would have caught #416 on its first batch, and #343-style intermittent
+    // faults within the next 64.
+    let parity_every: usize =
+        escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_PARITY_EVERY")
+            .unwrap_or(64);
+
     type Group<'r> = Vec<(&'r WaveformRead, Chunk)>;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Group>(groups_in_flight);
 
@@ -696,9 +706,31 @@ pub fn classify_reads_gpu(
         // group's CPU prep instead of blocking it.
         let gpu_handle = scope.spawn(move || -> Result<Vec<ReadCall>> {
             let mut out = Vec::new();
+            let mut n_group = 0usize;
             while let Ok(group) = rx.recv() {
                 let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
                 let logits = gpu.logits(&refs, spec)?;
+                // The GPU's answers are checked against the CPU's on real
+                // reads before any of them is kept (#416): the first group
+                // always, then one in every `parity_every`. A disagreement
+                // ends the GPU run with `GpuRefused` — the caller decides
+                // whether that means a CPU rerun or an error.
+                if n_group.is_multiple_of(parity_every) {
+                    let cpu: Vec<f64> = refs
+                        .par_iter()
+                        .map(|c| cpu_fallback.logit(c, spec))
+                        .collect::<Result<_>>()?;
+                    let worst = crate::waveform_net_gpu::check_parity(
+                        &logits,
+                        &cpu,
+                        &format!("GPU/CPU parity check on real batch {n_group}"),
+                    )?;
+                    tracing::debug!(
+                        "GPU/CPU parity on batch {n_group}: max |dP| = {worst:.2e} over {} reads",
+                        refs.len()
+                    );
+                }
+                n_group += 1;
                 for ((read, _), logit) in group.iter().zip(logits) {
                     out.push(call_from_logit(read, spec, logit));
                 }

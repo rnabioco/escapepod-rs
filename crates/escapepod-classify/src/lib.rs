@@ -53,6 +53,9 @@
 pub mod anchor;
 pub mod bam_tags;
 pub mod bundle;
+/// cuBLAS/cuBLASLt pairing check run before the graph goes onto CUDA (#416).
+#[cfg(feature = "cuda")]
+pub mod cuda_libs;
 pub mod features;
 #[cfg(feature = "fnn-onnx")]
 pub mod fnn;

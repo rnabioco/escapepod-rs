@@ -313,6 +313,13 @@ impl WaveformNetGpu {
                 )
             })?;
 
+        // Before tract-cuda creates its cuBLAS handle: a cuBLAS paired with
+        // another release's cuBLASLt returns wrong GEMMs without an error
+        // (#416). Repaired when the sibling library is there, refused when not.
+        let pairing = crate::cuda_libs::ensure_cublas_pairing()
+            .map_err(|e| GpuRefused(format!("cuBLAS/cuBLASLt pairing: {e}")))?;
+        tracing::debug!("waveform GPU scorer: {pairing}");
+
         tract_cuda::CudaTransform
             .transform(&mut typed)
             .map_err(|e| {
@@ -416,6 +423,73 @@ impl WaveformNetGpu {
     }
 }
 
+/// The GPU path was refused for a reason that says nothing about the reads:
+/// a library pairing that cannot be trusted, or a batch of real reads on
+/// which the GPU and the CPU scorer disagree. A caller that was only
+/// *allowed* to use the GPU (`--device auto`) falls back to the CPU on this;
+/// one that demanded it (`--device gpu`) stops. Never a silent GPU run.
+#[derive(Debug, Clone)]
+pub struct GpuRefused(pub String);
+
+impl std::fmt::Display for GpuRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the GPU charging scorer was refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for GpuRefused {}
+
+/// Largest `|P_gpu - P_cpu|` a checked batch may show. A healthy A30 run over
+/// 20k real reads peaks at 1.31e-4 (`cl` identical on 99.98% of reads, no
+/// call flipped at the operating point); #416's broken pairing peaked at 0.91
+/// and #343's batch-1 fault at a logit error of 0.45. 1e-3 keeps ~8x headroom
+/// over the healthy floor and is the threshold `examples/diag_343.rs` reports
+/// divergence at.
+pub const GPU_PARITY_TOLERANCE: f64 = 1e-3;
+
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Compare one batch's GPU logits against the CPU scorer's on the same
+/// chunks, in probability space (`|Δp|` is the same for either class, so
+/// `positive_class` does not enter). Returns the largest `|Δp|` when it is
+/// within [`GPU_PARITY_TOLERANCE`], and a [`GpuRefused`] naming it when not.
+pub fn check_parity(gpu: &[f64], cpu: &[f64], what: &str) -> Result<f64, GpuRefused> {
+    if gpu.len() != cpu.len() || gpu.is_empty() {
+        return Err(GpuRefused(format!(
+            "{what}: {} GPU logits against {} CPU logits",
+            gpu.len(),
+            cpu.len()
+        )));
+    }
+    let mut worst = 0.0f64;
+    let mut n_over = 0usize;
+    for (&g, &c) in gpu.iter().zip(cpu) {
+        let d = (sigmoid(g) - sigmoid(c)).abs();
+        // A NaN on either side is a disagreement, not a pass.
+        if d.is_nan() || d > GPU_PARITY_TOLERANCE {
+            n_over += 1;
+        }
+        if d.is_nan() {
+            worst = f64::INFINITY;
+        } else {
+            worst = worst.max(d);
+        }
+    }
+    if n_over > 0 {
+        return Err(GpuRefused(format!(
+            "{what}: {n_over} of {} reads disagree with the CPU scorer by more than \
+             {GPU_PARITY_TOLERANCE} in P(charged) (worst {worst:.3}). The GPU's answers \
+             for this run cannot be trusted; rerun with `--device cpu`, and see \
+             rnabioco/escapepod-rs#416 for the known cause (a cuBLAS/cuBLASLt pair from \
+             two different CUDA releases)",
+            gpu.len()
+        )));
+    }
+    Ok(worst)
+}
+
 fn prod(shape: [usize; 2]) -> usize {
     shape[0] * shape[1]
 }
@@ -444,6 +518,30 @@ mod tests {
     fn refuses_batch_sizes_below_two() {
         assert!(validate_batch(0).is_err());
         assert!(validate_batch(1).is_err());
+    }
+
+    #[test]
+    fn parity_passes_inside_tolerance() {
+        let cpu = [-2.0, 0.0, 1.5, 4.0];
+        let gpu: Vec<f64> = cpu.iter().map(|x| x + 1e-4).collect();
+        let worst = super::check_parity(&gpu, &cpu, "t").unwrap();
+        assert!(worst < super::GPU_PARITY_TOLERANCE, "{worst}");
+    }
+
+    #[test]
+    fn parity_refuses_a_divergent_batch() {
+        // #416's shape: logits unrelated to the CPU's.
+        let cpu = [-2.6, -2.6, -2.7, 3.0];
+        let gpu = [0.6, 0.5, -2.7, 3.0];
+        let err = super::check_parity(&gpu, &cpu, "t").unwrap_err();
+        assert!(err.0.contains("2 of 4"), "{err}");
+    }
+
+    #[test]
+    fn parity_refuses_nan_and_length_mismatch() {
+        assert!(super::check_parity(&[f64::NAN], &[0.0], "t").is_err());
+        assert!(super::check_parity(&[0.0, 0.0], &[0.0], "t").is_err());
+        assert!(super::check_parity(&[], &[], "t").is_err());
     }
 
     #[test]
