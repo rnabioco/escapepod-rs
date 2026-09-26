@@ -57,7 +57,6 @@ pixi run -e dev cargo nextest run -p escapepod-cli && pixi run cargo test --doc 
 - `merge.rs:47–152`: re-implements `PhaseTimer`. `filter.rs:213`/`bam_filter.rs:98`: same callback boilerplate.
 - `subset.rs:127–264`, `view.rs:141–229`: tests of `escapepod_pod5` fns already tested there.
 - `lib.rs` docs stale (no `classify`, `version = "0.5"`); `profile.rs:12` links nonexistent `PhaseTimer::finish`.
-- Scheduled removal, next minor: `escpod signal classify` (`commands/signal.rs`, 0.19.0); `--gpu` (`device.rs:93`); `--svm-model` (`commands/demux/classify.rs:160`) once `benchmarks/benchmark_demux.sh:194` and `benchmarks/README.md:894` are updated.
 
 ## Do not
 - Size a rayon pool in a command — `threads::init` is the only builder.

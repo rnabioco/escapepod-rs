@@ -532,6 +532,34 @@ fn read_ids_select_reads() {
     assert_eq!(got, wanted);
 }
 
+/// A dashless ID list — the compact 32-hex-char form `escpod filter` also
+/// accepts via `parse_uuid_flexible` — selects the same reads as the dashed
+/// one (rnabioco/escapepod-rs#409: `align.rs` used to match raw bytes, so a
+/// dashless list silently selected nothing).
+#[test]
+fn read_ids_dashless_selects_same_reads_as_dashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, input) = read_bam(&input_bam());
+    let wanted: Vec<String> = input.iter().step_by(7).map(name).collect();
+    assert!(!wanted.is_empty());
+    let dashless: Vec<String> = wanted.iter().map(|n| n.replace('-', "")).collect();
+    let ids = dir.path().join("ids_dashless.txt");
+    std::fs::write(&ids, dashless.join("\n") + "\n").unwrap();
+    let out = dir.path().join("out.bam");
+    align(
+        &input_bam(),
+        &fixtures().join("trna_reference.fa"),
+        &out,
+        &["--read-ids", ids.to_str().unwrap()],
+    );
+    let (_, recs) = read_bam(&out);
+    let got: Vec<String> = recs.iter().map(name).collect();
+    assert_eq!(
+        got, wanted,
+        "dashless --read-ids should select the same reads as the dashed form"
+    );
+}
+
 /// `--device gpu` is a requirement: a build without the `gpu` feature, or a
 /// host without a CUDA device, refuses it by name rather than running on the
 /// CPU. The only way it can succeed is a `gpu` build on a GPU host.

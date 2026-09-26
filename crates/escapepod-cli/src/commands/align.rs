@@ -70,6 +70,7 @@
 
 use anyhow::{Context, bail};
 use clap::Args;
+use escapepod_signal::parse_uuid_flexible;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::File;
@@ -427,6 +428,19 @@ fn load_reference(path: &Path) -> anyhow::Result<Panel> {
     Panel::new(refs).with_context(|| format!("reading reference {}", path.display()))
 }
 
+/// Canonicalise a read name for `--read-ids` matching, the way `escpod
+/// filter`'s ID list does: a name that parses as a UUID — dashed or the
+/// dashless 32-hex-char form `parse_uuid_flexible` also accepts — compares by
+/// its canonical dashed lowercase string, so either spelling names the same
+/// read. A name that is not a UUID (a FASTQ read name) compares as raw bytes.
+fn canonical_read_name(name: &[u8]) -> Vec<u8> {
+    std::str::from_utf8(name)
+        .ok()
+        .and_then(|s| parse_uuid_flexible(s).ok())
+        .map(|uuid| uuid.to_string().into_bytes())
+        .unwrap_or_else(|| name.to_vec())
+}
+
 fn load_read_ids(path: &Path) -> anyhow::Result<HashSet<Vec<u8>>> {
     let text = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let ids: HashSet<Vec<u8>> = text
@@ -434,10 +448,8 @@ fn load_read_ids(path: &Path) -> anyhow::Result<HashSet<Vec<u8>>> {
         .filter_map(|l| {
             let l = l.trim_ascii();
             (!l.is_empty() && !l.starts_with(b"#")).then(|| {
-                l.split(|b| b.is_ascii_whitespace())
-                    .next()
-                    .unwrap()
-                    .to_vec()
+                let name = l.split(|b| b.is_ascii_whitespace()).next().unwrap();
+                canonical_read_name(name)
             })
         })
         .collect();
@@ -459,7 +471,7 @@ fn read_batches(
     let keep = |name: Option<&[u8]>, counts: &mut ReadCounts| match &wanted {
         None => true,
         Some(w) => {
-            let ok = name.is_some_and(|n| w.contains(n));
+            let ok = name.is_some_and(|n| w.contains(&canonical_read_name(n)));
             if !ok {
                 counts.filtered += 1;
             }

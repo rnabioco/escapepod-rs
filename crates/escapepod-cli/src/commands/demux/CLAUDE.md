@@ -63,7 +63,6 @@
 - `sha256_hex` ×3 (run:4357, models:670, resquiggle_models:277).
 - run.rs:1422 "Only CRF bundles" bail unreachable after :1123.
 - run.rs:443 `detect_with` `CnnGpu` arm unreachable.
-- `--svm-model` alias (classify.rs:66) removed next minor; update `benchmarks/benchmark_demux.sh:194`, `benchmarks/README.md:894` first.
 
 ## Do not
 

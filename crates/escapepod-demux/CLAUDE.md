@@ -57,11 +57,8 @@ Wrap in `srun -p rna -c 32 --mem=32G pixi run …` (root "Build baseline and SLU
 CRF levers: `crf/CLAUDE.md`.
 
 ## Known debt
-- Shared ONNX toolkit (proto helpers, `LstmNode::parse`, `load_pinned` tract chain, zero-input probe, `ort_ep::cuda_session`) → one module beside `onnx_rewrite` (working name `onnx_graph`), not a crate.
-- ort session builder ×2: `adapter_cnn_gpu.rs:122-158`, `crf/encoder_gpu.rs:303-316`.
 - tract load chain ×8: `adapter_cnn.rs:207`, `crf/encoder.rs:760`, `encoder_native.rs:1192,1862`, classify `fnn.rs:107`, `fnn_lstm.rs:1001`, `waveform_net.rs:213`, `waveform_net_gpu.rs:242`.
 - Shape probes re-implement the forward pass: `adapter_cnn.rs:237`/`:279`; `adapter_cnn_gpu.rs:270`/`:298`.
-- `train.rs:286-400` binary/multiclass `dual_coef` split nothing reads, and no-op `--c`: to be removed.
 - `sv_class` ×2 (`svm/predictor.rs:94`, `svm/gpu.rs:298`); kernel-weighted pair loop ×2 (`predictor.rs:219`, `:313`); `ovo_votes` dead (`:345`).
 - `model.rs` validator copies (`186`/`493`, `268`/`521`); `svm/gpu.rs` gates per item, not `mod gpu`.
 

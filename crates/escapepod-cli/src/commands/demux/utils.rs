@@ -3,7 +3,7 @@
 use escapepod_demux::{BarcodeFingerprint, ReadBoundaries};
 use escapepod_signal::dtw::NormMethod;
 use escapepod_signal::{CompressedSignalChunk, ReadData, Reader, ReadsBatchView};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -108,7 +108,7 @@ pub fn parse_boundaries_csv(path: &Path) -> anyhow::Result<HashMap<Uuid, ReadBou
 fn open_csv_reader(path: &Path) -> anyhow::Result<Box<dyn BufRead>> {
     let file = File::open(path)?;
     if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        let decoder = GzDecoder::new(file);
+        let decoder = MultiGzDecoder::new(file);
         Ok(Box::new(BufReader::new(decoder)))
     } else {
         Ok(Box::new(BufReader::new(file)))
@@ -443,6 +443,44 @@ mod tests {
 
         let result = parse_boundaries_csv(temp_file.path()).unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    /// A `.gz` boundaries CSV is not necessarily a single gzip member — a
+    /// bgzipped or concatenated file is several. `GzDecoder` stops after the
+    /// first, silently truncating the file; `MultiGzDecoder` reads every
+    /// member (rnabioco/escapepod-rs#409).
+    #[test]
+    fn test_parse_boundaries_csv_reads_every_gzip_member() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundaries.csv.gz");
+
+        let mut bytes = Vec::new();
+        let mut enc = GzEncoder::new(&mut bytes, Compression::default());
+        enc.write_all(b"read_id,num_samples,adapter_start,adapter_end\n")
+            .unwrap();
+        enc.write_all(b"a1b2c3d4-e5f6-7890-abcd-ef1234567890,1000,100,500\n")
+            .unwrap();
+        enc.finish().unwrap();
+        let mut enc = GzEncoder::new(&mut bytes, Compression::default());
+        enc.write_all(b"b2c3d4e5-f6a7-8901-bcde-f12345678901,2000,200,600\n")
+            .unwrap();
+        enc.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result =
+            parse_boundaries_csv(&path).expect("both gzip members should be read as one file");
+        assert_eq!(result.len(), 2, "second gzip member was not read");
+
+        let uuid2 = Uuid::parse_str("b2c3d4e5-f6a7-8901-bcde-f12345678901").unwrap();
+        let b2 = result
+            .get(&uuid2)
+            .expect("read from the second gzip member");
+        assert_eq!(b2.num_samples, 2000);
+        assert_eq!(b2.adapter_start, 200);
+        assert_eq!(b2.adapter_end, 600);
     }
 
     #[test]
