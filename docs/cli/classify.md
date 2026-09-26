@@ -251,6 +251,36 @@ on its default library path — see the warning below.
     `LD_LIBRARY_PATH` itself, the same way it already would for the CNN/CRF
     onnxruntime stages.
 
+!!! warning "rnabioco/escapepod-rs#416: wrong probabilities, no error, on some nodes"
+    The same unversioned-name-first lookup, applied to cuBLAS. A CUDA runtime
+    environment (the pixi `gpu` env, or a pipeline's) ships `libcublas.so.12`
+    but not the unversioned `libcublas.so`, which is a `-dev` file — so
+    cudarc's first candidate is answered by the node's `ldconfig` cache. On a
+    node with a host toolkit registered there (compgpu03: CUDA 12.8), that
+    host cuBLAS is loaded, and *its* `NEEDED libcublasLt.so.12` is then
+    answered by `LD_LIBRARY_PATH` — the environment's 12.9. cuBLAS 12.8 over
+    cuBLASLt 12.9 runs without complaint and returns wrong GEMMs: the TCN's
+    GPU output correlated 0.009 with the CPU's on 20k reads (13.1% called
+    charged against 1.5%). Either consistent pair, 12.8/12.8 or 12.9/12.9,
+    is exact. A node with no second toolkit in the cache never mixes them,
+    which is why it looked like a property of the node.
+
+    Two guards now stand in front of that:
+
+    - **Before the graph goes onto CUDA**, escpod opens cuBLAS the way cudarc
+      will and compares the release of the cuBLAS and cuBLASLt files actually
+      loaded. On a mismatch it reloads cuBLAS against the cuBLASLt shipped
+      beside it and says so in a warning; if that is not possible, the GPU is
+      refused.
+    - **On real reads**, the first GPU batch of every run, then one batch in
+      every 64 (`ESCAPEPOD_WAVEFORM_GPU_PARITY_EVERY`), is also scored on the
+      CPU; any read differing by more than 1e-3 in P(charged) refuses the GPU.
+      A healthy run sits around 1e-5.
+
+    A refused GPU is an error under `--device gpu` and a warning plus a
+    whole-run CPU fallback under `--device auto` — never a GPU run whose
+    answers were not checked.
+
 ## Notes
 
 - A bundle's `abstain` rule is carried and **warned about, not applied** — if

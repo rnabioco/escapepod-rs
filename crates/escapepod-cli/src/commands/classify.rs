@@ -41,6 +41,7 @@ use escapepod_classify::{
     junction_positions, resolve_orientation, scan_bam, waveform,
 };
 
+use crate::device::Device;
 use crate::progress::create_spinner;
 use crate::style;
 use crate::util::resolve_pod5_inputs;
@@ -162,6 +163,7 @@ fn run_waveform(
     bundle: &ChargingBundle,
     geometry: &HashMap<String, escapepod_classify::RefGeometry>,
     gpu: bool,
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] device: Device,
 ) -> anyhow::Result<(Vec<ReadCall>, ClassifyStats, u64)> {
     if args.orientation != OrientationArg::Auto {
         // Not silently ignored: the flag exists to override a *vote*, and this
@@ -210,8 +212,25 @@ fn run_waveform(
     let (calls, stats) = if gpu {
         #[cfg(feature = "gpu")]
         {
-            let net = bundle.waveform_net_gpu(waveform_gpu_batch())?;
-            waveform::classify_reads_gpu(bundle, &scan.anchored, &pod5, &net)?
+            // Both the load (cuBLAS pairing) and the run (per-batch GPU/CPU
+            // parity on real reads) can refuse the GPU with `GpuRefused`
+            // (#416). `--device gpu` makes that an error; `auto` only allowed
+            // the GPU, so it falls back to the CPU scorer for the whole run.
+            let result = bundle
+                .waveform_net_gpu(waveform_gpu_batch())
+                .and_then(|net| waveform::classify_reads_gpu(bundle, &scan.anchored, &pod5, &net));
+            match result {
+                Ok(v) => v,
+                Err(e)
+                    if device != Device::Gpu
+                        && e.downcast_ref::<escapepod_classify::waveform_net_gpu::GpuRefused>()
+                            .is_some() =>
+                {
+                    warn!("{e:#}; --device {device}: scoring every read on the CPU instead");
+                    waveform::classify_reads(bundle, &scan.anchored, &pod5)?
+                }
+                Err(e) => return Err(e),
+            }
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -436,7 +455,8 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         // real datasets and dozens of synthetic ones. Root cause still
         // unknown; flagged there for anyone who hits it again.
         let placement = crate::device::place_and_report(device, crate::device::Stage::WaveformTcn)?;
-        let (calls, stats, records) = run_waveform(&args, &bundle, &geometry, placement.is_gpu())?;
+        let (calls, stats, records) =
+            run_waveform(&args, &bundle, &geometry, placement.is_gpu(), device)?;
         return finish(&args, &bundle, calls, stats, records);
     }
     crate::device::note_cpu_only(
