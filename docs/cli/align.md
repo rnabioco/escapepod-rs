@@ -45,6 +45,7 @@ reverse-strand record is refused.
 | `--mode <MODE>` | `local` (default) or `semiglobal` — see [Modes](#modes) |
 | `--scoring <M,X,O,E>` | Match, mismatch, gap open, gap extend (default `2,-1,-10,-1`) — see [Scoring](#scoring) |
 | `--min-score <N>` | A read whose best score is below this is written unmapped (default `0`) |
+| `--max-read-len <N>` | A read longer than this (nt) is not aligned at all and is written unmapped (default `1000`; `0` = no limit) — see [Long reads](#long-reads) |
 | `--max-ties <N>` | At most this many tied references besides the primary go into `XA` and `--secondary` (default: all) |
 | `--secondary` | Also write each tied reference as a secondary (0x100) record |
 | `--strand <forward\|both>` | `forward` (default: direct-RNA reads are always sense) or `both` |
@@ -123,9 +124,9 @@ primary. Secondaries carry `SEQ`/`QUAL` as `*` and only `NM`, `MD`, `AS` and
 `RG` (minimap2's convention), so the move table and modification calls are not
 duplicated once per tie.
 
-A read whose *S* is below `--min-score` — or that aligns no base at all — is
-written **unmapped** (flag 4) with its tags intact. Reads are never dropped
-(except by `--read-ids`).
+A read whose *S* is below `--min-score` — or that aligns no base at all, or
+is longer than `--max-read-len` — is written **unmapped** (flag 4) with its
+tags intact. Reads are never dropped (except by `--read-ids`).
 
 `--strand both` also scores the reverse complement of every read. A reverse
 winner gets flag 16 with `SEQ` reverse-complemented and `QUAL` reversed, as
@@ -166,6 +167,39 @@ implementation, which is itself tested against parasail.
 
 `ESCAPEPOD_ALIGN_BACKEND=scalar|avx2|avx512` caps the kernel choice, for A/B
 measurements; the run's second log line names the kernel in use.
+
+### Long reads
+
+A tRNA sample's median read is ~130 nt, but a real one carries a handful of
+reads of 50–400 kb, and each costs as much as thousands of ordinary reads.
+
+**By default they are not aligned at all.** `--max-read-len` (default `1000`)
+sets the longest read that is scored: nothing longer is a tRNA read in any
+practical sense. A longer read is neither scored (on the CPU or the GPU) nor
+traced, but it is still written, in input order, as an unmapped record (flag
+4) with every input tag copied and no `NM`/`MD`/`AS`/`XS`/`XA` — exactly as a
+read below `--min-score` is. The run's last lines say how many were skipped.
+Under `--strand both` neither strand is scored.
+
+`--max-read-len 0` removes the limit and aligns every read. Then two further
+things keep the long ones from holding up the run:
+
+- Reads of 1,024 nt or more are scored by a second layout of the same SIMD
+  kernel, which walks the read row by row across the references instead of
+  reference column by column down the read. Its working set is one row of
+  the panel, so it stays in cache at any read length, where the default
+  layout's grows with the read — 2.3× faster on a 395 kb read, and never
+  slower from ~1 kb up. Below 1,024 nt nothing changes.
+- A read of 16 kb or more (which already gets a unit of work of its own) has
+  its panel scored across all threads, one group of references per thread,
+  instead of on one — so the output writer, which must emit records in input
+  order, is not left waiting on it. With `--max-read-len 0`, input with many
+  reads of 16 kb or more close together can still stall the writer.
+
+Both give the same scores as before, so the output is identical. With
+`--device gpu`, reads over 4,096 nt are left to the CPU and take the same
+path. `ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY=1` turns both off — every read on the
+original layout and one thread per unit of work — for A/B measurements only.
 
 ### Performance
 

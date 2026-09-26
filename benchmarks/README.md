@@ -1,5 +1,164 @@
 # Benchmark Results
 
+## `escpod align`: long reads — reference-major score kernel and panel scoring across the pool (2026-09-26)
+
+A tRNA sample's median read is ~130 nt, but M1 carries 175 reads over
+4,096 nt, 52 over 20 kb and one of 395 kb. The phase-1 score kernel walks the
+reference column by column down the read, keeping `H`/`E` per *read base*: 50
+MB per lane group for the 395 kb read, streamed once per reference column, so
+it is memory-bound on exactly the reads that cost the most, and the chunk
+holding such a read ran for seconds on one thread while the ordered writer —
+and, once the permit window filled, the pool — waited for it (#415). Two
+changes, output byte-identical:
+
+- **A reference-major ("transposed") layout of the same kernel**
+  (`simd::{avx2,avx512}::score_group_transposed`): read row outer, reference
+  column inner, state = one panel row per lane group (~25 KB at 200 nt × 32
+  lanes, any read length). Same recurrence and op count per cell, reading a
+  code-major copy of the profile. `Aligner` uses it for reads of
+  `simd::TRANSPOSED_MIN_READ_LEN` = 1,024 nt or more.
+- **Panel scoring across the pool** for a read of 16 kb or more (the length at
+  which `cut_chunks` already gives it a chunk of its own): one rayon task per
+  lane group through the new `Aligner::score_group`, the row handed to
+  `map_reads_scored` through the `prescored` hook GPU rows use.
+  `ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY=1` turns both off on the same binary.
+
+**The kernel alone** (`crates/escapepod-align/examples/long_read_probe.rs`,
+one thread, rna / Gold 6240R, synthetic 164-reference panel of 138–200 nt,
+27,661 bases, default scoring; cells/s = read length × panel bases):
+
+| read (nt) | avx512 row-major | avx512 transposed | avx2 row-major | avx2 transposed |
+|---:|---:|---:|---:|---:|
+| 130 | 7.29e9 | 7.19e9 | 7.94e9 | 7.98e9 |
+| 500 | 7.19e9 | 7.21e9 | 7.69e9 | 8.00e9 |
+| 1,000 | 7.22e9 | 7.22e9 | 7.07e9 | 7.89e9 |
+| 2,000 | 7.25e9 | 7.30e9 | 7.20e9 | 7.99e9 |
+| 4,000 | 7.27e9 | 7.28e9 | 7.01e9 | 7.90e9 |
+| 16,000 | 5.00e9 | 7.29e9 | 5.82e9 | 7.90e9 |
+| 64,000 | 5.00e9 | 7.29e9 | 4.77e9 | 7.84e9 |
+| 256,000 | 4.33e9 | 7.27e9 | 4.79e9 | 7.84e9 |
+| 400,000 | 3.14e9 | 7.27e9 | 4.64e9 | 7.85e9 |
+
+(local mode; semi-global, where the transposed kernel skips the per-cell
+column max, is 8.6–8.7e9 transposed against 5.1–8.0e9 row-major at every
+length from 130 nt up.) The transposed kernel is flat at its in-cache rate
+at every length; the row-major one falls off once its per-read state leaves
+L2 (between 4 k and 16 k nt at 32 lanes) and reaches 2.3× slower at 400 kb.
+Below ~1 kb the two are within noise on AVX-512 (±1%), and AVX2's transposed
+kernel is 0–4% ahead, so the threshold is 1,024 nt: the first length at which
+the transposed kernel is at least as fast on both ISAs in both modes, well
+above any real tRNA read, so the row-major kernel — measured and tuned for
+those — stays the default for them.
+
+**M1's 395 kb read alone**, real panel (164 references, 24,790 bases):
+
+| | avx512 | avx2 |
+|---|---:|---:|
+| row-major, one thread | 3.15 s | 2.09 s |
+| row-major, one thread per lane group | 1.24 s (6 groups) | 0.84 s (11 groups) |
+| transposed, one thread | 1.37 s | 1.27 s |
+| transposed, one thread per lane group | **0.29 s** | **0.15 s** |
+
+(The 4.9 s quoted for this read in the section below was measured inside a
+full run on a busier node; 3.15 s is the probe's quiet-node number for the
+same kernel.) The split that did not help with the row-major layout — six
+50 MB streams contending for the same memory — is 4.7× with the transposed
+one.
+
+**M1 end to end, CPU arm** — `srun -p rna -c 32 --mem=32G`, `-t 32`, `-v`,
+the base commit (`20fc3a0`) and this change (`ec51e37`) as two `--bin` arms of
+`benchmarks/benchmark_align.sh`, interleaved, both `--features gpu` release
+builds scoring on the CPU (no GPU on rna):
+
+| arm | wall (s) | CPU (s) | MaxRSS (MiB) | workers busy (s of wall × 32) |
+|---|---:|---:|---:|---:|
+| base, avx512 | 19.2 / 19.5 | 479 / 482 | 2,346 / 2,298 | 477 of 611 / 480 of 621 |
+| **new, avx512** | **15.2 / 15.3** | 467 / 470 | 1,772 / 1,783 | 458 of 486 / 460 of 490 |
+| base, avx2 | 17.3 / 17.5 | 506 / 509 | 2,183 / 2,177 | 503 of 550 / 507 of 557 |
+| **new, avx2** | **15.9 / 15.9** | 487 / 489 | 1,543 / 1,552 | 481 of 506 / 483 of 506 |
+
+(`rep 1 / rep 2`.) 58 read strands of 16 kb or more were scored across the
+pool. The pool is now busy 94–95% of the run (78% before): what is left is the
+work itself, not waiting on stragglers. RSS drops ~0.55 GB — the chunks that
+used to pile up behind a long read in the permit window no longer do.
+`--strand both --secondary --mode semiglobal`, avx512, one rep: 34.9 → 26.1 s
+wall, 851 → 820 CPU-s, 116 strands split.
+
+**M1 end to end, GPU arm** — `sbatch -p gpu -A gpu_rbi -c 16 --gres=gpu:1
+--mem=48G` (compgpu03: Xeon Gold 6526Y, one A30), `-t 16`, `-v`, same two
+binaries, `--device cpu` and `--device gpu`, avx512, interleaved. The
+2026-09-25 numbers above were on compgpu01 (Gold 6326), whose CPU side is
+slower — 14.3 s there for the base binary's GPU arm, 11.1 s here — so the
+target, "the run without its long reads", was re-measured on this node with
+`--read-ids` naming M1's 489,743 reads under 20 kb:
+
+| arm | wall (s) | CPU (s) | MaxRSS (MiB) | workers busy (s of wall × 16) |
+|---|---:|---:|---:|---:|
+| base, `--device gpu` | 11.2 / 11.1 | 87 / 87 | 2,596 / 2,603 | 63 of 178 / 64 of 176 |
+| **new, `--device gpu`** | **7.7 / 7.7** | 85 / 84 | 2,029 / 1,935 | 55 of 122 / 56 of 122 |
+| base, `--device gpu`, reads < 20 kb only | 7.6 / 7.4 | 63 / 63 | 1,663 / 1,591 | 45 of 120 / 45 of 118 |
+| new, `--device gpu`, reads < 20 kb only | 7.4 / 7.4 | 63 / 63 | 1,615 / 1,633 | 46 of 118 / 45 of 117 |
+| base, `--device cpu` | 25.1 / 25.0 | 394 / 394 | 1,712 / 1,703 | 395 of 400 / 394 of 398 |
+| new, `--device cpu` | 24.7 / 24.7 | 390 / 390 | 1,262 / 1,268 | 379 of 394 / 380 of 395 |
+
+**The GPU arm lands on its floor**: 7.7 s with every read against 7.4–7.6 s
+without the 52 over 20 kb, so the long-read tail costs ~0.2 s where it cost
+3.6 s; the GPU thread's own time waiting on the device is 6.2 s of that
+(the same in every arm), which is now the bound. `--strand both --secondary
+--mode semiglobal`, `--device gpu`, one rep: 19.0 → 11.8 s. The 16-thread CPU
+arm was already work-bound on this node (the pool 98–99% busy before; one
+long read's seconds are absorbed while 15 threads keep working), so it gains
+only the long reads' cheaper kernel (−1%) and the ~0.45 GB of RSS the backed-up
+chunks held.
+
+**`--max-read-len` (default 1000 nt, added in the same PR).** No read over
+1,000 nt is a tRNA read in practice, so the default now writes them unmapped
+without scoring them (M1: 687 reads, 0.14%). avx512, `-t 32` on rna and
+`--device gpu -t 16` on compgpu01 (Gold 6326 + A30), same binary
+(`876ac45`), default against `--max-read-len 0`, interleaved:
+
+| arm | wall (s) | CPU (s) | MaxRSS (MiB) |
+|---|---:|---:|---:|
+| rna, default (limit 1000) | 13.4 / 13.3 | 418 / 417 | 1,214 / 1,234 |
+| rna, `--max-read-len 0` | 15.1 / 15.1 | 464 / 463 | 1,821 / 1,772 |
+| gpu, default (limit 1000) | 6.5 / 6.6 | 67 / 66 | 1,388 / 1,486 |
+| gpu, `--max-read-len 0` | 7.6 / 7.7 | 99 / 98 | 2,365 / 2,473 |
+
+With the limit, the GPU scores 489,108 of 489,108 queries and nothing falls
+back to the CPU. `--max-read-len 0` output is md5-equal to the numbers
+below (`4bb45893…` at the defaults, `ecd70db3…` at `--strand both
+--secondary --mode semiglobal`). At the default limit no read reaches the
+transposed kernel's 1,024 nt threshold or the 16 kb pool split, so neither
+runs; both stay for `--max-read-len 0` or a limit above 1,024.
+
+**Output.** `samtools view | md5sum` is equal between base and new, and
+between every backend and device arm, at the defaults
+(`4bb45893f63827f603931cf1a5b4ad57`) and at `--strand both --secondary --mode
+semiglobal` (`ecd70db3e34e0f4f78eedfb87d00955c`). In tests:
+`simd::tests::transposed_matches_scalar_random` (every SIMD backend, both
+modes, five schemes including a mismatch of 0 and of +1, a 37-reference
+ragged panel, reads either side of the threshold and 20–56 kb, equal to the
+scalar oracle), `transposed_matches_row_major_on_fixture_reads`,
+`mapper::tests::per_group_scores_equal_score_all`, and
+`align_e2e::long_read_alignment_matches_scalar_backend` (fixture reads plus
+40 kb and 20 kb synthetic reads, `-t 4`, default backend against
+`ESCAPEPOD_ALIGN_BACKEND=scalar`, two flag sets, every record equal).
+
+Reproduce:
+
+```bash
+srun -p rna -c 32 --mem=32G -- cargo run --release -p escapepod-align \
+    --example long_read_probe -- --split
+srun -p rna -c 32 --mem=32G -- cargo run --release -p escapepod-align \
+    --example long_read_probe -- --reference .../sacCer3-mature-tRNAs-dual-adapt-v2.fa \
+    --reads longest_read.fa --split
+srun -p rna -c 32 --mem=32G -- benchmarks/benchmark_align.sh \
+    --reads .../rebasecall/M1/M1.rbc.bam \
+    --reference .../sacCer3-mature-tRNAs-dual-adapt-v2.fa \
+    --backend avx512 --backend avx2 --reps 2 \
+    --bin escpod-base --bin escpod-new --md5 -- -v
+```
+
 ## `escpod align --device gpu`: CUDA panel scoring (2026-09-25)
 
 `escpod align` phase 2 (#401) moves the one stage worth moving — scoring every
@@ -57,7 +216,8 @@ groups on six threads (no faster: its chunk still took 3.4–3.9 s), and a
 larger window (4 batches: 14.3 → 12.6 s for +0.7 GB; 8: 11.5 s for +2 GB — not
 taken). The fix that should work is a row-tiled CPU score kernel for reads far
 longer than the panel, which helps both arms; it is a phase 1 kernel change and
-not part of this one.
+not part of this one. (Done in #415 — see the long-reads section above: this
+arm now runs M1 in 7.7 s against 11.1 s on the same node.)
 
 Reproduce:
 

@@ -257,3 +257,103 @@ unsafe fn pairs_kernel<const LOCAL: bool>(
         _mm256_storeu_si256(ends.end_j.as_mut_ptr() as *mut __m256i, bj);
     }
 }
+
+/// Score `query` against the 16 references of `g` with the reference-major
+/// (transposed) kernel, best score per lane into `best[..16]` (see the AVX-512
+/// `score_group_transposed`; this is the same kernel at half the width, with
+/// blend vectors for masks).
+///
+/// # Safety
+///
+/// The CPU must support AVX2, and `hbuf`/`fbuf` must hold at least
+/// `g.len * 16` elements.
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn score_group_transposed(
+    query: &[u8],
+    g: &Group,
+    gaps: Gaps,
+    mode: Mode,
+    hbuf: &mut [i16],
+    fbuf: &mut [i16],
+    best: &mut [i16; 32],
+) {
+    match mode {
+        // SAFETY: forwarded from this function's contract.
+        Mode::Local => unsafe { transposed::<true>(query, g, gaps, hbuf, fbuf, best) },
+        Mode::SemiGlobal => unsafe { transposed::<false>(query, g, gaps, hbuf, fbuf, best) },
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn transposed<const LOCAL: bool>(
+    query: &[u8],
+    g: &Group,
+    gaps: Gaps,
+    hbuf: &mut [i16],
+    fbuf: &mut [i16],
+    best: &mut [i16; 32],
+) {
+    let l = g.len;
+    assert!(hbuf.len() >= l * W && fbuf.len() >= l * W);
+    assert_eq!(g.lens.len(), W);
+    let tprof = g.tprof();
+    assert!(tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
+    let zero = _mm256_setzero_si256();
+    let neg = _mm256_set1_epi16(i16::MIN);
+    let vo = _mm256_set1_epi16(gaps.open);
+    let ve = _mm256_set1_epi16(gaps.extend);
+    let hp = hbuf.as_mut_ptr() as *mut __m256i;
+    let fp = fbuf.as_mut_ptr() as *mut __m256i;
+    let tp = tprof.as_ptr();
+    let ends = g.ends.as_ptr();
+    // SAFETY: as in the AVX-512 kernel — every offset stays inside buffers
+    // whose sizes are asserted above, and query codes are `< N_CODES`.
+    unsafe {
+        for j in 0..l {
+            _mm256_storeu_si256(hp.add(j), zero);
+            _mm256_storeu_si256(fp.add(j), neg);
+        }
+        let lens = _mm256_loadu_si256(g.lens.as_ptr() as *const __m256i);
+        let mut acc = if LOCAL { zero } else { neg };
+        for &c in query {
+            let row = tp.add(c as usize * l * W);
+            let mut hdiag = zero;
+            let mut hleft = zero;
+            let mut e = neg;
+            for j in 0..l {
+                let s = _mm256_loadu_si256(row.add(j * W) as *const __m256i);
+                let hup = _mm256_loadu_si256(hp.add(j));
+                let f = _mm256_max_epi16(
+                    _mm256_adds_epi16(hup, vo),
+                    _mm256_adds_epi16(_mm256_loadu_si256(fp.add(j)), ve),
+                );
+                _mm256_storeu_si256(fp.add(j), f);
+                e = _mm256_max_epi16(_mm256_adds_epi16(hleft, vo), _mm256_adds_epi16(e, ve));
+                let mut h = _mm256_max_epi16(_mm256_adds_epi16(hdiag, s), e);
+                hdiag = hup;
+                h = _mm256_max_epi16(h, f);
+                if LOCAL {
+                    h = _mm256_max_epi16(h, zero);
+                }
+                _mm256_storeu_si256(hp.add(j), h);
+                hleft = h;
+                if LOCAL {
+                    acc = _mm256_max_epi16(acc, h);
+                } else if *ends.add(j) != 0 {
+                    let last = _mm256_cmpeq_epi16(lens, _mm256_set1_epi16(j as i16 + 1));
+                    acc = _mm256_blendv_epi8(acc, _mm256_max_epi16(acc, h), last);
+                }
+            }
+        }
+        if !LOCAL && !query.is_empty() {
+            for j in 0..l {
+                let valid = _mm256_cmpgt_epi16(lens, _mm256_set1_epi16(j as i16));
+                let h = _mm256_loadu_si256(hp.add(j));
+                acc = _mm256_blendv_epi8(acc, _mm256_max_epi16(acc, h), valid);
+            }
+        }
+        _mm256_storeu_si256(best.as_mut_ptr() as *mut __m256i, acc);
+    }
+}
