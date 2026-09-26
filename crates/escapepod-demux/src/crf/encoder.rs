@@ -769,7 +769,7 @@ impl CrfEncoder {
         // a way back if a bundle's export ever disagrees with the native
         // kernel (its own load-time self-check already refuses such a graph;
         // this is the operator's override besides).
-        let native = if std::env::var_os("ESCAPEPOD_CRF_TRACT").is_some() {
+        let native = if escapepod_signal::pod5::env::flag("ESCAPEPOD_CRF_TRACT") {
             None
         } else {
             encoder_native::Recognized::from_proto(&proto, &meta, &layout)

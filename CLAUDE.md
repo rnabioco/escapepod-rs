@@ -276,6 +276,19 @@ When adding output: use `tracing::info!`/`warn!`/`error!` for diagnostics
 (don't hand-prefix messages with `Warning:`/`Note:` — the formatter prints the
 level); use `println!`→stdout only for the command's actual data product.
 
+### `ESCAPEPOD_*` env switches and knobs
+
+A boolean `ESCAPEPOD_*` switch or a positive-integer `ESCAPEPOD_*` knob goes
+through `escapepod_pod5::env::flag`/`positive_usize`, not a hand-rolled parse:
+`flag` is on for `1|true|yes|on` and off for unset/empty/`0|false|no|off`
+(case-insensitive), anything else warns once and counts as off; `positive_usize`
+is `None` when unset, and also warns once and returns `None` on a value that
+does not parse or is `0`. **Setting one of these to `0`/`false` now turns it
+off** — a hand-rolled `var_os(..).is_some()` check used to treat `=0` as "set",
+hence on, the opposite of every place that documents `=1` to enable something.
+Backend-name caps (`*_BACKEND`) and path variables (`*_CACHE`) are a different
+shape and keep their own parse.
+
 ## Architecture
 
 ### Workspace Structure

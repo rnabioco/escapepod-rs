@@ -462,7 +462,7 @@ fn bench_waveform_scorer(c: &mut Criterion) {
     // this graph, and no speedup would be worth that.
     eprintln!(
         "waveform graph: padding hoist {}; logit on the synthetic chunk = {:?}",
-        if std::env::var_os("ESCAPEPOD_WAVEFORM_HOIST").is_some() {
+        if escapepod_signal::pod5::env::flag("ESCAPEPOD_WAVEFORM_HOIST") {
             "ON (ESCAPEPOD_WAVEFORM_HOIST)"
         } else {
             "off (the default)"

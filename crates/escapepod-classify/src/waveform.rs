@@ -650,11 +650,9 @@ pub fn classify_reads_gpu(
     // memory — is the new default; a shallower single-axis sweep (varying
     // only `prep_chunk`, as the `--threads 4` sweep above did) would have
     // undersold the real optimum by ~35%.
-    let groups_in_flight: usize = std::env::var("ESCAPEPOD_WAVEFORM_GPU_GROUPS_IN_FLIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(64);
+    let groups_in_flight: usize =
+        escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_GROUPS_IN_FLIGHT")
+            .unwrap_or(64);
     // How many reads' worth of prep `rayon` load-balances per synchronous
     // `par_iter` call, independent of `batch` (the GPU's own fixed contract).
     // Tying this 1:1 to `batch` — the first version's choice — was a second
@@ -682,11 +680,9 @@ pub fn classify_reads_gpu(
     // `batch` large enough to exceed it. This never drops the default below
     // what's measured to work, and still scales up sensibly for a larger
     // `batch`.
-    let prep_chunk: usize = std::env::var("ESCAPEPOD_WAVEFORM_GPU_PREP_CHUNK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(batch.saturating_mul(8).max(4096));
+    let prep_chunk: usize =
+        escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_PREP_CHUNK")
+            .unwrap_or(batch.saturating_mul(8).max(4096));
 
     type Group<'r> = Vec<(&'r WaveformRead, Chunk)>;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Group>(groups_in_flight);

@@ -673,19 +673,12 @@ mod tests {
             .collect();
         assert!(reads.len() >= 5, "golden carries too few fixture reads");
         for fasta in ["trna_reference.fa", "trna_reference_ambiguous.fa"] {
-            let text = std::fs::read_to_string(
+            let file = std::fs::File::open(
                 root.join("../escapepod-classify/tests/fixtures")
                     .join(fasta),
             )
             .unwrap();
-            let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
-            for line in text.lines() {
-                if let Some(h) = line.strip_prefix('>') {
-                    refs.push((h.split_whitespace().next().unwrap().to_string(), Vec::new()));
-                } else {
-                    refs.last_mut().unwrap().1.extend(line.trim().bytes());
-                }
-            }
+            let refs = crate::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
             let panel = Panel::new(refs).unwrap();
             assert_eq!(panel.len(), 47);
             for scoring in schemes() {

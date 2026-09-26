@@ -151,7 +151,7 @@ impl Recognized {
             Ok(net) => Some(net),
             Err(why) => {
                 tracing::debug!("CRF encoder is not a recognised native-stack graph: {why}");
-                if std::env::var_os("ESCAPEPOD_CRF_DEBUG_RECOGNIZER").is_some() {
+                if escapepod_signal::pod5::env::flag("ESCAPEPOD_CRF_DEBUG_RECOGNIZER") {
                     eprintln!("CRF encoder is not a recognised native-stack graph: {why}");
                 }
                 None

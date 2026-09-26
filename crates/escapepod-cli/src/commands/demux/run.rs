@@ -2071,10 +2071,7 @@ fn filler_threads() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ESCAPEPOD_DEMUX_FILLERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
+        escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_DEMUX_FILLERS")
             .unwrap_or(DEFAULT_FILLERS)
             .min(32)
     })
@@ -2215,7 +2212,7 @@ fn thread_cpu_ns() -> u64 {
 fn fill_trace() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("ESCAPEPOD_CRF_GPU_TRACE").as_deref() == Ok("1"))
+    *CACHED.get_or_init(|| escapepod_signal::pod5::env::flag("ESCAPEPOD_CRF_GPU_TRACE"))
 }
 
 /// What the reader shards spend decoding, and how long they sit blocked handing
@@ -2975,11 +2972,7 @@ fn crf_gpu_block() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ESCAPEPOD_CRF_GPU_BLOCK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(4096)
+        escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_CRF_GPU_BLOCK").unwrap_or(4096)
     })
 }
 
@@ -3048,10 +3041,7 @@ fn crf_encoder_devices(visible: usize) -> Vec<i32> {
 /// A30 simply exhausted the card and killed the run.
 #[cfg(feature = "gpu")]
 fn crf_gpu_workers(devices: usize) -> usize {
-    std::env::var("ESCAPEPOD_CRF_GPU_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_CRF_GPU_WORKERS")
         .unwrap_or_else(|| (2 * devices).min(8))
         .max(1)
 }
@@ -3140,7 +3130,7 @@ struct GpuTrace {
 #[cfg(feature = "gpu")]
 impl GpuTrace {
     fn enabled() -> bool {
-        std::env::var("ESCAPEPOD_CRF_GPU_TRACE").as_deref() == Ok("1")
+        escapepod_signal::pod5::env::flag("ESCAPEPOD_CRF_GPU_TRACE")
     }
 
     /// Add `t`'s elapsed millis to `field`, but only when tracing is on — the

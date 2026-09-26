@@ -226,3 +226,108 @@ fn classify_bam_header_records_full_model_provenance() {
         "fixture bundle carries no abstain rule; DS must not invent one: {ds}"
     );
 }
+
+/// `escpod classify` now shares `escpod align`'s reference FASTA reader
+/// (rnabioco/escapepod-rs#410), so it accepts a gzipped reference exactly as
+/// `align` does — previously `geometry::read_fasta` called `read_to_string`
+/// directly and failed outright on a `.gz` file. The gzipped run must score
+/// identically to the plain-FASTA run.
+#[test]
+fn classify_accepts_a_gzipped_reference() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let plain_bam = dir.path().join("plain.bam");
+    let plain_tsv = dir.path().join("plain.tsv");
+    run_classifier(&["classify"], &plain_bam, &plain_tsv);
+
+    let reference_gz = dir.path().join("trna_reference.fa.gz");
+    let plain_fasta = std::fs::read(fixtures().join("trna_reference.fa")).unwrap();
+    let mut enc = flate2::write::GzEncoder::new(
+        std::fs::File::create(&reference_gz).unwrap(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(&plain_fasta).unwrap();
+    enc.finish().unwrap();
+
+    let gz_bam = dir.path().join("gz.bam");
+    let gz_tsv = dir.path().join("gz.tsv");
+    let out = Command::new(env!("CARGO_BIN_EXE_escpod"))
+        .arg("classify")
+        .arg(fixtures().join("trna_reads.pod5"))
+        .arg("--bam")
+        .arg(fixtures().join("trna_mappings_padded.bam"))
+        .arg("--reference")
+        .arg(&reference_gz)
+        .arg("--model")
+        .arg(fixtures().join("bundle"))
+        .arg("--output")
+        .arg(&gz_bam)
+        .arg("--tsv")
+        .arg(&gz_tsv)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "escpod classify --reference *.fa.gz failed:\n{stderr}"
+    );
+
+    let plain_calls = std::fs::read_to_string(&plain_tsv).unwrap();
+    let gz_calls = std::fs::read_to_string(&gz_tsv).unwrap();
+    assert_eq!(
+        plain_calls, gz_calls,
+        "a gzipped reference must score identically to the plain one"
+    );
+}
+
+/// A duplicate reference name is refused, exactly as `escpod align` refuses
+/// one — the same shared reader (rnabioco/escapepod-rs#410). Previously
+/// `geometry::read_fasta` built a `HashMap` directly and let the second
+/// record silently win.
+#[test]
+fn classify_refuses_a_duplicate_reference_name() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut fasta = std::fs::read_to_string(fixtures().join("trna_reference.fa")).unwrap();
+    let first_record: String = fasta.lines().take(2).collect::<Vec<_>>().join("\n");
+    let first_name = first_record
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches('>')
+        .to_string();
+    fasta.push('\n');
+    fasta.push_str(&first_record);
+    fasta.push('\n');
+    let dup_reference = dir.path().join("dup_reference.fa");
+    std::fs::write(&dup_reference, &fasta).unwrap();
+
+    let out_bam = dir.path().join("out.bam");
+    let out_tsv = dir.path().join("calls.tsv");
+    let out = Command::new(env!("CARGO_BIN_EXE_escpod"))
+        .arg("classify")
+        .arg(fixtures().join("trna_reads.pod5"))
+        .arg("--bam")
+        .arg(fixtures().join("trna_mappings_padded.bam"))
+        .arg("--reference")
+        .arg(&dup_reference)
+        .arg("--model")
+        .arg(fixtures().join("bundle"))
+        .arg("--output")
+        .arg(&out_bam)
+        .arg("--tsv")
+        .arg(&out_tsv)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "escpod classify should refuse a duplicate reference name"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("duplicate") && stderr.contains(&first_name),
+        "error should name the duplicate record ({first_name:?}): {stderr}"
+    );
+}

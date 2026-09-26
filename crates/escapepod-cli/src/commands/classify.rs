@@ -231,11 +231,7 @@ fn run_waveform(
 /// `waveform::classify_reads_gpu`) and a smaller fixed GPU memory reservation.
 #[cfg(feature = "gpu")]
 fn waveform_gpu_batch() -> usize {
-    std::env::var("ESCAPEPOD_WAVEFORM_GPU_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(128)
+    escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_BATCH").unwrap_or(128)
 }
 
 /// The `@PG` record's `DS` field: the bundle identity that is already

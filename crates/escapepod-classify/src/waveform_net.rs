@@ -212,7 +212,7 @@ impl WaveformNet {
         let mut proto = onnx
             .proto_model_for_path(path)
             .map_err(|e| anyhow!("cannot read the waveform model {}: {e}", path.display()))?;
-        let hoisted = if std::env::var_os("ESCAPEPOD_WAVEFORM_HOIST").is_some() {
+        let hoisted = if escapepod_signal::pod5::env::flag("ESCAPEPOD_WAVEFORM_HOIST") {
             hoist_conv_padding(&mut proto, 1)
         } else {
             0

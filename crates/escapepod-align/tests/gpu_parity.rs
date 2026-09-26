@@ -166,19 +166,12 @@ fn check(
 
 fn fixture_panel(fasta: &str) -> Panel {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(
+    let file = std::fs::File::open(
         root.join("../escapepod-classify/tests/fixtures")
             .join(fasta),
     )
     .unwrap();
-    let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
-    for line in text.lines() {
-        if let Some(h) = line.strip_prefix('>') {
-            refs.push((h.split_whitespace().next().unwrap().to_string(), Vec::new()));
-        } else {
-            refs.last_mut().unwrap().1.extend(line.trim().bytes());
-        }
-    }
+    let refs = escapepod_align::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
     Panel::new(refs).unwrap()
 }
 

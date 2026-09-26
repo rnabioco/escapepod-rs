@@ -251,7 +251,7 @@ impl WaveformNetGpu {
 
         // Off by default — see the module doc's point 2. Deliberately a
         // different env var from the CPU loader's `ESCAPEPOD_WAVEFORM_HOIST`.
-        let hoisted = if std::env::var_os("ESCAPEPOD_WAVEFORM_GPU_HOIST").is_some() {
+        let hoisted = if escapepod_signal::pod5::env::flag("ESCAPEPOD_WAVEFORM_GPU_HOIST") {
             hoist_conv_padding(&mut proto, batch)
         } else {
             0

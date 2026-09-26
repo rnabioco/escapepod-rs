@@ -9,6 +9,8 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// 5' adapter length of the construct (23 nt adapter + literal N). Only used
@@ -60,39 +62,47 @@ pub struct RefGeometry {
     pub right_anchor: Option<usize>,
 }
 
-/// Read a FASTA into `name → uppercase sequence` (name = first word).
+/// Read a FASTA (plain or gzip) into `name → uppercase sequence` (name = the
+/// header's first word).
 ///
 /// Public because a reference-anchored model reads the reference *sequence*,
 /// not only the junction's coordinate: the window is cut over
 /// `reference[alignment_start..alignment_end]`, and the expected k-mer levels
 /// the map is refined against come from those bases. One reader, so the
 /// coordinates and the sequence cannot come from differently-parsed files.
+///
+/// Parsing itself goes through `escapepod_align::fasta::read_fasta` — the one
+/// reference FASTA reader `escpod align` also uses (rnabioco/escapepod-rs#410)
+/// — so a duplicate reference name is refused here exactly as it is there,
+/// where it used to silently let the last one win.
 pub fn reference_sequences(path: &Path) -> Result<HashMap<String, String>> {
     read_fasta(path)
 }
 
+/// Open a FASTA, transparently gunzipping when the file starts with the
+/// gzip magic — `escapepod_align::fasta::read_fasta` is std-only and never
+/// decompresses anything itself (rnabioco/escapepod-rs#410), so each caller
+/// that wants gzip support does this small amount of I/O first.
+fn open_fasta(path: &Path) -> Result<Box<dyn BufRead>> {
+    let mut head = [0u8; 2];
+    let n = File::open(path)
+        .with_context(|| format!("cannot read reference FASTA {}", path.display()))?
+        .read(&mut head)?;
+    let file = File::open(path)?;
+    Ok(if n == 2 && head == [0x1f, 0x8b] {
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    })
+}
+
 fn read_fasta(path: &Path) -> Result<HashMap<String, String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read reference FASTA {}", path.display()))?;
-    let mut seqs = HashMap::new();
-    let mut name: Option<String> = None;
-    let mut parts: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix('>') {
-            if let Some(n) = name.take() {
-                seqs.insert(n, parts.join(""));
-            }
-            name = Some(rest.split_whitespace().next().unwrap_or("").to_string());
-            parts.clear();
-        } else if !line.is_empty() {
-            parts.push(line.to_uppercase());
-        }
-    }
-    if let Some(n) = name {
-        seqs.insert(n, parts.join(""));
-    }
-    Ok(seqs)
+    let records = escapepod_align::fasta::read_fasta(open_fasta(path)?)
+        .with_context(|| format!("reading reference {}", path.display()))?;
+    Ok(records
+        .into_iter()
+        .map(|(name, seq)| (name, String::from_utf8_lossy(&seq).to_uppercase()))
+        .collect())
 }
 
 /// Where the common arm begins, relative to the start of the motif.
