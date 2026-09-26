@@ -184,8 +184,8 @@ class Reader:
     Entering the context manager warms an in-memory read-id index so repeated
     ``reads(selection=...)`` lookups take an O(k) indexed path instead of
     re-scanning the reads table. Skipped for files above
-    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000) -- not a memory
-    guard, but a threshold against paying to build an index for a huge file
+    ``ESCAPEPOD_AUTOINDEX_MAX`` reads (default 5,000,000; ``0`` skips it for
+    every file) -- not a memory guard, but a threshold against paying to build an index for a huge file
     that turns out to only be iterated, never randomly accessed.
     """
 
@@ -208,6 +208,15 @@ class Reader:
     def run_infos(self) -> list[RunInfo]: ...
     @property
     def has_index(self) -> bool: ...
+    @property
+    def index_resident(self) -> bool:
+        """Whether the read-id index is already in memory (never builds one).
+
+        True once the context-manager warm-up (skipped above
+        ``ESCAPEPOD_AUTOINDEX_MAX`` reads; ``0`` skips it always) or a
+        ``reads(selection=...)`` lookup has built or loaded it.
+        """
+        ...
     def read_ids(self) -> list[str]: ...
     def reads(
         self, selection: Optional[list[str]] = None, missing_ok: bool = False

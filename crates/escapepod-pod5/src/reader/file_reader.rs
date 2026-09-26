@@ -179,8 +179,13 @@ fn probe_header_footer(file: &File) -> Result<()> {
 /// `.p5s` sidecar of any size uncapped, so the same file with a sidecar
 /// already holds the same entries in memory. The threshold decides where an
 /// index comes from and how loudly, never whether one exists.
+///
+/// `0` is a meaningful setting — every file is "above" it, so warm-up is
+/// always skipped — which is why this reads through
+/// [`crate::env::usize_allow_zero`] rather than `positive_usize`, which would
+/// reject it and fall back to the default (rnabioco/escapepod-rs#421).
 pub fn autoindex_max() -> usize {
-    crate::env::positive_usize("ESCAPEPOD_AUTOINDEX_MAX").unwrap_or(5_000_000)
+    crate::env::usize_allow_zero("ESCAPEPOD_AUTOINDEX_MAX").unwrap_or(5_000_000)
 }
 
 impl Reader {

@@ -358,6 +358,19 @@ impl PyReader {
         escapepod_signal::pod5::sidecar::sidecar_path(&self.path).exists()
     }
 
+    /// Whether the read-id index is already resident in memory, without
+    /// building one.
+    ///
+    /// True once the index has been built or loaded — by entering the reader
+    /// as a context manager (unless the file is above
+    /// ``ESCAPEPOD_AUTOINDEX_MAX`` reads) or by the first
+    /// ``reads(selection=...)``. Unlike ``has_index`` this looks at memory,
+    /// not disk, and asking never builds one.
+    #[getter]
+    fn index_resident(&self) -> bool {
+        self.inner.read_index_if_built().is_some()
+    }
+
     /// Build and write the .p5s sidecar read index for fast UUID lookups.
     ///
     /// Annotations already in the sidecar are preserved.

@@ -14,7 +14,7 @@
 - `merge.rs` — `merge_files`, copies signal IPC blocks byte-for-byte.
 - `compression/` — `vbz::decompress_signal_prefix` is the one decode path; `svb16/` dispatch only in `encode`/`decode_split`.
 - `footer.rs` `parse_footer`; `schema/` `narrow_channel`; `utils/table_builders` (every output table); `utils/pod5_assembler::write_post_signal_sections`; `flatbuffers_gen/` generated.
-- `env.rs` — `flag`/`positive_usize`, the one parse for every `ESCAPEPOD_*` boolean switch and positive-integer knob workspace-wide (rnabioco/escapepod-rs#410). Lives here, the lowest crate, so every other crate can reach it without a new dependency edge.
+- `env.rs` — `flag`/`positive_usize`/`usize_allow_zero`, the one parse for every `ESCAPEPOD_*` boolean switch and integer knob workspace-wide (rnabioco/escapepod-rs#410; `usize_allow_zero` for knobs where `0` means something, #421). Lives here, the lowest crate, so every other crate can reach it without a new dependency edge.
 
 ## Build, test, bench this crate alone
 Root CLAUDE.md "Build baseline and SLURM builds" for the `srun` form.
@@ -42,7 +42,7 @@ Root CLAUDE.md "Build baseline and SLURM builds" for the `srun` form.
 ## Env levers
 | var | effect | default | pinned |
 |---|---|---|---|
-| `ESCAPEPOD_AUTOINDEX_MAX` | reads above which an in-memory index build warns and `ReaderCache` skips warm-up; never disables indexing, not a memory cap | 5_000_000 | doc only (`escapepod.pyi` says "to bound memory" — wrong) |
+| `ESCAPEPOD_AUTOINDEX_MAX` | reads above which an in-memory index build warns and `ReaderCache` skips warm-up; `0` skips warm-up always (via `env::usize_allow_zero`); never disables indexing, not a memory cap | 5_000_000 | `=0` → `test_autoindex_max`, Python `test_reader_threshold_disables_autobuild` |
 | `ESCAPEPOD_POD5_FOOTER_SERIAL` | `1/true/yes/on` (via `env::flag`) forces the serial batch-header walk | parallel at ≥16 batches | serial≡parallel pinned; lever untested |
 | `POD5_DISABLE_MMAP_OPEN` | any value skips the pre-mmap SIGBUS probe | probe on | untested |
 

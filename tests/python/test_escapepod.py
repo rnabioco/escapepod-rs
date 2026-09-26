@@ -1072,14 +1072,17 @@ class TestDatasetReader:
 class TestContextManagerIndex:
     """Entering a reader as a context manager warms the in-memory read-id
     index so repeated ``reads(selection=...)`` takes the O(k) indexed path
-    (#97). The OnceLock state is not observable from Python, so these assert
-    correctness/parity across the warmed and threshold-disabled (scan) paths
-    rather than the cache itself.
+    (#97). ``Reader.index_resident`` exposes whether the index is built, so
+    these assert both the warm-up (or its skip) and read-id parity.
     """
 
-    def test_reader_selection_warmed(self, single_file):
+    def test_reader_selection_warmed(self, single_file, monkeypatch):
+        monkeypatch.delenv("ESCAPEPOD_AUTOINDEX_MAX", raising=False)
         sel = _IDS_A[:2]
+        assert not escapepod.Reader(str(single_file)).index_resident
         with escapepod.Reader(str(single_file)) as r:
+            # Entering warmed the index before any lookup asked for it.
+            assert r.index_resident
             reads = r.reads(selection=sel)
             # Second call exercises the now-warmed indexed path.
             reads_again = r.reads(selection=sel)
@@ -1088,11 +1091,16 @@ class TestContextManagerIndex:
 
     def test_reader_threshold_disables_autobuild(self, single_file, monkeypatch):
         """ESCAPEPOD_AUTOINDEX_MAX=0 skips the warm-up; selection still returns
-        identical results via the scan path."""
+        identical results, building the index on demand (#421)."""
         monkeypatch.setenv("ESCAPEPOD_AUTOINDEX_MAX", "0")
         sel = _IDS_A[:2]
         with escapepod.Reader(str(single_file)) as r:
+            # The skip itself, not just its results: read ids match either way,
+            # which is how #412 broke this without the test noticing.
+            assert not r.index_resident
             reads = r.reads(selection=sel)
+            # Deferred, never refused: the lookup that demanded it built it.
+            assert r.index_resident
         assert {x.read_id for x in reads} == set(sel)
 
     def test_dataset_selection_warmed(self, dataset_dir):
