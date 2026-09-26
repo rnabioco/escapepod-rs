@@ -11,10 +11,12 @@
 //! range is **≤ ~10 k references of ≤ ~1 kb**; nothing here seeds, so a larger
 //! panel is simply proportionally slower.
 //!
-//! Written clean-room from rnabioco/escapepod-rs#395. The functional model is
+//! Written from rnabioco/escapepod-rs#395. The functional model is
 //! gpu-tRNA-mapper (every read against every reference, ties explicit,
-//! tracebacks for winners only); none of its code or its semi-global
-//! definition is reproduced.
+//! tracebacks for winners only); none of its code is reproduced. Its design
+//! was reviewed for #415 (nothing ported): its semi-global DP is the same
+//! free-end-gap definition as this crate's, and only its SAM encoding of
+//! such alignments differs.
 //!
 //! # Layers
 //!

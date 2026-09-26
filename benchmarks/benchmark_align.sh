@@ -1,8 +1,10 @@
 #!/bin/bash
 # End-to-end `escpod align` benchmark across the kernel backends and devices.
 #
-# Runs the same alignment once per arm — a CPU backend (`ESCAPEPOD_ALIGN_BACKEND`
-# caps the dispatch) crossed with a `--device` — interleaved and repeated, and
+# Runs the same alignment once per arm — a binary (`--bin`, repeatable, so a
+# base build can be measured beside a new one), crossed with a CPU backend
+# (`ESCAPEPOD_ALIGN_BACKEND` caps the dispatch) and a `--device` — interleaved
+# and repeated, and
 # reports wall, CPU, MaxRSS and reads/s per run. The DP's cost is data-independent — reads x references x
 # lengths — so any real sample against any panel measures the right thing.
 #
@@ -10,7 +12,7 @@
 #   benchmarks/benchmark_align.sh --reads FILE --reference FA \
 #       [--backend NAME]... [--device auto|cpu|gpu]... \
 #       [--sort unsorted|coordinate|samtools]... [--reps N] [--threads N] \
-#       [--bin PATH] [--samtools PATH] [-- EXTRA...]
+#       [--bin PATH]... [--samtools PATH] [--md5] [-- EXTRA...]
 #
 # Default backends: avx512 avx2 scalar. Default device: none (the flag is not
 # passed, i.e. `auto`). With `--device cpu --device gpu` every backend runs on
@@ -18,7 +20,13 @@
 # the tracebacks and any read the GPU leaves to the CPU, and the run is checked
 # to have actually placed scoring on the GPU. A GPU arm needs a `gpu` build and
 # a GPU allocation (`srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1`). Arguments
-# after `--` go to escpod align.
+# after `--` go to escpod align (a global flag such as `-v` works there too; its
+# "workers were busy" line is echoed to stderr per run).
+#
+# `--md5` also prints, per run, the md5 of the output's records
+# (`samtools view | md5sum`, header excluded since `@PG CL` names the output
+# path) to stderr, so arms can be checked for identical output in the same
+# call. `samtools` comes from PATH, or from `$SAMTOOLS`, or from `--samtools`.
 #
 # `--sort` adds an output-order axis (default: the flag is not passed):
 # `unsorted` and `coordinate` are `escpod align --sort ...`; `samtools` is the
@@ -32,7 +40,8 @@
 
 set -uo pipefail
 
-reads="" reference="" reps=1 threads="" bin="./target/release/escpod" samtools="samtools"
+reads="" reference="" reps=1 threads="" md5=0 samtools="${SAMTOOLS:-samtools}"
+bins=()
 backends=()
 devices=()
 sorts=()
@@ -47,7 +56,8 @@ while [[ $# -gt 0 ]]; do
         --samtools) samtools="$2"; shift 2 ;;
         --reps) reps="$2"; shift 2 ;;
         --threads) threads="$2"; shift 2 ;;
-        --bin) bin="$2"; shift 2 ;;
+        --bin) bins+=("$2"); shift 2 ;;
+        --md5) md5=1; shift ;;
         --) shift; extra=("$@"); break ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -56,21 +66,25 @@ done
 [[ ${#backends[@]} -gt 0 ]] || backends=(avx512 avx2 scalar)
 [[ ${#devices[@]} -gt 0 ]] || devices=("-")
 [[ ${#sorts[@]} -gt 0 ]] || sorts=("-")
+[[ ${#bins[@]} -gt 0 ]] || bins=("./target/release/escpod")
 threads="${threads:-${SLURM_CPUS_PER_TASK:-$(nproc)}}"
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/escpod-align-bench.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 
 echo "# $(hostname) $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')" >&2
-echo "# $("$bin" --version) threads=$threads reads=$reads" >&2
+for bin in "${bins[@]}"; do echo "# $bin: $("$bin" --version)" >&2; done
+echo "# threads=$threads reads=$reads" >&2
 cat "$reads" > /dev/null  # page the input in once, before any arm
 
-printf 'rep\tbackend\tdevice\tsort\treads\twall_s\tcpu_s\tmax_rss_mib\treads_per_s\n'
+printf 'rep\tbin\tbackend\tdevice\tsort\treads\twall_s\tcpu_s\tmax_rss_mib\treads_per_s\n'
 for rep in $(seq 1 "$reps"); do
+    for b in "${!bins[@]}"; do
+    bin="${bins[$b]}"
     for be in "${backends[@]}"; do
     for dev in "${devices[@]}"; do
     for so in "${sorts[@]}"; do
-        log="$scratch/$be.$dev.$so.$rep.log"
+        log="$scratch/$b.$be.$dev.$so.$rep.log"
         dev_args=()
         [[ "$dev" == "-" ]] || dev_args=(--device "$dev")
         if [[ "$so" == "samtools" ]]; then
@@ -99,8 +113,13 @@ for rep in $(seq 1 "$reps"); do
         wall=$(awk -F': ' '/Elapsed \(wall clock\)/ {n=split($2,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; print s}' "$log")
         cpu=$(awk -F': ' '/User time/ {u=$2} /System time/ {s=$2} END {print u+s}' "$log")
         rss=$(awk -F': ' '/Maximum resident/ {printf "%.0f", $2/1024}' "$log")
-        printf '%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%s\t%.0f\n' "$rep" "$be" "$dev" "$so" "$n" "$wall" "$cpu" "$rss" "$(echo "$n / $wall" | bc -l)"
+        grep -o 'workers were busy.*' "$log" | sed "s|^|# rep $rep bin $b $be $dev $so: |" >&2
+        if [[ $md5 == 1 ]]; then
+            echo "# rep $rep bin $b $be $dev $so md5 $("$samtools" view "$scratch/out.bam" | md5sum | cut -d' ' -f1)" >&2
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%s\t%.0f\n' "$rep" "$b" "$be" "$dev" "$so" "$n" "$wall" "$cpu" "$rss" "$(echo "$n / $wall" | bc -l)"
         rm -f "$scratch/out.bam"
+    done
     done
     done
     done

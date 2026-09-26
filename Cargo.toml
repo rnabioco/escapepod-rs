@@ -73,6 +73,13 @@ strip = false
 [profile.dev.package."*"]
 opt-level = 2
 
+# escapepod-align's equality tests run the scalar oracle over reads of 20-60 kb
+# (and `align_e2e` runs `escpod align` under the scalar backend on them); at
+# opt-level 0 that oracle costs ~80 ns a cell and those tests run for minutes.
+# Debug assertions and overflow checks stay on.
+[profile.dev.package.escapepod-align]
+opt-level = 2
+
 # Optimized release build: LTO + single codegen unit for maximum performance.
 [profile.release]
 opt-level = 3
