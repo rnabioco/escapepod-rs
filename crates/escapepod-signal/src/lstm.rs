@@ -65,6 +65,9 @@ pub enum LstmBackend {
 /// Public so a caller's own dispatch tests (`escapepod_classify::fnn_lstm`'s
 /// among them) can tell whether the environment is already pinning a
 /// backend before asserting what an unconstrained dispatch would pick.
+// `*_BACKEND` caps are a name, not a flag/knob shape, and keep their own
+// parse (root CLAUDE.md's env-switch table).
+#[allow(clippy::disallowed_methods)]
 pub fn backend_cap() -> Option<LstmBackend> {
     static CAP: std::sync::OnceLock<Option<LstmBackend>> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
@@ -170,6 +173,9 @@ impl LstmBackend {
     /// single-read kernel inside a binary that batches.
     pub fn preferred_batch(self) -> usize {
         static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        // A sweep-width cap, not the on/off `flag()`/warn-on-garbage
+        // `positive_usize()` shape (root CLAUDE.md's env-switch table).
+        #[allow(clippy::disallowed_methods)]
         let wanted = OVERRIDE.get_or_init(|| {
             std::env::var("ESCAPEPOD_LSTM_BATCH")
                 .ok()

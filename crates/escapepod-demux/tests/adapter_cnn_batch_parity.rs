@@ -30,6 +30,9 @@ fn synth_signal(seed: u64, len: usize) -> Vec<f32> {
 
 #[test]
 fn batched_matches_per_read() {
+    // Test-only model-path knob (the ONNX file is not redistributable, so
+    // this test skips itself when unset), not the runtime switch/knob shape.
+    #[allow(clippy::disallowed_methods)]
     let Ok(model_path) = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX") else {
         eprintln!("ESCAPEPOD_TEST_ADAPTER_ONNX unset — skipping CNN batch-parity test");
         return;
@@ -76,6 +79,9 @@ fn batched_matches_per_read() {
 
 #[test]
 fn batch_of_one_matches_single() {
+    // Test-only model-path knob (the ONNX file is not redistributable, so
+    // this test skips itself when unset), not the runtime switch/knob shape.
+    #[allow(clippy::disallowed_methods)]
     let Ok(model_path) = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX") else {
         eprintln!("ESCAPEPOD_TEST_ADAPTER_ONNX unset — skipping CNN batch-of-one test");
         return;

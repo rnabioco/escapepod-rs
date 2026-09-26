@@ -27,6 +27,9 @@ fn env_lock() -> MutexGuard<'static, ()> {
 /// observe or clobber each other's variables.
 pub(crate) fn temp_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
     let _guard = env_lock();
+    // Test-only raw env access: saving the ambient value before overriding
+    // it for a test, not a runtime switch/knob parse.
+    #[allow(clippy::disallowed_methods)]
     let saved: Vec<_> = vars
         .iter()
         .map(|(k, _)| (*k, std::env::var_os(k)))

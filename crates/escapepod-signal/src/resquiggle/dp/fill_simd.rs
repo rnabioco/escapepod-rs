@@ -70,6 +70,9 @@ pub(super) enum DpBackend {
 /// pick. Never raises: a cap the machine cannot run is simply not reached.
 /// `avx2` is accepted but ignored (with a warning): there is no AVX2 kernel
 /// any more — see the module doc comment's dead-end note.
+// `*_BACKEND` caps are a name, not a flag/knob shape, and keep their own
+// parse (root CLAUDE.md's env-switch table).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn backend_cap() -> Option<DpBackend> {
     static CAP: std::sync::OnceLock<Option<DpBackend>> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {

@@ -202,6 +202,10 @@ impl Reader {
         // truncated-file / archive-stub failure into a recoverable error
         // instead of an uncatchable SIGBUS on first page fault. Set
         // `POD5_DISABLE_MMAP_OPEN=1` to skip it and map straight away.
+        // `POD5_..` predates the `ESCAPEPOD_*` flag() convention and is a
+        // presence-only escape hatch (any value skips the probe), not the
+        // on/off `flag()` shape (see the crate's "Env levers" table).
+        #[allow(clippy::disallowed_methods)]
         if std::env::var_os("POD5_DISABLE_MMAP_OPEN").is_none() {
             probe_header_footer(&file)?;
         }

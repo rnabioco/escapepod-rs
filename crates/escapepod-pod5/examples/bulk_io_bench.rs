@@ -56,6 +56,8 @@ fn main() {
     // ---- Phase A: per-read parallel (current demux pattern), reads [0, nn) ----
     // This path is known-pathological on cold network FS (the subject of #72);
     // set SKIP_A=1 to measure only the bulk path B and save cluster time.
+    // Bench-only knob for this profiling example, not an ESCAPEPOD_* switch.
+    #[allow(clippy::disallowed_methods)]
     let skip_a = std::env::var("SKIP_A").is_ok_and(|v| v != "0");
     let (bytes_a, dt_a) = if skip_a {
         (0usize, f64::NAN)
@@ -81,6 +83,8 @@ fn main() {
     // pattern: a single ascending sweep (sequential I/O) while CPU work would
     // parallelize separately. Default = rayon threads (the naive parallel-chunk
     // approach, which scatters and defeats readahead).
+    // Bench-only knob for this profiling example, not an ESCAPEPOD_* switch.
+    #[allow(clippy::disallowed_methods)]
     let streams: usize = std::env::var("BULK_STREAMS")
         .ok()
         .and_then(|s| s.parse().ok())

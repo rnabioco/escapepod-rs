@@ -4708,6 +4708,9 @@ mod gpu_placement_tests {
     /// per-device row budget is computed against the wrong denominator.
     #[test]
     fn workers_spread_evenly_over_the_encoder_devices() {
+        // Presence check only (test skip guard) — the real read is
+        // `escapepod_signal::pod5::env::positive_usize` above.
+        #[allow(clippy::disallowed_methods)]
         if std::env::var("ESCAPEPOD_CRF_GPU_WORKERS").is_ok() {
             return;
         }
