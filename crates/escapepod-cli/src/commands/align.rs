@@ -163,6 +163,11 @@ pub struct AlignArgs {
     )]
     pub min_score: i32,
 
+    /// Reads longer than this (nt) are not aligned: they are written unmapped,
+    /// in order, with their tags. `0` = no limit
+    #[arg(long, default_value_t = 1000, value_name = "N")]
+    pub max_read_len: usize,
+
     /// At most this many tied references besides the primary go into `XA`
     /// (and `--secondary`); default all. MAPQ is 0 for any tie regardless
     #[arg(long, value_name = "N")]
@@ -722,6 +727,16 @@ struct Job<'a> {
     split_long: bool,
     /// Read strands scored that way, for `-v`.
     split_strands: AtomicU64,
+    /// `--max-read-len`: a longer read is written unmapped, never scored
+    /// (`0` = no limit).
+    max_read_len: usize,
+    /// Reads written unmapped for `--max-read-len`.
+    skipped_long: AtomicU64,
+}
+
+/// Whether `--max-read-len` keeps a read of `len` bases out of alignment.
+fn over_limit(max_read_len: usize, len: usize) -> bool {
+    max_read_len != 0 && len > max_read_len
 }
 
 /// `=1` puts every read back on the row-major score kernel and on one
@@ -777,8 +792,21 @@ fn process_chunk(
             InRecord::Buf(r) => Ok(r),
         })
         .collect::<anyhow::Result<Vec<RecordBuf>>>()?;
-    let seqs: Vec<&[u8]> = records.iter().map(|r| r.sequence().as_ref()).collect();
+    // Reads over --max-read-len are not scored or traced anywhere; the rest
+    // are aligned as one batch, `kept[k]` being read `k`'s place in the chunk.
+    let kept: Vec<usize> = (0..records.len())
+        .filter(|&k| !over_limit(ctx.max_read_len, records[k].sequence().len()))
+        .collect();
+    let skipped = (records.len() - kept.len()) as u64;
+    if skipped > 0 {
+        ctx.skipped_long.fetch_add(skipped, Ordering::Relaxed);
+    }
+    let seqs: Vec<&[u8]> = kept
+        .iter()
+        .map(|&k| records[k].sequence().as_ref())
+        .collect();
     let gpu_row = |k: usize, reverse: bool| {
+        let k = kept[k];
         scores
             .as_ref()
             .and_then(|(batch, first)| batch.row(first + k, reverse))
@@ -806,13 +834,26 @@ fn process_chunk(
             out
         })
         .collect();
-    let mappings = ctx
+    let aligned = ctx
         .aligner
         .map_reads_scored(&seqs, &ctx.opts, |k, reverse| {
             pooled[k][usize::from(reverse)]
                 .as_deref()
                 .or_else(|| gpu_row(k, reverse))
         });
+    // Back into chunk order, with a skipped read as an unmapped mapping —
+    // written exactly as a read below --min-score is.
+    let mut mappings: Vec<ReadMapping> = (0..records.len())
+        .map(|_| ReadMapping {
+            best_score: None,
+            n_tied: 0,
+            suboptimal: None,
+            hits: Vec::new(),
+        })
+        .collect();
+    for (&k, m) in kept.iter().zip(aligned) {
+        mappings[k] = m;
+    }
     records
         .into_iter()
         .zip(&mappings)
@@ -1028,9 +1069,10 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         Some(scorer) => {
             let (tx, rx) = sync_channel::<Batch>(2);
             let both = opts.both_strands;
+            let max_read_len = args.max_read_len;
             let t = std::thread::Builder::new()
                 .name("escpod-align-gpu".into())
-                .spawn(move || gpu::score_batches(scorer, in_rx, tx, both))?;
+                .spawn(move || gpu::score_batches(scorer, in_rx, tx, both, max_read_len))?;
             (Box::new(rx.into_iter()), Some(t))
         }
         None => (Box::new(in_rx.into_iter().map(|b| (b, None))), None),
@@ -1049,6 +1091,8 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         secondary: args.secondary,
         split_long: !row_major_only,
         split_strands: AtomicU64::new(0),
+        max_read_len: args.max_read_len,
+        skipped_long: AtomicU64::new(0),
     };
     let busy = dispatch(&ctx, batches, res_tx, permit_rx);
     // Join every thread before deciding which error to report: a failed stage
@@ -1084,14 +1128,16 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     }
     let summary = write_result.with_context(|| format!("writing {}", args.output.display()))?;
     let counts = read_result.with_context(|| format!("reading {}", args.reads.display()))?;
+    let skipped_long = ctx.skipped_long.load(Ordering::Relaxed);
     debug!(
         "workers were busy {:.1} s of {:.1} s x {} threads; {} read strands of {}+ nt \
-         scored across the pool",
+         scored across the pool; {} reads over --max-read-len not aligned",
         busy.as_secs_f64(),
         started.elapsed().as_secs_f64(),
         threads,
         ctx.split_strands.load(Ordering::Relaxed),
         SPLIT_MIN_BASES,
+        skipped_long,
     );
 
     // --- Summary -----------------------------------------------------------
@@ -1105,6 +1151,13 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         info!(
             "skipped {} reads not named in --read-ids",
             style::count(counts.filtered)
+        );
+    }
+    if skipped_long > 0 {
+        info!(
+            "{} reads longer than --max-read-len {} nt were not aligned (written unmapped)",
+            style::count(skipped_long),
+            args.max_read_len
         );
     }
     let wall = started.elapsed().as_secs_f64();
@@ -1345,6 +1398,7 @@ mod gpu {
         rx: Receiver<Vec<InRecord>>,
         tx: SyncSender<Batch>,
         both_strands: bool,
+        max_read_len: usize,
     ) -> anyhow::Result<GpuStats> {
         use escapepod_align::alphabet::{encode_base, reverse_complement_codes};
         let mut stats = GpuStats {
@@ -1364,20 +1418,30 @@ mod gpu {
             wait_in += t.elapsed().as_secs_f64();
             t = Instant::now();
             let prepared = next.as_ref().map(|batch| {
+                // A read over --max-read-len goes as an empty query, which
+                // the kernel leaves unscored; the worker never asks for it.
+                let mut skipped = 0u64;
                 let mut codes: Vec<Vec<u8>> = batch
                     .iter()
                     .map(|rec| {
                         letters(rec, &mut buf);
+                        if over_limit(max_read_len, buf.len()) {
+                            skipped += 1;
+                            return Vec::new();
+                        }
                         buf.iter().map(|&b| encode_base(b)).collect()
                     })
                     .collect();
+                if both_strands {
+                    skipped *= 2;
+                }
                 if both_strands {
                     let rev: Vec<Vec<u8>> =
                         codes.iter().map(|c| reverse_complement_codes(c)).collect();
                     codes.extend(rev);
                 }
                 let queries: Vec<&[u8]> = codes.iter().map(Vec::as_slice).collect();
-                stats.queries += queries.len() as u64;
+                stats.queries += queries.len() as u64 - skipped;
                 scorer.prepare(&queries)
             });
             prep += t.elapsed().as_secs_f64();
@@ -1428,6 +1492,7 @@ mod gpu {
         _rx: Receiver<Vec<InRecord>>,
         _tx: SyncSender<Batch>,
         _both_strands: bool,
+        _max_read_len: usize,
     ) -> anyhow::Result<GpuStats> {
         match scorer {}
     }

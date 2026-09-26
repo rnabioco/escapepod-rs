@@ -709,7 +709,7 @@ fn long_read_alignment_matches_scalar_backend() {
             .arg(&reference)
             .arg("-o")
             .arg(out)
-            .args(["-t", "4"])
+            .args(["-t", "4", "--max-read-len", "0"])
             .args(extra)
             .env_remove("ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY");
         match backend {
@@ -750,5 +750,180 @@ fn long_read_alignment_matches_scalar_backend() {
             long.iter().all(|r| !r.flags().is_unmapped()),
             "flags {extra:?}"
         );
+    }
+}
+
+/// The fixture uBAM with over-limit reads spliced in: after fixture read 10,
+/// copies of it extended with random sequence to 1,000 nt (at the default
+/// limit, so aligned), 1,001 nt and 5,000 nt (over it). Each copy is written
+/// unmapped, keeps every tag of the read it came from, and carries one more
+/// (`ZZ:Z:long`) so the test can see tags survive. Returns the path and the
+/// input records in order.
+fn bam_with_long_reads(dir: &Path) -> (PathBuf, Vec<RecordBuf>) {
+    use sam::alignment::io::Write as _;
+    use sam::alignment::record::Flags;
+    let (header, input) = read_bam(&input_bam());
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut out = Vec::new();
+    for (k, r) in input.iter().enumerate() {
+        out.push(r.clone());
+        if k != 10 {
+            continue;
+        }
+        for len in [1_000usize, 1_001, 5_000] {
+            let mut seq = r.sequence().as_ref().to_vec();
+            let mut qual = r.quality_scores().as_ref().to_vec();
+            while seq.len() < len {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                seq.push(b"ACGT"[(x % 4) as usize]);
+                qual.push(20);
+            }
+            let mut long = r.clone();
+            *long.name_mut() = Some(format!("long_{len}").into_bytes().into());
+            *long.flags_mut() = Flags::UNMAPPED;
+            *long.reference_sequence_id_mut() = None;
+            *long.alignment_start_mut() = None;
+            *long.cigar_mut() = Default::default();
+            *long.sequence_mut() = seq.into();
+            *long.quality_scores_mut() = qual.into();
+            long.data_mut()
+                .insert(Tag::new(b'Z', b'Z'), Value::String("long".into()));
+            out.push(long);
+        }
+    }
+    let path = dir.join("with_long.bam");
+    let mut w = bam::io::Writer::new(std::fs::File::create(&path).unwrap());
+    w.write_header(&header).unwrap();
+    for r in &out {
+        w.write_alignment_record(&header, r).unwrap();
+    }
+    w.try_finish().unwrap();
+    (path, out)
+}
+
+/// `--max-read-len` (default 1000): a longer read is not aligned but still
+/// written, in input order, unmapped, with every input tag it carried except
+/// the aligner-owned ones; a read at the limit is aligned; and every read
+/// within the limit comes out exactly as it does with no limit.
+#[test]
+fn max_read_len_writes_long_reads_unmapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (reads, input) = bam_with_long_reads(dir.path());
+    let reference = fixtures().join("trna_reference.fa");
+    let (limited, unlimited) = (dir.path().join("limited.bam"), dir.path().join("all.bam"));
+    let stderr = align(&reads, &reference, &limited, &[]);
+    assert!(
+        stderr.contains("2 reads longer than --max-read-len 1000 nt were not aligned"),
+        "{stderr}"
+    );
+    align(&reads, &reference, &unlimited, &["--max-read-len", "0"]);
+    let (_, got) = read_bam(&limited);
+    let (_, all) = read_bam(&unlimited);
+    assert_eq!(got.len(), input.len());
+    assert_eq!(all.len(), input.len());
+    for ((o, i), a) in got.iter().zip(&input).zip(&all) {
+        assert_eq!(name(o), name(i), "input order");
+        if i.sequence().len() > 1000 {
+            assert!(o.flags().is_unmapped(), "{}", name(o));
+            assert_eq!(o.reference_sequence_id(), None);
+            assert_eq!(o.sequence(), i.sequence());
+            assert_eq!(o.quality_scores(), i.quality_scores());
+            let mut want = i.data().clone();
+            for t in OWNED {
+                want.remove(&Tag::from(t));
+            }
+            assert_eq!(o.data(), &want, "{}: tags", name(o));
+            assert_eq!(string_tag(o, *b"ZZ").as_deref(), Some("long"));
+            // Without the limit the same read is aligned.
+            assert!(int_tag(a, *b"AS").is_some(), "{}", name(a));
+        } else {
+            assert_eq!(o, a, "{}: differs from the unlimited run", name(o));
+        }
+    }
+    let at_limit = got.iter().find(|r| name(r) == "long_1000").unwrap();
+    assert!(
+        int_tag(at_limit, *b"AS").is_some(),
+        "a read at the limit is aligned"
+    );
+}
+
+/// `--max-read-len 0` is no limit: every read is scored and nothing is
+/// reported as skipped.
+#[test]
+fn max_read_len_zero_disables_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (reads, input) = bam_with_long_reads(dir.path());
+    let out = dir.path().join("out.bam");
+    let stderr = align(
+        &reads,
+        &fixtures().join("trna_reference.fa"),
+        &out,
+        &["--max-read-len", "0"],
+    );
+    assert!(!stderr.contains("--max-read-len"), "{stderr}");
+    let (_, got) = read_bam(&out);
+    assert_eq!(got.len(), input.len());
+    for r in got.iter().filter(|r| name(r).starts_with("long_")) {
+        assert!(!r.flags().is_unmapped(), "{}", name(r));
+        assert!(int_tag(r, *b"AS").is_some(), "{}", name(r));
+    }
+}
+
+/// The GPU path honours `--max-read-len` too: an over-limit read is never
+/// sent to the device (the GPU's query count excludes it) and the records
+/// equal the CPU run's, with and without both strands.
+#[cfg(feature = "gpu")]
+#[test]
+fn device_gpu_honours_max_read_len() {
+    let dir = tempfile::tempdir().unwrap();
+    let (reads, input) = bam_with_long_reads(dir.path());
+    let short = input.iter().filter(|r| r.sequence().len() <= 1000).count();
+    let run = |device: &str, out: &Path, extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_escpod"))
+            .arg("align")
+            .arg(&reads)
+            .arg("-r")
+            .arg(fixtures().join("trna_reference.fa"))
+            .arg("-o")
+            .arg(out)
+            .args(["--device", device])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let flag_sets: [&[&str]; 2] = [&[], &["--strand", "both"]];
+    for (k, extra) in flag_sets.iter().enumerate() {
+        let (cpu_out, gpu_out) = (
+            dir.path().join(format!("cpu{k}.bam")),
+            dir.path().join(format!("gpu{k}.bam")),
+        );
+        let g = run("gpu", &gpu_out, extra);
+        let stderr = String::from_utf8_lossy(&g.stderr);
+        if !g.status.success() {
+            assert!(
+                stderr.contains("--device gpu cannot run"),
+                "GPU run failed for a reason other than a missing device:\n{stderr}"
+            );
+            eprintln!("[align_e2e] skipping device_gpu_honours_max_read_len: {stderr}");
+            return;
+        }
+        let strands = if extra.is_empty() { 1 } else { 2 };
+        let queries = short * strands;
+        assert!(
+            stderr.contains(&format!("GPU scored {queries} of {queries} ")),
+            "over-limit reads reached the GPU:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("2 reads longer than --max-read-len"),
+            "{stderr}"
+        );
+        let c = run("cpu", &cpu_out, extra);
+        assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+        let (_, cpu) = read_bam(&cpu_out);
+        let (_, gpu) = read_bam(&gpu_out);
+        assert_eq!(cpu.len(), input.len());
+        assert_eq!(cpu, gpu, "flags {extra:?}");
     }
 }

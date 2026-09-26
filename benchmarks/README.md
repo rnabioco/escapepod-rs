@@ -111,6 +111,26 @@ long read's seconds are absorbed while 15 threads keep working), so it gains
 only the long reads' cheaper kernel (−1%) and the ~0.45 GB of RSS the backed-up
 chunks held.
 
+**`--max-read-len` (default 1000 nt, added in the same PR).** No read over
+1,000 nt is a tRNA read in practice, so the default now writes them unmapped
+without scoring them (M1: 687 reads, 0.14%). avx512, `-t 32` on rna and
+`--device gpu -t 16` on compgpu01 (Gold 6326 + A30), same binary
+(`876ac45`), default against `--max-read-len 0`, interleaved:
+
+| arm | wall (s) | CPU (s) | MaxRSS (MiB) |
+|---|---:|---:|---:|
+| rna, default (limit 1000) | 13.4 / 13.3 | 418 / 417 | 1,214 / 1,234 |
+| rna, `--max-read-len 0` | 15.1 / 15.1 | 464 / 463 | 1,821 / 1,772 |
+| gpu, default (limit 1000) | 6.5 / 6.6 | 67 / 66 | 1,388 / 1,486 |
+| gpu, `--max-read-len 0` | 7.6 / 7.7 | 99 / 98 | 2,365 / 2,473 |
+
+With the limit, the GPU scores 489,108 of 489,108 queries and nothing falls
+back to the CPU. `--max-read-len 0` output is md5-equal to the numbers
+below (`4bb45893…` at the defaults, `ecd70db3…` at `--strand both
+--secondary --mode semiglobal`). At the default limit no read reaches the
+transposed kernel's 1,024 nt threshold or the 16 kb pool split, so neither
+runs; both stay for `--max-read-len 0` or a limit above 1,024.
+
 **Output.** `samtools view | md5sum` is equal between base and new, and
 between every backend and device arm, at the defaults
 (`4bb45893f63827f603931cf1a5b4ad57`) and at `--strand both --secondary --mode
