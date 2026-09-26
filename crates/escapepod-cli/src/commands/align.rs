@@ -1,5 +1,6 @@
 //! `escpod align` — all-vs-all alignment of reads to a small reference panel
-//! (tRNA), writing an input-ordered BAM with every input tag carried through.
+//! (tRNA), writing an input-ordered (or, with `--sort coordinate`,
+//! coordinate-sorted) BAM with every input tag carried through.
 //!
 //! The DP, the kernels and the winner/tie rules live in `escapepod_align`;
 //! this command is I/O and orchestration:
@@ -14,7 +15,8 @@
 //! Memory is O(`--batch-size`): two batches may wait for the dispatcher, and
 //! chunks worth two more may be in flight (spawned, not yet written). There
 //! is no barrier between batches — see [`dispatch`] for the measurement that
-//! removed it.
+//! removed it. `--sort coordinate` adds its own bound on top: `--sort-memory`
+//! of held records, plus the largest single reference's when it is sorted.
 //!
 //! # With the scoring on a GPU
 //!
@@ -69,7 +71,11 @@
 //!
 //! # Output rules
 //!
-//! * Records in input order (`@HD SO:unsorted`); `@SQ` from the reference in
+//! * Records in input order (`@HD SO:unsorted`), or with `--sort coordinate`
+//!   in `samtools sort`'s order (`@HD SO:coordinate`) — the writer thread
+//!   still restores input order first, since that is the sort's tie-break,
+//!   then hands the records to a per-reference bucket sort ([`sort`]) that
+//!   writes the file once the input ends; `@SQ` from the reference in
 //!   file order; the input's `@RG`, `@PG`, `@CO` copied; one `@PG` for this run
 //!   chained to the last.
 //! * Every input tag is copied byte for byte. `NM`, `MD`, `AS`, `XS`, `XA` are
@@ -134,9 +140,30 @@ pub struct AlignArgs {
     #[arg(short, long, value_name = "FASTA")]
     pub reference: PathBuf,
 
-    /// Output BAM (`-` for stdout), records in input order
+    /// Output BAM (`-` for stdout): records in input order, or in coordinate
+    /// order with `--sort coordinate`
     #[arg(short, long, value_name = "BAM")]
     pub output: PathBuf,
+
+    /// Record order: `unsorted` (input order, `SO:unsorted`) or `coordinate`
+    /// (`samtools sort` order, `SO:coordinate`: reference, position, reverse
+    /// strand after forward, then input order; unmapped reads last). A sorted
+    /// file is written only once the last read is aligned
+    #[arg(long, value_enum, default_value_t = SortOrder::Unsorted, value_name = "ORDER")]
+    pub sort: SortOrder,
+
+    /// With `--sort coordinate`, records held in memory before the largest
+    /// per-reference buckets spill to a temporary file (K/M/G suffixes,
+    /// binary). Peak memory is about this plus the largest single reference's
+    /// records [default: 4G]
+    #[arg(long, value_parser = parse_size, value_name = "SIZE")]
+    pub sort_memory: Option<u64>,
+
+    /// With `--sort coordinate`, where spilled records go [default: the
+    /// output's directory; `$TMPDIR` for `-o -`]. The file is unlinked as
+    /// soon as it is created, so nothing is left behind on any exit
+    #[arg(long, value_name = "DIR")]
+    pub tmp_dir: Option<PathBuf>,
 
     /// `local` (Smith-Waterman, overhangs soft-clipped) or `semiglobal`
     /// (overlap: leading/trailing gaps of either sequence free)
@@ -206,6 +233,45 @@ pub struct AlignArgs {
 pub enum StrandArg {
     Forward,
     Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SortOrder {
+    Unsorted,
+    Coordinate,
+}
+
+/// Default `--sort-memory`.
+const DEFAULT_SORT_MEMORY: u64 = 4 << 30;
+
+/// A byte count with an optional binary suffix: `4G`, `512M`, `64K`, `4GiB`,
+/// `1000`.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let t = t
+        .strip_suffix("iB")
+        .or_else(|| t.strip_suffix('B'))
+        .unwrap_or(t);
+    let (digits, shift) = match t.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => {
+            let shift = match c.to_ascii_uppercase() {
+                'K' => 10,
+                'M' => 20,
+                'G' => 30,
+                'T' => 40,
+                _ => return Err(format!("{s}: unknown size suffix '{c}' (K, M, G or T)")),
+            };
+            (&t[..i], shift)
+        }
+        _ => (t, 0),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("{s}: not a size (e.g. 4G, 512M, 1000000)"))?;
+    n.checked_shl(shift)
+        .filter(|v| v >> shift == n)
+        .ok_or_else(|| format!("{s}: too large"))
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -901,10 +967,17 @@ fn score_across_pool(aligner: &Aligner, codes: &[u8]) -> Option<Vec<i16>> {
 // Header
 // ---------------------------------------------------------------------------
 
-fn build_header(panel: &Panel, input: &sam::Header) -> anyhow::Result<sam::Header> {
+fn build_header(
+    panel: &Panel,
+    input: &sam::Header,
+    sort: SortOrder,
+) -> anyhow::Result<sam::Header> {
     let mut hd = Map::<map::Header>::new(Version::new(1, 6));
-    hd.other_fields_mut()
-        .insert(hd_tag::SORT_ORDER, "unsorted".into());
+    let so = match sort {
+        SortOrder::Unsorted => "unsorted",
+        SortOrder::Coordinate => "coordinate",
+    };
+    hd.other_fields_mut().insert(hd_tag::SORT_ORDER, so.into());
     let mut b = sam::Header::builder().set_header(hd);
     for r in panel.references() {
         let len = std::num::NonZero::new(r.seq.len()).expect("panel refuses empty references");
@@ -1034,10 +1107,37 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             sam::Header::default(),
         ),
     };
-    let out_header = build_header(aligner.panel(), &in_header)?;
+    let out_header = build_header(aligner.panel(), &in_header, args.sort)?;
 
     // --- Output ------------------------------------------------------------
-    let sink: Box<dyn Write + Send> = if args.output.as_os_str() == "-" {
+    let to_stdout = args.output.as_os_str() == "-";
+    let sorter = match args.sort {
+        SortOrder::Unsorted => {
+            if args.sort_memory.is_some() || args.tmp_dir.is_some() {
+                warn!("--sort-memory and --tmp-dir only apply to --sort coordinate; ignored");
+            }
+            None
+        }
+        SortOrder::Coordinate => {
+            let tmp_dir = match &args.tmp_dir {
+                Some(d) => d.clone(),
+                None if to_stdout => std::env::temp_dir(),
+                None => match args.output.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => PathBuf::from("."),
+                },
+            };
+            let budget = args.sort_memory.unwrap_or(DEFAULT_SORT_MEMORY);
+            // Created now, not at the first spill, so an unusable --tmp-dir
+            // is the first error of the run rather than the last.
+            Some(sort::CoordinateSorter::new(
+                aligner.panel().len(),
+                usize::try_from(budget).unwrap_or(usize::MAX),
+                &tmp_dir,
+            )?)
+        }
+    };
+    let sink: Box<dyn Write + Send> = if to_stdout {
         Box::new(std::io::stdout())
     } else {
         Box::new(
@@ -1086,7 +1186,9 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let writer_spinner = spinner.clone();
     let writer_thread = std::thread::Builder::new()
         .name("escpod-align-writer".into())
-        .spawn(move || write_in_order(writer, res_rx, permit_tx, &writer_spinner, started))?;
+        .spawn(move || {
+            write_in_order(writer, sorter, res_rx, permit_tx, &writer_spinner, started)
+        })?;
 
     let ctx = Job {
         aligner: &aligner,
@@ -1258,11 +1360,17 @@ fn dispatch(
     std::time::Duration::from_nanos(busy_ns.load(Ordering::Relaxed))
 }
 
+/// The output BGZF stream, past the header.
+type OutStream = bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>;
+
 /// The writer thread's body: take encoded chunks as workers finish them,
-/// append them to the BGZF stream in input order, and return a permit for
-/// each chunk written.
+/// put them back in input order, and return a permit for each chunk taken.
+/// Unsorted, the records go straight to the BGZF stream; with a `sorter`,
+/// they go to it (in input order, which is its tie-break) and it writes the
+/// whole sorted file once the input ends.
 fn write_in_order(
-    writer: bam::io::Writer<bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>>,
+    writer: bam::io::Writer<OutStream>,
+    mut sorter: Option<sort::CoordinateSorter>,
     rx: Receiver<(u64, anyhow::Result<Encoded>)>,
     permits: SyncSender<()>,
     spinner: &indicatif::ProgressBar,
@@ -1277,7 +1385,10 @@ fn write_in_order(
         pending.insert(seq, result?);
         while let Some(encoded) = pending.remove(&next) {
             for (bytes, outcome) in encoded {
-                bgzf.write_all(&bytes)?;
+                match &mut sorter {
+                    Some(s) => s.push(&bytes)?,
+                    None => bgzf.write_all(&bytes)?,
+                }
                 summary.reads += 1;
                 match outcome {
                     Outcome::Unique => summary.unique += 1,
@@ -1303,8 +1414,312 @@ fn write_in_order(
     if !pending.is_empty() {
         bail!("{} chunks were aligned but never written", pending.len());
     }
+    if let Some(s) = sorter {
+        spinner.set_message(format!(
+            "{} reads aligned; writing in coordinate order",
+            style::count(summary.reads)
+        ));
+        s.finish(&mut bgzf)?;
+    }
     bgzf.finish()?;
     Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// Coordinate sort
+// ---------------------------------------------------------------------------
+
+/// `--sort coordinate`: a bucket sort, one bucket per reference.
+///
+/// The panel is small (hundreds of references), so there is no comparison
+/// sort over the whole file and no k-way merge. Each encoded record goes into
+/// its reference's bucket (unmapped records into one more, written last), in
+/// input order. Past the memory budget the largest in-memory buckets are
+/// appended to one unlinked temporary file, as segments that remember their
+/// bucket. At the end each reference's spilled segments and in-memory tail are
+/// read back — still in input order — and stable-sorted on `(pos, reverse)`
+/// alone, which is `samtools sort`'s order: `tid`, then `pos`, then the
+/// reverse flag, then input order, `tid -1` last. Peak memory is the budget
+/// plus the largest single reference's records, never the sample.
+mod sort {
+    use super::*;
+    use std::io::{Seek, SeekFrom};
+
+    /// One reference's records (or the unmapped ones): what is still in
+    /// memory, and where earlier ones went in the spill file.
+    #[derive(Default)]
+    struct Bucket {
+        held: Vec<u8>,
+        /// `(offset, length)` in the spill file, in input order.
+        spilled: Vec<(u64, u64)>,
+    }
+
+    pub(super) struct CoordinateSorter {
+        /// One per `@SQ`, then the unmapped bucket.
+        buckets: Vec<Bucket>,
+        /// Bytes held across all buckets (their capacity: what is allocated).
+        held: usize,
+        budget: usize,
+        spill: std::io::BufWriter<File>,
+        spill_len: u64,
+        spills: u64,
+        tmp_dir: PathBuf,
+    }
+
+    /// A BAM record's fields the order reads: `(tid, pos, reverse)`.
+    /// Offsets are into the record *with* its 4-byte `block_size`.
+    fn key(rec: &[u8]) -> (i32, i32, bool) {
+        let i32_at = |o: usize| i32::from_le_bytes(rec[o..o + 4].try_into().expect("4 bytes"));
+        let flag = u16::from_le_bytes([rec[18], rec[19]]);
+        (i32_at(4), i32_at(8), flag & 0x10 != 0)
+    }
+
+    /// Split concatenated encoded records at their `block_size`s.
+    fn records(mut bytes: &[u8]) -> impl Iterator<Item = anyhow::Result<&[u8]>> {
+        std::iter::from_fn(move || {
+            if bytes.is_empty() {
+                return None;
+            }
+            if bytes.len() < 4 {
+                return Some(Err(anyhow::anyhow!("truncated BAM record")));
+            }
+            let n = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes")) as usize + 4;
+            // 20 bytes reach the flag field; every real record has 36+.
+            if n < 20 || n > bytes.len() {
+                bytes = &[];
+                return Some(Err(anyhow::anyhow!("malformed BAM record ({n} bytes)")));
+            }
+            let (rec, rest) = bytes.split_at(n);
+            bytes = rest;
+            Some(Ok(rec))
+        })
+    }
+
+    impl CoordinateSorter {
+        pub(super) fn new(n_refs: usize, budget: usize, tmp_dir: &Path) -> anyhow::Result<Self> {
+            let file = tempfile::tempfile_in(tmp_dir).with_context(|| {
+                format!(
+                    "creating the sort's temporary file in {} (see --tmp-dir)",
+                    tmp_dir.display()
+                )
+            })?;
+            Ok(Self {
+                buckets: (0..=n_refs).map(|_| Bucket::default()).collect(),
+                held: 0,
+                budget,
+                spill: std::io::BufWriter::with_capacity(4 << 20, file),
+                spill_len: 0,
+                spills: 0,
+                tmp_dir: tmp_dir.to_path_buf(),
+            })
+        }
+
+        /// Take one read's encoded record(s), in input order.
+        pub(super) fn push(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+            let unmapped = self.buckets.len() - 1;
+            for rec in records(bytes) {
+                let rec = rec?;
+                let (tid, _, _) = key(rec);
+                let b = match usize::try_from(tid) {
+                    Ok(t) if t < unmapped => t,
+                    Ok(t) => bail!("record on reference {t}, but the panel has {unmapped}"),
+                    Err(_) => unmapped,
+                };
+                let held = &mut self.buckets[b].held;
+                let before = held.capacity();
+                held.extend_from_slice(rec);
+                self.held += held.capacity() - before;
+            }
+            if self.held > self.budget {
+                self.spill_largest()?;
+            }
+            Ok(())
+        }
+
+        /// Spill the largest buckets until half the budget is left, so a
+        /// spill is a few large writes rather than one per record.
+        fn spill_largest(&mut self) -> anyhow::Result<()> {
+            while self.held > self.budget / 2 {
+                let (b, _) = self
+                    .buckets
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, b)| b.held.len())
+                    .expect("at least the unmapped bucket");
+                let bucket = &mut self.buckets[b];
+                if bucket.held.is_empty() {
+                    // Only capacity is left; nothing to write.
+                    break;
+                }
+                self.spill.write_all(&bucket.held).with_context(|| {
+                    format!("spilling sorted records to {}", self.tmp_dir.display())
+                })?;
+                let len = bucket.held.len() as u64;
+                bucket.spilled.push((self.spill_len, len));
+                self.spill_len += len;
+                self.spills += 1;
+                self.held -= bucket.held.capacity();
+                bucket.held = Vec::new();
+            }
+            Ok(())
+        }
+
+        /// Read spilled segments back, in order, into `out`.
+        fn read_back(file: &File, segs: &[(u64, u64)], out: &mut Vec<u8>) -> anyhow::Result<()> {
+            for &(off, len) in segs {
+                let start = out.len();
+                out.resize(start + len as usize, 0);
+                let mut f = file;
+                f.seek(SeekFrom::Start(off))
+                    .and_then(|_| f.read_exact(&mut out[start..]))
+                    .context("reading back the sort's temporary file")?;
+            }
+            Ok(())
+        }
+
+        /// Write every record, sorted, to `out`.
+        pub(super) fn finish(mut self, out: &mut OutStream) -> anyhow::Result<()> {
+            let t0 = Instant::now();
+            self.spill
+                .flush()
+                .context("flushing the sort's temporary file")?;
+            let file = self
+                .spill
+                .into_inner()
+                .map_err(|e| e.into_error())
+                .context("flushing the sort's temporary file")?;
+            if self.spills > 0 {
+                info!(
+                    "sort: {:.0} MiB spilled past --sort-memory ({} MiB) to {} in {} writes",
+                    self.spill_len as f64 / f64::from(1u32 << 20),
+                    self.budget >> 20,
+                    style::path(self.tmp_dir.display()),
+                    self.spills
+                );
+            }
+            let unmapped = self.buckets.pop().expect("the unmapped bucket");
+            let mut bytes = Vec::new();
+            let mut order: Vec<(u64, usize, usize)> = Vec::new();
+            for bucket in self.buckets {
+                bytes.clear();
+                Self::read_back(&file, &bucket.spilled, &mut bytes)?;
+                bytes.extend_from_slice(&bucket.held);
+                drop(bucket.held);
+                order.clear();
+                let mut off = 0;
+                for rec in records(&bytes) {
+                    let rec = rec?;
+                    let (_, pos, reverse) = key(rec);
+                    // samtools' key: (pos + 1) << 1 | reverse, over one tid.
+                    let k = (((pos as i64) + 1) as u64) << 1 | reverse as u64;
+                    order.push((k, off, rec.len()));
+                    off += rec.len();
+                }
+                // Stable: equal keys keep input order, as samtools does.
+                order.sort_by_key(|&(k, _, _)| k);
+                for &(_, off, len) in &order {
+                    out.write_all(&bytes[off..off + len])?;
+                }
+            }
+            // Unmapped records are not reordered; one segment at a time.
+            for &seg in &unmapped.spilled {
+                bytes.clear();
+                Self::read_back(&file, &[seg], &mut bytes)?;
+                out.write_all(&bytes)?;
+            }
+            out.write_all(&unmapped.held)?;
+            debug!(
+                "sort: wrote the sorted records in {:.1} s",
+                t0.elapsed().as_secs_f64()
+            );
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A minimal BAM record: block_size, refID, pos, then zeros up to the
+        /// flag, and a trailing id byte so records can be told apart.
+        fn rec(tid: i32, pos: i32, reverse: bool, id: u8) -> Vec<u8> {
+            let mut r = Vec::new();
+            r.extend_from_slice(&33u32.to_le_bytes());
+            r.extend_from_slice(&tid.to_le_bytes());
+            r.extend_from_slice(&pos.to_le_bytes());
+            r.extend_from_slice(&[0u8; 6]);
+            r.extend_from_slice(&(if reverse { 0x10u16 } else { 0 }).to_le_bytes());
+            r.resize(36, 0);
+            r.push(id);
+            assert_eq!(r.len(), 33 + 4);
+            r
+        }
+
+        fn ids(bytes: &[u8]) -> Vec<u8> {
+            records(bytes)
+                .map(|r| *r.unwrap().last().unwrap())
+                .collect()
+        }
+
+        fn run(budget: usize, input: &[Vec<u8>]) -> (Vec<u8>, u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = CoordinateSorter::new(3, budget, dir.path()).unwrap();
+            for r in input {
+                s.push(r).unwrap();
+            }
+            let spills = s.spills;
+            let mut sink: Vec<u8> = Vec::new();
+            // Through a real BGZF stream, as run() writes it.
+            let path = dir.path().join("o.bgz");
+            let f: Box<dyn Write + Send> = Box::new(File::create(&path).unwrap());
+            let mut w = bgzf::io::MultithreadedWriter::with_worker_count(
+                std::num::NonZero::new(1).unwrap(),
+                f,
+            );
+            s.finish(&mut w).unwrap();
+            w.finish().unwrap();
+            bgzf::io::Reader::new(File::open(&path).unwrap())
+                .read_to_end(&mut sink)
+                .unwrap();
+            // Nothing but our own output is left in the temp dir.
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            (ids(&sink), spills)
+        }
+
+        #[test]
+        fn bucket_order_is_samtools_order() {
+            let input = vec![
+                rec(-1, -1, false, 0),
+                rec(2, 5, false, 1),
+                rec(0, 7, true, 2),
+                rec(0, 7, false, 3),
+                rec(0, 3, true, 4),
+                rec(-1, -1, false, 5),
+                rec(0, 7, true, 6),
+                rec(2, 0, false, 7),
+            ];
+            let want = vec![4, 3, 2, 6, 7, 1, 0, 5];
+            let (got, spills) = run(1 << 20, &input);
+            assert_eq!((got, spills), (want.clone(), 0));
+            // Spilling after every record gives the same order.
+            let (got, spills) = run(0, &input);
+            assert_eq!(got, want);
+            assert!(spills >= input.len() as u64, "{spills} spills");
+        }
+
+        #[test]
+        fn sizes_parse() {
+            assert_eq!(parse_size("4G"), Ok(4 << 30));
+            assert_eq!(parse_size("4GiB"), Ok(4 << 30));
+            assert_eq!(parse_size("512m"), Ok(512 << 20));
+            assert_eq!(parse_size("64K"), Ok(64 << 10));
+            assert_eq!(parse_size("1000"), Ok(1000));
+            assert_eq!(parse_size("0"), Ok(0));
+            assert!(parse_size("4Q").is_err());
+            assert!(parse_size("G").is_err());
+            assert!(parse_size("99999999999T").is_err());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

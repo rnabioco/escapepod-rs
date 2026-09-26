@@ -10,8 +10,9 @@
 #
 # Usage:
 #   benchmarks/benchmark_align.sh --reads FILE --reference FA \
-#       [--backend NAME]... [--device auto|cpu|gpu]... [--reps N] [--threads N] \
-#       [--bin PATH]... [--md5] [-- EXTRA...]
+#       [--backend NAME]... [--device auto|cpu|gpu]... \
+#       [--sort unsorted|coordinate|samtools]... [--reps N] [--threads N] \
+#       [--bin PATH]... [--samtools PATH] [--md5] [-- EXTRA...]
 #
 # Default backends: avx512 avx2 scalar. Default device: none (the flag is not
 # passed, i.e. `auto`). With `--device cpu --device gpu` every backend runs on
@@ -25,7 +26,12 @@
 # `--md5` also prints, per run, the md5 of the output's records
 # (`samtools view | md5sum`, header excluded since `@PG CL` names the output
 # path) to stderr, so arms can be checked for identical output in the same
-# call. `samtools` comes from PATH, or from `$SAMTOOLS`.
+# call. `samtools` comes from PATH, or from `$SAMTOOLS`, or from `--samtools`.
+#
+# `--sort` adds an output-order axis (default: the flag is not passed):
+# `unsorted` and `coordinate` are `escpod align --sort ...`; `samtools` is the
+# shape it replaces, `escpod align -o - | samtools sort -@ THREADS`, timed as
+# one pipeline (CPU summed over both, MaxRSS the larger of the two).
 #
 # The same rules as benchmark_charging.sh: arms are INTERLEAVED (A B C A B C),
 # the input is read once before the first arm so no arm pays to page it in,
@@ -34,10 +40,11 @@
 
 set -uo pipefail
 
-reads="" reference="" reps=1 threads="" md5=0
+reads="" reference="" reps=1 threads="" md5=0 samtools="${SAMTOOLS:-samtools}"
 bins=()
 backends=()
 devices=()
+sorts=()
 extra=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --reference) reference="$2"; shift 2 ;;
         --backend) backends+=("$2"); shift 2 ;;
         --device) devices+=("$2"); shift 2 ;;
+        --sort) sorts+=("$2"); shift 2 ;;
+        --samtools) samtools="$2"; shift 2 ;;
         --reps) reps="$2"; shift 2 ;;
         --threads) threads="$2"; shift 2 ;;
         --bin) bins+=("$2"); shift 2 ;;
@@ -56,8 +65,8 @@ done
 [[ -n "$reads" && -n "$reference" ]] || { echo "--reads and --reference are required" >&2; exit 2; }
 [[ ${#backends[@]} -gt 0 ]] || backends=(avx512 avx2 scalar)
 [[ ${#devices[@]} -gt 0 ]] || devices=("-")
+[[ ${#sorts[@]} -gt 0 ]] || sorts=("-")
 [[ ${#bins[@]} -gt 0 ]] || bins=("./target/release/escpod")
-samtools="${SAMTOOLS:-samtools}"
 threads="${threads:-${SLURM_CPUS_PER_TASK:-$(nproc)}}"
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/escpod-align-bench.XXXXXX")"
@@ -68,19 +77,33 @@ for bin in "${bins[@]}"; do echo "# $bin: $("$bin" --version)" >&2; done
 echo "# threads=$threads reads=$reads" >&2
 cat "$reads" > /dev/null  # page the input in once, before any arm
 
-printf 'rep\tbin\tbackend\tdevice\treads\twall_s\tcpu_s\tmax_rss_mib\treads_per_s\n'
+printf 'rep\tbin\tbackend\tdevice\tsort\treads\twall_s\tcpu_s\tmax_rss_mib\treads_per_s\n'
 for rep in $(seq 1 "$reps"); do
     for b in "${!bins[@]}"; do
     bin="${bins[$b]}"
     for be in "${backends[@]}"; do
     for dev in "${devices[@]}"; do
-        log="$scratch/$b.$be.$dev.$rep.log"
+    for so in "${sorts[@]}"; do
+        log="$scratch/$b.$be.$dev.$so.$rep.log"
         dev_args=()
         [[ "$dev" == "-" ]] || dev_args=(--device "$dev")
-        ESCAPEPOD_ALIGN_BACKEND="$be" /usr/bin/time -v \
-            "$bin" align "$reads" -r "$reference" -o "$scratch/out.bam" -t "$threads" \
-            "${dev_args[@]}" "${extra[@]}" \
-            2> "$log" || { cat "$log" >&2; exit 1; }
+        if [[ "$so" == "samtools" ]]; then
+            # GNU time reports its child's rusage, and bash waits for both
+            # sides of the pipe: CPU is the sum, MaxRSS the larger process.
+            ESCAPEPOD_ALIGN_BACKEND="$be" /usr/bin/time -v bash -o pipefail -c '
+                "$1" align "$2" -r "$3" -o - -t "$4" "${@:8}" \
+                    | "$5" sort -@ "$4" -T "$6/st" -o "$7" -' _ \
+                "$bin" "$reads" "$reference" "$threads" "$samtools" "$scratch" \
+                "$scratch/out.bam" "${dev_args[@]}" "${extra[@]}" \
+                2> "$log" || { cat "$log" >&2; exit 1; }
+        else
+            sort_args=()
+            [[ "$so" == "-" ]] || sort_args=(--sort "$so")
+            ESCAPEPOD_ALIGN_BACKEND="$be" /usr/bin/time -v \
+                "$bin" align "$reads" -r "$reference" -o "$scratch/out.bam" -t "$threads" \
+                "${dev_args[@]}" "${sort_args[@]}" "${extra[@]}" \
+                2> "$log" || { cat "$log" >&2; exit 1; }
+        fi
         grep -q "kernel $be " "$log" || { echo "backend $be did not run:" >&2; grep kernel "$log" >&2; }
         if [[ "$dev" == "gpu" ]]; then
             grep -q "on GPU" "$log" || { echo "--device gpu did not score on the GPU:" >&2; cat "$log" >&2; exit 1; }
@@ -90,12 +113,13 @@ for rep in $(seq 1 "$reps"); do
         wall=$(awk -F': ' '/Elapsed \(wall clock\)/ {n=split($2,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; print s}' "$log")
         cpu=$(awk -F': ' '/User time/ {u=$2} /System time/ {s=$2} END {print u+s}' "$log")
         rss=$(awk -F': ' '/Maximum resident/ {printf "%.0f", $2/1024}' "$log")
-        grep -o 'workers were busy.*' "$log" | sed "s|^|# rep $rep bin $b $be $dev: |" >&2
+        grep -o 'workers were busy.*' "$log" | sed "s|^|# rep $rep bin $b $be $dev $so: |" >&2
         if [[ $md5 == 1 ]]; then
-            echo "# rep $rep bin $b $be $dev md5 $("$samtools" view "$scratch/out.bam" | md5sum | cut -d' ' -f1)" >&2
+            echo "# rep $rep bin $b $be $dev $so md5 $("$samtools" view "$scratch/out.bam" | md5sum | cut -d' ' -f1)" >&2
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%s\t%.0f\n' "$rep" "$b" "$be" "$dev" "$n" "$wall" "$cpu" "$rss" "$(echo "$n / $wall" | bc -l)"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%s\t%.0f\n' "$rep" "$b" "$be" "$dev" "$so" "$n" "$wall" "$cpu" "$rss" "$(echo "$n / $wall" | bc -l)"
         rm -f "$scratch/out.bam"
+    done
     done
     done
     done
