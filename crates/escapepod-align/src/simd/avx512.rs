@@ -245,3 +245,109 @@ unsafe fn pairs_kernel<const LOCAL: bool>(
         _mm512_storeu_si512(ends.end_j.as_mut_ptr() as *mut __m512i, bj);
     }
 }
+
+/// Score `query` against the 32 references of `g` with the reference-major
+/// (transposed) kernel — read row outer, reference column inner — best score
+/// per lane into `best`. Equal to [`score_group`] lane for lane; see the
+/// parent module for why it exists and how padding is kept out.
+///
+/// # Safety
+///
+/// The CPU must support AVX-512F and AVX-512BW, and `hbuf`/`fbuf` must hold
+/// at least `g.len * 32` elements.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw")]
+pub(super) unsafe fn score_group_transposed(
+    query: &[u8],
+    g: &Group,
+    gaps: Gaps,
+    mode: Mode,
+    hbuf: &mut [i16],
+    fbuf: &mut [i16],
+    best: &mut [i16; 32],
+) {
+    match mode {
+        // SAFETY: forwarded from this function's contract.
+        Mode::Local => unsafe { transposed::<true>(query, g, gaps, hbuf, fbuf, best) },
+        Mode::SemiGlobal => unsafe { transposed::<false>(query, g, gaps, hbuf, fbuf, best) },
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn transposed<const LOCAL: bool>(
+    query: &[u8],
+    g: &Group,
+    gaps: Gaps,
+    hbuf: &mut [i16],
+    fbuf: &mut [i16],
+    best: &mut [i16; 32],
+) {
+    let l = g.len;
+    assert!(hbuf.len() >= l * W && fbuf.len() >= l * W);
+    assert_eq!(g.lens.len(), W);
+    assert!(g.tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
+    let zero = _mm512_setzero_si512();
+    let neg = _mm512_set1_epi16(i16::MIN);
+    let vo = _mm512_set1_epi16(gaps.open);
+    let ve = _mm512_set1_epi16(gaps.extend);
+    let hp = hbuf.as_mut_ptr() as *mut __m512i;
+    let fp = fbuf.as_mut_ptr() as *mut __m512i;
+    let tp = g.tprof.as_ptr();
+    let ends = g.ends.as_ptr();
+    // SAFETY: every offset below is `< l` vectors into buffers of at least
+    // `l * W` i16 (asserted above), `< l` into `ends`, or `< N_CODES * l`
+    // vectors into the transposed profile; query codes are `< N_CODES`.
+    unsafe {
+        // Row 0: H = 0, F = −∞.
+        for j in 0..l {
+            _mm512_storeu_si512(hp.add(j), zero);
+            _mm512_storeu_si512(fp.add(j), neg);
+        }
+        let mut acc = if LOCAL { zero } else { neg };
+        for &c in query {
+            let row = tp.add(c as usize * l * W);
+            // Column 0 is the zero border in both modes.
+            let mut hdiag = zero;
+            let mut hleft = zero;
+            let mut e = neg;
+            for j in 0..l {
+                let s = _mm512_loadu_si512(row.add(j * W) as *const __m512i);
+                let hup = _mm512_loadu_si512(hp.add(j));
+                let f = _mm512_max_epi16(
+                    _mm512_adds_epi16(hup, vo),
+                    _mm512_adds_epi16(_mm512_loadu_si512(fp.add(j)), ve),
+                );
+                _mm512_storeu_si512(fp.add(j), f);
+                e = _mm512_max_epi16(_mm512_adds_epi16(hleft, vo), _mm512_adds_epi16(e, ve));
+                let mut h = _mm512_max_epi16(_mm512_adds_epi16(hdiag, s), e);
+                hdiag = hup;
+                h = _mm512_max_epi16(h, f);
+                if LOCAL {
+                    h = _mm512_max_epi16(h, zero);
+                }
+                _mm512_storeu_si512(hp.add(j), h);
+                hleft = h;
+                if LOCAL {
+                    // Padding cells can never beat a valid one (module docs).
+                    acc = _mm512_max_epi16(acc, h);
+                } else {
+                    // Semi-global: every row of the lane's own last column.
+                    let end = *ends.add(j);
+                    if end != 0 {
+                        acc = _mm512_mask_max_epi16(acc, end, acc, h);
+                    }
+                }
+            }
+        }
+        if !LOCAL && !query.is_empty() {
+            // Semi-global: the last row, over each lane's valid columns.
+            let lens = _mm512_loadu_si512(g.lens.as_ptr() as *const __m512i);
+            for j in 0..l {
+                let valid = _mm512_cmpgt_epi16_mask(lens, _mm512_set1_epi16(j as i16));
+                acc = _mm512_mask_max_epi16(acc, valid, acc, _mm512_loadu_si512(hp.add(j)));
+            }
+        }
+        _mm512_storeu_si512(best.as_mut_ptr() as *mut __m512i, acc);
+    }
+}

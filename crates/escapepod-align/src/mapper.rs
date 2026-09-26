@@ -21,7 +21,7 @@ use crate::panel::Panel;
 use crate::sam;
 use crate::scalar::Alignment;
 use crate::scoring::{Mode, Scoring};
-use crate::simd::{self, Backend, Profile};
+use crate::simd::{self, Backend, Kernel, Profile};
 
 /// Per-read policy. The default: minimum score 0, every tie traced, forward
 /// strand only.
@@ -146,7 +146,13 @@ pub struct Aligner {
     mode: Mode,
     backend: Backend,
     profile: Option<Profile>,
+    /// Reads at least this long take [`Kernel::Transposed`]; `None`: none do.
+    transposed_min_len: Option<usize>,
 }
+
+/// References per unit of [`Aligner::score_group`] when a read is scored by
+/// the scalar path (which has no lane groups): the SIMD kernels' widest group.
+const SCALAR_GROUP: usize = 32;
 
 impl Aligner {
     /// Prepare `panel` with the fastest kernel this machine runs (under any
@@ -174,6 +180,41 @@ impl Aligner {
             mode,
             backend,
             profile,
+            transposed_min_len: Some(simd::TRANSPOSED_MIN_READ_LEN),
+        })
+    }
+
+    /// Score reads of at least `min_len` bases with the reference-major
+    /// ([`Kernel::Transposed`]) SIMD kernel, and shorter ones with the
+    /// row-major one; `None` keeps every read on the row-major kernel. The
+    /// default is [`simd::TRANSPOSED_MIN_READ_LEN`]. Both kernels give the
+    /// same scores — this only moves time — so it is the A/B lever, not a
+    /// choice a caller needs to make.
+    pub fn with_transposed_min_len(mut self, min_len: Option<usize>) -> Self {
+        self.transposed_min_len = min_len;
+        self
+    }
+
+    /// The read length from which the transposed kernel scores, if any.
+    pub fn transposed_min_len(&self) -> Option<usize> {
+        self.transposed_min_len
+    }
+
+    /// The SIMD profile, when a read of `len` bases is scored by a SIMD
+    /// kernel at all (not the scalar backend, and inside the i16 bound).
+    fn simd_profile(&self, len: usize) -> Option<&Profile> {
+        self.profile
+            .as_ref()
+            .filter(|_| simd::fits_i16(len, self.panel.max_len(), &self.scoring))
+    }
+
+    /// Which SIMD loop order scores a read of `len` bases; `None` when the
+    /// scalar path does.
+    pub fn kernel_for(&self, len: usize) -> Option<Kernel> {
+        self.simd_profile(len)?;
+        Some(match self.transposed_min_len {
+            Some(min) if len >= min => Kernel::Transposed,
+            _ => Kernel::RowMajor,
         })
     }
 
@@ -201,11 +242,105 @@ impl Aligner {
         if query.is_empty() {
             return;
         }
-        match &self.profile {
-            Some(p) if simd::fits_i16(query.len(), self.panel.max_len(), &self.scoring) => {
-                simd::score_profile(self.backend, p, query, &self.scoring, self.mode, out)
+        match self.kernel_for(query.len()) {
+            Some(kernel) => self.score_simd(query, kernel, out),
+            None => simd::score_scalar(&self.panel, query, &self.scoring, self.mode, out),
+        }
+    }
+
+    /// [`Aligner::score_all`] with the SIMD loop order forced, for tests that
+    /// pin one kernel against the other. Falls back to the scalar path where
+    /// `score_all` would.
+    #[cfg(test)]
+    pub(crate) fn score_all_with(&self, query: &[u8], kernel: Kernel, out: &mut Vec<i32>) {
+        out.clear();
+        out.resize(self.panel.len(), 0);
+        if query.is_empty() {
+            return;
+        }
+        match self.kernel_for(query.len()) {
+            Some(_) => self.score_simd(query, kernel, out),
+            None => simd::score_scalar(&self.panel, query, &self.scoring, self.mode, out),
+        }
+    }
+
+    fn score_simd(&self, query: &[u8], kernel: Kernel, out: &mut [i32]) {
+        let p = self
+            .profile
+            .as_ref()
+            .expect("kernel_for checked the profile");
+        simd::score_profile(
+            self.backend,
+            p,
+            query,
+            &self.scoring,
+            self.mode,
+            kernel,
+            out,
+        )
+    }
+
+    /// Into how many independent units [`Aligner::score_group`] splits the
+    /// panel for a read of `query_len` bases: the SIMD kernel's lane groups,
+    /// or runs of references when the scalar path scores it.
+    ///
+    /// A caller with threads to spare can score one long read's units on
+    /// different threads and assemble the row; this crate itself does not
+    /// spawn anything.
+    pub fn score_groups(&self, query_len: usize) -> usize {
+        match self.simd_profile(query_len) {
+            Some(p) => p.groups.len(),
+            None => self.panel.len().div_ceil(SCALAR_GROUP),
+        }
+    }
+
+    /// Score `query` (codes) against the references of unit `group` (of
+    /// [`Aligner::score_groups`]), replacing `out` with one `(panel index,
+    /// score)` per reference in it. Every unit's scores together equal
+    /// [`Aligner::score_all`]'s, reference for reference, whichever kernel
+    /// the read's length selects.
+    ///
+    /// # Panics
+    /// If `group` is not below `score_groups(query.len())`.
+    pub fn score_group(&self, query: &[u8], group: usize, out: &mut Vec<(usize, i32)>) {
+        out.clear();
+        match self.kernel_for(query.len()) {
+            Some(kernel) => {
+                let p = self
+                    .profile
+                    .as_ref()
+                    .expect("kernel_for checked the profile");
+                assert!(group < p.groups.len(), "group {group} out of range");
+                if query.is_empty() {
+                    let refs = p.groups[group].refs.iter().filter(|&&r| r != usize::MAX);
+                    out.extend(refs.map(|&r| (r, 0)));
+                    return;
+                }
+                simd::score_profile_group(
+                    self.backend,
+                    p,
+                    group,
+                    query,
+                    &self.scoring,
+                    self.mode,
+                    kernel,
+                    |r, s| out.push((r, s)),
+                );
             }
-            _ => simd::score_scalar(&self.panel, query, &self.scoring, self.mode, out),
+            None => {
+                let start = group * SCALAR_GROUP;
+                assert!(start < self.panel.len(), "group {group} out of range");
+                let end = (start + SCALAR_GROUP).min(self.panel.len());
+                out.extend((start..end).map(|r| {
+                    let codes = &self.panel.get(r).codes;
+                    let s = if query.is_empty() {
+                        0
+                    } else {
+                        crate::scalar::score(query, codes, &self.scoring, self.mode)
+                    };
+                    (r, s)
+                }));
+            }
         }
     }
 
@@ -501,6 +636,64 @@ mod tests {
             m.row(k + if rev { reads.len() } else { 0 })
         });
         assert_eq!(got, a.map_reads(&reads, &opts));
+    }
+
+    /// Every unit of the per-group API, assembled, equals the whole-panel
+    /// score: both modes, every backend, short reads (row-major) and a long
+    /// one (transposed), on a panel wide enough for several lane groups.
+    #[test]
+    fn per_group_scores_equal_score_all() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut base = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b"ACGT"[(x % 4) as usize]
+        };
+        let refs: Vec<(String, Vec<u8>)> = (0..70)
+            .map(|k| (format!("r{k}"), (0..40 + k).map(|_| base()).collect()))
+            .collect();
+        let panel = Panel::new(refs).unwrap();
+        let mut reads: Vec<Vec<u8>> = vec![Vec::new(), b"ACGTACGT".to_vec()];
+        for len in [30, 95, 180] {
+            reads.push((0..len).map(|_| base()).collect());
+        }
+        let mut long: Vec<u8> = (0..simd::TRANSPOSED_MIN_READ_LEN + 777)
+            .map(|_| base())
+            .collect();
+        long[500..545].copy_from_slice(&panel.get(5).seq);
+        reads.push(long);
+        for backend in Backend::available() {
+            for mode in [Mode::Local, Mode::SemiGlobal] {
+                let a = Aligner::with_backend(panel.clone(), Scoring::default(), mode, backend)
+                    .unwrap();
+                for read in &reads {
+                    let q = encode(read);
+                    let mut want = Vec::new();
+                    a.score_all(&q, &mut want);
+                    let mut got = vec![None; panel.len()];
+                    let mut unit = Vec::new();
+                    for g in 0..a.score_groups(q.len()) {
+                        a.score_group(&q, g, &mut unit);
+                        for &(r, s) in &unit {
+                            assert!(got[r].replace(s).is_none(), "reference {r} twice");
+                        }
+                    }
+                    let got: Vec<i32> = got
+                        .into_iter()
+                        .map(|s| s.expect("every reference"))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        want,
+                        "{} {} len {}",
+                        backend.name(),
+                        mode.name(),
+                        q.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

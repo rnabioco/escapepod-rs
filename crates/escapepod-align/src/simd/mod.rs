@@ -27,6 +27,35 @@
 //! mode takes the last row of each valid column and the whole of the lane's
 //! own last column.
 //!
+//! # Two loop orders: row-major and reference-major
+//!
+//! The walk above keeps two vectors of state *per read base*, so its working
+//! set grows with the read: fine for the ~130 nt median tRNA read, and 50 MB
+//! per lane group for the 395 kb read one real sample carries — streamed once
+//! per reference column, which makes the kernel memory-bound on exactly the
+//! reads that already cost the most (2e9 cells/s against ~4.5e9 in cache).
+//! [`Kernel::Transposed`] runs the same recurrence with the loops swapped:
+//! read row outer, reference column inner, so the state is the previous
+//! *row* — `H` and `F` per reference column, ~25 KB for a 200 nt group at 32
+//! lanes, whatever the read's length — and `E` travels along the row in a
+//! register. It reads a second profile laid out code-major
+//! (`tprof[(c * len + j) * lanes + lane]`), so one read row streams one
+//! contiguous slice of it.
+//!
+//! Padding columns are handled differently too. The row-major kernel masks
+//! each column; here a padding column scores `i16::MIN` in the transposed
+//! profile, so no padding cell can ever take the diagonal. In local mode that
+//! makes every padding cell a valid cell plus gap penalties, or the zero
+//! floor, so it can never exceed the lane's best and the running maximum
+//! needs no mask — for any scoring, `mismatch >= 0` included. Semi-global
+//! mode takes the lane's own last column inside the row loop (only at the at
+//! most `lanes` columns that end a lane, `Group::ends`) and the last row in
+//! one masked pass after it.
+//!
+//! [`Aligner`](crate::Aligner) picks the transposed kernel for reads of at
+//! least [`TRANSPOSED_MIN_READ_LEN`] bases; below that the row-major kernel
+//! is the measured, tuned default and stays so.
+//!
 //! # i16 is exact, not approximate
 //!
 //! Lanes are `i16` with saturating arithmetic, and `i16::MIN` stands for −∞.
@@ -73,6 +102,31 @@ pub enum Backend {
 
 /// The environment variable that caps the dispatch.
 pub const BACKEND_ENV: &str = "ESCAPEPOD_ALIGN_BACKEND";
+
+/// Reads at least this long are scored with the reference-major
+/// ([`Kernel::Transposed`]) kernel by default; shorter ones with the
+/// row-major one. Chosen from `examples/long_read_probe.rs` on Cascade Lake
+/// (`benchmarks/README.md`).
+pub const TRANSPOSED_MIN_READ_LEN: usize = 1024;
+
+/// Loop order of a SIMD score kernel (see the module docs). Both compute the
+/// same scores; they differ only in what stays in cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kernel {
+    /// Reference column outer, read row inner: state per read base.
+    RowMajor,
+    /// Read row outer, reference column inner: state per reference column.
+    Transposed,
+}
+
+impl Kernel {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kernel::RowMajor => "row-major",
+            Kernel::Transposed => "transposed",
+        }
+    }
+}
 
 impl Backend {
     #[cfg(target_arch = "x86_64")]
@@ -168,6 +222,11 @@ pub(crate) struct Group {
     pub(crate) refs: Vec<usize>,
     /// `prof[(j * N_CODES + c) * lanes + lane]` = `s(c, ref_lane[j])`.
     pub(crate) prof: Vec<i16>,
+    /// The transposed kernel's profile: `tprof[(c * len + j) * lanes + lane]`
+    /// = `s(c, ref_lane[j])`, and `i16::MIN` past the lane's end.
+    pub(crate) tprof: Vec<i16>,
+    /// `ends[j]`: bit `lane` set when column `j` is that lane's last.
+    pub(crate) ends: Vec<u32>,
 }
 
 /// A panel laid out for one lane width under one scoring.
@@ -196,14 +255,21 @@ impl Profile {
                 let mut idx = vec![usize::MAX; lanes];
                 // Padding scores as a mismatch; it is masked out, never read.
                 let mut prof = vec![scoring.mismatch as i16; len * N_CODES * lanes];
+                // Padding is −∞ here: no padding cell can take the diagonal.
+                let mut tprof = vec![i16::MIN; N_CODES * len * lanes];
+                let mut ends = vec![0u32; len];
                 for (lane, &ri) in chunk.iter().enumerate() {
                     let codes = refs[ri];
                     lens[lane] = codes.len() as i16;
                     idx[lane] = ri;
+                    if let Some(last) = codes.len().checked_sub(1) {
+                        ends[last] |= 1 << lane;
+                    }
                     for (j, &r) in codes.iter().enumerate() {
                         for c in 0..N_CODES {
-                            prof[(j * N_CODES + c) * lanes + lane] =
-                                scoring.substitution(c as u8, r) as i16;
+                            let s = scoring.substitution(c as u8, r) as i16;
+                            prof[(j * N_CODES + c) * lanes + lane] = s;
+                            tprof[(c * len + j) * lanes + lane] = s;
                         }
                     }
                 }
@@ -212,6 +278,8 @@ impl Profile {
                     lens,
                     refs: idx,
                     prof,
+                    tprof,
+                    ends,
                 }
             })
             .collect();
@@ -392,13 +460,42 @@ pub(crate) fn align_pairs(
 ///
 /// The caller has checked [`fits_i16`] and that `backend` is supported and
 /// matches `profile.lanes`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn score_profile(
     backend: Backend,
     profile: &Profile,
     query: &[u8],
     scoring: &Scoring,
     mode: Mode,
+    kernel: Kernel,
     out: &mut [i32],
+) {
+    for g in 0..profile.groups.len() {
+        score_profile_group(
+            backend,
+            profile,
+            g,
+            query,
+            scoring,
+            mode,
+            kernel,
+            |ri, s| out[ri] = s,
+        );
+    }
+}
+
+/// [`score_profile`] for one lane group: `emit(panel_index, score)` once per
+/// reference of group `group`. The unit a caller can spread over threads.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score_profile_group(
+    backend: Backend,
+    profile: &Profile,
+    group: usize,
+    query: &[u8],
+    scoring: &Scoring,
+    mode: Mode,
+    kernel: Kernel,
+    mut emit: impl FnMut(usize, i32),
 ) {
     debug_assert!(backend.supported());
     debug_assert_eq!(backend.lanes(), profile.lanes);
@@ -406,24 +503,26 @@ pub(crate) fn score_profile(
         open: scoring.gap_open as i16,
         extend: scoring.gap_extend as i16,
     };
+    let g = &profile.groups[group];
     let lanes = profile.lanes;
+    let mut best = [0i16; 32];
     SCRATCH.with(|s| {
         let (hbuf, ebuf) = &mut *s.borrow_mut();
-        let need = query.len() * lanes;
+        let need = match kernel {
+            Kernel::RowMajor => query.len() * lanes,
+            Kernel::Transposed => g.len * lanes,
+        };
         if hbuf.len() < need {
             hbuf.resize(need, 0);
             ebuf.resize(need, 0);
         }
-        let mut best = [0i16; 32];
-        for g in &profile.groups {
-            run_score_group(backend, query, g, gaps, mode, hbuf, ebuf, &mut best);
-            for (lane, &ri) in g.refs.iter().enumerate() {
-                if ri != usize::MAX {
-                    out[ri] = best[lane] as i32;
-                }
-            }
-        }
+        run_score_group(backend, kernel, query, g, gaps, mode, hbuf, ebuf, &mut best);
     });
+    for (lane, &ri) in g.refs.iter().enumerate() {
+        if ri != usize::MAX {
+            emit(ri, best[lane] as i32);
+        }
+    }
 }
 
 /// One score kernel call, dispatched on `backend`.
@@ -435,6 +534,7 @@ pub(crate) fn score_profile(
 #[allow(clippy::too_many_arguments)]
 fn run_score_group(
     backend: Backend,
+    kernel: Kernel,
     query: &[u8],
     g: &Group,
     gaps: Gaps,
@@ -443,13 +543,24 @@ fn run_score_group(
     ebuf: &mut [i16],
     best: &mut [i16; 32],
 ) {
-    match backend {
-        Backend::Scalar => unreachable!("scalar has no profile"),
-        // SAFETY: a SIMD `Backend` reaches here only through `Aligner`, which
-        // refuses one the CPU does not support; the caller sized the buffers
-        // for `query.len() * lanes` and the profile for `lanes`.
-        Backend::Avx2 => unsafe { avx2::score_group(query, g, gaps, mode, hbuf, ebuf, best) },
-        Backend::Avx512 => unsafe { avx512::score_group(query, g, gaps, mode, hbuf, ebuf, best) },
+    // SAFETY: a SIMD `Backend` reaches here only through `Aligner`, which
+    // refuses one the CPU does not support; the caller sized the buffers for
+    // `query.len() * lanes` (row-major) or `g.len * lanes` (transposed) and
+    // the profile for `lanes`.
+    match (backend, kernel) {
+        (Backend::Scalar, _) => unreachable!("scalar has no profile"),
+        (Backend::Avx2, Kernel::RowMajor) => unsafe {
+            avx2::score_group(query, g, gaps, mode, hbuf, ebuf, best)
+        },
+        (Backend::Avx2, Kernel::Transposed) => unsafe {
+            avx2::score_group_transposed(query, g, gaps, mode, hbuf, ebuf, best)
+        },
+        (Backend::Avx512, Kernel::RowMajor) => unsafe {
+            avx512::score_group(query, g, gaps, mode, hbuf, ebuf, best)
+        },
+        (Backend::Avx512, Kernel::Transposed) => unsafe {
+            avx512::score_group_transposed(query, g, gaps, mode, hbuf, ebuf, best)
+        },
     }
 }
 
@@ -457,6 +568,7 @@ fn run_score_group(
 #[allow(clippy::too_many_arguments)]
 fn run_score_group(
     _backend: Backend,
+    _kernel: Kernel,
     _query: &[u8],
     _g: &Group,
     _gaps: Gaps,
@@ -755,6 +867,176 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The three schemes above plus the edges `Scoring::validate` accepts and
+    /// the transposed kernel's padding argument has to survive: a mismatch
+    /// of zero, and a positive one.
+    fn transposed_schemes() -> [Scoring; 5] {
+        let [a, b, c] = schemes();
+        [
+            a,
+            b,
+            c,
+            Scoring::new(2, 0, -10, -1).unwrap(),
+            Scoring::new(3, 1, -5, -2).unwrap(),
+        ]
+    }
+
+    /// A read drawn from the panel: pieces of mutated references between
+    /// stretches of random sequence, `len` bases in all.
+    fn chimeric_read(rng: &mut Rng, panel: &Panel, len: usize) -> Vec<u8> {
+        let mut read = Vec::with_capacity(len + 300);
+        while read.len() < len {
+            let gap = rng.below(400);
+            read.extend(random_seq(rng, gap, 0.01));
+            let r = &panel.get(rng.below(panel.len())).seq;
+            read.extend(mutate(rng, r));
+        }
+        read.truncate(len);
+        read
+    }
+
+    /// The transposed kernel, forced, against the scalar oracle by equality:
+    /// every SIMD backend, both modes, five schemes (two with a mismatch of
+    /// zero or above), ragged lane groups, and reads short, either side of
+    /// [`TRANSPOSED_MIN_READ_LEN`], and 20–60 kb long.
+    #[test]
+    fn transposed_matches_scalar_random() {
+        let mut rng = Rng(0x5eed_0004);
+        let panel = random_panel(&mut rng, 37);
+        let backends: Vec<Backend> = Backend::available()
+            .into_iter()
+            .filter(|&b| b != Backend::Scalar)
+            .collect();
+        if backends.is_empty() {
+            eprintln!("transposed_matches_scalar_random: no SIMD backend on this machine; skipped");
+            return;
+        }
+        let t = TRANSPOSED_MIN_READ_LEN;
+        let mut combo = 0usize;
+        for scoring in transposed_schemes() {
+            for mode in [Mode::Local, Mode::SemiGlobal] {
+                let oracle =
+                    Aligner::with_backend(panel.clone(), scoring, mode, Backend::Scalar).unwrap();
+                let simd: Vec<Aligner> = backends
+                    .iter()
+                    .map(|&b| Aligner::with_backend(panel.clone(), scoring, mode, b).unwrap())
+                    .collect();
+                let mut reads: Vec<Vec<u8>> = Vec::new();
+                for k in 0..12 {
+                    let len = 1 + rng.below(320);
+                    reads.push(if k % 3 == 2 {
+                        random_seq(&mut rng, len, 0.02)
+                    } else {
+                        chimeric_read(&mut rng, &panel, len)
+                    });
+                }
+                for len in [t - 1, t + 1] {
+                    reads.push(chimeric_read(&mut rng, &panel, len));
+                }
+                // One long read per scheme and mode, 20–56 kb across them.
+                reads.push(chimeric_read(&mut rng, &panel, 20_000 + 4_000 * combo));
+                combo += 1;
+                for read in &reads {
+                    let q = encode(read);
+                    let mut want = Vec::new();
+                    oracle.score_all(&q, &mut want);
+                    for a in &simd {
+                        let mut got = Vec::new();
+                        a.score_all_with(&q, Kernel::Transposed, &mut got);
+                        assert_eq!(
+                            got,
+                            want,
+                            "{} {} {scoring} read of {} nt",
+                            a.backend().name(),
+                            mode.name(),
+                            q.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both loop orders on the real tRNA reads against both 47-reference
+    /// fixture panels: equal, reference for reference.
+    #[test]
+    fn transposed_matches_row_major_on_fixture_reads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let golden: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("tests/fixtures/align_golden.json")).unwrap(),
+        )
+        .unwrap();
+        let reads: Vec<Vec<u8>> = golden["pairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["source"].as_str() != Some("random"))
+            .map(|p| p["query"].as_str().unwrap().as_bytes().to_vec())
+            .collect();
+        assert!(reads.len() >= 5, "golden carries too few fixture reads");
+        for fasta in ["trna_reference.fa", "trna_reference_ambiguous.fa"] {
+            let file = std::fs::File::open(
+                root.join("../escapepod-classify/tests/fixtures")
+                    .join(fasta),
+            )
+            .unwrap();
+            let refs = crate::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
+            let panel = Panel::new(refs).unwrap();
+            for scoring in transposed_schemes() {
+                for mode in [Mode::Local, Mode::SemiGlobal] {
+                    for backend in Backend::available() {
+                        if backend == Backend::Scalar {
+                            continue;
+                        }
+                        let a =
+                            Aligner::with_backend(panel.clone(), scoring, mode, backend).unwrap();
+                        for read in &reads {
+                            let q = encode(read);
+                            let (mut row, mut tr) = (Vec::new(), Vec::new());
+                            a.score_all_with(&q, Kernel::RowMajor, &mut row);
+                            a.score_all_with(&q, Kernel::Transposed, &mut tr);
+                            assert_eq!(
+                                tr,
+                                row,
+                                "{} {} {scoring} {fasta}",
+                                backend.name(),
+                                mode.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The dispatch takes the transposed kernel from the named threshold on,
+    /// the row-major one below it, neither under the scalar backend, and
+    /// never once the threshold is switched off.
+    #[test]
+    fn dispatch_picks_transposed_above_threshold() {
+        let mut rng = Rng(0x5eed_0005);
+        let panel = random_panel(&mut rng, 37);
+        let t = TRANSPOSED_MIN_READ_LEN;
+        for backend in Backend::available() {
+            let a = Aligner::with_backend(panel.clone(), Scoring::default(), Mode::Local, backend)
+                .unwrap();
+            assert_eq!(a.transposed_min_len(), Some(t));
+            if backend == Backend::Scalar {
+                assert_eq!(a.kernel_for(t), None);
+                continue;
+            }
+            assert_eq!(a.kernel_for(1), Some(Kernel::RowMajor));
+            assert_eq!(a.kernel_for(t - 1), Some(Kernel::RowMajor));
+            assert_eq!(a.kernel_for(t), Some(Kernel::Transposed));
+            assert_eq!(a.kernel_for(400_000), Some(Kernel::Transposed));
+            let off = a.clone().with_transposed_min_len(None);
+            assert_eq!(off.kernel_for(400_000), Some(Kernel::RowMajor));
+            let low = a.with_transposed_min_len(Some(10));
+            assert_eq!(low.kernel_for(9), Some(Kernel::RowMajor));
+            assert_eq!(low.kernel_for(10), Some(Kernel::Transposed));
         }
     }
 
