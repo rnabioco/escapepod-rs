@@ -23,7 +23,7 @@
 | feature | gates |
 |---|---|
 | `cnn-detect` | tract boundary CNN, `onnx_rewrite` |
-| `crf-decode` | tract CRF encoder + `fqxv-align` (lattice decode always compiled) |
+| `crf-decode` | tract CRF encoder (lattice decode always compiled) |
 | `gpu` | **atomic**; implies both above; adds cudarc DTW/SVM, ort CUDA CNN+CRF, `cuda`, `ort_ep` |
 | `train` | `train.rs`; no extra crates |
 - `cnn-gpu`/`crf-gpu` no longer exist — `gpu` is the only GPU feature.

@@ -193,7 +193,6 @@ git dependency blocking publication, which is why it keeps a separate flag while
 | `serde`, `serde_json` | Model JSON |
 | `linfa`, `linfa-svm` | SVM training (feature `train`) |
 | `tract-onnx` | CNN adapter detection (feature `cnn-detect`) |
-| `fqxv-align` | WFA barcode matching (feature `crf-decode`) |
 
 ### escapepod-classify
 
