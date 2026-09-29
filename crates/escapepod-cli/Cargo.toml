@@ -198,8 +198,8 @@ demux-models = ["demux"]
 #
 # There used to be granular `cnn-gpu` / `crf-gpu` flags underneath this one,
 # justified as serving library consumers and CI isolation builds. Neither
-# holds: `escapepod-demux` depends on `fqxv-align` by git URL, so it and this
-# crate cannot be `cargo publish`ed and have no external consumers to serve,
+# holds: `escapepod-demux` is not published, so neither it nor this
+# crate has external consumers to serve,
 # and the isolation builds only ever proved that partial-GPU binaries compile —
 # binaries nobody ships, whose sole cost was the runtime prose in
 # `commands/demux/run.rs` explaining which half of a GPU request was a silent

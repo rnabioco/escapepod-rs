@@ -28,7 +28,7 @@
 //! - Optional `crf-decode` feature: the ONNX encoder through tract
 //!   ([`crf::CrfEncoder`]); `gpu` runs it on onnxruntime + CUDA instead.
 //! - [`crf::BarcodeRefs`]: matching a decoded sequence to a barcode reference
-//!   by edit distance (wavefront alignment via `fqxv-align`), with the
+//!   by edit distance (bit-vector Levenshtein), with the
 //!   margin-to-second-best as the confidence.
 //!
 //! # Model workflow

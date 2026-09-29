@@ -1,12 +1,11 @@
 //! Matching a decoded sequence to a barcode reference by edit distance.
 //!
 //! The last step of basecall-then-match demultiplexing, and the one that turns
-//! [`super::lattice`]'s sequences into barcode calls. Alignment comes from
-//! `fqxv-align`'s wavefront implementation rather than a local Levenshtein: WFA's
-//! work scales with the edit *distance* rather than sequence length, which is
-//! the right shape here because a decode sits ~4 edits from its own reference
-//! and ~10+ from every other one, so most of the 96 comparisons abandon almost
-//! immediately.
+//! [`super::lattice`]'s sequences into barcode calls. Distance comes from
+//! a bit-parallel Levenshtein (Myers 1999): a 40 nt reference packs into one
+//! `u64`, so a comparison is one pass over the decode with no allocation. A
+//! decode sits ~4 edits from its own reference and ~10+ from every other one,
+//! so the bounded form abandons most of the 96 comparisons well before the end.
 //!
 //! # What counts as a reference
 //!
@@ -28,8 +27,6 @@
 //! A margin of 0 means two references tie and the read is genuinely ambiguous.
 
 use std::path::Path;
-
-use fqxv_align::{wfa_align, wfa_align_opt};
 
 /// A barcode reference set: names and their target sequences.
 #[derive(Debug, Clone, Default)]
@@ -250,11 +247,10 @@ impl BarcodeRefs {
         for (i, refseq) in self.seqs.iter().enumerate() {
             // Cap each comparison at the current runner-up. Both branches below
             // discard any `d >= second`, so a reference that cannot beat it does
-            // not need its exact distance — only the fact that it lost. WFA's
-            // work scales with the distance it is allowed to reach, so this is
-            // what actually buys the early abandonment this module was written
-            // around: without a cap the `max_score` guard can never fire and
-            // every reference runs to its true optimum plus a full traceback.
+            // not need its exact distance — only the fact that it lost. The
+            // bit-vector abandons once the running score cannot get under the
+            // cap, so this is what buys the early exit: without a cap every
+            // reference runs the whole decode to its true distance.
             //
             // `best <= second` holds throughout (the swap below preserves it),
             // so capping at `second` cannot hide a new best either.
@@ -279,37 +275,107 @@ impl BarcodeRefs {
     }
 }
 
-/// Exact Levenshtein distance via WFA.
-///
-/// The cap is set to the longest possible optimal score — one full deletion
-/// plus one full insertion cannot be beaten by any alignment — so WFA never
-/// truncates and this is exact, while the cap still bounds its `O(s²)`
-/// traceback storage. `wfa_align`'s `dist` is substitutions plus inserted plus
-/// deleted bases, i.e. unit-cost Levenshtein, which is what the reference
-/// implementation computes.
+/// Exact Levenshtein distance (substitutions, insertions and deletions cost 1).
 fn edit_distance(a: &[u8], b: &[u8]) -> u32 {
-    let cap = (a.len() + b.len()) as u32;
-    wfa_align(a, b, cap).dist
+    bounded_distance(a, b, u32::MAX).expect("no limit cannot be exceeded")
 }
 
 /// Levenshtein distance, but only when it is strictly below `limit`.
 ///
 /// `Some(d)` iff `d < limit`; `None` means "at least `limit`", with no exact
-/// value computed. WFA abandons as soon as its wavefront passes `max_score`, so
-/// a reference far from the query stops early instead of running to its true
-/// optimum — and `wfa_align_opt` returns before the traceback, which is where
-/// the per-comparison allocations live.
-///
-/// `limit` is clamped to the longest possible optimal score so that the
-/// unbounded case (`u32::MAX`, the first comparison) stays exact rather than
-/// asking WFA for a score it can never reach.
+/// value computed, so a reference far from the query stops early instead of
+/// running to its true optimum. `limit == u32::MAX` is exact.
 fn edit_distance_within(a: &[u8], b: &[u8], limit: u32) -> Option<u32> {
+    bounded_distance(a, b, limit)
+}
+
+fn bounded_distance(a: &[u8], b: &[u8], limit: u32) -> Option<u32> {
     if limit == 0 {
         return None;
     }
-    let max_possible = (a.len() + b.len()) as u32;
-    let cap = (limit - 1).min(max_possible);
-    wfa_align_opt(a, b, cap).map(|al| al.dist)
+    let (pat, text) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    // Each length difference costs at least one indel.
+    if (text.len() - pat.len()) as u64 >= u64::from(limit) {
+        return None;
+    }
+    if pat.is_empty() {
+        return Some(text.len() as u32);
+    }
+    myers64(pat, text, limit).unwrap_or_else(|| {
+        let d = levenshtein_dp(pat, text);
+        (d < limit).then_some(d)
+    })
+}
+
+/// 2-bit code of an unambiguous base; anything else is not bit-parallel.
+fn base_code(b: u8) -> Option<usize> {
+    match b {
+        b'A' => Some(0),
+        b'C' => Some(1),
+        b'G' => Some(2),
+        b'T' => Some(3),
+        _ => None,
+    }
+}
+
+/// Myers' bit-vector edit distance, pattern in one machine word.
+///
+/// The outer `None` means "not applicable" — the pattern is longer than 64 or
+/// holds a byte that is not `ACGT` (where a match table over four symbols would
+/// silently call two equal `N`s different) — and the caller falls back to the
+/// DP. The inner value is [`bounded_distance`]'s.
+///
+/// `pv`/`mv` are the vertical +1/−1 deltas down the pattern column, so `score`
+/// tracks the last row. It can fall by at most one per text column, hence the
+/// abandon test: the final distance is at least `score - columns left`.
+fn myers64(pat: &[u8], text: &[u8], limit: u32) -> Option<Option<u32>> {
+    if pat.len() > 64 {
+        return None;
+    }
+    let mut peq = [0u64; 4];
+    for (i, &c) in pat.iter().enumerate() {
+        peq[base_code(c)?] |= 1 << i;
+    }
+    let last = 1u64 << (pat.len() - 1);
+    let (mut pv, mut mv) = (!0u64, 0u64);
+    let mut score = pat.len() as u32;
+    for (j, &c) in text.iter().enumerate() {
+        let eq = base_code(c).map_or(0, |k| peq[k]);
+        let xv = eq | mv;
+        let xh = ((eq & pv).wrapping_add(pv) ^ pv) | eq;
+        let ph = mv | !(xh | pv);
+        let mh = pv & xh;
+        if ph & last != 0 {
+            score += 1;
+        } else if mh & last != 0 {
+            score -= 1;
+        }
+        // Global alignment: the top row grows by one per column, so a +1 is
+        // carried in (a substring search would shift in 0).
+        let ph = (ph << 1) | 1;
+        let mh = mh << 1;
+        pv = mh | !(xv | ph);
+        mv = ph & xv;
+        if score.saturating_sub((text.len() - 1 - j) as u32) >= limit {
+            return Some(None);
+        }
+    }
+    Some((score < limit).then_some(score))
+}
+
+/// Textbook two-row DP: the fallback for what the bit-vector cannot take.
+fn levenshtein_dp(a: &[u8], b: &[u8]) -> u32 {
+    let mut prev: Vec<u32> = (0..=b.len() as u32).collect();
+    let mut cur = vec![0u32; b.len() + 1];
+    for (i, &x) in a.iter().enumerate() {
+        cur[0] = i as u32 + 1;
+        for (j, &y) in b.iter().enumerate() {
+            let sub = prev[j] + u32::from(x != y);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 #[cfg(test)]
@@ -317,8 +383,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Textbook DP, to check the WFA wrapper actually computes Levenshtein and
-    /// that the cap never truncates.
+    /// Textbook DP, kept apart from the production fallback so the oracle the
+    /// bit-vector is checked against shares no code with it.
     fn lev_reference(a: &[u8], b: &[u8]) -> u32 {
         let mut prev: Vec<u32> = (0..=b.len() as u32).collect();
         let mut cur = vec![0u32; b.len() + 1];
@@ -440,6 +506,85 @@ mod tests {
         assert_eq!(edit_distance_within(a, b, u32::MAX), Some(1));
         // Identical sequences are reachable at any non-zero limit.
         assert_eq!(edit_distance_within(a, a, 1), Some(0));
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Bit-vector against the DP over every length the single word can hold,
+    /// including empty, prefix/suffix and related pairs, and over the bytes it
+    /// hands to the fallback (non-ACGT, > 64 nt).
+    #[test]
+    fn bit_vector_matches_dp_on_random_pairs() {
+        let mut st = 0xD1B5_4A32_D192_ED03u64;
+        let alphabet: [&[u8]; 3] = [b"ACGT", b"AC", b"ACGTN"];
+        for trial in 0..3000 {
+            let alpha = alphabet[trial % 3];
+            let la = (xorshift(&mut st) % 80) as usize;
+            let a: Vec<u8> = (0..la)
+                .map(|_| alpha[(xorshift(&mut st) as usize) % alpha.len()])
+                .collect();
+            // Half the time b is a mutated copy of a, so small distances (the
+            // regime that matters) are well covered.
+            let b: Vec<u8> = if trial % 2 == 0 {
+                let mut b = a.clone();
+                for _ in 0..(xorshift(&mut st) % 6) {
+                    match (xorshift(&mut st) % 3, b.len()) {
+                        (0, n) if n > 0 => b[(xorshift(&mut st) as usize) % n] = alpha[0],
+                        (1, n) if n > 0 => {
+                            b.remove((xorshift(&mut st) as usize) % n);
+                        }
+                        _ => b.insert(
+                            (xorshift(&mut st) as usize) % (b.len() + 1),
+                            alpha[(xorshift(&mut st) as usize) % alpha.len()],
+                        ),
+                    }
+                }
+                b
+            } else {
+                let lb = (xorshift(&mut st) % 80) as usize;
+                (0..lb)
+                    .map(|_| alpha[(xorshift(&mut st) as usize) % alpha.len()])
+                    .collect()
+            };
+            let want = lev_reference(&a, &b);
+            assert_eq!(edit_distance(&a, &b), want, "a={a:?} b={b:?}");
+            assert_eq!(edit_distance(&b, &a), want, "symmetry a={a:?} b={b:?}");
+            // `Some(d)` iff `d < limit`, at every limit around the true value.
+            for limit in [0, 1, want.saturating_sub(1), want, want + 1, u32::MAX] {
+                let expect = (want < limit).then_some(want);
+                assert_eq!(
+                    edit_distance_within(&a, &b, limit),
+                    expect,
+                    "limit {limit} want {want} a={a:?} b={b:?}"
+                );
+            }
+        }
+    }
+
+    /// Two equal non-ACGT bytes must still match; a four-symbol table would
+    /// call them different.
+    #[test]
+    fn equal_ambiguous_bases_are_not_edits() {
+        assert_eq!(edit_distance(b"ACNGT", b"ACNGT"), 0);
+        assert_eq!(edit_distance(b"ACNGT", b"ACTGT"), 1);
+    }
+
+    /// A pattern longer than one word takes the DP and stays exact.
+    #[test]
+    fn long_patterns_fall_back_to_the_dp() {
+        let a = b"ACGT".repeat(20);
+        let mut b = a.clone();
+        b[6] = b'T'; // index 6 is a G: a real substitution
+        b.remove(40);
+        assert_eq!(lev_reference(&a, &b), 2);
+        assert_eq!(edit_distance(&a, &b), 2);
+        assert_eq!(edit_distance_within(&a, &b, 2), None);
+        assert_eq!(edit_distance_within(&a, &b, 3), Some(lev_reference(&a, &b)));
     }
 
     fn write_csv(body: &str) -> tempfile::NamedTempFile {

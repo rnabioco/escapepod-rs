@@ -1,7 +1,7 @@
 # crf/
 
 ## What this is
-Port of bonito's `CTC_CRF` (koi `ctc.{fwd,bwd}_scores_cu_sparse`). Encoder (native LSTM stack, tract, or ort CUDA) → two-pass lattice decode → barcode call by WFA edit distance (`barcode`) or constrained partition function (`refchain`).
+Port of bonito's `CTC_CRF` (koi `ctc.{fwd,bwd}_scores_cu_sparse`). Encoder (native LSTM stack, tract, or ort CUDA) → two-pass lattice decode → barcode call by edit distance (`barcode`) or constrained partition function (`refchain`).
 
 ## Module map
 - `mod.rs` — gates/re-exports; `BoundaryInputSpec` lives here so pin plumbing builds without `crf-decode`.
@@ -12,7 +12,7 @@ Port of bonito's `CTC_CRF` (koi `ctc.{fwd,bwd}_scores_cu_sparse`). Encoder (nati
 - `encoder_native.rs` — `Recognized::from_proto` recognizer + `encode_*` over `escapepod_signal::lstm`.
 - `encoder_gpu.rs` — `CrfEncoderGpu`: ort CUDA, zero-copy, halve-on-OOM; entry `basecall_batch*`.
 - `lattice_gpu.rs` + `_kernel.rs` — batched CUDA decode + ref scan, NVRTC at load; entry `decode_*time_major`.
-- `barcode.rs` — `BarcodeRefs::match_sequence` (fqxv WFA).
+- `barcode.rs` — `BarcodeRefs::match_sequence` (Myers bit-vector Levenshtein, DP fallback).
 
 ## Invariants and traps
 - Edges are `(destination, dropped_base)`; emitted base = `dest % n_base`. Inverted → plausible garbage. `source_state_matches_bonito_idx`.

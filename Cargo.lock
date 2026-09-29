@@ -1005,7 +1005,6 @@ dependencies = [
  "cudarc",
  "escapepod-pod5",
  "escapepod-signal",
- "fqxv-align",
  "indicatif",
  "ndarray",
  "ort",
@@ -1137,11 +1136,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "fqxv-align"
-version = "0.5.2"
-source = "git+https://github.com/rnabioco/fqxv?rev=a3af3d891f242f15e828ab2126069aa5dd67e693#a3af3d891f242f15e828ab2126069aa5dd67e693"
 
 [[package]]
 name = "futures-core"
