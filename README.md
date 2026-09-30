@@ -67,6 +67,20 @@ for that caveat, the full history, and how to reproduce.
 
 ### CLI (`escpod`)
 
+From [Bioconda](https://bioconda.github.io/):
+
+```bash
+pixi add bioconda::escapepod     # or: conda install -c conda-forge -c bioconda escapepod
+```
+
+The package installs `escpod`. It is built with GPU support, but that only
+matters if you have a GPU: nothing CUDA is loaded until a GPU stage runs, so
+on a CPU-only machine it behaves like any other build. To use a GPU you also
+need the runtime described under
+[GPU acceleration](https://rnabioco.github.io/escapepod-rs/cli/demux/#gpu-acceleration).
+The linux-64 package is compiled for x86-64-v3 (AVX2/FMA/BMI2), so it needs a
+Haswell-era or newer CPU.
+
 The `escpod` binary lives in the `escapepod-cli` crate. Every tagged version
 publishes prebuilt binaries on the
 [releases page](https://github.com/rnabioco/escapepod-rs/releases):
