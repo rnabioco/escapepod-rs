@@ -290,9 +290,9 @@ fn classify_device_cpu_flag_records_requested_cpu() {
     assert!(ds["device"].get("parity_checked_batches").is_none());
 }
 
-/// `escpod classify` now shares `escpod align`'s reference FASTA reader
-/// (rnabioco/escapepod-rs#410), so it accepts a gzipped reference exactly as
-/// `align` does — previously `geometry::read_fasta` called `read_to_string`
+/// `escpod classify` goes through the shared reference FASTA reader
+/// (`escapepod_signal::fasta`, rnabioco/escapepod-rs#410), so it accepts a
+/// gzipped reference — previously `geometry::read_fasta` called `read_to_string`
 /// directly and failed outright on a `.gz` file. The gzipped run must score
 /// identically to the plain-FASTA run.
 #[test]
@@ -345,8 +345,8 @@ fn classify_accepts_a_gzipped_reference() {
     );
 }
 
-/// A duplicate reference name is refused, exactly as `escpod align` refuses
-/// one — the same shared reader (rnabioco/escapepod-rs#410). Previously
+/// A duplicate reference name is refused by the shared reader
+/// (rnabioco/escapepod-rs#410). Previously
 /// `geometry::read_fasta` built a `HashMap` directly and let the second
 /// record silently win.
 #[test]

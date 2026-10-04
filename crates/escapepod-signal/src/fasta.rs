@@ -2,24 +2,62 @@
 
 //! The one reference FASTA reader (rnabioco/escapepod-rs#410).
 //!
-//! Before this, the reference FASTA was parsed in six places — this crate's
-//! own `escpod align` caller, `escapepod-classify`'s `geometry::read_fasta`,
-//! and four tests/examples — each a slightly different ad hoc loop, and two
-//! of them (`escpod align` and `escpod classify`) already disagreed on the
-//! same file: `align` read a gzipped reference and refused a duplicate name,
-//! `classify` failed on gzip and let a duplicate silently win. [`read_fasta`]
-//! is the rule every caller now goes through instead of writing its own.
+//! Before it, the reference FASTA was parsed in six places, each a slightly
+//! different ad hoc loop, and two of them already disagreed on the same file:
+//! one read a gzipped reference and refused a duplicate name, the other failed
+//! on gzip and let a duplicate silently win. [`read_fasta`] is the rule every
+//! caller goes through instead of writing its own. It is shared
+//! infrastructure that used to also serve `escpod align`, since moved to
+//! rnabioco/eschalign.
 //!
 //! Deliberately **not** the whole story: this function takes an
-//! already-open [`BufRead`], so gzip detection and file opening stay out of
-//! this std-only, `cargo publish`-able crate. A caller that wants to accept
-//! a gzipped reference wraps `flate2::read::MultiGzDecoder` itself first
-//! (`escapepod-cli`'s `align.rs::open_text` is the canonical shape).
+//! already-open [`BufRead`], so gzip detection and file opening stay with the
+//! caller. A caller that wants to accept a gzipped reference wraps
+//! `flate2::read::MultiGzDecoder` itself first (`escapepod-classify`'s
+//! `geometry::open_fasta` is the canonical shape).
+
+use std::fmt;
 
 use std::collections::HashSet;
 use std::io::BufRead;
 
-use crate::AlignError;
+/// Everything [`read_fasta`] can refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastaError {
+    /// The underlying reader failed.
+    Io(String),
+    /// A FASTA header (`>` line) with nothing but whitespace after it.
+    EmptyReferenceName(usize),
+    /// A FASTA header name that is not valid UTF-8.
+    NonUtf8ReferenceName(usize),
+    /// The same reference name given twice.
+    DuplicateReferenceName(String),
+    /// Sequence data before any `>` header.
+    ContentBeforeHeader(usize),
+}
+
+impl fmt::Display for FastaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "reading FASTA: {e}"),
+            Self::EmptyReferenceName(line) => {
+                write!(f, "FASTA line {line}: empty reference name")
+            }
+            Self::NonUtf8ReferenceName(line) => {
+                write!(f, "FASTA line {line}: non-UTF-8 reference name")
+            }
+            Self::DuplicateReferenceName(name) => {
+                write!(f, "duplicate reference name {name:?}")
+            }
+            Self::ContentBeforeHeader(line) => write!(
+                f,
+                "FASTA line {line}: sequence data before the first '>' header"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FastaError {}
 
 /// Parse a FASTA already opened as [`BufRead`], returning `(name, sequence)`
 /// pairs in file order.
@@ -40,7 +78,7 @@ use crate::AlignError;
 /// Case is preserved exactly as written; nothing here upper-cases a sequence
 /// or a name — a caller that wants that (as `escapepod-classify`'s geometry
 /// lookup does) applies it to this function's output.
-pub fn read_fasta<R: BufRead>(mut reader: R) -> Result<Vec<(String, Vec<u8>)>, AlignError> {
+pub fn read_fasta<R: BufRead>(mut reader: R) -> Result<Vec<(String, Vec<u8>)>, FastaError> {
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut current: Option<(String, Vec<u8>)> = None;
@@ -51,7 +89,7 @@ pub fn read_fasta<R: BufRead>(mut reader: R) -> Result<Vec<(String, Vec<u8>)>, A
         buf.clear();
         let n = reader
             .read_until(b'\n', &mut buf)
-            .map_err(|e| AlignError::FastaIo(e.to_string()))?;
+            .map_err(|e| FastaError::Io(e.to_string()))?;
         if n == 0 {
             break;
         }
@@ -66,19 +104,19 @@ pub fn read_fasta<R: BufRead>(mut reader: R) -> Result<Vec<(String, Vec<u8>)>, A
             }
             let name_bytes = first_word(header);
             if name_bytes.is_empty() {
-                return Err(AlignError::EmptyReferenceName(line_no));
+                return Err(FastaError::EmptyReferenceName(line_no));
             }
             let name = String::from_utf8(name_bytes.to_vec())
-                .map_err(|_| AlignError::NonUtf8ReferenceName(line_no))?;
+                .map_err(|_| FastaError::NonUtf8ReferenceName(line_no))?;
             if !seen.insert(name.clone()) {
-                return Err(AlignError::DuplicateReferenceName(name));
+                return Err(FastaError::DuplicateReferenceName(name));
             }
             current = Some((name, Vec::new()));
         } else {
             match current.as_mut() {
                 Some((_, seq)) => seq.extend(buf.iter().filter(|b| !b.is_ascii_whitespace())),
                 None if buf.iter().all(|b| b.is_ascii_whitespace()) => {}
-                None => return Err(AlignError::FastaContentBeforeHeader(line_no)),
+                None => return Err(FastaError::ContentBeforeHeader(line_no)),
             }
         }
     }
@@ -105,7 +143,7 @@ fn first_word(s: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
-    fn parse(s: &str) -> Result<Vec<(String, Vec<u8>)>, AlignError> {
+    fn parse(s: &str) -> Result<Vec<(String, Vec<u8>)>, FastaError> {
         read_fasta(s.as_bytes())
     }
 
@@ -185,21 +223,21 @@ mod tests {
     #[test]
     fn duplicate_name_is_refused() {
         let err = parse(">a\nAC\n>a\nGT\n").unwrap_err();
-        assert_eq!(err, AlignError::DuplicateReferenceName("a".to_string()));
+        assert_eq!(err, FastaError::DuplicateReferenceName("a".to_string()));
     }
 
     #[test]
     fn empty_name_is_refused() {
         let err = parse(">\nACGT\n").unwrap_err();
-        assert_eq!(err, AlignError::EmptyReferenceName(1));
+        assert_eq!(err, FastaError::EmptyReferenceName(1));
         let err = parse(">   \nACGT\n").unwrap_err();
-        assert_eq!(err, AlignError::EmptyReferenceName(1));
+        assert_eq!(err, FastaError::EmptyReferenceName(1));
     }
 
     #[test]
     fn content_before_the_first_header_is_refused() {
         let err = parse("ACGT\n>a\nACGT\n").unwrap_err();
-        assert_eq!(err, AlignError::FastaContentBeforeHeader(1));
+        assert_eq!(err, FastaError::ContentBeforeHeader(1));
     }
 
     #[test]
