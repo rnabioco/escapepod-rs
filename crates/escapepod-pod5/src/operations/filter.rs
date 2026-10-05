@@ -12,7 +12,7 @@ use crate::utils::pod5_assembler::{
     FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
 use crate::utils::table_builders::{
-    SchemaMetadata, SignalRow, build_reads_table_remapped, build_signal_batch,
+    SchemaMetadata, SignalRow, build_reads_table_remapped, write_raw_signal_table,
 };
 use crate::writer::atomic::{AtomicFile, Durability};
 use arrow::record_batch::RecordBatch;
@@ -21,7 +21,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 /// Criteria for filtering reads.
 #[derive(Debug, Clone, Default)]
@@ -637,107 +636,6 @@ pub fn subset_files<P: AsRef<Path> + Sync>(
     outcome.groups.sort_by(|a, b| a.0.cmp(&b.0));
     outcome.failures.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(outcome)
-}
-
-/// `Write` adapter that counts the bytes flowing through. The Arrow IPC
-/// writer needs a `Write` sink, but we also want to know how many bytes
-/// it emitted so we can compute `signal_end` without `stream_position()`.
-struct CountingWriter<'a, W: Write> {
-    inner: &'a mut W,
-    count: usize,
-}
-
-impl<'a, W: Write> CountingWriter<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
-        Self { inner, count: 0 }
-    }
-}
-
-impl<W: Write> Write for CountingWriter<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.count += n;
-        Ok(n)
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(buf)?;
-        self.count += buf.len();
-        Ok(())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Stream the signal IPC table directly to `file`, returning the number of
-/// bytes written.
-///
-/// Batches are built **in parallel** and written in order. Building a batch
-/// means faulting source pages in from the mmap and memcpy'ing them into an
-/// Arrow buffer; doing that inline with the writes made this loop single
-/// threaded and latency-bound — profiling a 10.4 GB copy showed 75% of samples
-/// in `memmove` plus kernel page-fault time, at 24% CPU (a quarter of one
-/// core). Fanning the build across rayon lets those faults and copies overlap
-/// each other while the IPC stream itself stays strictly sequential.
-///
-/// Peak memory is bounded by `lookahead × batch_size` chunks in flight,
-/// independent of total signal volume.
-fn write_raw_signal_table<W: Write>(
-    file: &mut W,
-    chunks: &[SignalRow<'_>],
-    batch_size: u32,
-    meta: &SchemaMetadata,
-) -> Result<usize> {
-    use crate::schema::signal_schema;
-    use arrow::ipc::writer::FileWriter;
-    use rayon::prelude::*;
-
-    let schema = Arc::new(meta.apply(signal_schema()));
-
-    // How many batches to build concurrently. Bounded so peak memory stays
-    // modest: at the default 1000-chunk batches and ~10 KB chunks this is
-    // ~10 MB per batch in flight.
-    let lookahead = rayon::current_num_threads().clamp(2, 16);
-
-    // Precompute batch boundaries so the parallel build is a pure map.
-    let ranges: Vec<(usize, usize)> = (0..chunks.len())
-        .step_by(batch_size.max(1) as usize)
-        .map(|start| {
-            (
-                start,
-                (start + batch_size.max(1) as usize).min(chunks.len()),
-            )
-        })
-        .collect();
-
-    let mut counter = CountingWriter::new(file);
-    {
-        let mut writer = FileWriter::try_new(&mut counter, &schema)?;
-
-        for window in ranges.chunks(lookahead) {
-            // Build this window concurrently; `collect` preserves order, so the
-            // IPC stream is written in exactly the original chunk order (which
-            // the reads table's signal-row prefix sums depend on).
-            let built: Vec<Result<arrow::record_batch::RecordBatch>> = window
-                .par_iter()
-                .map(|&(s, e)| {
-                    let run = &chunks[s..e];
-                    let total_bytes: usize = run.iter().map(|r| r.data.len()).sum();
-                    build_signal_batch(&schema, run.iter().copied(), total_bytes)
-                })
-                .collect();
-
-            for batch in built {
-                writer.write(&batch?)?;
-            }
-        }
-
-        writer.finish()?;
-    }
-
-    Ok(counter.count)
 }
 
 /// Read read IDs from a text file or stdin (one per line).
