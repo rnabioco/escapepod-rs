@@ -231,12 +231,12 @@ fn parse_flatbuffer_footer(data: &[u8]) -> Result<Footer> {
 
     // Read fields: file_identifier (0), software (1), pod5_version (2), contents (3)
     let file_identifier = read_field_offset(0)
-        .map(&read_string)
+        .map(read_string)
         .transpose()?
         .unwrap_or_default();
 
     let software = read_field_offset(1)
-        .map(&read_string)
+        .map(read_string)
         .transpose()?
         .unwrap_or_default();
 
