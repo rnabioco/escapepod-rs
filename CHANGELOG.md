@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`merge` no longer produces non-portable output when its inputs don't
+  share one batch stride.** It concatenated each input's own Arrow signal
+  batches as-is, offsetting only byte positions. Almost every POD5's own
+  *last* batch is short (a read count rarely divides evenly by the batch
+  size), so merging N files put a short batch from file `k` immediately
+  before a full one from file `k+1` at every file boundary but the last —
+  the exact non-uniform-stride shape #195 fixed on the writer side. escpod's
+  own reader walks real cumulative row counts and resolves such a file
+  correctly, but the official `pod5` library and dorado assume a constant
+  stride and mis-resolve every read after the break: dorado 2.1 reported
+  `Failed to get read signal - 'Invalid: Too few samples in input samples
+  array'` on a merge of 20 real multi-file flexizyme POD5 directories (every
+  one affected, since merging more than a couple of files makes a stride
+  break near-certain). `merge` now flattens every surviving (non-duplicate)
+  read's compressed signal chunks across all inputs and rebuilds the signal
+  table at one uniform stride via `write_raw_signal_table` (moved from
+  `operations::filter` into `utils::table_builders`, alongside the
+  `SignalRow`/`build_signal_batch` primitives it's built from, and now
+  shared by `filter`/`subset` and `merge` alike) — the same correctness-first
+  approach `filter`/`subset` already used. Compressed bytes are still copied
+  without decompression/recompression; only the Arrow batch grouping is
+  rebuilt. `MergeOptions` gains `signal_batch_size` (default `1_000`,
+  matching `FilterOptions`) to control it. A duplicate read's signal bytes
+  are also no longer carried into the output now that extraction happens
+  per-surviving-read instead of per-input-file.
+
 ## 0.31.0 (2026-09-29)
 
 ### Added

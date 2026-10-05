@@ -211,6 +211,56 @@ fn merge_duplicate_read_id_is_deduplicated() {
     assert_eq!(unique, HashSet::from([a_only, shared, b_only]));
 }
 
+/// Each input's own trailing batch is legitimately short (a read count
+/// rarely divides evenly by the signal batch size). Concatenating two such
+/// files' batches as-is — the pre-fix behaviour — put file `a`'s short
+/// batch immediately before file `b`'s first (full) batch in the merged
+/// output, breaking the constant stride dorado and the official `pod5`
+/// library assume between batches (escapepod itself walks real cumulative
+/// row counts and is unaffected — see `nonuniform_signal_batch`'s own docs,
+/// and escapepod-rs#195 for the writer-side version of the same bug class).
+#[test]
+fn merge_output_signal_batches_stay_uniform_even_with_short_trailing_inputs() {
+    let tmp = TempDir::new().expect("tempdir");
+    let a = tmp.path().join("a.pod5");
+    let b = tmp.path().join("b.pod5");
+    let merged = tmp.path().join("merged.pod5");
+
+    // Default WriterOptions batches signal at 100 rows/batch; 150 one-chunk
+    // reads per file means each input's own batches are [100, 50] — a short
+    // trailing batch, same shape as virtually every real POD5.
+    let fa = write_fixture(&a, "acq_a", 150, 10);
+    let fb = write_fixture(&b, "acq_b", 150, 10);
+
+    let result = merge_files(&[a, b], &merged, &MergeOptions::default(), None).expect("merge");
+    assert_eq!(result.reads_written, 300);
+    assert_eq!(result.duplicates_skipped, 0);
+
+    let reader = Reader::open(&merged).expect("open merged");
+    assert!(
+        reader.nonuniform_signal_batch().is_none(),
+        "merged output has a non-uniform signal batch: {:?} — dorado and the \
+         official pod5 library would resolve every read after it to the \
+         wrong signal",
+        reader.nonuniform_signal_batch()
+    );
+
+    // And nothing was lost or corrupted in the rebuild.
+    let reads: Vec<_> = reader
+        .reads()
+        .expect("reads")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read iter");
+    let merged_ids: HashSet<Uuid> = reads.iter().map(|r| r.read_id).collect();
+    let expected: HashSet<Uuid> = fa
+        .read_ids
+        .iter()
+        .chain(fb.read_ids.iter())
+        .copied()
+        .collect();
+    assert_eq!(merged_ids, expected);
+}
+
 #[allow(dead_code)]
 fn _ensure_run_info_helper_is_used() {
     // Keep make_run_info visible to the linker even if individual tests drop it.
