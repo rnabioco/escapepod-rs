@@ -422,22 +422,25 @@ fn build_partition_inner<R: PartitionRow>(
     })
 }
 
-/// Build reads Arrow IPC table.
+/// Shared core of `build_reads_table` and `build_reads_table_remapped`.
 ///
-/// Uses parallel partition-based building for performance:
-/// 1. Parallel dictionary collection (unique pore types, end reasons)
-/// 2. Create O(1) lookup maps for dictionary keys
-/// 3. Parallel partition building (split reads, build arrays per partition)
-/// 4. Concatenate partition arrays and create final RecordBatch
-pub(crate) fn build_reads_table(
-    reads: &[(ReadData, Vec<u64>)],
+/// Both callers reduce to the same four phases over a `[R: PartitionRow]`
+/// slice — parallel dictionary collection, O(1) key-lookup maps, parallel
+/// partition building (`build_partition_inner` already covers the one real
+/// per-row difference between merge's owned input and filter's borrowed
+/// one), then concatenation into a single `RecordBatch` split into
+/// `rows_per_batch`-row record batches on the way out. The two public names
+/// stay as thin wrappers so each call site keeps its own doc comment and
+/// neither has to spell out the other's input type.
+fn build_reads_table_generic<R: PartitionRow + Sync>(
+    rows: &[R],
     run_infos: &[RunInfoData],
     meta: &SchemaMetadata,
     rows_per_batch: usize,
 ) -> Result<Vec<u8>> {
     let schema = Arc::new(meta.apply(reads_schema()));
 
-    if reads.is_empty() {
+    if rows.is_empty() {
         let mut buffer = Vec::new();
         {
             let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
@@ -447,11 +450,12 @@ pub(crate) fn build_reads_table(
     }
 
     // Phase 1: Parallel dictionary collection
-    let (pore_type_set, end_reason_set): (HashSet<&str>, HashSet<&str>) = reads
+    let (pore_type_set, end_reason_set): (HashSet<&str>, HashSet<&str>) = rows
         .par_iter()
         .fold(
             || (HashSet::new(), HashSet::new()),
-            |(mut pores, mut ends), (read, _)| {
+            |(mut pores, mut ends), row| {
+                let read = row.read();
                 pores.insert(read.pore_type.as_str());
                 ends.insert(read.end_reason.as_str());
                 (pores, ends)
@@ -474,8 +478,8 @@ pub(crate) fn build_reads_table(
         .collect();
 
     // Phase 2: Create O(1) lookup maps for dictionary keys.
-    // (run_info doesn't need a map: each read's `run_info_index` is
-    // already the dict key index — see `PartitionRow::run_info_key`.)
+    // (run_info doesn't need a map: each row already carries its dict
+    // index — see `PartitionRow::run_info_key`.)
     let pore_type_map: HashMap<&str, i16> = pore_types
         .iter()
         .enumerate()
@@ -489,9 +493,9 @@ pub(crate) fn build_reads_table(
 
     // Phase 3: Parallel partition building
     let num_threads = rayon::current_num_threads().max(1);
-    let chunk_size = reads.len().div_ceil(num_threads);
+    let chunk_size = rows.len().div_ceil(num_threads);
 
-    let partition_arrays: Vec<PartitionArrays> = reads
+    let partition_arrays: Vec<PartitionArrays> = rows
         .par_chunks(chunk_size)
         .map(|chunk| build_partition_inner(chunk, &pore_type_map, &end_reason_map))
         .collect::<Result<Vec<_>>>()?;
@@ -627,19 +631,29 @@ pub(crate) fn build_reads_table(
     Ok(buffer)
 }
 
+/// Build reads Arrow IPC table for `merge`'s already-remapped, owned input.
+///
+/// See `build_reads_table_generic` for the shared four-phase build
+/// (parallel dictionary collection, O(1) key-lookup maps, parallel
+/// partition building, concatenation into `rows_per_batch`-row batches).
+pub(crate) fn build_reads_table(
+    reads: &[(ReadData, Vec<u64>)],
+    run_infos: &[RunInfoData],
+    meta: &SchemaMetadata,
+    rows_per_batch: usize,
+) -> Result<Vec<u8>> {
+    build_reads_table_generic(reads, run_infos, meta, rows_per_batch)
+}
+
 /// Lazy-remap reads-table builder for `filter`.
 ///
-/// Mirrors `build_reads_table` (parallel partition build, dictionary
-/// collection across the whole input, then `rows_per_batch` record batches on
-/// the way out) but consumes
-/// `FlatReadRef`s — borrowed source `ReadData`s plus the per-read
+/// Consumes `FlatReadRef`s — borrowed source `ReadData`s plus the per-read
 /// signal-row prefix-sum offset and a borrow of the source's run-info
 /// table — so the caller never has to materialize a `Vec<ProcessedRead>`.
-///
 /// On a 30M-match filter this saves ~6 GB peak RSS (200 B/read × 30M)
 /// without the per-batch overhead that broke the multi-batch streaming
-/// design. Within a single record batch, build cost is the same as
-/// `build_reads_table` — same parallel partitioning, same concat.
+/// design. See `build_reads_table_generic` for the shared build itself —
+/// cost within a single record batch is identical to `build_reads_table`.
 ///
 /// The caller (filter) precomputes each `FlatReadRef::run_info_key` —
 /// the index in the deduplicated `all_run_infos`, which doubles as the
@@ -650,183 +664,7 @@ pub(crate) fn build_reads_table_remapped(
     meta: &SchemaMetadata,
     rows_per_batch: usize,
 ) -> Result<Vec<u8>> {
-    let schema = Arc::new(meta.apply(reads_schema()));
-
-    if flat.is_empty() {
-        let mut buffer = Vec::new();
-        {
-            let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
-            writer.finish()?;
-        }
-        return Ok(buffer);
-    }
-
-    // Dictionary collection: parallel scan over the borrowed reads.
-    let (pore_type_set, end_reason_set): (HashSet<&str>, HashSet<&str>) = flat
-        .par_iter()
-        .fold(
-            || (HashSet::new(), HashSet::new()),
-            |(mut pores, mut ends), entry| {
-                pores.insert(entry.read.pore_type.as_str());
-                ends.insert(entry.read.end_reason.as_str());
-                (pores, ends)
-            },
-        )
-        .reduce(
-            || (HashSet::new(), HashSet::new()),
-            |(mut a_pores, mut a_ends), (b_pores, b_ends)| {
-                a_pores.extend(b_pores);
-                a_ends.extend(b_ends);
-                (a_pores, a_ends)
-            },
-        );
-
-    let pore_types: Vec<&str> = pore_type_set.into_iter().collect();
-    let end_reasons: Vec<&str> = end_reason_set.into_iter().collect();
-    let run_info_ids: Vec<&str> = all_run_infos
-        .iter()
-        .map(|ri| ri.acquisition_id.as_str())
-        .collect();
-
-    let pore_type_map: HashMap<&str, i16> = pore_types
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (s, i as i16))
-        .collect();
-    let end_reason_map: HashMap<&str, i16> = end_reasons
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (s, i as i16))
-        .collect();
-
-    // Parallel partition build: each partition does the inline remap.
-    let num_threads = rayon::current_num_threads().max(1);
-    let chunk_size = flat.len().div_ceil(num_threads);
-
-    let partition_arrays: Vec<PartitionArrays> = flat
-        .par_chunks(chunk_size)
-        .map(|chunk| build_partition_inner(chunk, &pore_type_map, &end_reason_map))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Concat partition arrays — identical to build_reads_table from here on.
-    macro_rules! concat_arrays {
-        ($field:ident, $array_type:ty) => {{
-            let refs: Vec<&dyn Array> = partition_arrays
-                .iter()
-                .map(|p| &p.$field as &dyn Array)
-                .collect();
-            Arc::new(
-                concat(&refs)?
-                    .as_any()
-                    .downcast_ref::<$array_type>()
-                    .unwrap()
-                    .clone(),
-            ) as ArrayRef
-        }};
-    }
-
-    let read_id_array = concat_arrays!(read_id, FixedSizeBinaryArray);
-    let signal_array = concat_arrays!(signal, ListArray);
-    let read_number_array = concat_arrays!(read_number, UInt32Array);
-    let start_array = concat_arrays!(start, UInt64Array);
-    let median_before_array = concat_arrays!(median_before, Float32Array);
-    let num_minknow_events_array = concat_arrays!(num_minknow_events, UInt64Array);
-    let tracked_scaling_scale_array = concat_arrays!(tracked_scaling_scale, Float32Array);
-    let tracked_scaling_shift_array = concat_arrays!(tracked_scaling_shift, Float32Array);
-    let predicted_scaling_scale_array = concat_arrays!(predicted_scaling_scale, Float32Array);
-    let predicted_scaling_shift_array = concat_arrays!(predicted_scaling_shift, Float32Array);
-    let num_reads_since_mux_change_array = concat_arrays!(num_reads_since_mux_change, UInt32Array);
-    let time_since_mux_change_array = concat_arrays!(time_since_mux_change, Float32Array);
-    let num_samples_array = concat_arrays!(num_samples, UInt64Array);
-    let channel_array = concat_arrays!(channel, UInt16Array);
-    let well_array = concat_arrays!(well, UInt8Array);
-    let calibration_offset_array = concat_arrays!(calibration_offset, Float32Array);
-    let calibration_scale_array = concat_arrays!(calibration_scale, Float32Array);
-    let end_reason_forced_array = concat_arrays!(end_reason_forced, BooleanArray);
-    let open_pore_level_array = concat_arrays!(open_pore_level, Float32Array);
-    let expected_open_pore_level_array = concat_arrays!(expected_open_pore_level, Float32Array);
-    let selected_read_level_array = concat_arrays!(selected_read_level, Float32Array);
-
-    let pore_type_keys_refs: Vec<&dyn Array> = partition_arrays
-        .iter()
-        .map(|p| &p.pore_type_keys as &dyn Array)
-        .collect();
-    let pore_type_keys = concat(&pore_type_keys_refs)?
-        .as_any()
-        .downcast_ref::<Int16Array>()
-        .unwrap()
-        .clone();
-    let pore_type_dict = StringArray::from_iter_values(pore_types.iter().copied());
-    let pore_type_array: ArrayRef = Arc::new(DictionaryArray::new(
-        pore_type_keys,
-        Arc::new(pore_type_dict),
-    ));
-
-    let end_reason_keys_refs: Vec<&dyn Array> = partition_arrays
-        .iter()
-        .map(|p| &p.end_reason_keys as &dyn Array)
-        .collect();
-    let end_reason_keys = concat(&end_reason_keys_refs)?
-        .as_any()
-        .downcast_ref::<Int16Array>()
-        .unwrap()
-        .clone();
-    let end_reason_dict = StringArray::from_iter_values(end_reasons.iter().copied());
-    let end_reason_array: ArrayRef = Arc::new(DictionaryArray::new(
-        end_reason_keys,
-        Arc::new(end_reason_dict),
-    ));
-
-    let run_info_keys_refs: Vec<&dyn Array> = partition_arrays
-        .iter()
-        .map(|p| &p.run_info_keys as &dyn Array)
-        .collect();
-    let run_info_keys = concat(&run_info_keys_refs)?
-        .as_any()
-        .downcast_ref::<Int16Array>()
-        .unwrap()
-        .clone();
-    let run_info_dict = StringArray::from_iter_values(run_info_ids.iter().copied());
-    let run_info_array: ArrayRef =
-        Arc::new(DictionaryArray::new(run_info_keys, Arc::new(run_info_dict)));
-
-    let arrays: Vec<ArrayRef> = vec![
-        read_id_array,
-        signal_array,
-        read_number_array,
-        start_array,
-        median_before_array,
-        num_minknow_events_array,
-        tracked_scaling_scale_array,
-        tracked_scaling_shift_array,
-        predicted_scaling_scale_array,
-        predicted_scaling_shift_array,
-        num_reads_since_mux_change_array,
-        time_since_mux_change_array,
-        num_samples_array,
-        channel_array,
-        well_array,
-        pore_type_array,
-        calibration_offset_array,
-        calibration_scale_array,
-        end_reason_array,
-        end_reason_forced_array,
-        run_info_array,
-        open_pore_level_array,
-        expected_open_pore_level_array,
-        selected_read_level_array,
-    ];
-
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let mut buffer = Vec::new();
-    {
-        let mut writer = ArrowFileWriter::try_new(&mut buffer, &schema)?;
-        write_reads_in_batches(&mut writer, &batch, rows_per_batch)?;
-        writer.finish()?;
-    }
-
-    Ok(buffer)
+    build_reads_table_generic(flat, all_run_infos, meta, rows_per_batch)
 }
 
 /// Write `batch` as a sequence of record batches of at most `rows` rows each.
