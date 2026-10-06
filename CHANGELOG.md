@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.31.1 (2026-10-05)
+
 ### Fixed
 
 - **`merge` no longer produces non-portable output when its inputs don't
