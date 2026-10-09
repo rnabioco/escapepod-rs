@@ -26,9 +26,9 @@ escapepod-signal = { workspace = true }
 flate2 = "1"
 # BAM reading for the pipeline (record types + the scan loop); writing the
 # cl-tagged output BAM stays in the CLI.
-noodles-bam = "0.95"
+noodles-bam = "0.96"
 noodles-bgzf = "0.52"
-noodles-sam = "0.90"
+noodles-sam = "0.91"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

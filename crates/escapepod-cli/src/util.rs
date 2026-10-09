@@ -292,7 +292,10 @@ pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
     let index = bam::fs::index(bam_path)?;
 
     // Write the index to file
-    bam::bai::fs::write(&bai_path, &index)?;
+    match index {
+        bam::Index::Bai(bai) => bam::bai::fs::write(&bai_path, &bai)?,
+        bam::Index::Csi(_) => anyhow::bail!("indexer produced a CSI index, expected BAI"),
+    }
 
     info!("created BAI index: {}", style::path(bai_path.display()));
 
