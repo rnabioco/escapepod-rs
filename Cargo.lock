@@ -941,7 +941,7 @@ dependencies = [
  "flate2",
  "libc",
  "noodles-bam",
- "noodles-bgzf",
+ "noodles-bgzf 0.51.0",
  "noodles-sam",
  "rayon",
  "serde",
@@ -976,9 +976,9 @@ dependencies = [
  "libc",
  "mimalloc",
  "noodles-bam",
- "noodles-bgzf",
- "noodles-core",
- "noodles-csi",
+ "noodles-bgzf 0.51.0",
+ "noodles-core 0.20.0",
+ "noodles-csi 0.62.0",
  "noodles-sam",
  "owo-colors",
  "parquet",
@@ -1647,9 +1647,9 @@ dependencies = [
  "bstr",
  "indexmap",
  "memchr",
- "noodles-bgzf",
- "noodles-core",
- "noodles-csi",
+ "noodles-bgzf 0.51.0",
+ "noodles-core 0.20.0",
+ "noodles-csi 0.61.0",
  "noodles-sam",
 ]
 
@@ -1658,6 +1658,18 @@ name = "noodles-bgzf"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "280d401d0358893ad706fb6094a18e7f9e8f3002630f4960889cb702b6e2714e"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "rayon",
+ "zlib-rs",
+]
+
+[[package]]
+name = "noodles-bgzf"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "950a8570bb43a68697bb34ba39a44f1171faacceb852104d4a35701b86d7ef29"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1675,6 +1687,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-core"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d99b2bca1b3816b186b4c10ab067a8a9d8331542c14cbd16f10c32dee345bc6a"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
 name = "noodles-csi"
 version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1683,8 +1704,21 @@ dependencies = [
  "bit-vec",
  "bstr",
  "indexmap",
- "noodles-bgzf",
- "noodles-core",
+ "noodles-bgzf 0.51.0",
+ "noodles-core 0.20.0",
+]
+
+[[package]]
+name = "noodles-csi"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a08a8df410c420e7282328537e003de1bf4d88f45de891e7acfd2be80171a33"
+dependencies = [
+ "bit-vec",
+ "bstr",
+ "indexmap",
+ "noodles-bgzf 0.52.0",
+ "noodles-core 0.21.0",
 ]
 
 [[package]]
@@ -1698,9 +1732,9 @@ dependencies = [
  "indexmap",
  "lexical-core",
  "memchr",
- "noodles-bgzf",
- "noodles-core",
- "noodles-csi",
+ "noodles-bgzf 0.51.0",
+ "noodles-core 0.20.0",
+ "noodles-csi 0.61.0",
 ]
 
 [[package]]
