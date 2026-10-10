@@ -607,14 +607,9 @@ impl ArrowIpcFooter {
             .map_err(|_| Error::InvalidState("Invalid read_id length".into()))?;
 
         // Read signal offsets (i64 array, row and row+1)
-        let offset_start = row * 8;
-        let offset_end = (row + 1) * 8;
-        let signal_start = read_i64_le(parsed.signal_offsets, offset_start)? as usize;
-        let signal_end = read_i64_le(parsed.signal_offsets, offset_end)? as usize;
-
         let signal_bytes = parsed
             .signal_data
-            .get(signal_start..signal_end)
+            .get(parsed.signal_range(row)?)
             .ok_or_else(|| Error::InvalidState("signal data out of bounds".into()))?;
 
         // Read samples count (u32)
@@ -625,6 +620,7 @@ impl ArrowIpcFooter {
             read_id: read_id_bytes,
             signal: signal_bytes,
             samples,
+            uncompressed: parsed.uncompressed,
         })
     }
 
@@ -695,14 +691,9 @@ impl ArrowIpcFooter {
                                 .map_err(|_| Error::InvalidState("Invalid read_id".into()))?;
 
                         // Extract signal
-                        let offset_start = row * 8;
-                        let offset_end = (row + 1) * 8;
-                        let signal_start =
-                            read_i64_le(parsed.signal_offsets, offset_start)? as usize;
-                        let signal_end = read_i64_le(parsed.signal_offsets, offset_end)? as usize;
                         let signal_bytes = parsed
                             .signal_data
-                            .get(signal_start..signal_end)
+                            .get(parsed.signal_range(row)?)
                             .ok_or_else(|| {
                                 Error::InvalidState("signal data out of bounds".into())
                             })?;
@@ -717,6 +708,7 @@ impl ArrowIpcFooter {
                                 read_id: read_id_bytes,
                                 signal: signal_bytes,
                                 samples,
+                                uncompressed: parsed.uncompressed,
                             },
                         ));
                     }
@@ -744,10 +736,46 @@ impl ArrowIpcFooter {
 pub struct RawSignalChunk<'a> {
     /// The read ID (16 bytes UUID).
     pub read_id: [u8; 16],
-    /// The compressed VBZ signal data (borrowed from mmap).
+    /// The signal bytes (borrowed from mmap): VBZ-compressed, or raw
+    /// little-endian `i16` when [`uncompressed`](Self::uncompressed) is set.
     pub signal: &'a [u8],
     /// Number of samples in this chunk.
     pub samples: u32,
+    /// The file stores this chunk as `LargeList<Int16>` rather than `minknow.vbz`.
+    pub uncompressed: bool,
+}
+
+impl<'a> RawSignalChunk<'a> {
+    /// The chunk's signal as VBZ bytes, compressing it first if the source
+    /// file stored it uncompressed. Block-copy paths (merge, filter, repack,
+    /// subset) write VBZ, so they go through this rather than `signal`.
+    pub fn vbz_bytes(&self) -> Result<std::borrow::Cow<'a, [u8]>> {
+        if !self.uncompressed {
+            return Ok(std::borrow::Cow::Borrowed(self.signal));
+        }
+        let samples = self.samples_i16()?;
+        Ok(std::borrow::Cow::Owned(
+            crate::compression::compress_signal(&samples)?,
+        ))
+    }
+
+    /// Raw `i16` samples of an uncompressed chunk.
+    pub(crate) fn samples_i16(&self) -> Result<Vec<i16>> {
+        if self.signal.len() != self.samples as usize * 2 {
+            return Err(Error::InvalidState(format!(
+                "uncompressed signal chunk has {} bytes for {} samples",
+                self.signal.len(),
+                self.samples
+            )));
+        }
+        Ok(self
+            .signal
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect())
+    }
 }
 
 /// Parsed buffer locations from a signal batch.
@@ -756,6 +784,22 @@ struct ParsedBatch<'a> {
     signal_offsets: &'a [u8],
     signal_data: &'a [u8],
     samples_data: &'a [u8],
+    /// `LargeList<Int16>` layout: offsets count `i16` elements, not bytes.
+    uncompressed: bool,
+}
+
+impl ParsedBatch<'_> {
+    /// Byte range of `row`'s signal within `signal_data`.
+    fn signal_range(&self, row: usize) -> Result<std::ops::Range<usize>> {
+        let start = read_i64_le(self.signal_offsets, row * 8)? as usize;
+        let end = read_i64_le(self.signal_offsets, (row + 1) * 8)? as usize;
+        let (start, end) = if self.uncompressed {
+            (start.saturating_mul(2), end.saturating_mul(2))
+        } else {
+            (start, end)
+        };
+        Ok(start..end)
+    }
 }
 
 impl<'a> ParsedBatch<'a> {
@@ -803,17 +847,24 @@ impl<'a> ParsedBatch<'a> {
         // by size: an uncompressed batch whose signal data happens to be the
         // same length as the samples column (e.g. 2 i16 samples/row = 4
         // bytes/row) is ambiguous under a size match. Index by position.
-        if buffer_infos.len() < 7 {
-            return Err(Error::InvalidArrowIpc(format!(
-                "Expected 7 signal-table buffers, found {}",
-                buffer_infos.len()
-            )));
-        }
+        //
+        // 7 buffers is the `minknow.vbz` layout (`LargeBinary`); 8 is the
+        // uncompressed layout (`LargeList<Int16>`), whose child array adds a
+        // validity buffer ahead of the sample data.
+        let uncompressed = match buffer_infos.len() {
+            7 => false,
+            8 => true,
+            n => {
+                return Err(Error::InvalidArrowIpc(format!(
+                    "Expected 7 (vbz) or 8 (uncompressed) signal-table buffers, found {n}"
+                )));
+            }
+        };
 
         let (read_id_off, read_id_len) = buffer_infos[1];
         let (signal_offsets_off, signal_offsets_len) = buffer_infos[3];
-        let (signal_data_off, signal_data_len) = buffer_infos[4];
-        let (samples_off, samples_len) = buffer_infos[6];
+        let (signal_data_off, signal_data_len) = buffer_infos[if uncompressed { 5 } else { 4 }];
+        let (samples_off, samples_len) = buffer_infos[if uncompressed { 7 } else { 6 }];
 
         let read_id_data = slice_at(body, read_id_off, read_id_len)?;
         let signal_offsets = slice_at(body, signal_offsets_off, signal_offsets_len)?;
@@ -844,6 +895,7 @@ impl<'a> ParsedBatch<'a> {
             signal_offsets,
             signal_data,
             samples_data,
+            uncompressed,
         })
     }
 

@@ -868,7 +868,7 @@ impl Reader {
                 CompressedSignalChunk {
                     read_id: Uuid::from_bytes(raw.read_id),
                     samples: raw.samples,
-                    data: Arc::from(raw.signal),
+                    data: Arc::from(raw.vbz_bytes()?),
                 },
             ));
         }
@@ -968,14 +968,16 @@ impl Reader {
 
         let signal_bytes = self.signal_table_bytes()?;
         let raw_chunks = footer.extract_signal_rows(signal_rows, signal_bytes)?;
-        Ok(raw_chunks
+        raw_chunks
             .iter()
-            .map(|raw| CompressedSignalChunk {
-                read_id: Uuid::from_bytes(raw.read_id),
-                samples: raw.samples,
-                data: Arc::from(raw.signal),
+            .map(|raw| {
+                Ok(CompressedSignalChunk {
+                    read_id: Uuid::from_bytes(raw.read_id),
+                    samples: raw.samples,
+                    data: Arc::from(raw.vbz_bytes()?),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Extract compressed signal chunks from a batch.
@@ -1005,13 +1007,14 @@ impl Reader {
                     message: "Expected FixedSizeBinaryArray".to_string(),
                 })?;
 
-        let signal_array =
-            signal_col
-                .as_binary_opt::<i64>()
-                .ok_or_else(|| Error::InvalidField {
-                    field: "signal".to_string(),
-                    message: "Expected LargeBinaryArray".to_string(),
-                })?;
+        let signal_array = signal_col.as_binary_opt::<i64>();
+        let signal_list = signal_col.as_list_opt::<i64>();
+        if signal_array.is_none() && signal_list.is_none() {
+            return Err(Error::InvalidField {
+                field: "signal".to_string(),
+                message: "Expected LargeBinaryArray or LargeListArray<Int16>".to_string(),
+            });
+        }
 
         let samples_array = samples_col
             .as_primitive_opt::<UInt32Type>()
@@ -1024,17 +1027,40 @@ impl Reader {
             let read_id_bytes = read_id_array.value(row);
             let read_id =
                 Uuid::from_slice(read_id_bytes).map_err(|e| Error::InvalidUuid(e.to_string()))?;
-            let compressed_data = signal_array.value(row);
             let samples = samples_array.value(row);
+            let data: Arc<[u8]> = match (signal_array, signal_list) {
+                (Some(a), _) => Arc::from(a.value(row)),
+                (None, Some(l)) => {
+                    // Uncompressed table: block-copy consumers expect VBZ.
+                    let raw = Self::list_row_i16(l, row)?;
+                    Arc::from(compression::compress_signal(&raw)?)
+                }
+                (None, None) => unreachable!("checked above"),
+            };
 
             chunks.push(CompressedSignalChunk {
                 read_id,
                 samples,
-                data: Arc::from(compressed_data),
+                data,
             });
         }
 
         Ok(())
+    }
+
+    /// One row of an uncompressed (`LargeList<Int16>`) signal column.
+    fn list_row_i16(list: &arrow::array::LargeListArray, row: usize) -> Result<Vec<i16>> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int16Type;
+
+        let values = list.value(row);
+        let ints = values
+            .as_primitive_opt::<Int16Type>()
+            .ok_or_else(|| Error::InvalidField {
+                field: "signal".to_string(),
+                message: "Expected Int16 list values".to_string(),
+            })?;
+        Ok(ints.values().to_vec())
     }
 
     /// Extract signal samples from a signal table batch row.
@@ -1061,13 +1087,18 @@ impl Reader {
 
         let sample_count = samples_array.value(row) as usize;
 
-        // Handle signal data (could be LargeBinary for VBZ)
+        // Uncompressed table (`LargeList<Int16>`): the samples are stored as-is.
+        if let Some(list) = signal_col.as_list_opt::<i64>() {
+            return Self::list_row_i16(list, row);
+        }
+
+        // Handle signal data (LargeBinary for VBZ)
         let signal_array =
             signal_col
                 .as_binary_opt::<i64>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "signal".to_string(),
-                    message: "Expected LargeBinaryArray".to_string(),
+                    message: "Expected LargeBinaryArray or LargeListArray<Int16>".to_string(),
                 })?;
 
         let compressed_data = signal_array.value(row);

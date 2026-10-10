@@ -238,3 +238,47 @@ class TestEscapepodToPod5:
 
         assert seen == set(idx_by_id)
         assert run_info_acqs == {ACQUISITION_ID}
+
+
+class TestUncompressedSignal:
+    """``Writer(compress_signal=False)`` writes the spec's ``LargeList<Int16>``
+    signal table (#446); both escapepod and reference ``pod5`` must read it."""
+
+    def test_uncompressed_file_reads_in_both_libraries(self, tmp_path):
+        path = tmp_path / "uncompressed.pod5"
+        run_info = escapepod.create_run_info(
+            acquisition_id=ACQUISITION_ID, sample_rate=SAMPLE_RATE
+        )
+        with escapepod.Writer(str(path), compress_signal=False) as writer:
+            ri_idx = writer.add_run_info(run_info)
+            for i in range(len(READ_IDS)):
+                writer.add_read(
+                    read_id=str(READ_IDS[i]),
+                    read_number=READ_NUMBERS[i],
+                    start_sample=START_SAMPLES[i],
+                    channel=CHANNELS[i],
+                    well=WELLS[i],
+                    pore_type=PORE_TYPES[i],
+                    calibration_offset=CALIBRATION[i][0],
+                    calibration_scale=CALIBRATION[i][1],
+                    median_before=MEDIAN_BEFORES[i],
+                    end_reason=END_REASON_STRS[i],
+                    end_reason_forced=END_REASONS[i][1],
+                    run_info_index=ri_idx,
+                    num_minknow_events=NUM_MINKNOW_EVENTS[i],
+                    signal=SIGNALS[i],
+                )
+
+        by_id = {str(rid): sig for rid, sig in zip(READ_IDS, SIGNALS)}
+
+        with pod5.Reader(path) as reader:
+            got = {str(r.read_id): np.asarray(r.signal) for r in reader.reads()}
+        assert set(got) == set(by_id)
+        for rid, sig in by_id.items():
+            np.testing.assert_array_equal(got[rid], sig, err_msg=f"pod5 {rid}")
+
+        with escapepod.Reader(str(path)) as reader:
+            for read in reader.reads():
+                np.testing.assert_array_equal(
+                    reader.get_signal(read), by_id[read.read_id]
+                )

@@ -779,12 +779,14 @@ pub(crate) fn build_pod5_footer(
 /// `data` borrows — for the block-copy operations it points straight into a
 /// source file's mmap, so constructing a batch from these is what faults those
 /// pages in.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SignalRow<'a> {
     /// The owning read's UUID, written to the signal table's `read_id` column.
     pub read_id: [u8; 16],
-    /// Compressed (VBZ) signal bytes for this chunk.
-    pub data: &'a [u8],
+    /// Compressed (VBZ) signal bytes for this chunk. Borrowed from the source
+    /// mmap on the block-copy path; owned only when the source file stored the
+    /// chunk uncompressed and it was re-compressed to be copied.
+    pub data: std::borrow::Cow<'a, [u8]>,
     /// Number of samples `data` decodes to.
     pub samples: u32,
 }
@@ -830,7 +832,51 @@ where
 
     for row in rows {
         read_id_builder.append_value(row.read_id)?;
-        signal_builder.append_value(row.data);
+        signal_builder.append_value(&row.data);
+        samples_builder.append_value(row.samples);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(read_id_builder.finish()) as ArrayRef,
+            Arc::new(signal_builder.finish()) as ArrayRef,
+            Arc::new(samples_builder.finish()) as ArrayRef,
+        ],
+    )?)
+}
+
+/// Build one signal-table batch in the uncompressed layout
+/// (`LargeList<Int16>`), from rows whose `data` is raw little-endian `i16`.
+pub fn build_signal_batch_uncompressed<'a, I>(
+    schema: &Arc<arrow::datatypes::Schema>,
+    rows: I,
+) -> Result<RecordBatch>
+where
+    I: IntoIterator<Item = SignalRow<'a>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    use arrow::array::{Int16Builder, LargeListBuilder};
+
+    let rows = rows.into_iter();
+    let n = rows.len();
+
+    let mut read_id_builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+    // The schema's item field is non-nullable and named "item".
+    let item = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::Int16,
+        false,
+    ));
+    let mut signal_builder = LargeListBuilder::new(Int16Builder::new()).with_field(item);
+    let mut samples_builder = UInt32Builder::with_capacity(n);
+
+    for row in rows {
+        read_id_builder.append_value(row.read_id)?;
+        for b in row.data.as_chunks::<2>().0 {
+            signal_builder.values().append_value(i16::from_le_bytes(*b));
+        }
+        signal_builder.append(true);
         samples_builder.append_value(row.samples);
     }
 
@@ -936,7 +982,7 @@ pub(crate) fn write_raw_signal_table<W: Write>(
                 .map(|&(s, e)| {
                     let run = &chunks[s..e];
                     let total_bytes: usize = run.iter().map(|r| r.data.len()).sum();
-                    build_signal_batch(&schema, run.iter().copied(), total_bytes)
+                    build_signal_batch(&schema, run.iter().cloned(), total_bytes)
                 })
                 .collect();
 

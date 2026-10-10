@@ -286,7 +286,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                 for chunk in chunk_iter.by_ref().take(n) {
                     signal_chunks.push(SignalRow {
                         read_id: chunk.read_id,
-                        data: chunk.signal,
+                        data: chunk.vbz_bytes()?,
                         samples: chunk.samples,
                     });
                 }
