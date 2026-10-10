@@ -50,3 +50,14 @@ fn summary_table_has_no_ansi_when_stdout_is_redirected() {
 fn inspect_summary_has_no_ansi_when_stdout_is_redirected() {
     assert_no_ansi(&["inspect", "summary", fixture_pod5().to_str().unwrap()]);
 }
+
+/// `inspect summary` (file and directory) and `inspect reads`, colour
+/// environment cleared, both streams redirected (#449).
+#[test]
+fn inspect_stdout_has_no_ansi() {
+    let pod5 = fixture_pod5();
+    let dir = pod5.parent().unwrap().to_path_buf();
+    assert_no_ansi(&["inspect", "summary", pod5.to_str().unwrap()]);
+    assert_no_ansi(&["inspect", "reads", pod5.to_str().unwrap()]);
+    assert_no_ansi(&["inspect", "summary", dir.to_str().unwrap()]);
+}
