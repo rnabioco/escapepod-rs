@@ -47,7 +47,8 @@ mod encoder_native;
 pub mod encoder_gpu;
 
 /// Periodic GPU-vs-CPU parity guard for the GPU encoder (#448). The comparison
-/// is always compiled so CI exercises it without a device.
+/// is device-free (`crf-decode`, which `gpu` implies) so CI exercises it without a GPU.
+#[cfg(feature = "crf-decode")]
 pub mod parity;
 
 /// Batched CUDA lattice decode. The CPU decode in [`lattice`] stays the

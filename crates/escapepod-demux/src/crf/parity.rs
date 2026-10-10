@@ -194,7 +194,7 @@ impl ParityGuard {
         pending.fetch_add(1, Ordering::AcqRel);
         rayon::spawn(move || {
             use rayon::prelude::*;
-            let cpu: Result<Vec<_>, _> = rows
+            let cpu: Result<Vec<ScoredDecode>, CrfError> = rows
                 .par_iter()
                 .map(|r| reference.score(r, chains.as_ref()))
                 .collect();
@@ -234,14 +234,12 @@ impl ParityGuard {
 /// The real CPU reference: a [`CrfEncoder`](super::encoder::CrfEncoder) loaded
 /// on first use, so a guard that never fires costs nothing and the load (tract
 /// plan, native self-check) is off the device thread.
-#[cfg(feature = "crf-decode")]
 pub struct LazyCpuEncoder {
     onnx: std::path::PathBuf,
     meta: super::encoder::CrfMetadata,
     enc: std::sync::OnceLock<Result<super::encoder::CrfEncoder, String>>,
 }
 
-#[cfg(feature = "crf-decode")]
 impl LazyCpuEncoder {
     pub fn new(onnx: impl Into<std::path::PathBuf>, meta: super::encoder::CrfMetadata) -> Self {
         Self {
@@ -252,7 +250,6 @@ impl LazyCpuEncoder {
     }
 }
 
-#[cfg(feature = "crf-decode")]
 impl CpuReference for LazyCpuEncoder {
     fn score(&self, prepped: &[f32], chains: Option<&RefChains>) -> Result<ScoredDecode, CrfError> {
         let enc = self
