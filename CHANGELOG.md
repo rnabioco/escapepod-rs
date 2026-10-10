@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.31.2 (2026-10-10)
+
 ### Removed
 
 - **`escpod align` and the `escapepod-align` crate moved to
@@ -10,6 +12,12 @@
   longer exist here, and `--device` no longer has an alignment stage. The
   reference FASTA reader it shared with `escpod classify` now lives in
   `escapepod_signal::fasta`.
+
+### Build / Tooling
+
+- Dependency bumps: `noodles-bam` 0.96, `noodles-sam` 0.91, `noodles-csi` 0.62,
+  `noodles-core` 0.21, `noodles-bgzf` 0.52, the cargo minor/patch group, and
+  `prefix-dev/setup-pixi` 0.11.
 
 ## 0.31.1 (2026-10-05)
 
