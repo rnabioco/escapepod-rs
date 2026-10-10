@@ -381,7 +381,7 @@ impl Default for FpParams {
 /// batched GPU CNN (`gpu`). The fused pipeline always detects through
 /// [`Detector::detect_batch`] so the GPU variant runs as one onnxruntime call
 /// per block instead of per read.
-enum Detector {
+enum DetectorKind {
     /// No detection at all: every head anchors its window on the read end, so
     /// nothing consumes an `adapter_end`.
     ///
@@ -400,6 +400,122 @@ enum Detector {
     Cnn(Box<escapepod_demux::AdapterCnn>),
     #[cfg(feature = "gpu")]
     CnnGpu(Box<escapepod_demux::AdapterCnnGpu>),
+    /// Test double: every read's inference fails with `msg`.
+    #[cfg(test)]
+    Failing { msg: &'static str },
+}
+
+/// `adapter_end` stamped on a read whose detector *errored*, as opposed to `0`,
+/// which is the detector's genuine "no adapter / too short" answer (#445).
+///
+/// `usize::MAX` rather than a new field on every bounds tuple: bounds travel as
+/// `(usize, usize)` through five producers, and a value no real read can reach
+/// keeps those signatures. Every consumer that reads a bound must go through
+/// [`is_detect_error`] first; the CRF window rules and the fingerprint heads do.
+const DETECT_ERROR_END: usize = usize::MAX;
+
+fn is_detect_error(adapter_end: usize) -> bool {
+    adapter_end == DETECT_ERROR_END
+}
+
+/// Run-wide tally of detector failures, shared by every producer through the
+/// one [`Detector`] they hold.
+#[derive(Default)]
+struct DetectHealth {
+    reads: std::sync::atomic::AtomicUsize,
+    errors: std::sync::atomic::AtomicUsize,
+    warned: std::sync::atomic::AtomicBool,
+    /// Set (strict runs only) by the first block that saw an error; read by
+    /// [`DetectHealth::check`] to stop the run.
+    abort: std::sync::Mutex<Option<String>>,
+}
+
+/// Error fraction of a block above which the log escalates from `warn!` to
+/// `error!`.
+const DETECT_ERROR_ESCALATE: f64 = 0.01;
+
+impl DetectHealth {
+    /// Account one detected block. `first` is the first error's message, if any.
+    fn record_block(&self, reads: usize, errors: usize, first: Option<&str>, strict: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.reads.fetch_add(reads, Relaxed);
+        if errors == 0 {
+            return;
+        }
+        self.errors.fetch_add(errors, Relaxed);
+        let msg = first.unwrap_or("unknown error");
+        if !self.warned.swap(true, Relaxed) {
+            tracing::warn!(
+                "boundary detector failed on a read ({msg}); failed reads are refused as \
+                 detector errors, not counted as `no adapter`"
+            );
+        }
+        if errors as f64 > reads as f64 * DETECT_ERROR_ESCALATE {
+            tracing::error!(
+                "boundary detector failed on {errors} of {reads} reads in one block ({msg}); \
+                 results for this run are unreliable"
+            );
+        }
+        if strict {
+            let mut slot = self.abort.lock().unwrap_or_else(|e| e.into_inner());
+            slot.get_or_insert_with(|| {
+                format!(
+                    "--device gpu: the boundary detector failed ({msg}); {errors} of {reads} \
+                     reads in the block. Aborting rather than writing them as unclassified"
+                )
+            });
+        }
+    }
+
+    /// `Err` once a strict run has seen a detector error.
+    fn check(&self) -> anyhow::Result<()> {
+        match self
+            .abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+        {
+            Some(m) => Err(anyhow::anyhow!("{m}")),
+            None => Ok(()),
+        }
+    }
+
+    fn errors(&self) -> usize {
+        self.errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// End-of-run summary: one `warn!` with the count when anything failed.
+    fn log_summary(&self) {
+        let (n, total) = (
+            self.errors(),
+            self.reads.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if n > 0 {
+            tracing::warn!(
+                "boundary detector errors: {n} of {total} reads were refused as detector \
+                 errors (not `no adapter`); see the first warning for the cause"
+            );
+        }
+    }
+}
+
+/// The adapter detector plus its failure accounting.
+struct Detector {
+    kind: DetectorKind,
+    health: DetectHealth,
+    /// `--device gpu`: any detector error aborts the run.
+    strict: bool,
+}
+
+/// Map a CNN result to an `adapter_end`. Too-short input is the detector's
+/// genuine "no adapter" answer (`0`); anything else is an error.
+#[cfg(feature = "cnn-detect")]
+fn end_or_error(r: Result<usize, escapepod_demux::AdapterCnnError>) -> Result<usize, String> {
+    match r {
+        Ok(e) => Ok(e),
+        Err(escapepod_demux::AdapterCnnError::SignalTooShort { .. }) => Ok(0),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Per-worker scratch for the LLR detect prep (normalize + downscale).
@@ -410,16 +526,28 @@ struct DetectScratch {
 }
 
 impl Detector {
+    fn new(kind: DetectorKind, strict: bool) -> Self {
+        Self {
+            kind,
+            health: DetectHealth::default(),
+            strict,
+        }
+    }
+
     /// Detect `(start, end)` for one read, reusing caller-owned buffers. The
     /// LLR prep otherwise allocates three full-length `f32` buffers per read,
     /// which is a real RSS spike on the long tail of the read-length
     /// distribution (medians of ~8 k samples, maxima in the millions).
-    fn detect_with(&self, signal: &[i16], scratch: &mut DetectScratch) -> (usize, usize) {
-        match self {
+    fn detect_with(
+        &self,
+        signal: &[i16],
+        scratch: &mut DetectScratch,
+    ) -> Result<(usize, usize), String> {
+        Ok(match &self.kind {
             // Not the detector's "no adapter" sentinel reused: no head that
             // runs under this variant reads the value at all.
-            Detector::None => (0, 0),
-            Detector::Llr {
+            DetectorKind::None => (0, 0),
+            DetectorKind::Llr {
                 min_adapter,
                 border_trim,
                 downscale: ds,
@@ -434,24 +562,24 @@ impl Detector {
                 (s * scale, e * scale)
             }
             #[cfg(feature = "cnn-detect")]
-            Detector::Cnn(cnn) => {
+            DetectorKind::Cnn(cnn) => {
                 let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
-                (0, cnn.detect_adapter_end(&sig_f32).unwrap_or(0))
+                (0, end_or_error(cnn.detect_adapter_end(&sig_f32))?)
             }
             // Per-read is a degenerate single-read batch; the producers always go
             // through `detect_batch`, so this is only a correctness fallback.
             #[cfg(feature = "gpu")]
-            Detector::CnnGpu(gpu) => {
+            DetectorKind::CnnGpu(gpu) => {
                 let sig_f32: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
-                let end = gpu
-                    .detect_adapter_end_batch(&[&sig_f32])
-                    .into_iter()
-                    .next()
-                    .and_then(Result::ok)
-                    .unwrap_or(0);
+                let end = match gpu.detect_adapter_end_batch(&[&sig_f32]).into_iter().next() {
+                    Some(r) => end_or_error(r)?,
+                    None => return Err("GPU detector returned no result".to_string()),
+                };
                 (0, end)
             }
-        }
+            #[cfg(test)]
+            DetectorKind::Failing { msg } => return Err((*msg).to_string()),
+        })
     }
 
     /// Per-read `(start, end)` for a whole window of decoded signals (`None` =
@@ -479,8 +607,34 @@ impl Detector {
         signals: &[Option<Vec<i16>>],
         split: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)>,
     ) -> Vec<(usize, usize)> {
+        let results = self.detect_results(signals, split);
+        let mut errors = 0usize;
+        let mut first: Option<String> = None;
+        let out: Vec<(usize, usize)> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(b) => b,
+                Err(e) => {
+                    errors += 1;
+                    first.get_or_insert(e);
+                    (0, DETECT_ERROR_END)
+                }
+            })
+            .collect();
+        self.health
+            .record_block(signals.len(), errors, first.as_deref(), self.strict);
+        out
+    }
+
+    /// One result per signal: the bounds, or the detector's error message.
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
+    fn detect_results(
+        &self,
+        signals: &[Option<Vec<i16>>],
+        split: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)>,
+    ) -> Vec<Result<(usize, usize), String>> {
         #[cfg(feature = "gpu")]
-        if let Detector::CnnGpu(gpu) = self {
+        if let DetectorKind::CnnGpu(gpu) = &self.kind {
             let cfg = gpu.config();
             let t_prep = std::time::Instant::now();
             let prepped: Vec<Option<escapepod_demux::PreppedWindow>> = signals
@@ -501,10 +655,10 @@ impl Detector {
                 );
             }
             let t_infer = std::time::Instant::now();
-            let out: Vec<(usize, usize)> = gpu
+            let out: Vec<Result<(usize, usize), String>> = gpu
                 .detect_prepped(&prepped)
                 .into_iter()
-                .map(|r| (0usize, r.unwrap_or(0)))
+                .map(|r| end_or_error(r).map(|e| (0usize, e)))
                 .collect();
             if let Some((_, infer_ms)) = split {
                 infer_ms.fetch_add(
@@ -517,7 +671,8 @@ impl Detector {
         signals
             .par_iter()
             .map_init(DetectScratch::default, |scratch, s| {
-                s.as_ref().map_or((0, 0), |v| self.detect_with(v, scratch))
+                s.as_ref()
+                    .map_or(Ok((0, 0)), |v| self.detect_with(v, scratch))
             })
             .collect()
     }
@@ -532,13 +687,15 @@ impl Detector {
     /// [`LLR_DECODE_BOUND`](super::utils::LLR_DECODE_BOUND) for the number and
     /// what an unbounded decode cost.
     fn signal_decode_bound(&self) -> Option<usize> {
-        match self {
-            Detector::None => None,
-            Detector::Llr { .. } => Some(super::utils::LLR_DECODE_BOUND),
+        match &self.kind {
+            DetectorKind::None => None,
+            DetectorKind::Llr { .. } => Some(super::utils::LLR_DECODE_BOUND),
             #[cfg(feature = "cnn-detect")]
-            Detector::Cnn(c) => Some(c.config().max_obs_trace),
+            DetectorKind::Cnn(c) => Some(c.config().max_obs_trace),
             #[cfg(feature = "gpu")]
-            Detector::CnnGpu(g) => Some(g.config().max_obs_trace),
+            DetectorKind::CnnGpu(g) => Some(g.config().max_obs_trace),
+            #[cfg(test)]
+            DetectorKind::Failing { .. } => Some(super::utils::LLR_DECODE_BOUND),
         }
     }
 
@@ -550,7 +707,7 @@ impl Detector {
     fn on_gpu(&self) -> bool {
         #[cfg(feature = "gpu")]
         {
-            matches!(self, Detector::CnnGpu(_))
+            matches!(self.kind, DetectorKind::CnnGpu(_))
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -794,6 +951,9 @@ struct Refusals {
     window: [std::sync::atomic::AtomicUsize; 5],
     /// No signal could be decoded for the read.
     no_signal: std::sync::atomic::AtomicUsize,
+    /// The boundary detector errored on the read (#445). Not `NoAdapter`: that
+    /// is the detector's answer, this is its failure.
+    detector_error: std::sync::atomic::AtomicUsize,
     /// The encoder failed on the read (warned per read as it happened).
     encoder: std::sync::atomic::AtomicUsize,
     /// The decoded sequence matched no reference at all.
@@ -829,6 +989,10 @@ impl Refusals {
         out.push((
             "no signal decoded".to_string(),
             self.no_signal.load(Relaxed),
+        ));
+        out.push((
+            "boundary detector error".to_string(),
+            self.detector_error.load(Relaxed),
         ));
         out.push(("encoder error".to_string(), self.encoder.load(Relaxed)));
         out.push((
@@ -1819,7 +1983,9 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("classifications writer panicked: {e:?}"))??;
     }
     summary.per_barcode.sort();
+    detector.health.log_summary();
     produce_result?;
+    detector.health.check()?;
     #[cfg(feature = "crf-decode")]
     for h in heads.iter() {
         if let ClassifyModel::Crf(c) = &h.model {
@@ -2121,6 +2287,7 @@ fn decode_bound(detector: &Detector, needs_full_read: bool) -> Option<usize> {
 fn drive_blocks(
     input: &[std::path::PathBuf],
     decode_to: Option<usize>,
+    detector: &Detector,
     mut process_block: impl FnMut(Vec<Option<Vec<i16>>>, Vec<BlockItem>),
 ) -> anyhow::Result<()> {
     let shards = filler_threads();
@@ -2137,6 +2304,9 @@ fn drive_blocks(
 
         for (sigs, items) in rx {
             process_block(sigs, items);
+            // A `--device gpu` run stops at the first detector error. Returning
+            // drops `rx`, so the fillers' next send fails and they wind down.
+            detector.health.check()?;
         }
 
         for f in fillers {
@@ -2354,6 +2524,7 @@ fn produce_cpu(
         &args.input,
         // A fingerprint head reads the adapter region itself, never the read end.
         decode_bound(detector, false),
+        detector,
         |sigs, items| {
             // Batch-detect the whole block (GPU CNN = grouped onnxruntime calls; LLR
             // / CPU-CNN = parallel per read), then classify reusing each decoded
@@ -2397,7 +2568,7 @@ fn classify_one_cpu(
     fp: FpParams,
     ws: &mut SvmWorkspace,
 ) -> (String, f64) {
-    if e <= s {
+    if e <= s || is_detect_error(e) {
         return (UNCLASSIFIED.to_string(), 0.0);
     }
     let Some(features) = extract_fingerprint_from_signal(
@@ -2437,6 +2608,7 @@ fn produce_cpu_gbm(
         &args.input,
         // A fingerprint head reads the adapter region itself, never the read end.
         decode_bound(detector, false),
+        detector,
         |sigs, items| {
             // Batch-detect the whole block, then fingerprint + GBM-classify in
             // chunks. The chunking exists so each rayon task can run the batched
@@ -2570,6 +2742,7 @@ fn produce_cpu_crf_multi(
     drive_blocks(
         &args.input,
         decode_bound(detector, needs_full_read),
+        detector,
         |sigs, items| {
             let bounds = detector.detect_batch(&sigs);
             let rows: Vec<_> = sigs.into_iter().zip(bounds).zip(items).collect();
@@ -2682,6 +2855,11 @@ fn prep_one_crf(
         window.clear();
         return false;
     };
+    if is_detect_error(adapter_end) {
+        Refusals::bump(&head.refusals.detector_error);
+        window.clear();
+        return false;
+    }
     // The detector reports `adapter_end` as an index into the decoded
     // prefix, which is what `prep` wants. Only the `chunk` samples ending
     // there are converted — the prefix itself can be the whole read under
@@ -2819,6 +2997,7 @@ fn produce_cpu_crf(
     drive_blocks(
         &args.input,
         decode_bound(detector, meta.needs_full_read()),
+        detector,
         |sigs, items| {
             let bounds = detector.detect_batch(&sigs);
             let rows: Vec<_> = sigs.into_iter().zip(bounds).zip(items).collect();
@@ -3468,6 +3647,7 @@ fn produce_gpu_crf(
                 detector,
                 heads.iter().any(|h| h.encoder.metadata().needs_full_read()),
             ),
+            detector,
             |sigs, items| {
                 if hung_up {
                     return;
@@ -3515,6 +3695,10 @@ fn produce_gpu_crf(
                                         Refusals::bump(&head.refusals.no_signal);
                                         return None;
                                     };
+                                    if is_detect_error(*adapter_end) {
+                                        Refusals::bump(&head.refusals.detector_error);
+                                        return None;
+                                    }
                                     let mut w = Vec::new();
                                     // Same conversion as the CPU path: only the
                                     // `chunk` samples ending at the anchor are
@@ -3595,7 +3779,7 @@ fn fingerprint_for_gbm(
     e: usize,
     fp: FpParams,
 ) -> Option<Vec<f64>> {
-    if e <= s {
+    if e <= s || is_detect_error(e) {
         return None;
     }
     extract_fingerprint_from_signal(
@@ -3719,6 +3903,7 @@ fn produce_gpu(
                         .map(|(_, chunks)| super::utils::decode_chunks_to(chunks, decode_to))
                         .collect();
                     let bounds = detector.detect_batch(&signals);
+                    detector.health.check()?;
                     let prepped: Vec<Option<Prepped>> = window
                         .par_iter()
                         .enumerate()
@@ -3726,7 +3911,7 @@ fn produce_gpu(
                             let read = &reads[*i];
                             let signal = signals[k].as_ref()?;
                             let (s, e) = bounds[k];
-                            let features = if e > s {
+                            let features = if e > s && !is_detect_error(e) {
                                 extract_fingerprint_from_signal(
                                     signal,
                                     s,
@@ -4098,7 +4283,13 @@ fn spawn_class_writer(
                     }
                 }
                 if with_adapter_end {
-                    write!(w, ",{adapter_end}")?;
+                    // Empty for a detector error: `0` would read as the
+                    // detector's own "no adapter" answer (#445).
+                    if is_detect_error(adapter_end) {
+                        write!(w, ",")?;
+                    } else {
+                        write!(w, ",{adapter_end}")?;
+                    }
                 }
                 writeln!(w)?;
             }
@@ -4195,6 +4386,9 @@ fn build_detector(
     device: crate::device::Device,
     needs_boundary: bool,
 ) -> anyhow::Result<Detector> {
+    // `--device gpu` is a requirement, not a preference: a detector error then
+    // aborts the run instead of becoming a plausible `unclassified` (#445).
+    let strict = matches!(device, crate::device::Device::Gpu);
     if !needs_boundary {
         // Refuse rather than ignore. `--method cnn` here would build a detector
         // whose `signal_decode_bound` truncates each read to its leading 16 000
@@ -4218,7 +4412,7 @@ fn build_detector(
             "{} none (this model anchors its window on the read end)",
             style::label("Adapter detection:")
         );
-        return Ok(Detector::None);
+        return Ok(Detector::new(DetectorKind::None, false));
     }
     let (pinned_method, pinned_onnx, pinned_input, pinned_sha) = match pin {
         Some(p) => (Some(p.method), p.onnx, p.input, p.sha256),
@@ -4253,11 +4447,14 @@ fn build_detector(
                  that runs on the device, and it is also the one the shipped barcode \
                  models were measured against.",
             );
-            Ok(Detector::Llr {
-                min_adapter: args.min_adapter,
-                border_trim: args.border_trim,
-                downscale: args.downscale.max(1),
-            })
+            Ok(Detector::new(
+                DetectorKind::Llr {
+                    min_adapter: args.min_adapter,
+                    border_trim: args.border_trim,
+                    downscale: args.downscale.max(1),
+                },
+                strict,
+            ))
         }
         "cnn" => {
             #[cfg(feature = "cnn-detect")]
@@ -4310,19 +4507,25 @@ fn build_detector(
                 // GPU detection is one batched onnxruntime call per block.
                 #[cfg(feature = "gpu")]
                 if on_gpu {
-                    return Ok(Detector::CnnGpu(Box::new(
-                        escapepod_demux::AdapterCnnGpu::load_with_config(path, config)
-                            .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
-                    )));
+                    return Ok(Detector::new(
+                        DetectorKind::CnnGpu(Box::new(
+                            escapepod_demux::AdapterCnnGpu::load_with_config(path, config)
+                                .map_err(|e| anyhow::anyhow!("loading CNN model on GPU: {e}"))?,
+                        )),
+                        strict,
+                    ));
                 }
                 // True only on the branch above, which returned. Reading it
                 // here keeps the binding live in a `cnn-detect`-without-`gpu`
                 // build and states the invariant in one place.
                 debug_assert!(!on_gpu, "GPU detection reached the CPU loader");
-                Ok(Detector::Cnn(Box::new(
-                    escapepod_demux::AdapterCnn::load_with_config(path, config)
-                        .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?,
-                )))
+                Ok(Detector::new(
+                    DetectorKind::Cnn(Box::new(
+                        escapepod_demux::AdapterCnn::load_with_config(path, config)
+                            .map_err(|e| anyhow::anyhow!("loading CNN model: {e}"))?,
+                    )),
+                    strict,
+                ))
             }
             #[cfg(not(feature = "cnn-detect"))]
             {
@@ -4989,5 +5192,80 @@ mod tests {
         // failing here, so the error the user sees comes from the real parse.
         std::fs::write(&meta, "not json").unwrap();
         assert!(crf_bundle_dir(root).is_none());
+    }
+}
+
+/// #445: a detector that *errors* must not be indistinguishable from one that
+/// found no adapter.
+#[cfg(test)]
+mod detector_error_tests {
+    use super::*;
+
+    fn signals() -> Vec<Option<Vec<i16>>> {
+        vec![Some(vec![0i16; 100]), None, Some(vec![1i16; 100])]
+    }
+
+    #[test]
+    fn detector_error_is_not_no_adapter() {
+        let det = Detector::new(DetectorKind::Failing { msg: "cuda wedged" }, false);
+        let bounds = det.detect_batch(&signals());
+        // A read with no decoded signal is a decode failure, not a detector one.
+        assert_eq!(bounds[1], (0, 0));
+        for i in [0, 2] {
+            assert!(
+                is_detect_error(bounds[i].1),
+                "read {i} must carry the error marker, not adapter_end = 0 (got {:?})",
+                bounds[i]
+            );
+            assert_ne!(bounds[i].1, 0);
+        }
+        assert_eq!(det.health.errors(), 2);
+        // Non-strict: the run carries on.
+        assert!(det.health.check().is_ok());
+
+        // And the head counts it under its own reason, not `no adapter`.
+        let r = Refusals::default();
+        Refusals::bump(&r.detector_error);
+        let report = r.report();
+        assert_eq!(report, vec![("boundary detector error".to_string(), 1)]);
+        assert!(
+            !report
+                .iter()
+                .any(|(l, _)| l == WindowRefusal::NoAdapter.label())
+        );
+    }
+
+    #[test]
+    fn gpu_device_detector_error_aborts() {
+        let det = Detector::new(DetectorKind::Failing { msg: "cuda wedged" }, true);
+        assert!(det.health.check().is_ok(), "nothing has failed yet");
+        let _ = det.detect_batch(&signals());
+        let err = det.health.check().expect_err("--device gpu must abort");
+        assert!(err.to_string().contains("cuda wedged"), "{err}");
+        assert!(err.to_string().contains("--device gpu"), "{err}");
+    }
+
+    #[test]
+    fn healthy_detector_records_nothing() {
+        let det = Detector::new(DetectorKind::None, true);
+        let bounds = det.detect_batch(&signals());
+        assert!(bounds.iter().all(|b| *b == (0, 0)));
+        assert_eq!(det.health.errors(), 0);
+        assert!(det.health.check().is_ok());
+    }
+
+    #[cfg(feature = "cnn-detect")]
+    #[test]
+    fn too_short_is_no_adapter_but_inference_failure_is_an_error() {
+        use escapepod_demux::AdapterCnnError as E;
+        assert_eq!(
+            end_or_error(Err(E::SignalTooShort {
+                len: 3,
+                required: 9
+            })),
+            Ok(0)
+        );
+        assert_eq!(end_or_error(Ok(42)), Ok(42));
+        assert!(end_or_error(Err(E::Run("cudaErrorLaunchFailure".into()))).is_err());
     }
 }
