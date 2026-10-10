@@ -37,7 +37,7 @@ jobs:
 
       - name: Run tests with coverage
         # Library crates covered by nextest: escapepod-pod5,
-        # escapepod-signal, escapepod-demux. escapepod-python (pyo3
+        # escapepod-signal, escapepod-demux, escapepod-classify. escapepod-python (pyo3
         # bindings exercised by the Python test harness) and escapepod-cli
         # (binary; command handlers covered end-to-end via compat tests)
         # are intentionally excluded from the lines gate.
@@ -53,6 +53,7 @@ jobs:
           --package escapepod-pod5
           --package escapepod-signal
           --package escapepod-demux
+          --package escapepod-classify
           --features escapepod-demux/train
 
       - name: LCOV report

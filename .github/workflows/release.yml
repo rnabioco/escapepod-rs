@@ -129,7 +129,7 @@ jobs:
   # Nothing CUDA-related is needed at build time: ort is load-dynamic and
   # cudarc uses dynamic-loading, so this builds on a runner with no GPU and no
   # CUDA toolkit, and the resulting binary runs fine on CPU-only machines as
-  # long as `--gpu` is not requested.
+  # long as no GPU path is requested (`--device gpu`, or `--device auto` on a node with a visible GPU).
   build-gpu:
     name: Build x86_64-unknown-linux-gnu-gpu
     needs: macos-verify
@@ -258,7 +258,7 @@ jobs:
 
           ### Which artifact
 
-          | Artifact | Linkage | `--gpu` |
+          | Artifact | Linkage | GPU |
           |---|---|---|
           | `…-x86_64-unknown-linux-musl.tar.gz` | static (musl) | no |
           | `…-aarch64-unknown-linux-musl.tar.gz` | static (musl) | no |
@@ -274,7 +274,7 @@ jobs:
 
           ### What `…-linux-gnu-gpu` needs at run time
 
-          Only when `--gpu` is actually requested — otherwise it behaves
+          Only when a GPU path is actually used (`--device gpu`, or `--device auto` on a node with a visible GPU) — otherwise it behaves
           exactly like the musl one. It expects a **CUDA 12** runtime and
           cuDNN 9, with an NVIDIA driver ≥ 535 (the DTW kernels target the
           CUDA 12.2 driver API), and a CUDA-enabled `libonnxruntime` matching
