@@ -588,6 +588,13 @@ impl Reader {
         Ok(&self.mmap[start..end])
     }
 
+    /// The file this reader came from, for error messages.
+    fn source_label(&self) -> String {
+        self.file_path
+            .as_ref()
+            .map_or_else(|| "<unknown POD5>".to_string(), |p| p.display().to_string())
+    }
+
     /// Get signal data for a read.
     ///
     /// The `signal_rows` parameter should be the signal row indices from the
@@ -609,6 +616,34 @@ impl Reader {
     /// to span several. It cannot skip a partial ZSTD block, so a read that
     /// fits in one — anything up to ~110k samples — saves the SVB16 stage only.
     pub fn get_signal_prefix(&self, signal_rows: &[u64], max_samples: usize) -> Result<Vec<i16>> {
+        self.get_signal_impl(None, signal_rows, max_samples)
+    }
+
+    /// [`Self::get_signal`] that also verifies each chunk's `read_id` against
+    /// `read_id` and errors, naming file, read and row, on a mismatch. Prefer
+    /// it whenever the read's id is at hand: the reads-table locator is
+    /// verified on lookup, this is the matching check on the signal side.
+    pub fn get_signal_checked(&self, read_id: Uuid, signal_rows: &[u64]) -> Result<Vec<i16>> {
+        self.get_signal_impl(Some(read_id), signal_rows, usize::MAX)
+    }
+
+    /// [`Self::get_signal_prefix`] with the `read_id` check of
+    /// [`Self::get_signal_checked`].
+    pub fn get_signal_prefix_checked(
+        &self,
+        read_id: Uuid,
+        signal_rows: &[u64],
+        max_samples: usize,
+    ) -> Result<Vec<i16>> {
+        self.get_signal_impl(Some(read_id), signal_rows, max_samples)
+    }
+
+    fn get_signal_impl(
+        &self,
+        expected: Option<Uuid>,
+        signal_rows: &[u64],
+        max_samples: usize,
+    ) -> Result<Vec<i16>> {
         let Some(footer) = self.signal_ipc_footer() else {
             // No parseable signal footer (missing table / edge case): fall back
             // to Arrow's own IPC reader, which has no prefix path of its own.
@@ -619,6 +654,12 @@ impl Reader {
 
         let signal_bytes = self.signal_table_bytes()?;
         let raw_chunks = footer.extract_signal_rows(signal_rows, signal_bytes)?;
+        super::signal_extractor::verify_chunk_ids(
+            &raw_chunks,
+            signal_rows,
+            expected,
+            &self.source_label(),
+        )?;
         super::signal_extractor::decode_chunks(&raw_chunks, max_samples)
     }
 
@@ -793,8 +834,13 @@ impl Reader {
         let mut per_read: Vec<&[crate::arrow_ipc::RawSignalChunk<'_>]> =
             Vec::with_capacity(reads.len());
         let mut offset = 0usize;
+        let source = self.source_label();
         for (_key, rows) in reads {
-            per_read.push(&raw_chunks[offset..offset + rows.len()]);
+            let chunks = &raw_chunks[offset..offset + rows.len()];
+            // A read's chunks must agree on their read_id (only the key, not
+            // the id, is known here).
+            super::signal_extractor::verify_chunk_ids(chunks, rows, None, &source)?;
+            per_read.push(chunks);
             offset += rows.len();
         }
 
@@ -894,6 +940,7 @@ impl Reader {
 
         Ok(SignalExtractor {
             signal_bytes,
+            source: self.source_label(),
             footer,
         })
     }
@@ -1634,7 +1681,11 @@ impl Reader {
             .footer
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let mut reader = self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1]))?;
+        let projection = Self::column_indices(
+            &self.create_arrow_reader(embedded)?.schema(),
+            &["read_id", "signal"],
+        )?;
+        let mut reader = self.create_arrow_reader_with_projection(embedded, Some(projection))?;
 
         let mut results = Vec::with_capacity(target_ids.len());
         for (batch_idx, targets) in batch_targets {
@@ -1643,14 +1694,14 @@ impl Reader {
                 index: batch_idx,
                 max: reader.num_batches(),
             })??;
-            let signal_col =
-                batch
-                    .column(1)
-                    .as_list_opt::<i32>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
+            let signal_col = batch
+                .column_by_name("signal")
+                .ok_or_else(|| Error::MissingField("signal".to_string()))?
+                .as_list_opt::<i32>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected ListArray".to_string(),
+                })?;
             // read_id is already in the projection; without this the returned
             // signal would carry the *queried* UUID whatever row it came from.
             let read_ids = crate::arrow_helpers::read_id_column(&batch)?;
@@ -1668,6 +1719,21 @@ impl Reader {
             }
         }
         Ok(results)
+    }
+
+    /// Positions of `names` in `schema`, in the order given.
+    pub(crate) fn column_indices(
+        schema: &arrow::datatypes::Schema,
+        names: &[&str],
+    ) -> Result<Vec<usize>> {
+        names
+            .iter()
+            .map(|name| {
+                schema
+                    .index_of(name)
+                    .map_err(|_| Error::MissingField((*name).to_string()))
+            })
+            .collect()
     }
 
     fn find_signal_rows_with_calibration_indexed(
@@ -1693,8 +1759,18 @@ impl Reader {
             .footer
             .reads_table()
             .ok_or_else(|| Error::MissingField("reads table".to_string()))?;
-        let mut reader =
-            self.create_arrow_reader_with_projection(embedded, Some(vec![0, 1, 16, 17]))?;
+        // Resolved by name: a schema that inserts a column ahead of these
+        // would otherwise shift a hardcoded index onto the wrong data.
+        let projection = Self::column_indices(
+            &self.create_arrow_reader(embedded)?.schema(),
+            &[
+                "read_id",
+                "signal",
+                "calibration_offset",
+                "calibration_scale",
+            ],
+        )?;
+        let mut reader = self.create_arrow_reader_with_projection(embedded, Some(projection))?;
 
         let mut results = Vec::with_capacity(target_ids.len());
         for (batch_idx, targets) in batch_targets {
@@ -1703,23 +1779,25 @@ impl Reader {
                 index: batch_idx,
                 max: reader.num_batches(),
             })??;
-            let signal_col =
-                batch
-                    .column(1)
-                    .as_list_opt::<i32>()
-                    .ok_or_else(|| Error::InvalidField {
-                        field: "signal".to_string(),
-                        message: "Expected ListArray".to_string(),
-                    })?;
+            let signal_col = batch
+                .column_by_name("signal")
+                .ok_or_else(|| Error::MissingField("signal".to_string()))?
+                .as_list_opt::<i32>()
+                .ok_or_else(|| Error::InvalidField {
+                    field: "signal".to_string(),
+                    message: "Expected ListArray".to_string(),
+                })?;
             let cal_offset_col = batch
-                .column(2)
+                .column_by_name("calibration_offset")
+                .ok_or_else(|| Error::MissingField("calibration_offset".to_string()))?
                 .as_primitive_opt::<Float32Type>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "calibration_offset".to_string(),
                     message: "Expected Float32Array".to_string(),
                 })?;
             let cal_scale_col = batch
-                .column(3)
+                .column_by_name("calibration_scale")
+                .ok_or_else(|| Error::MissingField("calibration_scale".to_string()))?
                 .as_primitive_opt::<Float32Type>()
                 .ok_or_else(|| Error::InvalidField {
                     field: "calibration_scale".to_string(),
@@ -1928,5 +2006,36 @@ mod uniformity_tests {
             bad.index, 1,
             "report the earliest divergence, not the worst"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::Reader;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// The projection is a function of the schema's names, not of where a
+    /// column happened to sit when the constants were written.
+    #[test]
+    fn projection_resolves_by_name() {
+        let schema = Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("inserted_later", DataType::Utf8, false),
+            Field::new("signal", DataType::Utf8, false),
+            Field::new("calibration_offset", DataType::Float32, false),
+            Field::new("calibration_scale", DataType::Float32, false),
+        ]);
+        let got = Reader::column_indices(
+            &schema,
+            &[
+                "read_id",
+                "signal",
+                "calibration_offset",
+                "calibration_scale",
+            ],
+        )
+        .unwrap();
+        assert_eq!(got, vec![0, 2, 3, 4], "an inserted column shifts positions");
+        assert!(Reader::column_indices(&schema, &["no_such_column"]).is_err());
     }
 }
