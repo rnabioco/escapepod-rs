@@ -661,6 +661,20 @@ pub fn pack_training_blocks(training: &[Vec<f32>], train_len: usize) -> Vec<f32>
     blocks
 }
 
+/// [`pack_training_blocks`] over any `AsRef<[f32]>` bank of equal-length rows.
+fn pack_reference_blocks<R: AsRef<[f32]>>(references: &[R], len: usize) -> Vec<f32> {
+    let n_blocks = references.len().div_ceil(DTW_LANES);
+    let mut blocks = vec![0.0f32; n_blocks * len * DTW_LANES];
+    for (k, r) in references.iter().enumerate() {
+        let base = (k / DTW_LANES) * len * DTW_LANES;
+        let lane = k % DTW_LANES;
+        for (j, &v) in r.as_ref().iter().enumerate() {
+            blocks[base + j * DTW_LANES + lane] = v;
+        }
+    }
+    blocks
+}
+
 /// Compute the full DTW distance matrix between query sequences and reference sequences.
 ///
 /// This function computes pairwise DTW distances between all query sequences and all
@@ -702,15 +716,55 @@ where
     // `flat_map(... .collect::<Vec<_>>())` allocated n_queries temporary Vecs
     // just to be flattened and dropped.
     let mut distances = vec![0.0f32; n_queries * n_refs];
-    distances
-        .par_chunks_mut(n_refs)
-        .enumerate()
-        .for_each(|(i, row)| {
-            let q = queries[i].as_ref();
-            for (j, slot) in row.iter_mut().enumerate() {
-                *slot = dtw_distance(q, references[j].as_ref(), window);
-            }
-        });
+
+    // A uniform-length bank (the fingerprint case) is packed once into the SoA
+    // block layout and scored with the 32-lane batch kernel, bit-identical to
+    // the scalar path. Below half a block of references most lanes would be
+    // padding, so tiny banks and ragged ones take the scalar path, which
+    // reuses one scratch per rayon task instead of allocating per pair.
+    let ref_len = references.first().map_or(0, |r| r.as_ref().len());
+    let uniform = ref_len > 0
+        && n_refs >= DTW_LANES / 2
+        && references.iter().all(|r| r.as_ref().len() == ref_len);
+
+    if uniform {
+        let blocks = pack_reference_blocks(references, ref_len);
+        distances.par_chunks_mut(n_refs).enumerate().for_each_init(
+            || (DtwBatchScratch::new(), Vec::<f64>::with_capacity(n_refs)),
+            |(scratch, out), (i, row)| {
+                dtw_distances_batch(
+                    queries[i].as_ref(),
+                    &blocks,
+                    ref_len,
+                    n_refs,
+                    window,
+                    0.0,
+                    out,
+                    scratch,
+                );
+                for (slot, &d) in row.iter_mut().zip(out.iter()) {
+                    *slot = d as f32;
+                }
+            },
+        );
+    } else {
+        distances.par_chunks_mut(n_refs).enumerate().for_each_init(
+            DtwScratch::new,
+            |scratch, (i, row)| {
+                let q = queries[i].as_ref();
+                for (j, slot) in row.iter_mut().enumerate() {
+                    *slot = dtw_distance_bounded_penalty_into(
+                        q,
+                        references[j].as_ref(),
+                        window,
+                        f32::INFINITY,
+                        0.0,
+                        scratch,
+                    );
+                }
+            },
+        );
+    }
 
     Array2::from_shape_vec((n_queries, n_refs), distances)
         .expect("Failed to create distance matrix")
@@ -1038,5 +1092,77 @@ mod tests {
         // Just below should abandon
         let bounded_low = dtw_distance_bounded(&a, &b, None, 0.5);
         assert!(bounded_low.is_infinite());
+    }
+
+    /// Deterministic pseudo-random fingerprint (no ext/ fixtures).
+    fn fixture(len: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    fn assert_matrix_matches_scalar(
+        queries: &[Vec<f32>],
+        refs: &[Vec<f32>],
+        window: Option<usize>,
+    ) {
+        let m = dtw_distance_matrix(queries, refs, window);
+        assert_eq!(m.shape(), &[queries.len(), refs.len()]);
+        for (i, q) in queries.iter().enumerate() {
+            for (j, r) in refs.iter().enumerate() {
+                let want = dtw_distance(q, r, window);
+                assert_eq!(
+                    m[[i, j]].to_bits(),
+                    want.to_bits(),
+                    "pair ({i},{j}) window {window:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dtw_matrix_matches_scalar_uniform() {
+        // 70 refs = two full blocks + a partial one; ragged *queries* are fine.
+        let refs: Vec<Vec<f32>> = (0..70).map(|k| fixture(40, k)).collect();
+        let queries: Vec<Vec<f32>> = [40, 40, 33, 1, 57]
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| fixture(l, 1000 + i as u64))
+            .collect();
+        assert_matrix_matches_scalar(&queries, &refs, None);
+    }
+
+    #[test]
+    fn dtw_matrix_matches_scalar_ragged() {
+        let refs: Vec<Vec<f32>> = (0..40).map(|k| fixture(20 + (k as usize % 7), k)).collect();
+        let queries: Vec<Vec<f32>> = (0..4).map(|i| fixture(24, 500 + i)).collect();
+        assert_matrix_matches_scalar(&queries, &refs, None);
+        assert_matrix_matches_scalar(&queries, &refs, Some(5));
+        // Empty reference mixed in: +INF contract.
+        let mut refs2 = refs.clone();
+        refs2[3].clear();
+        assert_matrix_matches_scalar(&queries, &refs2, None);
+    }
+
+    #[test]
+    fn dtw_matrix_matches_scalar_windowed() {
+        let refs: Vec<Vec<f32>> = (0..50).map(|k| fixture(30, k)).collect();
+        let queries: Vec<Vec<f32>> = [30, 28, 36, 45]
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| fixture(l, 900 + i as u64))
+            .collect();
+        // Includes windows too narrow for |n - m| (infeasible -> +INF).
+        for w in [0, 2, 5, 15, 100] {
+            assert_matrix_matches_scalar(&queries, &refs, Some(w));
+        }
     }
 }
