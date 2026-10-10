@@ -3,6 +3,8 @@
 mod cache;
 mod dataset;
 mod file_reader;
+#[cfg(test)]
+mod read_count_tests;
 mod read_index;
 mod read_iter;
 mod signal_extractor;
