@@ -22,6 +22,9 @@ const ROW_COUNT_PARALLEL_MIN: usize = 16;
 /// Read once. The answer cannot change within a process, and this sits on a
 /// path that a reader hits per file — one that a `classify` run may open
 /// dozens of.
+/// Prefix of the error [`ArrowIpcFooter::parse_confirming_total`] maps to `None`.
+const CLAIM_REFUTED: &str = "claimed row total refuted";
+
 fn footer_walk_forced_serial() -> bool {
     use std::sync::OnceLock;
     static FORCED: OnceLock<bool> = OnceLock::new();
@@ -184,6 +187,37 @@ impl ArrowIpcFooter {
     /// the stride. Any mismatch discards `known` and walks the batches, so a
     /// stale or corrupt cache costs time and never correctness.
     pub fn parse_with_row_counts(ipc_bytes: &[u8], known: Option<&[u64]>) -> Result<Self> {
+        let footer_bytes = Self::footer_flatbuffer(ipc_bytes)?;
+        Self::parse_footer_flatbuffer(footer_bytes, ipc_bytes, known, None)
+    }
+
+    /// Parse the footer taking `claimed_total` (a row total some cache says
+    /// this table holds) **only if the table bears it out**.
+    ///
+    /// The one thing a caller wants from a reads table is usually its length,
+    /// and the footer does not carry it: summing means reading every batch's
+    /// message header, a scattered touch per batch. A `.p5s` sidecar records
+    /// the total, but a sidecar is a cache, so it is checked rather than
+    /// believed. Real writers cut a table into equal batches and one short
+    /// last one, so the first and last batch headers (two touches) predict the
+    /// total as `(batches - 1) * first + last`. The claim is accepted only if
+    /// it equals that prediction; the prediction on its own would be a guess
+    /// about the writer, and the claim on its own would be a guess about the
+    /// cache, but two independent sources agreeing is not.
+    ///
+    /// Returns `Ok(None)` when they disagree — including for a perfectly
+    /// valid table of irregular batches, which then simply takes the walk.
+    pub fn parse_confirming_total(ipc_bytes: &[u8], claimed_total: u64) -> Result<Option<Self>> {
+        let footer_bytes = Self::footer_flatbuffer(ipc_bytes)?;
+        match Self::parse_footer_flatbuffer(footer_bytes, ipc_bytes, None, Some(claimed_total)) {
+            Ok(f) => Ok(Some(f)),
+            Err(Error::InvalidArrowIpc(m)) if m.starts_with(CLAIM_REFUTED) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Locate the footer FlatBuffer inside a complete IPC file.
+    fn footer_flatbuffer(ipc_bytes: &[u8]) -> Result<&[u8]> {
         let len = ipc_bytes.len();
 
         // Need at least magic (8) + footer_len (4) + magic (6) = 18 bytes minimum
@@ -225,8 +259,7 @@ impl ArrowIpcFooter {
         let footer_start = len - 6 - 4 - footer_len as usize;
         let footer_bytes = slice_at(ipc_bytes, footer_start, footer_len as usize)?;
 
-        // Parse the footer FlatBuffer to extract batch blocks
-        Self::parse_footer_flatbuffer(footer_bytes, ipc_bytes, known)
+        Ok(footer_bytes)
     }
 
     /// Parse the Footer FlatBuffer to extract record batch locations.
@@ -234,6 +267,7 @@ impl ArrowIpcFooter {
         footer_bytes: &[u8],
         full_ipc: &[u8],
         known: Option<&[u64]>,
+        claimed_total: Option<u64>,
     ) -> Result<Self> {
         // FlatBuffer footer structure (simplified):
         // - Root table offset (4 bytes from start)
@@ -328,6 +362,48 @@ impl ArrowIpcFooter {
                         });
                     }
 
+                    // A claimed total stands in for the walk only if two real
+                    // headers reproduce it (see `parse_confirming_total`).
+                    let predicted: Option<Vec<u64>> = match (known, claimed_total) {
+                        (None, Some(claimed)) if !record_batches.is_empty() => {
+                            let n = record_batches.len();
+                            let first = Self::parse_batch_row_count(
+                                full_ipc,
+                                record_batches[0].offset as usize,
+                            )?;
+                            let last = if n > 1 {
+                                Self::parse_batch_row_count(
+                                    full_ipc,
+                                    record_batches[n - 1].offset as usize,
+                                )?
+                            } else {
+                                first
+                            };
+                            let total = if n > 1 {
+                                (n as u64 - 1)
+                                    .checked_mul(first)
+                                    .and_then(|v| v.checked_add(last))
+                            } else {
+                                Some(first)
+                            };
+                            if total != Some(claimed) {
+                                return Err(Error::InvalidArrowIpc(format!(
+                                    "{CLAIM_REFUTED}: claimed {claimed}, first/last batch imply {total:?}"
+                                )));
+                            }
+                            let mut v = vec![first; n];
+                            v[n - 1] = last;
+                            Some(v)
+                        }
+                        (None, Some(claimed)) if claimed != 0 => {
+                            return Err(Error::InvalidArrowIpc(format!(
+                                "{CLAIM_REFUTED}: claimed {claimed} rows in a table with no batches"
+                            )));
+                        }
+                        _ => None,
+                    };
+                    let known = known.or(predicted.as_deref());
+
                     // Pass two: the row counts, the one field the footer does
                     // not carry. Supplied per batch where a caller knows them
                     // — which is the whole point, this read is the scattered
@@ -377,7 +453,7 @@ impl ArrowIpcFooter {
                      ignoring it and reading the batch headers (rebuild with \
                      `escpod index`)"
                 );
-                return Self::parse_footer_flatbuffer(footer_bytes, full_ipc, None);
+                return Self::parse_footer_flatbuffer(footer_bytes, full_ipc, None, None);
             }
         }
 

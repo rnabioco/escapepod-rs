@@ -41,7 +41,23 @@ use std::time::{Duration, Instant};
 use escapepod_pod5::Reader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--dataset <dir>`: time `Dataset::open` + `read_count` over a directory
+    // instead of per-file readers (the serial-vs-parallel open, #457).
+    if args.first().is_some_and(|a| a == "--dataset") {
+        args.remove(0);
+        let t0 = Instant::now();
+        let ds = escapepod_pod5::Dataset::open(args.first().ok_or("--dataset needs a directory")?)?;
+        let open = t0.elapsed();
+        let t1 = Instant::now();
+        let reads = ds.read_count()?;
+        println!(
+            "dataset: {} file(s), {reads} reads  open {open:.2?}  read_count {:.2?}",
+            ds.file_count(),
+            t1.elapsed()
+        );
+        return Ok(());
+    }
     if args.is_empty() {
         return Err("usage: open_cost <pod5 file or directory>...".into());
     }
@@ -72,13 +88,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let (mut t_open, mut t_index, mut t_extract) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (mut t_open, mut t_count, mut t_index, mut t_extract) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
     let faults0 = major_faults();
 
     for path in &paths {
         let t0 = Instant::now();
         let reader = Reader::open(path)?;
         let open = t0.elapsed();
+
+        // `read_count()` is what warm-up and `filter` pay before an index
+        // exists: a header walk, or the sidecar's recorded count (#457).
+        let tc = Instant::now();
+        let counted = reader.read_count()?;
+        let count = tc.elapsed();
 
         // Ordered as a caller pays them, and timed apart because they are two
         // different costs with two different fixes.
@@ -91,10 +118,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let extract = t2.elapsed();
 
         println!(
-            "  {:<44}  open {:>8.1?}  read_index {:>9.1?} ({reads} reads)  \
-             signal_extractor {:>9.1?}",
+            "  {:<44}  open {:>8.1?}  read_count {:>9.1?} ({counted})  \
+             read_index {:>9.1?} ({reads} reads)  signal_extractor {:>9.1?}",
             path.file_name().unwrap_or_default().to_string_lossy(),
             open,
+            count,
             index,
             extract,
         );
@@ -103,16 +131,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::hint::black_box(&extractor);
 
         t_open += open;
+        t_count += count;
         t_index += index;
         t_extract += extract;
     }
 
-    let total = t_open + t_index + t_extract;
+    let total = t_open + t_count + t_index + t_extract;
     println!(
-        "\ntotals over {} file(s):  open {:.2?}  read_index {:.2?}  \
+        "\ntotals over {} file(s):  open {:.2?}  read_count {:.2?}  read_index {:.2?}  \
          signal_extractor {:.2?}  =  {:.2?}   ({} major faults)",
         paths.len(),
         t_open,
+        t_count,
         t_index,
         t_extract,
         total,

@@ -21,6 +21,7 @@
 //! `ReaderCache`/`cached_reader`: same ordering guarantees, same failure
 //! semantics, same canonicalized-key story — see [`DatasetCache::get`].
 
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,10 +156,16 @@ impl Dataset {
             )));
         }
 
+        // Opened concurrently: each open pays a SIGBUS probe, run-info load
+        // and index warm-up, all of them round trips on a network filesystem
+        // that overlap across files. The results are collected in `files`
+        // order and the *first* failure in that order is returned, exactly
+        // what the serial loop did — rayon's own `collect::<Result<_>>()`
+        // would report whichever failure finished first.
+        let opened: Vec<Result<Arc<Reader>>> = files.par_iter().map(cached_reader).collect();
         let mut entries = Vec::with_capacity(files.len());
-        for file in files {
-            let reader = cached_reader(&file)?;
-            entries.push((file, reader));
+        for (file, reader) in files.into_iter().zip(opened) {
+            entries.push((file, reader?));
         }
 
         Ok(Self {
@@ -187,11 +194,12 @@ impl Dataset {
 
     /// Total number of reads across every file.
     pub fn read_count(&self) -> Result<usize> {
-        let mut total = 0;
-        for (_, reader) in &self.files {
-            total += reader.read_count()?;
-        }
-        Ok(total)
+        // Per-file counts are independent and, without a sidecar, a cold
+        // header walk each; sum them concurrently.
+        self.files
+            .par_iter()
+            .map(|(_, reader)| reader.read_count())
+            .try_reduce(|| 0, |a, b| Ok(a + b))
     }
 
     /// All run info records across the dataset, deduplicated by acquisition id.

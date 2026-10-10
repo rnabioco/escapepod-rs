@@ -1205,6 +1205,7 @@ pub fn read_sidecar_metadata(
     let provenance = check_identity(metadata, p5s_path, expect)?;
 
     Ok(Some(SidecarMetadata {
+        read_count: provenance.read_count,
         provenance,
         signal_batch_rows: metadata
             .get(P5S_SIGNAL_BATCH_ROWS_KEY)
@@ -1217,6 +1218,13 @@ pub fn read_sidecar_metadata(
 pub struct SidecarMetadata {
     /// What the sidecar says about its own origin.
     pub provenance: SidecarProvenance,
+    /// The number of reads the sidecar was written for, if recorded.
+    ///
+    /// A **claim**, not a fact: identity binding (file id + size) says the
+    /// sidecar belongs to this POD5, not that this number survived intact.
+    /// Use it through `Reader::read_count`, which checks it against the
+    /// reads table before believing it.
+    pub read_count: Option<u64>,
     /// Cached per-batch row counts of the POD5's signal table, if recorded.
     pub signal_batch_rows: Option<Vec<u64>>,
 }

@@ -18,6 +18,10 @@
 //! ```
 
 // Internal modules - not part of public API
+// Lets in-crate tests reuse `tests/common` (written against the public path).
+#[cfg(test)]
+extern crate self as escapepod_pod5;
+
 pub(crate) mod arrow_helpers;
 pub(crate) mod arrow_ipc;
 pub(crate) mod footer;

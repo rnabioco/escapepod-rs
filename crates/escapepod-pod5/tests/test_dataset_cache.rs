@@ -248,3 +248,42 @@ fn a_local_dataset_cache_behaves_like_reader_cache_one_level_up() {
     let d3 = cache.get(&[tmp.path()], true, ".pod5").unwrap();
     assert!(!Arc::ptr_eq(&d1, &d3), "clear must force a re-open");
 }
+
+/// Files are opened concurrently (#457), but results must stay in the sorted
+/// path order and the first failure in that order must be the one reported.
+#[test]
+fn dataset_open_preserves_order() {
+    let tmp = TempDir::new().unwrap();
+    // Distinct read counts per file, so a shuffled pairing of path and reader
+    // shows up as a wrong count rather than passing by symmetry.
+    let names: Vec<String> = (0..12).map(|i| format!("f{i:02}.pod5")).collect();
+    for (i, name) in names.iter().enumerate() {
+        fixture(&tmp, name, &format!("order_acq_{i}"), 3 + i);
+    }
+    let ds = Dataset::open_with(&[tmp.path()], false, ".pod5").unwrap();
+    assert_eq!(ds.file_count(), names.len());
+    for (i, path) in ds.paths().iter().enumerate() {
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), names[i]);
+        assert_eq!(
+            ds.reader_at(i).unwrap().read_count().unwrap(),
+            3 + i,
+            "reader {i} does not belong to {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        ds.read_count().unwrap(),
+        (0..12).map(|i| 3 + i).sum::<usize>()
+    );
+
+    // Two unreadable files: the error must be the earlier one's.
+    std::fs::write(tmp.path().join("f03.bad.pod5"), b"first").unwrap();
+    std::fs::write(tmp.path().join("f09.bad.pod5"), b"second-and-longer").unwrap();
+    let err = Dataset::open_with(&[tmp.path()], false, ".pod5")
+        .err()
+        .unwrap();
+    let serial = cached_reader(tmp.path().join("f03.bad.pod5"))
+        .err()
+        .unwrap();
+    assert_eq!(err.to_string(), serial.to_string());
+}

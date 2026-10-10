@@ -81,7 +81,7 @@ pub struct Reader {
     /// Memory-mapped file data.
     mmap: Mmap,
     /// Parsed file footer.
-    footer: Footer,
+    pub(crate) footer: Footer,
     /// Cached run info data.
     run_info_cache: Vec<RunInfoData>,
     /// Parsed Arrow IPC footer of the signal table (lazy — computed on first
@@ -96,6 +96,8 @@ pub struct Reader {
     read_index: OnceLock<ReadIndex>,
     /// Cached total read count (see [`Self::read_count`]).
     read_count: OnceLock<usize>,
+    /// The `.p5s` schema metadata, read once (see [`Self::sidecar_metadata`]).
+    sidecar_meta: OnceLock<Option<crate::sidecar::SidecarMetadata>>,
     /// Path to the POD5 file (for locating `.p5s` sidecar).
     file_path: Option<PathBuf>,
 }
@@ -250,6 +252,7 @@ impl Reader {
             signal_ipc_footer: OnceLock::new(),
             read_index: OnceLock::new(),
             read_count: OnceLock::new(),
+            sidecar_meta: OnceLock::new(),
             file_path: Some(file_path),
         };
         Ok(reader)
@@ -302,10 +305,32 @@ impl Reader {
     /// loud error on the paths that *depend* on it — [`Self::read_index`]
     /// keeps that behaviour, and this deliberately does not duplicate it.
     fn sidecar_signal_batch_rows(&self) -> Option<Vec<u64>> {
-        let p5s_path = self.p5s_path()?;
-        let identity = self.sidecar_identity().ok()?;
-        let meta = crate::sidecar::read_sidecar_metadata(&p5s_path, &identity).ok()??;
-        meta.signal_batch_rows
+        self.sidecar_metadata()?.signal_batch_rows.clone()
+    }
+
+    /// The `.p5s` schema metadata bound to this POD5, opened and footer-parsed
+    /// **once** per reader.
+    ///
+    /// The signal geometry, the read count and [`Self::has_sidecar_index`] all
+    /// want the same few keys, and each used to open the sidecar and parse its
+    /// Arrow footer for itself — three network round-trips' worth for one
+    /// file. `None` is a missing sidecar, one bound to another POD5, or an
+    /// unreadable one: this is a cache lookup on paths whose answer the POD5
+    /// itself holds, so it never fails an open. The paths that *depend* on the
+    /// sidecar ([`Self::read_index`]) read it themselves and stay loud.
+    ///
+    /// Cached for the reader's lifetime, like the read index: a sidecar
+    /// written after the first call is not seen by this instance.
+    fn sidecar_metadata(&self) -> Option<&crate::sidecar::SidecarMetadata> {
+        self.sidecar_meta
+            .get_or_init(|| {
+                let p5s_path = self.p5s_path()?;
+                let identity = self.sidecar_identity().ok()?;
+                crate::sidecar::read_sidecar_metadata(&p5s_path, &identity)
+                    .ok()
+                    .flatten()
+            })
+            .as_ref()
     }
 
     /// The signal footer for a bulk fetch — the cached one wherever there is
@@ -553,10 +578,15 @@ impl Reader {
 
     /// Get the total number of reads.
     ///
-    /// Parses the reads-table Arrow IPC footer to sum each
-    /// `BatchBlock::row_count` — O(num_batches), not O(num_reads). On a
-    /// 2.96M-read POD5 this is microseconds versus tens of milliseconds
-    /// for the previous full-scan implementation.
+    /// The reads-table Arrow IPC footer does not carry row counts, so the
+    /// plain answer sums each batch's own message header — O(num_batches)
+    /// scattered touches, which is what a network filesystem charges for.
+    /// When a `.p5s` sidecar bound to this POD5 records the count, it is used
+    /// instead, but **checked, not believed**: identity binding only proves
+    /// the sidecar belongs to this file, so the claim must also equal what the
+    /// table's first and last batch headers predict (two touches, not N) —
+    /// see [`crate::arrow_ipc::ArrowIpcFooter::parse_confirming_total`]. A
+    /// claim that does not hold up is ignored and the walk runs.
     pub fn read_count(&self) -> Result<usize> {
         if let Some(&count) = self.read_count.get() {
             return Ok(count);
@@ -564,13 +594,22 @@ impl Reader {
         // Compute outside the lock — may race with another thread, but
         // get_or_init will discard the extra copy. Mirrors `read_index`.
         let bytes = self.reads_table_bytes()?;
-        let footer = crate::arrow_ipc::ArrowIpcFooter::parse(bytes)?;
+        let confirmed = match self.sidecar_metadata().and_then(|m| m.read_count) {
+            Some(claimed) => {
+                crate::arrow_ipc::ArrowIpcFooter::parse_confirming_total(bytes, claimed)?
+            }
+            None => None,
+        };
+        let footer = match confirmed {
+            Some(f) => f,
+            None => crate::arrow_ipc::ArrowIpcFooter::parse(bytes)?,
+        };
         let count = footer.total_rows as usize;
         Ok(*self.read_count.get_or_init(|| count))
     }
 
     /// Raw bytes of the reads table (Arrow IPC stream slice into the mmap).
-    fn reads_table_bytes(&self) -> Result<&[u8]> {
+    pub(crate) fn reads_table_bytes(&self) -> Result<&[u8]> {
         let embedded = self
             .footer
             .reads_table()
@@ -1341,16 +1380,7 @@ impl Reader {
     /// that "you have no index" can be said before the lookup starts, not to
     /// classify why.
     pub fn has_sidecar_index(&self) -> bool {
-        let Some(p5s_path) = self.p5s_path() else {
-            return false;
-        };
-        let Ok(identity) = self.sidecar_identity() else {
-            return false;
-        };
-        matches!(
-            crate::sidecar::read_sidecar_metadata(&p5s_path, &identity),
-            Ok(Some(_))
-        )
+        self.sidecar_metadata().is_some()
     }
 
     /// Get or lazily build the read UUID index.
