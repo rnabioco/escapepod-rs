@@ -71,16 +71,16 @@ pub struct RefGeometry {
 /// the map is refined against come from those bases. One reader, so the
 /// coordinates and the sequence cannot come from differently-parsed files.
 ///
-/// Parsing itself goes through `escapepod_align::fasta::read_fasta` — the one
-/// reference FASTA reader `escpod align` also uses (rnabioco/escapepod-rs#410)
-/// — so a duplicate reference name is refused here exactly as it is there,
-/// where it used to silently let the last one win.
+/// Parsing itself goes through `escapepod_signal::fasta::read_fasta` — the one
+/// shared reference FASTA reader (rnabioco/escapepod-rs#410; it used to also
+/// serve the since-removed `escpod align`) — so a duplicate reference name is
+/// refused, where it used to silently let the last one win.
 pub fn reference_sequences(path: &Path) -> Result<HashMap<String, String>> {
     read_fasta(path)
 }
 
 /// Open a FASTA, transparently gunzipping when the file starts with the
-/// gzip magic — `escapepod_align::fasta::read_fasta` is std-only and never
+/// gzip magic — `escapepod_signal::fasta::read_fasta` never
 /// decompresses anything itself (rnabioco/escapepod-rs#410), so each caller
 /// that wants gzip support does this small amount of I/O first.
 fn open_fasta(path: &Path) -> Result<Box<dyn BufRead>> {
@@ -97,7 +97,7 @@ fn open_fasta(path: &Path) -> Result<Box<dyn BufRead>> {
 }
 
 fn read_fasta(path: &Path) -> Result<HashMap<String, String>> {
-    let records = escapepod_align::fasta::read_fasta(open_fasta(path)?)
+    let records = escapepod_signal::fasta::read_fasta(open_fasta(path)?)
         .with_context(|| format!("reading reference {}", path.display()))?;
     Ok(records
         .into_iter()

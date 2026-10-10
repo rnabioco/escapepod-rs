@@ -499,7 +499,7 @@ const AMBIGUITY_OFFSET: usize = 23;
 /// Records by name (the header's first token), sequence uppercased.
 fn read_fasta(path: &Path) -> std::collections::HashMap<String, Vec<u8>> {
     let file = std::fs::File::open(path).expect("the fixture reference reads");
-    let records = escapepod_align::fasta::read_fasta(std::io::BufReader::new(file))
+    let records = escapepod_signal::fasta::read_fasta(std::io::BufReader::new(file))
         .expect("the fixture reference parses");
     records
         .into_iter()

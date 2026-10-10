@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Removed
+
+- **`escpod align` and the `escapepod-align` crate moved to
+  [rnabioco/eschalign](https://github.com/rnabioco/eschalign)** (standalone
+  `eschalign` binary, history preserved). The `ESCAPEPOD_ALIGN_*` switches no
+  longer exist here, and `--device` no longer has an alignment stage. The
+  reference FASTA reader it shared with `escpod classify` now lives in
+  `escapepod_signal::fasta`.
+
 ## 0.31.1 (2026-10-05)
 
 ### Fixed

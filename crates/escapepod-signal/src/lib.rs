@@ -25,6 +25,7 @@
 // Signal-processing modules live in this crate.
 pub mod chunk;
 pub mod dtw;
+pub mod fasta;
 pub mod features;
 pub mod lstm;
 pub mod mapping;
