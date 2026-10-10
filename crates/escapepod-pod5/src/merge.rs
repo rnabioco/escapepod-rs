@@ -27,10 +27,10 @@ use crate::error::Result;
 use crate::reader::Reader;
 use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid};
 use crate::utils::pod5_assembler::{
-    ProcessedRead, deduplicate_run_infos, write_post_signal_sections,
+    FlatReadRef, deduplicate_run_infos, write_post_signal_sections,
 };
 use crate::utils::table_builders::{
-    SchemaMetadata, SignalRow, build_reads_table, write_raw_signal_table,
+    SchemaMetadata, SignalRow, build_reads_table_remapped, write_raw_signal_table,
 };
 use crate::writer::atomic::{AtomicFile, Durability};
 use rayon::prelude::*;
@@ -141,14 +141,6 @@ struct FileMetadata {
     reads: Vec<ReadData>,
 }
 
-/// A read carried from its source file through to the merged output: its
-/// original UUID (for cross-file duplicate detection), the `ReadData` with
-/// its `run_info_index` already remapped onto the deduplicated run-info
-/// list, and its **original, file-local** signal row indices (not yet
-/// renumbered — that happens only for reads that survive dedup, during the
-/// flattening pass below).
-type RemappedRead = (Uuid, ReadData, Vec<u64>);
-
 fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     inputs: &[P],
     output: Q,
@@ -211,87 +203,68 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         .collect();
     let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
 
-    // Transform reads in parallel (run_info remapping only — signal rows
-    // stay file-local until the flattening pass below knows which reads
-    // survive dedup).
-    let per_file_reads: Vec<Vec<RemappedRead>> = file_metadata
-        .par_iter()
-        .map(|metadata| {
-            metadata
-                .reads
-                .iter()
-                .map(|read| {
-                    let original_run_info = metadata.run_infos.get(read.run_info_index as usize);
-                    let new_run_info_idx = if let Some(ri) = original_run_info {
-                        *run_info_map.get(&ri.acquisition_id).unwrap_or(&0)
-                    } else {
-                        0
-                    };
-                    let new_read = read.for_writing(new_run_info_idx);
-                    (read.read_id, new_read, read.signal_rows.clone())
-                })
-                .collect()
-        })
-        .collect();
-
     // Phase 2: filter duplicates and flatten surviving reads' compressed
     // signal chunks into one list, assigning fresh global row indices from
     // the flattened order rather than from each file's original numbering.
     // One `extract_signal_rows` call per file (not per read) so the lookup
     // amortizes its batch-grouping work across every row it is asked for,
     // matching `filter`'s approach.
+    //
+    // Surviving reads are recorded as `FlatReadRef`s (a borrow of the
+    // source `ReadData`, a signal-row prefix sum and the remapped run-info
+    // key; ~32 B/read) instead of cloned `ReadData` + `Vec<u64>` pairs. The
+    // output reads table applies the remap while it is built
+    // (`build_reads_table_remapped`), exactly as `filter` does.
     let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
         HashSet::new()
     } else {
         HashSet::with_capacity(total_read_count as usize)
     };
 
-    let mut processed_reads: Vec<ProcessedRead> = Vec::with_capacity(total_read_count as usize);
+    let mut flat_reads: Vec<FlatReadRef<'_>> = Vec::with_capacity(total_read_count as usize);
     let mut signal_chunks: Vec<SignalRow<'_>> = Vec::new();
     let mut duplicate_count = 0u64;
     let mut signal_row_cursor: u64 = 0;
 
-    for (file_idx, file_reads) in per_file_reads.into_iter().enumerate() {
-        let metadata = &file_metadata[file_idx];
-
-        let mut survivors: Vec<(ReadData, Vec<u64>)> = Vec::with_capacity(file_reads.len());
-        for (read_id, new_read, original_signal_rows) in file_reads {
-            if !options.duplicate_ok {
-                if seen_reads.contains(&read_id) {
-                    duplicate_count += 1;
-                    continue;
-                }
-                seen_reads.insert(read_id);
+    for (file_idx, metadata) in file_metadata.iter().enumerate() {
+        let first_survivor = flat_reads.len();
+        for read in &metadata.reads {
+            if !options.duplicate_ok && !seen_reads.insert(read.read_id) {
+                duplicate_count += 1;
+                continue;
             }
-            survivors.push((new_read, original_signal_rows));
+            let run_info_key = metadata
+                .run_infos
+                .get(read.run_info_index as usize)
+                .and_then(|ri| run_info_map.get(&ri.acquisition_id).copied())
+                .unwrap_or(0);
+            flat_reads.push(FlatReadRef {
+                read,
+                new_signal_rows_start: signal_row_cursor,
+                run_info_key: i16::try_from(run_info_key).unwrap_or(0),
+            });
+            signal_row_cursor += read.signal_rows.len() as u64;
         }
 
+        let survivors = &flat_reads[first_survivor..];
         if !survivors.is_empty() {
             let signal_bytes = metadata.reader.signal_table_bytes()?;
             let flat_row_indices: Vec<u64> = survivors
                 .iter()
-                .flat_map(|(_, rows)| rows.iter().copied())
+                .flat_map(|r| r.read.signal_rows.iter().copied())
                 .collect();
             let raw_chunks = metadata
                 .footer
                 .extract_signal_rows(&flat_row_indices, signal_bytes)?;
+            drop(flat_row_indices);
 
-            let mut chunk_iter = raw_chunks.into_iter();
-            for (new_read, original_rows) in survivors {
-                let n = original_rows.len();
-                let new_signal_rows: Vec<u64> =
-                    (signal_row_cursor..signal_row_cursor + n as u64).collect();
-                signal_row_cursor += n as u64;
-
-                for chunk in chunk_iter.by_ref().take(n) {
-                    signal_chunks.push(SignalRow {
-                        read_id: chunk.read_id,
-                        data: chunk.vbz_bytes()?,
-                        samples: chunk.samples,
-                    });
-                }
-
-                processed_reads.push((new_read, new_signal_rows));
+            signal_chunks.reserve(raw_chunks.len());
+            for chunk in raw_chunks {
+                signal_chunks.push(SignalRow {
+                    read_id: chunk.read_id,
+                    data: chunk.vbz_bytes()?,
+                    samples: chunk.samples,
+                });
             }
         }
 
@@ -304,7 +277,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         }
     }
 
-    let total_reads = processed_reads.len() as u64;
+    let total_reads = flat_reads.len() as u64;
     let signal_rows_written = signal_row_cursor;
 
     // Phase 3: write the output file — header, the freshly uniform-stride
@@ -340,12 +313,14 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         });
     }
 
-    let reads_table_bytes = build_reads_table(
-        &processed_reads,
+    let reads_table_bytes = build_reads_table_remapped(
+        &flat_reads,
         &all_run_infos,
         &schema_meta,
         options.read_batch_size as usize,
     )?;
+    // Release the borrow refs before the reads-table bytes hit the writer.
+    drop(flat_reads);
     write_post_signal_sections(
         &mut file,
         &section_marker,

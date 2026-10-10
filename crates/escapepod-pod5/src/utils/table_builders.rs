@@ -248,9 +248,7 @@ struct PartitionArrays {
 }
 
 /// View of one row that's about to be emitted to the output reads
-/// table. Implementations encapsulate the two differences between the
-/// merge path (`(ReadData, Vec<u64>)` — already-remapped) and the
-/// filter path (`FlatReadRef` — borrowed source `ReadData` plus a
+/// table (`FlatReadRef` — borrowed source `ReadData` plus a
 /// prefix-sum signal-row offset and a precomputed run_info dict key).
 /// Everything else (read_id, scalar fields, pore_type / end_reason
 /// dict lookups) is identical and lives in `build_partition_inner`.
@@ -262,27 +260,6 @@ trait PartitionRow {
     /// Dictionary key for the `run_info` column — i.e. this read's
     /// index in the deduplicated `all_run_infos`.
     fn run_info_key(&self) -> i16;
-}
-
-impl PartitionRow for (ReadData, Vec<u64>) {
-    fn read(&self) -> &ReadData {
-        &self.0
-    }
-
-    fn append_signal_rows(&self, builder: &mut UInt64Builder) {
-        for &idx in &self.1 {
-            builder.append_value(idx);
-        }
-    }
-
-    fn run_info_key(&self) -> i16 {
-        // Merge's `for_writing` already remapped `run_info_index` to
-        // point at `all_run_infos`, which is exactly the dictionary
-        // index. Saturate on overflow rather than allocating an error
-        // path — i16::MAX (32767) is far past any realistic run-info
-        // count.
-        i16::try_from(self.0.run_info_index).unwrap_or(0)
-    }
 }
 
 impl PartitionRow for crate::utils::pod5_assembler::FlatReadRef<'_> {
@@ -422,7 +399,7 @@ fn build_partition_inner<R: PartitionRow>(
     })
 }
 
-/// Shared core of `build_reads_table` and `build_reads_table_remapped`.
+/// Core of `build_reads_table_remapped`.
 ///
 /// Both callers reduce to the same four phases over a `[R: PartitionRow]`
 /// slice — parallel dictionary collection, O(1) key-lookup maps, parallel
@@ -631,21 +608,7 @@ fn build_reads_table_generic<R: PartitionRow + Sync>(
     Ok(buffer)
 }
 
-/// Build reads Arrow IPC table for `merge`'s already-remapped, owned input.
-///
-/// See `build_reads_table_generic` for the shared four-phase build
-/// (parallel dictionary collection, O(1) key-lookup maps, parallel
-/// partition building, concatenation into `rows_per_batch`-row batches).
-pub(crate) fn build_reads_table(
-    reads: &[(ReadData, Vec<u64>)],
-    run_infos: &[RunInfoData],
-    meta: &SchemaMetadata,
-    rows_per_batch: usize,
-) -> Result<Vec<u8>> {
-    build_reads_table_generic(reads, run_infos, meta, rows_per_batch)
-}
-
-/// Lazy-remap reads-table builder for `filter`.
+/// Lazy-remap reads-table builder for `filter` and `merge`.
 ///
 /// Consumes `FlatReadRef`s — borrowed source `ReadData`s plus the per-read
 /// signal-row prefix-sum offset and a borrow of the source's run-info
@@ -653,7 +616,7 @@ pub(crate) fn build_reads_table(
 /// On a 30M-match filter this saves ~6 GB peak RSS (200 B/read × 30M)
 /// without the per-batch overhead that broke the multi-batch streaming
 /// design. See `build_reads_table_generic` for the shared build itself —
-/// cost within a single record batch is identical to `build_reads_table`.
+/// cost within a single record batch is unchanged.
 ///
 /// The caller (filter) precomputes each `FlatReadRef::run_info_key` —
 /// the index in the deduplicated `all_run_infos`, which doubles as the
