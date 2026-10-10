@@ -11,19 +11,15 @@ use crate::utils::table_builders::{SchemaMetadata, build_pod5_footer, build_run_
 use std::collections::HashMap;
 use std::io::Write;
 
-/// A read paired with the signal-row indices it should reference in the
-/// output reads table. Used by the writers in merge and filter.
-pub(crate) type ProcessedRead = (ReadData, Vec<u64>);
-
 /// A borrowed source read plus the precomputed bookkeeping needed to
 /// write it to the output reads table without first materializing a
-/// `ProcessedRead`.
+/// cloned read.
 ///
-/// Filter accumulates a `Vec<FlatReadRef>` over its `file_metadata` (one
-/// entry per matching read, in source-file order) and feeds it to
+/// Filter and merge accumulate a `Vec<FlatReadRef>` over its `file_metadata` (one
+/// entry per surviving read, in source-file order) and feeds it to
 /// `build_reads_table_remapped`, which applies the remap inline during
 /// the parallel partition build. This avoids the ~200 B/read clone of
-/// `for_writing` + `Vec<u64>` that an intermediate `Vec<ProcessedRead>`
+/// `for_writing` + `Vec<u64>` that an intermediate Vec of cloned reads
 /// would carry.
 ///
 /// `run_info_key` is the read's index in the deduplicated `all_run_infos`
@@ -48,10 +44,9 @@ const PADDING_ZEROS: [u8; 8] = [0u8; 8];
 /// - Padding to 8-byte alignment + section marker after signal
 /// - Run info table (caller already deduplicated)
 /// - Reads table — caller pre-builds the Arrow IPC bytes via
-///   `build_reads_table` (merge: materialized `Vec<ProcessedRead>`) or
-///   `build_reads_table_remapped` (filter: lazy-remap from
-///   `&[FlatReadRef]`). Splitting this lets filter avoid materializing
-///   ~200 B/read of intermediate `ProcessedRead`s on big match sets.
+///   `build_reads_table_remapped` (lazy-remap from `&[FlatReadRef]`, used
+///   by filter and merge), which avoids materializing ~200 B/read of
+///   intermediate cloned reads on big match sets.
 /// - POD5 footer (flatbuffer + length + closing signature)
 ///
 /// `signal_end` is the absolute byte offset of the end of the signal section
