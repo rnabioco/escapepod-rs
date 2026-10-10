@@ -46,6 +46,7 @@ Encoder changes are held to `benchmarks/benchmark_demux_crf.sh` + `evaluate_demu
 | `ESCAPEPOD_CRF_GPU_DECODE` | `0`: CPU decode | GPU if kernels load | no / CHANGELOG |
 | `ESCAPEPOD_CRF_GPU_ZEROCOPY` | `0`: copy scores to host | on with GPU decode | no / CHANGELOG |
 | `ESCAPEPOD_CRF_GPU_BATCH_ROWS` | rows per ort call, per worker | 1024/workers, ≥64 | unit / CHANGELOG |
+| `ESCAPEPOD_CRF_GPU_PARITY_EVERY` | GPU-vs-CPU re-score every N-th batch (`usize_allow_zero`, `0` off) | 64 | unit + `crf_gpu_parity` / CHANGELOG |
 | `ESCAPEPOD_CRF_GPU_WORKERS` | workers per device (read in CLI `run.rs`) | 2 | no / CHANGELOG |
 
 ## Known debt

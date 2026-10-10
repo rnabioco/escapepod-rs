@@ -234,6 +234,9 @@ pub struct CrfEncoderGpu {
     /// [`Self::decode_fallback`] rather than logged: this crate has no `tracing`
     /// dependency, and the CLI is the layer that decides how loud to be.
     zero_copy_fallback: Option<String>,
+    /// Periodic CPU re-score of a few reads (#448); `None` when
+    /// `ESCAPEPOD_CRF_GPU_PARITY_EVERY=0`.
+    parity: Option<super::parity::ParityGuard>,
 }
 
 impl CrfEncoderGpu {
@@ -290,8 +293,14 @@ impl CrfEncoderGpu {
         // worker, so `--threads 32` with 2 workers meant 64 spinning threads
         // on a 32-core allocation — cores the decode and prep feeding this
         // encoder needed. Scaling `--threads` up scaled the spin up with it.
+        let onnx = onnx.as_ref();
         let session =
             crate::ort_ep::cuda_session(onnx, device).map_err(|e| CrfError::Load(e.to_string()))?;
+        let parity = super::parity::ParityGuard::new(
+            super::parity::resolve_every(),
+            Arc::new(super::parity::LazyCpuEncoder::new(onnx, meta.clone())),
+            format!("GPU {device}"),
+        );
 
         // The lattice decode is the larger half of this path's host cost, so it
         // goes to the device too unless it cannot. `ESCAPEPOD_CRF_GPU_DECODE=0`
@@ -355,6 +364,7 @@ impl CrfEncoderGpu {
             device,
             zero_copy,
             zero_copy_fallback: None,
+            parity,
         };
         // Same reasoning as the CPU loader: catch a batch-major (boundary-CNN)
         // export here rather than after decoding noise for every read.
@@ -477,6 +487,24 @@ impl CrfEncoderGpu {
 
     /// Run the encoder over a batch of standardised windows.
     ///
+    /// Make a parity failure (#448) abort the run — what `--device gpu` means.
+    /// Without it a failure is logged at `error!` and the run continues.
+    pub fn set_parity_strict(&self, strict: bool) {
+        if let Some(g) = &self.parity {
+            g.set_strict(strict);
+        }
+    }
+
+    /// Wait for in-flight parity checks and return a strict guard's latched
+    /// failure. Call once after the run's last batch.
+    pub fn finish_parity(&self) -> Result<(), CrfError> {
+        self.parity.as_ref().map_or(Ok(()), |g| g.finish())
+    }
+
+    fn parity_check(&self) -> Result<(), CrfError> {
+        self.parity.as_ref().map_or(Ok(()), |g| g.check())
+    }
+
     /// Returns one `t_len * n_score` score buffer per input, already
     /// de-interleaved out of the time-major `[T, batch, n_score]` output into
     /// the per-read `[t][dest][edge]` layout the decode wants.
@@ -814,10 +842,12 @@ impl CrfEncoderGpu {
                 .iter()
                 .map(|&i| prepped[i].as_deref().unwrap())
                 .collect();
-            for (&i, scored) in idx
-                .iter()
-                .zip(self.run_and_decode_with_refs(&rows, backend, chains)?)
-            {
+            self.parity_check()?;
+            let scored = self.run_and_decode_with_refs(&rows, backend, chains)?;
+            if let Some(g) = &self.parity {
+                g.observe(&rows, &scored, Some(chains));
+            }
+            for (&i, scored) in idx.iter().zip(scored) {
                 out[i] = Some(scored);
             }
         }
@@ -980,7 +1010,20 @@ impl CrfEncoderGpu {
                 .iter()
                 .map(|&i| prepped[i].as_deref().unwrap())
                 .collect();
-            for (&i, seq) in idx.iter().zip(self.run_and_decode(&rows, backend)?) {
+            self.parity_check()?;
+            let seqs = self.run_and_decode(&rows, backend)?;
+            if let Some(g) = &self.parity {
+                let answers: Vec<ScoredDecode> = seqs
+                    .iter()
+                    .map(|s| ScoredDecode {
+                        sequence: s.clone(),
+                        ref_logp: Vec::new(),
+                        mean_logpost: f32::NAN,
+                    })
+                    .collect();
+                g.observe(&rows, &answers, None);
+            }
+            for (&i, seq) in idx.iter().zip(seqs) {
                 out[i] = Some(seq);
             }
         }

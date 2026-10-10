@@ -1399,6 +1399,9 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                             .max(1),
                     )[0];
                     let enc = CrfEncoderGpu::load_bundle_on_device(&dir, enc_device)?;
+                    // `--device gpu` demanded the device, so a parity failure
+                    // (#448) stops the run; under `auto` it is logged only.
+                    enc.set_parity_strict(device == crate::device::Device::Gpu);
                     if enc.gpu_decode_active() {
                         info!(
                             "{} GPU (onnxruntime CUDA), lattice decode GPU (batched), \
@@ -3482,12 +3485,15 @@ fn produce_gpu_crf(
     // Counted across heads, not per head: a worker's sessions all sit on the
     // same card at the same time.
     let per_device = (workers * n_heads).div_ceil(enc_devices.len());
+    let strict_parity = args.device.resolve() == crate::device::Device::Gpu;
     for e in encoders {
         e.share_device_with(per_device);
+        e.set_parity_strict(strict_parity);
     }
     for w in &extra {
         for e in w {
             e.share_device_with(per_device);
+            e.set_parity_strict(strict_parity);
         }
     }
     if workers > 1 || devices > 1 || n_heads > 1 {
@@ -3759,6 +3765,12 @@ fn produce_gpu_crf(
         for (w, g) in gpus.into_iter().enumerate() {
             g.join()
                 .map_err(|e| anyhow::anyhow!("GPU encoder worker {w} panicked: {e:?}"))??;
+        }
+        // The last parity check (#448) may still be in flight; under
+        // `--device gpu` its verdict is the run's.
+        for e in encoders.iter().copied().chain(extra.iter().flatten()) {
+            e.finish_parity()
+                .map_err(|e| anyhow::anyhow!("GPU encoder: {e}"))?;
         }
         if tracing_on {
             trace.report(t_wall.elapsed(), workers);
