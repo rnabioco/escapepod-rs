@@ -22,7 +22,10 @@ use ndarray::Array2;
 use rayon::prelude::*;
 
 use crate::model::{DtwSvmModel, KernelParams};
-use escapepod_signal::dtw::dtw_distance;
+use escapepod_signal::dtw::{
+    DTW_LANES, DtwBatchScratch, DtwScratch, dtw_distance_bounded_penalty_into, dtw_distances_batch,
+    pack_training_blocks,
+};
 
 /// Training configuration for DTW-SVM.
 #[derive(Debug, Clone)]
@@ -66,14 +69,59 @@ pub fn compute_distance_matrix(fingerprints: &[Vec<f64>], window: Option<usize>)
 
     // Compute upper triangle in parallel across rows. Each row returns
     // only the strict upper part `(j > i)`; diagonal is zero.
+    // Uniform-length bank (the usual case): pack once and score each row with
+    // the 32-lane batch kernel, starting at the block holding j = i + 1 (at
+    // most DTW_LANES - 1 lower-triangle lanes are computed and dropped).
+    // Bit-identical to the scalar path. Ragged banks keep the scalar loop,
+    // with one scratch per rayon task.
+    let len = f32_fps.first().map_or(0, Vec::len);
+    let uniform = len > 0 && n >= DTW_LANES && f32_fps.iter().all(|f| f.len() == len);
+    let blocks = if uniform {
+        pack_training_blocks(&f32_fps, len)
+    } else {
+        Vec::new()
+    };
+
     let upper: Vec<Vec<f64>> = (0..n)
         .into_par_iter()
-        .map(|i| {
-            let fi = &f32_fps[i];
-            (i + 1..n)
-                .map(|j| dtw_distance(fi, &f32_fps[j], window) as f64)
-                .collect()
-        })
+        .map_init(
+            || (DtwScratch::new(), DtwBatchScratch::new(), Vec::<f64>::new()),
+            |(scratch, bscratch, out), i| {
+                let fi = &f32_fps[i];
+                if uniform {
+                    let c0 = (i + 1) / DTW_LANES;
+                    let first = c0 * DTW_LANES;
+                    dtw_distances_batch(
+                        fi,
+                        &blocks[c0 * len * DTW_LANES..],
+                        len,
+                        n - first,
+                        window,
+                        0.0,
+                        out,
+                        bscratch,
+                    );
+                    // `out[k]` is j = first + k; keep j > i.
+                    out[i + 1 - first..]
+                        .iter()
+                        .map(|&d| d as f32 as f64)
+                        .collect()
+                } else {
+                    (i + 1..n)
+                        .map(|j| {
+                            dtw_distance_bounded_penalty_into(
+                                fi,
+                                &f32_fps[j],
+                                window,
+                                f32::INFINITY,
+                                0.0,
+                                scratch,
+                            ) as f64
+                        })
+                        .collect()
+                }
+            },
+        )
         .collect();
 
     let mut distances = Array2::<f64>::zeros((n, n));
@@ -363,6 +411,44 @@ mod tests {
         // Should be symmetric
         assert!((dm[[0, 1]] - dm[[1, 0]]).abs() < 1e-10);
         assert!((dm[[0, 2]] - dm[[2, 0]]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn distance_matrix_batch_matches_scalar() {
+        use escapepod_signal::dtw::dtw_distance;
+        // 70 fingerprints: crosses block boundaries for several row starts.
+        let mut x = 12345u64;
+        let mut fps: Vec<Vec<f64>> = (0..70)
+            .map(|_| {
+                (0..24)
+                    .map(|_| {
+                        x = x
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (x >> 40) as f64 / (1u64 << 24) as f64
+                    })
+                    .collect()
+            })
+            .collect();
+        for window in [None, Some(3)] {
+            let dm = compute_distance_matrix(&fps, window);
+            for i in 0..fps.len() {
+                for j in 0..fps.len() {
+                    let want = if i == j {
+                        0.0
+                    } else {
+                        let a: Vec<f32> = fps[i.min(j)].iter().map(|&v| v as f32).collect();
+                        let b: Vec<f32> = fps[i.max(j)].iter().map(|&v| v as f32).collect();
+                        dtw_distance(&a, &b, window) as f64
+                    };
+                    assert_eq!(dm[[i, j]].to_bits(), want.to_bits(), "({i},{j}) {window:?}");
+                }
+            }
+        }
+        // Ragged input takes the scalar path and still agrees.
+        fps[5].pop();
+        let dm = compute_distance_matrix(&fps, None);
+        assert!(dm[[5, 6]].is_finite());
     }
 
     #[test]

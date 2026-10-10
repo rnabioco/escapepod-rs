@@ -280,7 +280,7 @@ fn bench_dtw_matrix(c: &mut Criterion) {
     let mut group = c.benchmark_group("dtw_distance_matrix");
     group.sample_size(bench_sample_size(50));
     // training workload shape: (n_queries x n_refs) with moderate fingerprint length.
-    for &(q, r, l) in &[(8usize, 8usize, 150usize), (32, 32, 150)] {
+    for &(q, r, l) in &[(8usize, 8usize, 150usize), (32, 32, 150), (64, 96, 150)] {
         let queries: Vec<Vec<f32>> = (0..q).map(|i| pseudo_floats(l, 0x100 + i as u64)).collect();
         let refs: Vec<Vec<f32>> = (0..r).map(|i| pseudo_floats(l, 0x200 + i as u64)).collect();
         group.throughput(Throughput::Elements((q * r) as u64));
