@@ -96,11 +96,12 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
                     "{} signal batch {} has {} rows, expected {} — reads \
                      correctly here, but the official pod5 library and dorado \
                      assume a constant stride and will mis-resolve every signal \
-                     index after it. Rewrite with `escpod repack`.",
+                     index after it. {}.",
                     style::warning("Signal batches: NOT PORTABLE —"),
                     bad.index,
                     bad.rows,
                     bad.expected,
+                    crate::util::REWRITE_HINT,
                 );
             }
             println!();

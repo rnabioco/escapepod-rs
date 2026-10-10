@@ -517,7 +517,7 @@ scattered read of every signal batch header, which is paid on every process
 start otherwise and grows with the file.
 
 Worth running once on a networked node before submitting jobs against a large
-file — the same reason `escpod resquiggle models fetch` exists.
+file — the same reason `escpod demux models fetch` exists.
 
 Examples:
   escpod index input.pod5                   Index one file
