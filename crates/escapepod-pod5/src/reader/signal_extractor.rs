@@ -23,7 +23,11 @@ pub(crate) fn decode_chunks(chunks: &[RawSignalChunk<'_>], max_samples: usize) -
         let take = cs.min(remaining);
         // `decompress_signal_prefix(.., cs, cs)` is the full decode, so this
         // needs no special case for the last chunk.
-        result.extend_from_slice(&decompress_signal_prefix(chunk.signal, cs, take)?);
+        if chunk.uncompressed {
+            result.extend_from_slice(&chunk.samples_i16()?[..take]);
+        } else {
+            result.extend_from_slice(&decompress_signal_prefix(chunk.signal, cs, take)?);
+        }
         remaining -= take;
     }
     Ok(result)

@@ -348,12 +348,14 @@ fn assemble_output(
             // `RawSignalChunk` has already read it out of the source.
             let chunks: SignalChunks<'_> = raw_chunks
                 .into_iter()
-                .map(|chunk| SignalRow {
-                    read_id: chunk.read_id,
-                    data: chunk.signal,
-                    samples: chunk.samples,
+                .map(|chunk| {
+                    Ok(SignalRow {
+                        read_id: chunk.read_id,
+                        data: chunk.vbz_bytes()?,
+                        samples: chunk.samples,
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
 
             Ok(chunks)
         })

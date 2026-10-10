@@ -3,7 +3,7 @@
 use crate::CompressedSignalChunk;
 use crate::compression;
 use crate::error::{Error, Result};
-use crate::schema::{reads_schema, run_info_schema, signal_schema};
+use crate::schema::{reads_schema, run_info_schema, signal_schema, signal_schema_uncompressed};
 use crate::types::{
     FOOTER_MAGIC, POD5_SIGNATURE, POD5_VERSION, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid,
 };
@@ -238,6 +238,28 @@ impl Writer {
     }
 
     /// Apply MINKNOW schema metadata to an Arrow schema.
+    /// The signal table's schema for this writer's `compress_signal` setting:
+    /// `minknow.vbz` `LargeBinary`, or the spec's `LargeList<Int16>`.
+    fn signal_table_schema(&self) -> arrow::datatypes::Schema {
+        if self.options.compress_signal {
+            signal_schema()
+        } else {
+            signal_schema_uncompressed()
+        }
+    }
+
+    /// Refuse the pre-built-VBZ-batch entry points on an uncompressed writer:
+    /// they would put `LargeBinary` VBZ bytes in a `LargeList<Int16>` table.
+    fn require_compressed_signal(&self, what: &str) -> Result<()> {
+        if self.options.compress_signal {
+            Ok(())
+        } else {
+            Err(Error::InvalidState(format!(
+                "{what} writes pre-compressed VBZ signal and cannot be used with compress_signal=false"
+            )))
+        }
+    }
+
     fn schema_with_metadata(&self, schema: arrow::datatypes::Schema) -> arrow::datatypes::Schema {
         let mut metadata = schema.metadata().clone();
         metadata.insert(
@@ -418,10 +440,22 @@ impl Writer {
             signal_row_indices.push(self.current_signal_row);
             self.current_signal_row += 1;
 
+            // An uncompressed table stores raw samples, so inflate the VBZ.
+            let data: Arc<[u8]> = if self.options.compress_signal {
+                chunk.data.clone() // Arc clone is cheap
+            } else {
+                let samples = compression::decompress_signal(&chunk.data, chunk.samples as usize)?;
+                Arc::from(
+                    samples
+                        .iter()
+                        .flat_map(|&s| s.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                )
+            };
             self.pending_signal.push(SignalChunk {
                 read_id: chunk.read_id,
                 samples: chunk.samples,
-                data: chunk.data.clone(), // Arc clone is cheap
+                data,
             });
             // Per chunk, not per read — see `flush_signal_if_full`.
             self.flush_signal_if_full()?;
@@ -449,6 +483,7 @@ impl Writer {
         if self.finalized {
             return Err(Error::WriterFinalized);
         }
+        self.require_compressed_signal("write_signal_batch")?;
 
         // Flush any pending signal first
         self.flush_signal_batch()?;
@@ -487,6 +522,7 @@ impl Writer {
         if self.finalized {
             return Err(Error::WriterFinalized);
         }
+        self.require_compressed_signal("write_raw_signal_header")?;
         if self.signal_writer.is_some() {
             return Err(Error::InvalidState(
                 "Cannot mix raw signal writing with batch writing".into(),
@@ -519,6 +555,7 @@ impl Writer {
             ));
         }
 
+        self.require_compressed_signal("write_raw_signal_batches")?;
         let first_row = self.current_signal_row;
 
         // Ensure file is available
@@ -600,24 +637,25 @@ impl Writer {
             return Ok(());
         }
 
-        let schema = Arc::new(self.schema_with_metadata(signal_schema()));
+        let schema = Arc::new(self.schema_with_metadata(self.signal_table_schema()));
 
         // Shared with the block-copy path so the signal table's column layout
         // has exactly one definition. Note this writes the *real* read ID,
         // where `filter`/`subset` write zeros — see `build_signal_batch`.
         let pending = std::mem::take(&mut self.pending_signal);
         let total_signal_bytes: usize = pending.iter().map(|c| c.data.len()).sum();
-        let batch = crate::utils::table_builders::build_signal_batch(
-            &schema,
-            pending
-                .iter()
-                .map(|chunk| crate::utils::table_builders::SignalRow {
-                    read_id: *chunk.read_id.as_bytes(),
-                    data: &chunk.data,
-                    samples: chunk.samples,
-                }),
-            total_signal_bytes,
-        )?;
+        let rows = pending
+            .iter()
+            .map(|chunk| crate::utils::table_builders::SignalRow {
+                read_id: *chunk.read_id.as_bytes(),
+                data: std::borrow::Cow::Borrowed(&chunk.data[..]),
+                samples: chunk.samples,
+            });
+        let batch = if self.options.compress_signal {
+            crate::utils::table_builders::build_signal_batch(&schema, rows, total_signal_bytes)?
+        } else {
+            crate::utils::table_builders::build_signal_batch_uncompressed(&schema, rows)?
+        };
         drop(pending);
 
         // Write directly to file (create writer on first batch, taking ownership of file)
