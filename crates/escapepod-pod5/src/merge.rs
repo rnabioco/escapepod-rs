@@ -1,21 +1,41 @@
 //! High-performance POD5 file merging.
 //!
-//! This module provides functionality to merge multiple POD5 files into one,
-//! using raw byte copying to avoid Arrow deserialization overhead.
+//! This module provides functionality to merge multiple POD5 files into one.
+//!
+//! The signal table is rebuilt at a uniform batch stride rather than
+//! concatenating each input's own Arrow batches as-is. A read's `signal`
+//! column holds GLOBAL row indices, and readers resolve one to a position by
+//! assuming a constant stride between batches (`escpod` itself does not —
+//! see [`crate::reader::file_reader::Reader::nonuniform_signal_batch`] — but
+//! the official `pod5` library and dorado do). Almost every POD5 file's own
+//! *last* batch is short (its read count rarely divides evenly by the batch
+//! size), so copying N files' batches back-to-back puts a short batch from
+//! file `k` immediately before a full one from file `k+1` at every file
+//! boundary but the last — breaking the stride dorado assumes at every one
+//! of those points. `filter`/`subset` already avoid this by flattening every
+//! source's compressed signal chunks into one list and re-batching it
+//! uniformly (`write_raw_signal_table`, in `utils::table_builders`); `merge`
+//! now does the same, reusing that writer rather than duplicating it.
+//!
+//! Signal bytes are still copied, not decompressed/recompressed: each row is
+//! one independently VBZ-compressed chunk, so only the Arrow batch grouping
+//! (which rows land in which batch) is rebuilt — the compressed bytes
+//! themselves are borrowed straight out of each source's mmap.
 
-use crate::arrow_ipc::{ArrowIpcFooter, BatchBlock};
-use crate::error::{Error, Result};
+use crate::arrow_ipc::ArrowIpcFooter;
+use crate::error::Result;
 use crate::reader::Reader;
-use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
+use crate::types::{POD5_SIGNATURE, ReadData, RunInfoData, SECTION_MARKER_LENGTH, Uuid};
 use crate::utils::pod5_assembler::{
     ProcessedRead, deduplicate_run_infos, write_post_signal_sections,
 };
-use crate::utils::table_builders::{SchemaMetadata, build_arrow_ipc_footer, build_reads_table};
+use crate::utils::table_builders::{
+    SchemaMetadata, SignalRow, build_reads_table, write_raw_signal_table,
+};
 use crate::writer::atomic::{AtomicFile, Durability};
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -29,6 +49,8 @@ pub struct MergeOptions {
     pub duplicate_ok: bool,
     /// Number of reads per batch in output file.
     pub read_batch_size: u32,
+    /// Number of signal chunks per batch in the output file's signal table.
+    pub signal_batch_size: u32,
     /// How hard to push bytes to stable storage before renaming into place.
     pub durability: Durability,
 }
@@ -38,6 +60,8 @@ impl Default for MergeOptions {
         Self {
             duplicate_ok: false,
             read_batch_size: 1_000,
+            // Matches `FilterOptions`'s default — the two now share a writer.
+            signal_batch_size: 1_000,
             durability: Durability::default(),
         }
     }
@@ -48,7 +72,7 @@ impl Default for MergeOptions {
 pub enum MergePhase {
     /// Loading metadata from input files (parallel).
     LoadingMetadata,
-    /// Writing signal data to output file.
+    /// Extracting and flattening signal chunks, file by file.
     WritingSignal,
     /// Writing reads table.
     WritingReads,
@@ -80,9 +104,6 @@ pub struct MergeResult {
 
 /// Merge multiple POD5 files into a single output file.
 ///
-/// This function uses zero-copy async I/O with scoped threads to overlap
-/// reading and writing, passing mmap slices directly to the writer thread.
-///
 /// # Arguments
 /// * `inputs` - Slice of input file paths
 /// * `output` - Output file path
@@ -98,7 +119,9 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
     progress_callback: Option<&(dyn Fn(MergeProgress) + Sync + Send)>,
 ) -> Result<MergeResult> {
     if inputs.is_empty() {
-        return Err(Error::InvalidState("No input files specified".into()));
+        return Err(crate::error::Error::InvalidState(
+            "No input files specified".into(),
+        ));
     }
 
     merge_impl(inputs, output, options, progress_callback)
@@ -106,11 +129,11 @@ pub fn merge_files<P: AsRef<Path>, Q: AsRef<Path>>(
 
 /// Collected metadata from a single file for merging.
 ///
-/// Holds the live `Reader` so that the signal header/batch slices into its
-/// mmap stay valid for the duration of Phase 2. Dropping the reader would
-/// invalidate the mmap and force us to copy the (potentially 20+ GB) signal
-/// bytes into owned `Vec<u8>` on the heap, which doesn't fit when merging
-/// production-scale runs.
+/// Holds the live `Reader` so that the signal footer/chunk slices into its
+/// mmap stay valid for the duration of the signal-flattening pass. Dropping
+/// the reader would invalidate the mmap and force us to copy the
+/// (potentially 20+ GB) signal bytes into owned `Vec<u8>` on the heap, which
+/// doesn't fit when merging production-scale runs.
 struct FileMetadata {
     reader: Reader,
     footer: ArrowIpcFooter,
@@ -118,8 +141,14 @@ struct FileMetadata {
     reads: Vec<ReadData>,
 }
 
-/// Main merge implementation using zero-copy async I/O.
-/// Uses scoped threads to pass mmap slices directly to writer thread.
+/// A read carried from its source file through to the merged output: its
+/// original UUID (for cross-file duplicate detection), the `ReadData` with
+/// its `run_info_index` already remapped onto the deduplicated run-info
+/// list, and its **original, file-local** signal row indices (not yet
+/// renumbered — that happens only for reads that survive dedup, during the
+/// flattening pass below).
+type RemappedRead = (Uuid, ReadData, Vec<u64>);
+
 fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     inputs: &[P],
     output: Q,
@@ -135,8 +164,9 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     let files_loaded = AtomicUsize::new(0);
 
     // Phase 1: Open files and collect metadata in parallel. We keep each
-    // `Reader` alive (and therefore its mmap) so Phase 2 can borrow signal
-    // bytes directly from the mmap rather than copying them into heap Vecs.
+    // `Reader` alive (and therefore its mmap) so the next phase can borrow
+    // signal bytes directly from the mmap rather than copying them into heap
+    // Vecs.
     let metadata_results: Vec<Result<FileMetadata>> = input_paths
         .par_iter()
         .map(|path| {
@@ -173,160 +203,20 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
         metadata_results.into_iter().collect::<Result<Vec<_>>>()?;
     let total_read_count: u64 = file_metadata.iter().map(|m| m.reads.len() as u64).sum();
 
-    // Phase 2: Write signal data using scoped thread (from pre-read memory)
-    let mut all_batches: Vec<BatchBlock> = Vec::new();
-    let mut current_offset: usize = 0;
-    let mut current_signal_row: u64 = 0;
-    let mut signal_offsets: Vec<u64> = Vec::with_capacity(num_files);
-
-    use std::sync::mpsc;
-    use std::thread;
-
-    // Create a single section marker UUID to reuse at all section boundaries
-    let section_marker = Uuid::new_v4();
-    let schema_meta = SchemaMetadata::new();
-
-    // Stage the output alongside its destination. The guard is held on this
-    // thread for the whole merge so that any failure — including a panic in
-    // the writer thread — unlinks the partial file on unwind and leaves an
-    // existing destination untouched. This is also what makes an in-place
-    // merge safe: the inputs stay mapped on their original inode and only a
-    // directory entry is swapped at the end.
-    let atomic = AtomicFile::with_durability(output.as_ref(), options.durability)?;
-    let staging = atomic.reopen()?;
-
-    let (mut file, signal_end, signal_rows) =
-        thread::scope(|scope| -> Result<(File, usize, u64)> {
-            // Channel for sending byte slices to writer thread
-            // Buffer of 32 allows sender to stay ahead of writer
-            let (tx, rx) = mpsc::sync_channel::<&[u8]>(32);
-
-            // Spawn writer thread within scope - can borrow from parent
-            let writer_handle = scope.spawn(move || -> std::io::Result<(File, usize)> {
-                let mut file = BufWriter::with_capacity(MERGE_WRITE_BUFFER_SIZE, staging);
-
-                // Write POD5 header
-                file.write_all(&POD5_SIGNATURE)?;
-                file.write_all(section_marker.as_bytes())?;
-
-                // Write all signal data from channel
-                for bytes in rx {
-                    file.write_all(bytes)?;
-                }
-
-                let pos = file.stream_position()? as usize;
-                file.flush()?;
-                Ok((file.into_inner()?, pos))
-            });
-
-            // Main thread: send signal bytes to writer. Slices borrow from
-            // each file's live mmap (via `metadata.reader`); `file_metadata`
-            // is owned by the main thread and outlives this scope.
-            let mut header_written = false;
-
-            for (file_idx, metadata) in file_metadata.iter().enumerate() {
-                // Record signal row offset for this file
-                signal_offsets.push(current_signal_row);
-
-                let signal_bytes = metadata.reader.signal_table_bytes()?;
-                let signal_header = metadata.footer.header_bytes(signal_bytes);
-                let signal_batches = metadata.footer.batches_bytes(signal_bytes);
-
-                // Write header from first file only
-                if !header_written {
-                    tx.send(signal_header)
-                        .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
-                    current_offset = signal_header.len();
-                    header_written = true;
-                }
-
-                // Send batch bytes — a slice straight into the mmap, no heap copy.
-                tx.send(signal_batches)
-                    .map_err(|_| Error::Io(std::io::Error::other("Writer thread closed")))?;
-
-                // Adjust batch offsets for the combined output
-                for batch in &metadata.footer.record_batches {
-                    let relative_offset =
-                        batch.offset as usize - metadata.footer.batches_start_offset;
-                    let new_offset = current_offset + relative_offset;
-
-                    all_batches.push(BatchBlock {
-                        offset: new_offset as i64,
-                        metadata_length: batch.metadata_length,
-                        body_length: batch.body_length,
-                        row_count: batch.row_count,
-                    });
-                }
-
-                current_offset += signal_batches.len();
-                current_signal_row += metadata.footer.total_rows;
-
-                if let Some(cb) = progress_callback {
-                    cb(MergeProgress {
-                        phase: MergePhase::WritingSignal,
-                        current: file_idx + 1,
-                        total: num_files,
-                    });
-                }
-            }
-
-            // Close channel
-            drop(tx);
-
-            // Wait for writer to finish
-            let (mut file, _signal_end) = writer_handle
-                .join()
-                .map_err(|_| Error::Io(std::io::Error::other("Writer thread panicked")))?
-                .map_err(Error::Io)?;
-
-            // Write IPC footer directly (small data, no need for async).
-            // The footer must embed the real signal schema — Arrow's reader
-            // trusts the footer's schema when decoding batches, so an empty
-            // one silently strips every column.
-            let signal_schema = schema_meta.apply(crate::schema::signal_schema());
-            let footer_bytes = build_arrow_ipc_footer(&all_batches, &signal_schema)?;
-            file.write_all(&footer_bytes).map_err(Error::Io)?;
-
-            let footer_len = footer_bytes.len() as i32;
-            file.write_all(&footer_len.to_le_bytes())
-                .map_err(Error::Io)?;
-            file.write_all(b"ARROW1").map_err(Error::Io)?;
-            file.flush().map_err(Error::Io)?;
-
-            let final_pos = file.stream_position().map_err(Error::Io)? as usize;
-
-            Ok((file, final_pos, current_signal_row))
-        })?;
-
-    // Phase 3: Write remaining sections (run info, reads, footer)
-
     // Borrow each file's run_infos for dedup — no clone of the (heavy)
     // RunInfoData entries. The deduped Vec is reused for the writer below.
     let per_file_run_infos: Vec<&[RunInfoData]> = file_metadata
         .iter()
         .map(|m| m.run_infos.as_slice())
         .collect();
-
     let (all_run_infos, run_info_map) = deduplicate_run_infos(&per_file_run_infos);
 
-    // Notify start of reads phase
-    if let Some(cb) = progress_callback {
-        cb(MergeProgress {
-            phase: MergePhase::WritingReads,
-            current: 0,
-            total: total_read_count as usize,
-        });
-    }
-
-    // Transform reads in parallel (signal row adjustment, run_info remapping).
-    // Each entry pairs the read's original UUID (for dedup) with the
-    // remapped `ProcessedRead` payload that the writer expects.
-    type RemappedRead = (Uuid, ReadData, Vec<u64>);
-
+    // Transform reads in parallel (run_info remapping only — signal rows
+    // stay file-local until the flattening pass below knows which reads
+    // survive dedup).
     let per_file_reads: Vec<Vec<RemappedRead>> = file_metadata
         .par_iter()
-        .zip(signal_offsets.par_iter())
-        .map(|(metadata, &signal_offset)| {
+        .map(|metadata| {
             metadata
                 .reads
                 .iter()
@@ -337,21 +227,19 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                     } else {
                         0
                     };
-
-                    let new_signal_rows: Vec<u64> = read
-                        .signal_rows
-                        .iter()
-                        .map(|&row| row + signal_offset)
-                        .collect();
-
                     let new_read = read.for_writing(new_run_info_idx);
-                    (read.read_id, new_read, new_signal_rows)
+                    (read.read_id, new_read, read.signal_rows.clone())
                 })
                 .collect()
         })
         .collect();
 
-    // Sequential duplicate filtering (requires ordered access to seen_reads)
+    // Phase 2: filter duplicates and flatten surviving reads' compressed
+    // signal chunks into one list, assigning fresh global row indices from
+    // the flattened order rather than from each file's original numbering.
+    // One `extract_signal_rows` call per file (not per read) so the lookup
+    // amortizes its batch-grouping work across every row it is asked for,
+    // matching `filter`'s approach.
     let mut seen_reads: HashSet<Uuid> = if options.duplicate_ok {
         HashSet::new()
     } else {
@@ -359,10 +247,15 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     };
 
     let mut processed_reads: Vec<ProcessedRead> = Vec::with_capacity(total_read_count as usize);
+    let mut signal_chunks: Vec<SignalRow<'_>> = Vec::new();
     let mut duplicate_count = 0u64;
+    let mut signal_row_cursor: u64 = 0;
 
-    for file_reads in per_file_reads {
-        for (read_id, new_read, new_signal_rows) in file_reads {
+    for (file_idx, file_reads) in per_file_reads.into_iter().enumerate() {
+        let metadata = &file_metadata[file_idx];
+
+        let mut survivors: Vec<(ReadData, Vec<u64>)> = Vec::with_capacity(file_reads.len());
+        for (read_id, new_read, original_signal_rows) in file_reads {
             if !options.duplicate_ok {
                 if seen_reads.contains(&read_id) {
                     duplicate_count += 1;
@@ -370,15 +263,83 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
                 }
                 seen_reads.insert(read_id);
             }
-            processed_reads.push((new_read, new_signal_rows));
+            survivors.push((new_read, original_signal_rows));
+        }
+
+        if !survivors.is_empty() {
+            let signal_bytes = metadata.reader.signal_table_bytes()?;
+            let flat_row_indices: Vec<u64> = survivors
+                .iter()
+                .flat_map(|(_, rows)| rows.iter().copied())
+                .collect();
+            let raw_chunks = metadata
+                .footer
+                .extract_signal_rows(&flat_row_indices, signal_bytes)?;
+
+            let mut chunk_iter = raw_chunks.into_iter();
+            for (new_read, original_rows) in survivors {
+                let n = original_rows.len();
+                let new_signal_rows: Vec<u64> =
+                    (signal_row_cursor..signal_row_cursor + n as u64).collect();
+                signal_row_cursor += n as u64;
+
+                for chunk in chunk_iter.by_ref().take(n) {
+                    signal_chunks.push(SignalRow {
+                        read_id: chunk.read_id,
+                        data: chunk.signal,
+                        samples: chunk.samples,
+                    });
+                }
+
+                processed_reads.push((new_read, new_signal_rows));
+            }
+        }
+
+        if let Some(cb) = progress_callback {
+            cb(MergeProgress {
+                phase: MergePhase::WritingSignal,
+                current: file_idx + 1,
+                total: num_files,
+            });
         }
     }
 
     let total_reads = processed_reads.len() as u64;
+    let signal_rows_written = signal_row_cursor;
 
-    // Build the reads-table Arrow IPC bytes (single batch from the
-    // already-materialized `processed_reads`), then write the post-signal
-    // sections.
+    // Phase 3: write the output file — header, the freshly uniform-stride
+    // signal table, then run info / reads / footer.
+
+    let schema_meta = SchemaMetadata::new();
+    let section_marker = Uuid::new_v4();
+
+    // Stage the output alongside its destination. Any `?` between here and
+    // the commit at the end drops this guard, which unlinks the partial file
+    // on unwind and leaves an existing destination untouched. This is also
+    // what makes an in-place merge safe: the inputs stay mapped on their
+    // original inode and only a directory entry is swapped at the end.
+    let atomic = AtomicFile::with_durability(output.as_ref(), options.durability)?;
+    let mut file = BufWriter::with_capacity(MERGE_WRITE_BUFFER_SIZE, atomic.reopen()?);
+
+    file.write_all(&POD5_SIGNATURE)?;
+    file.write_all(section_marker.as_bytes())?;
+
+    let signal_table_bytes_written = write_raw_signal_table(
+        &mut file,
+        &signal_chunks,
+        options.signal_batch_size,
+        &schema_meta,
+    )?;
+    let signal_end = POD5_SIGNATURE.len() + SECTION_MARKER_LENGTH + signal_table_bytes_written;
+
+    if let Some(cb) = progress_callback {
+        cb(MergeProgress {
+            phase: MergePhase::WritingReads,
+            current: 0,
+            total: total_reads as usize,
+        });
+    }
+
     let reads_table_bytes = build_reads_table(
         &processed_reads,
         &all_run_infos,
@@ -402,7 +363,7 @@ fn merge_impl<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(MergeResult {
         reads_written: total_reads,
         duplicates_skipped: duplicate_count,
-        signal_rows,
+        signal_rows: signal_rows_written,
         files_processed: file_metadata.len(),
     })
 }

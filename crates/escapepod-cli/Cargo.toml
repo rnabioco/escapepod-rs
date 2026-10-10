@@ -46,11 +46,11 @@ libc = { version = "0.2", optional = true }
 # measure against.
 mimalloc = { version = "0.1", optional = true }
 # BAM file support
-noodles-bam = { version = "0.95", optional = true }
-noodles-bgzf = { version = "0.51", optional = true }
-noodles-core = { version = "0.20", optional = true }
-noodles-csi = { version = "0.61", optional = true }
-noodles-sam = { version = "0.90", optional = true }
+noodles-bam = { version = "0.96", optional = true }
+noodles-bgzf = { version = "0.52", optional = true }
+noodles-core = { version = "0.21", optional = true }
+noodles-csi = { version = "0.62", optional = true }
+noodles-sam = { version = "0.91", optional = true }
 owo-colors = { version = "4", optional = true }
 parquet = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
