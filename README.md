@@ -74,7 +74,7 @@ publishes prebuilt binaries on the
 | `escpod-<ver>-{x86_64,aarch64}-apple-darwin.tar.gz` | macOS |
 
 ```bash
-VER=v0.26.0
+VER=v0.31.2
 curl -L "https://github.com/rnabioco/escapepod-rs/releases/download/$VER/escpod-$VER-x86_64-unknown-linux-musl.tar.gz" | tar xz
 ./escpod --version
 ```

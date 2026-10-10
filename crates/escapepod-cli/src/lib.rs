@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! # Library only — no clap/noodles/etc. (use the current workspace version):
-//! escapepod-cli = { version = "0.24", default-features = false, features = ["signal"] }
+//! escapepod-cli = { version = "0.31", default-features = false, features = ["signal"] }
 //! ```
 //!
 //! | Module        | Crate                                                              | Feature    |
