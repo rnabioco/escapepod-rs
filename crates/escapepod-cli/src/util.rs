@@ -75,16 +75,26 @@ pub fn warn_if_not_portable(files: &[PathBuf]) {
                 "{}: signal batch {} has {} rows, expected {} — this file reads \
                  correctly here, but the official pod5 library and dorado assume \
                  a constant batch stride and will mis-resolve every signal index \
-                 after it (silently, in dorado's case). Rewrite it with \
-                 `escpod repack` before basecalling.",
+                 after it (silently, in dorado's case). {} before basecalling.",
                 f.display(),
                 bad.index,
                 bad.rows,
                 bad.expected,
+                REWRITE_HINT,
             );
         }
     }
 }
+
+/// How to fix a non-uniform signal-batch stride. `escpod repack` only exists
+/// in builds with the `experimental` feature, which release artifacts do not
+/// have, so only name it where it is runnable.
+pub const REWRITE_HINT: &str = if cfg!(feature = "experimental") {
+    "Rewrite it with `escpod repack`"
+} else {
+    "Rewrite it with the official `pod5 repack` (or an escpod build with \
+     `--features experimental`, which has `escpod repack`)"
+};
 
 /// Heuristic: does this path look like an unexpanded shell glob?
 fn path_looks_like_glob(path: &Path) -> bool {
@@ -262,54 +272,51 @@ pub fn open_reader_with_warning(file_path: &PathBuf, is_directory: bool) -> Open
     }
 }
 
-/// Ensure a BAI index exists for the given BAM file, creating one if necessary.
+/// Load the BAI index for `bam_path`, building it in memory if none exists.
 ///
-/// Returns the path to the BAI file (either existing or newly created).
-pub fn ensure_bai_index(bam_path: &Path) -> anyhow::Result<PathBuf> {
-    // noodles expects the index at path.bam.bai
+/// An existing `<name>.bam.bai` or `<name>.bai` is read and used as-is. When
+/// neither exists the index is built from the BAM and then written beside it
+/// as a cache for the next run; if that write fails (a read-only directory is
+/// the usual cause) the in-memory index is still returned, so a read-only BAM
+/// location never makes a command fail.
+pub fn load_bai_index(bam_path: &Path) -> anyhow::Result<bam::bai::Index> {
+    // noodles' default location is path.bam.bai; path.bai is the other
+    // common convention.
     let bai_path = bam_path.with_extension("bam.bai");
-
-    if bai_path.exists() {
-        return Ok(bai_path);
-    }
-
-    // Also check for path.bai (alternative naming convention)
     let alt_bai_path = bam_path.with_extension("bai");
-    if alt_bai_path.exists() {
-        info!(
-            "found index at {} but noodles expects {}",
-            style::path(alt_bai_path.display()),
-            style::path(bai_path.display())
-        );
+
+    for existing in [&bai_path, &alt_bai_path] {
+        if existing.exists() {
+            return Ok(bam::bai::fs::read(existing)?);
+        }
     }
 
     info!(
-        "BAI index not found, creating {}...",
-        style::path(bai_path.display())
+        "BAI index not found, building it from {}...",
+        style::path(bam_path.display())
     );
-
-    // Build the index from the BAM file
-    let index = bam::fs::index(bam_path)?;
-
-    // Write the index to file
-    match index {
-        bam::Index::Bai(bai) => bam::bai::fs::write(&bai_path, &bai)?,
+    let bai = match bam::fs::index(bam_path)? {
+        bam::Index::Bai(bai) => bai,
         bam::Index::Csi(_) => anyhow::bail!("indexer produced a CSI index, expected BAI"),
+    };
+
+    match bam::bai::fs::write(&bai_path, &bai) {
+        Ok(()) => info!("created BAI index: {}", style::path(bai_path.display())),
+        Err(e) => warn!(
+            "could not write {} ({e}); using the index in memory only",
+            style::path(bai_path.display())
+        ),
     }
-
-    info!("created BAI index: {}", style::path(bai_path.display()));
-
-    Ok(bai_path)
+    Ok(bai)
 }
 
 /// Count total records in a BAM file using its BAI index.
 ///
-/// Creates the BAI index if it does not already exist.
+/// Builds the index in memory if it does not already exist.
 /// Returns the total number of records (mapped + unmapped).
 #[cfg(feature = "experimental")]
 pub fn count_bam_records(bam_path: &Path) -> anyhow::Result<u64> {
-    let bai_path = ensure_bai_index(bam_path)?;
-    let index = bam::bai::fs::read(&bai_path)?;
+    let index = load_bai_index(bam_path)?;
 
     let mut total: u64 = 0;
     for ref_seq in index.reference_sequences() {

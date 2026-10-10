@@ -8,7 +8,7 @@ use crate::commands::profile::PhaseTimer;
 use crate::progress::{create_progress_bar, create_spinner};
 use crate::style;
 use crate::util::{
-    check_output_not_input, check_output_writable, ensure_bai_index, resolve_pod5_inputs,
+    check_output_not_input, check_output_writable, load_bai_index, resolve_pod5_inputs,
 };
 use bstr::ByteSlice;
 use escapepod_signal::Durability;
@@ -207,11 +207,13 @@ fn read_ids_from_bam_region(
     ids: &mut HashSet<Uuid>,
     records_scanned: &mut u64,
 ) -> anyhow::Result<()> {
-    // Ensure BAI index exists (create if needed)
-    ensure_bai_index(bam_path)?;
+    // Use the existing BAI, or build one in memory (and cache it beside the
+    // BAM when that directory is writable).
+    let index = load_bai_index(bam_path)?;
 
     // Build indexed reader
     let mut reader = bam::io::indexed_reader::Builder::default()
+        .set_index(index)
         .build_from_path(bam_path)
         .map_err(|e| {
             anyhow::anyhow!(
@@ -260,7 +262,8 @@ fn read_ids_from_bam_full(
     let file = std::fs::File::open(bam_path)?;
     let mut reader = bam::io::Reader::new(BufReader::new(file));
 
-    let header = reader.read_header()?;
+    // The header must be consumed before records can be read.
+    reader.read_header()?;
 
     for result in reader.records() {
         let record = result?;
@@ -272,9 +275,6 @@ fn read_ids_from_bam_full(
             ids.insert(uuid);
         }
     }
-
-    // Silence unused variable warning
-    let _ = header;
 
     Ok(())
 }
