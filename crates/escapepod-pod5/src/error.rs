@@ -82,6 +82,22 @@ pub enum Error {
         row: usize,
     },
 
+    /// A signal chunk's own `read_id` is not the read it was fetched for.
+    ///
+    /// The signal table's `read_id` column exists for exactly this check. A
+    /// mismatch means the signal row locator (a reads-table `signal` entry, or
+    /// a cached batch geometry) points at another read's data.
+    #[error(
+        "signal row {row} of {file} belongs to read {found}, not {expected}; \
+         the signal row locator does not describe this file"
+    )]
+    SignalReadIdMismatch {
+        file: String,
+        expected: uuid::Uuid,
+        found: uuid::Uuid,
+        row: u64,
+    },
+
     /// The `.p5s` read index pointed past the end of a record batch.
     ///
     /// Caught before the row reaches an Arrow accessor, which would panic

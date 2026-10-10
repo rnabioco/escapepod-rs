@@ -639,12 +639,19 @@ impl ArrowIpcFooter {
             std::collections::BTreeMap::new();
 
         for (result_idx, &row) in signal_rows.iter().enumerate() {
-            if let Some((batch_idx, local_row)) = self.batch_for_row(row) {
-                batch_rows
-                    .entry(batch_idx)
-                    .or_default()
-                    .push((result_idx, local_row));
-            }
+            // An unmapped row is an error, not a skipped slot: dropping it
+            // returned a shorter signal (single-read paths) or chunks that no
+            // longer lined up with their reads (bulk paths).
+            let (batch_idx, local_row) = self.batch_for_row(row).ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "Signal row {row} out of bounds (signal table has {} rows)",
+                    self.total_rows
+                ))
+            })?;
+            batch_rows
+                .entry(batch_idx)
+                .or_default()
+                .push((result_idx, local_row));
         }
 
         // Parse batches in parallel. Each batch is an independent IPC block
@@ -734,7 +741,8 @@ impl ArrowIpcFooter {
             }
         }
 
-        // Convert to vec, filtering out any missing
+        // Every requested row was mapped above and every batch fills its own
+        // slots, so no slot can be empty.
         Ok(results.into_iter().flatten().collect())
     }
 }
