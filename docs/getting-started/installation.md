@@ -9,6 +9,23 @@ Only to build from source:
 
 ## Installing the CLI
 
+### Bioconda
+
+```bash
+pixi add bioconda::escapepod     # or: conda install -c conda-forge -c bioconda escapepod
+```
+
+The package installs `escpod`, built with `--features gpu`. That feature needs
+nothing CUDA at build time, and at run time the CUDA and onnxruntime libraries
+are only loaded when a GPU stage runs, so on a CPU-only machine the package
+behaves like the musl build (`--device auto` falls back to the CPU). To use a
+GPU you need the runtime described under [GPU
+acceleration](../cli/demux.md#gpu-acceleration).
+
+The linux-64 package is compiled for x86-64-v3 (AVX2, FMA, BMI2), which means
+a Haswell-era (2013) or newer CPU. Wider instruction sets such as AVX-512 are
+picked at run time.
+
 ### Prebuilt binaries
 
 Every tagged version publishes `escpod` binaries on the
