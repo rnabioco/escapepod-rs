@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **Periodic GPU-vs-CPU parity guard for the CRF encoder** (#448). Every 64th
+  device batch, up to 8 reads are re-scored on the CPU encoder in a rayon task
+  and compared on decoded sequence (and `ref_logp`/`mean_logpost` when a panel
+  is scored). A disagreement is logged at `error!`; under `--device gpu` it
+  also fails the run. `ESCAPEPOD_CRF_GPU_PARITY_EVERY=N` sets the period,
+  `0` turns it off.
+
 ## 0.31.2 (2026-10-10)
 
 ### Removed

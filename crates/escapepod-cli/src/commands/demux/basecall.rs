@@ -174,6 +174,16 @@ impl Basecaller {
         }
     }
 
+    /// Wait for the GPU encoder's in-flight parity checks (#448); a strict
+    /// (`--device gpu`) failure becomes the command's error.
+    fn finish_parity(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Cpu(_) => Ok(()),
+            #[cfg(feature = "gpu")]
+            Self::Gpu(e) => Ok(e.finish_parity()?),
+        }
+    }
+
     fn layout(&self) -> &escapepod_demux::crf::CrfLayout {
         match self {
             Self::Cpu(e) => e.layout(),
@@ -504,9 +514,10 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             "{} GPU (onnxruntime CUDA)",
             style::label("Encoder runs on:")
         );
-        Basecaller::Gpu(Box::new(escapepod_demux::crf::CrfEncoderGpu::load_bundle(
-            &args.model,
-        )?))
+        let enc = escapepod_demux::crf::CrfEncoderGpu::load_bundle(&args.model)?;
+        // Parity failures (#448) stop the run only when the GPU was demanded.
+        enc.set_parity_strict(args.device.resolve() == crate::device::Device::Gpu);
+        Basecaller::Gpu(Box::new(enc))
     } else {
         Basecaller::Cpu(Box::new(CrfEncoder::load_bundle(&args.model)?))
     };
@@ -758,6 +769,7 @@ pub fn run(args: BasecallArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("demux reader thread panicked: {e:?}"))??;
         Ok(())
     })?;
+    encoder.finish_parity()?;
     out.flush()?;
     progress.finish_and_clear();
 
