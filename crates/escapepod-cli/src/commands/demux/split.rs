@@ -12,6 +12,9 @@ use tabled::{builder::Builder, settings::Style};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// The group an empty label folds into, and what `--classified-only` drops.
+const UNCLASSIFIED: &str = escapepod_signal::pod5::sidecar::UNCLASSIFIED_LABEL;
+
 /// Arguments for the split subcommand.
 #[derive(Debug, clap::Args)]
 pub struct SplitArgs {
@@ -139,13 +142,13 @@ pub fn run(args: SplitArgs) -> anyhow::Result<()> {
     let mut skipped_unclassified: u64 = 0;
     for (read_id, barcode) in &barcode_mapping {
         let barcode_key = if barcode.is_empty() {
-            "unclassified"
+            UNCLASSIFIED
         } else {
             barcode.as_str()
         };
         unique_barcodes.insert(barcode_key);
 
-        if barcode_key == "unclassified" && args.classified_only {
+        if barcode_key == UNCLASSIFIED && args.classified_only {
             skipped_unclassified += 1;
             continue;
         }

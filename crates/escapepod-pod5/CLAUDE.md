@@ -10,7 +10,7 @@
 - `arrow_ipc.rs` — `ArrowIpcFooter::parse_with_row_counts`, `extract_signal_rows` (zero-copy).
 - `arrow_helpers.rs` — `ReadsBatchView` (columns resolved once per batch), `ReadColumns`, `verify_index_row`.
 - `sidecar.rs` — per-file + collection `.p5s`; `load_sidecar_for_write`, `write_sidecar_file_checked`.
-- `operations/` — filter+subset share `assemble_output`; `repack`; `annotate` (`resolve_sidecar` merges own + collection).
+- `operations/` — filter+subset share `assemble_output`; `repack`; `annotate` (`resolve_sidecar` merges own + collection); `table` (`LabelTableBuilder`: a CSV/TSV read→label table straight into shared-index `LabelCodesIndexed` columns; gzip and fill are the caller's).
 - `merge.rs` — `merge_files`, copies signal IPC blocks byte-for-byte.
 - `compression/` — `vbz::decompress_signal_prefix` is the one decode path; `svb16/` dispatch only in `encode`/`decode_split`.
 - `footer.rs` `parse_footer`; `schema/` `narrow_channel`; `utils/table_builders` (every output table); `utils/pod5_assembler::write_post_signal_sections`; `flatbuffers_gen/` generated.

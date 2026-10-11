@@ -260,7 +260,7 @@ struct Decoded {
 }
 
 /// escpod's own sentinel for a read that could not be placed (`demux/run.rs`).
-const UNCLASSIFIED: &str = "unclassified";
+const UNCLASSIFIED: &str = escapepod_signal::pod5::sidecar::UNCLASSIFIED_LABEL;
 
 /// The thresholds that can turn a matched read into `unclassified`.
 ///

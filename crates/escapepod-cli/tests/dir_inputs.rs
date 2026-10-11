@@ -12,91 +12,10 @@
 
 #![cfg(feature = "cli")]
 
+mod common;
+
+use common::{Workspace, assert_has_rows, assert_ok, run};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn fixture_pod5() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("escapepod-classify/tests/fixtures/trna_reads.pod5")
-}
-
-fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .args(args)
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to run escpod")
-}
-
-fn assert_ok(args: &[&str]) -> Output {
-    let out = run(args);
-    assert!(
-        out.status.success(),
-        "`escpod {}` failed:\n{}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out
-}
-
-/// A CSV is more than its header — the failure this file exists for wrote a
-/// header and stopped.
-fn assert_has_rows(path: &Path) {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-    let rows = text.lines().skip(1).filter(|l| !l.is_empty()).count();
-    assert!(rows > 0, "{} has no data rows:\n{text}", path.display());
-}
-
-/// A directory holding one copy of the fixture, plus somewhere to write.
-struct Workspace {
-    _tmp: tempfile::TempDir,
-    dir: PathBuf,
-    out: PathBuf,
-}
-
-impl Workspace {
-    fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("pod5");
-        let out = tmp.path().join("out");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::copy(fixture_pod5(), dir.join("reads.pod5")).unwrap();
-        Self {
-            _tmp: tmp,
-            dir,
-            out,
-        }
-    }
-
-    fn dir(&self) -> &str {
-        self.dir.to_str().unwrap()
-    }
-
-    fn out(&self, name: &str) -> PathBuf {
-        self.out.join(name)
-    }
-
-    /// Boundaries for the fixture, detected from the directory — which makes
-    /// this both a fixture builder and the `detect` half of the assertion.
-    fn boundaries(&self) -> PathBuf {
-        let csv = self.out("boundaries.csv");
-        assert_ok(&[
-            "demux",
-            "detect",
-            "--method",
-            "llr",
-            self.dir(),
-            "-o",
-            csv.to_str().unwrap(),
-        ]);
-        assert_has_rows(&csv);
-        csv
-    }
-}
 
 /// `read_id,<column>` over every read in a boundaries CSV, for the commands
 /// that take an assignment table.

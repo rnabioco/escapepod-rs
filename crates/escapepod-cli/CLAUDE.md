@@ -45,6 +45,8 @@ pixi run -e dev cargo nextest run -p escapepod-cli && pixi run cargo test --doc 
 - `collect_pod5_inputs` dedupes but keeps argument order — `merge`/`repack`/`index` output order depends on it.
 - `experimental` stubs (`repack`, `resquiggle`) exist so `escpod repack` errors with a rebuild hint, not "unknown subcommand". `annotate` has none: it ships by default, and a leftover stub would shadow the real command.
 - `build.rs` must name the real `HEAD` path (`git rev-parse --git-path HEAD`): a nonexistent `rerun-if-changed` target reruns the script every build.
+- `annotate --from-table`/`-a` look before they write: a pre-pass over every input's `read_ids()` refuses (error, nothing written) when no read matches. With the fill on, every read counts as assigned, so nothing the writers report can catch a table from another run, and an in-place replace would overwrite a good column with all-`unclassified` → `tests/annotate_table.rs::a_table_for_another_run_is_refused_before_anything_is_written`. The fill (`apply_fill`) is CLI-side and must keep `codes.len() == index.len()` per column — the writers `get` a slot and silently drop one with no code.
+- `util::open_maybe_gzip` sniffs `1f 8b` and uses `MultiGzDecoder`; `GzDecoder` silently truncates a multi-member table → `a_multi_member_gzip_is_read_whole`.
 - Every command resolves POD5 reads through the read index and processes them in storage order (the #334 rule); BGZF pools are sized from the rayon pool — `MultithreadedReader::new` is one worker.
 
 ## Known debt

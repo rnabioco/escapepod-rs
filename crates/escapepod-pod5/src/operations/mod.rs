@@ -9,6 +9,7 @@ mod filter;
 mod repack;
 mod split;
 mod subset;
+mod table;
 
 pub use annotate::{
     ABSENT_CODE, ABSENT_SCORE, AnnotateOptions, AnnotateResult, CollectionResult, ColumnStat,
@@ -24,3 +25,4 @@ pub use filter::{
 pub use repack::{RepackOptions, RepackResult, repack_files};
 pub use split::parse_barcode_mapping;
 pub use subset::parse_csv_mapping;
+pub use table::{LabelTable, LabelTableBuilder, TableColumn};
