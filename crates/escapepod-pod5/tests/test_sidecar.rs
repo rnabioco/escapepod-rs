@@ -604,7 +604,7 @@ fn index_via_sidecar_matches_scan() {
 }
 
 /// `has_sidecar_index` answers what a command needs before it decides whether
-/// to tell the user about `escpod index`: is there a sidecar *this* file can
+/// to tell the user about `escpod sidecar index`: is there a sidecar *this* file can
 /// take an index from?
 ///
 /// A sidecar bound to a different POD5 answers no. That is not a contradiction
@@ -1322,7 +1322,7 @@ fn index_rebuild_refuses_an_unreadable_sidecar_rather_than_starting_empty() {
 
 #[test]
 fn both_sidecar_readers_apply_the_same_version_gate() {
-    // `escpod index` decides whether to rewrite a sidecar by reading its
+    // `escpod sidecar index` decides whether to rewrite a sidecar by reading its
     // metadata, then rewrites it through the full reader. If the cheap check
     // accepts a file the full read would reject, check-then-write is unsound:
     // the command is told the file is fine, and only finds out otherwise once
@@ -1361,7 +1361,7 @@ fn both_sidecar_readers_apply_the_same_version_gate() {
 // Lost updates: the atomic write makes a sidecar update all-or-nothing, which
 // prevents a *torn* file and says nothing about a second writer. The realistic
 // case is not corruption — it is a long `demux --annotate` still running when
-// someone runs `escpod index` on the same file to speed it up.
+// someone runs `escpod sidecar index` on the same file to speed it up.
 // ---------------------------------------------------------------------------
 
 #[test]

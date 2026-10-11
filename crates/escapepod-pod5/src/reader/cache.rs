@@ -191,7 +191,7 @@ fn warm_index(reader: &Reader, path: &Path) {
             file = ?path,
             reads,
             "not warming the read index for a large file; the first lookup that \
-             needs it will build it (`escpod index` persists it across processes)"
+             needs it will build it (`escpod sidecar index` persists it across processes)"
         );
         return;
     }

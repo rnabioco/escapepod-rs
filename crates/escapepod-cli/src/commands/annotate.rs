@@ -21,27 +21,145 @@ use escapepod_signal::pod5::sidecar::{MAX_ANNOTATION_LABELS, UNCLASSIFIED_LABEL}
 use crate::style;
 use crate::util::{collect_pod5_inputs, open_maybe_gzip};
 
-/// Parsed `escpod annotate` arguments (one action per invocation).
-pub struct AnnotateCmd {
+/// Parsed `escpod sidecar annotate` arguments (one action per invocation).
+///
+/// The one definition behind both spellings: `escpod sidecar annotate` and the
+/// hidden `escpod annotate` nest this same struct, so the two cannot drift
+/// apart (see [`crate::commands::sidecar`]).
+#[derive(clap::Args)]
+#[command(after_help = "\
+Writes a read → label mapping into the .p5s sidecar next to each POD5 file.
+The POD5 itself is never modified. The sidecar is a plain Arrow IPC table
+(read_id, batch_idx, row_idx, plus one dictionary column per annotation) —
+readable directly with pyarrow/polars — and is bound to its POD5 by file
+identifier + size, so a stale or misplaced sidecar fails loudly. Existing
+sidecar contents (the read index, other annotations) are preserved.
+
+Examples:
+  escpod sidecar annotate -a demux.csv input.pod5        Annotate with demux assignments
+  escpod sidecar annotate -a demux.csv data_dir/         Annotate a directory recursively
+  escpod sidecar annotate -a samples.csv --name sample input.pod5
+  escpod sidecar annotate data_dir/ --from-table calls.csv.gz --column barcode=predicted_barcode
+                                                 Label reads from another tool's
+                                                 read-to-label table (CSV/TSV, gzip ok)
+  escpod sidecar annotate --design samplesheet.csv input.pod5
+                                                 Map barcode (combinations) to
+                                                 experimental conditions
+")]
+#[command(group(
+    clap::ArgGroup::new("action")
+        .required(true)
+        .args([
+            "assignments",
+            "design",
+            "from_table",
+            "list",
+            "remove",
+            "remove_design"
+        ])
+))]
+pub struct AnnotateArgs {
+    /// Input POD5 file(s) or directory
+    #[arg(required = true, value_name = "FILES")]
     pub inputs: Vec<PathBuf>,
+
+    /// CSV mapping reads to labels (read_id + barcode/predicted_barcode
+    /// columns — the output of `demux classify` or `demux basecall --barcodes`)
+    #[arg(short = 'a', long, value_name = "CSV")]
     pub assignments: Option<PathBuf>,
-    pub design: Option<PathBuf>,
-    pub keys: Option<Vec<String>>,
-    pub name: String,
-    pub list: bool,
-    pub remove: Option<String>,
-    pub remove_design: bool,
-    /// `--from-table`: one or more read → label tables (shards of one run).
+
+    /// Table mapping reads to labels, from another tool (CSV or TSV, one
+    /// header row; gzip is detected). Needs --column. Reads the table does
+    /// not label get --unassigned-label. Repeat for the shards of one run
+    #[arg(
+        long,
+        value_name = "TABLE",
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        requires = "columns",
+        conflicts_with_all = ["assignments", "name"]
+    )]
     pub from_table: Vec<PathBuf>,
-    /// `--id-column`; `read_id` when unset.
+
+    /// With --from-table: the table's read-id column (default: read_id; a
+    /// leading '#' in the header, as WarpDemuX writes, is ignored)
+    #[arg(
+        long,
+        value_name = "COL",
+        requires = "from_table",
+        conflicts_with_all = TABLE_ONLY_CONFLICTS
+    )]
     pub id_column: Option<String>,
-    /// `--column NAME=COL`: sidecar column name and the table column it reads.
+
+    /// With --from-table: write sidecar column NAME from table column COL,
+    /// verbatim (e.g. barcode=predicted_barcode). Repeat for several
+    #[arg(
+        long = "column",
+        value_name = "NAME=COL",
+        requires = "from_table",
+        conflicts_with_all = TABLE_ONLY_CONFLICTS,
+        action = clap::ArgAction::Append,
+        value_parser = parse_column_spec
+    )]
     pub columns: Vec<(String, String)>,
-    /// `--unassigned-label`; [`UNCLASSIFIED_LABEL`] when unset, and none at all
-    /// when set empty.
+
+    /// With --from-table: label for reads the table does not label (absent
+    /// from it, or an empty cell) [default: unclassified]. Pass '' to leave
+    /// them unlabelled
+    #[arg(
+        long,
+        value_name = "LABEL",
+        requires = "from_table",
+        conflicts_with_all = TABLE_ONLY_CONFLICTS
+    )]
     pub unassigned_label: Option<String>,
+
+    /// Experimental-design CSV: one column per key annotation (e.g.
+    /// `barcode`, or `ldx,edx` for combinations) plus one column per
+    /// experimental variable (e.g. `condition`). Stored in the sidecar
+    /// and materialized as derived per-read columns
+    #[arg(long, value_name = "CSV")]
+    pub design: Option<PathBuf>,
+
+    /// With --design: which CSV columns are the keys (default: every
+    /// column whose name matches an existing annotation)
+    #[arg(long, value_name = "COLS", requires = "design", value_delimiter = ',')]
+    pub keys: Option<Vec<String>>,
+
+    /// Annotation name (the sidecar column to write, with -a; --from-table
+    /// names its columns with --column instead)
+    #[arg(long, default_value = escapepod_signal::pod5::sidecar::DEFAULT_ANNOTATION_NAME)]
+    pub name: String,
+
+    /// List each file's sidecar contents (index, annotations, design)
+    #[arg(long)]
+    pub list: bool,
+
+    /// Remove an annotation by name (design columns are refused —
+    /// remove or update the design instead)
+    #[arg(long, value_name = "NAME")]
+    pub remove: Option<String>,
+
+    /// Remove the experimental design and its derived columns
+    #[arg(long)]
+    pub remove_design: bool,
+
+    /// Replace a sidecar bound to a different POD5 instead of erroring
+    #[arg(long)]
     pub force: bool,
+
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
 }
+
+/// The other actions, for the options that only mean something with
+/// `--from-table`. `requires` alone is not enough: clap does not report a
+/// required argument as missing when it conflicts with one that was given, so
+/// `-a x.csv --column barcode=y` would otherwise parse and quietly ignore
+/// `--column`.
+const TABLE_ONLY_CONFLICTS: [&str; 5] =
+    ["assignments", "design", "list", "remove", "remove_design"];
 
 /// `clap` value parser for `--column NAME=COL`.
 pub fn parse_column_spec(s: &str) -> Result<(String, String), String> {
@@ -61,7 +179,7 @@ pub fn parse_column_spec(s: &str) -> Result<(String, String), String> {
 /// the CSV format `demux split` consumes), label reads from an external table
 /// (`--from-table`), or record an experimental-design table (`--design`), or
 /// inspect/prune the sidecar (`--list`, `--remove`, `--remove-design`).
-pub fn run(cmd: AnnotateCmd) -> anyhow::Result<()> {
+pub fn run(cmd: AnnotateArgs) -> anyhow::Result<()> {
     // Captured before expansion flattens directories away: a directory may
     // also have a collection sidecar beside it, and `--list` should say so
     // rather than printing only the members' own.

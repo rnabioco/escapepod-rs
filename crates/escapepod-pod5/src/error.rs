@@ -73,7 +73,7 @@ pub enum Error {
     /// construction — never from a sidecar this escpod wrote for this file.
     #[error(
         "read index for {requested} points at batch {batch} row {row}, which holds {found}; \
-         the .p5s does not describe this file's reads — rebuild it with `escpod index`"
+         the .p5s does not describe this file's reads — rebuild it with `escpod sidecar index`"
     )]
     SidecarIndexMismatch {
         requested: uuid::Uuid,
@@ -104,7 +104,7 @@ pub enum Error {
     /// rather than error.
     #[error(
         "read index for {requested} points at row {row} of batch {batch}, which has {rows} rows; \
-         the .p5s does not describe this file's reads — rebuild it with `escpod index`"
+         the .p5s does not describe this file's reads — rebuild it with `escpod sidecar index`"
     )]
     SidecarRowOutOfBounds {
         requested: uuid::Uuid,

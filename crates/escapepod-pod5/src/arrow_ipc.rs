@@ -451,7 +451,7 @@ impl ArrowIpcFooter {
                     actual_batches = record_batches.len(),
                     "cached signal batch geometry does not match this file; \
                      ignoring it and reading the batch headers (rebuild with \
-                     `escpod index`)"
+                     `escpod sidecar index`)"
                 );
                 return Self::parse_footer_flatbuffer(footer_bytes, full_ipc, None, None);
             }

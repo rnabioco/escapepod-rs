@@ -202,7 +202,7 @@ fn annotate_on_a_directory_writes_one_collection_sidecar() {
     let csv = ws.out("assign.csv");
     std::fs::write(&csv, mapping_from(&boundaries, "barcode", "BC01")).unwrap();
 
-    assert_ok(&["annotate", ws.dir(), "-a", csv.to_str().unwrap()]);
+    assert_ok(&["sidecar", "annotate", ws.dir(), "-a", csv.to_str().unwrap()]);
 
     let collection = ws.dir.with_extension("p5s");
     assert!(
@@ -235,7 +235,7 @@ fn annotate_on_a_directory_writes_one_collection_sidecar() {
     // `--list` has to account for the members, not disown them. A file whose
     // labels live in the collection is *covered*; printing "no sidecar" under
     // the collection that holds them says the opposite of what is true.
-    let out = assert_ok(&["annotate", "--list", ws.dir()]);
+    let out = assert_ok(&["sidecar", "annotate", "--list", ws.dir()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("reads indexed across 1 files"),

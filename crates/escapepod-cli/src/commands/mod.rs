@@ -20,6 +20,7 @@ pub mod repack;
 pub mod resquiggle;
 #[cfg(feature = "experimental")]
 pub mod resquiggle_models;
+pub mod sidecar;
 pub mod subset;
 pub mod summary;
 pub mod view;

@@ -21,7 +21,7 @@
 //! * `scan+shuffled`  — the 0.19.0 path the issue measured.
 //! * `scan+storage`   — ordering alone (the 0.21.0 column-variant path).
 //! * `index+storage`  — this branch. Run the probe a second time after
-//!   `escpod index` to get the sidecar-backed version of the same arm.
+//!   `escpod sidecar index` to get the sidecar-backed version of the same arm.
 //!
 //! **Every arm gets its own disjoint read sample**, because a shared one would
 //! hand each later arm the previous arm's page cache — the confound the issue
@@ -45,7 +45,7 @@
 //! ```
 //!
 //! Give it a directory of symlinks rather than the run itself if you do not
-//! want `escpod index` writing sidecars into primary data.
+//! want `escpod sidecar index` writing sidecars into primary data.
 //!
 //! # What it measured (2026-09-07, rna, BeeGFS)
 //!

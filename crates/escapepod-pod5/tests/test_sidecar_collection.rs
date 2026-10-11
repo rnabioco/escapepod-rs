@@ -298,7 +298,7 @@ fn a_member_sidecar_and_the_collection_are_merged_column_by_column() {
     let member = members(&dir).into_iter().next().unwrap();
 
     // The file's own sidecar carries one column; the directory's collection
-    // carries the other two. This is what `escpod index` (index only) beside a
+    // carries the other two. This is what `escpod sidecar index` (index only) beside a
     // demultiplexed directory looks like, and neither may hide the other.
     let own = vec![ColumnWrite {
         name: "flowcell".to_string(),

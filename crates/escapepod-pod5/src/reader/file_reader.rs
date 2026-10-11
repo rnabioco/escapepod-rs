@@ -184,7 +184,7 @@ fn probe_header_footer(file: &File) -> Result<()> {
 /// large the file, because the only alternative is a full scan of the reads
 /// table on every call, which is orders of magnitude worse than the memory it
 /// would save. Above this threshold that build is reported at `warn` rather
-/// than `debug`, naming `escpod index`, because it is a cost worth knowing
+/// than `debug`, naming `escpod sidecar index`, because it is a cost worth knowing
 /// about even though it is the right cost to pay.
 ///
 /// A caller that is merely *guessing* that random access is coming — the
@@ -1388,7 +1388,7 @@ impl Reader {
     ///
     /// Schema metadata only — it never decodes the (potentially
     /// multi-million-row) index, so a command may ask before deciding whether
-    /// to tell the user about `escpod index`.
+    /// to tell the user about `escpod sidecar index`.
     ///
     /// A sidecar that exists but does not load — wrong version, bound to a
     /// different POD5 — answers `false` here. That is a hint, not the ruling:
@@ -1429,7 +1429,7 @@ impl Reader {
                         file = ?self.file_path,
                         reads,
                         "no .p5s sidecar; building an in-memory read index for a \
-                         large file — run `escpod index` to persist it and skip \
+                         large file — run `escpod sidecar index` to persist it and skip \
                          this on every future open"
                     );
                 } else {
@@ -1437,7 +1437,7 @@ impl Reader {
                         file = ?self.file_path,
                         reads,
                         "no .p5s sidecar; building the read index in memory \
-                         (`escpod index` persists it across processes)"
+                         (`escpod sidecar index` persists it across processes)"
                     );
                 }
                 self.build_read_index_from_scan()?
@@ -1449,7 +1449,7 @@ impl Reader {
     /// Measure the signal table's per-batch row counts by actually reading
     /// every batch header, ignoring any cached geometry.
     ///
-    /// This is the expensive walk itself. Only `escpod index` should want it:
+    /// This is the expensive walk itself. Only `escpod sidecar index` should want it:
     /// its whole job is to pay a cost once so that later opens do not, and a
     /// command that *writes* the cache must not seed it from the cache.
     fn measure_signal_batch_rows(&self) -> Vec<u64> {
@@ -1472,7 +1472,7 @@ impl Reader {
     /// Annotations in a valid existing sidecar are preserved; a stale or
     /// unreadable sidecar is replaced outright (its contents were bound to
     /// a different file and unusable anyway). This is called by the
-    /// `escpod index` CLI command.
+    /// `escpod sidecar index` CLI command.
     ///
     /// Also records the signal table's batch geometry, which is the other
     /// per-file constant a reader would otherwise rediscover the hard way —
@@ -1538,7 +1538,7 @@ impl Reader {
     /// sidecar that omits it condemns every later open to pay again. It used
     /// to be recorded only by [`Self::build_and_write_index`], which meant the
     /// sidecars real workflows actually produce — `demux --annotate`,
-    /// `escpod annotate` — never had it, and re-measured on every run.
+    /// `escpod sidecar annotate` — never had it, and re-measured on every run.
     /// Routing the writes through here is what makes that impossible to
     /// forget in a path added later.
     ///
@@ -1659,7 +1659,7 @@ impl Reader {
     /// arrive in BAM order, which is unrelated to POD5 storage order, so the
     /// last one sits near EOF and the scan runs to the end of the file anyway.
     ///
-    /// Persist the index with `escpod index` to skip the build entirely.
+    /// Persist the index with `escpod sidecar index` to skip the build entirely.
     pub fn reads_by_ids(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<ReadData>> {
         if target_ids.is_empty() {
             return Ok(Vec::new());

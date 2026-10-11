@@ -502,13 +502,13 @@ pub fn read_design(pod5_path: impl AsRef<Path>) -> Result<Design> {
 
     let sc = sidecar::read_sidecar_file(&p5s_path, &identity)?.ok_or_else(|| {
         Error::Parse(format!(
-            "no sidecar at {}; create one with `escpod annotate`",
+            "no sidecar at {}; create one with `escpod sidecar annotate`",
             p5s_path.display()
         ))
     })?;
     sc.design().cloned().ok_or_else(|| {
         Error::Parse(format!(
-            "{} has no experimental design; record one with `escpod annotate --design`",
+            "{} has no experimental design; record one with `escpod sidecar annotate --design`",
             p5s_path.display()
         ))
     })
@@ -631,7 +631,7 @@ struct Resolved {
 ///
 /// The two are **merged**, per column, with the file's own sidecar winning:
 /// it is bound to this exact POD5 by `file_identifier` + size, which is the
-/// stronger claim. Merging rather than choosing is what lets `escpod index`'s
+/// stronger claim. Merging rather than choosing is what lets `escpod sidecar index`'s
 /// index-only sidecar sit next to an annotated collection without either one
 /// hiding the other.
 fn resolve_sidecar(pod5_path: &Path) -> Result<Resolved> {
@@ -644,7 +644,7 @@ fn resolve_sidecar(pod5_path: &Path) -> Result<Resolved> {
     };
     resolve_sidecar_opt(pod5_path)?.ok_or_else(|| {
         Error::Parse(format!(
-            "no sidecar at {}; create one with `escpod annotate`",
+            "no sidecar at {}; create one with `escpod sidecar annotate`",
             describe()
         ))
     })
