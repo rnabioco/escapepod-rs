@@ -34,8 +34,8 @@ pub fn compress_signal(samples: &[i16]) -> Result<Vec<u8>> {
 
     ZSTD_ENCODE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let (cctx, svb, zbuf) = match &mut *slot {
-            Some(pair) => pair,
+        let EncodeScratch { cctx, svb, zbuf } = match &mut *slot {
+            Some(scratch) => scratch,
             empty => {
                 let mut cctx = zstd::bulk::Compressor::new(ZSTD_LEVEL)
                     .map_err(|e| Error::Compression(format!("ZSTD encoder init failed: {}", e)))?;
@@ -46,7 +46,11 @@ pub fn compress_signal(samples: &[i16]) -> Result<Vec<u8>> {
                 cctx.include_contentsize(true).map_err(|e| {
                     Error::Compression(format!("ZSTD set content size failed: {}", e))
                 })?;
-                empty.insert((cctx, Vec::new(), Vec::new()))
+                empty.insert(EncodeScratch {
+                    cctx,
+                    svb: Vec::new(),
+                    zbuf: Vec::new(),
+                })
             }
         };
 
@@ -67,12 +71,20 @@ pub fn compress_signal(samples: &[i16]) -> Result<Vec<u8>> {
     })
 }
 
+/// A thread's reusable encode state: the ZSTD context, the SVB16 output and
+/// the compressed output.
+struct EncodeScratch {
+    cctx: zstd::bulk::Compressor<'static>,
+    svb: Vec<u8>,
+    zbuf: Vec<u8>,
+}
+
 thread_local! {
     /// One ZSTD compression context + SVB16 scratch per thread. A fresh
     /// `Encoder` per chunk built a `CCtx`, its tables and a 32 KB buffer for
     /// every read. Thread-local for the same reason as the decoder's: callers
     /// fan out over rayon and `Compressor` is `Send`, not `Sync`.
-    static ZSTD_ENCODE: RefCell<Option<(zstd::bulk::Compressor<'static>, Vec<u8>, Vec<u8>)>> =
+    static ZSTD_ENCODE: RefCell<Option<EncodeScratch>> =
         const { RefCell::new(None) };
 }
 
