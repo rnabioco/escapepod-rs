@@ -105,7 +105,7 @@ reader.build_and_write_index(sidecar_path(&path))?;
 
 ## Sidecar Annotations
 
-Per-read annotations written by `escpod annotate` / `escpod demux
+Per-read annotations written by `escpod sidecar annotate` / `escpod demux
 --annotate` (barcode assignments, design-derived conditions) live in the
 `.p5s` sidecar and are read through `escapepod_signal::operations`:
 

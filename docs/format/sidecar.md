@@ -10,7 +10,7 @@ file beneath it, so a fifty-file run leaves one annotated result rather than
 fifty. See [One sidecar for a directory](#one-sidecar-for-a-directory).
 
 This page is the on-disk specification. For how to *use* sidecars, see the
-[`annotate` reference](../cli/annotate.md) and the
+[`sidecar annotate` reference](../cli/sidecar-annotate.md) and the
 [sidecar overview](../experimental/index.md#the-p5s-sidecar).
 
 ## Layout
@@ -142,14 +142,14 @@ scattered touch per batch, which on a network filesystem measured 15–24 ms
 file with 8866 signal batches spent 4.95 s there, 78% of a cold 5000-read
 scattered fetch. With the geometry cached that becomes 4.82 ms.
 
-**Every** sidecar write records it when it is not already there — `escpod index`,
-`escpod annotate`, `demux --annotate` alike — so a sidecar cannot end up
+**Every** sidecar write records it when it is not already there — `escpod sidecar index`,
+`escpod sidecar annotate`, `demux --annotate` alike — so a sidecar cannot end up
 carrying a read index and nothing else. A write that finds a value already
 present carries it through untouched rather than re-measuring: identity binding
 has already proved the POD5 is the same file, so a recorded geometry cannot have
 gone stale under it.
 
-`escpod index` is the exception, and deliberately: it re-measures even when a
+`escpod sidecar index` is the exception, and deliberately: it re-measures even when a
 value is present, because rebuilding the cache is the job it exists to do. It
 also refuses to skip a sidecar that has an index but no geometry — otherwise the
 obvious remedy for a slow file would report "already indexed" and do nothing.
@@ -260,7 +260,7 @@ Nothing downstream has to know which shape holds the answer. `view --include`,
 a POD5 for its columns, and escapepod looks in both places: the file's own
 `.p5s` first, then the collection beside its directory. The two are **merged**
 per column with the file's own sidecar winning, so an index-only sidecar left
-by `escpod index` sits happily beside an annotated collection and neither hides
+by `escpod sidecar index` sits happily beside an annotated collection and neither hides
 the other.
 
 For pyarrow, one file is the whole point:
@@ -273,18 +273,18 @@ table = ipc.open_file("run1/pod5.p5s").read_all()
 ### What a collection does not carry
 
 - **No signal batch geometry.** That describes one POD5's signal table and
-  belongs in that file's own sidecar; `escpod index` is what measures it. Run
-  `escpod index <dir>` if you want the per-file index and geometry caches as
+  belongs in that file's own sidecar; `escpod sidecar index` is what measures it. Run
+  `escpod sidecar index <dir>` if you want the per-file index and geometry caches as
   well — the two shapes coexist.
-- **No experimental design.** `escpod annotate --design` targets member
+- **No experimental design.** `escpod sidecar annotate --design` targets member
   sidecars, where the derived columns it materializes belong.
 
 ## Write semantics
 
 Sidecar writes are atomic — the new file is staged beside the destination
 and renamed into place — and column-preserving in both directions:
-rebuilding the read index (`escpod index`) keeps annotations, and writing an
-annotation (`escpod annotate`, `demux --annotate`) keeps the index and other
+rebuilding the read index (`escpod sidecar index`) keeps annotations, and writing an
+annotation (`escpod sidecar annotate`, `demux --annotate`) keeps the index and other
 annotations. A crash mid-write leaves the previous sidecar intact. This
 matters because the file mixes a rebuildable cache (the index) with data
 products that exist nowhere else once the CSV that produced them is deleted

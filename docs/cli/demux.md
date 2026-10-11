@@ -83,7 +83,7 @@ With more than one model each is given as `NAME=PATH`. `NAME` is that axis's
 sidecar annotation column, and it is **yours, not the bundle's** — it names
 the axis in your experimental design, and the same model can serve different
 axes in different runs. Those column names are exactly what
-[`annotate --design`](annotate.md#experimental-designs) keys a
+[`sidecar annotate --design`](sidecar-annotate.md#experimental-designs) keys a
 multi-column samplesheet on:
 
 ```bash
@@ -91,7 +91,7 @@ cat samplesheet.csv
 # ldx,fdx,library,condition
 # ldx01,fdx01,A,plain_adapter
 # ldx04,fdx02,B,plain_adapter
-escpod annotate --design samplesheet.csv reads.pod5
+escpod sidecar annotate --design samplesheet.csv reads.pod5
 escpod view reads.pod5 --include read_id,ldx,fdx,library,condition
 ```
 

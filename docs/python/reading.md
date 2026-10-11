@@ -76,7 +76,7 @@ reports whether a sidecar exists.
 
 ## Sidecar annotations
 
-Per-read annotations recorded with `escpod annotate` (e.g. demux barcode
+Per-read annotations recorded with `escpod sidecar annotate` (e.g. demux barcode
 assignments) live in the `.p5s` sidecar next to the POD5 and are exposed as
 plain dicts:
 

@@ -1,8 +1,10 @@
-# annotate
+# escpod sidecar annotate
 
 Record per-read annotations — demux barcode assignments, experimental
 conditions — in the [`.p5s` sidecar](../format/sidecar.md) next to POD5
-files. The POD5 itself is never modified.
+files. The POD5 itself is never modified. It builds the read index when the
+sidecar does not have one yet; [`sidecar index`](sidecar-index.md) is the
+labels-free form. See the [`sidecar` overview](sidecar.md).
 
 ## Label reads from another tool's table
 
@@ -12,7 +14,7 @@ A read-to-label table from another demultiplexer (WarpDemuX's
 elsewhere — without cutting a per-sample POD5 and duplicating the signal:
 
 ```bash
-escpod annotate run1/pod5/ \
+escpod sidecar annotate run1/pod5/ \
     --from-table run1/predictions/barcode_predictions_0.csv.gz \
     --column barcode=predicted_barcode
 
@@ -59,7 +61,7 @@ writing a column that already exists replaces it in place while the rest of
 the sidecar survives.
 
 The sidecar lands beside the path *as given*. To keep a run's canonical
-directory free of `.p5s` files, point `annotate` at a directory of symlinks to
+directory free of `.p5s` files, point `sidecar annotate` at a directory of symlinks to
 its POD5s. Put `FILES` before `--from-table`, or repeat the flag per table:
 `--from-table` takes every following argument as a table.
 
@@ -68,12 +70,12 @@ its POD5s. Put `FILES` before `--from-table`, or repeat the flag per table:
 Exactly one action per invocation:
 
 ```bash
-escpod annotate --from-table <TABLE>... --column NAME=COL <FILES>...  # label reads from a table
-escpod annotate -a <CSV> <FILES>...            # write an annotation
-escpod annotate --design <CSV> <FILES>...      # record an experimental design
-escpod annotate --list <FILES>...              # show sidecar contents
-escpod annotate --remove <NAME> <FILES>...     # remove one annotation
-escpod annotate --remove-design <FILES>...     # remove the design + derived columns
+escpod sidecar annotate --from-table <TABLE>... --column NAME=COL <FILES>...  # label reads from a table
+escpod sidecar annotate -a <CSV> <FILES>...            # write an annotation
+escpod sidecar annotate --design <CSV> <FILES>...      # record an experimental design
+escpod sidecar annotate --list <FILES>...              # show sidecar contents
+escpod sidecar annotate --remove <NAME> <FILES>...     # remove one annotation
+escpod sidecar annotate --remove-design <FILES>...     # remove the design + derived columns
 ```
 
 `<FILES>` are POD5 files and/or directories (searched recursively).
@@ -100,7 +102,7 @@ escpod annotate --remove-design <FILES>...     # remove the design + derived col
 
 ```bash
 escpod demux … --classifications demux.csv     # or any read_id,barcode CSV
-escpod annotate -a demux.csv reads.pod5
+escpod sidecar annotate -a demux.csv reads.pod5
 ```
 
 Assignments are intersected with the reads actually present in each file;
@@ -117,7 +119,7 @@ Naming a **directory** writes a single
 it, covering every POD5 beneath — and no per-file sidecars:
 
 ```bash
-escpod annotate -a demux.csv run1/pod5/        # writes run1/pod5.p5s, and nothing else
+escpod sidecar annotate -a demux.csv run1/pod5/        # writes run1/pod5.p5s, and nothing else
 ```
 
 (`--from-table` does the same for a directory.)
@@ -132,7 +134,7 @@ Naming files individually keeps the per-file behaviour — there is no directory
 for a collection to sit beside:
 
 ```bash
-escpod annotate -a demux.csv run1/pod5/*.pod5  # writes one .p5s per file
+escpod sidecar annotate -a demux.csv run1/pod5/*.pod5  # writes one .p5s per file
 ```
 
 If you are running the fused demux pipeline anyway, `escpod demux
@@ -149,7 +151,7 @@ cat samplesheet.csv
 # barcode,condition,replicate
 # nbc01,fresh_edx01,r1
 # nbc02,fresh_edx02,r1
-escpod annotate --design samplesheet.csv reads.pod5
+escpod sidecar annotate --design samplesheet.csv reads.pod5
 ```
 
 Each variable becomes a derived per-read column (here `condition` and
@@ -186,4 +188,7 @@ Python: `Reader.annotation()`, `Reader.annotation_names()`,
   by a newer escpod) is refused with or without `--force`, because its barcode
   and score columns exist nowhere else and a rebuild would replace them with an
   empty column set.
+- `escpod annotate` is the old spelling of this command. It still works, as a
+  hidden alias that warns on stderr and forwards here, and will be removed in a
+  later release.
 - Format details: [The `.p5s` Sidecar](../format/sidecar.md).

@@ -1,4 +1,4 @@
-# escpod index
+# escpod sidecar index
 
 Build the [`.p5s` sidecar](../format/sidecar.md) caches for a POD5 file: the
 **read index** (O(log n) lookup by read ID instead of a full-table scan) and
@@ -6,14 +6,16 @@ the **signal batch geometry** (the per-batch row counts of the signal table).
 The POD5 itself is never modified.
 
 Both caches are rebuildable from the POD5 at any time, which is what separates
-`index` from [`annotate`](annotate.md) — annotations are data products that
-exist nowhere else, so `annotate` refuses to replace a sidecar it cannot read
-rather than rebuilding it, while `index` will always rebuild.
+`sidecar index` from [`sidecar annotate`](sidecar-annotate.md) — annotations
+are data products that exist nowhere else, so `sidecar annotate` refuses to
+replace a sidecar it cannot read rather than rebuilding it, while
+`sidecar index` will always rebuild. It is the labels-free form of the same
+operation; see the [`sidecar` overview](sidecar.md).
 
 ## Usage
 
 ```bash
-escpod index [OPTIONS] <FILES>...
+escpod sidecar index [OPTIONS] <FILES>...
 ```
 
 ## Arguments
@@ -33,10 +35,10 @@ escpod index [OPTIONS] <FILES>...
 ## Examples
 
 ```bash
-escpod index input.pod5          # index one file
-escpod index *.pod5              # index all POD5 files
-escpod index data_dir/           # index a directory recursively
-escpod index input.pod5 --force  # rebuild an existing sidecar
+escpod sidecar index input.pod5          # index one file
+escpod sidecar index *.pod5              # index all POD5 files
+escpod sidecar index data_dir/           # index a directory recursively
+escpod sidecar index input.pod5 --force  # rebuild an existing sidecar
 ```
 
 ## What gets cached, and why
@@ -75,7 +77,7 @@ file too.
 Once, on a **networked node**, before submitting jobs against a large file —
 the same reason [`escpod resquiggle models fetch`](../experimental/resquiggle.md)
 exists. Every sidecar write records the geometry when it is not already there
-(`escpod index`, `escpod annotate`, `demux --annotate` alike), so a sidecar
+(`escpod sidecar index`, `escpod sidecar annotate`, `demux --annotate` alike), so a sidecar
 cannot end up carrying a read index and nothing else.
 
 A sidecar that already holds both caches is skipped. One missing either — for
@@ -93,5 +95,8 @@ cache is the job this command exists to do.
   logs a warning and falls back to the full walk — a stale cache costs time,
   never correctness.
 - This format replaces the earlier `.p5i` index sidecar; delete any `.p5i`
-  files and rerun `escpod index`.
+  files and rerun `escpod sidecar index`.
+- `escpod index` is the old spelling of this command. It still works, as a
+  hidden alias that warns on stderr and forwards here, and will be removed in a
+  later release.
 - Format details: [The `.p5s` Sidecar](../format/sidecar.md).

@@ -24,8 +24,11 @@ nav = [
     { "subset" = "cli/subset.md" },
     { "demux" = "cli/demux.md" },
     { "classify" = "cli/classify.md" },
-    { "index" = "cli/index-command.md" },
-    { "annotate" = "cli/annotate.md" },
+    { "sidecar" = [
+      { "Overview" = "cli/sidecar.md" },
+      { "sidecar index" = "cli/sidecar-index.md" },
+      { "sidecar annotate" = "cli/sidecar-annotate.md" },
+    ] },
   ] },
   { "Experimental" = [
     { "Overview" = "experimental/index.md" },

@@ -22,8 +22,7 @@ These commands are in the default build — no extra Cargo features required.
 | [bam-filter](bam-filter.md) | Filter reads based on paired BAM file |
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
 | [demux](demux.md) | Barcode demultiplexing — DTW-SVM, GBM, or CTC-CRF, end to end |
-| [index](index-command.md) | Build the `.p5s` sidecar caches (read index + signal batch geometry) |
-| [annotate](annotate.md) | Record per-read labels (a demux CSV, an external read-to-label table, an experimental design) in the `.p5s` sidecar |
+| [sidecar](sidecar.md) | Write the `.p5s` sidecar: [`sidecar index`](sidecar-index.md) builds the caches (read index + signal batch geometry), [`sidecar annotate`](sidecar-annotate.md) records per-read labels (a demux CSV, an external read-to-label table, an experimental design) |
 | [classify](classify.md) | Read-level classification against a model bundle (tRNA charging) |
 
 Read alignment (formerly `escpod align`) now lives in its own tool,

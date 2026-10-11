@@ -19,7 +19,7 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **Fast** - 3-5x faster than the Python `pod5` tools moving bulk data, 20-50x
   on metadata-only commands
 - **Memory efficient** - Memory-mapped I/O for large files
-- **Full featured** - View, inspect, merge, filter, subset, index
+- **Full featured** - View, inspect, merge, filter, subset, sidecar (index, annotate)
 - **BAM integration** - Filter reads by alignment status
 - **Barcode demultiplexing** - `escpod demux` runs DTW-SVM, GBM, or CTC-CRF
   classification end to end, in the default build
@@ -90,7 +90,7 @@ On a CPU-only box that binary needs none of them — `--device auto` (the
 default) just falls back.
 
 To build instead — the default build ships the stable commands plus the full
-demux tree, `classify`, and `index`:
+demux tree, `classify`, and `sidecar`:
 
 ```bash
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
