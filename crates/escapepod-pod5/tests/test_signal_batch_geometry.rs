@@ -144,7 +144,7 @@ fn index_records_geometry_and_reader_agrees_with_an_unindexed_one() {
     assert_eq!(
         meta.signal_batch_rows.as_deref(),
         Some(truth.as_slice()),
-        "`escpod index` must record the geometry it walked"
+        "`escpod sidecar index` must record the geometry it walked"
     );
 
     // The cached path must produce exactly the same footer.
@@ -203,10 +203,10 @@ fn annotate_a_few(path: &std::path::Path, ids: &[Uuid], label: &str) {
 #[test]
 fn annotating_a_file_with_no_sidecar_records_the_geometry() {
     // The workflow that actually produces sidecars in the wild:
-    // `demux --annotate` / `escpod annotate -a`, on a file nobody indexed.
+    // `demux --annotate` / `escpod sidecar annotate -a`, on a file nobody indexed.
     // Before this was wired up, the sidecar such a run created had a read
     // index and no geometry, so every later open re-walked the batch headers
-    // — and the obvious remedy, `escpod index`, skipped the file as "already
+    // — and the obvious remedy, `escpod sidecar index`, skipped the file as "already
     // indexed".
     let (_tmp, path, ids) = fixture();
     let truth = Reader::open(&path).unwrap().signal_batch_row_counts();
@@ -293,7 +293,7 @@ fn a_sidecar_written_without_geometry_is_backfilled_by_the_next_write() {
 fn index_then_demux_reuses_the_geometry_and_keeps_it() {
     use escapepod_pod5::operations::read_annotation;
 
-    // The sequence the whole design is for: pre-warm with `escpod index`, then
+    // The sequence the whole design is for: pre-warm with `escpod sidecar index`, then
     // run the pipeline. The geometry must be reused (not re-measured into
     // something different) and must survive the annotation write, while the
     // annotation lands.
@@ -461,7 +461,7 @@ fn a_geometry_bound_to_another_pod5_is_never_used() {
 }
 
 // ---------------------------------------------------------------------------
-// Completing a sidecar in place — what the ungated `escpod index` does to the
+// Completing a sidecar in place — what the ungated `escpod sidecar index` does to the
 // sidecar every pre-geometry `demux --annotate` left behind.
 // ---------------------------------------------------------------------------
 

@@ -93,7 +93,7 @@ escpod filter -i reference_ids.txt -o matching.pod5 experiment.pod5
 
 ### Filter by Sidecar Annotation
 
-With demux assignments recorded in the `.p5s` sidecar (`escpod annotate` or
+With demux assignments recorded in the `.p5s` sidecar (`escpod sidecar annotate` or
 `escpod demux --annotate`), materialize one group on demand — no ID lists,
 no full split:
 

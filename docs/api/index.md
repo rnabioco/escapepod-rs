@@ -56,7 +56,7 @@ The bundle carries the whole feature recipe — feature order and offsets, the k
 
 ### escapepod-cli
 
-The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `index`, `annotate`, the `demux` tree, and `classify`. `annotate` ships with them; `repack` and `resquiggle` live behind the `experimental` feature — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `sidecar` (`index` and `annotate`), the `demux` tree, and `classify`. `sidecar` ships with them; `repack` and `resquiggle` live behind the `experimental` feature — see below.
 
 ## Quick Reference
 

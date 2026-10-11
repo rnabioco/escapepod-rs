@@ -1,4 +1,8 @@
 //! Build the read-index columns of `.p5s` sidecars for fast read lookup.
+//!
+//! Reached as `escpod sidecar index`; the top-level `escpod index` is a hidden,
+//! deprecated forwarder that parses the same [`IndexArgs`] (see
+//! [`crate::commands::sidecar`]).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,6 +16,44 @@ use crate::style;
 use crate::util::collect_pod5_inputs;
 use escapepod_signal::pod5::sidecar::sidecar_path;
 
+/// Parsed `escpod sidecar index` arguments.
+///
+/// The one definition behind both spellings: `escpod sidecar index` and the
+/// hidden `escpod index` nest this same struct, so the two cannot drift apart.
+#[derive(clap::Args)]
+#[command(after_help = "\
+Both caches are rebuildable from the POD5, which is never modified. The read
+index gives O(log n) lookup by read ID; the signal batch geometry saves a
+scattered read of every signal batch header, which is paid on every process
+start otherwise and grows with the file.
+
+Worth running once on a networked node before submitting jobs against a large
+file — the same reason `escpod demux models fetch` exists.
+
+Examples:
+  escpod sidecar index input.pod5           Index one file
+  escpod sidecar index *.pod5               Index all POD5 files
+  escpod sidecar index data_dir/            Index directory recursively
+  escpod sidecar index input.pod5 --force   Rebuild an existing sidecar
+
+A sidecar that already holds both caches is skipped; one missing either (e.g.
+written by `demux --annotate`, which records the index but not the geometry) is
+completed in place, preserving annotations and scores.
+")]
+pub struct IndexArgs {
+    /// Input POD5 file(s) or directory
+    #[arg(required = true, value_name = "FILES")]
+    pub inputs: Vec<PathBuf>,
+
+    /// Rebuild existing .p5s sidecars (annotations are preserved)
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
+}
+
 /// Build the `.p5s` read index for one or more POD5 files.
 ///
 /// The index maps each read UUID to its location in the reads table,
@@ -20,7 +62,15 @@ use escapepod_signal::pod5::sidecar::sidecar_path;
 /// written next to the POD5 file by appending `.p5s` to the full
 /// filename (e.g. `reads.pod5` → `reads.pod5.p5s`); annotations already
 /// in the sidecar are preserved.
-pub fn run(inputs: Vec<PathBuf>, force: bool) -> anyhow::Result<()> {
+///
+/// `args.threads` is not read here: `main` sizes the rayon pool from it before
+/// dispatch (see `crate::requested_threads`).
+pub fn run(args: IndexArgs) -> anyhow::Result<()> {
+    let IndexArgs {
+        inputs,
+        force,
+        threads: _,
+    } = args;
     let files = collect_pod5_inputs(&inputs)?;
 
     let total = files.len();
@@ -45,8 +95,8 @@ pub fn run(inputs: Vec<PathBuf>, force: bool) -> anyhow::Result<()> {
             // the signal batch geometry. Asking merely "does a sidecar load?"
             // was right when the index was all there was, and became wrong the
             // moment the geometry joined it: a sidecar created by
-            // `demux --annotate` or `escpod annotate` has an index and no
-            // geometry, so the obvious remedy — run `escpod index` — would
+            // `demux --annotate` or `escpod sidecar annotate` has an index and no
+            // geometry, so the obvious remedy — run `escpod sidecar index` — would
             // report "already indexed" and do nothing, leaving every later open
             // to re-walk the batch headers.
             //

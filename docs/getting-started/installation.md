@@ -77,7 +77,7 @@ sudo cp target/release/escpod /usr/local/bin/
 ### Optional features
 
 The default build ships the stable CLI surface (summary, view, inspect,
-merge, filter, bam-filter, subset, `index`) **plus the full demux tree** —
+merge, filter, bam-filter, subset, `sidecar`) **plus the full demux tree** —
 fused `demux`, `detect`, `fingerprint`, `classify`, `basecall`, `split`,
 `models`, `train` — with CNN adapter detection, CRF basecalling, and model
 fetching included, **and `classify`**, the read-level model runner
@@ -91,7 +91,7 @@ live behind Cargo features:
 | `gpu` | every GPU path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify; selected at run time with `--device` (default `auto`), CUDA libraries at run time only |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 
-`escpod index` and `escpod annotate` — the commands that write the `.p5s`
+`escpod sidecar index` and `escpod sidecar annotate` — the commands that write the `.p5s`
 sidecar — are in the default build, as is everything that *consumes* one
 (`demux --annotate`, `demux split --sidecar`, `filter --annotation`, `view`,
 `inspect`).

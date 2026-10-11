@@ -32,7 +32,7 @@ pub struct SplitArgs {
     pub classifications: Option<PathBuf>,
 
     /// Read assignments from each input's .p5s sidecar (written by
-    /// `escpod annotate`) instead of a classifications CSV
+    /// `escpod sidecar annotate`) instead of a classifications CSV
     #[arg(long)]
     pub sidecar: bool,
 

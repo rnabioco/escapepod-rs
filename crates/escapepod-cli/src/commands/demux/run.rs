@@ -65,7 +65,7 @@ pub struct RunArgs {
     ///
     /// With more than one model each must be given as `NAME=PATH`, and `NAME`
     /// becomes that axis's sidecar annotation column — which is what
-    /// `escpod annotate --design` keys a multi-column samplesheet on
+    /// `escpod sidecar annotate --design` keys a multi-column samplesheet on
     /// (`ldx,fdx -> condition,replicate`). The name is deliberately yours and
     /// not the bundle's: it names the axis in *your* experimental design, and
     /// the same model can serve different axes in different runs.
@@ -207,7 +207,7 @@ pub struct RunArgs {
     pub output_dir: Option<PathBuf>,
 
     /// Record each read's barcode assignment in the input's .p5s sidecar
-    /// (`escpod annotate` format). With no -d/--output-dir this is the only
+    /// (`escpod sidecar annotate` format). With no -d/--output-dir this is the only
     /// output: demux without duplicating the POD5, split on demand later
     /// with `demux split --sidecar`
     #[arg(long)]
@@ -1188,7 +1188,7 @@ fn resolve_head_names(specs: &[ModelSpec]) -> anyhow::Result<Vec<String>> {
             (None, _) => anyhow::bail!(
                 "--model {} needs a name when several models are given: write it as \
                  NAME=PATH (e.g. `--model ldx={}`). NAME becomes the sidecar column this \
-                 axis is recorded in, and `escpod annotate --design` keys a samplesheet \
+                 axis is recorded in, and `escpod sidecar annotate --design` keys a samplesheet \
                  on those column names.",
                 spec.path.display(),
                 spec.path.display(),

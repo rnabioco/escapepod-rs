@@ -806,7 +806,7 @@ class TestIndex:
 
 
 class TestSidecarAnnotations:
-    """Reading .p5s sidecar annotations (written by `escpod annotate`).
+    """Reading .p5s sidecar annotations (written by `escpod sidecar annotate`).
 
     Python only reads annotations, so without an escpod-written sidecar these
     exercise the no-sidecar / index-only behavior: empty listings, clear

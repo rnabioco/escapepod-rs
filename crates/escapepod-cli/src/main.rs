@@ -508,176 +508,41 @@ a wrong answer rather than an error.
         args: Vec<String>,
     },
 
-    /// Build the .p5s caches — read index and signal batch geometry — for fast
-    /// read lookup and fast signal access
+    /// Write the .p5s sidecar: build the read index, record per-read annotations
     #[command(after_help = "\
-Both caches are rebuildable from the POD5, which is never modified. The read
-index gives O(log n) lookup by read ID; the signal batch geometry saves a
-scattered read of every signal batch header, which is paid on every process
-start otherwise and grows with the file.
-
-Worth running once on a networked node before submitting jobs against a large
-file — the same reason `escpod demux models fetch` exists.
+Both commands write the .p5s sidecar beside each POD5 file; the POD5 itself is
+never written. `annotate` records per-read labels (a demux CSV, another tool's
+read-to-label table, an experimental design) and builds the read index when the
+sidecar does not have one yet. `index` is the labels-free form: it builds the
+read index and the signal batch geometry and nothing else. Each preserves what
+the other wrote.
 
 Examples:
-  escpod index input.pod5                   Index one file
-  escpod index *.pod5                       Index all POD5 files
-  escpod index data_dir/                    Index directory recursively
-  escpod index input.pod5 --force           Rebuild an existing sidecar
-
-A sidecar that already holds both caches is skipped; one missing either (e.g.
-written by `demux --annotate`, which records the index but not the geometry) is
-completed in place, preserving annotations and scores.
+  escpod sidecar index data_dir/
+  escpod sidecar annotate -a demux.csv data_dir/
+  escpod sidecar annotate data_dir/ --from-table calls.csv.gz --column barcode=predicted_barcode
 ")]
-    Index {
-        /// Input POD5 file(s) or directory
-        #[arg(required = true, value_name = "FILES")]
-        inputs: Vec<PathBuf>,
-
-        /// Rebuild existing .p5s sidecars (annotations are preserved)
-        #[arg(short, long)]
-        force: bool,
-
-        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
-        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
-        threads: Option<usize>,
+    Sidecar {
+        #[command(subcommand)]
+        command: commands::sidecar::SidecarCommand,
     },
 
-    /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar
-    #[command(after_help = "\
-Writes a read → label mapping into the .p5s sidecar next to each POD5 file.
-The POD5 itself is never modified. The sidecar is a plain Arrow IPC table
-(read_id, batch_idx, row_idx, plus one dictionary column per annotation) —
-readable directly with pyarrow/polars — and is bound to its POD5 by file
-identifier + size, so a stale or misplaced sidecar fails loudly. Existing
-sidecar contents (the read index, other annotations) are preserved.
+    /// Deprecated alias for `escpod sidecar index`.
+    //
+    // Hidden rather than removed: `index` is the spelling every release so far
+    // has shipped, so existing pipeline scripts still name it. It warns and
+    // forwards. (Plain comments, not doc comments: a second doc paragraph would
+    // become the long `--help`.)
+    #[command(hide = true)]
+    Index(commands::index::IndexArgs),
 
-Examples:
-  escpod annotate -a demux.csv input.pod5        Annotate with demux assignments
-  escpod annotate -a demux.csv data_dir/         Annotate a directory recursively
-  escpod annotate -a samples.csv --name sample input.pod5
-  escpod annotate data_dir/ --from-table calls.csv.gz --column barcode=predicted_barcode
-                                                 Label reads from another tool's
-                                                 read-to-label table (CSV/TSV, gzip ok)
-  escpod annotate --design samplesheet.csv input.pod5
-                                                 Map barcode (combinations) to
-                                                 experimental conditions
-")]
-    #[command(group(
-        clap::ArgGroup::new("action")
-            .required(true)
-            .args([
-                "assignments",
-                "design",
-                "from_table",
-                "list",
-                "remove",
-                "remove_design"
-            ])
-    ))]
-    Annotate {
-        /// Input POD5 file(s) or directory
-        #[arg(required = true, value_name = "FILES")]
-        inputs: Vec<PathBuf>,
-
-        /// CSV mapping reads to labels (read_id + barcode/predicted_barcode
-        /// columns — the output of `demux classify` or `demux basecall --barcodes`)
-        #[arg(short = 'a', long, value_name = "CSV")]
-        assignments: Option<PathBuf>,
-
-        /// Table mapping reads to labels, from another tool (CSV or TSV, one
-        /// header row; gzip is detected). Needs --column. Reads the table does
-        /// not label get --unassigned-label. Repeat for the shards of one run
-        #[arg(
-            long,
-            value_name = "TABLE",
-            num_args = 1..,
-            action = clap::ArgAction::Append,
-            requires = "columns",
-            conflicts_with_all = ["assignments", "name"]
-        )]
-        from_table: Vec<PathBuf>,
-
-        /// With --from-table: the table's read-id column (default: read_id; a
-        /// leading '#' in the header, as WarpDemuX writes, is ignored)
-        #[arg(
-            long,
-            value_name = "COL",
-            requires = "from_table",
-            conflicts_with_all = TABLE_ONLY_CONFLICTS
-        )]
-        id_column: Option<String>,
-
-        /// With --from-table: write sidecar column NAME from table column COL,
-        /// verbatim (e.g. barcode=predicted_barcode). Repeat for several
-        #[arg(
-            long = "column",
-            value_name = "NAME=COL",
-            requires = "from_table",
-            conflicts_with_all = TABLE_ONLY_CONFLICTS,
-            action = clap::ArgAction::Append,
-            value_parser = commands::annotate::parse_column_spec
-        )]
-        columns: Vec<(String, String)>,
-
-        /// With --from-table: label for reads the table does not label (absent
-        /// from it, or an empty cell) [default: unclassified]. Pass '' to leave
-        /// them unlabelled
-        #[arg(
-            long,
-            value_name = "LABEL",
-            requires = "from_table",
-            conflicts_with_all = TABLE_ONLY_CONFLICTS
-        )]
-        unassigned_label: Option<String>,
-
-        /// Experimental-design CSV: one column per key annotation (e.g.
-        /// `barcode`, or `ldx,edx` for combinations) plus one column per
-        /// experimental variable (e.g. `condition`). Stored in the sidecar
-        /// and materialized as derived per-read columns
-        #[arg(long, value_name = "CSV")]
-        design: Option<PathBuf>,
-
-        /// With --design: which CSV columns are the keys (default: every
-        /// column whose name matches an existing annotation)
-        #[arg(long, value_name = "COLS", requires = "design", value_delimiter = ',')]
-        keys: Option<Vec<String>>,
-
-        /// Annotation name (the sidecar column to write, with -a; --from-table
-        /// names its columns with --column instead)
-        #[arg(long, default_value = escapepod_signal::pod5::sidecar::DEFAULT_ANNOTATION_NAME)]
-        name: String,
-
-        /// List each file's sidecar contents (index, annotations, design)
-        #[arg(long)]
-        list: bool,
-
-        /// Remove an annotation by name (design columns are refused —
-        /// remove or update the design instead)
-        #[arg(long, value_name = "NAME")]
-        remove: Option<String>,
-
-        /// Remove the experimental design and its derived columns
-        #[arg(long)]
-        remove_design: bool,
-
-        /// Replace a sidecar bound to a different POD5 instead of erroring
-        #[arg(long)]
-        force: bool,
-
-        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
-        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
-        threads: Option<usize>,
-    },
+    /// Deprecated alias for `escpod sidecar annotate`.
+    //
+    // Hidden rather than removed, for the same reason as `index`: it warns and
+    // forwards.
+    #[command(hide = true)]
+    Annotate(commands::annotate::AnnotateArgs),
 }
-
-/// The other `annotate` actions, for the options that only mean something with
-/// `--from-table`. `requires` alone is not enough: clap does not report a
-/// required argument as missing when it conflicts with one that was given, so
-/// `-a x.csv --column barcode=y` would otherwise parse and quietly ignore
-/// `--column`.
-const TABLE_ONLY_CONFLICTS: [&str; 5] =
-    ["assignments", "design", "list", "remove", "remove_design"];
 
 /// The `-t/--threads` value the user asked for, whichever command they ran.
 ///
@@ -696,15 +561,17 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         | Commands::Subset { threads, .. }
         | Commands::BamFilter { threads, .. } => *threads,
 
-        Commands::Index { threads, .. } => *threads,
+        Commands::Sidecar { command } => commands::sidecar::requested_threads(command),
+        // The deprecated top-level spellings parse the same args as `sidecar
+        // index|annotate`, so they must reach the pool sizing the same way.
+        Commands::Index(args) => args.threads,
+        Commands::Annotate(args) => args.threads,
 
         Commands::Summary(args) => args.threads,
         Commands::Inspect {
             command: InspectCommands::Summary { threads, .. },
         } => *threads,
         Commands::Inspect { .. } => None,
-
-        Commands::Annotate { threads, .. } => *threads,
 
         // Like `demux`, resquiggle flattens its run args under a subcommand.
         #[cfg(feature = "experimental")]
@@ -999,42 +866,11 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "experimental"))]
         Commands::Resquiggle { .. } => feature_disabled("resquiggle", "experimental"),
 
-        Commands::Index {
-            inputs,
-            force,
-            threads: _,
-        } => commands::index::run(inputs, force),
+        Commands::Sidecar { command } => commands::sidecar::run(command),
 
-        Commands::Annotate {
-            inputs,
-            assignments,
-            design,
-            keys,
-            name,
-            list,
-            remove,
-            remove_design,
-            from_table,
-            id_column,
-            columns,
-            unassigned_label,
-            force,
-            threads: _,
-        } => commands::annotate::run(commands::annotate::AnnotateCmd {
-            inputs,
-            assignments,
-            design,
-            keys,
-            name,
-            list,
-            remove,
-            remove_design,
-            from_table,
-            id_column,
-            columns,
-            unassigned_label,
-            force,
-        }),
+        // Deprecated aliases; each warns, then forwards to the real command.
+        Commands::Index(args) => commands::sidecar::run_legacy_index(args),
+        Commands::Annotate(args) => commands::sidecar::run_legacy_annotate(args),
     }
 }
 
@@ -1216,35 +1052,56 @@ mod tests {
         }
     }
 
-    /// `annotate` ships in the default build, so its `-t` must reach the pool
-    /// sizing in every build — it used to be a stub there (#486).
+    /// `sidecar index` / `sidecar annotate` and their hidden top-level
+    /// spellings parse the same args, so each must reach the pool sizing.
+    /// `annotate` ships in the default build, so its `-t` must reach it in
+    /// every build (it used to be a stub there, #486), and a deprecated path
+    /// that silently loses `-j` is the #155 bug wearing a different hat.
     #[test]
-    fn annotate_threads_reach_main() {
-        assert_eq!(
-            threads_for(&["escpod", "index", "in.pod5", "-t", "4"]),
-            Some(4)
-        );
-        for flag in ["-t", "-j", "--threads"] {
+    fn sidecar_commands_and_their_aliases_forward_threads() {
+        for index in [&["escpod", "sidecar", "index"][..], &["escpod", "index"]] {
             assert_eq!(
-                threads_for(&["escpod", "annotate", "--list", "in.pod5", flag, "3"]),
-                Some(3),
-                "annotate dropped {flag}"
+                threads_for(&[index, &["in.pod5", "-t", "4"]].concat()),
+                Some(4),
+                "{index:?} dropped -t"
+            );
+            assert_eq!(threads_for(&[index, &["in.pod5"]].concat()), None);
+        }
+        for annotate in [
+            &["escpod", "sidecar", "annotate"][..],
+            &["escpod", "annotate"],
+        ] {
+            for flag in ["-t", "-j", "--threads"] {
+                assert_eq!(
+                    threads_for(&[annotate, &["--list", "in.pod5", flag, "3"]].concat()),
+                    Some(3),
+                    "{annotate:?} dropped {flag}"
+                );
+            }
+            assert_eq!(
+                threads_for(&[annotate, &["--list", "in.pod5"]].concat()),
+                None
             );
         }
-        assert_eq!(
-            threads_for(&["escpod", "annotate", "--list", "in.pod5"]),
-            None
-        );
     }
 
     /// `--from-table` joins the `action` group, needs a column to read, and
     /// excludes `-a` — including past `--name`'s default, which must not count
-    /// as the user having asked for it.
+    /// as the user having asked for it. Run against `sidecar annotate` and the
+    /// hidden `annotate` it replaces: they share one args struct, and this is
+    /// what keeps it that way.
     #[test]
-    fn from_table_flag_combinations_parse() {
-        let parse = |extra: &[&str]| {
-            Cli::try_parse_from([&["escpod", "annotate", "pod5/"][..], extra].concat())
-        };
+    fn sidecar_flag_combinations_parse() {
+        for prefix in [
+            &["escpod", "sidecar", "annotate"][..],
+            &["escpod", "annotate"],
+        ] {
+            from_table_flag_combinations(prefix);
+        }
+    }
+
+    fn from_table_flag_combinations(prefix: &[&str]) {
+        let parse = |extra: &[&str]| Cli::try_parse_from([prefix, &["pod5/"][..], extra].concat());
         let ok = |extra: &[&str]| {
             parse(extra).unwrap_or_else(|e| panic!("{extra:?} should parse: {e}"));
         };

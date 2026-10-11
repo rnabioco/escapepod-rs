@@ -191,7 +191,7 @@ fn warn_unindexed(paths: &[&Path]) {
 }
 
 /// The wording of [`warn_unindexed`], split out so a test can hold it to the
-/// two things it must always carry: the remedy (`escpod index`) and the file
+/// two things it must always carry: the remedy (`escpod sidecar index`) and the file
 /// to run it on. `None` when every input is already indexed.
 fn unindexed_hint(paths: &[&Path]) -> Option<String> {
     const SHOWN: usize = 3;
@@ -200,7 +200,7 @@ fn unindexed_hint(paths: &[&Path]) -> Option<String> {
         let p = first.display();
         return Some(format!(
             "no `.p5s` read index for {p} — building one in memory for this run, and \
-             every later run over it will build it again. `escpod index {p}` writes it \
+             every later run over it will build it again. `escpod sidecar index {p}` writes it \
              once, beside the POD5."
         ));
     }
@@ -215,7 +215,7 @@ fn unindexed_hint(paths: &[&Path]) -> Option<String> {
     Some(format!(
         "no `.p5s` read index for {} of this run's POD5 inputs ({}) — building them in \
          memory for this run, and every later run over them will build them again. \
-         `escpod index` on those files writes them once, beside each POD5.",
+         `escpod sidecar index` on those files writes them once, beside each POD5.",
         paths.len(),
         listed.join(", "),
     ))
@@ -718,7 +718,10 @@ mod tests {
         assert!(unindexed_hint(&[]).is_none());
 
         let one = unindexed_hint(&[Path::new("/data/run/reads.pod5")]).unwrap();
-        assert!(one.contains("escpod index /data/run/reads.pod5"), "{one}");
+        assert!(
+            one.contains("escpod sidecar index /data/run/reads.pod5"),
+            "{one}"
+        );
         assert!(one.contains(".p5s"), "{one}");
 
         let paths: Vec<PathBuf> = (0..5)
@@ -726,7 +729,7 @@ mod tests {
             .collect();
         let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
         let many = unindexed_hint(&refs).unwrap();
-        assert!(many.contains("escpod index"), "{many}");
+        assert!(many.contains("escpod sidecar index"), "{many}");
         assert!(many.contains("5 of this run's POD5 inputs"), "{many}");
         assert!(many.contains("f0.pod5"), "{many}");
         // Listed, then truncated — a directory of hundreds must not print one

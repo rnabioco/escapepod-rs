@@ -11,14 +11,14 @@ output formats may change between releases. All of them live behind the
 | [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP |
 | [repack](repack.md) | Re-pack POD5 files with current compression settings |
 
-`demux`, `classify`, `index` and `annotate` ship in the default build and are
+`demux`, `classify` and `sidecar` (`index`, `annotate`) ship in the default build and are
 documented in the [CLI Reference](../cli/index.md).
 
 ## The `.p5s` sidecar
 
 `reads.pod5` gets one companion file, `reads.pod5.p5s`, holding any
-combination of a read index (`escpod index`) and named per-read annotations
-(`escpod annotate`). The POD5 itself is **never modified** — raw sequencer
+combination of a read index (`escpod sidecar index`) and named per-read annotations
+(`escpod sidecar annotate`). The POD5 itself is **never modified** — raw sequencer
 output stays byte-identical and checksummable; deleting an annotation is
 editing or deleting the sidecar.
 
@@ -32,8 +32,8 @@ table = ipc.open_file("reads.pod5.p5s").read_all()
 It is bound to its POD5 by file identifier and size, so a stale sidecar or
 one copied next to the wrong file fails loudly — and says what it *was* built
 from, which is the thing you want to know at that moment. Reading it directly
-with pyarrow, as above, skips that check: a direct reader owns it. `index`
-preserves annotations, and `annotate` preserves the index and other
+with pyarrow, as above, skips that check: a direct reader owns it. `sidecar index`
+preserves annotations, and `sidecar annotate` preserves the index and other
 annotations — each command touches only its own columns. Format details:
 [The `.p5s` Sidecar](../format/sidecar.md).
 
@@ -51,16 +51,16 @@ escpod filter reads.pod5 --annotation barcode=nbc05 -o nbc05.pod5   # one group
 
 `--annotate` combines with `-d` (write split files AND the sidecar) and with
 `--classifications` (also keep the CSV). The stepwise route still works:
-`escpod annotate -a demux.csv reads.pod5` records an existing classifications
+`escpod sidecar annotate -a demux.csv reads.pod5` records an existing classifications
 CSV into the sidecar.
 
 Working with annotations:
 
 ```bash
 escpod inspect summary reads.pod5        # shows the sidecar: index, annotations, design
-escpod annotate --list reads.pod5        # per-annotation labels + read counts
-escpod annotate --remove sample reads.pod5
-escpod annotate --remove-design reads.pod5   # drops the design + derived columns
+escpod sidecar annotate --list reads.pod5        # per-annotation labels + read counts
+escpod sidecar annotate --remove sample reads.pod5
+escpod sidecar annotate --remove-design reads.pod5   # drops the design + derived columns
 escpod view reads.pod5 --include read_id,barcode,condition   # join columns into TSV
 escpod filter reads.pod5 --annotation condition=fresh --annotation replicate=r1 -o out.pod5
 ```
@@ -77,7 +77,7 @@ cat samplesheet.csv
 # barcode,condition,replicate
 # nbc01,fresh_edx01,r1
 # …
-escpod annotate --design samplesheet.csv reads.pod5
+escpod sidecar annotate --design samplesheet.csv reads.pod5
 escpod demux split reads.pod5 --sidecar --annotation condition -d by_condition/
 ```
 
@@ -86,17 +86,17 @@ Each design variable becomes an ordinary per-read column (`condition`,
 `reader.annotation("condition")` all work with no join logic. Rewriting a
 key annotation (say, re-demuxing `barcode`) automatically re-derives the
 dependent columns, and writing a derived column directly is refused — the
-design stays the source of truth. See [annotate](../cli/annotate.md) for the full
+design stays the source of truth. See [sidecar annotate](../cli/sidecar-annotate.md) for the full
 command reference.
 
 Everything about the sidecar works in the default build:
-[`escpod index`](../cli/index-command.md), [`escpod annotate`](../cli/annotate.md),
+[`escpod sidecar index`](../cli/sidecar-index.md), [`escpod sidecar annotate`](../cli/sidecar-annotate.md),
 [`demux --annotate`](../cli/demux.md#sidecar-output), and everything that
 *consumes* one — `demux split --sidecar`, `filter --annotation`, `view`,
 `inspect summary`.
 
 This format replaces the earlier `.p5i` index sidecar; delete any `.p5i`
-files and rerun `escpod index`.
+files and rerun `escpod sidecar index`.
 
 ## Building
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! `escpod annotate --from-table` (#486): label reads in the `.p5s` sidecar
+//! `escpod sidecar annotate --from-table` (#486): label reads in the `.p5s` sidecar
 //! from another tool's read-to-label table.
 //!
 //! These run the real binary, because what matters is what lands in the
@@ -120,6 +120,7 @@ fn viewed(file: &Path, column: &str) -> BTreeMap<String, String> {
 
 fn annotate_table(input: &Path, table: &Path, extra: &[&str]) {
     let mut args = vec![
+        "sidecar",
         "annotate",
         s(input),
         "--from-table",
@@ -265,7 +266,7 @@ fn from_table_on_a_directory_writes_one_collection_sidecar() {
     // Reading goes through the POD5, and finds the collection.
     assert_eq!(viewed(&pod5(&ws), "barcode"), expected(&ids));
 
-    let out = assert_ok(&["annotate", "--list", ws.dir()]);
+    let out = assert_ok(&["sidecar", "annotate", "--list", ws.dir()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("covered by") && !stdout.contains("no sidecar"),
@@ -288,6 +289,7 @@ fn from_table_replaces_the_named_column_and_keeps_the_rest() {
         .join("\n");
     std::fs::write(&samples, text + "\n").unwrap();
     assert_ok(&[
+        "sidecar",
         "annotate",
         s(&pod5(&ws)),
         "-a",
@@ -317,7 +319,7 @@ fn from_table_replaces_the_named_column_and_keeps_the_rest() {
         "the other column did not survive: {samples:?}"
     );
 
-    let out = assert_ok(&["annotate", "--list", s(&pod5(&ws))]);
+    let out = assert_ok(&["sidecar", "annotate", "--list", s(&pod5(&ws))]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("20 reads indexed")
@@ -348,6 +350,7 @@ fn a_table_for_another_run_is_refused_before_anything_is_written() {
 
     // Nothing exists yet: refusing must not leave a sidecar behind either.
     let out = run(&[
+        "sidecar",
         "annotate",
         s(&pod5(&ws)),
         "--from-table",
@@ -363,6 +366,7 @@ fn a_table_for_another_run_is_refused_before_anything_is_written() {
     );
     assert!(!per_file_sidecar(&ws).exists(), "a sidecar was written");
     let out = run(&[
+        "sidecar",
         "annotate",
         ws.dir(),
         "--from-table",
@@ -381,6 +385,7 @@ fn a_table_for_another_run_is_refused_before_anything_is_written() {
     annotate_table(&pod5(&ws), &table, &[]);
     let before = std::fs::read(per_file_sidecar(&ws)).unwrap();
     let out = run(&[
+        "sidecar",
         "annotate",
         s(&pod5(&ws)),
         "--from-table",
@@ -404,7 +409,7 @@ fn a_table_for_another_run_is_refused_before_anything_is_written() {
         "read_id,barcode\n00000000-0000-4000-8000-000000000001,BC01\n",
     )
     .unwrap();
-    let out = run(&["annotate", s(&pod5(&ws)), "-a", s(&wrong_csv)]);
+    let out = run(&["sidecar", "annotate", s(&pod5(&ws)), "-a", s(&wrong_csv)]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "wrong CSV accepted:\n{stderr}");
     assert!(stderr.contains("Nothing was written"), "{stderr}");
@@ -435,8 +440,9 @@ fn from_table_without_fill_matches_dash_a() {
     let table = table_ws.out("assign.csv");
     std::fs::write(&table, format!("read_id,barcode\n{}\n", rows.join("\n"))).unwrap();
 
-    assert_ok(&["annotate", s(&pod5(&csv_ws)), "-a", s(&csv)]);
+    assert_ok(&["sidecar", "annotate", s(&pod5(&csv_ws)), "-a", s(&csv)]);
     assert_ok(&[
+        "sidecar",
         "annotate",
         s(&pod5(&table_ws)),
         "--from-table",

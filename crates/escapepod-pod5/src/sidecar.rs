@@ -118,7 +118,7 @@ pub const P5S_WRITER_KEY: &str = "escapepod:writer";
 /// measured 15-24 ms *each* cold, 27-39% of a cold scattered fetch and a flat
 /// ~5 s per process on a 33 GB file with 8866 batches. It is also pure
 /// function of a file that never changes, so paying for it more than once is
-/// waste. `escpod index` walks it once and records the answer here.
+/// waste. `escpod sidecar index` walks it once and records the answer here.
 ///
 /// Two things it deliberately is **not**:
 ///
@@ -237,7 +237,7 @@ impl SidecarProvenance {
 /// Sidecar format version for a file whose annotations are all label columns.
 ///
 /// Still what gets written whenever no numeric column is present, which is
-/// every sidecar `escpod annotate` produces and every demux run without
+/// every sidecar `escpod sidecar annotate` produces and every demux run without
 /// `--ref-scores`. See [`P5S_VERSION_SCORES`] for why the bump is gated on
 /// content rather than applied to every write.
 pub const P5S_VERSION: &str = "1";
@@ -270,12 +270,12 @@ pub const P5S_VERSION_COLLECTION: &str = "3";
 /// so the two readers can tell each other's files apart and say so, rather
 /// than failing on a missing column further in.
 pub const P5S_MEMBERS_KEY: &str = "escapepod:members";
-/// Default annotation column name (what `escpod annotate` writes).
+/// Default annotation column name (what `escpod sidecar annotate` writes).
 pub const DEFAULT_ANNOTATION_NAME: &str = "barcode";
 
 /// The label for a read no demultiplexer assigned to a barcode: what `demux
 /// --annotate` and `demux split` write and read for one, and what
-/// `escpod annotate --from-table` gives a read its table does not label.
+/// `escpod sidecar annotate --from-table` gives a read its table does not label.
 ///
 /// One constant so the spellings cannot drift apart — a column that says
 /// `unclassified` in one command and `unassigned` in another splits one group
@@ -611,7 +611,7 @@ pub struct Sidecar {
     /// Unlike [`Self::provenance`] this **is** carried through a
     /// read-modify-write: it describes the POD5, which identity binding
     /// already proves has not changed, so an `annotate` that does not look at
-    /// the signal table has no reason to discard it. Only `escpod index`
+    /// the signal table has no reason to discard it. Only `escpod sidecar index`
     /// re-measures it.
     signal_batch_rows: Option<Vec<u64>>,
 }
@@ -886,7 +886,7 @@ fn check_version(metadata: &Metadata, p5s_path: &Path) -> Result<()> {
     if metadata.contains_key(P5S_MEMBERS_KEY) {
         return Err(Error::Parse(format!(
             "{} is a collection sidecar covering a directory of POD5 files, \
-             not a per-file sidecar; read it with `escpod annotate --list <dir>`",
+             not a per-file sidecar; read it with `escpod sidecar annotate --list <dir>`",
             p5s_path.display()
         )));
     }
@@ -938,7 +938,7 @@ fn check_identity(
             .unwrap_or_default();
         return Err(Error::Parse(format!(
             "{} does not match this POD5 file (stale or copied from another){}; \
-             rebuild with `escpod index` / `escpod annotate`",
+             rebuild with `escpod sidecar index` / `escpod sidecar annotate`",
             p5s_path.display(),
             origin
         )));
@@ -1030,7 +1030,7 @@ pub fn read_sidecar_file(
     let reader = ArrowFileReader::try_new(file, None).map_err(|e| {
         Error::Parse(format!(
             "{} is not a readable .p5s sidecar (legacy .p5i or corrupt?): {e}; \
-             delete it and rebuild with `escpod index` / `escpod annotate`",
+             delete it and rebuild with `escpod sidecar index` / `escpod sidecar annotate`",
             p5s_path.display()
         ))
     })?;
@@ -1200,7 +1200,7 @@ pub fn read_sidecar_metadata(
     let reader = ArrowFileReader::try_new(file, None).map_err(|e| {
         Error::Parse(format!(
             "{} is not a readable .p5s sidecar (legacy .p5i or corrupt?): {e}; \
-             delete it and rebuild with `escpod index` / `escpod annotate`",
+             delete it and rebuild with `escpod sidecar index` / `escpod sidecar annotate`",
             p5s_path.display()
         ))
     })?;
@@ -1209,7 +1209,7 @@ pub fn read_sidecar_metadata(
 
     // The same version gate `read_sidecar_file` applies, and it must stay the
     // same. A caller that checks cheaply here and then rewrites the sidecar —
-    // `escpod index` completing a missing cache — would otherwise be told the
+    // `escpod sidecar index` completing a missing cache — would otherwise be told the
     // file is fine, and only discover on the rewrite that it cannot be loaded,
     // by which point the rewrite has already replaced annotations that took
     // hours to compute. The two readers agreeing about "is this loadable" is
@@ -1377,7 +1377,7 @@ pub fn write_sidecar_file_checked(
 /// The atomic write makes a sidecar update all-or-nothing, which prevents a
 /// *torn* file — but says nothing about a **lost update**. The realistic case
 /// is not corruption, it is two writers: a `demux --annotate` run that takes
-/// hours is still going when someone runs `escpod index` on the same file to
+/// hours is still going when someone runs `escpod sidecar index` on the same file to
 /// speed it up. Index reads the sidecar as it is now, demux finishes and
 /// writes its barcodes, index finishes and renames over them. Nothing errors,
 /// nothing is corrupt, and hours of classification are gone.
@@ -1415,7 +1415,7 @@ impl SidecarStamp {
         }
         Err(Error::Parse(format!(
             "{} changed while it was being updated — another process (a demux \
-             run finishing, or a concurrent `escpod index`) wrote it in the \
+             run finishing, or a concurrent `escpod sidecar index`) wrote it in the \
              meantime. Refusing to overwrite, because that write may hold \
              annotations or scores that exist nowhere else. Re-run this \
              command.",
@@ -1590,7 +1590,7 @@ struct MemberJson {
 ///
 /// Two things a collection deliberately does not carry:
 ///
-/// * an experimental design — `escpod annotate --design` targets member
+/// * an experimental design — `escpod sidecar annotate --design` targets member
 ///   sidecars, where the derived columns it materialises belong;
 /// * a signal batch geometry — that is a property of one POD5's signal table,
 ///   and belongs in that file's own sidecar.
@@ -2134,7 +2134,7 @@ pub fn read_sidecar_entries(
     let probe = ArrowFileReader::try_new(file, None).map_err(|e| {
         Error::Parse(format!(
             "{} is not a readable .p5s sidecar (legacy .p5i or corrupt?): {e}; \
-             delete it and rebuild with `escpod index` / `escpod annotate`",
+             delete it and rebuild with `escpod sidecar index` / `escpod sidecar annotate`",
             p5s_path.display()
         ))
     })?;
