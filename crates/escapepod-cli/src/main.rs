@@ -93,7 +93,7 @@ Examples:
   escpod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
   escpod summary input.pod5                 Comprehensive statistics
 
-Experimental commands (repack, resquiggle, annotate) are not built by default.
+Experimental commands (repack, resquiggle) are not built by default.
 Rebuild with `--features experimental` to enable them.
 ")]
 struct Cli {
@@ -543,8 +543,7 @@ completed in place, preserving annotations and scores.
         threads: Option<usize>,
     },
 
-    /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar (experimental; requires `--features experimental`)
-    #[cfg(feature = "experimental")]
+    /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar
     #[command(after_help = "\
 Writes a read → label mapping into the .p5s sidecar next to each POD5 file.
 The POD5 itself is never modified. The sidecar is a plain Arrow IPC table
@@ -557,6 +556,9 @@ Examples:
   escpod annotate -a demux.csv input.pod5        Annotate with demux assignments
   escpod annotate -a demux.csv data_dir/         Annotate a directory recursively
   escpod annotate -a samples.csv --name sample input.pod5
+  escpod annotate data_dir/ --from-table calls.csv.gz --column barcode=predicted_barcode
+                                                 Label reads from another tool's
+                                                 read-to-label table (CSV/TSV, gzip ok)
   escpod annotate --design samplesheet.csv input.pod5
                                                  Map barcode (combinations) to
                                                  experimental conditions
@@ -564,7 +566,14 @@ Examples:
     #[command(group(
         clap::ArgGroup::new("action")
             .required(true)
-            .args(["assignments", "design", "list", "remove", "remove_design"])
+            .args([
+                "assignments",
+                "design",
+                "from_table",
+                "list",
+                "remove",
+                "remove_design"
+            ])
     ))]
     Annotate {
         /// Input POD5 file(s) or directory
@@ -575,6 +584,52 @@ Examples:
         /// columns — the output of `demux classify` or `demux basecall --barcodes`)
         #[arg(short = 'a', long, value_name = "CSV")]
         assignments: Option<PathBuf>,
+
+        /// Table mapping reads to labels, from another tool (CSV or TSV, one
+        /// header row; gzip is detected). Needs --column. Reads the table does
+        /// not label get --unassigned-label. Repeat for the shards of one run
+        #[arg(
+            long,
+            value_name = "TABLE",
+            num_args = 1..,
+            action = clap::ArgAction::Append,
+            requires = "columns",
+            conflicts_with_all = ["assignments", "name"]
+        )]
+        from_table: Vec<PathBuf>,
+
+        /// With --from-table: the table's read-id column (default: read_id; a
+        /// leading '#' in the header, as WarpDemuX writes, is ignored)
+        #[arg(
+            long,
+            value_name = "COL",
+            requires = "from_table",
+            conflicts_with_all = TABLE_ONLY_CONFLICTS
+        )]
+        id_column: Option<String>,
+
+        /// With --from-table: write sidecar column NAME from table column COL,
+        /// verbatim (e.g. barcode=predicted_barcode). Repeat for several
+        #[arg(
+            long = "column",
+            value_name = "NAME=COL",
+            requires = "from_table",
+            conflicts_with_all = TABLE_ONLY_CONFLICTS,
+            action = clap::ArgAction::Append,
+            value_parser = commands::annotate::parse_column_spec
+        )]
+        columns: Vec<(String, String)>,
+
+        /// With --from-table: label for reads the table does not label (absent
+        /// from it, or an empty cell) [default: unclassified]. Pass '' to leave
+        /// them unlabelled
+        #[arg(
+            long,
+            value_name = "LABEL",
+            requires = "from_table",
+            conflicts_with_all = TABLE_ONLY_CONFLICTS
+        )]
+        unassigned_label: Option<String>,
 
         /// Experimental-design CSV: one column per key annotation (e.g.
         /// `barcode`, or `ldx,edx` for combinations) plus one column per
@@ -588,7 +643,8 @@ Examples:
         #[arg(long, value_name = "COLS", requires = "design", value_delimiter = ',')]
         keys: Option<Vec<String>>,
 
-        /// Annotation name (the sidecar column to write, with -a)
+        /// Annotation name (the sidecar column to write, with -a; --from-table
+        /// names its columns with --column instead)
         #[arg(long, default_value = escapepod_signal::pod5::sidecar::DEFAULT_ANNOTATION_NAME)]
         name: String,
 
@@ -613,20 +669,15 @@ Examples:
         #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
     },
-
-    /// Record per-read annotations in the .p5s sidecar (rebuild with `--features experimental` to enable)
-    #[cfg(not(feature = "experimental"))]
-    #[command(hide = true)]
-    Annotate {
-        /// Annotate arguments (ignored; feature not enabled)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
-    },
 }
+
+/// The other `annotate` actions, for the options that only mean something with
+/// `--from-table`. `requires` alone is not enough: clap does not report a
+/// required argument as missing when it conflicts with one that was given, so
+/// `-a x.csv --column barcode=y` would otherwise parse and quietly ignore
+/// `--column`.
+const TABLE_ONLY_CONFLICTS: [&str; 5] =
+    ["assignments", "design", "list", "remove", "remove_design"];
 
 /// The `-t/--threads` value the user asked for, whichever command they ran.
 ///
@@ -653,10 +704,7 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         } => *threads,
         Commands::Inspect { .. } => None,
 
-        #[cfg(feature = "experimental")]
         Commands::Annotate { threads, .. } => *threads,
-        #[cfg(not(feature = "experimental"))]
-        Commands::Annotate { .. } => None,
 
         // Like `demux`, resquiggle flattens its run args under a subcommand.
         #[cfg(feature = "experimental")]
@@ -957,7 +1005,6 @@ fn main() -> anyhow::Result<()> {
             threads: _,
         } => commands::index::run(inputs, force),
 
-        #[cfg(feature = "experimental")]
         Commands::Annotate {
             inputs,
             assignments,
@@ -967,6 +1014,10 @@ fn main() -> anyhow::Result<()> {
             list,
             remove,
             remove_design,
+            from_table,
+            id_column,
+            columns,
+            unassigned_label,
             force,
             threads: _,
         } => commands::annotate::run(commands::annotate::AnnotateCmd {
@@ -978,11 +1029,12 @@ fn main() -> anyhow::Result<()> {
             list,
             remove,
             remove_design,
+            from_table,
+            id_column,
+            columns,
+            unassigned_label,
             force,
         }),
-
-        #[cfg(not(feature = "experimental"))]
-        Commands::Annotate { .. } => feature_disabled("annotate", "experimental"),
     }
 }
 
@@ -1164,13 +1216,113 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental")]
+    /// `annotate` ships in the default build, so its `-t` must reach the pool
+    /// sizing in every build — it used to be a stub there (#486).
     #[test]
-    fn experimental_commands_forward_threads() {
+    fn annotate_threads_reach_main() {
         assert_eq!(
             threads_for(&["escpod", "index", "in.pod5", "-t", "4"]),
             Some(4)
         );
+        for flag in ["-t", "-j", "--threads"] {
+            assert_eq!(
+                threads_for(&["escpod", "annotate", "--list", "in.pod5", flag, "3"]),
+                Some(3),
+                "annotate dropped {flag}"
+            );
+        }
+        assert_eq!(
+            threads_for(&["escpod", "annotate", "--list", "in.pod5"]),
+            None
+        );
+    }
+
+    /// `--from-table` joins the `action` group, needs a column to read, and
+    /// excludes `-a` — including past `--name`'s default, which must not count
+    /// as the user having asked for it.
+    #[test]
+    fn from_table_flag_combinations_parse() {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from([&["escpod", "annotate", "pod5/"][..], extra].concat())
+        };
+        let ok = |extra: &[&str]| {
+            parse(extra).unwrap_or_else(|e| panic!("{extra:?} should parse: {e}"));
+        };
+        let refused = |extra: &[&str]| {
+            assert!(parse(extra).is_err(), "{extra:?} should be refused");
+        };
+
+        ok(&[
+            "--from-table",
+            "t.csv.gz",
+            "--column",
+            "barcode=predicted_barcode",
+        ]);
+        // Repeatable, and several columns.
+        ok(&[
+            "--from-table",
+            "a.csv",
+            "--from-table",
+            "b.csv",
+            "--column",
+            "ldx=x",
+            "--column",
+            "fdx=y",
+            "--id-column",
+            "#read_id",
+            "--unassigned-label",
+            "",
+        ]);
+        // Multi-value: several tables after one flag, then the other flags.
+        ok(&["--from-table", "a.csv", "b.csv", "--column", "barcode=x"]);
+
+        // A table with nothing to read from it.
+        refused(&["--from-table", "t.csv"]);
+        // The flags that only make sense with a table.
+        refused(&["--column", "barcode=x"]);
+        refused(&["-a", "demux.csv", "--column", "barcode=x"]);
+        refused(&["-a", "demux.csv", "--id-column", "read_id"]);
+        refused(&["-a", "demux.csv", "--unassigned-label", "none"]);
+        // One action per invocation: `-a` and a table are two.
+        refused(&[
+            "-a",
+            "demux.csv",
+            "--from-table",
+            "t.csv",
+            "--column",
+            "b=x",
+        ]);
+        refused(&[
+            "--design",
+            "s.csv",
+            "--from-table",
+            "t.csv",
+            "--column",
+            "b=x",
+        ]);
+        refused(&["--list", "--from-table", "t.csv", "--column", "b=x"]);
+        // `--name` is `-a`'s; naming columns is `--column`'s job. Its default
+        // must not trip this, though — the first `ok` above passed without it.
+        refused(&[
+            "--from-table",
+            "t.csv",
+            "--column",
+            "b=x",
+            "--name",
+            "sample",
+        ]);
+        // NAME=COL needs both halves.
+        refused(&["--from-table", "t.csv", "--column", "barcode"]);
+        refused(&["--from-table", "t.csv", "--column", "=x"]);
+        // And the old surface is unchanged.
+        ok(&["-a", "demux.csv"]);
+        ok(&["-a", "demux.csv", "--name", "sample"]);
+        ok(&["--list"]);
+    }
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn experimental_commands_forward_threads() {
         // resquiggle flattens its run args under a subcommand, like demux.
         assert_eq!(
             threads_for(&[

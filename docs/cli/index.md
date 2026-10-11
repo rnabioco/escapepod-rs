@@ -23,14 +23,15 @@ These commands are in the default build — no extra Cargo features required.
 | [subset](subset.md) | Split reads into multiple files based on CSV mapping |
 | [demux](demux.md) | Barcode demultiplexing — DTW-SVM, GBM, or CTC-CRF, end to end |
 | [index](index-command.md) | Build the `.p5s` sidecar caches (read index + signal batch geometry) |
+| [annotate](annotate.md) | Record per-read labels (a demux CSV, an external read-to-label table, an experimental design) in the `.p5s` sidecar |
 | [classify](classify.md) | Read-level classification against a model bundle (tRNA charging) |
 
 Read alignment (formerly `escpod align`) now lives in its own tool,
 [eschalign](https://github.com/rnabioco/eschalign).
 
-Additional commands — `repack`, `resquiggle`, and
-[`annotate`](../experimental/annotate.md) — need `--features experimental`;
-see the [Experimental](../experimental/index.md) section.
+Additional commands — `repack` and `resquiggle` — need
+`--features experimental`; see the [Experimental](../experimental/index.md)
+section.
 
 ## Global Options
 

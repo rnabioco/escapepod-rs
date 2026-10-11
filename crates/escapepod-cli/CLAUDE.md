@@ -7,7 +7,7 @@
 ## Module map
 - `main.rs` — clap tree, `EscpodFormatter`, `-q/-v` → `EnvFilter`, `requested_threads`, signal/SIGPIPE handlers, dispatch, arg-parse unit tests.
 - `lib.rs` re-exports; `build.rs` `ESCPOD_VERSION`; `progress.rs` bars (hidden below INFO); `commands/profile.rs` `PhaseTimer`; `style.rs` ANSI gated on stderr TTY + `NO_COLOR`; `threads.rs` the one rayon `init`; `device.rs` `--device` + `Stage` placement; `util.rs` input/output resolution, BAI; `test_env.rs` env lock for tests.
-- `commands/`: `view inspect summary merge filter bam_filter subset index classify`, `signal` (deprecated alias), and under `experimental`: `repack annotate resquiggle resquiggle_models`.
+- `commands/`: `view inspect summary merge filter bam_filter subset index annotate classify`, `signal` (deprecated alias), and under `experimental`: `repack resquiggle resquiggle_models`.
 - `commands/demux/` — see `commands/demux/CLAUDE.md`.
 
 ## Feature flags
@@ -16,7 +16,7 @@
 | `cli` (default) | the binary; implies `signal demux classify cnn-detect crf-decode demux-models model-fetch` |
 | `mimalloc` (default) | global allocator |
 | `pod5 signal demux classify` | library layers → `escapepod-*`; `classify` also forwards `fnn-onnx`,`waveform-onnx` |
-| `experimental` | `repack annotate resquiggle`; implies `classify` |
+| `experimental` | `repack resquiggle`; implies `classify` |
 | `model-fetch` | ureq/sha2/zip; `models-download` = `resquiggle models fetch`, implies `experimental`+`model-fetch` |
 | `demux-models` | ≡ `demux` today |
 | `gpu` | every GPU path → `escapepod-demux/gpu`, `escapepod-classify/cuda` |
@@ -43,8 +43,10 @@ pixi run -e dev cargo nextest run -p escapepod-cli && pixi run cargo test --doc 
 - `threads::init` has one call site, before dispatch; an earlier `par_iter` pins the pool silently.
 - `device.rs` uses `cfg!` not `#[cfg]` so a musl build can say the feature is missing.
 - `collect_pod5_inputs` dedupes but keeps argument order — `merge`/`repack`/`index` output order depends on it.
-- `experimental` stubs exist so `escpod repack` errors with a rebuild hint, not "unknown subcommand".
+- `experimental` stubs (`repack`, `resquiggle`) exist so `escpod repack` errors with a rebuild hint, not "unknown subcommand". `annotate` has none: it ships by default, and a leftover stub would shadow the real command.
 - `build.rs` must name the real `HEAD` path (`git rev-parse --git-path HEAD`): a nonexistent `rerun-if-changed` target reruns the script every build.
+- `annotate --from-table`/`-a` look before they write: a pre-pass over every input's `read_ids()` refuses (error, nothing written) when no read matches. With the fill on, every read counts as assigned, so nothing the writers report can catch a table from another run, and an in-place replace would overwrite a good column with all-`unclassified` → `tests/annotate_table.rs::a_table_for_another_run_is_refused_before_anything_is_written`. The fill (`apply_fill`) is CLI-side and must keep `codes.len() == index.len()` per column — the writers `get` a slot and silently drop one with no code.
+- `util::open_maybe_gzip` sniffs `1f 8b` and uses `MultiGzDecoder`; `GzDecoder` silently truncates a multi-member table → `a_multi_member_gzip_is_read_whole`.
 - Every command resolves POD5 reads through the read index and processes them in storage order (the #334 rule); BGZF pools are sized from the rayon pool — `MultithreadedReader::new` is one worker.
 
 ## Known debt

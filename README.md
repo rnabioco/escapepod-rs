@@ -33,7 +33,7 @@ A Rust library and CLI for reading and writing Oxford Nanopore POD5 files.
 - **Crash-safe writes** - Output is staged and renamed into place, so an
   interrupted run never leaves a corrupt archive or damages an existing one
 
-Three commands — `repack`, `resquiggle`, `annotate` — are experimental and live
+Two commands — `repack` and `resquiggle` — are experimental and live
 behind the `experimental` Cargo feature; GPU acceleration is a single opt-in
 flag (`--features gpu`), with `--device` choosing per stage at run time. See
 the [docs](https://rnabioco.github.io/escapepod-rs/) for the details behind the
@@ -99,7 +99,7 @@ cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli
 Opt into experimental commands:
 
 ```bash
-# repack, resquiggle, annotate
+# repack, resquiggle
 cargo install --git https://github.com/rnabioco/escapepod-rs escapepod-cli --features experimental
 ```
 

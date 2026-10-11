@@ -6,6 +6,7 @@ use noodles_bam as bam;
 use noodles_csi::BinningIndex;
 #[cfg(feature = "experimental")]
 use noodles_csi::binning_index::ReferenceSequence as _;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -189,6 +190,32 @@ pub fn collect_pod5_inputs(inputs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     all_files.retain(|p| seen.insert(p.clone()));
 
     Ok(all_files)
+}
+
+/// Open a text file for reading, gunzipping it when it starts with the gzip
+/// magic (`1f 8b`) — whatever it is called.
+///
+/// Sniffed rather than keyed on a `.gz` extension: a table copied out of a
+/// pipeline keeps whatever name it was given, and the bytes are the truth. The
+/// decoder is `MultiGzDecoder`, **never** `GzDecoder`: a bgzipped or
+/// concatenated file is several gzip members, and `GzDecoder` stops quietly
+/// after the first — for a table of read calls that turns every call past the
+/// first member into "no call" without an error (#409).
+pub fn open_maybe_gzip(path: &Path) -> anyhow::Result<Box<dyn BufRead>> {
+    use anyhow::Context as _;
+
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let gzipped = reader
+        .fill_buf()
+        .with_context(|| format!("cannot read {}", path.display()))?
+        .starts_with(&[0x1f, 0x8b]);
+    Ok(if gzipped {
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(reader)))
+    } else {
+        Box::new(reader)
+    })
 }
 
 /// Format a byte count as a human-readable string (e.g., "1.2 GB").

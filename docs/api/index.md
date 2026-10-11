@@ -56,7 +56,7 @@ The bundle carries the whole feature recipe — feature order and offsets, the k
 
 ### escapepod-cli
 
-The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `index`, the `demux` tree, and `classify`. `repack`, `resquiggle`, and `annotate` live behind the `experimental` feature — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `index`, `annotate`, the `demux` tree, and `classify`. `annotate` ships with them; `repack` and `resquiggle` live behind the `experimental` feature — see below.
 
 ## Quick Reference
 
@@ -126,7 +126,7 @@ match result {
 |---------|--------|
 | `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal`, `demux`, `classify`, `cnn-detect`, `crf-decode`, `demux-models`, `model-fetch` |
 | `pod5` / `signal` / `demux` | Library re-exports of each layer (for `default-features = false` consumers) |
-| `experimental` | Implies `classify`; unlocks `repack`, `resquiggle`, `annotate` |
+| `experimental` | Implies `classify`; unlocks `repack`, `resquiggle` |
 | `demux` | The `demux` subcommand tree (fused pipeline, detect / fingerprint / classify / basecall / split / models / train) — *implied by `cli`* |
 | `classify` | `escpod classify` (tRNA charging) via `escapepod-classify`, with `fnn-onnx` on — *implied by `cli`* |
 | `crf-decode` | CTC-CRF barcode basecalling (`demux basecall`) — *implied by `cli`* |

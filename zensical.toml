@@ -25,10 +25,10 @@ nav = [
     { "demux" = "cli/demux.md" },
     { "classify" = "cli/classify.md" },
     { "index" = "cli/index-command.md" },
+    { "annotate" = "cli/annotate.md" },
   ] },
   { "Experimental" = [
     { "Overview" = "experimental/index.md" },
-    { "annotate" = "experimental/annotate.md" },
     { "resquiggle" = "experimental/resquiggle.md" },
     { "repack" = "experimental/repack.md" },
   ] },

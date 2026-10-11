@@ -273,6 +273,20 @@ pub const P5S_MEMBERS_KEY: &str = "escapepod:members";
 /// Default annotation column name (what `escpod annotate` writes).
 pub const DEFAULT_ANNOTATION_NAME: &str = "barcode";
 
+/// The label for a read no demultiplexer assigned to a barcode: what `demux
+/// --annotate` and `demux split` write and read for one, and what
+/// `escpod annotate --from-table` gives a read its table does not label.
+///
+/// One constant so the spellings cannot drift apart — a column that says
+/// `unclassified` in one command and `unassigned` in another splits one group
+/// in two.
+pub const UNCLASSIFIED_LABEL: &str = "unclassified";
+
+/// The most distinct labels one annotation column can hold. The label table is
+/// indexed by `u16` on disk, so the 65 536th label is refused at write time —
+/// callers that build a column up front check against this to fail earlier.
+pub const MAX_ANNOTATION_LABELS: usize = u16::MAX as usize;
+
 /// Column names reserved for the read index; everything else is an
 /// annotation.
 ///
@@ -348,9 +362,9 @@ impl AnnotationSection {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        if labels.len() > usize::from(u16::MAX) {
+        if labels.len() > MAX_ANNOTATION_LABELS {
             return Err(Error::Parse(format!(
-                "{} distinct labels exceed the annotation limit of 65535",
+                "{} distinct labels exceed the annotation limit of {MAX_ANNOTATION_LABELS}",
                 labels.len()
             )));
         }

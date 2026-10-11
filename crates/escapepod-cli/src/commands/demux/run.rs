@@ -42,7 +42,7 @@ use escapepod_signal::{
 use rayon::prelude::*;
 use tracing::info;
 
-const UNCLASSIFIED: &str = "unclassified";
+const UNCLASSIFIED: &str = escapepod_signal::pod5::sidecar::UNCLASSIFIED_LABEL;
 
 /// Arguments for the fused demux pipeline.
 #[derive(Debug, clap::Args)]

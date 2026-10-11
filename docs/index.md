@@ -101,7 +101,7 @@ See the [Rust Library](library/index.md) for the full crate API.
 ## Documentation
 
 - [CLI Reference](cli/index.md) — every `escpod` command
-- [Experimental](experimental/index.md) — annotations, resquiggle, repack
+- [Experimental](experimental/index.md) — resquiggle, repack
 - [Python API](python/index.md) — reading and writing POD5 from Python
 - [Rust Library](library/index.md) — using escapepod in your Rust projects
 - [File Format](format/index.md) — technical details of the POD5 container and sidecar

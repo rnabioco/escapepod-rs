@@ -181,5 +181,6 @@ Prefer Rust? The same operations are available in the
 - [Python API](../python/index.md) - Full Python reading/writing/signal reference
 - [CLI Reference](../cli/index.md) - Full documentation of all commands
 - [demux](../cli/demux.md) - Barcode demultiplexing, models, GPU acceleration
-- [Experimental](../experimental/index.md) - annotate, resquiggle, repack
+- [annotate](../cli/annotate.md) - Record per-read labels in the `.p5s` sidecar
+- [Experimental](../experimental/index.md) - resquiggle, repack
 - [File Format](../format/index.md) - Understanding the POD5 format

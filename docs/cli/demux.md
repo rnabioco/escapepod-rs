@@ -83,7 +83,7 @@ With more than one model each is given as `NAME=PATH`. `NAME` is that axis's
 sidecar annotation column, and it is **yours, not the bundle's** — it names
 the axis in your experimental design, and the same model can serve different
 axes in different runs. Those column names are exactly what
-[`annotate --design`](../experimental/annotate.md#experimental-designs) keys a
+[`annotate --design`](annotate.md#experimental-designs) keys a
 multi-column samplesheet on:
 
 ```bash

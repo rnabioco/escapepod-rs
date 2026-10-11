@@ -99,9 +99,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --profile ci
-      # `experimental` gates whole commands — `annotate`, `resquiggle`,
-      # `repack` — and therefore any test of them, so the run above compiles
-      # those tests out and reports green without having run them. Cheap to add
+      # `experimental` gates whole commands — `resquiggle`, `repack` — and
+      # therefore any test of them, so the run above compiles those tests out
+      # and reports green without having run them. (`annotate` shipped in the
+      # default build in #486 and is covered by the run above.) Cheap to add
       # here and nowhere else: the feature resolves to `classify`, which the
       # default `cli` feature already enables, so this recompiles
       # escapepod-cli alone rather than rebuilding the dependency graph the way

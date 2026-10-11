@@ -6,9 +6,9 @@ the **signal batch geometry** (the per-batch row counts of the signal table).
 The POD5 itself is never modified.
 
 Both caches are rebuildable from the POD5 at any time, which is what separates
-`index` from [`annotate`](../experimental/annotate.md) — annotations are data
-products that exist nowhere else, so writing them stays behind
-`--features experimental`, while `index` ships in the default build.
+`index` from [`annotate`](annotate.md) — annotations are data products that
+exist nowhere else, so `annotate` refuses to replace a sidecar it cannot read
+rather than rebuilding it, while `index` will always rebuild.
 
 ## Usage
 

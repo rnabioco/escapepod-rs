@@ -3,7 +3,6 @@
 use escapepod_demux::{BarcodeFingerprint, ReadBoundaries};
 use escapepod_signal::dtw::NormMethod;
 use escapepod_signal::{CompressedSignalChunk, ReadData, Reader, ReadsBatchView};
-use flate2::read::MultiGzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -104,15 +103,10 @@ pub fn parse_boundaries_csv(path: &Path) -> anyhow::Result<HashMap<Uuid, ReadBou
     Ok(boundaries_map)
 }
 
-/// Open a CSV file, auto-detecting gzip compression from the .gz extension.
+/// Open a CSV file, auto-detecting gzip compression from the file's magic
+/// bytes (see [`crate::util::open_maybe_gzip`]).
 fn open_csv_reader(path: &Path) -> anyhow::Result<Box<dyn BufRead>> {
-    let file = File::open(path)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        let decoder = MultiGzDecoder::new(file);
-        Ok(Box::new(BufReader::new(decoder)))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
+    crate::util::open_maybe_gzip(path)
 }
 
 /// Detect column indices for boundary fields by examining the CSV header.
