@@ -41,7 +41,9 @@ use std::hint::black_box;
 
 use escapepod_classify::anchor::{AnchorSource, SpanMode};
 use escapepod_classify::features::{expected_levels_z, junction_features};
-use escapepod_classify::{AnchoredRead, FeatureRecipe, KmerLevels, Orientation, feature_grid};
+use escapepod_classify::{
+    AnchoredRead, FeatureRecipe, KmerLevels, Orientation, PackedMoves, feature_grid,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -112,7 +114,12 @@ fn synthetic_read(seed: u64) -> AnchoredRead {
         mapq: 60,
         ns: N_BASES as i64 * SAMPLES_PER_BASE,
         seq,
-        seq_to_sig: (0..=N_BASES as i64).map(|i| i * SAMPLES_PER_BASE).collect(),
+        moves: PackedMoves::new(
+            1,
+            &(0..N_BASES as i64 * SAMPLES_PER_BASE)
+                .map(|i| u8::from(i % SAMPLES_PER_BASE == 0))
+                .collect::<Vec<u8>>(),
+        ),
         nb: N_BASES,
         q_junction: Q_JUNCTION,
         q_cca_a: Q_JUNCTION - 1,
