@@ -291,6 +291,240 @@ pub fn input_contribution(w: &LstmWeights, seq: usize, x: &[f32], xw: &mut [f32]
     }
 }
 
+/// `out[t][gi] = bias[gi] + Σ_k x[k * sk + t * st] * wt[k * g + gi]` for every
+/// `t < seq` — the shared dense-layer kernel behind [`input_contribution_vec`]
+/// and `escapepod_demux::crf::encoder_native`'s linear head.
+///
+/// `wt` is `[n_in][g]`; `out` is `[seq][g]`. `(sk, st)` are the strides of `x`
+/// along the input-channel and time axes, so one kernel reads both a
+/// channel-major `[n_in][seq]` input (`sk = seq`, `st = 1`) and a time-major
+/// `[seq][n_in]` one (`sk = 1`, `st = n_in`).
+///
+/// The scalar form is the rank-1 update the recurrence kernels used to run per
+/// timestep: stream the whole `wt` once for every `t`. The vector paths tile
+/// several timesteps per weight load and walk gates outermost, so one
+/// `n_in x 32` column block of `wt` stays in L1 across the whole sequence.
+/// The accumulation order over `k` is unchanged and every product is a
+/// separate `mul` then `add` (no FMA) exactly as the scalar loop rounds, so
+/// every backend is **bit-identical** to the scalar one per output lane. A
+/// vector backend whose width does not divide `g` into 32-gate blocks takes
+/// the scalar path.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_rows(
+    backend: LstmBackend,
+    wt: &[f32],
+    bias: &[f32],
+    n_in: usize,
+    g: usize,
+    x: &[f32],
+    sk: usize,
+    st: usize,
+    seq: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(wt.len(), n_in * g, "wt is [n_in][g]");
+    assert_eq!(bias.len(), g, "bias is [g]");
+    assert_eq!(out.len(), seq * g, "out is [seq][g]");
+    if seq == 0 {
+        return;
+    }
+    if n_in > 0 {
+        assert!(
+            (n_in - 1) * sk + (seq - 1) * st < x.len(),
+            "x is too short for the given strides"
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    if g.is_multiple_of(32) && backend.supported() {
+        let args = AffineArgs {
+            wt: wt.as_ptr(),
+            bias: bias.as_ptr(),
+            n_in,
+            g,
+            x: x.as_ptr(),
+            sk,
+            st,
+            out: out.as_mut_ptr(),
+        };
+        match backend {
+            LstmBackend::Scalar => {}
+            // Safety: `supported()` checked the target features; the length
+            // asserts above bound every pointer the kernels form, and `g` is
+            // a multiple of 32.
+            LstmBackend::Avx2 => {
+                unsafe { affine_avx2(&args, seq) };
+                return;
+            }
+            LstmBackend::Avx512 => {
+                unsafe { affine_avx512(&args, seq) };
+                return;
+            }
+        }
+    }
+    let _ = backend;
+    for t in 0..seq {
+        let row = &mut out[t * g..(t + 1) * g];
+        row.copy_from_slice(bias);
+        for k in 0..n_in {
+            let xk = x[k * sk + t * st];
+            let wk = &wt[k * g..(k + 1) * g];
+            for (r, wv) in row.iter_mut().zip(wk) {
+                *r += xk * wv;
+            }
+        }
+    }
+}
+
+/// Raw pointers and strides for the vector [`affine_rows`] kernels.
+#[cfg(target_arch = "x86_64")]
+struct AffineArgs {
+    wt: *const f32,
+    bias: *const f32,
+    n_in: usize,
+    g: usize,
+    x: *const f32,
+    sk: usize,
+    st: usize,
+    out: *mut f32,
+}
+
+/// Timesteps per weight load in the AVX2 [`affine_rows`] kernel: 2 vectors
+/// (16 gates) x 4 timesteps = 8 accumulators, 4 broadcasts, a weight load
+/// and a product temporary.
+#[cfg(target_arch = "x86_64")]
+const AFFINE_AVX2_TB: usize = 4;
+/// The AVX-512 one: 2 vectors (32 gates) x 8 timesteps = 16 accumulators.
+#[cfg(target_arch = "x86_64")]
+const AFFINE_AVX512_TB: usize = 8;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn affine_avx2(a: &AffineArgs, seq: usize) {
+    let main = seq / AFFINE_AVX2_TB * AFFINE_AVX2_TB;
+    // Safety: as `affine_rows`.
+    unsafe {
+        affine_avx2_tb::<AFFINE_AVX2_TB>(a, 0, main);
+        affine_avx2_tb::<1>(a, main, seq);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn affine_avx2_tb<const TB: usize>(a: &AffineArgs, t_begin: usize, t_end: usize) {
+    use std::arch::x86_64::*;
+    // Safety: `affine_rows` bounds `x`, `wt`, `bias` and `out` for every
+    // index formed below; `t_end - t_begin` is a multiple of `TB`.
+    unsafe {
+        let mut gb = 0usize;
+        while gb < a.g {
+            let b = [
+                _mm256_loadu_ps(a.bias.add(gb)),
+                _mm256_loadu_ps(a.bias.add(gb + 8)),
+            ];
+            let mut t = t_begin;
+            while t < t_end {
+                // `acc[v][r]`: vector `v` of the 16-gate block, timestep `r`.
+                let mut acc = [[b[0]; TB], [b[1]; TB]];
+                for k in 0..a.n_in {
+                    let xp = a.x.add(k * a.sk + t * a.st);
+                    let wp = a.wt.add(k * a.g + gb);
+                    let mut xb = [_mm256_setzero_ps(); TB];
+                    for (r, xr) in xb.iter_mut().enumerate() {
+                        *xr = _mm256_set1_ps(*xp.add(r * a.st));
+                    }
+                    for (v, accv) in acc.iter_mut().enumerate() {
+                        let wv = _mm256_loadu_ps(wp.add(v * 8));
+                        for (s, xr) in accv.iter_mut().zip(xb.iter()) {
+                            // mul then add, not fmadd: the scalar form's
+                            // two roundings.
+                            *s = _mm256_add_ps(*s, _mm256_mul_ps(*xr, wv));
+                        }
+                    }
+                }
+                for (v, accv) in acc.iter().enumerate() {
+                    for (r, s) in accv.iter().enumerate() {
+                        _mm256_storeu_ps(a.out.add((t + r) * a.g + gb + v * 8), *s);
+                    }
+                }
+                t += TB;
+            }
+            gb += 16;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn affine_avx512(a: &AffineArgs, seq: usize) {
+    let mut t = 0usize;
+    // Safety: as `affine_rows`.
+    unsafe {
+        let main = seq / AFFINE_AVX512_TB * AFFINE_AVX512_TB;
+        affine_avx512_tb::<AFFINE_AVX512_TB>(a, t, main);
+        t = main;
+        if seq - t >= 4 {
+            affine_avx512_tb::<4>(a, t, t + 4);
+            t += 4;
+        }
+        affine_avx512_tb::<1>(a, t, seq);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "avx512f")]
+unsafe fn affine_avx512_tb<const TB: usize>(a: &AffineArgs, t_begin: usize, t_end: usize) {
+    use std::arch::x86_64::*;
+    // Safety: as `affine_avx2_tb`.
+    unsafe {
+        let mut gb = 0usize;
+        while gb < a.g {
+            let b = [
+                _mm512_loadu_ps(a.bias.add(gb)),
+                _mm512_loadu_ps(a.bias.add(gb + 16)),
+            ];
+            let mut t = t_begin;
+            while t < t_end {
+                let mut acc = [[b[0]; TB], [b[1]; TB]];
+                for k in 0..a.n_in {
+                    let xp = a.x.add(k * a.sk + t * a.st);
+                    let wp = a.wt.add(k * a.g + gb);
+                    let mut xb = [_mm512_setzero_ps(); TB];
+                    for (r, xr) in xb.iter_mut().enumerate() {
+                        *xr = _mm512_set1_ps(*xp.add(r * a.st));
+                    }
+                    for (v, accv) in acc.iter_mut().enumerate() {
+                        let wv = _mm512_loadu_ps(wp.add(v * 16));
+                        for (s, xr) in accv.iter_mut().zip(xb.iter()) {
+                            *s = _mm512_add_ps(*s, _mm512_mul_ps(*xr, wv));
+                        }
+                    }
+                }
+                for (v, accv) in acc.iter().enumerate() {
+                    for (r, s) in accv.iter().enumerate() {
+                        _mm512_storeu_ps(a.out.add((t + r) * a.g + gb + v * 16), *s);
+                    }
+                }
+                t += TB;
+            }
+            gb += 32;
+        }
+    }
+}
+
+/// [`input_contribution`] through [`affine_rows`] on `backend`: bit-identical
+/// to it, with each weight load serving several timesteps.
+pub fn input_contribution_vec(
+    backend: LstmBackend,
+    w: &LstmWeights,
+    seq: usize,
+    x: &[f32],
+    xw: &mut [f32],
+) {
+    affine_rows(backend, &w.wt, &w.bias, w.n_in, 4 * w.h, x, seq, 1, seq, xw);
+}
+
 /// One read, one direction, scalar reference kernel.
 ///
 /// `x` is channel-major `[n_in][seq]`. `xw` is `seq * 4H` scratch; `gates` is
@@ -417,7 +651,7 @@ pub unsafe fn run_avx2(
     // and store stays inside its buffer; the target features are guaranteed
     // by the dispatch in `LstmBackend::best_for`.
     unsafe {
-        input_contribution(w, seq, x, xw);
+        input_contribution_vec(LstmBackend::Avx2, w, seq, x, xw);
         let mut hcur = vec![0.0f32; h];
         let mut c = vec![0.0f32; h];
         let rt = w.rt.as_ptr();
@@ -545,7 +779,7 @@ pub unsafe fn run_avx2_batch<const N: usize>(
     unsafe {
         for (r, x) in xs.iter().enumerate() {
             let off = r * xw_len;
-            input_contribution(w, seq, x, &mut xw[off..off + xw_len]);
+            input_contribution_vec(LstmBackend::Avx2, w, seq, x, &mut xw[off..off + xw_len]);
         }
         let mut hcur = vec![0.0f32; N * h];
         let mut c = vec![0.0f32; N * h];
@@ -676,7 +910,7 @@ pub unsafe fn run_avx512_batch<const N: usize>(
     unsafe {
         for (r, x) in xs.iter().enumerate() {
             let off = r * xw_len;
-            input_contribution(w, seq, x, &mut xw[off..off + xw_len]);
+            input_contribution_vec(LstmBackend::Avx512, w, seq, x, &mut xw[off..off + xw_len]);
         }
         let mut hcur = vec![0.0f32; N * h];
         let mut c = vec![0.0f32; N * h];
@@ -1240,6 +1474,70 @@ mod tests {
                         "{backend:?} reverse={reverse} n_reads={n_reads}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The time-blocked input projection must reproduce the old per-timestep
+    /// rank-1 loop ([`input_contribution`]) bit for bit on every backend the
+    /// machine has — the blocking changes which `W` loads serve which
+    /// timestep, never the order of the sum over `k` (and each product is a
+    /// separate mul and add, as the scalar loop rounds). Shapes include the
+    /// real CRF ones (`n_in = H = 96`, seq 300) and sequence lengths that
+    /// leave every tail width.
+    #[test]
+    fn input_projection_is_bit_identical_to_the_rank_1_loop() {
+        for &(n_in, h) in &[(96usize, 96usize), (4, 96), (1, 32), (96, 32)] {
+            let w = weights(n_in, h, 31 + n_in as u64);
+            for seq in [1usize, 2, 3, 4, 5, 7, 8, 9, 12, 13, 33, 300] {
+                let x = input(n_in, seq, 90 + seq as u64);
+                let mut want = vec![0.0f32; seq * 4 * h];
+                input_contribution(&w, seq, &x, &mut want);
+                for backend in LstmBackend::available() {
+                    let mut got = vec![f32::NAN; seq * 4 * h];
+                    input_contribution_vec(backend, &w, seq, &x, &mut got);
+                    assert_eq!(
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{backend:?} n_in={n_in} h={h} seq={seq}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`affine_rows`] with a time-major `x` (the CRF linear head's layout:
+    /// channel stride 1, time stride `n_in`) against the scalar loop, at the
+    /// head's real width (`g = 1024`).
+    #[test]
+    fn affine_rows_time_major_is_bit_identical() {
+        let (n_in, g) = (96usize, 1024usize);
+        let mut rng = Rng(5);
+        let wt: Vec<f32> = (0..n_in * g).map(|_| rng.next(0.4)).collect();
+        let bias: Vec<f32> = (0..g).map(|_| rng.next(0.2)).collect();
+        for seq in [1usize, 5, 8, 31, 32, 33] {
+            let x: Vec<f32> = (0..seq * n_in).map(|_| rng.next(1.0)).collect();
+            let mut want = vec![0.0f32; seq * g];
+            affine_rows(
+                LstmBackend::Scalar,
+                &wt,
+                &bias,
+                n_in,
+                g,
+                &x,
+                1,
+                n_in,
+                seq,
+                &mut want,
+            );
+            for backend in LstmBackend::available() {
+                let mut got = vec![f32::NAN; seq * g];
+                affine_rows(backend, &wt, &bias, n_in, g, &x, 1, n_in, seq, &mut got);
+                assert_eq!(
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{backend:?} seq={seq}"
+                );
             }
         }
     }
