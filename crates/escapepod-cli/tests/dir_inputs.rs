@@ -276,7 +276,6 @@ fn an_empty_directory_is_fatal() {
 /// member. `view --include` going through `operations::read_columns` is what
 /// says the copies are not needed — nothing downstream has to learn that a
 /// collection exists.
-#[cfg(feature = "experimental")]
 #[test]
 fn annotate_on_a_directory_writes_one_collection_sidecar() {
     let ws = Workspace::new();

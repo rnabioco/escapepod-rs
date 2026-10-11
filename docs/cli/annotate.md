@@ -4,8 +4,6 @@ Record per-read annotations — demux barcode assignments, experimental
 conditions — in the [`.p5s` sidecar](../format/sidecar.md) next to POD5
 files. The POD5 itself is never modified.
 
-Requires `--features experimental`.
-
 ## Usage
 
 Exactly one action per invocation:
@@ -72,7 +70,7 @@ escpod annotate -a demux.csv run1/pod5/*.pod5  # writes one .p5s per file
 
 If you are running the fused demux pipeline anyway, `escpod demux
 --annotate` writes the sidecar directly and skips the CSV round-trip — see
-[demux](../cli/demux.md#sidecar-output).
+[demux](demux.md#sidecar-output).
 
 ## Experimental designs
 
@@ -99,8 +97,7 @@ re-demuxing `barcode`) automatically re-derives the dependent columns, and
 
 ## Consuming annotations
 
-Everything downstream reads the sidecar in the default build — no
-`experimental` feature needed:
+Everything downstream reads the sidecar:
 
 ```bash
 escpod inspect summary reads.pod5                     # sidecar section

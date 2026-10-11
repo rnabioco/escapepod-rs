@@ -10,7 +10,8 @@ file beneath it, so a fifty-file run leaves one annotated result rather than
 fifty. See [One sidecar for a directory](#one-sidecar-for-a-directory).
 
 This page is the on-disk specification. For how to *use* sidecars, see the
-[experimental overview](../experimental/index.md#the-p5s-sidecar).
+[`annotate` reference](../cli/annotate.md) and the
+[sidecar overview](../experimental/index.md#the-p5s-sidecar).
 
 ## Layout
 

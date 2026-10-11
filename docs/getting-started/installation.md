@@ -86,16 +86,15 @@ live behind Cargo features:
 
 | Feature | Commands unlocked |
 |---------|-------------------|
-| `experimental` | `repack`, `resquiggle`, `annotate` |
+| `experimental` | `repack`, `resquiggle` |
 | `train` | adds `demux train-svm` (SVM training via linfa) |
 | `gpu` | every GPU path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify; selected at run time with `--device` (default `auto`), CUDA libraries at run time only |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 
-Note the sidecar asymmetry: `escpod index` builds caches that can always be
-rebuilt from the POD5, so it is in the default build; `escpod annotate` writes
-data products that exist nowhere else, so it needs `--features experimental`.
-*Consuming* a sidecar (`demux --annotate`, `demux split --sidecar`,
-`filter --annotation`, `view`, `inspect`) is default-build throughout.
+`escpod index` and `escpod annotate` — the commands that write the `.p5s`
+sidecar — are in the default build, as is everything that *consumes* one
+(`demux --annotate`, `demux split --sidecar`, `filter --annotation`, `view`,
+`inspect`).
 
 `gpu` needs CUDA libraries at run time only; the repository's pixi `gpu`
 environment provides all of them — see

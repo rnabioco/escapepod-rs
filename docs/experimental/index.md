@@ -8,11 +8,10 @@ output formats may change between releases. All of them live behind the
 
 | Command | Purpose |
 |---------|---------|
-| [annotate](annotate.md) | Record per-read annotations (demux barcodes, designs) in the `.p5s` sidecar |
 | [resquiggle](resquiggle.md) | Refine signal-to-base mapping using banded DP |
 | [repack](repack.md) | Re-pack POD5 files with current compression settings |
 
-`demux`, `classify` and `index` ship in the default build and are
+`demux`, `classify`, `index` and `annotate` ship in the default build and are
 documented in the [CLI Reference](../cli/index.md).
 
 ## The `.p5s` sidecar
@@ -87,17 +86,14 @@ Each design variable becomes an ordinary per-read column (`condition`,
 `reader.annotation("condition")` all work with no join logic. Rewriting a
 key annotation (say, re-demuxing `barcode`) automatically re-derives the
 dependent columns, and writing a derived column directly is refused — the
-design stays the source of truth. See [annotate](annotate.md) for the full
+design stays the source of truth. See [annotate](../cli/annotate.md) for the full
 command reference.
 
-Note the split in feature gates. [`escpod index`](../cli/index-command.md) and
-everything that *consumes* a sidecar — `demux split --sidecar`,
-`filter --annotation`, `view`, `inspect summary` — work in the default build.
-So does [`demux --annotate`](../cli/demux.md#sidecar-output),
-which is the usual way a sidecar comes into existence in the first place.
-Only `escpod annotate` needs `--features experimental`: `index` builds caches
-that can always be rebuilt from the POD5, while `annotate` writes data products
-that exist nowhere else.
+Everything about the sidecar works in the default build:
+[`escpod index`](../cli/index-command.md), [`escpod annotate`](../cli/annotate.md),
+[`demux --annotate`](../cli/demux.md#sidecar-output), and everything that
+*consumes* one — `demux split --sidecar`, `filter --annotation`, `view`,
+`inspect summary`.
 
 This format replaces the earlier `.p5i` index sidecar; delete any `.p5i`
 files and rerun `escpod index`.
@@ -107,7 +103,7 @@ files and rerun `escpod index`.
 One feature covers everything in this section:
 
 ```bash
-# repack, resquiggle, annotate
+# repack, resquiggle
 cargo build --release --features experimental
 ```
 

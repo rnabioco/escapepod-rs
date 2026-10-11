@@ -93,7 +93,7 @@ Examples:
   escpod filter in.pod5 -i ids.txt -o out.pod5   Filter by read IDs
   escpod summary input.pod5                 Comprehensive statistics
 
-Experimental commands (repack, resquiggle, annotate) are not built by default.
+Experimental commands (repack, resquiggle) are not built by default.
 Rebuild with `--features experimental` to enable them.
 ")]
 struct Cli {
@@ -543,8 +543,7 @@ completed in place, preserving annotations and scores.
         threads: Option<usize>,
     },
 
-    /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar (experimental; requires `--features experimental`)
-    #[cfg(feature = "experimental")]
+    /// Record per-read annotations (e.g. demux barcodes) in the .p5s sidecar
     #[command(after_help = "\
 Writes a read → label mapping into the .p5s sidecar next to each POD5 file.
 The POD5 itself is never modified. The sidecar is a plain Arrow IPC table
@@ -613,19 +612,6 @@ Examples:
         #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
         threads: Option<usize>,
     },
-
-    /// Record per-read annotations in the .p5s sidecar (rebuild with `--features experimental` to enable)
-    #[cfg(not(feature = "experimental"))]
-    #[command(hide = true)]
-    Annotate {
-        /// Annotate arguments (ignored; feature not enabled)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
-    },
 }
 
 /// The `-t/--threads` value the user asked for, whichever command they ran.
@@ -653,10 +639,7 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         } => *threads,
         Commands::Inspect { .. } => None,
 
-        #[cfg(feature = "experimental")]
         Commands::Annotate { threads, .. } => *threads,
-        #[cfg(not(feature = "experimental"))]
-        Commands::Annotate { .. } => None,
 
         // Like `demux`, resquiggle flattens its run args under a subcommand.
         #[cfg(feature = "experimental")]
@@ -957,7 +940,6 @@ fn main() -> anyhow::Result<()> {
             threads: _,
         } => commands::index::run(inputs, force),
 
-        #[cfg(feature = "experimental")]
         Commands::Annotate {
             inputs,
             assignments,
@@ -980,9 +962,6 @@ fn main() -> anyhow::Result<()> {
             remove_design,
             force,
         }),
-
-        #[cfg(not(feature = "experimental"))]
-        Commands::Annotate { .. } => feature_disabled("annotate", "experimental"),
     }
 }
 
@@ -1164,13 +1143,30 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental")]
+    /// `annotate` ships in the default build, so its `-t` must reach the pool
+    /// sizing in every build — it used to be a stub there (#486).
     #[test]
-    fn experimental_commands_forward_threads() {
+    fn annotate_threads_reach_main() {
         assert_eq!(
             threads_for(&["escpod", "index", "in.pod5", "-t", "4"]),
             Some(4)
         );
+        for flag in ["-t", "-j", "--threads"] {
+            assert_eq!(
+                threads_for(&["escpod", "annotate", "--list", "in.pod5", flag, "3"]),
+                Some(3),
+                "annotate dropped {flag}"
+            );
+        }
+        assert_eq!(
+            threads_for(&["escpod", "annotate", "--list", "in.pod5"]),
+            None
+        );
+    }
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn experimental_commands_forward_threads() {
         // resquiggle flattens its run args under a subcommand, like demux.
         assert_eq!(
             threads_for(&[
