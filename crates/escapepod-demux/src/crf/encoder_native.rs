@@ -77,6 +77,8 @@ use std::collections::HashMap;
 use escapepod_signal::lstm::{self, LstmBackend, LstmWeights};
 use tract_onnx::pb;
 
+#[cfg(target_arch = "x86_64")]
+use super::conv_tile;
 use super::encoder::CrfMetadata;
 use super::lattice::CrfLayout;
 use crate::onnx_graph::{
@@ -214,7 +216,8 @@ impl Recognized {
                 in_c, conv.in_c,
                 "channel count agrees with the recognised weights"
             );
-            let (next, next_len) = conv1d_silu(&cur, in_c, len, conv, &mut conv_scratch);
+            let (next, next_len) =
+                conv1d_silu(&cur, in_c, len, conv, self.backend, &mut conv_scratch);
             cur = next;
             len = next_len;
             in_c = conv.out_c;
@@ -629,7 +632,7 @@ impl Recognized {
                     let (mut cur, mut len, mut in_c) = (p.to_vec(), self.chunk, 1usize);
                     for conv in &self.convs {
                         let (next, next_len) =
-                            conv1d_silu(&cur, in_c, len, conv, &mut conv_scratch);
+                            conv1d_silu(&cur, in_c, len, conv, self.backend, &mut conv_scratch);
                         cur = next;
                         len = next_len;
                         in_c = conv.out_c;
@@ -688,6 +691,9 @@ impl Recognized {
 struct ConvScratch {
     padded: Vec<f32>,
     phases: Vec<f32>,
+    /// The tiled kernels' `[out_c][out_pad]` accumulator, before SiLU.
+    #[cfg(target_arch = "x86_64")]
+    tiled: Vec<f32>,
 }
 
 /// One 1-D convolution (symmetric zero padding, arbitrary stride) plus SiLU
@@ -724,6 +730,7 @@ fn conv1d_silu(
     in_c: usize,
     len: usize,
     conv: &ConvLayer,
+    backend: LstmBackend,
     scratch: &mut ConvScratch,
 ) -> (Vec<f32>, usize) {
     let padded_len = len + conv.pad_lo + conv.pad_hi;
@@ -737,24 +744,25 @@ fn conv1d_silu(
         dst.copy_from_slice(&input[ic * len..(ic + 1) * len]);
     }
 
-    let mut acc = vec![0.0f32; conv.out_c * out_len];
-    for oc in 0..conv.out_c {
-        acc[oc * out_len..(oc + 1) * out_len].fill(conv.bias[oc]);
-    }
-
     let stride = conv.stride;
+    // The register-tiled kernels work on whole vectors of output positions,
+    // so each accumulator row is rounded up to the width and every phase row
+    // is long enough that the last (padding) vector stays inside it.
+    let lanes = backend.lanes();
+    let out_pad = out_len.next_multiple_of(lanes);
     // `phase[ic][r]` is `padded[ic]` subsampled every `stride` starting at
     // `r`: `phase[ic][r][j] = padded[ic][r + j * stride]`. `stride == 1` is
     // one trivial phase equal to the channel itself, so the general path
     // below covers both without a separate branch on `stride`.
     let phase_len = padded_len.div_ceil(stride);
+    let phase_row = phase_len.max((conv.k - 1) / stride + out_pad);
     let phases = &mut scratch.phases;
     phases.clear();
-    phases.resize(in_c * stride * phase_len, 0.0);
+    phases.resize(in_c * stride * phase_row, 0.0);
     for ic in 0..in_c {
         let padded_ch = &padded[ic * padded_len..(ic + 1) * padded_len];
         for r in 0..stride {
-            let dst = &mut phases[(ic * stride + r) * phase_len..(ic * stride + r + 1) * phase_len];
+            let dst = &mut phases[(ic * stride + r) * phase_row..][..phase_len];
             for (j, d) in dst.iter_mut().enumerate() {
                 if let Some(&x) = padded_ch.get(r + j * stride) {
                     *d = x;
@@ -763,6 +771,41 @@ fn conv1d_silu(
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if backend != LstmBackend::Scalar {
+        let geom = conv_tile::Geom {
+            in_c,
+            out_c: conv.out_c,
+            k: conv.k,
+            stride,
+            phase_row,
+            out_pad,
+        };
+        let tiled = &mut scratch.tiled;
+        tiled.clear();
+        tiled.resize(conv.out_c * out_pad, 0.0);
+        match backend {
+            LstmBackend::Avx512 => {
+                conv_tile::conv_avx512(&conv.weight, &conv.bias, phases, geom, tiled)
+            }
+            _ => conv_tile::conv_avx2(&conv.weight, &conv.bias, phases, geom, tiled),
+        }
+        let mut acc = vec![0.0f32; conv.out_c * out_len];
+        for (dst, src) in acc
+            .chunks_exact_mut(out_len)
+            .zip(tiled.chunks_exact(out_pad))
+        {
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d = v * sigmoid(v);
+            }
+        }
+        return (acc, out_len);
+    }
+
+    let mut acc = vec![0.0f32; conv.out_c * out_len];
+    for oc in 0..conv.out_c {
+        acc[oc * out_len..(oc + 1) * out_len].fill(conv.bias[oc]);
+    }
     for oc in 0..conv.out_c {
         let w_oc = &conv.weight[oc * in_c * conv.k..(oc + 1) * in_c * conv.k];
         let acc_row = &mut acc[oc * out_len..(oc + 1) * out_len];
@@ -770,8 +813,7 @@ fn conv1d_silu(
             let w_ic = &w_oc[ic * conv.k..(ic + 1) * conv.k];
             for (kk, &wv) in w_ic.iter().enumerate() {
                 let (r, q) = (kk % stride, kk / stride);
-                let phase =
-                    &phases[(ic * stride + r) * phase_len..(ic * stride + r + 1) * phase_len];
+                let phase = &phases[(ic * stride + r) * phase_row..][..phase_row];
                 let window = &phase[q..q + out_len];
                 for (a, &x) in acc_row.iter_mut().zip(window) {
                     *a += wv * x;
@@ -1768,6 +1810,119 @@ mod tests {
         let mut mismatched = spec.meta();
         mismatched.crf.blank_score = Some(spec.blank_score + 1.0);
         assert!(Recognized::from_proto(&proto, &mismatched, &layout).is_none());
+    }
+
+    /// `conv1d_silu` as it was before the register-tiled kernels (#464), kept
+    /// verbatim as the reference the tiled path is held to bit for bit.
+    fn conv1d_silu_reference(
+        input: &[f32],
+        in_c: usize,
+        len: usize,
+        conv: &ConvLayer,
+    ) -> (Vec<f32>, usize) {
+        let padded_len = len + conv.pad_lo + conv.pad_hi;
+        let out_len = (padded_len - conv.k) / conv.stride + 1;
+        let mut padded = vec![0.0f32; in_c * padded_len];
+        for ic in 0..in_c {
+            let dst =
+                &mut padded[ic * padded_len + conv.pad_lo..ic * padded_len + conv.pad_lo + len];
+            dst.copy_from_slice(&input[ic * len..(ic + 1) * len]);
+        }
+        let mut acc = vec![0.0f32; conv.out_c * out_len];
+        for oc in 0..conv.out_c {
+            acc[oc * out_len..(oc + 1) * out_len].fill(conv.bias[oc]);
+        }
+        let stride = conv.stride;
+        let phase_len = padded_len.div_ceil(stride);
+        let mut phases = vec![0.0f32; in_c * stride * phase_len];
+        for ic in 0..in_c {
+            let padded_ch = &padded[ic * padded_len..(ic + 1) * padded_len];
+            for r in 0..stride {
+                let dst =
+                    &mut phases[(ic * stride + r) * phase_len..(ic * stride + r + 1) * phase_len];
+                for (j, d) in dst.iter_mut().enumerate() {
+                    if let Some(&x) = padded_ch.get(r + j * stride) {
+                        *d = x;
+                    }
+                }
+            }
+        }
+        for oc in 0..conv.out_c {
+            let w_oc = &conv.weight[oc * in_c * conv.k..(oc + 1) * in_c * conv.k];
+            let acc_row = &mut acc[oc * out_len..(oc + 1) * out_len];
+            for ic in 0..in_c {
+                let w_ic = &w_oc[ic * conv.k..(ic + 1) * conv.k];
+                for (kk, &wv) in w_ic.iter().enumerate() {
+                    let (r, q) = (kk % stride, kk / stride);
+                    let phase =
+                        &phases[(ic * stride + r) * phase_len..(ic * stride + r + 1) * phase_len];
+                    let window = &phase[q..q + out_len];
+                    for (a, &x) in acc_row.iter_mut().zip(window) {
+                        *a += wv * x;
+                    }
+                }
+            }
+        }
+        for v in &mut acc {
+            *v *= sigmoid(*v);
+        }
+        (acc, out_len)
+    }
+
+    /// The register-tiled convolution reproduces the axpy loop bit for bit, on
+    /// every backend the machine has: the production shapes (stage 1/2/3 of
+    /// the ldx32 export, chunk 3000, stride 10) and shapes chosen to hit every
+    /// tail: `out_c` not a multiple of the channel tile, `out_len` not a
+    /// multiple of the vector width or the tile, `k` not a multiple of the
+    /// stride, `k < stride`, and `len` shorter than one vector.
+    #[test]
+    fn conv1d_silu_tiled_matches_the_axpy_loop_bit_for_bit() {
+        // (in_c, out_c, k, stride, pad_lo, pad_hi, len)
+        let shapes: &[(usize, usize, usize, usize, usize, usize, usize)] = &[
+            (1, 4, 5, 1, 2, 2, 3000),
+            (4, 16, 5, 1, 2, 2, 3000),
+            (16, 96, 19, 10, 9, 9, 3000),
+            (16, 96, 31, 10, 15, 15, 3000),
+            (3, 7, 5, 1, 2, 2, 301),
+            (5, 6, 7, 3, 3, 3, 211),
+            (2, 5, 4, 7, 0, 0, 100),
+            (3, 9, 13, 4, 6, 5, 77),
+            (2, 3, 3, 1, 1, 1, 5),
+            (1, 1, 1, 1, 0, 0, 1),
+        ];
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for &(in_c, out_c, k, stride, pad_lo, pad_hi, len) in shapes {
+            let conv = ConvLayer {
+                in_c,
+                out_c,
+                k,
+                pad_lo,
+                pad_hi,
+                stride,
+                weight: (0..out_c * in_c * k).map(|_| rng.next(0.5)).collect(),
+                bias: (0..out_c).map(|_| rng.next(0.3)).collect(),
+            };
+            let input: Vec<f32> = (0..in_c * len).map(|_| rng.next(2.0)).collect();
+            let (want, want_len) = conv1d_silu_reference(&input, in_c, len, &conv);
+            let mut scratch = ConvScratch::default();
+            for backend in LstmBackend::available() {
+                // Twice through one scratch: a reused buffer must not leak the
+                // previous call's values into the padding lanes it reads.
+                for pass in 0..2 {
+                    let (got, got_len) =
+                        conv1d_silu(&input, in_c, len, &conv, backend, &mut scratch);
+                    assert_eq!(got_len, want_len);
+                    let same = got
+                        .iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    assert!(
+                        same,
+                        "{backend:?} pass {pass} shape (in {in_c}, out {out_c}, k {k}, stride {stride}, len {len})"
+                    );
+                }
+            }
+        }
     }
 
     /// The time-blocked linear head reproduces the per-timestep rank-1 loop it
