@@ -978,12 +978,15 @@ impl CrfEncoder {
         assert_eq!(prepped.len(), out.len(), "one output slot per prepped read");
         if let Some(net) = &self.native {
             let stride = self.meta.t_len() * self.layout.n_score;
-            let mut flat = vec![0.0f32; prepped.len() * stride];
-            net.encode_batch_into(prepped, &mut flat);
-            for (o, chunk) in out.iter_mut().zip(flat.chunks_exact(stride)) {
-                o.clear();
-                o.extend_from_slice(chunk);
+            // Score straight into the caller's buffers: every element is
+            // overwritten, so a reused `Vec` of the right length is not even
+            // re-zeroed (the old flat staging buffer was ~12 MB per group,
+            // allocated, zeroed, then copied out).
+            for o in out.iter_mut() {
+                o.resize(stride, 0.0);
             }
+            let mut views: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            net.encode_batch_slices(prepped, &mut views);
             return Ok(());
         }
         for (p, o) in prepped.iter().zip(out.iter_mut()) {

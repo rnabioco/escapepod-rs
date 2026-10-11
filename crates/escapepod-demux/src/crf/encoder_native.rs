@@ -207,13 +207,14 @@ impl Recognized {
             "output is t_len * n_score"
         );
 
+        let mut conv_scratch = ConvScratch::default();
         let (mut cur, mut len, mut in_c) = (prepped.to_vec(), self.chunk, 1usize);
         for conv in &self.convs {
             debug_assert_eq!(
                 in_c, conv.in_c,
                 "channel count agrees with the recognised weights"
             );
-            let (next, next_len) = conv1d_silu(&cur, in_c, len, conv);
+            let (next, next_len) = conv1d_silu(&cur, in_c, len, conv, &mut conv_scratch);
             cur = next;
             len = next_len;
             in_c = conv.out_c;
@@ -325,38 +326,53 @@ impl Recognized {
     }
 
     /// The linear layer, tanh, scale and blank pad — the tail shared by
-    /// [`Self::encode_into`] and [`Self::encode_batch_into`]. `hs` is one
+    /// [`Self::encode_into`] and [`Self::encode_batch_slices`]. `hs` is one
     /// read's `[seq][H]` time-major LSTM output; `out` receives `t_len *
     /// n_score` scores in `[t][dest * n_edges + edge]` order.
     fn linear_head(&self, hs: &[f32], out: &mut [f32]) {
+        /// Timesteps per [`lstm::affine_rows`] call: the kernel walks gates
+        /// outermost, so a 12 KB column block of the 393 KB weight stays in
+        /// L1 across all of them, and `TBLK * o_dim` logits (128 KB) stay in L2.
+        const TBLK: usize = 32;
         let (h, seq) = (self.hidden, self.t_len);
         let o_dim = self.n_states * self.n_base;
-        let mut logits = vec![0.0f32; o_dim];
-        for t in 0..seq {
-            let hv = &hs[t * h..(t + 1) * h];
-            logits.copy_from_slice(&self.linear_b);
-            for (&x, wr) in hv.iter().zip(self.linear_w.chunks_exact(o_dim)) {
-                for (l, w) in logits.iter_mut().zip(wr) {
-                    *l += x * w;
-                }
-            }
+        let mut logits = vec![0.0f32; TBLK.min(seq) * o_dim];
+        for t0 in (0..seq).step_by(TBLK) {
+            let n = TBLK.min(seq - t0);
+            let block = &mut logits[..n * o_dim];
+            // `hs` is time-major `[seq][H]`: channel stride 1, time stride H.
+            lstm::affine_rows(
+                self.backend,
+                &self.linear_w,
+                &self.linear_b,
+                h,
+                o_dim,
+                &hs[t0 * h..],
+                1,
+                h,
+                n,
+                block,
+            );
             // Vectorised in place, not one `f32::tanh` (a full libm call) per
             // of the up to 1024 moves at every one of up to 350 timesteps:
             // measured as ~10 ms/read of scalar tanh calls alone, the same
             // order as the whole LSTM stack, before this (#331).
-            lstm::tanh_slice(self.backend, &mut logits);
-            let row = &mut out[t * self.n_score..(t + 1) * self.n_score];
-            for state in 0..self.n_states {
-                row[state * self.n_edges] = self.blank_score;
-                let moves = &logits[state * self.n_base..(state + 1) * self.n_base];
-                for (base, &m) in moves.iter().enumerate() {
-                    row[state * self.n_edges + 1 + base] = self.scale * m;
+            lstm::tanh_slice(self.backend, block);
+            for (r, logits_t) in block.chunks_exact(o_dim).enumerate() {
+                let t = t0 + r;
+                let row = &mut out[t * self.n_score..(t + 1) * self.n_score];
+                for state in 0..self.n_states {
+                    row[state * self.n_edges] = self.blank_score;
+                    let moves = &logits_t[state * self.n_base..(state + 1) * self.n_base];
+                    for (base, &m) in moves.iter().enumerate() {
+                        row[state * self.n_edges + 1 + base] = self.scale * m;
+                    }
                 }
             }
         }
     }
 
-    /// How many reads [`Self::encode_batch_into`] scores per pass at full
+    /// How many reads [`Self::encode_batch_slices`] scores per pass at full
     /// efficiency on this backend. See [`LstmBackend::preferred_batch`].
     pub fn preferred_batch(&self) -> usize {
         self.backend.preferred_batch()
@@ -553,6 +569,22 @@ impl Recognized {
         }
     }
 
+    /// [`Self::encode_batch_slices`] into one flat buffer: `out` is
+    /// `prepped.len() * t_len * n_score`, one read's scores after another in
+    /// [`Self::encode_into`]'s order. Test-only; production callers own a
+    /// buffer per read and use `encode_batch_slices`.
+    #[cfg(test)]
+    pub fn encode_batch_into(&self, prepped: &[&[f32]], out: &mut [f32]) {
+        let stride = self.t_len * self.n_score;
+        assert_eq!(
+            out.len(),
+            prepped.len() * stride,
+            "output is n * t_len * n_score"
+        );
+        let mut outs: Vec<&mut [f32]> = out.chunks_exact_mut(stride).collect();
+        self.encode_batch_slices(prepped, &mut outs);
+    }
+
     /// [`Self::encode_into`], `prepped.len()` reads at once — any count, not
     /// only `preferred_batch()`. Internally chunked into groups of
     /// `preferred_batch()` (a short tail included), the same convention
@@ -560,24 +592,26 @@ impl Recognized {
     /// caller does not need to know the backend's width, and the buffers
     /// below are sized for the widest group once and reused across chunks.
     ///
-    /// Every read in a chunk shares that chunk's LSTM weight-row loads, which
-    /// is where the single-read kernel's time goes (see
-    /// [`escapepod_signal::lstm`]). The convolutions and the linear head are
-    /// looped per read — plain GEMM work the compiler already vectorises, and
-    /// a small fraction of the stack's MACs (#331) — so the batching pays for
-    /// itself entirely in the recurrence. `out` is `prepped.len() * t_len *
-    /// n_score`, one read's scores after another in [`Self::encode_into`]'s
-    /// order.
-    pub fn encode_batch_into(&self, prepped: &[&[f32]], out: &mut [f32]) {
+    /// Every read in a chunk shares that chunk's LSTM weight-row loads. The
+    /// convolutions are looped per read; the input projections and the linear
+    /// head are time-blocked dense layers (`escapepod_signal::lstm::affine_rows`).
+    /// Read `i` is scored straight into `outs[i]` (each `t_len * n_score`
+    /// long, in [`Self::encode_into`]'s order) — for a caller that already
+    /// owns a buffer per read and would otherwise copy out of one flat
+    /// staging buffer (`CrfEncoder::encode_group`: ~12 MB per 8-read group).
+    pub fn encode_batch_slices(&self, prepped: &[&[f32]], outs: &mut [&mut [f32]]) {
         let n_total = prepped.len();
         for p in prepped {
             assert_eq!(p.len(), self.chunk, "encoder takes a chunk-sample window");
         }
-        assert_eq!(
-            out.len(),
-            n_total * self.t_len * self.n_score,
-            "output is n * t_len * n_score"
-        );
+        assert_eq!(outs.len(), n_total, "one output slice per read");
+        for o in outs.iter() {
+            assert_eq!(
+                o.len(),
+                self.t_len * self.n_score,
+                "output is t_len * n_score"
+            );
+        }
 
         let (h, g, seq) = (self.hidden, 4 * self.hidden, self.t_len);
         let batch = self.preferred_batch();
@@ -585,6 +619,7 @@ impl Recognized {
         let mut gates = vec![0.0f32; batch * g];
         let mut hs = vec![0.0f32; batch * seq * h];
 
+        let mut conv_scratch = ConvScratch::default();
         let mut done = 0usize;
         while done < n_total {
             let n = (n_total - done).min(batch);
@@ -593,7 +628,8 @@ impl Recognized {
                 .map(|p| {
                     let (mut cur, mut len, mut in_c) = (p.to_vec(), self.chunk, 1usize);
                     for conv in &self.convs {
-                        let (next, next_len) = conv1d_silu(&cur, in_c, len, conv);
+                        let (next, next_len) =
+                            conv1d_silu(&cur, in_c, len, conv, &mut conv_scratch);
                         cur = next;
                         len = next_len;
                         in_c = conv.out_c;
@@ -626,17 +662,15 @@ impl Recognized {
 
             for r in 0..n {
                 let hs_r = &hs[r * seq * h..(r + 1) * seq * h];
-                let out_r = &mut out[(done + r) * self.t_len * self.n_score
-                    ..(done + r + 1) * self.t_len * self.n_score];
-                self.linear_head(hs_r, out_r);
+                self.linear_head(hs_r, &mut *outs[done + r]);
             }
             done += n;
         }
     }
 
-    /// [`Self::encode_batch_into`], returning owned scores per read — used
+    /// `encode_batch_into`, returning owned scores per read — used
     /// only by tests; production callers (`CrfEncoder::encode_group`) go
-    /// through `encode_batch_into` directly to reuse their own buffers.
+    /// through `encode_batch_slices` directly to reuse their own buffers.
     #[cfg(test)]
     pub fn encode_batch(&self, prepped: &[&[f32]]) -> Vec<Vec<f32>> {
         let n = prepped.len();
@@ -645,6 +679,15 @@ impl Recognized {
         self.encode_batch_into(prepped, &mut flat);
         flat.chunks_exact(stride).map(<[f32]>::to_vec).collect()
     }
+}
+
+/// Per-call buffers for [`conv1d_silu`]'s zero-padded and polyphase copies of
+/// its input, reused across the three stages and the reads of a group instead
+/// of three fresh allocations per stage.
+#[derive(Default)]
+struct ConvScratch {
+    padded: Vec<f32>,
+    phases: Vec<f32>,
 }
 
 /// One 1-D convolution (symmetric zero padding, arbitrary stride) plus SiLU
@@ -676,11 +719,19 @@ impl Recognized {
 ///   contiguous slice: `ot * stride + kk = stride * (ot + kk / stride) + (kk
 ///   % stride)`, exactly `phase[kk % stride]` indexed at `ot + kk / stride`.
 ///   `stride == 1` skips this (already contiguous with `q = 0`, one phase).
-fn conv1d_silu(input: &[f32], in_c: usize, len: usize, conv: &ConvLayer) -> (Vec<f32>, usize) {
+fn conv1d_silu(
+    input: &[f32],
+    in_c: usize,
+    len: usize,
+    conv: &ConvLayer,
+    scratch: &mut ConvScratch,
+) -> (Vec<f32>, usize) {
     let padded_len = len + conv.pad_lo + conv.pad_hi;
     let out_len = (padded_len - conv.k) / conv.stride + 1;
     // Zero-pad each channel once so the accumulation below is branch-free.
-    let mut padded = vec![0.0f32; in_c * padded_len];
+    let padded = &mut scratch.padded;
+    padded.clear();
+    padded.resize(in_c * padded_len, 0.0);
     for ic in 0..in_c {
         let dst = &mut padded[ic * padded_len + conv.pad_lo..ic * padded_len + conv.pad_lo + len];
         dst.copy_from_slice(&input[ic * len..(ic + 1) * len]);
@@ -697,7 +748,9 @@ fn conv1d_silu(input: &[f32], in_c: usize, len: usize, conv: &ConvLayer) -> (Vec
     // one trivial phase equal to the channel itself, so the general path
     // below covers both without a separate branch on `stride`.
     let phase_len = padded_len.div_ceil(stride);
-    let mut phases = vec![0.0f32; in_c * stride * phase_len];
+    let phases = &mut scratch.phases;
+    phases.clear();
+    phases.resize(in_c * stride * phase_len, 0.0);
     for ic in 0..in_c {
         let padded_ch = &padded[ic * padded_len..(ic + 1) * padded_len];
         for r in 0..stride {
@@ -1715,6 +1768,59 @@ mod tests {
         let mut mismatched = spec.meta();
         mismatched.crf.blank_score = Some(spec.blank_score + 1.0);
         assert!(Recognized::from_proto(&proto, &mismatched, &layout).is_none());
+    }
+
+    /// The time-blocked linear head reproduces the per-timestep rank-1 loop it
+    /// replaced (the pre-#458 `linear_head`, kept here verbatim as the
+    /// reference) bit for bit, on every backend the machine has.
+    #[test]
+    fn linear_head_matches_the_rank_1_loop_bit_for_bit() {
+        let spec = Spec::default_spec();
+        let proto = build_proto(&spec, 17);
+        let (h, seq) = (spec.hidden, spec.t_len());
+        let mut state = 0xA5A5_1234_9E37_79B9u64;
+        let hs: Vec<f32> = (0..seq * h)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0) * 0.9
+            })
+            .collect();
+        for backend in LstmBackend::available() {
+            let net = Recognized::from_proto(&proto, &spec.meta(), &spec.layout())
+                .expect("recognised")
+                .with_backend(backend)
+                .unwrap();
+            let o_dim = net.n_states * net.n_base;
+            let mut want = vec![0.0f32; seq * net.n_score];
+            let mut logits = vec![0.0f32; o_dim];
+            for t in 0..seq {
+                let hv = &hs[t * h..(t + 1) * h];
+                logits.copy_from_slice(&net.linear_b);
+                for (&x, wr) in hv.iter().zip(net.linear_w.chunks_exact(o_dim)) {
+                    for (l, w) in logits.iter_mut().zip(wr) {
+                        *l += x * w;
+                    }
+                }
+                lstm::tanh_slice(net.backend, &mut logits);
+                let row = &mut want[t * net.n_score..(t + 1) * net.n_score];
+                for st in 0..net.n_states {
+                    row[st * net.n_edges] = net.blank_score;
+                    let moves = &logits[st * net.n_base..(st + 1) * net.n_base];
+                    for (base, &m) in moves.iter().enumerate() {
+                        row[st * net.n_edges + 1 + base] = net.scale * m;
+                    }
+                }
+            }
+            let mut got = vec![f32::NAN; seq * net.n_score];
+            net.linear_head(&hs, &mut got);
+            assert_eq!(
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{backend:?}"
+            );
+        }
     }
 
     /// Scoring reads in lockstep changes nothing about any read's scores: the
