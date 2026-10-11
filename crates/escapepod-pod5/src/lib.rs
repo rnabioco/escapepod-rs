@@ -58,6 +58,7 @@ pub use error::{Error, Result};
 pub use merge::{MergeOptions, MergePhase, MergeProgress, MergeResult, merge_files};
 pub use operations::{RepackOptions, RepackResult, repack_files};
 pub use progress::{Progress, ProgressCallback};
+pub use reader::NonUniformSignalBatch;
 pub use reader::ReadIndex;
 pub use reader::Reader;
 pub use reader::ReaderCache;
