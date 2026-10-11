@@ -39,7 +39,7 @@ mold = ">=2.4"
 # passthrough. `$CONDA_PREFIX` resolves to the active env prefix, so this works
 # uniformly across default/dev/python-test/gpu/… without hardcoding a path.
 [activation]
-env = { DORADO_VERSION = "1.4.0", DORADO_DIR = "$PIXI_PROJECT_ROOT/.pixi/tools", PATH = "$DORADO_DIR/dorado-$DORADO_VERSION-linux-x64/bin:$PATH", LD_PRELOAD = "$CONDA_PREFIX/lib/mold/mold-wrapper.so", MOLD_PATH = "$CONDA_PREFIX/bin/mold" }
+env = { DORADO_VERSION = "2.1.2", DORADO_DIR = "$PIXI_PROJECT_ROOT/.pixi/tools", PATH = "$DORADO_DIR/dorado-$DORADO_VERSION-linux-x64/bin:$PATH", LD_PRELOAD = "$CONDA_PREFIX/lib/mold/mold-wrapper.so", MOLD_PATH = "$CONDA_PREFIX/bin/mold" }
 
 [tasks]
 install-dorado = """

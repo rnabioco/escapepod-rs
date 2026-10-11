@@ -1268,3 +1268,9 @@ cargo build --release
 - Python-library benchmark (`benchmark_python.sh`): both `escapepod` and `pod5`
   in the `python-test` pixi env — `pixi run -e python-test maturin develop
   --release --manifest-path crates/escapepod-python/Cargo.toml`
+
+## dorado compatibility
+
+`benchmarks/dorado-compat/` is not a benchmark but a manual compatibility check (needs a GPU,
+dorado and real POD5s); see its README. It lives here because it is run by hand on the
+cluster like the harnesses above, and `tests/compat/` is a pytest suite for CI-able checks.
