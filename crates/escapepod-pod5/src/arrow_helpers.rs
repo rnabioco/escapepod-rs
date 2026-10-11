@@ -13,6 +13,7 @@ use arrow::datatypes::{
     Float32Type, Int16Type, TimestampMillisecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::record_batch::RecordBatch;
+use std::marker::PhantomData;
 
 /// Helper for extracting typed values from Arrow RecordBatches.
 ///
@@ -454,22 +455,22 @@ impl ReadColumns {
 /// type simply fails on every file written by pod5 0.3.46 and later. Resolving
 /// to this enum keeps both widths readable and hands callers a `u32` either
 /// way, which is what upstream's C++ `ReadData` now uses too.
-enum ChannelColumn<'a> {
+enum ChannelColumn {
     /// V3-V5 files.
-    U16(&'a UInt16Array),
+    U16(UInt16Array),
     /// V6 and later.
-    U32(&'a UInt32Array),
+    U32(UInt32Array),
 }
 
-impl<'a> ChannelColumn<'a> {
-    fn resolve(batch: &'a RecordBatch) -> Result<Self> {
+impl ChannelColumn {
+    fn resolve(batch: &RecordBatch) -> Result<Self> {
         let col = require_col(batch, "channel")?;
         if let Some(arr) = col.as_any().downcast_ref::<UInt32Array>() {
-            return Ok(Self::U32(arr));
+            return Ok(Self::U32(arr.clone()));
         }
         col.as_any()
             .downcast_ref::<UInt16Array>()
-            .map(Self::U16)
+            .map(|a| Self::U16(a.clone()))
             .ok_or_else(|| Error::InvalidField {
                 field: "channel".to_string(),
                 message: "Expected UInt32Array (POD5 V6) or UInt16Array (V3-V5)".to_string(),
@@ -498,43 +499,53 @@ impl<'a> ChannelColumn<'a> {
 ///
 /// Construct once per batch with `ReadsBatchView::new`, then call `read(row)`
 /// to extract a `ReadData` without re-doing column lookups or downcasts.
+///
+/// The view holds `Arc`-backed handles to the batch's columns rather than
+/// borrows of them, so it can live beside the batch it came from (as the
+/// `reads()` iterator needs) and outlive the `&RecordBatch` it was built from.
 pub struct ReadsBatchView<'a> {
     // V0
-    read_id: &'a FixedSizeBinaryArray,
-    signal: &'a ListArray,
-    read_number: &'a UInt32Array,
-    start: &'a UInt64Array,
-    median_before: &'a Float32Array,
+    read_id: FixedSizeBinaryArray,
+    signal: ListArray,
+    read_number: UInt32Array,
+    start: UInt64Array,
+    median_before: Float32Array,
     // V1
-    num_minknow_events: &'a UInt64Array,
-    tracked_scaling_scale: Option<&'a Float32Array>,
-    tracked_scaling_shift: Option<&'a Float32Array>,
-    predicted_scaling_scale: Option<&'a Float32Array>,
-    predicted_scaling_shift: Option<&'a Float32Array>,
-    num_reads_since_mux_change: Option<&'a UInt32Array>,
-    time_since_mux_change: Option<&'a Float32Array>,
+    num_minknow_events: UInt64Array,
+    tracked_scaling_scale: Option<Float32Array>,
+    tracked_scaling_shift: Option<Float32Array>,
+    predicted_scaling_scale: Option<Float32Array>,
+    predicted_scaling_shift: Option<Float32Array>,
+    num_reads_since_mux_change: Option<UInt32Array>,
+    time_since_mux_change: Option<Float32Array>,
     // V2
-    num_samples: &'a UInt64Array,
+    num_samples: UInt64Array,
     // V3 (widened to uint32 in V6)
-    channel: ChannelColumn<'a>,
-    well: &'a UInt8Array,
-    pore_type_keys: &'a Int16Array,
+    channel: ChannelColumn,
+    well: UInt8Array,
+    pore_type_keys: Int16Array,
     /// Pre-built `PoreType` per unique pore-type dictionary value, indexed
     /// by the dictionary key. Per-row `read()` calls clone a `PoreType`
     /// out of here — refcount-only on the underlying `Arc<str>`, no
     /// allocation per read.
     pore_type_values: Vec<PoreType>,
-    calibration_offset: &'a Float32Array,
-    calibration_scale: &'a Float32Array,
-    end_reason_keys: &'a Int16Array,
-    end_reason_values: &'a StringArray,
-    end_reason_forced: &'a BooleanArray,
-    run_info_keys: &'a Int16Array,
+    calibration_offset: Float32Array,
+    calibration_scale: Float32Array,
+    end_reason_keys: Int16Array,
+    /// The dictionary's labels, kept for [`Self::end_reason_dict`].
+    end_reason_labels: StringArray,
+    /// `end_reason_labels` parsed once, indexed by the dictionary key — the
+    /// `EndReason` counterpart of `pore_type_values`, so a row costs an index
+    /// instead of a string parse.
+    end_reason_values: Vec<EndReason>,
+    end_reason_forced: BooleanArray,
+    run_info_keys: Int16Array,
     // V4
-    open_pore_level: Option<&'a Float32Array>,
+    open_pore_level: Option<Float32Array>,
     // V5
-    expected_open_pore_level: Option<&'a Float32Array>,
-    selected_read_level: Option<&'a Float32Array>,
+    expected_open_pore_level: Option<Float32Array>,
+    selected_read_level: Option<Float32Array>,
+    _batch: PhantomData<&'a RecordBatch>,
 }
 
 impl<'a> ReadsBatchView<'a> {
@@ -543,26 +554,39 @@ impl<'a> ReadsBatchView<'a> {
     /// fields differently — the actual column is resolved here, so per-row
     /// extraction never needs to retry.
     pub fn new(batch: &'a RecordBatch, try_alternate_field_names: bool) -> Result<Self> {
+        Self::from_batch(batch, try_alternate_field_names)
+    }
+
+    /// [`Self::new`] without tying the view to the borrow of `batch`: the view
+    /// clones the columns' `Arc` handles, so it holds nothing of `batch`.
+    pub(crate) fn from_batch(
+        batch: &RecordBatch,
+        try_alternate_field_names: bool,
+    ) -> Result<ReadsBatchView<'a>> {
+        fn req<T: Array + Clone + 'static>(batch: &RecordBatch, name: &str, ty: &str) -> Result<T> {
+            require_typed::<T>(batch, name, ty).cloned()
+        }
+        fn opt<T: Array + Clone + 'static>(batch: &RecordBatch, name: &str) -> Option<T> {
+            optional_typed::<T>(batch, name).cloned()
+        }
+
         let start = if try_alternate_field_names {
-            optional_typed::<UInt64Array>(batch, "start_sample")
-                .or_else(|| optional_typed::<UInt64Array>(batch, "start"))
+            opt::<UInt64Array>(batch, "start_sample")
+                .or_else(|| opt::<UInt64Array>(batch, "start"))
                 .ok_or_else(|| Error::MissingField("start_sample/start".to_string()))?
         } else {
-            require_typed::<UInt64Array>(batch, "start", "UInt64Array")?
+            req::<UInt64Array>(batch, "start", "UInt64Array")?
         };
 
         let open_pore_level = if try_alternate_field_names {
-            optional_typed::<Float32Array>(batch, "predicted_scaling_open_pore_level")
-                .or_else(|| optional_typed::<Float32Array>(batch, "open_pore_level"))
+            opt::<Float32Array>(batch, "predicted_scaling_open_pore_level")
+                .or_else(|| opt::<Float32Array>(batch, "open_pore_level"))
         } else {
-            optional_typed::<Float32Array>(batch, "open_pore_level")
+            opt::<Float32Array>(batch, "open_pore_level")
         };
 
-        let pore_type_dict = require_typed::<DictionaryArray<Int16Type>>(
-            batch,
-            "pore_type",
-            "DictionaryArray<Int16>",
-        )?;
+        let pore_type_dict =
+            req::<DictionaryArray<Int16Type>>(batch, "pore_type", "DictionaryArray<Int16>")?;
         let pore_type_dict_values = downcast::<StringArray>(
             pore_type_dict.values().as_ref(),
             "pore_type",
@@ -572,82 +596,50 @@ impl<'a> ReadsBatchView<'a> {
             .map(|i| PoreType::from(pore_type_dict_values.value(i)))
             .collect();
 
-        let end_reason_dict = require_typed::<DictionaryArray<Int16Type>>(
-            batch,
-            "end_reason",
-            "DictionaryArray<Int16>",
-        )?;
-        let end_reason_values = downcast::<StringArray>(
+        let end_reason_dict =
+            req::<DictionaryArray<Int16Type>>(batch, "end_reason", "DictionaryArray<Int16>")?;
+        let end_reason_labels = downcast::<StringArray>(
             end_reason_dict.values().as_ref(),
             "end_reason",
             "String dictionary values",
-        )?;
+        )?
+        .clone();
+        let end_reason_values: Vec<EndReason> = (0..end_reason_labels.len())
+            .map(|i| end_reason_labels.value(i).parse().unwrap_or_default())
+            .collect();
 
-        let run_info_dict = require_typed::<DictionaryArray<Int16Type>>(
-            batch,
-            "run_info",
-            "DictionaryArray<Int16>",
-        )?;
+        let run_info_dict =
+            req::<DictionaryArray<Int16Type>>(batch, "run_info", "DictionaryArray<Int16>")?;
 
         Ok(ReadsBatchView {
-            read_id: require_typed::<FixedSizeBinaryArray>(
-                batch,
-                "read_id",
-                "FixedSizeBinaryArray",
-            )?,
-            signal: require_typed::<ListArray>(batch, "signal", "ListArray")?,
-            read_number: require_typed::<UInt32Array>(batch, "read_number", "UInt32Array")?,
+            read_id: req::<FixedSizeBinaryArray>(batch, "read_id", "FixedSizeBinaryArray")?,
+            signal: req::<ListArray>(batch, "signal", "ListArray")?,
+            read_number: req::<UInt32Array>(batch, "read_number", "UInt32Array")?,
             start,
-            median_before: require_typed::<Float32Array>(batch, "median_before", "Float32Array")?,
-            num_minknow_events: require_typed::<UInt64Array>(
-                batch,
-                "num_minknow_events",
-                "UInt64Array",
-            )?,
-            tracked_scaling_scale: optional_typed::<Float32Array>(batch, "tracked_scaling_scale"),
-            tracked_scaling_shift: optional_typed::<Float32Array>(batch, "tracked_scaling_shift"),
-            predicted_scaling_scale: optional_typed::<Float32Array>(
-                batch,
-                "predicted_scaling_scale",
-            ),
-            predicted_scaling_shift: optional_typed::<Float32Array>(
-                batch,
-                "predicted_scaling_shift",
-            ),
-            num_reads_since_mux_change: optional_typed::<UInt32Array>(
-                batch,
-                "num_reads_since_mux_change",
-            ),
-            time_since_mux_change: optional_typed::<Float32Array>(batch, "time_since_mux_change"),
-            num_samples: require_typed::<UInt64Array>(batch, "num_samples", "UInt64Array")?,
+            median_before: req::<Float32Array>(batch, "median_before", "Float32Array")?,
+            num_minknow_events: req::<UInt64Array>(batch, "num_minknow_events", "UInt64Array")?,
+            tracked_scaling_scale: opt::<Float32Array>(batch, "tracked_scaling_scale"),
+            tracked_scaling_shift: opt::<Float32Array>(batch, "tracked_scaling_shift"),
+            predicted_scaling_scale: opt::<Float32Array>(batch, "predicted_scaling_scale"),
+            predicted_scaling_shift: opt::<Float32Array>(batch, "predicted_scaling_shift"),
+            num_reads_since_mux_change: opt::<UInt32Array>(batch, "num_reads_since_mux_change"),
+            time_since_mux_change: opt::<Float32Array>(batch, "time_since_mux_change"),
+            num_samples: req::<UInt64Array>(batch, "num_samples", "UInt64Array")?,
             channel: ChannelColumn::resolve(batch)?,
-            well: require_typed::<UInt8Array>(batch, "well", "UInt8Array")?,
-            pore_type_keys: pore_type_dict.keys(),
+            well: req::<UInt8Array>(batch, "well", "UInt8Array")?,
+            pore_type_keys: pore_type_dict.keys().clone(),
             pore_type_values,
-            calibration_offset: require_typed::<Float32Array>(
-                batch,
-                "calibration_offset",
-                "Float32Array",
-            )?,
-            calibration_scale: require_typed::<Float32Array>(
-                batch,
-                "calibration_scale",
-                "Float32Array",
-            )?,
-            end_reason_keys: end_reason_dict.keys(),
+            calibration_offset: req::<Float32Array>(batch, "calibration_offset", "Float32Array")?,
+            calibration_scale: req::<Float32Array>(batch, "calibration_scale", "Float32Array")?,
+            end_reason_keys: end_reason_dict.keys().clone(),
+            end_reason_labels,
             end_reason_values,
-            end_reason_forced: require_typed::<BooleanArray>(
-                batch,
-                "end_reason_forced",
-                "BooleanArray",
-            )?,
-            run_info_keys: run_info_dict.keys(),
+            end_reason_forced: req::<BooleanArray>(batch, "end_reason_forced", "BooleanArray")?,
+            run_info_keys: run_info_dict.keys().clone(),
             open_pore_level,
-            expected_open_pore_level: optional_typed::<Float32Array>(
-                batch,
-                "expected_open_pore_level",
-            ),
-            selected_read_level: optional_typed::<Float32Array>(batch, "selected_read_level"),
+            expected_open_pore_level: opt::<Float32Array>(batch, "expected_open_pore_level"),
+            selected_read_level: opt::<Float32Array>(batch, "selected_read_level"),
+            _batch: PhantomData,
         })
     }
 
@@ -667,8 +659,8 @@ impl<'a> ReadsBatchView<'a> {
 
     /// The distinct `end_reason` dictionary labels for this batch.
     pub fn end_reason_dict(&self) -> Vec<String> {
-        (0..self.end_reason_values.len())
-            .map(|i| self.end_reason_values.value(i).to_string())
+        (0..self.end_reason_labels.len())
+            .map(|i| self.end_reason_labels.value(i).to_string())
             .collect()
     }
 
@@ -680,7 +672,16 @@ impl<'a> ReadsBatchView<'a> {
     /// Confirm a `.p5s` locator points at the read it claims to, before this
     /// row is used. See [`verify_index_row`].
     pub fn verify_row(&self, requested: Uuid, batch_idx: usize, row: usize) -> Result<()> {
-        verify_index_row(self.read_id, requested, batch_idx, row)
+        verify_index_row(&self.read_id, requested, batch_idx, row)
+    }
+
+    /// The row's `end_reason`, via the per-dictionary parse done at
+    /// construction. A key outside the dictionary yields the default, as the
+    /// per-row parse it replaces did.
+    #[inline]
+    fn end_reason_at(&self, row: usize) -> EndReason {
+        let key = self.end_reason_keys.value(row) as usize;
+        self.end_reason_values.get(key).copied().unwrap_or_default()
     }
 
     /// Build a `ReadData` for one row from the resolved columns.
@@ -693,17 +694,7 @@ impl<'a> ReadsBatchView<'a> {
                 .unwrap_or_default()
         };
 
-        let end_reason = {
-            let key = self.end_reason_keys.value(row) as usize;
-            if key < self.end_reason_values.len() {
-                self.end_reason_values
-                    .value(key)
-                    .parse()
-                    .unwrap_or_default()
-            } else {
-                EndReason::default()
-            }
-        };
+        let end_reason = self.end_reason_at(row);
 
         let run_info_index = self.run_info_keys.value(row) as u32;
 
@@ -737,36 +728,48 @@ impl<'a> ReadsBatchView<'a> {
             num_minknow_events: self.num_minknow_events.value(row),
             tracked_scaling_scale: self
                 .tracked_scaling_scale
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(1.0),
             tracked_scaling_shift: self
                 .tracked_scaling_shift
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(0.0),
             predicted_scaling_scale: self
                 .predicted_scaling_scale
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(1.0),
             predicted_scaling_shift: self
                 .predicted_scaling_shift
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(0.0),
             num_reads_since_mux_change: self
                 .num_reads_since_mux_change
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(0),
             time_since_mux_change: self
                 .time_since_mux_change
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(0.0),
             num_samples: self.num_samples.value(row),
-            open_pore_level: self.open_pore_level.map(|a| a.value(row)).unwrap_or(0.0),
+            open_pore_level: self
+                .open_pore_level
+                .as_ref()
+                .map(|a| a.value(row))
+                .unwrap_or(0.0),
             expected_open_pore_level: self
                 .expected_open_pore_level
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(0.0),
             selected_read_level: self
                 .selected_read_level
+                .as_ref()
                 .map(|a| a.value(row))
                 .unwrap_or(0.0),
             signal_rows,
@@ -797,16 +800,7 @@ impl<'a> ReadsBatchView<'a> {
                     .cloned()
                     .unwrap_or_default(),
             );
-            let ekey = self.end_reason_keys.value(row) as usize;
-            cols.end_reason
-                .push(if ekey < self.end_reason_values.len() {
-                    self.end_reason_values
-                        .value(ekey)
-                        .parse()
-                        .unwrap_or_default()
-                } else {
-                    EndReason::default()
-                });
+            cols.end_reason.push(self.end_reason_at(row));
             cols.end_reason_forced
                 .push(self.end_reason_forced.value(row));
         }
@@ -831,50 +825,55 @@ impl<'a> ReadsBatchView<'a> {
 
         extend_opt_f32(
             &mut cols.tracked_scaling_scale,
-            self.tracked_scaling_scale,
+            self.tracked_scaling_scale.as_ref(),
             n,
             1.0,
         );
         extend_opt_f32(
             &mut cols.tracked_scaling_shift,
-            self.tracked_scaling_shift,
+            self.tracked_scaling_shift.as_ref(),
             n,
             0.0,
         );
         extend_opt_f32(
             &mut cols.predicted_scaling_scale,
-            self.predicted_scaling_scale,
+            self.predicted_scaling_scale.as_ref(),
             n,
             1.0,
         );
         extend_opt_f32(
             &mut cols.predicted_scaling_shift,
-            self.predicted_scaling_shift,
+            self.predicted_scaling_shift.as_ref(),
             n,
             0.0,
         );
         extend_opt_u32(
             &mut cols.num_reads_since_mux_change,
-            self.num_reads_since_mux_change,
+            self.num_reads_since_mux_change.as_ref(),
             n,
             0,
         );
         extend_opt_f32(
             &mut cols.time_since_mux_change,
-            self.time_since_mux_change,
+            self.time_since_mux_change.as_ref(),
             n,
             0.0,
         );
-        extend_opt_f32(&mut cols.open_pore_level, self.open_pore_level, n, 0.0);
+        extend_opt_f32(
+            &mut cols.open_pore_level,
+            self.open_pore_level.as_ref(),
+            n,
+            0.0,
+        );
         extend_opt_f32(
             &mut cols.expected_open_pore_level,
-            self.expected_open_pore_level,
+            self.expected_open_pore_level.as_ref(),
             n,
             0.0,
         );
         extend_opt_f32(
             &mut cols.selected_read_level,
-            self.selected_read_level,
+            self.selected_read_level.as_ref(),
             n,
             0.0,
         );
@@ -1007,6 +1006,52 @@ mod tests {
             .collect();
 
         (per_row, cols.channel, extracted)
+    }
+
+    /// The view and the by-name extractor agree on **every** field, on the
+    /// minimal batch (every optional V1/V4/V5 column absent, so each takes its
+    /// default) at both channel widths. `reads()` runs the view; this pins it
+    /// to the extractor it replaced (#467).
+    #[test]
+    fn view_matches_by_name_extractor_on_every_field() {
+        for narrow in [false, true] {
+            let batch = reads_batch(&[1, 2675, 60_000, 7], narrow);
+            let view = ReadsBatchView::new(&batch, false).unwrap();
+            for row in 0..batch.num_rows() {
+                let ext = BatchFieldExtractor::new(&batch, row);
+                let want = ReadData {
+                    read_id: ext.get_uuid("read_id").unwrap(),
+                    read_number: ext.get_u32("read_number").unwrap(),
+                    start_sample: ext.get_u64("start").unwrap(),
+                    channel: ext.get_u32_or_u16("channel").unwrap(),
+                    well: ext.get_u8("well").unwrap(),
+                    pore_type: ext.get_dict_string("pore_type").unwrap().into(),
+                    calibration_offset: ext.get_f32("calibration_offset").unwrap(),
+                    calibration_scale: ext.get_f32("calibration_scale").unwrap(),
+                    median_before: ext.get_f32("median_before").unwrap(),
+                    end_reason: ext.get_dict_string("end_reason").unwrap().parse().unwrap(),
+                    end_reason_forced: ext.get_bool("end_reason_forced").unwrap(),
+                    run_info_index: ext.get_dict_index("run_info").unwrap() as u32,
+                    num_minknow_events: ext.get_u64("num_minknow_events").unwrap(),
+                    tracked_scaling_scale: 1.0,
+                    tracked_scaling_shift: 0.0,
+                    predicted_scaling_scale: 1.0,
+                    predicted_scaling_shift: 0.0,
+                    num_reads_since_mux_change: 0,
+                    time_since_mux_change: 0.0,
+                    num_samples: ext.get_u64("num_samples").unwrap(),
+                    open_pore_level: 0.0,
+                    expected_open_pore_level: 0.0,
+                    selected_read_level: 0.0,
+                    signal_rows: ext.get_signal_rows().unwrap(),
+                };
+                assert_eq!(
+                    format!("{:?}", view.read(row).unwrap()),
+                    format!("{want:?}"),
+                    "row {row}, narrow={narrow}"
+                );
+            }
+        }
     }
 
     /// POD5 V6 widened `channel` to `uint32`; values above `u16::MAX` must

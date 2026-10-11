@@ -1,6 +1,6 @@
 //! Iterator over reads in a POD5 file.
 
-use crate::arrow_helpers::BatchFieldExtractor;
+use crate::arrow_helpers::{BatchFieldExtractor, ReadsBatchView};
 use crate::error::{Error, Result};
 use crate::types::ReadData;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
@@ -16,6 +16,11 @@ pub struct ReadIterator<'a> {
     pub(super) arrow_reader: ArrowFileReader<Cursor<&'a [u8]>>,
     pub(super) current_batch: Option<RecordBatch>,
     pub(super) batch_row: usize,
+    /// Columns of `current_batch`, resolved once when the batch is loaded
+    /// rather than by name for every row. `None` when the batch could not be
+    /// resolved (a column missing or mistyped): rows then take the per-row
+    /// extractor, which reports exactly the error it always did.
+    pub(super) view: Option<ReadsBatchView<'a>>,
 }
 
 impl<'a> Iterator for ReadIterator<'a> {
@@ -32,6 +37,7 @@ impl<'a> Iterator for ReadIterator<'a> {
             if need_new_batch {
                 match self.arrow_reader.next() {
                     Some(Ok(batch)) => {
+                        self.view = ReadsBatchView::from_batch(&batch, false).ok();
                         self.current_batch = Some(batch);
                         self.batch_row = 0;
                     }
@@ -44,15 +50,12 @@ impl<'a> Iterator for ReadIterator<'a> {
             if let Some(batch) = &self.current_batch {
                 let row = self.batch_row;
                 self.batch_row += 1;
-                return Some(Self::read_from_batch(batch, row));
+                return Some(match &self.view {
+                    Some(view) => view.read(row),
+                    None => extract_read_from_batch(batch, row, false),
+                });
             }
         }
-    }
-}
-
-impl<'a> ReadIterator<'a> {
-    fn read_from_batch(batch: &RecordBatch, row: usize) -> Result<ReadData> {
-        extract_read_from_batch(batch, row, false)
     }
 }
 
