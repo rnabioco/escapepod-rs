@@ -14,6 +14,9 @@
 //! running escapepod's refinement, so both tools operate in the same coordinate
 //! space and can be compared directly.
 
+// Reads back a few-record fixture BAM; a BGZF worker pool is for scans.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;

@@ -5,6 +5,8 @@
 //! both `--kmer-table` and `--kmer-model` (rnabioco/escapepod-rs#409).
 
 #![cfg(feature = "experimental")]
+// Reads back a few-record fixture BAM; a BGZF worker pool is for scans.
+#![allow(clippy::disallowed_methods)]
 
 use noodles_bam as bam;
 use noodles_sam::header::record::value::map::program::tag as pg_tag;

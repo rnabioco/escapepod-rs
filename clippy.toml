@@ -9,4 +9,5 @@ disallowed-methods = [
     { path = "std::env::var", reason = "use escapepod_pod5::env::{flag, positive_usize, usize_allow_zero} for ESCAPEPOD_* switches/knobs; allowed only in escapepod-pod5/src/env.rs and the documented exceptions (*_BACKEND caps, *_CACHE paths, ESCAPEPOD_CRF_GPU_DECODE/ZEROCOPY, bench-only knobs, third-party/cargo-provided vars)" },
     { path = "std::env::var_os", reason = "use escapepod_pod5::env::{flag, positive_usize, usize_allow_zero} for ESCAPEPOD_* switches/knobs; allowed only in escapepod-pod5/src/env.rs and the documented exceptions (*_BACKEND caps, *_CACHE paths, ESCAPEPOD_CRF_GPU_DECODE/ZEROCOPY, bench-only knobs, third-party/cargo-provided vars)" },
     { path = "noodles_bgzf::io::MultithreadedReader::new", reason = "one worker no matter the name; use with_worker_count sized from the rayon pool" },
+    { path = "noodles_bam::io::Reader::new", reason = "inflates every BGZF block on the calling thread; build the reader from noodles_bgzf::io::MultithreadedReader::with_worker_count sized from the rayon pool via bam::io::Reader::from" },
 ]
