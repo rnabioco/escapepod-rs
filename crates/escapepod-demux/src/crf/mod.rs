@@ -36,6 +36,9 @@ pub mod barcode;
 #[cfg(feature = "crf-decode")]
 pub mod encoder;
 
+/// Register-tiled convolution kernels for `encoder_native`.
+#[cfg(all(feature = "crf-decode", target_arch = "x86_64"))]
+mod conv_tile;
 /// The native CPU forward pass `encoder` runs when the export matches
 /// (`encoder_native::Recognized::from_proto`); private because `encoder` is
 /// the only caller, `CrfEncoder` is the crate's one public entry point to it,
