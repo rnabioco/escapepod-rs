@@ -8,7 +8,7 @@ use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::{
-    check_output_not_input, check_output_writable, collect_pod5_inputs, warn_if_not_portable,
+    check_output_not_input, check_output_writable, collect_pod5_inputs, warn_not_portable,
 };
 use escapepod_signal::Durability;
 use escapepod_signal::operations::{
@@ -44,7 +44,6 @@ pub fn run(
     // directories has to name them all in one call or the read-ID list is
     // filtered against only part of the run.
     let files = collect_pod5_inputs(&input)?;
-    warn_if_not_portable(&files);
     check_output_not_input(&output, &files)?;
     let is_directory = files.len() > 1;
 
@@ -236,6 +235,13 @@ pub fn run(
     let result = filter_files_with_criteria(&files, &output, &criteria, options, Some(progress))?;
 
     filter_bar.finish_with_message(format!("{} matched", result.matched_reads));
+
+    // Reported from the readers the filter itself opened: the check used to be
+    // a separate serial pass that opened and walked every input before the
+    // filter opened and walked them again.
+    for (path, bad) in &result.nonuniform_inputs {
+        warn_not_portable(path, bad);
+    }
 
     let percentage = result.match_percentage();
     info!(

@@ -17,6 +17,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::read_index::ReadIndex;
 use super::read_iter::{ReadIterator, extract_read_from_batch};
@@ -38,6 +39,20 @@ pub struct SignalCalibration {
 
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
+
+/// How many signal footers this process has parsed (one per [`Reader`] that
+/// needed one; each is the per-batch header walk the cold open pays for).
+static SIGNAL_FOOTER_PARSES: AtomicUsize = AtomicUsize::new(0);
+
+/// Signal footers parsed so far in this process.
+///
+/// A test hook, not API: it lets a test assert that a command resolves a
+/// file's signal geometry once, because the cost it guards is invisible in
+/// the output and shows only on a cold network filesystem (rnabioco/escapepod-rs#465).
+#[doc(hidden)]
+pub fn signal_footer_parses() -> usize {
+    SIGNAL_FOOTER_PARSES.load(Ordering::Relaxed)
+}
 
 /// A signal batch whose row count breaks the file's stride.
 ///
@@ -282,6 +297,7 @@ impl Reader {
                 let end = start + embedded.length as usize;
                 let slice = self.mmap.get(start..end)?;
                 let known = self.sidecar_signal_batch_rows();
+                SIGNAL_FOOTER_PARSES.fetch_add(1, Ordering::Relaxed);
                 let footer = ArrowIpcFooter::parse_with_row_counts(slice, known.as_deref()).ok()?;
                 if footer.record_batches.is_empty() || footer.total_rows == 0 {
                     return None;

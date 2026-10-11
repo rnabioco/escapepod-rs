@@ -17,7 +17,6 @@ use escapepod_signal::parse_uuid_flexible;
 use noodles_bam as bam;
 use noodles_core::Region;
 use std::collections::HashSet;
-use std::io::BufReader;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -198,6 +197,14 @@ fn read_ids_from_bam(
     Ok((ids, records_scanned))
 }
 
+/// BGZF inflate workers for a full scan: half the rayon pool, at least one.
+///
+/// `MultithreadedReader::new` is ONE worker whatever the name suggests.
+/// `-t/--threads` sizes the pool, so the flag governs this too.
+fn bgzf_workers() -> std::num::NonZero<usize> {
+    std::num::NonZero::new(rayon::current_num_threads().div_ceil(2).max(1)).expect("at least one")
+}
+
 /// Read IDs from BAM using indexed region query.
 fn read_ids_from_bam_region(
     bam_path: &PathBuf,
@@ -260,7 +267,11 @@ fn read_ids_from_bam_full(
     records_scanned: &mut u64,
 ) -> anyhow::Result<()> {
     let file = std::fs::File::open(bam_path)?;
-    let mut reader = bam::io::Reader::new(BufReader::new(file));
+    // Inflate on a worker pool: a full scan is one cursor parsing records, and
+    // `bam::io::Reader::new` would inflate every BGZF block on that same
+    // thread. Half the rayon pool, as `escapepod-classify`'s scan does.
+    let decoder = noodles_bgzf::io::MultithreadedReader::with_worker_count(bgzf_workers(), file);
+    let mut reader = bam::io::Reader::from(decoder);
 
     // The header must be consumed before records can be read.
     reader.read_header()?;

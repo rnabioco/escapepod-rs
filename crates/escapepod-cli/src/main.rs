@@ -647,6 +647,12 @@ fn requested_threads(command: &Commands) -> Option<usize> {
 
         Commands::Index { threads, .. } => *threads,
 
+        Commands::Summary(args) => args.threads,
+        Commands::Inspect {
+            command: InspectCommands::Summary { threads, .. },
+        } => *threads,
+        Commands::Inspect { .. } => None,
+
         #[cfg(feature = "experimental")]
         Commands::Annotate { threads, .. } => *threads,
         #[cfg(not(feature = "experimental"))]
@@ -669,10 +675,7 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         Commands::Classify { .. } => None,
 
         // No `--threads` flag; these run on the default pool.
-        Commands::View { .. }
-        | Commands::Inspect { .. }
-        | Commands::Summary(_)
-        | Commands::Repack { .. } => None,
+        Commands::View { .. } | Commands::Repack { .. } => None,
     }
 }
 
@@ -688,6 +691,10 @@ Examples:
         /// Input POD5 file or directory
         #[arg(value_name = "INPUT")]
         input: PathBuf,
+
+        /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+        #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+        threads: Option<usize>,
     },
 
     /// List all read IDs in the file
@@ -850,7 +857,7 @@ fn main() -> anyhow::Result<()> {
         } => commands::view::run(input, include, exclude, ids, output, separator, no_header),
 
         Commands::Inspect { command } => match command {
-            InspectCommands::Summary { input } => commands::inspect::summary(input),
+            InspectCommands::Summary { input, threads: _ } => commands::inspect::summary(input),
             InspectCommands::Reads { input } => commands::inspect::reads(input),
             InspectCommands::Read { input, read_id } => commands::inspect::read(input, read_id),
         },

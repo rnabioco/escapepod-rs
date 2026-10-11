@@ -6,6 +6,8 @@
 //! generated from `escapepod_models.charging`).
 
 #![cfg(feature = "classify")]
+// These read back a few-record fixture BAM; a BGZF worker pool is for scans.
+#![allow(clippy::disallowed_methods)]
 
 use noodles_bam as bam;
 use noodles_sam::alignment::RecordBuf;

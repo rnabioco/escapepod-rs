@@ -5,7 +5,7 @@
 use crate::arrow_helpers::ReadsBatchView;
 use crate::arrow_ipc::ArrowIpcFooter;
 use crate::error::{Error, Result};
-use crate::reader::Reader;
+use crate::reader::{NonUniformSignalBatch, Reader};
 use crate::types::{EndReason, POD5_SIGNATURE, ReadData, RunInfoData, Uuid};
 use crate::utils::parse_uuid_flexible;
 use crate::utils::pod5_assembler::{
@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Criteria for filtering reads.
 #[derive(Debug, Clone, Default)]
@@ -131,6 +131,14 @@ pub struct FilterResult {
     pub read_errors: u64,
     /// Number of signal errors encountered.
     pub signal_errors: u64,
+    /// Inputs whose signal batches break the constant stride the official
+    /// `pod5` library and dorado assume, in input order (see
+    /// [`Reader::nonuniform_signal_batch`]).
+    ///
+    /// Found on the reader the filter already holds, from the signal footer it
+    /// already walked: a caller that wants to warn about portability no longer
+    /// needs a second open and a second walk of every file first.
+    pub nonuniform_inputs: Vec<(PathBuf, NonUniformSignalBatch)>,
 }
 
 impl FilterResult {
@@ -155,6 +163,8 @@ struct FileMetadata {
     matching_reads: Vec<ReadData>,
     /// Total number of reads in the file (for statistics).
     total_read_count: usize,
+    /// Set when the signal batches break the file's constant stride.
+    nonuniform: Option<NonUniformSignalBatch>,
 }
 
 /// Filter reads from POD5 files based on a set of read IDs.
@@ -207,6 +217,8 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
             let signal_bytes = reader.signal_table_bytes()?;
             let signal_footer = reader.signal_footer_for_bulk(signal_bytes)?.into_owned();
             let run_infos = reader.run_infos().to_vec();
+            // Answered from the footer cached just above, not a second walk.
+            let nonuniform = reader.nonuniform_signal_batch();
 
             // Fast path: when only filtering by UUID, use reads_by_ids()
             // to skip non-matching batches entirely.
@@ -251,6 +263,7 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
                 run_infos,
                 matching_reads,
                 total_read_count,
+                nonuniform,
             })
         })
         .collect();
@@ -278,11 +291,18 @@ pub fn filter_files_with_criteria<P: AsRef<Path> + Sync>(
 
     let matched = assemble_output(output_path.as_ref(), &sources, &options, progress.as_ref())?;
 
+    let nonuniform_inputs: Vec<(PathBuf, NonUniformSignalBatch)> = input_paths
+        .iter()
+        .zip(&file_metadata)
+        .filter_map(|(path, m)| m.nonuniform.map(|bad| (path.to_path_buf(), bad)))
+        .collect();
+
     Ok(FilterResult {
         total_reads: total_read_count,
         matched_reads: matched,
         read_errors: 0,
         signal_errors: 0,
+        nonuniform_inputs,
     })
 }
 
@@ -943,6 +963,7 @@ mod tests {
             matched_reads: 25,
             read_errors: 0,
             signal_errors: 0,
+            nonuniform_inputs: Vec::new(),
         };
         assert!((result.match_percentage() - 25.0).abs() < 0.001);
     }

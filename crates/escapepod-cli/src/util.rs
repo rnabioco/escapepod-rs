@@ -53,7 +53,7 @@ pub fn resolve_pod5_inputs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
     anyhow::bail!("Path does not exist: {}", path.display())
 }
 
-/// Warn about inputs that only escapepod can read correctly.
+/// Warn that an input only escapepod can read correctly.
 ///
 /// A POD5 whose signal batches break stride resolves fine here — this crate
 /// walks cumulative per-batch row counts — and mis-resolves in the official
@@ -62,28 +62,23 @@ pub fn resolve_pod5_inputs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// the basecaller (escapepod-rs#195), so it has to be said out loud at the
 /// point the file is used, not only when someone runs `inspect`.
 ///
-/// Costs one Arrow IPC footer parse per file (a few KB, no signal decode), and
-/// never fails the run: the data is readable here, it is the downstream tool
+/// Takes the finding rather than a path: the command already holds an open
+/// reader whose signal footer has been walked, and re-opening every input to
+/// ask the same question was a second serial cold walk (rnabioco/escapepod-rs#465).
+/// Never fails the run: the data is readable here, it is the downstream tool
 /// that will suffer.
-pub fn warn_if_not_portable(files: &[PathBuf]) {
-    for f in files {
-        let Ok(reader) = escapepod_signal::pod5::Reader::open(f) else {
-            continue; // a real open failure is reported by the caller
-        };
-        if let Some(bad) = reader.nonuniform_signal_batch() {
-            tracing::warn!(
-                "{}: signal batch {} has {} rows, expected {} — this file reads \
-                 correctly here, but the official pod5 library and dorado assume \
-                 a constant batch stride and will mis-resolve every signal index \
-                 after it (silently, in dorado's case). {} before basecalling.",
-                f.display(),
-                bad.index,
-                bad.rows,
-                bad.expected,
-                REWRITE_HINT,
-            );
-        }
-    }
+pub fn warn_not_portable(f: &Path, bad: &escapepod_signal::pod5::NonUniformSignalBatch) {
+    tracing::warn!(
+        "{}: signal batch {} has {} rows, expected {} — this file reads \
+         correctly here, but the official pod5 library and dorado assume \
+         a constant batch stride and will mis-resolve every signal index \
+         after it (silently, in dorado's case). {} before basecalling.",
+        f.display(),
+        bad.index,
+        bad.rows,
+        bad.expected,
+        REWRITE_HINT,
+    );
 }
 
 /// How to fix a non-uniform signal-batch stride. `escpod repack` only exists
