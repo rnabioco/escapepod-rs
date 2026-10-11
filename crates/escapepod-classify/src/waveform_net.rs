@@ -364,7 +364,7 @@ fn prod(shape: [usize; 2]) -> usize {
 /// zero row's own normalisation cannot perturb any real row's, since each row
 /// only reduces over its own axis. Pure and tract-independent so it is
 /// testable without the `cuda` feature.
-#[cfg(any(feature = "cuda", test))]
+#[cfg(test)]
 pub(crate) fn pack_batch(
     role: WaveformTensor,
     chunks: &[&Chunk],
@@ -372,8 +372,23 @@ pub(crate) fn pack_batch(
     batch: usize,
 ) -> Result<Vec<f32>> {
     let [rows, cols] = spec.tensor_shape(role);
+    let mut buf = vec![0.0f32; batch * rows * cols];
+    pack_batch_into(role, chunks, spec, &mut buf)?;
+    Ok(buf)
+}
+
+/// [`pack_batch`] into a caller-owned, already zero-filled buffer of
+/// `batch * rows * cols` values, so a caller that owns the destination (a
+/// tensor's own storage) pays one copy rather than two.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn pack_batch_into(
+    role: WaveformTensor,
+    chunks: &[&Chunk],
+    spec: &WaveformSpec,
+    buf: &mut [f32],
+) -> Result<()> {
+    let [rows, cols] = spec.tensor_shape(role);
     let cell = rows * cols;
-    let mut buf = vec![0.0f32; batch * cell];
     for (i, chunk) in chunks.iter().enumerate() {
         let data: &[f32] = match role {
             WaveformTensor::Signal => &chunk.signal,
@@ -389,7 +404,7 @@ pub(crate) fn pack_batch(
         }
         buf[i * cell..(i + 1) * cell].copy_from_slice(data);
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// The first `n_valid` values of a `[batch, 1]` output, as f64 logits —

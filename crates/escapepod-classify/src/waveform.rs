@@ -724,7 +724,15 @@ pub fn classify_reads_gpu(
         escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_WAVEFORM_GPU_PARITY_EVERY")
             .unwrap_or(64);
 
-    type Group<'r> = Vec<(&'r WaveformRead, Chunk)>;
+    // What crosses the channel is the batch's tensors, already packed on the
+    // producer side (`WaveformNetGpu::pack`), not the chunks: the GPU-submitting
+    // thread then does nothing but the call. The chunks themselves travel only
+    // for the groups the parity check re-scores on the CPU.
+    struct Group<'r> {
+        reads: Vec<&'r WaveformRead>,
+        packed: crate::waveform_net_gpu::PackedBatch,
+        parity_chunks: Option<Vec<Chunk>>,
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel::<Group>(groups_in_flight);
 
     let mut stats = ClassifyStats::default();
@@ -739,49 +747,81 @@ pub fn classify_reads_gpu(
     // the lock is not on any hot path.
     let parity = std::sync::Arc::new(std::sync::Mutex::new(GpuParitySummary::default()));
 
-    let gpu_calls = std::thread::scope(|scope| -> Result<Vec<ReadCall>> {
-        // The only thread that calls `gpu.logits()`, so GPU calls stay
-        // sequential exactly as before — only now overlapped with the next
-        // group's CPU prep instead of blocking it. The clone lives inside
-        // the `spawn` argument itself (rather than as its own `let` above
-        // it) so only the clone, never the outer `parity`, is captured by
-        // `move`.
-        let gpu_handle = scope.spawn({
+    // The parity re-score of a checked group runs as a rayon task spawned from
+    // the GPU thread (#478), not on it: a failure lands here and in `failed`,
+    // which the GPU thread polls so a refused run still stops promptly.
+    let parity_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let (parity_err_ref, failed_ref) = (&parity_err, &failed);
+
+    let gpu_calls = rayon::in_place_scope(|rs| {
+        std::thread::scope(|scope| -> Result<Vec<ReadCall>> {
+            // The only thread that calls `gpu.logits()`, so GPU calls stay
+            // sequential exactly as before — only now overlapped with the next
+            // group's CPU prep instead of blocking it. The clone lives inside
+            // the `spawn` argument itself (rather than as its own `let` above
+            // it) so only the clone, never the outer `parity`, is captured by
+            // `move`.
+            let gpu_handle = scope.spawn({
             let parity = std::sync::Arc::clone(&parity);
             move || -> Result<Vec<ReadCall>> {
                 let mut out = Vec::new();
                 let mut n_group = 0usize;
                 while let Ok(group) = rx.recv() {
-                    let refs: Vec<&Chunk> = group.iter().map(|(_, c)| c).collect();
-                    let logits = gpu.logits(&refs, spec)?;
+                    if failed_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let Group {
+                        reads,
+                        packed,
+                        parity_chunks,
+                    } = group;
+                    let logits = gpu.logits_packed(packed)?;
                     // The GPU's answers are checked against the CPU's on real
-                    // reads before any of them is kept (#416): the first group
-                    // always, then one in every `parity_every`. A disagreement
-                    // ends the GPU run with `GpuRefused` — the caller decides
-                    // whether that means a CPU rerun or an error. The count
-                    // and worst `|ΔP|` are kept rather than only logged
-                    // (#425), so a caller can attach this run's own evidence
-                    // to its output.
-                    if n_group.is_multiple_of(parity_every) {
-                        let cpu: Vec<f64> = refs
-                            .par_iter()
-                            .map(|c| cpu_fallback.logit(c, spec))
-                            .collect::<Result<_>>()?;
-                        let worst = crate::waveform_net_gpu::check_parity(
-                            &logits,
-                            &cpu,
-                            &format!("GPU/CPU parity check on real batch {n_group}"),
-                        )?;
-                        tracing::debug!(
-                            "GPU/CPU parity on batch {n_group}: max |dP| = {worst:.2e} over {} reads",
-                            refs.len()
-                        );
-                        let mut p = parity.lock().expect("gpu parity mutex poisoned");
-                        p.checked_batches += 1;
-                        p.worst_abs_dp = p.worst_abs_dp.max(worst);
+                    // reads (#416): the first group always, then one in every
+                    // `parity_every`. A disagreement ends the GPU run with
+                    // `GpuRefused` -- the caller decides whether that means a
+                    // CPU rerun or an error. The count and worst `|dP|` are
+                    // kept rather than only logged (#425), so a caller can
+                    // attach this run's own evidence to its output. The
+                    // re-score is a rayon task so this thread goes straight
+                    // back to the next group; the run's output is released
+                    // only after every such task has finished.
+                    if let Some(chunks) = parity_chunks {
+                        let gpu_logits = logits.clone();
+                        let parity = std::sync::Arc::clone(&parity);
+                        let idx = n_group;
+                        rs.spawn(move |_| {
+                            let check = || -> Result<()> {
+                                let cpu: Vec<f64> = chunks
+                                    .par_iter()
+                                    .map(|c| cpu_fallback.logit(c, spec))
+                                    .collect::<Result<_>>()?;
+                                let worst = crate::waveform_net_gpu::check_parity(
+                                    &gpu_logits,
+                                    &cpu,
+                                    &format!("GPU/CPU parity check on real batch {idx}"),
+                                )?;
+                                tracing::debug!(
+                                    "GPU/CPU parity on batch {idx}: max |dP| = {worst:.2e} over {} reads",
+                                    chunks.len()
+                                );
+                                let mut p = parity.lock().expect("gpu parity mutex poisoned");
+                                p.checked_batches += 1;
+                                p.worst_abs_dp = p.worst_abs_dp.max(worst);
+                                Ok(())
+                            };
+                            if let Err(e) = check() {
+                                failed_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                parity_err_ref
+                                    .lock()
+                                    .expect("gpu parity error mutex poisoned")
+                                    .get_or_insert(e);
+                            }
+                        });
                     }
                     n_group += 1;
-                    for ((read, _), logit) in group.iter().zip(logits) {
+                    for (read, logit) in reads.iter().zip(logits) {
                         out.push(call_from_logit(read, spec, logit));
                     }
                 }
@@ -794,77 +834,110 @@ pub fn classify_reads_gpu(
             }
         });
 
-        'outer: for slice in reads.chunks(SUPERBATCH) {
-            // Valid preps not yet folded into a full group, in the same
-            // order they would have landed in `ready` if the whole
-            // superbatch were prepared up front — so which reads share a
-            // GPU group is unaffected by streaming them in smaller pieces.
-            let mut carry: Vec<(&WaveformRead, Chunk)> = Vec::with_capacity(batch);
+            // Index of the next group to be built; the consumer counts the same
+            // sequence, since groups are sent in the order they are numbered.
+            let mut next_group = 0usize;
+            'outer: for slice in reads.chunks(SUPERBATCH) {
+                // Valid preps not yet folded into a full group, in the same
+                // order they would have landed in `ready` if the whole
+                // superbatch were prepared up front — so which reads share a
+                // GPU group is unaffected by streaming them in smaller pieces.
+                let mut carry: Vec<(&WaveformRead, Chunk)> = Vec::with_capacity(batch);
 
-            for raw in slice.chunks(prep_chunk) {
-                let prepared: Vec<Prepared> = raw
-                    .par_iter()
-                    .map(|&read| {
-                        let Some(info) = pod5.reads().get(&read.read_id) else {
-                            return Ok(Prepared::None(no_call(read, NoCallReason::NoSignal)));
-                        };
-                        let raw = signal_adc(info, &extractors)?;
-                        if raw.len() as i64 != read.ns {
-                            return Ok(Prepared::None(no_call(read, NoCallReason::NsMismatch)));
+                for raw in slice.chunks(prep_chunk) {
+                    let prepared: Vec<Prepared> = raw
+                        .par_iter()
+                        .map(|&read| {
+                            let Some(info) = pod5.reads().get(&read.read_id) else {
+                                return Ok(Prepared::None(no_call(read, NoCallReason::NoSignal)));
+                            };
+                            let raw = signal_adc(info, &extractors)?;
+                            if raw.len() as i64 != read.ns {
+                                return Ok(Prepared::None(no_call(read, NoCallReason::NsMismatch)));
+                            }
+                            let Some(chunk) =
+                                assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw)
+                            else {
+                                return Ok(Prepared::None(no_call(read, no_chunk)));
+                            };
+                            Ok(Prepared::Ready(read, chunk))
+                        })
+                        .collect::<Result<_>>()?;
+
+                    for p in prepared {
+                        match p {
+                            Prepared::Ready(read, chunk) => carry.push((read, chunk)),
+                            Prepared::None(n) => record_no_call(&mut stats, n),
                         }
-                        let Some(chunk) = assemble_chunk(bundle.kmer.as_ref(), spec, read, &raw)
-                        else {
-                            return Ok(Prepared::None(no_call(read, no_chunk)));
-                        };
-                        Ok(Prepared::Ready(read, chunk))
+                    }
+
+                    // Every group this burst filled, packed in parallel on the
+                    // rayon pool (#478) and then sent in order. Which reads share
+                    // a group, and the group's index (the parity check's
+                    // schedule), are fixed before any packing happens.
+                    let mut burst: Vec<(usize, Vec<(&WaveformRead, Chunk)>)> = Vec::new();
+                    while carry.len() >= batch {
+                        burst.push((next_group, carry.drain(0..batch).collect()));
+                        next_group += 1;
+                    }
+                    let groups: Vec<Group> = burst
+                        .into_par_iter()
+                        .map(|(idx, members)| -> Result<Group> {
+                            let refs: Vec<&Chunk> = members.iter().map(|(_, c)| c).collect();
+                            let packed = gpu.pack(&refs, spec)?;
+                            let (reads, chunks): (Vec<_>, Vec<_>) = members.into_iter().unzip();
+                            Ok(Group {
+                                reads,
+                                packed,
+                                parity_chunks: idx.is_multiple_of(parity_every).then_some(chunks),
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    for group in groups {
+                        if tx.send(group).is_err() {
+                            // The GPU thread died; stop producing and surface
+                            // its error at `join` below instead of this one.
+                            break 'outer;
+                        }
+                    }
+                }
+
+                // Fewer than `batch` valid reads left at the end of this
+                // superbatch: score them on the CPU rather than pad a GPU call —
+                // same rule as before, see the doc comment above. Up to
+                // `batch - 1` reads can land here, each ~6.6 ms through the
+                // batch-1 CPU tract plan, so scoring them one at a time on this
+                // (producer) thread could block it for the better part of a
+                // second with the rest of the rayon pool *and* the GPU both
+                // idle. `cpu_fallback` (`WaveformNet`) is `Sync` — the same plan
+                // handle `classify_reads` above already calls from inside a
+                // `par_iter` closure — so fanning this out is bit-identical: it
+                // changes which thread calls `logit`, never what it computes.
+                // `calls` only gets its final order from the `sort_by_key` at
+                // the very end, so which thread appends first does not matter.
+                let tail: Vec<ReadCall> = carry
+                    .into_par_iter()
+                    .map(|(read, chunk)| -> Result<ReadCall> {
+                        let logit = cpu_fallback.logit(&chunk, spec)?;
+                        Ok(call_from_logit(read, spec, logit))
                     })
-                    .collect::<Result<_>>()?;
-
-                for p in prepared {
-                    match p {
-                        Prepared::Ready(read, chunk) => carry.push((read, chunk)),
-                        Prepared::None(n) => record_no_call(&mut stats, n),
-                    }
-                }
-
-                while carry.len() >= batch {
-                    let group: Group = carry.drain(0..batch).collect();
-                    if tx.send(group).is_err() {
-                        // The GPU thread died; stop producing and surface
-                        // its error at `join` below instead of this one.
-                        break 'outer;
-                    }
-                }
+                    .collect::<Result<Vec<_>>>()?;
+                calls.extend(tail);
             }
 
-            // Fewer than `batch` valid reads left at the end of this
-            // superbatch: score them on the CPU rather than pad a GPU call —
-            // same rule as before, see the doc comment above. Up to
-            // `batch - 1` reads can land here, each ~6.6 ms through the
-            // batch-1 CPU tract plan, so scoring them one at a time on this
-            // (producer) thread could block it for the better part of a
-            // second with the rest of the rayon pool *and* the GPU both
-            // idle. `cpu_fallback` (`WaveformNet`) is `Sync` — the same plan
-            // handle `classify_reads` above already calls from inside a
-            // `par_iter` closure — so fanning this out is bit-identical: it
-            // changes which thread calls `logit`, never what it computes.
-            // `calls` only gets its final order from the `sort_by_key` at
-            // the very end, so which thread appends first does not matter.
-            let tail: Vec<ReadCall> = carry
-                .into_par_iter()
-                .map(|(read, chunk)| -> Result<ReadCall> {
-                    let logit = cpu_fallback.logit(&chunk, spec)?;
-                    Ok(call_from_logit(read, spec, logit))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            calls.extend(tail);
-        }
-
-        drop(tx);
-        gpu_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("GPU scoring thread panicked"))?
+            drop(tx);
+            gpu_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("GPU scoring thread panicked"))?
+        })
     })?;
+    // `in_place_scope` has returned, so every parity task has finished.
+    if let Some(e) = parity_err
+        .into_inner()
+        .expect("gpu parity error mutex poisoned")
+    {
+        return Err(e);
+    }
 
     // The spawned thread's own clone is dropped by the time `join()` above
     // returns, so this is the last strong reference — never a race.

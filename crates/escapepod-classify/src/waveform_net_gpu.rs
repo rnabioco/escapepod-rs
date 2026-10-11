@@ -131,7 +131,7 @@ use escapepod_demux::onnx_rewrite::{expand_instance_norm, hoist_conv_padding};
 use escapepod_signal::chunk::Chunk;
 
 use crate::bundle::{WaveformSpec, WaveformTensor};
-use crate::waveform_net::{pack_batch, resolve_inputs, unpack_logits};
+use crate::waveform_net::{pack_batch_into, resolve_inputs, unpack_logits};
 
 /// The runtime symbol tract-cuda's pinned cudarc build (`cuda-12020`, this
 /// crate's `Cargo.toml`) resolves against to read a device's properties.
@@ -403,7 +403,7 @@ impl WaveformNetGpu {
     /// Score up to `batch_size()` chunks in one GPU call.
     ///
     /// `chunks.len()` may be less than `batch_size()` — the trailing rows are
-    /// zero-padded (see [`pack_batch`]) and sliced back off on the way out —
+    /// zero-padded (see [`pack_batch_into`]) and sliced back off on the way out —
     /// but never more; that is a caller bug; see
     /// [`crate::waveform::classify_reads_gpu`] for why a shorter group is
     /// routed to the CPU scorer instead of padded through here.
@@ -419,22 +419,66 @@ impl WaveformNetGpu {
             );
         }
 
-        let mut values: TVec<TValue> = tvec!();
+        let packed = self.pack(chunks, spec)?;
+        self.logits_packed(packed)
+    }
+
+    /// Build the batch's input tensors on the calling thread, so a pipeline
+    /// can do this on its producer side and leave the GPU-submitting thread
+    /// with nothing but the call. The same bytes [`Self::logits`] feeds the
+    /// plan: that method is exactly `pack` then [`Self::logits_packed`].
+    pub fn pack(&self, chunks: &[&Chunk], spec: &WaveformSpec) -> Result<PackedBatch> {
+        if chunks.is_empty() {
+            bail!("pack() called with zero chunks");
+        }
+        if chunks.len() > self.batch {
+            bail!(
+                "{} chunks given but this GPU scorer is compiled for batch {}",
+                chunks.len(),
+                self.batch
+            );
+        }
+        let mut tensors = Vec::with_capacity(self.inputs.len());
         for role in &self.inputs {
             let [rows, cols] = spec.tensor_shape(*role);
-            let buf = pack_batch(*role, chunks, spec, self.batch)?;
-            let t = Tensor::from_shape(&[self.batch, rows, cols], &buf)
-                .map_err(|e| anyhow!("cannot build the {} tensor: {e}", role.name()))?;
-            values.push(t.into());
+            let mut t = Tensor::zero::<f32>(&[self.batch, rows, cols])
+                .map_err(|e| anyhow!("cannot allocate the {} tensor: {e}", role.name()))?;
+            {
+                let mut view = t
+                    .try_as_plain_ram_mut()
+                    .map_err(|e| anyhow!("cannot write the {} tensor: {e}", role.name()))?;
+                let buf = view
+                    .as_slice_mut::<f32>()
+                    .map_err(|e| anyhow!("cannot write the {} tensor: {e}", role.name()))?;
+                pack_batch_into(*role, chunks, spec, buf)?;
+            }
+            tensors.push(t);
         }
+        Ok(PackedBatch {
+            tensors,
+            n_valid: chunks.len(),
+        })
+    }
+
+    /// Score a batch built by [`Self::pack`] in one GPU call.
+    pub fn logits_packed(&self, packed: PackedBatch) -> Result<Vec<f64>> {
+        let PackedBatch { tensors, n_valid } = packed;
+        let values: TVec<TValue> = tensors.into_iter().map(Into::into).collect();
 
         let out = tract_cuda::with_cuda_stream(|_| self.plan.run(values))
             .map_err(|e| anyhow!("waveform model GPU inference failed: {e}"))?;
         let view = out[0]
             .to_plain_array_view::<f32>()
             .map_err(|e| anyhow!("the waveform model output is not f32: {e}"))?;
-        unpack_logits(view.iter().copied(), chunks.len())
+        unpack_logits(view.iter().copied(), n_valid)
     }
+}
+
+/// One GPU batch's input tensors, already packed (see
+/// [`WaveformNetGpu::pack`]) and in the graph's own input order.
+pub struct PackedBatch {
+    tensors: Vec<Tensor>,
+    n_valid: usize,
 }
 
 /// The GPU path was refused for a reason that says nothing about the reads:
