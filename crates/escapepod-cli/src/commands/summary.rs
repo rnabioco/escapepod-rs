@@ -8,6 +8,7 @@ use crate::util::{format_bytes, format_duration_hours, format_number, resolve_po
 use chrono::{TimeZone, Utc};
 use escapepod_signal::{Reader, ReadsBatchView, RunInfoData};
 use owo_colors::OwoColorize;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -25,6 +26,10 @@ pub struct SummaryArgs {
     /// Output as JSON instead of formatted table.
     #[arg(long)]
     pub json: bool,
+
+    /// Number of threads for parallel processing (default: 16, or all available CPUs if fewer)
+    #[arg(short = 't', long, visible_short_alias = 'j', value_name = "N")]
+    pub threads: Option<usize>,
 }
 
 /// Aggregated statistics for reads.
@@ -114,120 +119,64 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     progress_bar.set_message("files");
     let show_message = !progress_bar.is_hidden();
 
-    // Process each file
-    for path in &files {
-        if show_message {
-            progress_bar.set_message(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        }
-        // Try to open the file, skip if corrupted
-        let reader = match Reader::open(path) {
-            Ok(r) => r,
-            Err(e) => {
-                corrupted_files.push(path.display().to_string());
-                warnings.push(format!(
-                    "Corrupted/unreadable file: {} ({})",
-                    path.display(),
-                    e
-                ));
+    // Each file is analysed independently (a cold open and a full reads-table
+    // scan are both per-file latency, so files overlap on the rayon pool) and
+    // the results are folded below in input order, so everything printed --
+    // the file list, warnings, the first file's run info -- is exactly what the
+    // serial loop produced.
+    let analysed: Vec<Result<FileAnalysis, (String, String)>> = files
+        .par_iter()
+        .map(|path| {
+            if show_message {
+                progress_bar.set_message(
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+            let r = analyse_file(path);
+            progress_bar.inc(1);
+            r
+        })
+        .collect();
+
+    for result in analysed {
+        let fa = match result {
+            Ok(fa) => fa,
+            Err((path, e)) => {
+                warnings.push(format!("Corrupted/unreadable file: {} ({})", path, e));
+                corrupted_files.push(path);
                 continue;
             }
         };
 
-        // Track old version files for summary
-        let version = reader.pod5_version();
-        if !version.starts_with(CURRENT_POD5_VERSION) && !version.is_empty() {
-            *old_version_files.entry(version.to_string()).or_insert(0) += 1;
+        if let Some(version) = fa.old_version {
+            *old_version_files.entry(version).or_insert(0) += 1;
         }
-
-        // Get file size
-        let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-        // Get batch count (handle errors gracefully)
-        let batch_count = reader.read_batch_count().unwrap_or(0);
-
-        // Get run info from first file
         if run_info.is_none()
-            && let Some(ri) = reader.run_infos().first()
+            && let Some(ri) = fa.run_info
         {
-            run_info = Some(ri.clone());
             sample_rate = ri.sample_rate;
+            run_info = Some(ri);
         }
+        warnings.extend(fa.warnings);
 
-        // Count reads and collect stats
-        let mut file_read_count = 0u64;
-        let mut read_errors = 0u64;
-
-        match reader.read_batches() {
-            Ok(batches) => {
-                for batch_result in batches {
-                    let Ok(batch) = batch_result else {
-                        read_errors += 1;
-                        continue;
-                    };
-                    let Ok(view) = ReadsBatchView::new(&batch, false) else {
-                        read_errors += 1;
-                        continue;
-                    };
-                    for row in 0..view.num_rows() {
-                        match view.read(row) {
-                            Ok(read) => {
-                                file_read_count += 1;
-                                stats.count += 1;
-                                stats.total_samples += read.num_samples;
-                                stats.lengths.push(read.num_samples);
-
-                                *stats.channels.entry(read.channel).or_insert(0) += 1;
-                                stats.max_channel = stats.max_channel.max(read.channel);
-
-                                if read.well >= 1 && read.well <= 4 {
-                                    stats.wells[read.well as usize] += 1;
-                                }
-
-                                *stats
-                                    .end_reasons
-                                    .entry(read.end_reason.as_str().to_string())
-                                    .or_insert(0) += 1;
-                            }
-                            Err(_) => {
-                                read_errors += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warnings.push(format!(
-                    "Cannot read reads from {}: {}",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    e
-                ));
-            }
+        let s = fa.stats;
+        stats.count += s.count;
+        stats.total_samples += s.total_samples;
+        stats.lengths.extend(s.lengths);
+        for (ch, n) in s.channels {
+            *stats.channels.entry(ch).or_insert(0) += n;
         }
-
-        if read_errors > 0 {
-            warnings.push(format!(
-                "{} read errors in {}",
-                read_errors,
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
+        stats.max_channel = stats.max_channel.max(s.max_channel);
+        for (w, n) in s.wells.iter().enumerate() {
+            stats.wells[w] += n;
         }
-
-        file_summaries.push(FileSummary {
-            path: path.display().to_string(),
-            size_bytes,
-            read_count: file_read_count,
-            batch_count,
-            pod5_version: reader.pod5_version().to_string(),
-            software: reader.software().to_string(),
-            file_identifier: reader.file_identifier().to_string(),
-        });
-
-        progress_bar.inc(1);
+        for (er, n) in s.end_reasons {
+            *stats.end_reasons.entry(er).or_insert(0) += n;
+        }
+        file_summaries.push(fa.summary);
     }
 
     progress_bar.finish_and_clear();
@@ -292,6 +241,105 @@ pub fn run(args: SummaryArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// One file's contribution to the summary, produced independently per file.
+struct FileAnalysis {
+    summary: FileSummary,
+    stats: ReadStats,
+    run_info: Option<RunInfoData>,
+    /// Set when the file's POD5 version is not the current one.
+    old_version: Option<String>,
+    warnings: Vec<String>,
+}
+
+/// Open and scan one file. `Err((path, message))` is an unreadable file.
+fn analyse_file(path: &Path) -> Result<FileAnalysis, (String, String)> {
+    let reader = Reader::open(path).map_err(|e| (path.display().to_string(), e.to_string()))?;
+
+    let version = reader.pod5_version();
+    let old_version = (!version.starts_with(CURRENT_POD5_VERSION) && !version.is_empty())
+        .then(|| version.to_string());
+
+    let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let batch_count = reader.read_batch_count().unwrap_or(0);
+    let run_info = reader.run_infos().first().cloned();
+
+    let mut stats = ReadStats::default();
+    let mut warnings = Vec::new();
+    let mut file_read_count = 0u64;
+    let mut read_errors = 0u64;
+
+    match reader.read_batches() {
+        Ok(batches) => {
+            for batch_result in batches {
+                let Ok(batch) = batch_result else {
+                    read_errors += 1;
+                    continue;
+                };
+                let Ok(view) = ReadsBatchView::new(&batch, false) else {
+                    read_errors += 1;
+                    continue;
+                };
+                for row in 0..view.num_rows() {
+                    match view.read(row) {
+                        Ok(read) => {
+                            file_read_count += 1;
+                            stats.count += 1;
+                            stats.total_samples += read.num_samples;
+                            stats.lengths.push(read.num_samples);
+
+                            *stats.channels.entry(read.channel).or_insert(0) += 1;
+                            stats.max_channel = stats.max_channel.max(read.channel);
+
+                            if read.well >= 1 && read.well <= 4 {
+                                stats.wells[read.well as usize] += 1;
+                            }
+
+                            *stats
+                                .end_reasons
+                                .entry(read.end_reason.as_str().to_string())
+                                .or_insert(0) += 1;
+                        }
+                        Err(_) => {
+                            read_errors += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "Cannot read reads from {}: {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                e
+            ));
+        }
+    }
+
+    if read_errors > 0 {
+        warnings.push(format!(
+            "{} read errors in {}",
+            read_errors,
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+
+    Ok(FileAnalysis {
+        summary: FileSummary {
+            path: path.display().to_string(),
+            size_bytes,
+            read_count: file_read_count,
+            batch_count,
+            pod5_version: reader.pod5_version().to_string(),
+            software: reader.software().to_string(),
+            file_identifier: reader.file_identifier().to_string(),
+        },
+        stats,
+        run_info,
+        old_version,
+        warnings,
+    })
 }
 
 /// Infer total channels from max channel seen.

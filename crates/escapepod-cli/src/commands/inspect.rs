@@ -7,6 +7,7 @@
 use crate::style::stdout as style;
 use crate::util::resolve_pod5_inputs;
 use escapepod_signal::{Reader, ReadsBatchView};
+use rayon::prelude::*;
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -30,11 +31,33 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
     let mut total_reads = 0usize;
     let mut total_batches = 0usize;
 
-    for file_path in &files {
-        let reader = match Reader::open(file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                if is_directory {
+    // A directory only needs each file's two counts, and getting them costs a
+    // cold open per file (an mmap and a footer parse on a network filesystem),
+    // so the opens overlap on the rayon pool. Printing and warning stay
+    // sequential in input order below, so the output is the serial loop's.
+    let counts: Vec<Result<(usize, usize), String>> = if is_directory {
+        files
+            .par_iter()
+            .map(|p| {
+                Reader::open(p)
+                    .map(|r| {
+                        (
+                            r.read_count().unwrap_or(0),
+                            r.read_batch_count().unwrap_or(0),
+                        )
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    for (file_idx, file_path) in files.iter().enumerate() {
+        if is_directory {
+            let (read_count, batch_count) = match &counts[file_idx] {
+                Ok(c) => *c,
+                Err(e) => {
                     warn!(
                         "skipping {} ({})",
                         crate::style::path(
@@ -43,11 +66,20 @@ pub fn summary(input: PathBuf) -> anyhow::Result<()> {
                         e
                     );
                     continue;
-                } else {
-                    return Err(e.into());
                 }
-            }
-        };
+            };
+            total_reads += read_count;
+            total_batches += batch_count;
+            println!(
+                "  {}: {} reads, {} batches",
+                style::path(file_path.file_name().unwrap_or_default().to_string_lossy()),
+                style::count(read_count),
+                batch_count
+            );
+            continue;
+        }
+
+        let reader = Reader::open(file_path)?;
 
         if !is_directory {
             println!(
