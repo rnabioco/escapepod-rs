@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::reader::Reader;
@@ -124,6 +125,42 @@ pub enum ColumnValues {
     /// `Float32` scores. `NaN` is refused rather than dropped, because unlike
     /// an empty label it is a value someone may have meant.
     Scores(HashMap<Uuid, f32>),
+    /// [`LabelCodes`](Self::LabelCodes) as a struct of arrays: `index` maps a
+    /// read to a slot, `codes[slot]` is its code, and a slot holding
+    /// [`ABSENT_CODE`] has no label. The `index` is an `Arc` so every column of
+    /// one run shares a single read-id map instead of each holding its own
+    /// (~40 B per read per column, ~10 GB across the columns of a 57 M-read
+    /// dual-axis `--ref-scores` demux). Identical on disk.
+    LabelCodesIndexed {
+        /// Distinct labels, indexed by code.
+        dictionary: Vec<String>,
+        /// Read id to slot, shared between columns.
+        index: Arc<HashMap<Uuid, u32>>,
+        /// Per-slot index into `dictionary`, or [`ABSENT_CODE`].
+        codes: Vec<u32>,
+    },
+    /// [`Scores`](Self::Scores) as a struct of arrays, see
+    /// [`LabelCodesIndexed`](Self::LabelCodesIndexed). A slot holding
+    /// [`ABSENT_SCORE`] has no value; any other `NaN` is still refused.
+    ScoresIndexed {
+        /// Read id to slot, shared between columns.
+        index: Arc<HashMap<Uuid, u32>>,
+        /// Per-slot score, or [`ABSENT_SCORE`].
+        values: Vec<f32>,
+    },
+}
+
+/// The "no label" code in [`ColumnValues::LabelCodesIndexed`].
+pub const ABSENT_CODE: u32 = u32::MAX;
+
+/// The "no value" marker in [`ColumnValues::ScoresIndexed`]: a quiet `NaN` with
+/// a payload no arithmetic produces, so a genuine `NaN` score is still seen
+/// (and refused) rather than mistaken for absence.
+pub const ABSENT_SCORE: f32 = f32::from_bits(0x7fc0_dead);
+
+/// Whether `v` is the [`ABSENT_SCORE`] marker (bitwise: `NaN != NaN`).
+pub fn is_absent_score(v: f32) -> bool {
+    v.to_bits() == ABSENT_SCORE.to_bits()
 }
 
 /// What one column write did.
@@ -245,6 +282,45 @@ pub fn write_columns(
                     labels: annotation.labels().len(),
                 };
                 sc.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::LabelCodesIndexed {
+                dictionary,
+                index,
+                codes,
+            } => {
+                let annotation = AnnotationSection::from_pairs(
+                    &column.name,
+                    sc.entries().iter().filter_map(|&(uuid_bytes, _, _)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        let code = *codes.get(*index.get(&uuid)? as usize)?;
+                        let label = dictionary.get(code as usize)?;
+                        (!label.is_empty()).then_some((uuid, label.as_str()))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: annotation.len(),
+                    labels: annotation.labels().len(),
+                };
+                sc.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::ScoresIndexed { index, values } => {
+                let score = ScoreSection::from_pairs(
+                    &column.name,
+                    sc.entries().iter().filter_map(|&(uuid_bytes, _, _)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        let v = *values.get(*index.get(&uuid)? as usize)?;
+                        (!is_absent_score(v)).then_some((uuid, v))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: score.len(),
+                    labels: 0,
+                };
+                sc.set_score(score);
                 stat
             }
             ColumnValues::Scores(values) => {
@@ -910,6 +986,45 @@ pub fn write_collection_columns(
                     labels: annotation.labels().len(),
                 };
                 existing.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::LabelCodesIndexed {
+                dictionary,
+                index,
+                codes,
+            } => {
+                let annotation = AnnotationSection::from_pairs(
+                    &column.name,
+                    existing.entries().iter().filter_map(|&(uuid_bytes, ..)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        let code = *codes.get(*index.get(&uuid)? as usize)?;
+                        let label = dictionary.get(code as usize)?;
+                        (!label.is_empty()).then_some((uuid, label.as_str()))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: annotation.len(),
+                    labels: annotation.labels().len(),
+                };
+                existing.set_annotation(annotation);
+                stat
+            }
+            ColumnValues::ScoresIndexed { index, values } => {
+                let score = ScoreSection::from_pairs(
+                    &column.name,
+                    existing.entries().iter().filter_map(|&(uuid_bytes, ..)| {
+                        let uuid = Uuid::from_bytes(uuid_bytes);
+                        let v = *values.get(*index.get(&uuid)? as usize)?;
+                        (!is_absent_score(v)).then_some((uuid, v))
+                    }),
+                )?;
+                let stat = ColumnStat {
+                    name: column.name.clone(),
+                    assigned: score.len(),
+                    labels: 0,
+                };
+                existing.set_score(score);
                 stat
             }
             ColumnValues::Scores(values) => {
