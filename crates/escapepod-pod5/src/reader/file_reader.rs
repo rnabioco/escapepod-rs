@@ -444,6 +444,7 @@ impl Reader {
             arrow_reader: reader,
             current_batch: None,
             batch_row: 0,
+            view: None,
         })
     }
 

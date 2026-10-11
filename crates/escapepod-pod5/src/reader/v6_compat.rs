@@ -207,6 +207,21 @@ fn reader_opens_a_real_v6_file_with_channels_above_u16_max() {
         wide_channels
     );
 
+    // `reads()` resolves columns once per batch; it must agree with the
+    // by-name extractor on every field of every row, V6 channel included.
+    let mut by_name = Vec::new();
+    for batch in reader.read_batches().expect("batches") {
+        let batch = batch.expect("batch");
+        for row in 0..batch.num_rows() {
+            by_name.push(Reader::read_from_batch(&batch, row).expect("by-name row"));
+        }
+    }
+    assert_eq!(
+        format!("{reads:?}"),
+        format!("{by_name:?}"),
+        "reads() diverges from the by-name extractor on a V6 file"
+    );
+
     // Columnar path (`read_columns()` -> ReadsBatchView::append_columns).
     let cols = reader.read_columns().expect("read columns");
     assert_eq!(cols.channel, wide_channels);
