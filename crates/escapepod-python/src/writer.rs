@@ -162,6 +162,7 @@ impl PyWriter {
     #[allow(clippy::too_many_arguments)]
     fn add_read(
         &mut self,
+        py: Python<'_>,
         read_id: &str,
         read_number: u32,
         start_sample: u64,
@@ -223,19 +224,21 @@ impl PyWriter {
         };
 
         let writer = self.writer_mut()?;
-        writer.add_read(read, &signal_vec).map_err(to_py_err)
+        py.detach(|| writer.add_read(read, &signal_vec))
+            .map_err(to_py_err)
     }
 
     /// Add a read from an existing ReadData object and signal array.
     fn add_read_data(
         &mut self,
+        py: Python<'_>,
         read: &crate::read_data::PyReadData,
         signal: &Bound<'_, PyArray1<i16>>,
     ) -> PyResult<()> {
         let signal_vec: Vec<i16> = signal.to_vec()?;
+        let inner = read.inner.clone();
         let writer = self.writer_mut()?;
-        writer
-            .add_read(read.inner.clone(), &signal_vec)
+        py.detach(|| writer.add_read(inner, &signal_vec))
             .map_err(to_py_err)
     }
 
@@ -246,6 +249,7 @@ impl PyWriter {
     /// the same length.
     fn add_reads(
         &mut self,
+        py: Python<'_>,
         reads: Vec<PyRef<'_, crate::read_data::PyReadData>>,
         signals: Vec<Bound<'_, PyArray1<i16>>>,
     ) -> PyResult<()> {
@@ -263,13 +267,15 @@ impl PyWriter {
             .map(|s| s.to_vec())
             .collect::<Result<_, _>>()?;
 
+        let batch: Vec<(escapepod_signal::ReadData, &[i16])> = reads
+            .iter()
+            .zip(&signal_vecs)
+            .map(|(read, signal)| (read.inner.clone(), signal.as_slice()))
+            .collect();
         let writer = self.writer_mut()?;
-        for (read, signal) in reads.iter().zip(&signal_vecs) {
-            writer
-                .add_read(read.inner.clone(), signal)
-                .map_err(to_py_err)?;
-        }
-        Ok(())
+        // Compression is the cost: release the GIL for it, and fan the
+        // batch's chunks out over rayon (output order is unchanged).
+        py.detach(|| writer.add_reads(batch)).map_err(to_py_err)
     }
 
     /// Finalize and close the POD5 file.
