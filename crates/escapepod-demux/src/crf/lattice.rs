@@ -589,6 +589,23 @@ pub fn decode_with(
     )
 }
 
+/// [`decode_with`] over a strided view of one read inside a batched,
+/// time-major score buffer — see [`decode_with_refs_strided`] for the layout.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_with_strided(
+    layout: &CrfLayout,
+    alphabet: &[u8],
+    scores: &[f32],
+    t_len: usize,
+    row_stride: usize,
+    scratch: &mut CrfScratch,
+    backend: Backend,
+) -> Result<String, CrfDecodeError> {
+    decode_inner(
+        layout, alphabet, scores, t_len, row_stride, scratch, backend, None,
+    )
+}
+
 /// [`decode_with`], additionally scoring every reference in `chains` against
 /// the same encoder output.
 ///
