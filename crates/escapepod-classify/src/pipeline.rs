@@ -37,6 +37,47 @@ pub struct BamScan {
     pub skips: HashMap<SkipReason, u64>,
 }
 
+impl BamScan {
+    /// Fold one record's outcome in: the best-mapq alignment of a read is kept
+    /// (the first seen wins a tie), a skip is counted. No vote is cast here.
+    fn absorb(&mut self, outcome: ScanOutcome) {
+        match outcome {
+            ScanOutcome::Anchored(read) => match self.anchored.entry(read.read_id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if read.mapq > e.get().mapq {
+                        e.insert(*read);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(*read);
+                }
+            },
+            ScanOutcome::Skip(reason) => {
+                *self.skips.entry(reason).or_default() += 1;
+            }
+        }
+    }
+
+    /// One orientation vote per read, on its surviving alignment.
+    ///
+    /// Counting per record let a read with k anchored alignments vote k times,
+    /// and for a frame its kept alignment may not share. The tally is a sum, so
+    /// the map's iteration order cannot reach it.
+    fn tally_votes(&mut self) {
+        self.votes = self
+            .anchored
+            .par_iter()
+            .fold(OrientationVotes::default, |mut v, (_, read)| {
+                v.add(read);
+                v
+            })
+            .reduce(OrientationVotes::default, |a, b| OrientationVotes {
+                time: a.time + b.time,
+                reversed: a.reversed + b.reversed,
+            });
+    }
+}
+
 /// BGZF inflate workers for a scan that anchors records on the rayon pool.
 ///
 /// `MultithreadedReader::new` is ONE worker, whatever the name suggests. The
@@ -52,7 +93,8 @@ pub(crate) fn bgzf_workers() -> std::num::NonZero<usize> {
 /// Every record runs through [`anchor::scan_record`]; records whose
 /// reference is absent from the header resolve as
 /// [`SkipReason::Filtered`]. Multiple alignments of one read keep the
-/// highest-mapq record (the reference implementation's dedup).
+/// highest-mapq record (the reference implementation's dedup), and votes
+/// once, on that record.
 pub fn scan_bam(
     bam_path: &Path,
     geometry: &HashMap<String, RefGeometry>,
@@ -114,29 +156,13 @@ pub fn scan_bam(
             .collect_into_vec(&mut outcomes);
 
         for outcome in outcomes.drain(..) {
-            match outcome {
-                ScanOutcome::Anchored(read) => {
-                    scan.votes.add(&read);
-                    match scan.anchored.entry(read.read_id) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            if read.mapq > e.get().mapq {
-                                e.insert(*read);
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(*read);
-                        }
-                    }
-                }
-                ScanOutcome::Skip(reason) => {
-                    *scan.skips.entry(reason).or_default() += 1;
-                }
-            }
+            scan.absorb(outcome);
         }
         if n < BATCH {
             break;
         }
     }
+    scan.tally_votes();
     Ok(scan)
 }
 
@@ -707,5 +733,49 @@ mod tests {
         // line per file.
         assert!(many.contains("and 2 more"), "{many}");
         assert!(!many.contains("f4.pod5"), "{many}");
+    }
+
+    /// A read at `q_junction` with its body anchor at base 2, so it votes
+    /// `time` when the junction is the earlier base and `reversed` otherwise.
+    fn anchored(id: u128, mapq: u8, q_junction: usize) -> ScanOutcome {
+        ScanOutcome::Anchored(Box::new(AnchoredRead {
+            read_id: Uuid::from_u128(id),
+            reference: "trna".into(),
+            mapq,
+            ns: 50,
+            seq: b"ACGTA".to_vec(),
+            moves: anchor::PackedMoves::new(1, &[1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+            nb: 5,
+            q_junction,
+            q_cca_a: 0,
+            ts: 0,
+            q_div_m1: None,
+            q_body_mid: Some(2),
+            q_polya_mid: None,
+            qf: vec![],
+            anchor_source: anchor::AnchorSource::Exact,
+        }))
+    }
+
+    /// A read the BAM aligns more than once is one informative read, and its
+    /// vote is the one its kept (highest-mapq) alignment casts. Counting per
+    /// record gave read 1 two votes -- one of them for the frame its kept
+    /// alignment disagrees with.
+    #[test]
+    fn a_read_with_several_alignments_votes_once_on_the_one_kept() {
+        let mut scan = BamScan::default();
+        // Read 1: mapq 10 says time, mapq 60 says reversed -- reversed is kept.
+        scan.absorb(anchored(1, 10, 0));
+        scan.absorb(anchored(1, 60, 4));
+        // Read 1 again, lower mapq than the kept one: dropped.
+        scan.absorb(anchored(1, 30, 0));
+        // Read 2: one alignment, time.
+        scan.absorb(anchored(2, 60, 0));
+        scan.tally_votes();
+
+        assert_eq!(scan.anchored.len(), 2);
+        assert_eq!(scan.votes.total(), 2, "{:?}", scan.votes);
+        assert_eq!(scan.votes.time, 1);
+        assert_eq!(scan.votes.reversed, 1);
     }
 }

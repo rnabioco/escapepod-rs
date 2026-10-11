@@ -16,7 +16,6 @@
 
 use crate::geometry::RefGeometry;
 use anyhow::{Result, bail};
-use escapepod_signal::mapping::seq_to_signal_from_moves;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::record::data::field::Tag;
@@ -48,7 +47,8 @@ impl OrientationVotes {
         if let Some(qb) = read.q_body_mid
             && qb < read.nb
         {
-            if read.seq_to_sig[read.q_junction] < read.seq_to_sig[qb] {
+            let s2s = read.seq_to_sig();
+            if s2s[read.q_junction] < s2s[qb] {
                 self.time += 1;
             } else {
                 self.reversed += 1;
@@ -94,6 +94,71 @@ pub fn resolve_orientation(
     })
 }
 
+/// A move table reduced to the one thing the query→signal map needs: which
+/// strides carry a `1`.
+///
+/// One bit per stride, trailing zero bytes dropped. The map is
+/// `i * stride + ts` for each set bit `i`, closed by `ns`, so nothing else of
+/// the `mv` array (its values other than `1`, its length past the last `1`)
+/// can reach an output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedMoves {
+    stride: u32,
+    bits: Box<[u8]>,
+}
+
+impl PackedMoves {
+    /// Pack a move array (`m == 1` is a base boundary, anything else is not).
+    pub fn new(stride: u32, moves: &[u8]) -> Self {
+        let mut bits = vec![0u8; moves.len().div_ceil(8)];
+        for (i, &m) in moves.iter().enumerate() {
+            if m == 1 {
+                bits[i / 8] |= 1 << (i % 8);
+            }
+        }
+        while bits.last() == Some(&0) {
+            bits.pop();
+        }
+        Self {
+            stride,
+            bits: bits.into_boxed_slice(),
+        }
+    }
+
+    /// Number of bases: the count of `1` moves.
+    pub fn n_bases(&self) -> usize {
+        self.bits.iter().map(|b| b.count_ones() as usize).sum()
+    }
+
+    /// The query→signal map in untrimmed coordinates: `nb + 1` entries, base
+    /// `i` at `move_index * stride + ts`, the last entry `ns`.
+    pub fn seq_to_sig(&self, ts: i64, ns: i64) -> Vec<i64> {
+        let stride = i64::from(self.stride);
+        let mut map = Vec::with_capacity(self.n_bases() + 1);
+        for (byte_i, &byte) in self.bits.iter().enumerate() {
+            let mut b = byte;
+            while b != 0 {
+                let i = byte_i * 8 + b.trailing_zeros() as usize;
+                map.push(i as i64 * stride + ts);
+                b &= b - 1;
+            }
+        }
+        map.push(ns);
+        map
+    }
+}
+
+impl AnchoredRead {
+    /// Move-table map: signal position per base, length `nb + 1` (the last
+    /// entry is `ns`). Indexes whichever frame the run's orientation says.
+    ///
+    /// Derived on each call; hold the result across a read's lookups rather
+    /// than calling this per base.
+    pub fn seq_to_sig(&self) -> Vec<i64> {
+        self.moves.seq_to_sig(self.ts, self.ns)
+    }
+}
+
 /// One read anchored to its reference junction, frame not yet resolved.
 ///
 /// Holds everything the feature stage needs once the run's orientation is
@@ -111,9 +176,11 @@ pub struct AnchoredRead {
     /// Basecalled query sequence (uppercase not applied; the k-mer lookup
     /// uppercases internally).
     pub seq: Vec<u8>,
-    /// Move-table map: signal position per base, length `nb + 1` (the last
-    /// entry is `ns`). Indexes whichever frame the run's orientation says.
-    pub seq_to_sig: Vec<i64>,
+    /// The move table, bit-packed. The query→signal map it expands to
+    /// ([`AnchoredRead::seq_to_sig`]) is eight bytes per base and this struct is
+    /// held for every read in the BAM at once, so the map is derived where it
+    /// is used rather than stored.
+    pub moves: PackedMoves,
     /// Number of basecalled bases (count of 1-moves).
     pub nb: usize,
     pub q_junction: usize,
@@ -188,7 +255,9 @@ fn move_table(record: &RecordBuf) -> Option<(usize, Vec<u8>, i64, i64)> {
 }
 
 /// Build the Remora-convention query→signal map from a move table, in
-/// **untrimmed** signal coordinates.
+/// **untrimmed** signal coordinates. This is the reference form of
+/// [`PackedMoves::seq_to_sig`] (which a read carries instead of the map); the
+/// two are pinned equal in the tests.
 ///
 /// [`seq_to_signal_from_moves`] returns the map in trimmed coordinates (base 0
 /// at sample 0, closing boundary `ns - ts`), which is the frame the move table
@@ -196,8 +265,10 @@ fn move_table(record: &RecordBuf) -> Option<(usize, Vec<u8>, i64, i64)> {
 /// array instead — `sig_span` flips spans through `ns`, and the signal is
 /// never sliced — so every entry gets `ts` added back and the closing boundary
 /// lands on `ns`.
+#[cfg(test)]
 fn seq_to_sig_map(moves: &[u8], stride: usize, ts: i64, ns: i64) -> Vec<i64> {
-    let mut map = seq_to_signal_from_moves(moves, stride as u32, ts, ns as u64);
+    let mut map =
+        escapepod_signal::mapping::seq_to_signal_from_moves(moves, stride as u32, ts, ns as u64);
     for v in &mut map {
         *v += ts;
     }
@@ -400,8 +471,8 @@ pub fn scan_record(
     };
     let (qj, anchor_source) = flank_anchored_qj(&q, &donor, g, qj_backfill);
 
-    let seq_to_sig = seq_to_sig_map(&moves, stride, ts, ns);
-    let nb = seq_to_sig.len() - 1;
+    let moves = PackedMoves::new(stride as u32, &moves);
+    let nb = moves.n_bases();
     // The anchor positions must index inside the move table (the reference
     // implementation checks `> nb`; `== nb` would have crashed it, so `>=`
     // here loses no read that survives the Python).
@@ -444,7 +515,7 @@ pub fn scan_record(
         mapq,
         ns,
         seq: seq.to_vec(),
-        seq_to_sig,
+        moves,
         nb,
         q_junction: qj,
         q_cca_a: qa,
@@ -601,7 +672,7 @@ pub fn finalize(
     mode: SpanMode,
 ) -> JunctionCoords {
     let reversed = orientation == Orientation::Reversed;
-    let s2s = &read.seq_to_sig;
+    let s2s = &read.seq_to_sig()[..];
     let qj = read.q_junction as i64;
 
     let j_span = sig_span(s2s, read.ns, read.q_junction, reversed);
@@ -708,7 +779,7 @@ mod tests {
             mapq: 60,
             ns: (nb as i64) * 10,
             seq: vec![b'A'; nb],
-            seq_to_sig: (0..=nb as i64).map(|i| i * 10).collect(),
+            moves: tenfold_moves(nb),
             nb,
             q_junction: 20,
             q_cca_a: 19,
@@ -722,6 +793,12 @@ mod tests {
     }
 
     const OFFSETS: [i32; 5] = [-1, 0, 1, 2, 3];
+
+    /// Stride 1, a base every ten samples: `seq_to_sig()` is `0, 10, .., 10*nb`.
+    fn tenfold_moves(nb: usize) -> PackedMoves {
+        let mv: Vec<u8> = (0..nb * 10).map(|i| u8::from(i % 10 == 0)).collect();
+        PackedMoves::new(1, &mv)
+    }
 
     // ---- flank-anchored junction placement --------------------------------
     //
@@ -943,6 +1020,44 @@ mod tests {
         // ns - ts.
         let map = seq_to_sig_map(&[1, 0, 1, 1, 0], 5, 10, 40);
         assert_eq!(map, vec![10, 20, 25, 40]);
+    }
+
+    /// The packed form is the same map as the reference expansion, over move
+    /// arrays with values other than 0/1, a trailing run of zeros, a non-byte
+    /// length, and no 1s at all.
+    #[test]
+    fn packed_moves_expand_to_the_reference_map() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200usize {
+            let len = (next() % 400) as usize + round % 3;
+            let mv: Vec<u8> = (0..len)
+                .map(|_| match next() % 6 {
+                    0 | 1 => 1,
+                    2 => 2,
+                    _ => 0,
+                })
+                .collect();
+            let stride = (next() % 7 + 1) as usize;
+            let ts = (next() % 50) as i64;
+            let ns = (len * stride) as i64 + ts + (next() % 9) as i64;
+            let packed = PackedMoves::new(stride as u32, &mv);
+            assert_eq!(
+                packed.seq_to_sig(ts, ns),
+                seq_to_sig_map(&mv, stride, ts, ns),
+                "round {round}"
+            );
+            assert_eq!(
+                packed.n_bases(),
+                mv.iter().filter(|&&m| m == 1).count(),
+                "round {round}"
+            );
+        }
     }
 
     #[test]

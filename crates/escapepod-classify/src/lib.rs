@@ -75,7 +75,7 @@ pub mod waveform_net_gpu;
 pub mod window;
 
 pub use anchor::{
-    AnchoredRead, MaskSource, Orientation, OrientationVotes, ScanOutcome, SpanMode,
+    AnchoredRead, MaskSource, Orientation, OrientationVotes, PackedMoves, ScanOutcome, SpanMode,
     resolve_orientation,
 };
 pub use anchor::{JunctionCoords, SkipReason, finalize, query_positions, scan_record};
