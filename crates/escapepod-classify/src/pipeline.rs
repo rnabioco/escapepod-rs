@@ -216,10 +216,14 @@ impl Pod5Index {
     /// and the file holds is found either way, and one it does not hold is
     /// absent either way.
     pub fn build(paths: &[PathBuf], wanted: &HashSet<Uuid>) -> Result<Self> {
-        let mut readers = Vec::with_capacity(paths.len());
-        for path in paths {
-            readers.push(escapepod_signal::Reader::open(path)?);
-        }
+        // Opens overlap: each is a cold mmap + footer parse on a network
+        // filesystem, and none depends on another. `collect` keeps path order,
+        // so `reader_idx` -- and with it `storage_key` -- is what the serial
+        // loop assigned.
+        let readers: Vec<escapepod_signal::Reader> = paths
+            .par_iter()
+            .map(escapepod_signal::Reader::open)
+            .collect::<escapepod_signal::Result<_>>()?;
         // Ahead of the lookups, not after them: a line about how long this run
         // is going to take is only useful while the run is still ahead of you.
         // Opening a reader is an mmap and a footer parse; the index — the part
@@ -232,9 +236,16 @@ impl Pod5Index {
             .collect();
         warn_unindexed(&unindexed);
 
+        // Lookups overlap across files for the same reason; the merge below
+        // is in reader order, so a read id present in two files resolves to the
+        // later one exactly as before.
+        let per_reader = readers
+            .par_iter()
+            .map(|reader| reader.find_signal_rows_with_calibration_by_ids(wanted))
+            .collect::<escapepod_signal::Result<Vec<_>>>()?;
         let mut reads = HashMap::new();
-        for (reader_idx, reader) in readers.iter().enumerate() {
-            for found in reader.find_signal_rows_with_calibration_by_ids(wanted)? {
+        for (reader_idx, found_in_reader) in per_reader.into_iter().enumerate() {
+            for found in found_in_reader {
                 reads.insert(
                     found.read_id,
                     Pod5ReadInfo {
