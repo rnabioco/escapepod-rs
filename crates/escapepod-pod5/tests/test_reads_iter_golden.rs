@@ -66,7 +66,11 @@ fn read(i: u32) -> ReadData {
         pore_type: ["rna_004", "not_set", "dna_r10.4.1"][(i % 3) as usize].into(),
         calibration_offset: -220.25 + f * 0.125,
         calibration_scale: 0.19 + f * 1e-4,
-        median_before: if i.is_multiple_of(7) { f32::NAN } else { 200.5 + f },
+        median_before: if i.is_multiple_of(7) {
+            f32::NAN
+        } else {
+            200.5 + f
+        },
         end_reason: ALL_END_REASONS[(i as usize * 7) % ALL_END_REASONS.len()],
         end_reason_forced: i.is_multiple_of(3),
         run_info_index: 0,
@@ -78,9 +82,21 @@ fn read(i: u32) -> ReadData {
         num_reads_since_mux_change: i * 5,
         time_since_mux_change: 12.5 + f,
         num_samples: 0, // set by the writer from the signal
-        open_pore_level: if i.is_multiple_of(5) { f32::NAN } else { 220.0 + f },
-        expected_open_pore_level: if i.is_multiple_of(11) { -0.0 } else { 221.0 + f },
-        selected_read_level: if i.is_multiple_of(13) { f32::NAN } else { 222.0 + f },
+        open_pore_level: if i.is_multiple_of(5) {
+            f32::NAN
+        } else {
+            220.0 + f
+        },
+        expected_open_pore_level: if i.is_multiple_of(11) {
+            -0.0
+        } else {
+            221.0 + f
+        },
+        selected_read_level: if i.is_multiple_of(13) {
+            f32::NAN
+        } else {
+            222.0 + f
+        },
         signal_rows: Vec::new(),
     }
 }
