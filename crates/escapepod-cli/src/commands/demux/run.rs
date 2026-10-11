@@ -33,7 +33,7 @@ use escapepod_demux::{
     extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
-use escapepod_signal::operations::{ColumnValues, ColumnWrite};
+use escapepod_signal::operations::{ABSENT_CODE, ABSENT_SCORE, ColumnValues, ColumnWrite};
 use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
 use escapepod_signal::{
     CompressedSignalChunk, PredefinedDictionaries, ReadData, Reader, ReadsBatchView, RunInfoData,
@@ -4046,8 +4046,16 @@ fn writer_thread(
 /// Sidecar-only demux writes no CSV, so without this the lattice scores would
 /// be computed and then dropped on exactly the runs that have nowhere else to
 /// keep them (#241).
+///
+/// Struct of arrays: one `index` (read id to slot) shared by every column, and
+/// each axis's columns are plain `Vec`s indexed by slot. Five `HashMap<Uuid,_>`
+/// per axis held the 16-byte id five times over, ~40 B per entry each — ~10 GB
+/// at 57 M reads with `--ref-scores` (#468).
 #[derive(Default)]
 struct Collected {
+    /// Read id to slot in every column below. Slots are handed out in arrival
+    /// order; a repeated id reuses its slot, as the maps it replaces overwrote.
+    index: HashMap<Uuid, u32>,
     /// One entry per axis, in head order.
     axes: Vec<CollectedAxis>,
 }
@@ -4061,13 +4069,13 @@ struct CollectedAxis {
     labels: Vec<String>,
     /// Reverse of `labels`, for interning.
     label_ids: HashMap<String, u32>,
-    /// Per read, an index into `labels` — never the label itself. This map
+    /// Per slot, an index into `labels` — never the label itself. This column
     /// lives for the whole run (sidecars are written once every input has been
     /// classified), so a `String` per read to say `nbc07` is one 32-byte heap
     /// chunk per read for one of sixteen values: ~4 GB at 57 M reads, which is
     /// most of a demux job's non-reclaimable memory. Same reasoning as
     /// [`CollectedScores::best`], which has always done this.
-    barcode: HashMap<Uuid, u32>,
+    barcode: Vec<u32>,
     /// Only populated under `--ref-scores`.
     crf: Option<CollectedScores>,
 }
@@ -4078,10 +4086,22 @@ struct CollectedAxis {
 #[derive(Default)]
 struct CollectedScores {
     names: Vec<String>,
-    best: HashMap<Uuid, u32>,
-    logp: HashMap<Uuid, f32>,
-    margin: HashMap<Uuid, f32>,
-    mean_logpost: HashMap<Uuid, f32>,
+    /// Per slot; [`ABSENT_CODE`] for a read that never decoded.
+    best: Vec<u32>,
+    /// Per slot; [`ABSENT_SCORE`] where there is no value.
+    logp: Vec<f32>,
+    margin: Vec<f32>,
+    mean_logpost: Vec<f32>,
+}
+
+impl CollectedScores {
+    /// A new slot, empty in every column.
+    fn grow(&mut self) {
+        self.best.push(ABSENT_CODE);
+        self.logp.push(ABSENT_SCORE);
+        self.margin.push(ABSENT_SCORE);
+        self.mean_logpost.push(ABSENT_SCORE);
+    }
 }
 
 impl CollectedAxis {
@@ -4107,7 +4127,7 @@ impl CollectedAxis {
     /// entry per read was the single largest allocation in the run.
     fn label_counts(&self) -> Vec<(String, usize)> {
         let mut counts = vec![0usize; self.labels.len()];
-        for &code in self.barcode.values() {
+        for &code in &self.barcode {
             counts[code as usize] += 1;
         }
         let mut out: Vec<(String, usize)> = self
@@ -4127,11 +4147,12 @@ impl CollectedAxis {
     /// `String` per read: materializing them here would put back, all at once
     /// and for every column simultaneously, exactly the allocation the codes
     /// exist to avoid.
-    fn into_columns(self, sole: bool) -> Vec<ColumnWrite> {
+    fn into_columns(self, sole: bool, index: &Arc<HashMap<Uuid, u32>>) -> Vec<ColumnWrite> {
         let mut out = vec![ColumnWrite {
             name: self.name.clone(),
-            values: ColumnValues::LabelCodes {
+            values: ColumnValues::LabelCodesIndexed {
                 dictionary: self.labels,
+                index: Arc::clone(index),
                 codes: self.barcode,
             },
         }];
@@ -4145,8 +4166,9 @@ impl CollectedAxis {
         };
         out.push(ColumnWrite {
             name: col("crf_best"),
-            values: ColumnValues::LabelCodes {
+            values: ColumnValues::LabelCodesIndexed {
                 dictionary: crf.names,
+                index: Arc::clone(index),
                 codes: crf.best,
             },
         });
@@ -4157,7 +4179,10 @@ impl CollectedAxis {
         ] {
             out.push(ColumnWrite {
                 name: col(suffix),
-                values: ColumnValues::Scores(values),
+                values: ColumnValues::ScoresIndexed {
+                    index: Arc::clone(index),
+                    values,
+                },
             });
         }
         out
@@ -4168,10 +4193,41 @@ impl Collected {
     /// Every axis's sidecar columns, in head order.
     fn into_columns(self) -> Vec<ColumnWrite> {
         let sole = self.axes.len() == 1;
+        let index = Arc::new(self.index);
         self.axes
             .into_iter()
-            .flat_map(|a| a.into_columns(sole))
+            .flat_map(|a| a.into_columns(sole, &index))
             .collect()
+    }
+
+    /// Record one read's calls, one per axis in head order.
+    fn record<'a>(&mut self, read_id: Uuid, calls: impl Iterator<Item = &'a Call>) {
+        let next = self.index.len() as u32;
+        let slot = *self.index.entry(read_id).or_insert(next) as usize;
+        let fresh = slot == next as usize;
+        for (dst, call) in self.axes.iter_mut().zip(calls) {
+            let code = dst.intern(&call.barcode);
+            if fresh {
+                dst.barcode.push(code);
+                if let Some(s) = dst.crf.as_mut() {
+                    s.grow();
+                }
+            } else {
+                dst.barcode[slot] = code;
+            }
+            // Recorded for gated reads too, matching the CSV: a sidecar
+            // that says `unclassified` should still say what it was
+            // rejected for. A repeated id keeps the earlier scores where this
+            // call has none, as the per-column maps did.
+            if let (Some(scores), Some(c)) = (dst.crf.as_mut(), call.crf) {
+                scores.best[slot] = c.best;
+                scores.logp[slot] = c.logp;
+                if let Some(m) = c.margin {
+                    scores.margin[slot] = m;
+                }
+                scores.mean_logpost[slot] = c.mean_logpost;
+            }
+        }
     }
 }
 
@@ -4252,6 +4308,7 @@ fn spawn_class_writer(
             None => None,
         };
         let mut collected = collect.then(|| Collected {
+            index: HashMap::new(),
             axes: axes
                 .iter()
                 .map(|axis| CollectedAxis {
@@ -4306,21 +4363,7 @@ fn spawn_class_writer(
                 writeln!(w)?;
             }
             if let Some(out) = &mut collected {
-                for (dst, call) in out.axes.iter_mut().zip(calls.iter()) {
-                    let code = dst.intern(&call.barcode);
-                    dst.barcode.insert(read_id, code);
-                    // Recorded for gated reads too, matching the CSV: a sidecar
-                    // that says `unclassified` should still say what it was
-                    // rejected for.
-                    if let (Some(scores), Some(c)) = (dst.crf.as_mut(), call.crf) {
-                        scores.best.insert(read_id, c.best);
-                        scores.logp.insert(read_id, c.logp);
-                        if let Some(m) = c.margin {
-                            scores.margin.insert(read_id, m);
-                        }
-                        scores.mean_logpost.insert(read_id, c.mean_logpost);
-                    }
-                }
+                out.record(read_id, calls.iter());
             }
         }
         if let Some(w) = &mut writer {
@@ -4947,7 +4990,7 @@ mod gpu_placement_tests {
 
 #[cfg(all(test, feature = "crf-decode"))]
 mod tests {
-    use super::{CollectedAxis, ColumnValues, PathBuf, crf_bundle_dir};
+    use super::{Arc, CollectedAxis, ColumnValues, HashMap, PathBuf, crf_bundle_dir};
     use uuid::Uuid;
 
     /// The sidecar-only barcode summary used to be built by cloning the whole
@@ -4959,12 +5002,9 @@ mod tests {
     fn label_counts_match_counting_the_labels() {
         let mut c = CollectedAxis::default();
         let mut expected: std::collections::HashMap<String, usize> = Default::default();
-        for (i, label) in ["nbc02", "nbc01", "nbc02", "unclassified", "nbc02"]
-            .into_iter()
-            .enumerate()
-        {
+        for label in ["nbc02", "nbc01", "nbc02", "unclassified", "nbc02"] {
             let code = c.intern(label);
-            c.barcode.insert(Uuid::from_u128(i as u128), code);
+            c.barcode.push(code);
             *expected.entry(label.to_string()).or_default() += 1;
         }
         // A label that was interned but that no read ended up with — the code
@@ -4992,16 +5032,27 @@ mod tests {
         assert_ne!(a, b);
 
         let ids: Vec<Uuid> = (0..2).map(Uuid::from_u128).collect();
-        c.barcode.insert(ids[0], a);
-        c.barcode.insert(ids[1], b);
+        c.barcode.push(a);
+        c.barcode.push(b);
+        let index: Arc<HashMap<Uuid, u32>> = Arc::new(
+            ids.iter()
+                .enumerate()
+                .map(|(i, &u)| (u, i as u32))
+                .collect(),
+        );
 
-        let columns = c.into_columns(true);
+        let columns = c.into_columns(true, &index);
         assert_eq!(columns[0].name, "barcode");
-        let ColumnValues::LabelCodes { dictionary, codes } = &columns[0].values else {
+        let ColumnValues::LabelCodesIndexed {
+            dictionary,
+            index,
+            codes,
+        } = &columns[0].values
+        else {
             panic!("barcode column must hand over codes, not materialized labels");
         };
-        assert_eq!(dictionary[codes[&ids[0]] as usize], "nbc01");
-        assert_eq!(dictionary[codes[&ids[1]] as usize], "nbc02");
+        assert_eq!(dictionary[codes[index[&ids[0]] as usize] as usize], "nbc01");
+        assert_eq!(dictionary[codes[index[&ids[1]] as usize] as usize], "nbc02");
     }
 
     /// `NAME=PATH` is resolved against the filesystem first, so a path that
@@ -5130,11 +5181,12 @@ mod tests {
                 ..Default::default()
             };
             let code = a.intern("nbc01");
-            a.barcode.insert(Uuid::from_u128(0), code);
+            a.barcode.push(code);
             a
         };
 
         let sole = super::Collected {
+            index: Default::default(),
             axes: vec![axis("barcode")],
         };
         let got: Vec<String> = sole.into_columns().into_iter().map(|c| c.name).collect();
@@ -5151,6 +5203,7 @@ mod tests {
         );
 
         let dual = super::Collected {
+            index: Default::default(),
             axes: vec![axis("ldx"), axis("fdx")],
         };
         let got: Vec<String> = dual.into_columns().into_iter().map(|c| c.name).collect();
