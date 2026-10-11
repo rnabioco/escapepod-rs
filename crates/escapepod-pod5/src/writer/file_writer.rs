@@ -399,6 +399,54 @@ impl Writer {
         Ok(())
     }
 
+    /// Add many reads at once, compressing their signal chunks in parallel.
+    ///
+    /// Equivalent to calling [`add_read`](Self::add_read) for each pair in
+    /// order — the file is byte-identical — but the VBZ work fans out over the
+    /// rayon pool; only the (cheap) bookkeeping stays serial. Nothing is
+    /// committed to the writer if compression fails.
+    pub fn add_reads(&mut self, reads: Vec<(ReadData, &[i16])>) -> Result<()> {
+        use rayon::prelude::*;
+
+        if self.finalized {
+            return Err(Error::WriterFinalized);
+        }
+        if !self.options.compress_signal || reads.len() < 2 || rayon::current_num_threads() < 2 {
+            for (read, signal) in reads {
+                self.add_read(read, signal)?;
+            }
+            return Ok(());
+        }
+
+        let chunk_size = self.options.max_signal_chunk_size as usize;
+        let work: Vec<(usize, &[i16])> = reads
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (_, signal))| signal.chunks(chunk_size).map(move |c| (i, c)))
+            .collect();
+        // Indexed parallel collect: output order is the input order.
+        let compressed: Vec<CompressedSignalChunk> = work
+            .par_iter()
+            .map(|&(i, chunk)| {
+                Ok(CompressedSignalChunk {
+                    read_id: reads[i].0.read_id,
+                    samples: chunk.len() as u32,
+                    data: Arc::from(compression::compress_signal(chunk)?),
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let mut next = 0;
+        for (i, (read, _)) in reads.into_iter().enumerate() {
+            let start = next;
+            while next < work.len() && work[next].0 == i {
+                next += 1;
+            }
+            self.add_read_with_compressed_signal(read, &compressed[start..next])?;
+        }
+        Ok(())
+    }
+
     /// Flush the signal batch the moment it reaches `signal_batch_size`, so
     /// every batch but the last holds *exactly* that many rows.
     ///
@@ -1572,6 +1620,66 @@ mod tests {
         assert_eq!(signal_back.len(), 50000);
         assert_eq!(signal_back, signal);
 
+        Ok(())
+    }
+
+    /// `add_reads` (parallel compression) writes the same reads and signal
+    /// rows as `add_read` in a loop — multi-chunk, empty and single-sample reads
+    /// included, and across several signal batches.
+    #[test]
+    fn add_reads_is_byte_identical_to_add_read_loop() -> Result<()> {
+        let options = || WriterOptions {
+            max_signal_chunk_size: 1000,
+            signal_batch_size: 7,
+            ..WriterOptions::default()
+        };
+        let lens = [0usize, 1, 999, 1000, 1001, 2500, 17, 3000, 8, 1];
+        let signals: Vec<Vec<i16>> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| generate_test_signal(n, i as i16 * 3))
+            .collect();
+        // Read ids are random per call: build the reads once, clone per file.
+        let base_reads: Vec<ReadData> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| create_test_read(0, i as u32 + 1, n as u64))
+            .collect();
+        let make_reads = |_idx: u32| base_reads.clone();
+
+        let serial = NamedTempFile::new().unwrap();
+        let mut w = Writer::create(serial.path(), options())?;
+        let idx = w.add_run_info(create_test_run_info("batch_test"))?;
+        for (read, sig) in make_reads(idx).into_iter().zip(&signals) {
+            w.add_read(read, sig)?;
+        }
+        w.finish()?;
+
+        let batched = NamedTempFile::new().unwrap();
+        let mut w = Writer::create(batched.path(), options())?;
+        let idx = w.add_run_info(create_test_run_info("batch_test"))?;
+        let reads = make_reads(idx);
+        w.add_reads(
+            reads
+                .into_iter()
+                .zip(signals.iter().map(|s| s.as_slice()))
+                .collect(),
+        )?;
+        w.finish()?;
+
+        // The file embeds a random identifier, so compare contents, not bytes:
+        // same reads (including signal-row indices) and same signal.
+        let (rs, rb) = (Reader::open(serial.path())?, Reader::open(batched.path())?);
+        let reads_of = |r: &Reader| -> Result<Vec<ReadData>> {
+            r.reads()?.collect::<std::result::Result<Vec<_>, _>>()
+        };
+        let (a, b) = (reads_of(&rs)?, reads_of(&rb)?);
+        assert_eq!(a.len(), lens.len());
+        for ((x, y), sig) in a.iter().zip(&b).zip(&signals) {
+            assert_eq!(x.read_id, y.read_id);
+            assert_eq!(x.signal_rows, y.signal_rows);
+            assert_eq!(&rb.get_signal(&y.signal_rows)?, sig);
+        }
         Ok(())
     }
 

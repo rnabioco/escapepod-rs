@@ -70,6 +70,37 @@ pub fn encode(samples: &[i16]) -> Result<Vec<u8>> {
     encode_scalar(samples)
 }
 
+/// Encode into a caller-owned buffer (cleared first), reusing its capacity.
+///
+/// Byte-identical to [`encode`]; exists so per-chunk callers (the VBZ writer)
+/// need not allocate and zero `max_size + 16` bytes for every chunk.
+pub fn encode_into(samples: &[i16], out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            let keys_len = key_length(samples.len());
+            let max_size = max_encoded_size(samples.len());
+            // The SIMD tail ORs into `keys`, so they must start zeroed; the
+            // data region is fully overwritten up to what is kept.
+            out.resize(max_size + 16, 0);
+            out[..keys_len].fill(0);
+            let (keys, data) = out.split_at_mut(keys_len);
+            // SAFETY: runtime SSSE3 check above.
+            let written = unsafe { simd_ssse3::encode(samples, keys, data) };
+            out.truncate(keys_len + written);
+            return Ok(());
+        }
+    }
+
+    *out = encode_scalar(samples)?;
+    Ok(())
+}
+
 #[cfg(target_arch = "x86_64")]
 fn encode_ssse3(samples: &[i16]) -> Vec<u8> {
     let keys_len = key_length(samples.len());

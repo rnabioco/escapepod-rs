@@ -32,28 +32,60 @@ pub fn compress_signal(samples: &[i16]) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    // Stage 1: SVB16 encoding
-    let svb_encoded = svb16::encode(samples)?;
+    ZSTD_ENCODE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let EncodeScratch { cctx, svb, zbuf } = match &mut *slot {
+            Some(scratch) => scratch,
+            empty => {
+                let mut cctx = zstd::bulk::Compressor::new(ZSTD_LEVEL)
+                    .map_err(|e| Error::Compression(format!("ZSTD encoder init failed: {}", e)))?;
+                // The ONT C++ VBZ library (lib_pod5, Dorado) requires the
+                // decompressed size in the frame header. The one-shot API
+                // records it; set the flag explicitly rather than lean on
+                // the default.
+                cctx.include_contentsize(true).map_err(|e| {
+                    Error::Compression(format!("ZSTD set content size failed: {}", e))
+                })?;
+                empty.insert(EncodeScratch {
+                    cctx,
+                    svb: Vec::new(),
+                    zbuf: Vec::new(),
+                })
+            }
+        };
 
-    // Stage 2: ZSTD compression
-    // Use an encoder with include_contentsize and pledged source size so that
-    // the ZSTD frame header contains the decompressed size. The ONT C++ VBZ
-    // library (lib_pod5, Dorado) requires this field to be present.
-    let mut encoder = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL)
-        .map_err(|e| Error::Compression(format!("ZSTD encoder init failed: {}", e)))?;
-    encoder
-        .include_contentsize(true)
-        .map_err(|e| Error::Compression(format!("ZSTD set content size failed: {}", e)))?;
-    encoder
-        .set_pledged_src_size(Some(svb_encoded.len() as u64))
-        .map_err(|e| Error::Compression(format!("ZSTD set pledged src size failed: {}", e)))?;
-    std::io::copy(&mut svb_encoded.as_slice(), &mut encoder)
-        .map_err(|e| Error::Compression(format!("ZSTD compression failed: {}", e)))?;
-    let compressed = encoder
-        .finish()
-        .map_err(|e| Error::Compression(format!("ZSTD finish failed: {}", e)))?;
+        // Stage 1: SVB16 encoding, into reused scratch.
+        svb16::encode_into(samples, svb)?;
 
-    Ok(compressed)
+        // Stage 2: ZSTD compression, one-shot, into an exactly-bounded buffer.
+        zbuf.clear();
+        zbuf.reserve(zstd::zstd_safe::compress_bound(svb.len()));
+        cctx.compress_to_buffer(svb, zbuf)
+            .map_err(|e| Error::Compression(format!("ZSTD compression failed: {}", e)))?;
+        let out = zbuf.clone();
+        if svb.capacity() > MAX_RETAINED_SCRATCH {
+            *svb = Vec::new();
+            *zbuf = Vec::new();
+        }
+        Ok(out)
+    })
+}
+
+/// A thread's reusable encode state: the ZSTD context, the SVB16 output and
+/// the compressed output.
+struct EncodeScratch {
+    cctx: zstd::bulk::Compressor<'static>,
+    svb: Vec<u8>,
+    zbuf: Vec<u8>,
+}
+
+thread_local! {
+    /// One ZSTD compression context + SVB16 scratch per thread. A fresh
+    /// `Encoder` per chunk built a `CCtx`, its tables and a 32 KB buffer for
+    /// every read. Thread-local for the same reason as the decoder's: callers
+    /// fan out over rayon and `Compressor` is `Send`, not `Sync`.
+    static ZSTD_ENCODE: RefCell<Option<EncodeScratch>> =
+        const { RefCell::new(None) };
 }
 
 /// Largest buffer a thread keeps alive between `decompress_signal` calls.
@@ -261,6 +293,53 @@ pub fn decompress_signal_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-#466 encoder, verbatim: a fresh streaming `Encoder` per chunk.
+    /// Kept as the byte-level reference the pooled one-shot path must match.
+    fn compress_signal_reference(samples: &[i16]) -> Vec<u8> {
+        if samples.is_empty() {
+            return Vec::new();
+        }
+        let svb_encoded = svb16::encode(samples).unwrap();
+        let mut encoder = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL).unwrap();
+        encoder.include_contentsize(true).unwrap();
+        encoder
+            .set_pledged_src_size(Some(svb_encoded.len() as u64))
+            .unwrap();
+        std::io::copy(&mut svb_encoded.as_slice(), &mut encoder).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Compressed bytes are identical to the per-chunk-encoder implementation
+    /// across lengths (0, 1, SIMD-block and key-byte boundaries, ZSTD 128 KiB
+    /// block boundary, the writer's 102_400-sample chunk) and signal shapes,
+    /// including reuse of one thread's scratch across shrinking/growing calls.
+    #[test]
+    fn test_compress_byte_identical_to_streaming_reference() {
+        let lens = [
+            0usize, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 255, 256, 1000, 4095, 4096, 4097,
+            65_535, 65_536, 65_537, 102_399, 102_400, 102_401, 150_000,
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for &len in lens.iter().chain(lens.iter().rev()) {
+            let smooth: Vec<i16> = (0..len)
+                .map(|i| 500 + ((i as f64 * 0.01).sin() * 80.0) as i16 + (next() % 5) as i16)
+                .collect();
+            let noisy: Vec<i16> = (0..len).map(|_| next() as i16).collect();
+            let constant = vec![-3i16; len];
+            for samples in [&smooth, &noisy, &constant] {
+                let got = compress_signal(samples).unwrap();
+                assert_eq!(got, compress_signal_reference(samples), "len {len}");
+                assert_eq!(decompress_signal(&got, len).unwrap(), *samples, "len {len}");
+            }
+        }
+    }
 
     #[test]
     fn test_compress_decompress_empty() {
