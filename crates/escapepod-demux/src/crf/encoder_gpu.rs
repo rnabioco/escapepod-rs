@@ -100,7 +100,9 @@ use ort::value::Tensor;
 use rayon::prelude::*;
 
 use super::encoder::{CrfError, CrfMetadata};
-use super::lattice::{Backend, CrfLayout, CrfScratch, decode_with, decode_with_refs_strided};
+use super::lattice::{
+    Backend, CrfLayout, CrfScratch, decode_with_refs_strided, decode_with_strided,
+};
 use super::refchain::{RefChains, ScoredDecode};
 
 /// A cheap identity for a reference panel, so the device scan tables can be
@@ -628,30 +630,18 @@ impl CrfEncoderGpu {
         self.run_raw(rows, |data, t_len, batch, n_score| {
             (0..batch)
                 .into_par_iter()
-                .map_init(
-                    || {
-                        (
-                            CrfScratch::new(),
-                            Vec::<f32>::with_capacity(t_len * n_score),
-                        )
-                    },
-                    |(scratch, buf), b| {
-                        buf.clear();
-                        for t in 0..t_len {
-                            let off = (t * batch + b) * n_score;
-                            buf.extend_from_slice(&data[off..off + n_score]);
-                        }
-                        decode_with(
-                            &self.layout,
-                            &self.alphabet,
-                            buf.as_slice(),
-                            t_len,
-                            scratch,
-                            backend,
-                        )
-                        .map_err(|e| CrfError::Decode(e.to_string()))
-                    },
-                )
+                .map_init(CrfScratch::new, |scratch, b| {
+                    decode_with_strided(
+                        &self.layout,
+                        &self.alphabet,
+                        &data[b * n_score..],
+                        t_len,
+                        batch * n_score,
+                        scratch,
+                        backend,
+                    )
+                    .map_err(|e| CrfError::Decode(e.to_string()))
+                })
                 .collect()
         })
     }

@@ -40,7 +40,7 @@ use crate::{AdapterCnnConfig, AdapterCnnError};
 /// simply yields proportionally fewer rows. Using total VRAM means an 80 GB A100/H100
 /// gets ~3× larger batches automatically, while the halve-retry covers any
 /// over-estimate (e.g. a model with more channels).
-fn resolve_batch_elems() -> usize {
+fn resolve_batch_elems(device: i32) -> usize {
     /// Empirical peak device bytes per input element (`rows × len`) at the OOM
     /// boundary for the rna004 TCN — folds in channel count and the number of
     /// live conv activations, with headroom.
@@ -50,23 +50,43 @@ fn resolve_batch_elems() -> usize {
     if let Some(n) = escapepod_signal::pod5::env::positive_usize("ESCAPEPOD_CNN_GPU_BATCH_ELEMS") {
         return n;
     }
-    match cuda_total_mem_bytes() {
-        Some(total) => (total / BYTES_PER_ELEM).clamp(2_000_000, 64_000_000),
-        None => FALLBACK,
+    batch_elems_for(device, cuda_total_mem_bytes, BYTES_PER_ELEM, FALLBACK)
+}
+
+/// Budget for `device`, with the VRAM query injected so a test can check which
+/// ordinal is asked about without a GPU.
+fn batch_elems_for(
+    device: i32,
+    total_mem: impl FnOnce(i32) -> Option<usize>,
+    bytes_per_elem: usize,
+    fallback: usize,
+) -> usize {
+    match total_mem(device) {
+        Some(total) => (total / bytes_per_elem).clamp(2_000_000, 64_000_000),
+        None => fallback,
     }
 }
 
-/// Total memory (bytes) of the CUDA device the CUDA EP will use (ordinal 0,
-/// after `CUDA_VISIBLE_DEVICES`). `None` if the driver/device can't be queried.
-fn cuda_total_mem_bytes() -> Option<usize> {
+/// Lock the session, recovering from poisoning. Same policy as the CRF encoder
+/// (`encoder_gpu.rs`): the panic that poisoned the lock is already reported by
+/// the thread that hit it, and a half-finished `run` does not corrupt the
+/// session handle, so re-panicking in every later caller only buries the cause.
+fn lock_session<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Total memory (bytes) of CUDA device `device` — the ordinal the session is
+/// pinned to, after `CUDA_VISIBLE_DEVICES`. `None` if the driver/device can't
+/// be queried.
+fn cuda_total_mem_bytes(device: i32) -> Option<usize> {
     use cudarc::driver::result;
     // SAFETY: these are read-only CUDA driver queries. `cuInit` is idempotent
     // (ort also initializes the driver) and device-property queries need no
     // context; any failure just yields `None` (we fall back to a fixed cap).
     unsafe {
         result::init().ok()?;
-        let device = result::device::get(0).ok()?;
-        result::device::total_mem(device).ok()
+        let dev = result::device::get(device).ok()?;
+        result::device::total_mem(dev).ok()
     }
 }
 
@@ -126,7 +146,7 @@ impl AdapterCnnGpu {
         Ok(Self {
             session: Mutex::new(session),
             config,
-            batch_elems: resolve_batch_elems(),
+            batch_elems: resolve_batch_elems(device),
         })
     }
 
@@ -244,7 +264,7 @@ impl AdapterCnnGpu {
         data[..n].copy_from_slice(&prepped[..n]);
         let input = Tensor::from_array(([1usize, 1, len], data))
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-        let mut session = self.session.lock().expect("ort session mutex poisoned");
+        let mut session = lock_session(&self.session);
         let outputs = session
             .run(ort::inputs![input])
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
@@ -273,7 +293,7 @@ impl AdapterCnnGpu {
         let data = pack_batch(prepped, sub, len);
         let input = Tensor::from_array(([g, 1, len], data))
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
-        let mut session = self.session.lock().expect("ort session mutex poisoned");
+        let mut session = lock_session(&self.session);
         let outputs = session
             .run(ort::inputs![input])
             .map_err(|e| AdapterCnnError::Run(e.to_string()))?;
@@ -310,4 +330,39 @@ impl AdapterCnnGpu {
 fn is_out_of_memory(e: &AdapterCnnError) -> bool {
     matches!(e, AdapterCnnError::Run(m)
         if m.contains("Failed to allocate") || m.contains("out of memory") || m.contains("CUDA_ERROR_OUT_OF_MEMORY"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_budget_queries_the_configured_ordinal() {
+        let mut asked = None;
+        let n = batch_elems_for(
+            3,
+            |d| {
+                asked = Some(d);
+                Some(80_000_000_000)
+            },
+            5500,
+            1,
+        );
+        assert_eq!(asked, Some(3));
+        assert_eq!(n, 14_545_454);
+        assert_eq!(batch_elems_for(0, |_| None, 5500, 7), 7);
+    }
+
+    #[test]
+    fn poisoned_session_lock_is_recovered() {
+        let m = std::sync::Arc::new(Mutex::new(5u32));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert_eq!(*lock_session(&m), 5);
+    }
 }
