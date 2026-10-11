@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.33.0 (2026-10-11)
+
+### Added
+
+- **`escpod annotate` ships in the default build, and `--from-table` labels reads from another tool's table** (#486). `annotate` was behind the `experimental` feature, so a pipeline that installs release binaries could not use it; `experimental` now covers only `repack` and `resquiggle`. `--from-table <TABLE>... --column NAME=COL` reads a read-id to label table (CSV or TSV, gzip detected including multi-member files, a leading `#` in the header ignored, `--id-column` to name the id column) into the `.p5s` sidecar through the same writers `demux --annotate` uses: one collection sidecar for a directory argument, the footer UUID/size binding, in-place replacement of the named column. Labels are taken verbatim, so a WarpDemuX table's bare integers and `-1` stay `7` and `-1`. Reads the table does not label (absent, or an empty cell) get `unclassified`, as with `demux --annotate`; `--unassigned-label LABEL` changes it and `--unassigned-label ''` leaves them absent. A table or `-a` CSV that matches no read in any input is now refused before anything is written (it used to replace a good column with an empty one, and with the fill would have replaced it with all-`unclassified`).
+
+### Changed
+
+- **`escpod index` and `escpod annotate` are now `escpod sidecar index` and `escpod sidecar annotate`** (#488). Both commands write the `.p5s` sidecar through the same writers, with the same footer identity binding and collection-sidecar handling, and `annotate` already builds the read index when none exists, so `index` is the labels-free case of the same operation; the group names the file they share and leaves room for further sidecar tooling. Arguments, output, exit codes and the `.p5s` format are unchanged, and `escpod sidecar --help` carries the overview. The top-level `escpod index` and `escpod annotate` keep working as hidden forwarders to the new commands (not listed in `--help`, same arguments and behaviour), each logging one deprecation warning on stderr that names the new spelling, the way `escpod signal classify` was retired (#375). Scripts should switch; the old spellings will be removed in a later release. The unindexed-input warning (`classify`, the reader's index-build notice), the sidecar error messages that suggest a rebuild, and the `demux --annotate` / `demux split --sidecar` help now say `escpod sidecar index` / `escpod sidecar annotate`, and the docs move under a `sidecar` section (`cli/sidecar.md` with one page per command).
+
 ## 0.32.0 (2026-10-11)
 
 ### Added
