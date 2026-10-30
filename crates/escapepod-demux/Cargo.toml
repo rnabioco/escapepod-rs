@@ -70,7 +70,7 @@ tract-onnx = { workspace = true, optional = true }
 # that TLS stack is dead weight in the graph — and it broke the GPU release
 # artifact, which builds in a `manylinux_2_28` container with no openssl-devel.
 # `std`/`ndarray`/`tracing`/`api-27` are the defaults we do use, restated.
-ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
     "api-27",
     "cuda",
     "load-dynamic",
