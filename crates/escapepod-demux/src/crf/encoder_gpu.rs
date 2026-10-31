@@ -717,7 +717,8 @@ impl CrfEncoderGpu {
         binding.synchronize_outputs().map_err(run)?;
 
         let tensor = outputs[0]
-            .downcast_ref::<DynTensorValueType>()
+            .view()
+            .downcast::<DynTensorValueType>()
             .map_err(|e| CrfError::Run(format!("encoder output is not a tensor: {e}")))?;
 
         // If the EP declined the binding and produced a host tensor, `data_ptr`
