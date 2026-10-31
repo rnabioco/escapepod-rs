@@ -12,11 +12,29 @@
 //! Bumping is a decision, not an accident.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ort::ep::{ArenaExtendStrategy, CUDA};
-use ort::execution_providers::ExecutionProviderDispatch;
+use ort::environment::Environment;
+use ort::ep::{ArenaExtendStrategy, CUDA, ExecutionProviderDispatch};
 use ort::session::Session;
+
+/// The process-wide onnxruntime environment. rc.14 made it an explicit value
+/// that every `Session::builder` borrows, and `build()` refuses a second one,
+/// so it is created once, on first use, and kept for the life of the process.
+/// Telemetry is off: these run on compute nodes with no route out.
+fn environment() -> Result<&'static Environment, ort::Error> {
+    static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        ort::init()
+            .with_name("escapepod")
+            .with_telemetry(false)
+            .build()
+            .map_err(|e| e.to_string())
+    })
+    .as_ref()
+    .map_err(|e| ort::Error::new(e.clone()))
+}
 
 /// Whether CUDA EP registration failure is fatal for every session built from
 /// here on. See [`require_cuda`].
@@ -150,7 +168,7 @@ pub(crate) fn cuda_providers_on(device_id: i32) -> [ExecutionProviderDispatch; 1
 /// execution mode, which neither caller enables — set anyway so the bound
 /// holds if that ever changes.
 pub(crate) fn cuda_session(path: impl AsRef<Path>, device: i32) -> Result<Session, ort::Error> {
-    Session::builder()?
+    Session::builder(environment()?)?
         .with_intra_threads(1)?
         .with_inter_threads(1)?
         .with_intra_op_spinning(false)?
