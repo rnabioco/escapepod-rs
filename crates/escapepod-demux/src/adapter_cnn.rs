@@ -35,34 +35,47 @@ use tract_onnx::tract_core::model::TypedRunnableModel;
 /// Parameters controlling the CNN detector. Defaults match ADAPTed's
 /// `rna004_130bps@v0.2.4.toml` `[core]` block and escapepod-models' training
 /// config.
+///
+/// Composes [`BoundaryInputSpec`](crate::crf::BoundaryInputSpec), the input
+/// geometry a bundle declares (`min_obs_adapter`, `max_obs_trace`,
+/// `downscale_factor`, `pad_value`, `input_len`), and adds the one decode
+/// policy field the contract omits, `max_obs_adapter`. The spec's fields are
+/// reachable directly through `Deref` (`cfg.max_obs_trace`).
+///
+/// `max_obs_trace` ends the signal window the model was trained/normalized
+/// over (`signal[min_obs_adapter:max_obs_trace]`); statistics and the model
+/// input come from that bounded window, NOT the whole read (normalizing a
+/// multi-hundred-k mRNA gives statistics the CNN never saw). For reads shorter
+/// than it (tRNA) the window clamps to the read end. `pad_value` is what the
+/// window is right-padded to [`input_len`](Self::input_len) with
+/// ([`SCORE_EXCL`] unless a bundle declares otherwise); anything else, zero
+/// included, feeds the model a pattern it never saw.
 #[derive(Debug, Clone, Copy)]
 pub struct AdapterCnnConfig {
-    pub min_obs_adapter: usize,
+    /// The model's input geometry (the bundle-declared contract).
+    pub input: crate::crf::BoundaryInputSpec,
+    /// Upper bound of the decode's argmax range (policy, not contract).
     pub max_obs_adapter: usize,
-    pub downscale_factor: usize,
-    /// End of the signal window the model was trained/normalized over
-    /// (`signal[min_obs_adapter:max_obs_trace]`). Normalization statistics and
-    /// the model input are taken from this bounded window — NOT the whole read.
-    /// Critical for long reads (mRNA): normalizing over an entire multi-hundred-k
-    /// transcript gives the CNN statistics it never saw in training. For reads
-    /// shorter than this (tRNA) the window clamps to the read end, so bounding
-    /// is a no-op. Matches escapepod-models `DataConfig.max_obs_trace`.
-    pub max_obs_trace: usize,
-    /// Value the window is right-padded to [`input_len`](Self::input_len) with,
-    /// and the NaN substitute during normalisation ([`SCORE_EXCL`] unless a
-    /// bundle declares otherwise). Padding with anything else — zero included —
-    /// feeds the model a pattern it never saw.
-    pub pad_value: f32,
+}
+
+impl std::ops::Deref for AdapterCnnConfig {
+    type Target = crate::crf::BoundaryInputSpec;
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
 }
 
 impl Default for AdapterCnnConfig {
     fn default() -> Self {
         Self {
-            min_obs_adapter: 1000,
+            input: crate::crf::BoundaryInputSpec {
+                min_obs_adapter: 1000,
+                max_obs_trace: 16000,
+                downscale_factor: 10,
+                input_len: 1500,
+                pad_value: SCORE_EXCL,
+            },
             max_obs_adapter: 6500,
-            downscale_factor: 10,
-            max_obs_trace: 16000,
-            pad_value: SCORE_EXCL,
         }
     }
 }
@@ -101,10 +114,10 @@ impl AdapterCnnConfig {
         spec: &crate::crf::BoundaryInputSpec,
     ) -> Result<Self, AdapterCnnError> {
         let cfg = Self {
-            min_obs_adapter: spec.min_obs_adapter,
-            max_obs_trace: spec.max_obs_trace,
-            downscale_factor: spec.downscale_factor.max(1),
-            pad_value: spec.pad_value,
+            input: crate::crf::BoundaryInputSpec {
+                downscale_factor: spec.downscale_factor.max(1),
+                ..*spec
+            },
             ..Self::default()
         };
         if cfg.input_len() != spec.input_len {

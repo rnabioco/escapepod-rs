@@ -15,12 +15,11 @@
 //! the same parse for the rarer knob where `0` is a meaningful setting
 //! rather than a typo — `ESCAPEPOD_AUTOINDEX_MAX=0` disables speculative
 //! index warm-up, and routing it through [`positive_usize`] silently turned
-//! that off (rnabioco/escapepod-rs#421). A caller whose knob's
-//! *default* is "on" (`ESCAPEPOD_CRF_GPU_DECODE`, `ESCAPEPOD_CRF_GPU_ZEROCOPY`
-//! — `=0` opts out of an on-by-default behaviour) does not fit [`flag`]'s
-//! fixed off-when-unset contract and is deliberately left alone; backend-name
+//! that off (rnabioco/escapepod-rs#421). A switch whose *default* is "on"
+//! (`ESCAPEPOD_CRF_GPU_DECODE`, `ESCAPEPOD_CRF_GPU_ZEROCOPY` — `=0` opts out
+//! of an on-by-default behaviour) uses [`flag_default_on`]; backend-name
 //! caps (`*_BACKEND`) and path variables (`*_CACHE`) are a different shape
-//! entirely and stay on their own parse too.
+//! entirely and stay on their own parse.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -73,6 +72,39 @@ pub fn flag(name: &str) -> bool {
                 format_args!("value is not valid Unicode; treating it as off"),
             );
             false
+        }
+    }
+}
+
+/// A boolean `ESCAPEPOD_*` switch whose default is *on*.
+///
+/// The opt-out counterpart of [`flag`]: on when unset or empty, off for `0`,
+/// `false`, `no` or `off` (case-insensitive), on for `1|true|yes|on`.
+/// Anything else warns once per name and keeps the default (on), so a typo
+/// cannot silently disable a behaviour.
+#[allow(clippy::disallowed_methods)]
+pub fn flag_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                warn_once(
+                    name,
+                    format_args!(
+                        "{v:?} is not 1/true/yes/on or 0/false/no/off; keeping the default (on)"
+                    ),
+                );
+                true
+            }
+        },
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_once(
+                name,
+                format_args!("value is not valid Unicode; keeping the default (on)"),
+            );
+            true
         }
     }
 }
@@ -225,6 +257,21 @@ mod tests {
         assert!(!with_var("ESCAPEPOD_TEST_FLAG_ZERO", Some("0"), || flag(
             "ESCAPEPOD_TEST_FLAG_ZERO"
         )));
+    }
+
+    #[test]
+    fn flag_default_on_contract() {
+        const N: &str = "ESCAPEPOD_TEST_FLAG_DEFAULT_ON";
+        let read = |v: Option<&str>| with_var(N, v, || flag_default_on(N));
+        assert!(read(None), "unset is on");
+        assert!(read(Some("")), "empty is on");
+        for v in ["0", "false", "FALSE", "no", "NO", "off", "Off"] {
+            assert!(!read(Some(v)), "{v:?} should be off");
+        }
+        for v in ["1", "true", "yes", "on"] {
+            assert!(read(Some(v)), "{v:?} should be on");
+        }
+        assert!(read(Some("maybe")), "garbage warns and keeps the default");
     }
 
     #[test]
