@@ -933,7 +933,7 @@ dependencies = [
  "libc",
  "noodles-bam",
  "noodles-bgzf",
- "noodles-sam",
+ "noodles-sam 0.91.0",
  "rayon",
  "serde",
  "serde_json",
@@ -969,7 +969,7 @@ dependencies = [
  "noodles-bgzf",
  "noodles-core",
  "noodles-csi",
- "noodles-sam",
+ "noodles-sam 0.91.0",
  "owo-colors",
  "parquet",
  "rayon",
@@ -1055,7 +1055,7 @@ dependencies = [
  "flate2",
  "ndarray",
  "noodles-bam",
- "noodles-sam",
+ "noodles-sam 0.91.0",
  "parquet",
  "rand 0.10.3",
  "rayon",
@@ -1630,9 +1630,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-bam"
-version = "0.96.0"
+version = "0.98.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "483ca346cd22cdffea7c5eb1b7530ee5dd1218fe0f023f2b2c175a84f7b09d7e"
+checksum = "9695fd6594a78ecfaaa0c2c365412fed0f69388479504a588a6ba330db82923e"
 dependencies = [
  "bstr",
  "indexmap",
@@ -1640,7 +1640,7 @@ dependencies = [
  "noodles-bgzf",
  "noodles-core",
  "noodles-csi",
- "noodles-sam",
+ "noodles-sam 0.93.0",
 ]
 
 [[package]]
@@ -1682,6 +1682,22 @@ name = "noodles-sam"
 version = "0.91.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9663f864dc2e1b5a875dafb670ee284956f5bf4f76be6124f3dd73379a1252db"
+dependencies = [
+ "bitflags",
+ "bstr",
+ "indexmap",
+ "lexical-core",
+ "memchr",
+ "noodles-bgzf",
+ "noodles-core",
+ "noodles-csi",
+]
+
+[[package]]
+name = "noodles-sam"
+version = "0.93.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a562af0b8f8e82a939fa4ce311cdddea95cf7f265917e474d75ba0827e09a9a"
 dependencies = [
  "bitflags",
  "bstr",
