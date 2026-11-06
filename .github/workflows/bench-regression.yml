@@ -56,6 +56,8 @@ jobs:
           }
           run_if_present escapepod-signal hot_paths
           run_if_present escapepod-pod5 io_hot_paths
+          run_if_present escapepod-demux classify
+          run_if_present escapepod-classify charging
 
       - name: Bench PR HEAD vs. baseline
         run: |
@@ -75,13 +77,15 @@ jobs:
           }
           bench_diff escapepod-signal hot_paths signal_bench.txt
           bench_diff escapepod-pod5 io_hot_paths pod5_bench.txt
+          bench_diff escapepod-demux classify demux_bench.txt
+          bench_diff escapepod-classify charging classify_bench.txt
 
       - name: Flag regressions
         run: |
           # Criterion prints "regressed" on a line when a group shows
           # statistically-significant slowdown. Surface these without failing
           # the build so the PR author sees the hit.
-          if grep -E "Performance has regressed" signal_bench.txt pod5_bench.txt; then
+          if grep -E "Performance has regressed" signal_bench.txt pod5_bench.txt demux_bench.txt classify_bench.txt; then
             echo "::warning::Criterion detected a regression — inspect the artifact."
           fi
 
@@ -92,5 +96,7 @@ jobs:
           path: |
             signal_bench.txt
             pod5_bench.txt
+            demux_bench.txt
+            classify_bench.txt
             /tmp/criterion
           retention-days: 14
