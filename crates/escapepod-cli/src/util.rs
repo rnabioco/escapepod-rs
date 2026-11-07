@@ -1,6 +1,6 @@
 //! Utility functions for the CLI.
 
-use escapepod_signal::Reader;
+use escapepod_signal::pod5::Reader;
 use noodles_bam as bam;
 #[cfg(feature = "experimental")]
 use noodles_csi::BinningIndex;
@@ -13,6 +13,46 @@ use walkdir::WalkDir;
 use tracing::{info, warn};
 
 use crate::style;
+
+/// Resolve an on-disk cache directory.
+///
+/// Precedence: `$<var>` → `$XDG_CACHE_HOME/escapepod/<subdir>` →
+/// `$HOME/.cache/escapepod/<subdir>`. Per the XDG spec, an empty
+/// `XDG_CACHE_HOME` is treated as unset (and so is an empty `$<var>`).
+pub fn cache_dir(var: &str, subdir: &str) -> anyhow::Result<PathBuf> {
+    // `*_CACHE` path variables (and the standard XDG_CACHE_HOME/HOME they
+    // fall back to) are a different shape from a flag/knob and keep their
+    // own parse (root CLAUDE.md's env-switch table).
+    #[allow(clippy::disallowed_methods)]
+    if let Some(d) = std::env::var_os(var).filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(d));
+    }
+    #[allow(clippy::disallowed_methods)]
+    if let Some(d) = std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(d).join("escapepod").join(subdir));
+    }
+    #[allow(clippy::disallowed_methods)]
+    if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return Ok(PathBuf::from(h)
+            .join(".cache")
+            .join("escapepod")
+            .join(subdir));
+    }
+    anyhow::bail!("cannot determine cache directory: set {var}, XDG_CACHE_HOME, or HOME");
+}
+
+/// Lowercase-hex sha256 of a byte slice.
+#[cfg(feature = "model-fetch")]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 
 /// Resolve input path to a list of POD5 files.
 ///
@@ -359,7 +399,9 @@ pub fn get_reads_iter_with_warning<'a>(
     reader: &'a Reader,
     file_path: &Path,
     is_directory: bool,
-) -> OpenResult<impl Iterator<Item = escapepod_signal::Result<escapepod_signal::ReadData>> + 'a> {
+) -> OpenResult<
+    impl Iterator<Item = escapepod_signal::pod5::Result<escapepod_signal::pod5::ReadData>> + 'a,
+> {
     match reader.reads() {
         Ok(iter) => OpenResult::Ok(iter),
         Err(e) => {

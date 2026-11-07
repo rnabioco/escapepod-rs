@@ -10,11 +10,8 @@
 //! - [`WarpDemuxModel`] and [`DtwSvmModel`] JSON loaders.
 //! - Per-read DTW classifier ([`classify_read`]) and full SVM predictor
 //!   ([`classify_with_svm`]) with Platt scaling + libsvm-style OvO coupling.
-//! - Optional `train` feature: build a `DtwSvmModel` from labeled fingerprints
-//!   ([`train_svm`] and friends). Today this is a labels-only stub that relies
-//!   on kernel-weighted voting at predict time; see `train.rs`.
 //! - Optional `gpu` feature: batched GPU DTW matrix (routed through
-//!   `escapepod-signal`'s CUDA kernel) for classify and training.
+//!   `escapepod-signal`'s CUDA kernel) for classify.
 //! - Optional `cnn-detect` feature: adapter-end detection by running an
 //!   exported boundary-CNN ONNX graph through tract-onnx ([`AdapterCnn`]).
 //!   This is CPU-only and architecture-agnostic (any `[B,1,L] -> [B,2,L]`
@@ -82,9 +79,6 @@ mod ort_ep;
 mod probability;
 mod svm;
 
-#[cfg(feature = "train")]
-mod train;
-
 #[cfg(feature = "cnn-detect")]
 pub mod adapter_cnn;
 
@@ -144,9 +138,6 @@ pub use svm::DEFAULT_GPU_CHUNK_CELLS;
 
 #[cfg(feature = "gpu")]
 pub use svm::{classify_with_svm_batch_gpu, classify_with_svm_batch_gpu_with_ctx};
-
-#[cfg(feature = "train")]
-pub use train::*;
 
 #[cfg(feature = "cnn-detect")]
 pub use adapter_cnn::{AdapterCnn, AdapterCnnConfig, AdapterCnnError, PreppedWindow};

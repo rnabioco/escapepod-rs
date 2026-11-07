@@ -10,11 +10,11 @@ use crate::style;
 use crate::util::{
     check_output_not_input, check_output_writable, collect_pod5_inputs, warn_not_portable,
 };
-use escapepod_signal::Durability;
-use escapepod_signal::operations::{
+use escapepod_signal::pod5::Durability;
+use escapepod_signal::pod5::operations::{
     FilterCriteria, FilterOptions, filter_files_with_criteria, read_annotation, read_ids_from_file,
 };
-use escapepod_signal::types::EndReason;
+use escapepod_signal::pod5::types::EndReason;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -97,7 +97,7 @@ pub fn run(
                 .or_default()
                 .insert(label.to_string());
         }
-        let mut selected: Option<HashSet<escapepod_signal::Uuid>> = None;
+        let mut selected: Option<HashSet<escapepod_signal::pod5::Uuid>> = None;
         for (name, labels) in &by_name {
             let mut ids = HashSet::new();
             let mut known_labels: HashSet<&str> = HashSet::new();
@@ -216,8 +216,8 @@ pub fn run(
     let bar_for_callback = filter_bar.clone();
 
     // Create progress callback
-    let progress: escapepod_signal::ProgressCallback =
-        Box::new(move |p: escapepod_signal::Progress| {
+    let progress: escapepod_signal::pod5::ProgressCallback =
+        Box::new(move |p: escapepod_signal::pod5::Progress| {
             bar_for_callback.set_length(p.total);
             bar_for_callback.set_position(p.current);
         });

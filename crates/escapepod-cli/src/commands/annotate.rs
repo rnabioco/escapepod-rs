@@ -10,8 +10,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 use tracing::{info, warn};
 
-use escapepod_signal::Uuid;
-use escapepod_signal::operations::{
+use escapepod_signal::pod5::Uuid;
+use escapepod_signal::pod5::operations::{
     ABSENT_CODE, ColumnStat, ColumnValues, ColumnWrite, DesignOptions, LabelTable,
     LabelTableBuilder, parse_barcode_mapping, remove_annotation, remove_design,
     write_collection_columns, write_columns, write_design,
@@ -266,7 +266,7 @@ fn run_list(files: &[PathBuf], dirs: &[PathBuf]) -> anyhow::Result<()> {
 
     for pod5_path in files {
         let p5s_path = sidecar_path(pod5_path);
-        let reader = escapepod_signal::Reader::open(pod5_path)?;
+        let reader = escapepod_signal::pod5::Reader::open(pod5_path)?;
         let identity = reader.sidecar_identity()?;
         let sidecar = match read_sidecar_file(&p5s_path, &identity) {
             Ok(Some(s)) => s,
@@ -589,7 +589,7 @@ fn scan_inputs(
     files
         .par_iter()
         .map(|path| {
-            let ids = escapepod_signal::Reader::open(path)
+            let ids = escapepod_signal::pod5::Reader::open(path)
                 .and_then(|reader| reader.read_ids())
                 .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             let mut scan = FileScan {

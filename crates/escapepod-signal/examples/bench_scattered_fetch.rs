@@ -46,7 +46,7 @@
 //! on a file too large to cache, and treat a file that fits in RAM as a warm
 //! measurement only.
 
-use escapepod_signal::Reader;
+use escapepod_signal::pod5::Reader;
 use escapepod_signal::pod5::Uuid;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};

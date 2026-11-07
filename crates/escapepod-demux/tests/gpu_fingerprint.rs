@@ -73,6 +73,7 @@ fn cpu_fp(sig: &[i16]) -> Option<Vec<f64>> {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_fingerprint_matches_cpu() {
     let Some(ctx) = try_context() else { return };
 

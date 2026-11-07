@@ -94,6 +94,7 @@ fn golden_alphabet(fixture: &serde_json::Value) -> Vec<u8> {
 /// The headline check: the batched GPU decode reproduces bonito's own
 /// sequences, for every read in the fixture, decoded as one batch.
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_decode_matches_bonito() {
     let fixture = golden();
     let layout = golden_layout(&fixture);
@@ -127,6 +128,7 @@ fn gpu_decode_matches_bonito() {
 /// this is what catches a batch-stride error, which would otherwise produce
 /// plausible sequences attributed to the wrong reads.
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_batching_does_not_change_any_read() {
     let fixture = golden();
     let layout = golden_layout(&fixture);
@@ -167,6 +169,7 @@ fn gpu_batching_does_not_change_any_read() {
 /// de-interleave — so it must give bit-for-bit the same sequences as feeding
 /// the same reads in batch-major order.
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn time_major_decodes_identically_to_batch_major() {
     let fixture = golden();
     let layout = golden_layout(&fixture);
@@ -211,6 +214,7 @@ fn time_major_decodes_identically_to_batch_major() {
 /// tie-break, which must resolve to the lowest `dest * n_edges + edge` on both
 /// sides), and one with a -inf column.
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_agrees_with_cpu_reference() {
     let layout = CrfLayout::new(4, 4).unwrap();
     let Some(gpu) = try_context(layout) else {
@@ -264,6 +268,7 @@ fn gpu_agrees_with_cpu_reference() {
 /// A batch big enough to span several blocks, checked read-by-read against the
 /// CPU. Deterministic input — no RNG, so a failure reproduces exactly.
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_agrees_with_cpu_over_a_wide_batch() {
     let layout = CrfLayout::new(4, 4).unwrap();
     let Some(gpu) = try_context(layout) else {
@@ -312,6 +317,7 @@ fn gpu_agrees_with_cpu_over_a_wide_batch() {
 /// the contract is agreement, not bit-identity. The sequences must match
 /// exactly — that contract *is* bit-level.
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn ref_scan_matches_cpu() {
     use escapepod_demux::crf::{RefChains, decode_with_refs};
 

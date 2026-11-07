@@ -245,7 +245,7 @@ fn main() {
 
         let wanted: HashSet<uuid::Uuid> = read_ids
             .iter()
-            .filter_map(|s| escapepod_signal::parse_uuid_flexible(s).ok())
+            .filter_map(|s| escapepod_signal::pod5::parse_uuid_flexible(s).ok())
             .collect();
 
         // Raw signal for exactly the reads under test, from the cache if one
@@ -322,7 +322,7 @@ fn main() {
         let mut matched_bases: Vec<i64> = Vec::new();
         let mut missed_bases: Vec<i64> = Vec::new();
         for i in 0..n {
-            let Ok(id) = escapepod_signal::parse_uuid_flexible(&read_ids[i]) else {
+            let Ok(id) = escapepod_signal::pod5::parse_uuid_flexible(&read_ids[i]) else {
                 missing += 1;
                 continue;
             };
@@ -571,7 +571,7 @@ fn main() {
             // comparison above, but seen by the DP over the whole read.
             let mut spans = String::new();
             for rid in read_ids.iter().take(n) {
-                if let Some(r) = escapepod_signal::parse_uuid_flexible(rid)
+                if let Some(r) = escapepod_signal::pod5::parse_uuid_flexible(rid)
                     .ok()
                     .and_then(|id| by_id.get(&id))
                 {

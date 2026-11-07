@@ -1,8 +1,8 @@
 //! Split subcommand - split reads into separate POD5 files by barcode.
 
 use crate::style;
-use escapepod_signal::Durability;
-use escapepod_signal::operations::{
+use escapepod_signal::pod5::Durability;
+use escapepod_signal::pod5::operations::{
     FilterOptions, parse_barcode_mapping, read_annotation, subset_files,
 };
 use std::collections::{HashMap, HashSet};

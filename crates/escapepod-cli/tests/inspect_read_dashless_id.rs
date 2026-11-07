@@ -3,7 +3,7 @@
 //! `inspect read`'s own help text promises a dash-less 32-hex read ID works
 //! (`src/main.rs`'s `after_help` for the `Read` subcommand), but it used to
 //! reject that form outright: `read_id.parse::<Uuid>()` only accepts the
-//! canonical dashed form, where `escapepod_signal::parse_uuid_flexible` (used
+//! canonical dashed form, where `escapepod_signal::pod5::parse_uuid_flexible` (used
 //! everywhere else the CLI takes a read ID) accepts both.
 
 #![cfg(feature = "cli")]

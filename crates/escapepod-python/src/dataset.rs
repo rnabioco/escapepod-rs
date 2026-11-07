@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use escapepod_signal::RecordBatch;
+use escapepod_signal::pod5::RecordBatch;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
@@ -16,11 +16,11 @@ use crate::reader::adc_to_pa;
 /// as a single stream — the escapepod analogue of `pod5.DatasetReader`.
 ///
 /// The directory scan, read-id routing, and bulk-decode logic all live in
-/// [`escapepod_signal::Dataset`] (escapepod-rs#384) — this type is a thin
+/// [`escapepod_signal::pod5::Dataset`] (escapepod-rs#384) — this type is a thin
 /// pyo3 marshalling layer over it, not a second implementation.
 ///
 /// Every file is opened through the process-global, never-evicted reader
-/// cache (`escapepod_signal::cached_reader`), so opening many `DatasetReader`s
+/// cache (`escapepod_signal::pod5::cached_reader`), so opening many `DatasetReader`s
 /// over a process's lifetime accumulates every file's reader there rather
 /// than freeing it when a `DatasetReader` is closed or garbage-collected —
 /// see `crates/escapepod-python/CLAUDE.md`.
@@ -32,7 +32,7 @@ use crate::reader::adc_to_pa;
 ///             print(read.read_id)
 #[pyclass(name = "DatasetReader")]
 pub struct PyDatasetReader {
-    dataset: escapepod_signal::Dataset,
+    dataset: escapepod_signal::pod5::Dataset,
 }
 
 impl PyDatasetReader {
@@ -42,7 +42,7 @@ impl PyDatasetReader {
     /// index) rather than folding it into the same `KeyError` — the two are
     /// different problems and reporting the wrong one is worse than the scan
     /// this routing index replaced.
-    fn owning_reader(&self, read: &PyReadData) -> PyResult<&escapepod_signal::Reader> {
+    fn owning_reader(&self, read: &PyReadData) -> PyResult<&escapepod_signal::pod5::Reader> {
         let found = self
             .dataset
             .owning_reader(&read.inner.read_id)
@@ -92,12 +92,12 @@ impl PyDatasetReader {
         // the GIL released.
         let py = path.py();
         let dataset = py
-            .detach(|| escapepod_signal::Dataset::open_with(&roots, recursive, suffix))
+            .detach(|| escapepod_signal::pod5::Dataset::open_with(&roots, recursive, suffix))
             .map_err(|e| match e {
                 // `Dataset::open_with`'s one InvalidState case is "no files
                 // found" — a ValueError, as this raised directly before the
                 // logic moved into escapepod-pod5.
-                escapepod_signal::Error::InvalidState(msg) => {
+                escapepod_signal::pod5::Error::InvalidState(msg) => {
                     pyo3::exceptions::PyValueError::new_err(msg)
                 }
                 other => to_py_err(other),
@@ -178,7 +178,7 @@ impl PyDatasetReader {
         missing_ok: bool,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let reads = self.collect_inner(selection, missing_ok)?;
-        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+        let refs: Vec<&escapepod_signal::pod5::ReadData> = reads.iter().collect();
         crate::read_data::reads_to_columns(py, &refs)
     }
 
@@ -191,7 +191,7 @@ impl PyDatasetReader {
         missing_ok: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let reads = self.collect_inner(selection, missing_ok)?;
-        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+        let refs: Vec<&escapepod_signal::pod5::ReadData> = reads.iter().collect();
         let dict = crate::read_data::reads_to_columns(py, &refs)?;
         crate::read_data::dict_to_pandas(py, dict)
     }
@@ -205,7 +205,7 @@ impl PyDatasetReader {
         missing_ok: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let reads = self.collect_inner(selection, missing_ok)?;
-        let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+        let refs: Vec<&escapepod_signal::pod5::ReadData> = reads.iter().collect();
         let dict = crate::read_data::reads_to_columns(py, &refs)?;
         crate::read_data::dict_to_polars(py, dict)
     }
@@ -370,7 +370,7 @@ impl PyDatasetReader {
         &self,
         selection: Option<Vec<String>>,
         missing_ok: bool,
-    ) -> PyResult<Vec<escapepod_signal::ReadData>> {
+    ) -> PyResult<Vec<escapepod_signal::pod5::ReadData>> {
         match selection {
             None => {
                 let mut out = Vec::new();
@@ -386,11 +386,11 @@ impl PyDatasetReader {
                 Ok(out)
             }
             Some(ids) => {
-                let target: HashSet<escapepod_signal::Uuid> = ids
+                let target: HashSet<escapepod_signal::pod5::Uuid> = ids
                     .iter()
                     .map(|s| {
-                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
-                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
+                        escapepod_signal::pod5::utils::parse_uuid_flexible(s).map_err(|e| {
+                            to_py_err(escapepod_signal::pod5::Error::InvalidUuid(e.to_string()))
                         })
                     })
                     .collect::<PyResult<_>>()?;
@@ -414,7 +414,7 @@ impl PyDatasetReader {
     }
 
     /// Group reads by owning file, decode each file's signals in one bulk
-    /// call via [`escapepod_signal::Dataset::decode_bulk`], then restore the
+    /// call via [`escapepod_signal::pod5::Dataset::decode_bulk`], then restore the
     /// caller's input order.
     fn decode_bulk(
         &self,
@@ -422,13 +422,13 @@ impl PyDatasetReader {
         reads: &[PyRef<'_, PyReadData>],
         max_samples: usize,
     ) -> PyResult<Vec<(String, Vec<i16>)>> {
-        let inner_reads: Vec<escapepod_signal::ReadData> =
+        let inner_reads: Vec<escapepod_signal::pod5::ReadData> =
             reads.iter().map(|r| r.inner.clone()).collect();
 
         let decoded = py
             .detach(|| self.dataset.decode_bulk(&inner_reads, max_samples))
             .map_err(|e| match e {
-                escapepod_signal::Error::ReadNotFound(uuid) => {
+                escapepod_signal::pod5::Error::ReadNotFound(uuid) => {
                     pyo3::exceptions::PyKeyError::new_err(format!(
                         "read {uuid} is not part of this dataset"
                     ))
@@ -470,8 +470,8 @@ impl PyDatasetReadIterator {
                 let batch = self.current_batch.as_ref().unwrap();
                 let row = self.batch_row;
                 self.batch_row += 1;
-                let inner =
-                    escapepod_signal::Reader::read_from_batch(batch, row).map_err(to_py_err)?;
+                let inner = escapepod_signal::pod5::Reader::read_from_batch(batch, row)
+                    .map_err(to_py_err)?;
                 return Ok(Some(PyReadData { inner }));
             }
 

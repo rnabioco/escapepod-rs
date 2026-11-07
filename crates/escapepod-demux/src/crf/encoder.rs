@@ -538,8 +538,8 @@ impl CrfMetadata {
     /// avoids: calibration and standardisation fuse into one pass over exactly
     /// the window.
     ///
-    /// Calibration is the **fused** `adc.mul_add(scale, offset * scale)` that
-    /// `escapepod_python::adc_to_pa` and `demux basecall` use, then
+    /// Calibration is [`escapepod_signal::pod5::calibrate_pa`] — the fused
+    /// `adc.mul_add(scale, offset * scale)` every calibrating path uses, then
     /// `(pa - mean) / stdev` — the same three operations in the same order, so
     /// this is bit-identical to those two paths rather than merely equivalent.
     ///
@@ -562,11 +562,10 @@ impl CrfMetadata {
         out.clear();
         let (lo, hi) = self.window(adapter_end, adc.len())?;
         let (mean, stdev) = (self.standardisation.mean, self.standardisation.stdev);
-        let bias = offset * scale;
         out.extend(
             adc[lo..hi]
                 .iter()
-                .map(|&v| (f32::from(v).mul_add(scale, bias) - mean) / stdev),
+                .map(|&v| (escapepod_signal::pod5::calibrate_pa(v, offset, scale) - mean) / stdev),
         );
         Ok(())
     }
@@ -1093,22 +1092,6 @@ impl CrfEncoder {
         let scores = self.scores_of(&outputs)?;
         self.decode_scores(scores, scratch, self.backend)
     }
-
-    /// Basecall one read from raw calibrated pA and a detected adapter end.
-    ///
-    /// Returns `Ok(None)` when the read has no usable window — see
-    /// [`CrfMetadata::prep`].
-    pub fn basecall(
-        &self,
-        signal_pa: &[f32],
-        adapter_end: usize,
-        scratch: &mut CrfScratch,
-    ) -> Result<Option<String>, CrfError> {
-        match self.meta.prep(signal_pa, adapter_end) {
-            Some(prepped) => self.basecall_prepped(&prepped, scratch).map(Some),
-            None => Ok(None),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1349,18 +1332,14 @@ mod tests {
     /// `prep_adc_into` must be bit-identical to calibrating the whole prefix
     /// and calling `prep` on it — that equality is the only reason it is safe to
     /// convert just the window. Checked against the *fused* reference
-    /// (`escapepod_python::adc_to_pa`), which is what `demux basecall` used.
+    /// (`escapepod_signal::pod5::calibrate_pa_slice`), which is what `demux basecall` uses.
     #[test]
     fn prep_adc_into_matches_calibrate_then_prep() {
         let m = meta();
         let (offset, scale) = (7.5f32, 0.1875f32);
         let adc: Vec<i16> = (0..5000).map(|i| ((i * 37) % 4096 - 2048) as i16).collect();
 
-        let bias = offset * scale;
-        let pa: Vec<f32> = adc
-            .iter()
-            .map(|&v| f32::from(v).mul_add(scale, bias))
-            .collect();
+        let pa = escapepod_signal::pod5::calibrate_pa_slice(&adc, offset, scale);
 
         for end in [2200usize, 3000, 4000, 5000] {
             let want = m.prep(&pa, end).expect("usable window");

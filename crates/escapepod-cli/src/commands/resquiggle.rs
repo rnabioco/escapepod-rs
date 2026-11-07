@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use escapepod_classify::bam_tags::int_tag as get_int_tag;
 use escapepod_classify::pipeline::{Pod5Index, Pod5ReadInfo};
 use escapepod_signal::mapping::seq_to_signal_from_moves;
-use escapepod_signal::parse_uuid_flexible;
+use escapepod_signal::pod5::parse_uuid_flexible;
 use escapepod_signal::resquiggle::{
     BandingAlgo, KmerTable, RefineAlgo, RefineSettings, RescaleAlgo, RescaleFilterParams,
     RoughRescaleAlgo, calculate_initial_scaling, refine_signal_map, reverse_query_to_signal_map,
@@ -502,7 +502,7 @@ fn run_resquiggle(args: ResquiggleRunArgs) -> anyhow::Result<()> {
 /// Shared context for parallel refinement of BAM records.
 struct RefineContext<'a> {
     pod5_reads: &'a HashMap<uuid::Uuid, Pod5ReadInfo>,
-    signal_extractors: &'a [escapepod_signal::SignalExtractor<'a>],
+    signal_extractors: &'a [escapepod_signal::pod5::SignalExtractor<'a>],
     kmer_table: &'a KmerTable,
     settings: &'a RefineSettings,
     rna: bool,
@@ -514,7 +514,7 @@ struct RefineContext<'a> {
 impl<'a> RefineContext<'a> {
     fn new(
         pod5_reads: &'a HashMap<uuid::Uuid, Pod5ReadInfo>,
-        signal_extractors: &'a [escapepod_signal::SignalExtractor<'a>],
+        signal_extractors: &'a [escapepod_signal::pod5::SignalExtractor<'a>],
         kmer_table: &'a KmerTable,
         settings: &'a RefineSettings,
         rna: bool,

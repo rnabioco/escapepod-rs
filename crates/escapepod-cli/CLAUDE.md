@@ -7,7 +7,7 @@
 ## Module map
 - `main.rs` — clap tree, `EscpodFormatter`, `-q/-v` → `EnvFilter`, `requested_threads`, signal/SIGPIPE handlers, dispatch, arg-parse unit tests.
 - `lib.rs` re-exports; `build.rs` `ESCPOD_VERSION`; `progress.rs` bars (hidden below INFO); `commands/profile.rs` `PhaseTimer`; `style.rs` ANSI gated on stderr TTY + `NO_COLOR`; `threads.rs` the one rayon `init`; `device.rs` `--device` + `Stage` placement; `util.rs` input/output resolution, BAI; `test_env.rs` env lock for tests.
-- `commands/`: `view inspect summary merge filter bam_filter subset index annotate sidecar classify` (`sidecar` only nests `index`/`annotate` and owns the hidden `escpod index`/`escpod annotate` forwarders), `signal` (deprecated alias), and under `experimental`: `repack resquiggle resquiggle_models`.
+- `commands/`: `view inspect summary merge filter bam_filter subset index annotate sidecar classify` (`sidecar` only nests `index`/`annotate` and owns the hidden `escpod index`/`escpod annotate` forwarders), and under `experimental`: `repack resquiggle resquiggle_models`.
 - `commands/demux/` — see `commands/demux/CLAUDE.md`.
 
 ## Feature flags
@@ -20,7 +20,6 @@
 | `model-fetch` | ureq/sha2/zip; `models-download` = `resquiggle models fetch`, implies `experimental`+`model-fetch` |
 | `demux-models` | ≡ `demux` today |
 | `gpu` | every GPU path → `escapepod-demux/gpu`, `escapepod-classify/cuda` |
-| `train` | → `escapepod-demux/train` |
 
 Planned: `experimental` ≡ `classify` — fold or split; drop the `demux-models` alias; `models-download` must stop dragging in `classify`.
 
@@ -36,7 +35,7 @@ pixi run cargo build --release -p escapepod-cli
 pixi run cargo build -p escapepod-cli --no-default-features --features cli   # system allocator A/B
 pixi run -e dev cargo nextest run -p escapepod-cli && pixi run cargo test --doc -p escapepod-cli
 ```
-`tests/`: `classify_e2e` (golden parity + alias warning), `sidecar_group` (new vs hidden-legacy spelling byte-for-byte), `dir_inputs`, `thread_pool` (spawns the binary) — all read `../escapepod-classify/tests/fixtures/`, no `ext/`. `main.rs` unit tests pin parsing; `cli_definition_is_internally_consistent` is clap's `debug_assert` and the only thing that catches a bad `#[command(flatten)]`.
+`tests/`: `classify_e2e` (golden parity), `sidecar_group` (new vs hidden-legacy spelling byte-for-byte), `dir_inputs`, `thread_pool` (spawns the binary) — all read `../escapepod-classify/tests/fixtures/`, no `ext/`. `main.rs` unit tests pin parsing; `cli_definition_is_internally_consistent` is clap's `debug_assert` and the only thing that catches a bad `#[command(flatten)]`.
 
 ## Invariants and traps
 - `requested_threads` is an exhaustive match on purpose — the #155 tripwire.

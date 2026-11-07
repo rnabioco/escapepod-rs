@@ -14,7 +14,7 @@
 - `basecall.rs` — CRF decode from boundaries (`crf-decode`).
 - `fingerprint.rs` — t-test fingerprints, CSV/Parquet by extension.
 - `split.rs` — reads → per-barcode POD5 from CSV or `.p5s`.
-- `train.rs` / `train_svm.rs` — reference bank / SVM fit (`train`).
+- `train.rs` — reference bank (`demux train`). The old `train-svm` stub was removed (#504).
 - `models.rs` — pinned manifest + offline cache (`demux-models`; fetch needs `model-fetch`).
 - `info.rs` `--info`; `fp_io.rs` table readers; `utils.rs` CSV parsers, `decode_chunks_to`, `process_reads_par`; `mod.rs` dispatch + dir expansion; `types.rs` train JSON.
 
@@ -60,7 +60,7 @@
 - LLR ×3: run:422, detect:130, train:409 (train's skips downscale — unifying changes reference banks; explicit decision).
 - Env readers ×5 (run:2070–3141); `GpuTrace` ≡ detect.rs `StageTimes`.
 - `for_writing` called per read in every producer and again in `writer_thread:3845`.
-- `sha256_hex` ×3 (run:4357, models:670, resquiggle_models:277).
+- `sha256_hex` and `cache_dir` now live in `util.rs` (#505).
 - run.rs:1422 "Only CRF bundles" bail unreachable after :1123.
 - run.rs:443 `detect_with` `CnnGpu` arm unreachable.
 

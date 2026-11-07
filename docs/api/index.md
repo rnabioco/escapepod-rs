@@ -18,10 +18,10 @@ The workspace is split into six crates:
 | Crate | Role |
 |-------|------|
 | `escapepod-pod5` | POD5 format I/O (reader, writer, VBZ, footer, block-level merge/filter/subset) |
-| `escapepod-signal` | Signal algorithms (DTW, resquiggle, segmentation, k-mer primitives); **re-exports the full `escapepod-pod5` surface** |
+| `escapepod-signal` | Signal algorithms (DTW, resquiggle, segmentation, k-mer primitives); re-exports `escapepod-pod5` whole as `escapepod_signal::pod5` |
 | `escapepod-demux` | WarpDemuX-compatible barcode demultiplexing (DTW + SVM classifier, CTC-CRF basecalling, optional CNN adapter detection and GPU acceleration) |
 | `escapepod-classify` | Read-level classification against model bundles — the tRNA charging classifier behind `escpod classify` |
-| `escapepod-cli` | The `escpod` CLI binary (default `cli` feature) plus an optional umbrella library (imported as `escapepod_cli`) re-exporting the layers below |
+| `escapepod-cli` | The `escpod` CLI binary (default `cli` feature); no library target |
 | `escapepod-python` | pyo3 bindings |
 
 ### escapepod-pod5
@@ -42,7 +42,7 @@ Signal-processing algorithms, layered on top of `escapepod-pod5` (which it re-ex
 
 Barcode demultiplexing. Separate crate; included in the default CLI build (it adds no third-party dependencies), and available to library consumers via `--features demux`.
 
-**Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `crf` (CTC-CRF lattice decode; `encoder`/`barcode` behind `crf-decode`), `train` (feature `train`), `adapter_cnn` (feature `cnn-detect`).
+**Modules:** `model` (JSON loaders), `classify` (per-read and batched GPU), `svm` (RBF kernel + Platt scaling), `probability`, `crf` (CTC-CRF lattice decode; `encoder`/`barcode` behind `crf-decode`), `adapter_cnn` (feature `cnn-detect`).
 
 ### escapepod-classify
 
@@ -56,14 +56,14 @@ The bundle carries the whole feature recipe — feature order and offsets, the k
 
 ### escapepod-cli
 
-The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. The same crate doubles as an umbrella library: `default-features = false` plus `pod5` / `signal` / `demux` re-exports the corresponding layer (e.g. `escapepod_cli::signal`) without the CLI's dependency tree. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `sidecar` (`index` and `annotate`), the `demux` tree, and `classify`. `sidecar` ships with them; `repack` and `resquiggle` live behind the `experimental` feature — see below.
+The `escpod` binary, built by the default `cli` feature — so `cargo install --git https://github.com/rnabioco/escapepod-rs` ships the tool. Commands built with `cli`: `summary`, `view`, `inspect`, `merge`, `filter`, `bam-filter`, `subset`, `sidecar` (`index` and `annotate`), the `demux` tree, and `classify`. `sidecar` ships with them; `repack` and `resquiggle` live behind the `experimental` feature — see below.
 
 ## Quick Reference
 
 ### Opening Files
 
 ```rust linenums="1"
-use escapepod_signal::Reader;
+use escapepod_signal::pod5::Reader;
 
 let reader = Reader::open("file.pod5")?;
 ```
@@ -71,7 +71,7 @@ let reader = Reader::open("file.pod5")?;
 ### Creating Files
 
 ```rust linenums="1"
-use escapepod_signal::{Writer, WriterOptions};
+use escapepod_signal::pod5::{Writer, WriterOptions};
 
 let writer = Writer::create("output.pod5", WriterOptions::default())?;
 ```
@@ -108,7 +108,7 @@ writer.finish()?;
 ## Error Handling
 
 ```rust linenums="1"
-use escapepod_signal::Error;
+use escapepod_signal::pod5::Error;
 
 match result {
     Ok(value) => { /* success */ }
@@ -124,23 +124,18 @@ match result {
 
 | Feature | Effect |
 |---------|--------|
-| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `signal`, `demux`, `classify`, `cnn-detect`, `crf-decode`, `demux-models`, `model-fetch` |
-| `pod5` / `signal` / `demux` | Library re-exports of each layer (for `default-features = false` consumers) |
-| `experimental` | Implies `classify`; unlocks `repack`, `resquiggle` |
-| `demux` | The `demux` subcommand tree (fused pipeline, detect / fingerprint / classify / basecall / split / models / train) — *implied by `cli`* |
-| `classify` | `escpod classify` (tRNA charging) via `escapepod-classify`, with `fnn-onnx` on — *implied by `cli`* |
+| `cli` *(default)* | Builds the `escpod` binary and its CLI dependencies; implies `cnn-detect`, `crf-decode`, `demux-models`, `model-fetch` |
+| `experimental` | Unlocks `repack`, `resquiggle` |
 | `crf-decode` | CTC-CRF barcode basecalling (`demux basecall`) — *implied by `cli`* |
 | `demux-models` / `model-fetch` | Model-bundle registry and `demux models fetch` — *implied by `cli`* |
-| `train` | Implies `demux`; adds `demux train-svm` (linfa-svm) |
 | `gpu` | Every GPU path reachable from `--device gpu`, in one atomic flag: CNN adapter detection + CRF encoder (onnxruntime CUDA) and DTW classify (cudarc). There is no way to build half a GPU binary |
-| `cnn-detect` | Part of `cli`; implies `demux`. CNN/TCN adapter detection through `tract-onnx` (bring-your-own ONNX model — no weights are bundled) |
+| `cnn-detect` | Part of `cli`. CNN/TCN adapter detection through `tract-onnx` (bring-your-own ONNX model — no weights are bundled) |
 | `models-download` | Implies `experimental`; `resquiggle models fetch` (k-mer tables) |
 
 ### `escapepod-demux`
 
 | Feature | Effect |
 |---------|--------|
-| `train` | `DtwSvmModel` training via `linfa-svm` |
 | `gpu` | Every GPU path in one flag: `escapepod-signal`'s CUDA DTW kernel plus the onnxruntime CUDA CNN detector and CRF encoder (implies `cnn-detect` + `crf-decode`) |
 | `cnn-detect` | ADAPTed-style CNN adapter detection via `tract-onnx` |
 | `crf-decode` | CTC-CRF encoder via `tract-onnx` + barcode matching |
@@ -191,7 +186,6 @@ git dependency blocking publication, which is why it keeps a separate flag while
 | `escapepod-pod5`, `escapepod-signal` | Format I/O + DTW |
 | `ndarray` | Feature vectors |
 | `serde`, `serde_json` | Model JSON |
-| `linfa`, `linfa-svm` | SVM training (feature `train`) |
 | `tract-onnx` | CNN adapter detection (feature `cnn-detect`) |
 
 ### escapepod-classify

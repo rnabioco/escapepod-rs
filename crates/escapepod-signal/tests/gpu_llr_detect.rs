@@ -139,11 +139,13 @@ fn run_parity(ds: usize, label: &str) {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_llr_detect_matches_cpu_no_downscale() {
     run_parity(1, "ds=1");
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_llr_detect_matches_cpu_downscale10() {
     run_parity(10, "ds=10");
 }
