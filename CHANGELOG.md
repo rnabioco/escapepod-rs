@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.34.0 (2026-11-07)
+
 ### Removed (breaking)
 
 - **Public API surface trimmed** (#504). Removed public paths:
@@ -15,6 +17,13 @@
 ### Changed
 
 - **One ADC→pA calibration definition** (#501). `escapepod_pod5::calibrate_pa` (reachable as `escapepod_signal::pod5::calibrate_pa`, plus `calibrate_pa_slice` and `SignalCalibration::to_pa`) is the single definition, the fused `adc.mul_add(scale, offset * scale)`; `escpod classify`, the CRF demux window prep and the Python bindings all call it. `escpod classify` previously calibrated unfused (`(adc + offset) * scale`, two roundings), about an ulp away from the Python binding that built its goldens: the charging feature grid's max deviation from the reference golden drops from 2.1e-6 to 2.4e-7, probabilities unchanged within 1e-6. A shared golden (`crates/escapepod-pod5/tests/fixtures/calibration_pa.tsv`) pins Rust and Python to the same bits.
+- **Environment switch parsing is uniform** (#513). `ESCAPEPOD_CRF_GPU_DECODE` and `ESCAPEPOD_CRF_GPU_ZEROCOPY` (default on) are now also turned off by `false`, `no` and `off` (case-insensitive), not only `0`. `ESCAPEPOD_LSTM_BATCH` goes through the shared positive-integer parser: garbage or `0` now warns once and falls back to the default instead of being silently ignored. Internally the cache-directory and sha256 helpers, `BaseJustify` and the boundary-CNN input spec each have a single definition.
+- **LSTM batch dispatch is unified in `lstm::run_batch`** (#515). Internal refactor of the AVX2/AVX-512/scalar batch selection shared by the charging scorer and the CRF encoder. Calls are unchanged; the CRF encoder's AVX-512 placement shifts by about 3% and the charging scorer is not slower.
+- **Breaking for library consumers that name noodles types:** `noodles-bam` 0.96 -> 0.98 (#499) and `noodles-sam` 0.91 -> 0.93 change types that appear in `escapepod-classify`'s public signatures; rebuild against the new versions. `zip` 8.6 -> 9.3 (#498) and the cargo minor/patch group bumps (#494, #514).
+
+### Build / Tooling
+
+- CI type-checks the GPU targets and benches demux/classify (#508); GPU tests are now `#[ignore]`d so a run without a device reports them as skipped rather than passing; new GBM bench and demux CLI smoke tests (#511), and a test pinning instance-norm batch invariance through tract (#510).
 
 ## 0.33.0 (2026-10-11)
 
