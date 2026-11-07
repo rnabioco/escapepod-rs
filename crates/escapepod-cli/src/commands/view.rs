@@ -5,8 +5,8 @@
 use crate::util::{
     OpenResult, get_reads_iter_with_warning, open_reader_with_warning, resolve_pod5_inputs,
 };
-use escapepod_signal::operations::SidecarColumn;
-use escapepod_signal::{determine_fields, write_field_value};
+use escapepod_signal::pod5::operations::SidecarColumn;
+use escapepod_signal::pod5::{determine_fields, write_field_value};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -83,8 +83,9 @@ pub fn run(
         // rather than a silently empty column. Label and score columns are
         // both just columns here — the caller asked for a name, and which
         // kind it is is the sidecar's business.
-        let annotations = escapepod_signal::operations::read_columns(file_path, &annotation_fields)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))?;
+        let annotations =
+            escapepod_signal::pod5::operations::read_columns(file_path, &annotation_fields)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))?;
 
         // Write reads
         let reads_iter = match get_reads_iter_with_warning(&reader, file_path, is_directory) {
@@ -140,7 +141,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use escapepod_signal::{ALL_FIELDS, DEFAULT_FIELDS, determine_fields};
+    use escapepod_signal::pod5::{ALL_FIELDS, DEFAULT_FIELDS, determine_fields};
 
     #[test]
     fn test_determine_fields_default() {

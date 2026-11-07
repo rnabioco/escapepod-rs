@@ -8,7 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use escapepod_demux::{BOUNDARY_PADDING_SAMPLES, ReadFingerprint, extract_fingerprint_from_signal};
 use escapepod_signal::dtw::NormMethod;
-use escapepod_signal::{Reader, ReadsBatchView};
+use escapepod_signal::pod5::{Reader, ReadsBatchView};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;

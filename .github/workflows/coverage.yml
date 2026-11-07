@@ -54,7 +54,6 @@ jobs:
           --package escapepod-signal
           --package escapepod-demux
           --package escapepod-classify
-          --features escapepod-demux/train
 
       - name: LCOV report
         run: cargo llvm-cov report --lcov --output-path lcov.info

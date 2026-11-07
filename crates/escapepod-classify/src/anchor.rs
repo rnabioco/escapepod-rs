@@ -483,7 +483,7 @@ pub fn scan_record(
     let Some(read_id) = record
         .name()
         .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
-        .and_then(|s| escapepod_signal::parse_uuid_flexible(s).ok())
+        .and_then(|s| escapepod_signal::pod5::parse_uuid_flexible(s).ok())
     else {
         return ScanOutcome::Skip(SkipReason::BadName);
     };

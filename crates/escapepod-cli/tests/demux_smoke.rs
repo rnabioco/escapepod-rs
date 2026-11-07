@@ -101,7 +101,7 @@ fn count_reads(pod5s: &[std::path::PathBuf]) -> usize {
     pod5s
         .iter()
         .map(|p| {
-            escapepod_signal::Reader::open(p)
+            escapepod_signal::pod5::Reader::open(p)
                 .unwrap()
                 .read_count()
                 .unwrap()

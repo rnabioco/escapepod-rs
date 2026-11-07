@@ -2,7 +2,7 @@
 
 use escapepod_demux::{BarcodeFingerprint, ReadBoundaries};
 use escapepod_signal::dtw::NormMethod;
-use escapepod_signal::{CompressedSignalChunk, ReadData, Reader, ReadsBatchView};
+use escapepod_signal::pod5::{CompressedSignalChunk, ReadData, Reader, ReadsBatchView};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

@@ -20,7 +20,6 @@
 | `model-fetch` | ureq/sha2/zip; `models-download` = `resquiggle models fetch`, implies `experimental`+`model-fetch` |
 | `demux-models` | ≡ `demux` today |
 | `gpu` | every GPU path → `escapepod-demux/gpu`, `escapepod-classify/cuda` |
-| `train` | → `escapepod-demux/train` |
 
 Planned: `experimental` ≡ `classify` — fold or split; drop the `demux-models` alias; `models-download` must stop dragging in `classify`.
 

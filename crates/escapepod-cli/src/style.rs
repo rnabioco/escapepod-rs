@@ -123,7 +123,6 @@ pub fn value<T: Display>(s: T) -> String {
 
 /// Style for a warning label (only the demux `split` summary still labels
 /// inline; other warnings now flow through `tracing::warn!`).
-#[cfg_attr(not(feature = "demux"), allow(dead_code))]
 pub fn warning_label<T: Display>(s: T) -> String {
     if use_color() {
         format!("{}", s.yellow().bold())

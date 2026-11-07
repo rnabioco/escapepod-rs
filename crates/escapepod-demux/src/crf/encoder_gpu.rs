@@ -309,7 +309,7 @@ impl CrfEncoderGpu {
         // forces the CPU decode, which is what A/B measurements and any future
         // bisect want.
         let (lattice, decode_fallback) =
-            if !escapepod_pod5::env::flag_default_on("ESCAPEPOD_CRF_GPU_DECODE") {
+            if !escapepod_signal::pod5::env::flag_default_on("ESCAPEPOD_CRF_GPU_DECODE") {
                 (
                     None,
                     Some("disabled by ESCAPEPOD_CRF_GPU_DECODE=0".to_string()),
@@ -330,8 +330,8 @@ impl CrfEncoderGpu {
         // have to reach the host anyway. Note this is a *request*: `lattice` only
         // proves the CUDA driver and NVRTC work, which says nothing about whether
         // onnxruntime registered its CUDA EP. The probe below settles that.
-        let zero_copy =
-            lattice.is_some() && escapepod_pod5::env::flag_default_on("ESCAPEPOD_CRF_GPU_ZEROCOPY");
+        let zero_copy = lattice.is_some()
+            && escapepod_signal::pod5::env::flag_default_on("ESCAPEPOD_CRF_GPU_ZEROCOPY");
 
         let mut encoder = Self {
             session: Mutex::new(session),

@@ -13,8 +13,8 @@
 //! Usage: analyze_pruning <model.json> <reads.pod5> [max_reads]
 
 use escapepod_demux::{AnyModel, extract_fingerprint_from_signal, load_any_model};
-use escapepod_signal::Reader;
 use escapepod_signal::dtw::{NormMethod, dtw_distance};
+use escapepod_signal::pod5::Reader;
 use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
 
 fn main() -> anyhow::Result<()> {
@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     'outer: for batch in reader.read_batches()? {
         let batch = batch?;
-        let view = escapepod_signal::ReadsBatchView::new(&batch, false)?;
+        let view = escapepod_signal::pod5::ReadsBatchView::new(&batch, false)?;
         for row in 0..view.num_rows() {
             let Ok(read) = view.read(row) else { continue };
             if read.signal_rows.is_empty() {

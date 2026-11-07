@@ -11,7 +11,6 @@
 - `gbm.rs` — HistGradientBoosting walk over a compact arena; `predict_many` = 8-lane lockstep.
 - `probability.rs` — softmax/margin/threshold head shared by SVM and GBM.
 - `fingerprint.rs` — t-test segmentation → fingerprint; `MAX_FINGERPRINT_WINDOW` clamp.
-- `train.rs` (`train`) — labels-only stub; predictor ignores its `dual_coef`.
 - `adapter_cnn.rs` (`cnn-detect`) / `adapter_cnn_gpu.rs` (`gpu`) — prep/decode shared; only the runtime differs.
 - `onnx_rewrite.rs` — proto rewrites before tract lowers a graph.
 - `ort_ep.rs` (`gpu`) — the one spelling of ort's CUDA EP; `require_cuda`.
@@ -25,7 +24,6 @@
 | `cnn-detect` | tract boundary CNN, `onnx_rewrite` |
 | `crf-decode` | tract CRF encoder (lattice decode always compiled) |
 | `gpu` | **atomic**; implies both above; adds cudarc DTW/SVM, ort CUDA CNN+CRF, `cuda`, `ort_ep` |
-| `train` | `train.rs`; no extra crates |
 - `cnn-gpu`/`crf-gpu` no longer exist — `gpu` is the only GPU feature.
 
 ## Build, test, bench this crate alone

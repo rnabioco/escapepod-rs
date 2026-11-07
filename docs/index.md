@@ -78,7 +78,7 @@ See the [Python API](python/index.md) for reading, writing, and signal helpers.
 ### Rust
 
 ```rust linenums="1"
-use escapepod_signal::Reader;
+use escapepod_signal::pod5::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
 

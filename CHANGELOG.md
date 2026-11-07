@@ -2,9 +2,19 @@
 
 ## Unreleased
 
+### Removed (breaking)
+
+- **Public API surface trimmed** (#504). Removed public paths:
+  - the flat `escapepod_signal::*` re-exports of the POD5 layer (`escapepod_signal::Reader`, `Writer`, `calibrate_pa`, the `reader`/`writer`/`merge`/`operations`/... module aliases and the rest); use `escapepod_signal::pod5::...` (or depend on `escapepod-pod5`);
+  - the `escapepod_cli` umbrella library (the crate remains the `escpod` binary);
+  - the `train` feature and the `train-svm` subcommand (and `escapepod-demux`'s `train` module and its dependency on `escapepod-pod5`);
+  - `ovo_votes`;
+  - `CrfEncoder::basecall`;
+  - `escapepod_pod5::utils::dictionary`.
+
 ### Changed
 
-- **One ADC→pA calibration definition** (#501). `escapepod_pod5::calibrate_pa` (re-exported by `escapepod-signal`, plus `calibrate_pa_slice` and `SignalCalibration::to_pa`) is the single definition, the fused `adc.mul_add(scale, offset * scale)`; `escpod classify`, the CRF demux window prep and the Python bindings all call it. `escpod classify` previously calibrated unfused (`(adc + offset) * scale`, two roundings), about an ulp away from the Python binding that built its goldens: the charging feature grid's max deviation from the reference golden drops from 2.1e-6 to 2.4e-7, probabilities unchanged within 1e-6. A shared golden (`crates/escapepod-pod5/tests/fixtures/calibration_pa.tsv`) pins Rust and Python to the same bits.
+- **One ADC→pA calibration definition** (#501). `escapepod_pod5::calibrate_pa` (reachable as `escapepod_signal::pod5::calibrate_pa`, plus `calibrate_pa_slice` and `SignalCalibration::to_pa`) is the single definition, the fused `adc.mul_add(scale, offset * scale)`; `escpod classify`, the CRF demux window prep and the Python bindings all call it. `escpod classify` previously calibrated unfused (`(adc + offset) * scale`, two roundings), about an ulp away from the Python binding that built its goldens: the charging feature grid's max deviation from the reference golden drops from 2.1e-6 to 2.4e-7, probabilities unchanged within 1e-6. A shared golden (`crates/escapepod-pod5/tests/fixtures/calibration_pa.tsv`) pins Rust and Python to the same bits.
 
 ## 0.33.0 (2026-10-11)
 

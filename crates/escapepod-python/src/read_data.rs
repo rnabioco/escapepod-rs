@@ -11,7 +11,7 @@ use crate::writer::parse_end_reason;
 /// A single read's metadata from a POD5 file.
 #[pyclass(name = "ReadData", frozen)]
 pub struct PyReadData {
-    pub(crate) inner: escapepod_signal::ReadData,
+    pub(crate) inner: escapepod_signal::pod5::ReadData,
 }
 
 #[pymethods]
@@ -78,11 +78,11 @@ impl PyReadData {
         selected_read_level: f32,
         signal_rows: Option<Vec<u64>>,
     ) -> PyResult<Self> {
-        let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
-            .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
+        let uuid = escapepod_signal::pod5::utils::parse_uuid_flexible(read_id)
+            .map_err(|e| to_py_err(escapepod_signal::pod5::Error::InvalidUuid(e.to_string())))?;
         let end_reason = parse_end_reason(end_reason)?;
         Ok(Self {
-            inner: escapepod_signal::ReadData {
+            inner: escapepod_signal::pod5::ReadData {
                 read_id: uuid,
                 read_number,
                 start_sample,
@@ -269,7 +269,7 @@ impl PyReadData {
 /// Run information metadata from a POD5 file.
 #[pyclass(name = "RunInfo", frozen)]
 pub struct PyRunInfo {
-    pub(crate) inner: escapepod_signal::RunInfoData,
+    pub(crate) inner: escapepod_signal::pod5::RunInfoData,
 }
 
 #[pymethods]
@@ -325,7 +325,7 @@ impl PyRunInfo {
         tracking_id: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
-            inner: escapepod_signal::RunInfoData {
+            inner: escapepod_signal::pod5::RunInfoData {
                 acquisition_id: acquisition_id.to_string(),
                 acquisition_start_time,
                 adc_max,
@@ -470,14 +470,14 @@ impl PyRunInfo {
 struct ColumnSet<'py, 'r> {
     py: Python<'py>,
     dict: Bound<'py, PyDict>,
-    reads: &'r [&'r escapepod_signal::ReadData],
+    reads: &'r [&'r escapepod_signal::pod5::ReadData],
 }
 
 impl<'py, 'r> ColumnSet<'py, 'r> {
     fn num<T: numpy::Element>(
         &self,
         name: &str,
-        get: impl Fn(&escapepod_signal::ReadData) -> T,
+        get: impl Fn(&escapepod_signal::pod5::ReadData) -> T,
     ) -> PyResult<()> {
         let col: Vec<T> = self.reads.iter().map(|&r| get(r)).collect();
         self.dict.set_item(name, PyArray1::from_vec(self.py, col))
@@ -486,7 +486,7 @@ impl<'py, 'r> ColumnSet<'py, 'r> {
     fn strs<'a, S: pyo3::IntoPyObject<'py>>(
         &self,
         name: &str,
-        get: impl Fn(&'a escapepod_signal::ReadData) -> S,
+        get: impl Fn(&'a escapepod_signal::pod5::ReadData) -> S,
     ) -> PyResult<()>
     where
         'r: 'a,
@@ -498,7 +498,7 @@ impl<'py, 'r> ColumnSet<'py, 'r> {
 
 pub(crate) fn reads_to_columns<'py>(
     py: Python<'py>,
-    reads: &[&escapepod_signal::ReadData],
+    reads: &[&escapepod_signal::pod5::ReadData],
 ) -> PyResult<Bound<'py, PyDict>> {
     let c = ColumnSet {
         py,
@@ -535,7 +535,7 @@ pub(crate) fn reads_to_columns<'py>(
     Ok(c.dict)
 }
 
-/// Build a column dict directly from a [`ReadColumns`](escapepod_signal::ReadColumns)
+/// Build a column dict directly from a [`ReadColumns`](escapepod_signal::pod5::ReadColumns)
 /// struct-of-arrays — the fast path for whole-file metadata exports.
 ///
 /// The numeric `Vec`s are handed to numpy by move (no copy); only `read_id` and
@@ -544,7 +544,7 @@ pub(crate) fn reads_to_columns<'py>(
 /// dominates `to_pandas` wall time at scale (see #98).
 pub(crate) fn columns_to_dict<'py>(
     py: Python<'py>,
-    cols: escapepod_signal::ReadColumns,
+    cols: escapepod_signal::pod5::ReadColumns,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(

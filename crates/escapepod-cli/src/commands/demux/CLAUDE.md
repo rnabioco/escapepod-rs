@@ -14,7 +14,7 @@
 - `basecall.rs` — CRF decode from boundaries (`crf-decode`).
 - `fingerprint.rs` — t-test fingerprints, CSV/Parquet by extension.
 - `split.rs` — reads → per-barcode POD5 from CSV or `.p5s`.
-- `train.rs` / `train_svm.rs` — reference bank / SVM fit (`train`).
+- `train.rs` — reference bank (`demux train`). The old `train-svm` stub was removed (#504).
 - `models.rs` — pinned manifest + offline cache (`demux-models`; fetch needs `model-fetch`).
 - `info.rs` `--info`; `fp_io.rs` table readers; `utils.rs` CSV parsers, `decode_chunks_to`, `process_reads_par`; `mod.rs` dispatch + dir expansion; `types.rs` train JSON.
 
