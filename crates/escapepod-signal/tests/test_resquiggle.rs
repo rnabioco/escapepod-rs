@@ -137,19 +137,18 @@ fn build_query_to_signal_map(
 /// query-to-signal map. This test applies the same reversal before running
 /// escapepod's refinement so both tools operate in the same coordinate space.
 #[test]
+#[ignore = "needs data/drna fishnet reference, yeast tRNA pod5/bam and data/kmer_models table"]
 fn test_resquiggle_vs_fishnet() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let project_root = Path::new(manifest_dir).parent().unwrap();
 
     // --- Load fishnet reference parquet ---
     let parquet_path = project_root.join("data/drna/fishnet_yeast_trna_query.parquet");
-    if !parquet_path.exists() {
-        eprintln!(
-            "Skipping test: fishnet reference not found at {}",
-            parquet_path.display()
-        );
-        return;
-    }
+    assert!(
+        parquet_path.exists(),
+        "fishnet reference not found at {}",
+        parquet_path.display()
+    );
     let fishnet_ref = load_fishnet_reference(&parquet_path);
 
     // --- Load kmer table ---

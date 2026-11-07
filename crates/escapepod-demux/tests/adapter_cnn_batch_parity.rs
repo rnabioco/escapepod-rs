@@ -29,14 +29,13 @@ fn synth_signal(seed: u64, len: usize) -> Vec<f32> {
 }
 
 #[test]
+#[ignore = "needs ESCAPEPOD_TEST_ADAPTER_ONNX (boundary CNN ONNX file)"]
 fn batched_matches_per_read() {
     // Test-only model-path knob (the ONNX file is not redistributable, so
     // this test skips itself when unset), not the runtime switch/knob shape.
     #[allow(clippy::disallowed_methods)]
-    let Ok(model_path) = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX") else {
-        eprintln!("ESCAPEPOD_TEST_ADAPTER_ONNX unset — skipping CNN batch-parity test");
-        return;
-    };
+    let model_path = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX")
+        .expect("set ESCAPEPOD_TEST_ADAPTER_ONNX to a boundary-CNN ONNX file");
 
     let cnn = AdapterCnn::load(&model_path).expect("load CNN model");
 
@@ -78,14 +77,13 @@ fn batched_matches_per_read() {
 }
 
 #[test]
+#[ignore = "needs ESCAPEPOD_TEST_ADAPTER_ONNX (boundary CNN ONNX file)"]
 fn batch_of_one_matches_single() {
     // Test-only model-path knob (the ONNX file is not redistributable, so
     // this test skips itself when unset), not the runtime switch/knob shape.
     #[allow(clippy::disallowed_methods)]
-    let Ok(model_path) = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX") else {
-        eprintln!("ESCAPEPOD_TEST_ADAPTER_ONNX unset — skipping CNN batch-of-one test");
-        return;
-    };
+    let model_path = std::env::var("ESCAPEPOD_TEST_ADAPTER_ONNX")
+        .expect("set ESCAPEPOD_TEST_ADAPTER_ONNX to a boundary-CNN ONNX file");
     let cnn = AdapterCnn::load(&model_path).expect("load CNN model");
     let sig = synth_signal(42, 9259);
     let single = cnn.detect_adapter_end(&sig).unwrap();

@@ -54,6 +54,7 @@ fn varied_signal(seed: u64, len: usize) -> Vec<i16> {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_svb16_matches_cpu_scalar() {
     let Some(ctx) = try_context() else { return };
 
@@ -94,6 +95,7 @@ fn gpu_svb16_matches_cpu_scalar() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_svb16_large_batch() {
     let Some(ctx) = try_context() else { return };
 
