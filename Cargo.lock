@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-classify"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-cli"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-demux"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-pod5"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-python"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "escapepod-classify",
  "escapepod-signal",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "escapepod-signal"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "arrow",
