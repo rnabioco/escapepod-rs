@@ -25,8 +25,8 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use escapepod_signal::compression::vbz;
 use escapepod_signal::dtw::{Fingerprint, NormMethod, dtw_distance, normalize_fingerprint};
+use escapepod_signal::pod5::compression::vbz;
 use escapepod_signal::resquiggle::adaptive_dp::adaptive_banded_dp;
 use escapepod_signal::resquiggle::bands::Band;
 use escapepod_signal::resquiggle::dp::{ViterbiBuffers, banded_dp, dp_step_buffered};
@@ -242,7 +242,7 @@ fn bench_fingerprint_mad(c: &mut Criterion) {
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |bench, _| {
             bench.iter_batched(
-                || Fingerprint::new(values.clone(), escapepod_signal::types::Uuid::nil()),
+                || Fingerprint::new(values.clone(), escapepod_signal::pod5::types::Uuid::nil()),
                 |mut fp| {
                     normalize_fingerprint(black_box(&mut fp), NormMethod::Median);
                     fp

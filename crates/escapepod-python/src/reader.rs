@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use escapepod_signal::ReadsBatchView;
+use escapepod_signal::pod5::ReadsBatchView;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
@@ -29,7 +29,7 @@ pub(crate) fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
 ///         reads = reader.get_reads(ids)
 #[pyclass(name = "Reader")]
 pub struct PyReader {
-    inner: escapepod_signal::Reader,
+    inner: escapepod_signal::pod5::Reader,
     path: PathBuf,
 }
 
@@ -40,7 +40,7 @@ impl PyReader {
     /// Accepts a string path or any os.PathLike object (e.g. pathlib.Path).
     #[new]
     fn new(path: PathBuf) -> PyResult<Self> {
-        let reader = escapepod_signal::Reader::open(&path).map_err(to_py_err)?;
+        let reader = escapepod_signal::pod5::Reader::open(&path).map_err(to_py_err)?;
         Ok(Self {
             inner: reader,
             path,
@@ -178,17 +178,17 @@ impl PyReader {
     ///
     /// Uses the ReadIndex for O(log n) lookup when a .p5s sidecar exists.
     fn get_read(&self, read_id: &str) -> PyResult<PyReadData> {
-        let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
-            .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
+        let uuid = escapepod_signal::pod5::utils::parse_uuid_flexible(read_id)
+            .map_err(|e| to_py_err(escapepod_signal::pod5::Error::InvalidUuid(e.to_string())))?;
 
         let index = self.inner.read_index().map_err(to_py_err)?;
         let (batch_idx, row_idx) = index
             .get(&uuid)
-            .ok_or_else(|| to_py_err(escapepod_signal::Error::ReadNotFound(uuid)))?;
+            .ok_or_else(|| to_py_err(escapepod_signal::pod5::Error::ReadNotFound(uuid)))?;
 
         let batch = self.inner.read_batch(batch_idx).map_err(to_py_err)?;
         let inner =
-            escapepod_signal::Reader::read_from_batch(&batch, row_idx).map_err(to_py_err)?;
+            escapepod_signal::pod5::Reader::read_from_batch(&batch, row_idx).map_err(to_py_err)?;
         Ok(PyReadData { inner })
     }
 
@@ -389,7 +389,7 @@ impl PyReader {
         let path = self.path.clone();
         py.detach(|| {
             let sidecar =
-                escapepod_signal::operations::read_sidecar_for(&path).map_err(to_py_err)?;
+                escapepod_signal::pod5::operations::read_sidecar_for(&path).map_err(to_py_err)?;
             Ok(sidecar
                 .map(|s| {
                     s.annotation_names()
@@ -410,7 +410,7 @@ impl PyReader {
         let path = self.path.clone();
         py.detach(|| {
             let sidecar =
-                escapepod_signal::operations::read_sidecar_for(&path).map_err(to_py_err)?;
+                escapepod_signal::pod5::operations::read_sidecar_for(&path).map_err(to_py_err)?;
             Ok(sidecar
                 .map(|s| s.score_names().into_iter().map(str::to_string).collect())
                 .unwrap_or_default())
@@ -430,7 +430,8 @@ impl PyReader {
     ) -> PyResult<std::collections::HashMap<String, f32>> {
         let path = self.path.clone();
         py.detach(|| {
-            let score = escapepod_signal::operations::read_score(&path, name).map_err(to_py_err)?;
+            let score =
+                escapepod_signal::pod5::operations::read_score(&path, name).map_err(to_py_err)?;
             Ok(score
                 .iter()
                 .map(|(uuid, v)| (uuid.to_string(), v))
@@ -492,8 +493,8 @@ impl PyReader {
     ) -> PyResult<std::collections::HashMap<String, String>> {
         let path = self.path.clone();
         py.detach(|| {
-            let annotation =
-                escapepod_signal::operations::read_annotation(&path, name).map_err(to_py_err)?;
+            let annotation = escapepod_signal::pod5::operations::read_annotation(&path, name)
+                .map_err(to_py_err)?;
             Ok(annotation
                 .iter()
                 .map(|(uuid, label)| (uuid.to_string(), label.to_string()))
@@ -521,7 +522,7 @@ impl PyReader {
         // demands it, not traded for a scan (escapepod-rs#251).
         let py = slf.py();
         let n = slf.inner.read_count().unwrap_or(usize::MAX);
-        if n <= escapepod_signal::autoindex_max() {
+        if n <= escapepod_signal::pod5::autoindex_max() {
             let inner = &slf.inner;
             py.detach(|| {
                 let _ = inner.read_index();
@@ -588,7 +589,7 @@ impl PyReader {
             }
             Some(sel) => {
                 let reads = self.collect_inner(Some(sel), missing_ok)?;
-                let refs: Vec<&escapepod_signal::ReadData> = reads.iter().collect();
+                let refs: Vec<&escapepod_signal::pod5::ReadData> = reads.iter().collect();
                 crate::read_data::reads_to_columns(py, &refs)
             }
         }
@@ -601,14 +602,14 @@ impl PyReader {
         &self,
         selection: Option<Vec<String>>,
         missing_ok: bool,
-    ) -> PyResult<Vec<escapepod_signal::ReadData>> {
+    ) -> PyResult<Vec<escapepod_signal::pod5::ReadData>> {
         match selection {
             Some(read_ids) => {
-                let target_ids: HashSet<escapepod_signal::Uuid> = read_ids
+                let target_ids: HashSet<escapepod_signal::pod5::Uuid> = read_ids
                     .iter()
                     .map(|s| {
-                        escapepod_signal::utils::parse_uuid_flexible(s).map_err(|e| {
-                            to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string()))
+                        escapepod_signal::pod5::utils::parse_uuid_flexible(s).map_err(|e| {
+                            to_py_err(escapepod_signal::pod5::Error::InvalidUuid(e.to_string()))
                         })
                     })
                     .collect::<PyResult<_>>()?;
@@ -642,7 +643,7 @@ struct PyReadIterator {
     reader: Py<PyReader>,
     num_batches: usize,
     batch_idx: usize,
-    current: std::vec::IntoIter<escapepod_signal::ReadData>,
+    current: std::vec::IntoIter<escapepod_signal::pod5::ReadData>,
 }
 
 #[pymethods]

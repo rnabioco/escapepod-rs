@@ -30,7 +30,7 @@ pulling in signal-processing code.
 ## Quick Example
 
 ```rust linenums="1"
-use escapepod_signal::{Reader, Writer, WriterOptions, ReadData, RunInfoData};
+use escapepod_signal::pod5::{Reader, Writer, WriterOptions, ReadData, RunInfoData};
 
 // Read a POD5 file
 let reader = Reader::open("input.pod5")?;
@@ -57,10 +57,10 @@ writer.finish()?;
 
 ## Error Handling
 
-All operations return `Result<T, escapepod_signal::Error>`. The error type provides detailed information about what went wrong:
+All operations return `Result<T, escapepod_signal::pod5::Error>`. The error type provides detailed information about what went wrong:
 
 ```rust linenums="1"
-use escapepod_signal::{Reader, Error};
+use escapepod_signal::pod5::{Reader, Error};
 
 match Reader::open("file.pod5") {
     Ok(reader) => { /* use reader */ }

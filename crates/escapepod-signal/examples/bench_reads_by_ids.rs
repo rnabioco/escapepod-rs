@@ -8,7 +8,7 @@
 //! scan on the first call. The sidecar is temporarily hidden to measure the
 //! build, then restored.
 
-use escapepod_signal::Reader;
+use escapepod_signal::pod5::Reader;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;

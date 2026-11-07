@@ -6,7 +6,7 @@
 // stderr-gated `crate::style` explicitly.
 use crate::style::stdout as style;
 use crate::util::resolve_pod5_inputs;
-use escapepod_signal::{Reader, ReadsBatchView};
+use escapepod_signal::pod5::{Reader, ReadsBatchView};
 use rayon::prelude::*;
 use std::path::PathBuf;
 use tracing::warn;
@@ -353,7 +353,7 @@ pub fn read(input: PathBuf, read_id: String) -> anyhow::Result<()> {
     let files = resolve_pod5_inputs(&input)?;
     let is_directory = files.len() > 1;
     // Accepts the dash-less 32-hex form too, per the command's own help text.
-    let target_id: uuid::Uuid = escapepod_signal::parse_uuid_flexible(&read_id)?;
+    let target_id: uuid::Uuid = escapepod_signal::pod5::parse_uuid_flexible(&read_id)?;
 
     for file_path in &files {
         let reader = match Reader::open(file_path) {
