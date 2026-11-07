@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use escapepod_demux::crf::{
     BarcodeMatch, BarcodeRefs, CrfEncoder, CrfScratch, RefChains, ScoredDecode,
 };
-use escapepod_signal::{Reader, ReadsBatchView};
+use escapepod_signal::pod5::{Reader, ReadsBatchView};
 use rayon::prelude::*;
 use tracing::{info, warn};
 

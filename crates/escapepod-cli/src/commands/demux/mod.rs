@@ -11,7 +11,6 @@
 //! 4. **basecall**: CTC-CRF barcode basecalling from detected boundaries
 //! 5. **split**: Write demultiplexed reads to separate POD5 files
 //! 6. **train**: Generate reference barcodes from known samples
-//! 7. **train-svm**: Train SVM model from fingerprints (requires `train` feature)
 
 #[cfg(feature = "crf-decode")]
 mod basecall;
@@ -28,9 +27,6 @@ mod train;
 mod types;
 mod utils;
 
-#[cfg(feature = "train")]
-mod train_svm;
-
 #[cfg(feature = "crf-decode")]
 pub use basecall::BasecallArgs;
 pub use classify::ClassifyArgs;
@@ -40,14 +36,11 @@ pub use run::RunArgs;
 pub use split::SplitArgs;
 pub use train::TrainArgs;
 
-#[cfg(feature = "train")]
-pub use train_svm::TrainSvmArgs;
-
 /// Main demux command arguments.
 ///
 /// With no subcommand, `demux` runs the fused streaming pipeline (detect +
 /// fingerprint + classify in one pass → demultiplexed POD5). The granular
-/// `detect`/`fingerprint`/`classify`/`split`/`train*` subcommands remain for
+/// `detect`/`fingerprint`/`classify`/`split`/`train` subcommands remain for
 /// advanced/debugging use.
 #[derive(Debug, clap::Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -143,18 +136,6 @@ Examples:
   escpod demux train --assignments assignments.csv -o reference.json
 ")]
     Train(TrainArgs),
-
-    /// Train SVM model from fingerprints (requires --features train)
-    #[cfg(feature = "train")]
-    #[command(
-        name = "train-svm",
-        after_help = "\
-Examples:
-  escpod demux train-svm -f fingerprints.csv -o model.json
-  escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
-"
-    )]
-    TrainSvm(TrainSvmArgs),
 }
 
 /// The `-t/-j` value for whichever demux stage was invoked.
@@ -176,9 +157,6 @@ pub fn requested_threads(args: &DemuxArgs) -> Option<usize> {
         Some(DemuxCommand::Classify(a)) => a.threads,
         Some(DemuxCommand::Split(a)) => a.threads,
         Some(DemuxCommand::Train(a)) => a.threads,
-        // train-svm has no --threads flag.
-        #[cfg(feature = "train")]
-        Some(DemuxCommand::TrainSvm(_)) => None,
     }
 }
 
@@ -223,7 +201,5 @@ pub fn run(args: DemuxArgs) -> anyhow::Result<()> {
             split::run(split_args)
         }
         DemuxCommand::Train(train_args) => train::run(train_args),
-        #[cfg(feature = "train")]
-        DemuxCommand::TrainSvm(train_svm_args) => train_svm::run(train_svm_args),
     }
 }

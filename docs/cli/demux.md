@@ -237,7 +237,6 @@ flowchart LR
 | [split](#split) | Split reads into separate POD5 files by barcode (CSV or `--sidecar`) |
 | `models` | List / fetch published model bundles (`list`, `path`, `fetch [--all]`) |
 | [train](#train) | Train reference fingerprints from known samples |
-| [train-svm](#train-svm) | Train SVM model from fingerprints (requires `train` feature) |
 
 ---
 
@@ -838,64 +837,6 @@ escpod demux train --assignments known_barcodes.csv -o reference.json
 
 # Use trained reference for classification
 escpod demux classify fingerprints.csv --reference reference.json -o classifications.csv
-```
-
----
-
-## train-svm
-
-Train an SVM model from labeled fingerprints for probabilistic barcode classification. This command requires the `train` feature to be enabled.
-
-**Note:** This creates a DTW-SVM model that provides probability outputs for each class, enabling more nuanced confidence thresholds.
-
-### Usage
-
-```bash
-escpod demux train-svm -f <FINGERPRINTS> -o <OUTPUT> [OPTIONS]
-```
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `-f, --fingerprints <FILE>` | CSV file with fingerprints (read_id, barcode, feat1, feat2, ...) (required) |
-| `-o, --output <FILE>` | Output JSON file for trained SVM model (required) |
-| `--gamma <VALUE>` | RBF kernel gamma parameter (default: 1.0) |
-| `--power <VALUE>` | Power to raise distances before exponential (default: 1.0) |
-| `--window <N>` | DTW window constraint (Sakoe-Chiba band) |
-| `--thresholds <VALUES>` | Per-class confidence thresholds (comma-separated) |
-| `--max-per-class <N>` | Randomly subsample each barcode class to at most N fingerprints before training — required for large datasets since the all-pairs DTW distance matrix is O(N²) memory. Balanced (same cap per class) and deterministic under `--seed` |
-| `--seed <N>` | RNG seed for `--max-per-class` subsampling (default: 42) |
-| `-h, --help` | Print help |
-
-### Input Format
-
-The fingerprints CSV should include barcode labels:
-
-```csv
-read_id,barcode,fp_0,fp_1,fp_2,...,fp_9
-a1b2c3d4-...,BC00,-0.823,1.234,-0.156,...
-b2c3d4e5-...,BC00,-0.712,0.987,-0.234,...
-c3d4e5f6-...,BC01,-0.456,0.789,-0.321,...
-```
-
-### Example
-
-```bash
-# Train SVM with default parameters
-escpod demux train-svm -f fingerprints.csv -o model.json
-
-# Train with custom hyperparameters
-escpod demux train-svm -f fingerprints.csv -o model.json --gamma 0.5 --window 10
-
-# Use the trained SVM model for classification (--model auto-detects the JSON shape)
-escpod demux classify fingerprints.csv --model model.json -o classifications.csv
-```
-
-### Building with train feature
-
-```bash
-cargo build --release --features train
 ```
 
 ---

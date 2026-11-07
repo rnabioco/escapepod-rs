@@ -87,7 +87,6 @@ live behind Cargo features:
 | Feature | Commands unlocked |
 |---------|-------------------|
 | `experimental` | `repack`, `resquiggle` |
-| `train` | adds `demux train-svm` (SVM training via linfa) |
 | `gpu` | every GPU path, and the only GPU feature — CNN adapter detection, the CTC-CRF encoder, DTW classify; selected at run time with `--device` (default `auto`), CUDA libraries at run time only |
 | `models-download` | `resquiggle models fetch` (k-mer table prefetch) |
 

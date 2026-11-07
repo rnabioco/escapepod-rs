@@ -43,7 +43,6 @@ required-features = ["crf-decode"]
 
 [dependencies]
 anyhow = { workspace = true }
-escapepod-pod5 = { workspace = true }
 escapepod-signal = { workspace = true }
 ndarray = "0.17"
 rayon = { workspace = true }
@@ -139,11 +138,6 @@ gpu = [
 # `gpu` flag any finer (its production legs are untouched), it adds one more
 # flag for the same non-production primitives escapepod-signal gates.
 gpu-prep-experimental = ["escapepod-signal/gpu-prep-experimental"]
-# Build `DtwSvmModel` JSON files from labeled fingerprints. Pulls no crate of
-# its own: the fit is the labels-only stub `train.rs` describes, and the
-# `linfa`/`linfa-svm` dependencies this feature used to enable were compiled
-# for every `--features train` build without a single `use` of them.
-train = []
 # Expose `onnx_graph::test_support`'s synthetic-graph builders outside
 # `cfg(test)`. `cfg(test)` never crosses a crate boundary, so
 # `escapepod-classify`'s own LSTM-recognizer tests (`fnn_lstm`) need this

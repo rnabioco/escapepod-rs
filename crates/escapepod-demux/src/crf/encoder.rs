@@ -1093,22 +1093,6 @@ impl CrfEncoder {
         let scores = self.scores_of(&outputs)?;
         self.decode_scores(scores, scratch, self.backend)
     }
-
-    /// Basecall one read from raw calibrated pA and a detected adapter end.
-    ///
-    /// Returns `Ok(None)` when the read has no usable window — see
-    /// [`CrfMetadata::prep`].
-    pub fn basecall(
-        &self,
-        signal_pa: &[f32],
-        adapter_end: usize,
-        scratch: &mut CrfScratch,
-    ) -> Result<Option<String>, CrfError> {
-        match self.meta.prep(signal_pa, adapter_end) {
-            Some(prepped) => self.basecall_prepped(&prepped, scratch).map(Some),
-            None => Ok(None),
-        }
-    }
 }
 
 #[cfg(test)]
