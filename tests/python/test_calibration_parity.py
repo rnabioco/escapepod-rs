@@ -18,7 +18,12 @@ import escapepod
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 GOLDEN = (
-    REPO_ROOT / "crates" / "escapepod-pod5" / "tests" / "fixtures" / "calibration_pa.tsv"
+    REPO_ROOT
+    / "crates"
+    / "escapepod-pod5"
+    / "tests"
+    / "fixtures"
+    / "calibration_pa.tsv"
 )
 
 
