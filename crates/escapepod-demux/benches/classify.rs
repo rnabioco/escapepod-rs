@@ -342,6 +342,51 @@ fn bench_svm_predict(c: &mut Criterion) {
     group.finish();
 }
 
+/// `BarcodeRefs::match_sequence`: 96 references of 40 nt (the shipped
+/// barcode layout) against a noisy decode and an exact hit. `BarcodeRefs` is
+/// exported under `crf-decode`, so run with `--features crf-decode`.
+#[cfg(feature = "crf-decode")]
+fn bench_barcode_match(c: &mut Criterion) {
+    use escapepod_demux::crf::BarcodeRefs;
+    let mut state = 0xBA5Eu64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let seqs: Vec<String> = (0..96)
+        .map(|_| {
+            (0..40)
+                .map(|_| b"ACGT"[(next() % 4) as usize] as char)
+                .collect()
+        })
+        .collect();
+    let refs = BarcodeRefs::from_pairs(
+        seqs.iter()
+            .enumerate()
+            .map(|(i, s)| (format!("BC{i:02}"), s.as_str())),
+    )
+    .unwrap();
+    // 4 substitutions from reference 37.
+    let mut noisy = seqs[37].clone().into_bytes();
+    for pos in [3usize, 11, 22, 35] {
+        noisy[pos] = if noisy[pos] == b'A' { b'C' } else { b'A' };
+    }
+    let exact = seqs[37].clone().into_bytes();
+    assert_eq!(refs.match_sequence(&noisy).unwrap().index, 37);
+
+    let mut group = c.benchmark_group("barcode_match_sequence");
+    group.throughput(Throughput::Elements(96));
+    group.bench_function("96refs_noisy", |b| {
+        b.iter(|| refs.match_sequence(black_box(&noisy)));
+    });
+    group.bench_function("96refs_exact", |b| {
+        b.iter(|| refs.match_sequence(black_box(&exact)));
+    });
+    group.finish();
+}
+
 // NOTE: the biggest workspace win — avoiding per-read `k×k` coupling-matrix
 // allocations in `couple_probabilities` — doesn't show up in a single-threaded
 // microbench. `predict` is ~99% DTW time at 32 classes / 150 features, so
@@ -349,6 +394,18 @@ fn bench_svm_predict(c: &mut Criterion) {
 // production par_iter workloads where per-thread heap contention matters;
 // measure that end-to-end on a real pod5 via hyperfine.
 
+#[cfg(feature = "crf-decode")]
+criterion_group!(
+    benches,
+    bench_classify_read,
+    bench_compute_distances,
+    bench_predict_windowed,
+    bench_decision_function_windowed,
+    bench_svm_pipeline,
+    bench_svm_predict,
+    bench_barcode_match,
+);
+#[cfg(not(feature = "crf-decode"))]
 criterion_group!(
     benches,
     bench_classify_read,

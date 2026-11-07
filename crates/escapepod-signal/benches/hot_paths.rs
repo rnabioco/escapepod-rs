@@ -349,6 +349,100 @@ fn bench_median_select_vs_sort(c: &mut Criterion) {
     group.finish();
 }
 
+/// `llr::detect_adapter` on a synthetic read: open pore, adapter plateau,
+/// poly(A)-like body, as `demux detect --method llr` sees it.
+fn bench_llr_detect_adapter(c: &mut Criterion) {
+    use escapepod_signal::segmentation::detect_adapter;
+    let mut group = c.benchmark_group("llr_detect_adapter");
+    for &len in &[2_000usize, 8_000] {
+        let noise = pseudo_floats(len, 0xADA7);
+        let signal: Vec<f32> = noise
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let level = if i < len / 8 {
+                    200.0
+                } else if i < len / 3 {
+                    100.0
+                } else {
+                    140.0
+                };
+                level + n * 3.0
+            })
+            .collect();
+        // Guard: the synthetic read must actually exercise the split search.
+        assert_ne!(detect_adapter(&signal, 100, 20), (0, 0));
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &(), |bench, _| {
+            bench.iter(|| detect_adapter(black_box(&signal), 100, 20));
+        });
+    }
+    group.finish();
+}
+
+/// `seq_encoding::encode_signal_kmer_batch` at a charging-style window.
+fn bench_encode_signal_kmer_batch(c: &mut Criterion) {
+    use escapepod_signal::seq_encoding::{KmerContext, SignalKmerBatch, encode_signal_kmer_batch};
+    configure_rayon();
+    let ctx = KmerContext::new(3, 5);
+    let (rows, n_bases, signal_len) = (64usize, 80usize, 400usize);
+    let mut seq_ints = Vec::new();
+    let mut seq_ints_offsets = vec![0usize];
+    let mut seq_to_signal = Vec::new();
+    let mut seq_to_signal_offsets = vec![0usize];
+    for r in 0..rows {
+        let noise = pseudo_floats(n_bases + ctx.before + ctx.after, 0xB0 + r as u64);
+        seq_ints.extend(noise.iter().map(|x| ((x.abs() * 4.0) as i8).clamp(0, 3)));
+        seq_ints_offsets.push(seq_ints.len());
+        seq_to_signal.extend((0..=n_bases as i64).map(|b| b * 5));
+        seq_to_signal_offsets.push(seq_to_signal.len());
+    }
+    let batch = SignalKmerBatch {
+        seq_ints: &seq_ints,
+        seq_ints_offsets: &seq_ints_offsets,
+        seq_to_signal: &seq_to_signal,
+        seq_to_signal_offsets: &seq_to_signal_offsets,
+    };
+    let mut group = c.benchmark_group("encode_signal_kmer_batch");
+    group.throughput(Throughput::Elements(rows as u64));
+    group.bench_function(format!("{rows}rows_x{signal_len}"), |bench| {
+        bench.iter(|| encode_signal_kmer_batch(black_box(&batch), signal_len, ctx));
+    });
+    group.finish();
+}
+
+/// `chunk::process_read` in query coordinates (trim, normalise, anchor), the
+/// per-read step every window model shares.
+fn bench_chunk_process_read(c: &mut Criterion) {
+    use escapepod_signal::chunk::{Anchor, ProcessConfig, ReadInputs, process_read};
+    let stride = 6u32;
+    let n_moves = 1_500usize;
+    let n_samples = n_moves * stride as usize;
+    let raw: Vec<i16> = pseudo_signal(n_samples + 100, 0xC4);
+    // One base every ~4 strides.
+    let moves: Vec<u8> = (0..n_moves).map(|i| u8::from(i % 4 == 0)).collect();
+    let n_bases = moves.iter().filter(|&&m| m == 1).count();
+    let sequence: Vec<u8> = (0..n_bases).map(|i| b"ACGT"[i % 4]).collect();
+    let inputs = ReadInputs {
+        raw: &raw,
+        moves: &moves,
+        stride,
+        trim: 50,
+        num_samples: (n_samples + 50) as u64,
+    };
+    let cfg = ProcessConfig::default();
+    let anchor = Anchor::Query {
+        sequence: &sequence,
+    };
+    assert!(process_read(inputs, anchor, &cfg).is_some());
+    let mut group = c.benchmark_group("chunk_process_read");
+    group.throughput(Throughput::Elements(n_samples as u64));
+    group.bench_function("query_median_mad", |bench| {
+        bench.iter(|| process_read(black_box(inputs), black_box(anchor), &cfg));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dtw,
@@ -359,5 +453,8 @@ criterion_group!(
     bench_vbz_roundtrip,
     bench_dtw_matrix,
     bench_median_select_vs_sort,
+    bench_llr_detect_adapter,
+    bench_encode_signal_kmer_batch,
+    bench_chunk_process_read,
 );
 criterion_main!(benches);
