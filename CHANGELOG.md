@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **One ADC→pA calibration definition** (#501). `escapepod_pod5::calibrate_pa` (re-exported by `escapepod-signal`, plus `calibrate_pa_slice` and `SignalCalibration::to_pa`) is the single definition, the fused `adc.mul_add(scale, offset * scale)`; `escpod classify`, the CRF demux window prep and the Python bindings all call it. `escpod classify` previously calibrated unfused (`(adc + offset) * scale`, two roundings), about an ulp away from the Python binding that built its goldens: the charging feature grid's max deviation from the reference golden drops from 2.1e-6 to 2.4e-7, probabilities unchanged within 1e-6. A shared golden (`crates/escapepod-pod5/tests/fixtures/calibration_pa.tsv`) pins Rust and Python to the same bits.
+
 ## 0.33.0 (2026-10-11)
 
 ### Added
