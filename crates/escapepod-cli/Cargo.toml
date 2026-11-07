@@ -64,7 +64,7 @@ tracing-subscriber = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 # Release bundles ship as zip archives; deflate is the only method they use and
 # rides on flate2, which is already in the graph.
-zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 uuid = { workspace = true, optional = true }
 walkdir = { version = "2", optional = true }
 
