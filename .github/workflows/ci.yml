@@ -309,11 +309,13 @@ jobs:
       # cudarc/NVRTC DTW only, no onnxruntime. It is the one crate here with a
       # plausible external consumer, so it keeps a flag that does not drag ort in.
       - name: gpu — DTW CUDA kernel (cudarc, escapepod-signal)
-        run: cargo clippy -p escapepod-signal --features gpu
+        run: cargo clippy -p escapepod-signal --features gpu --all-targets
       - name: gpu — every GPU path (cudarc + ort, escapepod-demux)
-        run: cargo clippy -p escapepod-demux --features gpu
+        run: cargo clippy -p escapepod-demux --features gpu --all-targets
       - name: gpu — CLI union (what `--features gpu` users build)
-        run: cargo clippy -p escapepod-cli --features gpu
+        run: cargo clippy -p escapepod-cli --features gpu --all-targets
+      - name: cuda — tract-cuda waveform scorer (escapepod-classify)
+        run: cargo clippy -p escapepod-classify --features cuda --all-targets
       # Not an opt-in feature, but the one library-crate combination no other
       # job produces: `escapepod-cli`'s default build turns `waveform-onnx` and
       # `fnn-onnx` on together, so `escapepod-classify` with only the former is

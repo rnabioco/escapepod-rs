@@ -343,16 +343,18 @@ pub fn signal_adc(
 }
 
 /// Extract one read's calibrated picoamp signal:
-/// `pA = (adc + offset) * scale`, in `f32`.
+/// `pA = (adc + offset) * scale`, in `f32`, through
+/// [`escapepod_signal::pod5::calibrate_pa`] (the fused form every other path uses).
 pub fn signal_pa(
     info: &Pod5ReadInfo,
     extractors: &[escapepod_signal::pod5::SignalExtractor<'_>],
 ) -> Result<Vec<f32>> {
     let raw = extractors[info.reader_idx].get_signal(&info.signal_rows)?;
-    Ok(raw
-        .iter()
-        .map(|&adc| (adc as f32 + info.calibration_offset) * info.calibration_scale)
-        .collect())
+    Ok(escapepod_signal::pod5::calibrate_pa_slice(
+        &raw,
+        info.calibration_offset,
+        info.calibration_scale,
+    ))
 }
 
 /// The canonical `offsets × FEAT_STATS` feature grid for one read: spans

@@ -60,7 +60,7 @@
 - LLR ×3: run:422, detect:130, train:409 (train's skips downscale — unifying changes reference banks; explicit decision).
 - Env readers ×5 (run:2070–3141); `GpuTrace` ≡ detect.rs `StageTimes`.
 - `for_writing` called per read in every producer and again in `writer_thread:3845`.
-- `sha256_hex` ×3 (run:4357, models:670, resquiggle_models:277).
+- `sha256_hex` and `cache_dir` now live in `util.rs` (#505).
 - run.rs:1422 "Only CRF bundles" bail unreachable after :1123.
 - run.rs:443 `detect_with` `CnnGpu` arm unreachable.
 
