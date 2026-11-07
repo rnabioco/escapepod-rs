@@ -38,22 +38,17 @@ impl Rng {
 // skips itself when unset), not the runtime switch/knob shape.
 #[allow(clippy::disallowed_methods)]
 fn load_bundle() -> Option<String> {
-    match std::env::var("ESCAPEPOD_CRF_BUNDLE") {
-        Ok(dir) => Some(dir),
-        Err(_) => {
-            eprintln!(
-                "skipping crf_encoder_native_parity: set ESCAPEPOD_CRF_BUNDLE to a \
-                 CRF bundle directory to run it"
-            );
-            None
-        }
-    }
+    Some(
+        std::env::var("ESCAPEPOD_CRF_BUNDLE")
+            .expect("set ESCAPEPOD_CRF_BUNDLE to a CRF bundle directory"),
+    )
 }
 
 /// The native encoder loads (this bundle's export is the recognised shape)
 /// and its scores agree with tract's within the load-time self-check's own
 /// tolerance, on 64 seeded windows distinct from the one that check used.
 #[test]
+#[ignore = "needs ESCAPEPOD_CRF_BUNDLE (CRF bundle directory)"]
 fn native_scores_agree_with_tract_on_real_weights() {
     let Some(dir) = load_bundle() else { return };
     let encoder =
