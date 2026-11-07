@@ -1308,13 +1308,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs data/drna/yeast_trna_reads.pod5"]
     fn test_parse_real_signal_table() {
         // Use bundled test data in data/drna
         let test_file = std::path::Path::new("../data/drna/yeast_trna_reads.pod5");
-        if !test_file.exists() {
-            eprintln!("Skipping test - test file not found at {:?}", test_file);
-            return;
-        }
+        assert!(test_file.exists(), "test file not found at {test_file:?}");
 
         let reader = crate::Reader::open(test_file).expect("Failed to open test file");
         let signal_bytes = reader

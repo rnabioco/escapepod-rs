@@ -77,6 +77,7 @@ fn make_svm_model(training: Vec<Vec<f64>>, labels: Vec<i32>) -> DtwSvmModel {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn parity_svm_classify_batch() {
     let Some(ctx) = try_context() else { return };
 
@@ -138,6 +139,7 @@ fn parity_svm_classify_batch() {
 /// `penalty^2` warp cost identically to the CPU `dtw_distance_penalty`, so
 /// `--gpu` classify matches CPU classify (and therefore WarpDemuX).
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn parity_svm_classify_batch_penalty() {
     let Some(ctx) = try_context() else { return };
 
@@ -190,6 +192,7 @@ fn parity_svm_classify_batch_penalty() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn parity_svm_classify_batch_real_ovo() {
     let Some(ctx) = try_context() else { return };
 

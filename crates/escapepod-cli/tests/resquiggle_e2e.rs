@@ -30,12 +30,10 @@ fn kmer_table() -> PathBuf {
 }
 
 #[test]
+#[ignore = "needs data/kmer_models/rna004_9mer_levels_v1.txt.gz"]
 fn resquiggle_pg_cl_records_the_kmer_table_flag() {
     let kmer_table = kmer_table();
-    if !kmer_table.exists() {
-        eprintln!("skipping test: {:?} not found", kmer_table);
-        return;
-    }
+    assert!(kmer_table.exists(), "{kmer_table:?} not found");
 
     let dir = tempfile::tempdir().unwrap();
     let out_bam = dir.path().join("out.bam");

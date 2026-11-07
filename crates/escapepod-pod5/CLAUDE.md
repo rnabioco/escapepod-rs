@@ -52,7 +52,7 @@ Root CLAUDE.md "Build baseline and SLURM builds" for the `srun` form.
 - Hand-parsed footer `footer.rs:148-420` despite `flatbuffers_gen::Footer` accessors.
 - Indexed lookups ×3 `reader/file_reader.rs:1527-1702`; 7 copies of "slice embedded table".
 - Sidecar mirror: `sidecar.rs:1034-1134`≡`:1861-1956`, `:683-762`≡`:1640-1698`.
-- `utils/run_info.rs` not in `utils/mod.rs` (never compiles); `utils/dictionary.rs` dead.
+- `utils/dictionary.rs` dead.
 
 ## Do not
 - Copy `.pod5` into a worktree/test dir — root CLAUDE.md storage rules; symlink.
