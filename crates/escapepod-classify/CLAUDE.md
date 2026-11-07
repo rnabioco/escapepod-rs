@@ -13,7 +13,7 @@ Cluster/build/profiling policy: root `CLAUDE.md` ("Build Commands", "Build basel
 - `bundle` — closed `metadata.json` schema, checksums, variant → `ChargingBundle`/`ChargingScorer`. `recipe` — `FeatureRecipe`, the feature space as a borrowed view.
 - `geometry` (FASTA motif/arm → `RefGeometry`) → `anchor` (ref→query→signal, orientation vote, `finalize`) → `features` (dwell/mean/std/resid grid) / `window` (raw pA window).
 - `waveform` — windowed variant: own scan, `MD` reference, chunk assembly, CPU/GPU loops; `waveform_net{,_gpu}` — tract / tract-cuda loaders.
-- `fnn` — `feature_model` loader; `fnn_lstm` — BiLSTM export recogniser (kernel in `signal::lstm`).
+- `fnn` — `feature_model` loader; `fnn_lstm` — BiLSTM export recogniser (kernel and dispatch in `signal::lstm::run_batch`, called once per direction).
 - `pipeline` — `scan_bam`, `Pod5Index`, `classify_reads`, `ClassifyStats`. `bam_tags` — `mv`/`ns`/`ts`/`MD`. `lib` — re-exports, `cl_from_probability`.
 
 ## Three bundle variants, one feature space
@@ -74,7 +74,6 @@ cargo run -p escapepod-classify --example verify_feature_model --features fnn-on
 - `waveform_net.rs:235-298` / `waveform_net_gpu.rs:275-369`: duplicated open/pin/probe.
 - `window::BaseJustify` duplicates `signal::chunk::BaseJustify`.
 - `anchor::ref_to_query`: second CIGAR walk beside `signal::mapping::ref_to_signal`.
-- `fnn_lstm.rs` `(backend, n)` match at `400-514` → `signal::lstm::run_batch`.
 
 ## Do not
 

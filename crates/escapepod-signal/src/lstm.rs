@@ -23,6 +23,12 @@
 //!   contiguous, so the transpose happens once per layer boundary instead of
 //!   once per gate element).
 //!
+//! Both callers reach the kernels through [`run_batch`], which owns the one
+//! `(backend, group width)` → kernel table (single read and lockstep groups
+//! alike) and checks the preconditions the kernels' `unsafe` rests on; the
+//! kernels stay `pub` for the equivalence tests and probes that pin them one
+//! by one.
+//!
 //! For which layers reverse and why (bonito's "run backward without a
 //! backward LSTM" trick — reverse the sequence, run an ONNX-forward LSTM,
 //! reverse the output back), see `escapepod_demux::crf::encoder_native`.
