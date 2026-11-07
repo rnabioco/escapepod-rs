@@ -64,7 +64,6 @@ fn default_is_capped_at_available_parallelism() {
 /// already built the global pool at `available_parallelism()`. Both methods must
 /// now report the requested width. Neither command gets as far as reading a
 /// read — that is fine, the pool is sized before dispatch either way.
-#[cfg(feature = "demux")]
 #[test]
 fn demux_detect_honours_threads_for_every_method() {
     let base = ["demux", "detect", "no-such-file.pod5", "-o", "out.csv"];
