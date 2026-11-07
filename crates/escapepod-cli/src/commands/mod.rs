@@ -5,9 +5,7 @@
 
 pub mod annotate;
 pub mod bam_filter;
-#[cfg(feature = "classify")]
 pub mod classify;
-#[cfg(feature = "demux")]
 pub mod demux;
 pub mod filter;
 pub mod index;

@@ -74,18 +74,18 @@ fn a_sidecar_does_not_change_a_single_call() {
     let indexed = copy_pod5(tmp.path(), "indexed.pod5");
 
     let sidecar = escapepod_signal::pod5::sidecar::sidecar_path(&indexed);
-    let written = escapepod_signal::Reader::open(&indexed)
+    let written = escapepod_signal::pod5::Reader::open(&indexed)
         .unwrap()
         .build_and_write_index(&sidecar)
         .unwrap();
     assert!(written > 0, "the fixture indexed to nothing");
     assert!(
-        escapepod_signal::Reader::open(&indexed)
+        escapepod_signal::pod5::Reader::open(&indexed)
             .unwrap()
             .has_sidecar_index()
     );
     assert!(
-        !escapepod_signal::Reader::open(&bare)
+        !escapepod_signal::pod5::Reader::open(&bare)
             .unwrap()
             .has_sidecar_index()
     );
@@ -138,7 +138,7 @@ fn pod5_index_resolves_reads_through_the_index_not_a_scan() {
     let pod5 = copy_pod5(tmp.path(), "forged.pod5");
     let p5s = sidecar_path(&pod5);
 
-    let reader = escapepod_signal::Reader::open(&pod5).unwrap();
+    let reader = escapepod_signal::pod5::Reader::open(&pod5).unwrap();
     let identity = reader.sidecar_identity().unwrap();
     reader.build_and_write_index(&p5s).unwrap();
 

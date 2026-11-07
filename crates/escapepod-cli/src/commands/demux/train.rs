@@ -7,8 +7,8 @@ use crate::style;
 use escapepod_demux::{
     compute_consensus_fingerprint, compute_std_dev_fingerprint, extract_fingerprint_from_signal,
 };
+use escapepod_signal::pod5::{Reader, ReadsBatchView};
 use escapepod_signal::segmentation::{detect_adapter, normalize_signal};
-use escapepod_signal::{Reader, ReadsBatchView};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

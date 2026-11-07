@@ -514,7 +514,7 @@ fn run_cnn(args: DetectArgs, device: crate::device::Device) -> anyhow::Result<()
         #[cfg(feature = "gpu")]
         {
             use escapepod_demux::AdapterCnnConfig;
-            use escapepod_signal::Reader;
+            use escapepod_signal::pod5::Reader;
             use rayon::prelude::*;
             use std::sync::mpsc::sync_channel;
 

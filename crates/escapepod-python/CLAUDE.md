@@ -29,13 +29,13 @@ pixi run -e python-test test-compat    # tests/compat/ against reference pod5
 - `ANCHOR_SOURCES`/`MASK_SOURCES` (`anchored.rs:549-556`) hand-copy enum discriminant order; derive from the enums.
 - `adc_to_pa` (`reader.rs:14`) duplicates `classify::pipeline::signal_pa`; one `calibrate()` belongs in `escapepod-signal`.
 - `Writer`: exception path aborts, GC path finalises with `ResourceWarning` — both deliberate.
-- `DatasetReader` (`dataset.rs`) opens every file through the process-global, never-evicted `escapepod_signal::cached_reader` (escapepod-rs#384), not a private `Vec<Reader>` it used to own. Opening many `DatasetReader`s over a process's lifetime therefore accumulates every file's reader in that cache rather than freeing it on `__exit__`/GC the way it used to — a real lifetime change, intentional (it's what sharing the cache means), not a leak to fix. `escapepod_signal::global_reader_cache().clear()` is the Rust-side escape hatch; nothing here exposes it to Python yet.
+- `DatasetReader` (`dataset.rs`) opens every file through the process-global, never-evicted `escapepod_signal::pod5::cached_reader` (escapepod-rs#384), not a private `Vec<Reader>` it used to own. Opening many `DatasetReader`s over a process's lifetime therefore accumulates every file's reader in that cache rather than freeing it on `__exit__`/GC the way it used to — a real lifetime change, intentional (it's what sharing the cache means), not a leak to fix. `escapepod_signal::pod5::global_reader_cache().clear()` is the Rust-side escape hatch; nothing here exposes it to Python yet.
 
 ## Known debt
 
 - `read_data.rs:305-351` `PyRunInfo::new` ≡ `writer.rs:425-471` `create_run_info`.
 - `read_data.rs:55-112` `PyReadData::new` vs `writer.rs:163-227` `add_read`: 23-kwarg assembly ×2.
-- `reader.rs` / `dataset.rs`: `get_signal{,_pa}`, `get_signals{,_pa}`, `byte_count`, `to_*` duplicated; share free fns over `&escapepod_signal::Reader`.
+- `reader.rs` / `dataset.rs`: `get_signal{,_pa}`, `get_signals{,_pa}`, `byte_count`, `to_*` duplicated; share free fns over `&escapepod_signal::pod5::Reader`.
 - `anchored.rs:41-48` `mask_source_name` → `MaskSource::as_str`.
 
 ## Do not

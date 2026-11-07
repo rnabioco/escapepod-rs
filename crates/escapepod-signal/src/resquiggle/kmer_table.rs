@@ -453,14 +453,12 @@ mod tests {
     /// one position. Pinned here because swapping one for the other silently
     /// shifts every predicted level.
     #[test]
+    #[ignore = "needs the aa-tRNA-seq-pipeline 9mer_levels_v1.txt table at an absolute path"]
     fn rna004_dominant_base_is_not_the_midpoint() {
         let p = std::path::Path::new(
             "/beevol/home/jhessel/devel/rnabioco/aa-tRNA-seq-pipeline/resources/kmers/9mer_levels_v1.txt",
         );
-        if !p.exists() {
-            eprintln!("RNA004 kmer table not present; skipping");
-            return;
-        }
+        assert!(p.exists(), "RNA004 kmer table not present");
         let t = KmerTable::from_file(p).expect("load");
         assert_eq!(t.k(), 9);
         assert_eq!(t.dominant_base(), 3, "empirically dominant base");
@@ -487,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs data/kmer_models/rna004_9mer_levels_v1.txt.gz"]
     fn test_load_rna004_kmer_table() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -494,10 +493,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("data/kmer_models/rna004_9mer_levels_v1.txt.gz");
-        if !path.exists() {
-            eprintln!("skipping test: {:?} not found", path);
-            return;
-        }
+        assert!(path.exists(), "{path:?} not found");
         let table = KmerTable::from_file(&path).unwrap();
         assert_eq!(table.k(), 9);
 
@@ -515,6 +511,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs data/kmer_models/rna004_9mer_levels_v1.txt.gz"]
     fn test_fix_gauge_rna004() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -522,10 +519,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("data/kmer_models/rna004_9mer_levels_v1.txt.gz");
-        if !path.exists() {
-            eprintln!("skipping test: {:?} not found", path);
-            return;
-        }
+        assert!(path.exists(), "{path:?} not found");
         let mut table = KmerTable::from_file(&path).unwrap();
         table.fix_gauge().unwrap();
 

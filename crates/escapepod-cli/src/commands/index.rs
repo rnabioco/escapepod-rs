@@ -85,7 +85,7 @@ pub fn run(args: IndexArgs) -> anyhow::Result<()> {
             let p5s_path = sidecar_path(pod5_path);
 
             let t0 = Instant::now();
-            let reader = match escapepod_signal::Reader::open(pod5_path) {
+            let reader = match escapepod_signal::pod5::Reader::open(pod5_path) {
                 Ok(r) => r,
                 Err(e) => return Some(anyhow::Error::from(e)),
             };

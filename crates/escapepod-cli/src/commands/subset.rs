@@ -8,8 +8,8 @@
 use crate::commands::profile::PhaseTimer;
 use crate::style;
 use crate::util::{check_output_not_input, resolve_pod5_inputs};
-use escapepod_signal::Durability;
-use escapepod_signal::operations::{FilterOptions, parse_csv_mapping, subset_files};
+use escapepod_signal::pod5::Durability;
+use escapepod_signal::pod5::operations::{FilterOptions, parse_csv_mapping, subset_files};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::info;
@@ -126,8 +126,8 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use escapepod_signal::operations::parse_csv_mapping;
-    use escapepod_signal::parse_uuid_flexible;
+    use escapepod_signal::pod5::operations::parse_csv_mapping;
+    use escapepod_signal::pod5::parse_uuid_flexible;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use uuid::Uuid;

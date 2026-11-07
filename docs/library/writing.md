@@ -5,7 +5,7 @@ The `Writer` struct creates new POD5 files with automatic signal compression.
 ## Creating a Writer
 
 ```rust linenums="1"
-use escapepod_signal::{Writer, WriterOptions};
+use escapepod_signal::pod5::{Writer, WriterOptions};
 
 // Default options
 let writer = Writer::create("output.pod5", WriterOptions::default())?;
@@ -24,7 +24,7 @@ let writer = Writer::create("output.pod5", options)?;
 Every read references a run info entry. Add run info before adding reads:
 
 ```rust linenums="1"
-use escapepod_signal::RunInfoData;
+use escapepod_signal::pod5::RunInfoData;
 use std::collections::HashMap;
 
 let run_info = RunInfoData {
@@ -50,7 +50,7 @@ let run_info_index = writer.add_run_info(run_info)?;
 Add reads with their signal data:
 
 ```rust linenums="1"
-use escapepod_signal::{ReadData, EndReason};
+use escapepod_signal::pod5::{ReadData, EndReason};
 use uuid::Uuid;
 
 let read = ReadData {
@@ -90,11 +90,11 @@ The file is not valid until `finish()` completes successfully.
 ## Complete Example
 
 ```rust linenums="1"
-use escapepod_signal::{Writer, WriterOptions, ReadData, RunInfoData, EndReason};
+use escapepod_signal::pod5::{Writer, WriterOptions, ReadData, RunInfoData, EndReason};
 use uuid::Uuid;
 use std::collections::HashMap;
 
-fn write_pod5_file() -> Result<(), escapepod_signal::Error> {
+fn write_pod5_file() -> Result<(), escapepod_signal::pod5::Error> {
     let mut writer = Writer::create("output.pod5", WriterOptions::default())?;
 
     // Add run info
@@ -157,7 +157,7 @@ This typically achieves 60-80% compression on nanopore signal data.
 ## Copying Reads Between Files
 
 ```rust linenums="1"
-use escapepod_signal::{Reader, Writer, WriterOptions};
+use escapepod_signal::pod5::{Reader, Writer, WriterOptions};
 
 let reader = Reader::open("input.pod5")?;
 let mut writer = Writer::create("output.pod5", WriterOptions::default())?;

@@ -18,8 +18,8 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use escapepod_signal::Reader;
     use escapepod_signal::dtw::GpuDtwContext;
+    use escapepod_signal::pod5::Reader;
     use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
 
     const MIN_ADAPTER: usize = 200;

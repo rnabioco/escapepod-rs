@@ -33,12 +33,12 @@ use escapepod_demux::{
     extract_fingerprint_from_signal, load_any_model,
 };
 use escapepod_signal::dtw::NormMethod;
-use escapepod_signal::operations::{ABSENT_CODE, ABSENT_SCORE, ColumnValues, ColumnWrite};
-use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
-use escapepod_signal::{
+use escapepod_signal::pod5::operations::{ABSENT_CODE, ABSENT_SCORE, ColumnValues, ColumnWrite};
+use escapepod_signal::pod5::{
     CompressedSignalChunk, PredefinedDictionaries, ReadData, Reader, ReadsBatchView, RunInfoData,
     Uuid, Writer, WriterOptions,
 };
+use escapepod_signal::segmentation::{detect_adapter, downscale_normalize_into};
 use rayon::prelude::*;
 use tracing::info;
 
@@ -2062,7 +2062,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
                 continue;
             }
             let path = escapepod_signal::pod5::sidecar::collection_sidecar_path(dir);
-            let result = escapepod_signal::operations::write_collection_columns(
+            let result = escapepod_signal::pod5::operations::write_collection_columns(
                 &path, &members, &columns, false,
             )
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -2091,7 +2091,7 @@ pub fn run(mut args: RunArgs) -> anyhow::Result<()> {
             // One read-modify-write for all five columns: five separate ones
             // would rewrite the sidecar five times and leave four intermediate
             // states on disk describing a run that never happened.
-            let result = escapepod_signal::operations::write_columns(path, &columns, false)
+            let result = escapepod_signal::pod5::operations::write_columns(path, &columns, false)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             let barcode = result.columns.first();
             info!(

@@ -10,8 +10,8 @@
 use std::time::Instant;
 
 use escapepod_demux::extract_fingerprint_from_signal;
-use escapepod_signal::Reader;
 use escapepod_signal::dtw::NormMethod;
+use escapepod_signal::pod5::Reader;
 use escapepod_signal::segmentation::{detect_adapter, downscale, normalize_signal};
 use uuid::Uuid;
 

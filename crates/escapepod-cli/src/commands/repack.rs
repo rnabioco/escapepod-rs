@@ -7,7 +7,7 @@ use crate::commands::profile::PhaseTimer;
 use crate::progress::create_progress_bar;
 use crate::style;
 use crate::util::collect_pod5_inputs;
-use escapepod_signal::{Durability, RepackOptions, repack_files};
+use escapepod_signal::pod5::{Durability, RepackOptions, repack_files};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,8 +72,8 @@ pub fn run(
     // Create progress callback
     let bar = overall_bar.clone();
     let progress_counter = bar_progress.clone();
-    let progress_callback: escapepod_signal::ProgressCallback =
-        Box::new(move |p: escapepod_signal::Progress| {
+    let progress_callback: escapepod_signal::pod5::ProgressCallback =
+        Box::new(move |p: escapepod_signal::pod5::Progress| {
             let prev = progress_counter.swap(p.current, Ordering::Relaxed);
             if p.current > prev {
                 bar.inc(p.current - prev);

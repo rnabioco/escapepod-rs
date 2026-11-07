@@ -83,7 +83,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use escapepod_signal::{Reader, ReadsBatchView, SignalExtractor, Uuid};
+use escapepod_signal::pod5::{Reader, ReadsBatchView, SignalExtractor, Uuid};
 
 thread_local! {
     /// Worker count for the fetch phase, set once from `--threads`.
@@ -253,7 +253,7 @@ fn run_arm(
     let readers: Vec<Reader> = paths
         .iter()
         .map(Reader::open)
-        .collect::<escapepod_signal::Result<_>>()?;
+        .collect::<escapepod_signal::pod5::Result<_>>()?;
     let wanted: HashSet<Uuid> = sample.iter().copied().collect();
 
     let majflt0 = major_faults();
@@ -283,7 +283,7 @@ fn run_arm(
     let extractors: Vec<SignalExtractor<'_>> = readers
         .iter()
         .map(|r| r.signal_extractor())
-        .collect::<escapepod_signal::Result<_>>()?;
+        .collect::<escapepod_signal::pod5::Result<_>>()?;
 
     // Threading is the whole question, not a detail. `classify_reads` hands
     // rayon `par_chunks` of the ordered reads, so with T workers there are T

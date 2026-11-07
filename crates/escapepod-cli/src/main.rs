@@ -2,7 +2,7 @@
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
-use escapepod_signal::Durability;
+use escapepod_signal::pod5::Durability;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
@@ -425,7 +425,6 @@ Examples:
     Summary(commands::summary::SummaryArgs),
 
     /// Barcode demultiplexing workflow
-    #[cfg(feature = "demux")]
     #[command(after_help = "\
 Examples:
   escpod demux input.pod5 --model model.json -d out/   Fused pipeline (recommended)
@@ -445,21 +444,9 @@ POD5 per stage; prefer the fused form unless you want the intermediate files.
     Demux(commands::demux::DemuxArgs),
 
     /// Barcode demultiplexing workflow (rebuild with `--features demux` to enable)
-    #[cfg(not(feature = "demux"))]
-    #[command(hide = true)]
-    Demux {
-        /// Demux subcommand and arguments (ignored; feature not enabled)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
-    },
 
     /// Classify reads against a model bundle (tRNA charging) from POD5 +
     /// aligned BAM
-    #[cfg(feature = "classify")]
     #[command(after_help = "\
 Examples:
   escpod classify reads.pod5 -b aln.bam -r ref.fa -m bundle/ -o out.bam
@@ -479,17 +466,6 @@ a wrong answer rather than an error.
     Classify(commands::classify::ClassifyArgs),
 
     /// Classify reads against a model bundle (rebuild with `--features classify` to enable)
-    #[cfg(not(feature = "classify"))]
-    #[command(hide = true)]
-    Classify {
-        /// Classify arguments (ignored; feature not enabled)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
-    },
 
     /// Refine signal-to-base mapping using banded DP (experimental; requires `--features experimental`)
     #[cfg(feature = "experimental")]
@@ -579,15 +555,9 @@ fn requested_threads(command: &Commands) -> Option<usize> {
         #[cfg(not(feature = "experimental"))]
         Commands::Resquiggle { .. } => None,
 
-        #[cfg(feature = "demux")]
         Commands::Demux(args) => commands::demux::requested_threads(args),
-        #[cfg(not(feature = "demux"))]
-        Commands::Demux { .. } => None,
 
-        #[cfg(feature = "classify")]
         Commands::Classify(args) => args.threads,
-        #[cfg(not(feature = "classify"))]
-        Commands::Classify { .. } => None,
 
         // No `--threads` flag; these run on the default pool.
         Commands::View { .. } | Commands::Repack { .. } => None,
@@ -674,7 +644,7 @@ fn install_signal_handler() {
             std::process::exit(130);
         }
         eprintln!("\nInterrupted — discarding incomplete output...");
-        escapepod_signal::abort_all_in_flight_writes();
+        escapepod_signal::pod5::abort_all_in_flight_writes();
         std::process::exit(130);
     });
 
@@ -848,17 +818,9 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Summary(args) => commands::summary::run(args),
 
-        #[cfg(feature = "demux")]
         Commands::Demux(args) => commands::demux::run(args),
 
-        #[cfg(not(feature = "demux"))]
-        Commands::Demux { .. } => feature_disabled("demux", "demux"),
-
-        #[cfg(feature = "classify")]
         Commands::Classify(args) => commands::classify::run(args),
-
-        #[cfg(not(feature = "classify"))]
-        Commands::Classify { .. } => feature_disabled("classify", "classify"),
 
         #[cfg(feature = "experimental")]
         Commands::Resquiggle(args) => commands::resquiggle::run(args),
@@ -1201,7 +1163,6 @@ mod tests {
 
     /// `escpod classify` must reach the pool sizing — a path that silently
     /// loses `-j` is the #155 bug wearing a different hat.
-    #[cfg(feature = "classify")]
     #[test]
     fn classify_forwards_threads() {
         let prefix = &["escpod", "classify"][..];

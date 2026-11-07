@@ -223,7 +223,7 @@ fn unindexed_hint(paths: &[&Path]) -> Option<String> {
 
 /// An index over one or more POD5 files, restricted to wanted read ids.
 pub struct Pod5Index {
-    readers: Vec<escapepod_signal::Reader>,
+    readers: Vec<escapepod_signal::pod5::Reader>,
     reads: HashMap<Uuid, Pod5ReadInfo>,
 }
 
@@ -246,10 +246,10 @@ impl Pod5Index {
         // filesystem, and none depends on another. `collect` keeps path order,
         // so `reader_idx` -- and with it `storage_key` -- is what the serial
         // loop assigned.
-        let readers: Vec<escapepod_signal::Reader> = paths
+        let readers: Vec<escapepod_signal::pod5::Reader> = paths
             .par_iter()
-            .map(escapepod_signal::Reader::open)
-            .collect::<escapepod_signal::Result<_>>()?;
+            .map(escapepod_signal::pod5::Reader::open)
+            .collect::<escapepod_signal::pod5::Result<_>>()?;
         // Ahead of the lookups, not after them: a line about how long this run
         // is going to take is only useful while the run is still ahead of you.
         // Opening a reader is an mmap and a footer parse; the index — the part
@@ -268,7 +268,7 @@ impl Pod5Index {
         let per_reader = readers
             .par_iter()
             .map(|reader| reader.find_signal_rows_with_calibration_by_ids(wanted))
-            .collect::<escapepod_signal::Result<Vec<_>>>()?;
+            .collect::<escapepod_signal::pod5::Result<Vec<_>>>()?;
         let mut reads = HashMap::new();
         for (reader_idx, found_in_reader) in per_reader.into_iter().enumerate() {
             for found in found_in_reader {
@@ -320,12 +320,12 @@ impl Pod5Index {
     }
 
     /// One signal extractor per file, for parallel on-demand extraction.
-    pub fn extractors(&self) -> Result<Vec<escapepod_signal::SignalExtractor<'_>>> {
+    pub fn extractors(&self) -> Result<Vec<escapepod_signal::pod5::SignalExtractor<'_>>> {
         Ok(self
             .readers
             .iter()
             .map(|r| r.signal_extractor())
-            .collect::<escapepod_signal::Result<_>>()?)
+            .collect::<escapepod_signal::pod5::Result<_>>()?)
     }
 }
 
@@ -337,22 +337,24 @@ impl Pod5Index {
 /// builder, which reads the POD5 integers.
 pub fn signal_adc(
     info: &Pod5ReadInfo,
-    extractors: &[escapepod_signal::SignalExtractor<'_>],
+    extractors: &[escapepod_signal::pod5::SignalExtractor<'_>],
 ) -> Result<Vec<i16>> {
     Ok(extractors[info.reader_idx].get_signal(&info.signal_rows)?)
 }
 
 /// Extract one read's calibrated picoamp signal:
-/// `pA = (adc + offset) * scale`, in `f32`.
+/// `pA = (adc + offset) * scale`, in `f32`, through
+/// [`escapepod_signal::pod5::calibrate_pa`] (the fused form every other path uses).
 pub fn signal_pa(
     info: &Pod5ReadInfo,
-    extractors: &[escapepod_signal::SignalExtractor<'_>],
+    extractors: &[escapepod_signal::pod5::SignalExtractor<'_>],
 ) -> Result<Vec<f32>> {
     let raw = extractors[info.reader_idx].get_signal(&info.signal_rows)?;
-    Ok(raw
-        .iter()
-        .map(|&adc| (adc as f32 + info.calibration_offset) * info.calibration_scale)
-        .collect())
+    Ok(escapepod_signal::pod5::calibrate_pa_slice(
+        &raw,
+        info.calibration_offset,
+        info.calibration_scale,
+    ))
 }
 
 /// The canonical `offsets × FEAT_STATS` feature grid for one read: spans

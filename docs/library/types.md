@@ -256,7 +256,7 @@ pub enum Error {
 ### Error Handling Example
 
 ```rust linenums="1"
-use escapepod_signal::{Reader, Error};
+use escapepod_signal::pod5::{Reader, Error};
 
 fn process_file(path: &str) -> Result<(), String> {
     let reader = Reader::open(path).map_err(|e| match e {

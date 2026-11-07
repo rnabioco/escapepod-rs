@@ -16,7 +16,7 @@ use crate::read_data::PyRunInfo;
 ///         writer.add_read(read_data_dict, signal)
 #[pyclass(name = "Writer")]
 pub struct PyWriter {
-    inner: Option<escapepod_signal::Writer>,
+    inner: Option<escapepod_signal::pod5::Writer>,
 }
 
 #[pymethods]
@@ -54,7 +54,7 @@ impl PyWriter {
         compress_signal: Option<bool>,
         software: Option<String>,
     ) -> PyResult<Self> {
-        let mut opts = escapepod_signal::WriterOptions::default();
+        let mut opts = escapepod_signal::pod5::WriterOptions::default();
         if let Some(v) = max_signal_chunk_size {
             opts.max_signal_chunk_size = v;
         }
@@ -71,7 +71,7 @@ impl PyWriter {
             opts.software = v;
         }
 
-        let writer = escapepod_signal::Writer::create(&path, opts).map_err(to_py_err)?;
+        let writer = escapepod_signal::pod5::Writer::create(&path, opts).map_err(to_py_err)?;
         Ok(Self {
             inner: Some(writer),
         })
@@ -188,15 +188,15 @@ impl PyWriter {
         expected_open_pore_level: f32,
         selected_read_level: f32,
     ) -> PyResult<()> {
-        let uuid = escapepod_signal::utils::parse_uuid_flexible(read_id)
-            .map_err(|e| to_py_err(escapepod_signal::Error::InvalidUuid(e.to_string())))?;
+        let uuid = escapepod_signal::pod5::utils::parse_uuid_flexible(read_id)
+            .map_err(|e| to_py_err(escapepod_signal::pod5::Error::InvalidUuid(e.to_string())))?;
 
         let parsed_end_reason = parse_end_reason(end_reason)?;
 
         let signal_vec: Vec<i16> = signal.to_vec()?;
         let sample_count = num_samples.unwrap_or(signal_vec.len() as u64);
 
-        let read = escapepod_signal::ReadData {
+        let read = escapepod_signal::pod5::ReadData {
             read_id: uuid,
             read_number,
             start_sample,
@@ -267,7 +267,7 @@ impl PyWriter {
             .map(|s| s.to_vec())
             .collect::<Result<_, _>>()?;
 
-        let batch: Vec<(escapepod_signal::ReadData, &[i16])> = reads
+        let batch: Vec<(escapepod_signal::pod5::ReadData, &[i16])> = reads
             .iter()
             .zip(&signal_vecs)
             .map(|(read, signal)| (read.inner.clone(), signal.as_slice()))
@@ -325,10 +325,10 @@ impl PyWriter {
 }
 
 impl PyWriter {
-    fn writer_mut(&mut self) -> PyResult<&mut escapepod_signal::Writer> {
+    fn writer_mut(&mut self) -> PyResult<&mut escapepod_signal::pod5::Writer> {
         self.inner
             .as_mut()
-            .ok_or_else(|| to_py_err(escapepod_signal::Error::WriterFinalized))
+            .ok_or_else(|| to_py_err(escapepod_signal::pod5::Error::WriterFinalized))
     }
 }
 
@@ -379,7 +379,7 @@ impl Drop for PyWriter {
 /// `Unknown`, which would let callers write misspelled metadata without
 /// noticing. Here we validate against the known set and raise a
 /// `ValueError` for anything else.
-pub(crate) fn parse_end_reason(s: &str) -> PyResult<escapepod_signal::EndReason> {
+pub(crate) fn parse_end_reason(s: &str) -> PyResult<escapepod_signal::pod5::EndReason> {
     const VALID: &[&str] = &[
         "unknown",
         "mux_change",
@@ -451,7 +451,7 @@ pub fn create_run_info(
     tracking_id: Option<HashMap<String, String>>,
 ) -> PyRunInfo {
     PyRunInfo {
-        inner: escapepod_signal::RunInfoData {
+        inner: escapepod_signal::pod5::RunInfoData {
             acquisition_id: acquisition_id.to_string(),
             acquisition_start_time,
             adc_max,

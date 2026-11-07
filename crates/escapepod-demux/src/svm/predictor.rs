@@ -330,37 +330,6 @@ impl<'a> SvmPredictor<'a> {
         self.ovo_decisions_into(kernel_values, decisions);
     }
 
-    /// Convert OvO decision values to class votes.
-    ///
-    /// Each binary classifier votes for one of its two classes.
-    /// The class with the most votes wins.
-    ///
-    /// # Arguments
-    ///
-    /// * `decisions` - Decision values from `decision_function`
-    ///
-    /// # Returns
-    ///
-    /// Vote count for each class
-    pub fn ovo_votes(&self, decisions: &[f64]) -> Vec<i32> {
-        let n_classes = self.model.n_classes;
-        let mut votes = vec![0i32; n_classes];
-
-        let mut pair_idx = 0;
-        for i in 0..n_classes {
-            for j in (i + 1)..n_classes {
-                if decisions[pair_idx] > 0.0 {
-                    votes[i] += 1;
-                } else {
-                    votes[j] += 1;
-                }
-                pair_idx += 1;
-            }
-        }
-
-        votes
-    }
-
     /// Convert decision values to probabilities using sigmoid + OvO voting.
     ///
     /// If Platt scaling parameters are available, uses those for calibration.

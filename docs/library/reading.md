@@ -5,7 +5,7 @@ The `Reader` struct provides efficient access to POD5 file contents.
 ## Opening a File
 
 ```rust linenums="1"
-use escapepod_signal::Reader;
+use escapepod_signal::pod5::Reader;
 
 let reader = Reader::open("experiment.pod5")?;
 ```
@@ -107,10 +107,10 @@ reader.build_and_write_index(sidecar_path(&path))?;
 
 Per-read annotations written by `escpod sidecar annotate` / `escpod demux
 --annotate` (barcode assignments, design-derived conditions) live in the
-`.p5s` sidecar and are read through `escapepod_signal::operations`:
+`.p5s` sidecar and are read through `escapepod_signal::pod5::operations`:
 
 ```rust linenums="1"
-use escapepod_signal::operations::{read_annotation, read_design};
+use escapepod_signal::pod5::operations::{read_annotation, read_design};
 
 let barcodes = read_annotation(&path, Some("barcode"))?;
 for (read_id, label) in barcodes.iter() {

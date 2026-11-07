@@ -105,12 +105,17 @@ impl BaseJustify {
     }
 
     /// The spelling [`from_name`](Self::from_name) accepts.
-    pub fn name(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
             Self::Center => "center",
             Self::End => "end",
         }
+    }
+
+    /// Alias of [`as_str`](Self::as_str).
+    pub fn name(self) -> &'static str {
+        self.as_str()
     }
 
     /// The focus sample for a base spanning `[start, end)`.
@@ -120,6 +125,23 @@ impl BaseJustify {
             Self::Start => start,
             Self::End => end,
             Self::Center => (start + end) / 2,
+        }
+    }
+}
+
+impl std::str::FromStr for BaseJustify {
+    type Err = String;
+
+    /// Strict: only `start|center|end` (unlike [`BaseJustify::from_name`],
+    /// which also accepts `centre`). This is the Python-facing spelling.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "start" => Ok(Self::Start),
+            "center" => Ok(Self::Center),
+            "end" => Ok(Self::End),
+            other => Err(format!(
+                "base_justify must be start|center|end, got {other:?}"
+            )),
         }
     }
 }

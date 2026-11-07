@@ -912,7 +912,7 @@ fn finish(
         let cl = record
             .name()
             .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
-            .and_then(|s| escapepod_signal::parse_uuid_flexible(s).ok())
+            .and_then(|s| escapepod_signal::pod5::parse_uuid_flexible(s).ok())
             .and_then(|id| cl_by_id.get(&id));
         if let Some(&cl) = cl {
             record.data_mut().insert(cl_tag, Value::UInt8(cl));

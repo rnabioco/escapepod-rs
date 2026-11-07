@@ -3,7 +3,7 @@
 //! These tests verify end-to-end workflows including reading, writing,
 //! merging, and filtering POD5 files.
 
-use escapepod_signal::{EndReason, ReadData, Reader, RunInfoData, Writer, WriterOptions};
+use escapepod_signal::pod5::{EndReason, ReadData, Reader, RunInfoData, Writer, WriterOptions};
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -72,7 +72,7 @@ fn generate_test_signal(num_samples: usize, offset: i16) -> Vec<i16> {
 }
 
 #[test]
-fn test_full_round_trip() -> escapepod_signal::Result<()> {
+fn test_full_round_trip() -> escapepod_signal::pod5::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 
@@ -126,7 +126,7 @@ fn test_full_round_trip() -> escapepod_signal::Result<()> {
 }
 
 #[test]
-fn test_v5_pore_level_fields_round_trip() -> escapepod_signal::Result<()> {
+fn test_v5_pore_level_fields_round_trip() -> escapepod_signal::pod5::Result<()> {
     // POD5 V5 added `expected_open_pore_level` and `selected_read_level`.
     // Verify non-zero values survive a Writer -> Reader round trip (the schema
     // columns are written and read back, not silently dropped to the default).
@@ -157,7 +157,7 @@ fn test_v5_pore_level_fields_round_trip() -> escapepod_signal::Result<()> {
 }
 
 #[test]
-fn test_read_with_context_tags_and_tracking_id() -> escapepod_signal::Result<()> {
+fn test_read_with_context_tags_and_tracking_id() -> escapepod_signal::pod5::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 
@@ -208,7 +208,7 @@ fn test_read_with_context_tags_and_tracking_id() -> escapepod_signal::Result<()>
 }
 
 #[test]
-fn test_large_signal_chunking() -> escapepod_signal::Result<()> {
+fn test_large_signal_chunking() -> escapepod_signal::pod5::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 
@@ -250,7 +250,7 @@ fn test_large_signal_chunking() -> escapepod_signal::Result<()> {
 }
 
 #[test]
-fn test_all_end_reasons() -> escapepod_signal::Result<()> {
+fn test_all_end_reasons() -> escapepod_signal::pod5::Result<()> {
     let temp_file = NamedTempFile::new().expect("Failed to create temp file");
     let path = temp_file.path();
 

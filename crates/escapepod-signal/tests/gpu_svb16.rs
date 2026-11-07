@@ -7,8 +7,8 @@
 
 #![cfg(feature = "gpu-prep-experimental")]
 
-use escapepod_signal::compression::svb16;
 use escapepod_signal::dtw::{GpuDtwContext, GpuDtwError};
+use escapepod_signal::pod5::compression::svb16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 /// Build a GPU context, skipping gracefully if no device/NVRTC is present.
@@ -54,6 +54,7 @@ fn varied_signal(seed: u64, len: usize) -> Vec<i16> {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_svb16_matches_cpu_scalar() {
     let Some(ctx) = try_context() else { return };
 
@@ -94,6 +95,7 @@ fn gpu_svb16_matches_cpu_scalar() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn gpu_svb16_large_batch() {
     let Some(ctx) = try_context() else { return };
 
