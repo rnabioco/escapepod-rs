@@ -69,6 +69,7 @@ fn assert_close(cpu: &ndarray::Array2<f32>, gpu: &ndarray::Array2<f32>) {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn parity_unwindowed() {
     let Some(ctx) = try_context() else { return };
     let queries = random_matrix(1, 32, 128);
@@ -81,6 +82,7 @@ fn parity_unwindowed() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn parity_banded() {
     let Some(ctx) = try_context() else { return };
     let queries = random_matrix(3, 24, 110);
@@ -93,6 +95,7 @@ fn parity_banded() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn parity_uneven_lengths() {
     let Some(ctx) = try_context() else { return };
     let mut queries = random_matrix(5, 8, 100);
@@ -109,6 +112,7 @@ fn parity_uneven_lengths() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn empty_inputs() {
     let Some(ctx) = try_context() else { return };
     let empty: Vec<Vec<f32>> = Vec::new();

@@ -47,7 +47,6 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 | `ESCAPEPOD_LSTM_BACKEND=scalar\|avx2\|avx512` | caps LSTM kernel | best supported | tests sweep `available()` |
 | `ESCAPEPOD_LSTM_BATCH=N` | caps lockstep width (≤3 AVX2, ≤8 AVX-512) | max | no |
 | `ESCAPEPOD_DP_BACKEND=scalar\|avx512` | caps dwell-DP sweep (`avx2` warns, ignored) | best supported | tests sweep |
-| `ESCAPEPOD_DTW_AVX512=1` | AVX-512 batch DTW, slower everywhere | off | yes; scheduled removal |
 | `ESCAPEPOD_BENCH_THREADS/SAMPLES` | `hot_paths` pool / sample count | rayon / criterion | bench only |
 
 ## Known debt
@@ -55,7 +54,7 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 - `normalize.rs:101-170` `normalize_downscale_into` reachable only at factor 1 (`:217-221`) — fold into `downscale_normalize_into`.
 - `dp/fill.rs:437` `_weight`, `dp/mod.rs:42` `dwell_weight` dead in production; `DpContext` Option+unwrap → enum; `fill.rs:74-92` `dp_step` test-only.
 - `lstm.rs:593-607` unreachable tail (`h%8==0 ⇒ g%32==0`); `lstm.rs:394-502` `run_avx2` vs `::<1>` bench-gated (`charging`, `ESCAPEPOD_LSTM_BATCH=1`).
-- `fingerprint.rs:190-212` re-implements `median_and_mad_with_scratch`; `chunk.rs:993-1007` re-spells the alphabet, `:580` allocates a String per read, `:952` ignores `encode_signal_kmer_into`.
+- `chunk.rs:993-1007` re-spells the alphabet, `:580` allocates a String per read, `:952` ignores `encode_signal_kmer_into`.
 
 ## Do not
 - Bump `target-cpu`/`target-feature`: SIGILL on rna and Alpine.

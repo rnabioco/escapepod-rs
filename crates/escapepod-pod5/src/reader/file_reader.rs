@@ -37,6 +37,14 @@ pub struct SignalCalibration {
     pub calibration_scale: f32,
 }
 
+impl SignalCalibration {
+    /// This read's raw ADC samples in picoamperes, through
+    /// [`crate::calibrate_pa`] — the one calibration definition.
+    pub fn to_pa(&self, adc: &[i16]) -> Vec<f32> {
+        crate::calibrate_pa_slice(adc, self.calibration_offset, self.calibration_scale)
+    }
+}
+
 /// Default maximum number of signal batches to cache.
 const DEFAULT_MAX_CACHED_BATCHES: usize = 10;
 

@@ -17,12 +17,11 @@ use escapepod_demux::crf::parity::{MAX_SAMPLE, compare};
 use escapepod_demux::crf::{CrfEncoder, CrfEncoderGpu, CrfScratch};
 
 #[test]
+#[ignore = "needs a CUDA GPU and ESCAPEPOD_CRF_BUNDLE"]
 #[allow(clippy::disallowed_methods)] // bundle path + the knob under test, as in crf_encoder_native_parity
 fn healthy_gpu_does_not_trip_the_guard() {
-    let Ok(bundle) = std::env::var("ESCAPEPOD_CRF_BUNDLE") else {
-        eprintln!("skipping crf_gpu_parity: set ESCAPEPOD_CRF_BUNDLE to a CRF bundle directory");
-        return;
-    };
+    let bundle = std::env::var("ESCAPEPOD_CRF_BUNDLE")
+        .expect("set ESCAPEPOD_CRF_BUNDLE to a CRF bundle directory");
     // The guard under test, at the tightest cadence. Set before load: the
     // guard reads it then.
     // SAFETY: this test binary has one test and no other thread reads the env.

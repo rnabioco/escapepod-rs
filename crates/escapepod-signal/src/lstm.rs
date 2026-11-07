@@ -173,15 +173,8 @@ impl LstmBackend {
     /// single-read kernel inside a binary that batches.
     pub fn preferred_batch(self) -> usize {
         static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        // A sweep-width cap, not the on/off `flag()`/warn-on-garbage
-        // `positive_usize()` shape (root CLAUDE.md's env-switch table).
-        #[allow(clippy::disallowed_methods)]
-        let wanted = OVERRIDE.get_or_init(|| {
-            std::env::var("ESCAPEPOD_LSTM_BATCH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|&n| n >= 1)
-        });
+        let wanted =
+            OVERRIDE.get_or_init(|| escapepod_pod5::env::positive_usize("ESCAPEPOD_LSTM_BATCH"));
         let max = match self {
             LstmBackend::Scalar => 1,
             #[cfg(target_arch = "x86_64")]

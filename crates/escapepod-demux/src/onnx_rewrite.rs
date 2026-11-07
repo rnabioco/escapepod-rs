@@ -793,4 +793,148 @@ mod tests {
         m.graph.as_mut().unwrap().node[0].domain = "com.example".into();
         assert_eq!(expand_instance_norm(&mut m, 3), 0);
     }
+
+    // ---------------------------------------------------------------------
+    // `expand_instance_norm` numerically, through tract (#502)
+    //
+    // The tests above pin the axes the rewritten graph *names*; this one pins
+    // what tract *computes*. One read scored alone and the same read scored
+    // as row 0 of a batch of four must agree — the definition of an
+    // instance norm.
+    //
+    // The rewrite was written because tract's own lowering failed that: it
+    // reduced over every axis but the channel, batch included. As of
+    // tract-onnx 0.23.8 (the locked version when this test was written) it
+    // no longer does — `instance_norm.rs` reduces over `2..rank` — and this
+    // test records that rather than the older behaviour. If a tract bump
+    // brings the leak back, the first assertion fails and the rewrite is
+    // mandatory again for any batched tract graph.
+
+    mod batched {
+        use super::super::expand_instance_norm;
+        use crate::onnx_graph::test_support::{Rng, f32_init, node, value_info};
+        use tract_onnx::pb;
+        use tract_onnx::prelude::*;
+
+        const C: usize = 4;
+        const W: usize = 16;
+        const BATCH: usize = 4;
+
+        /// `x [N, C, W] -> InstanceNormalization -> y`, opset 18, scale and
+        /// bias as initializers. Shapes are declared at batch 1; the test
+        /// pins the batch through the input fact.
+        fn proto() -> pb::ModelProto {
+            let mut rng = Rng(0x5eed_0502);
+            let mut norm = node(
+                "InstanceNormalization",
+                &["x", "scale", "bias"],
+                &["y"],
+                vec![],
+            );
+            norm.attribute.push(pb::AttributeProto {
+                name: "epsilon".into(),
+                r#type: pb::attribute_proto::AttributeType::Float as i32,
+                f: 1e-5,
+                ..Default::default()
+            });
+            pb::ModelProto {
+                ir_version: 8,
+                opset_import: vec![pb::OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 18,
+                }],
+                graph: Some(pb::GraphProto {
+                    node: vec![norm],
+                    initializer: vec![
+                        f32_init("scale", &[C as i64], &mut rng, 1.0),
+                        f32_init("bias", &[C as i64], &mut rng, 1.0),
+                    ],
+                    input: vec![value_info("x", &[1, C as i64, W as i64])],
+                    output: vec![value_info("y", &[1, C as i64, W as i64])],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// Run `proto` through tract on `x`, pinned to `[n, C, W]`.
+        fn run(proto: &pb::ModelProto, n: usize, x: &[f32]) -> Vec<f32> {
+            let plan = tract_onnx::onnx()
+                .model_for_proto_model(proto)
+                .unwrap()
+                .with_input_fact(0, f32::fact([n, C, W]).into())
+                .unwrap()
+                .into_optimized()
+                .unwrap()
+                .into_runnable()
+                .unwrap();
+            let t = Tensor::from_shape(&[n, C, W], x).unwrap();
+            let out = plan.run(tvec!(t.into())).unwrap();
+            out[0]
+                .to_plain_array_view::<f32>()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect()
+        }
+
+        fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max)
+        }
+
+        /// The read under test, and a batch with it in row 0 beside three
+        /// neighbours on different offsets and scales — so a reduction that
+        /// leaks across rows cannot land on the same statistics by chance.
+        fn inputs() -> (Vec<f32>, Vec<f32>) {
+            let mut rng = Rng(0xbad_ba7c);
+            let solo: Vec<f32> = (0..C * W).map(|_| rng.next(1.0)).collect();
+            let mut batch = solo.clone();
+            for row in 1..BATCH {
+                let (offset, scale) = (3.0 * row as f32, 1.0 + row as f32);
+                batch.extend((0..C * W).map(|_| offset + scale * rng.next(1.0)));
+            }
+            (solo, batch)
+        }
+
+        /// A read's output does not depend on its batch neighbours, with or
+        /// without the rewrite, and the rewrite agrees with tract at batch 1.
+        #[test]
+        fn instance_norm_is_per_read_in_a_batch() {
+            let (solo, batch) = inputs();
+
+            let raw = proto();
+            let raw_solo = run(&raw, 1, &solo);
+            let raw_batched = run(&raw, BATCH, &batch);
+            let leak = max_abs_diff(&raw_solo, &raw_batched[..C * W]);
+            assert!(
+                leak <= 1e-5,
+                "tract's own InstanceNormalization lowering reduces across the \
+                 batch again (row 0 moved by {leak:e}): every batched tract graph \
+                 with an instance norm now needs expand_instance_norm"
+            );
+
+            let mut rewritten = proto();
+            assert_eq!(expand_instance_norm(&mut rewritten, 3), 1);
+            let fixed_solo = run(&rewritten, 1, &solo);
+            let fixed_batched = run(&rewritten, BATCH, &batch);
+            let drift = max_abs_diff(&fixed_solo, &fixed_batched[..C * W]);
+            assert!(
+                drift <= 1e-5,
+                "after expand_instance_norm a read's output still depends on its \
+                 batch neighbours (row 0 moved by {drift:e})"
+            );
+
+            // At batch 1 tract's lowering is the spec, so the rewrite must
+            // agree with it there (to the rsqrt-vs-sqrt ulp its doc names).
+            let vs_spec = max_abs_diff(&fixed_solo, &raw_solo);
+            assert!(
+                vs_spec <= 1e-5,
+                "the rewrite disagrees with tract at batch 1 by {vs_spec:e}"
+            );
+        }
+    }
 }
