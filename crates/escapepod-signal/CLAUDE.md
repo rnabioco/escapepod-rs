@@ -10,7 +10,7 @@
 - `segmentation/` — `llr::detect_adapter`, `ttest::segment_signal`, `normalize::downscale_normalize_into` + MAD helpers.
 - `chunk.rs` — `process_read` → `read_rows` → `cut_chunk`; channel lists in `ChunkSpec`; `signal_kmer_inputs` (pub, encoding-independent — a caller of `cut_chunk` recovers `sig_start`/`sig_end` from `Chunk::focus_signal_pos` + `spec.signal_context`, but must then run that pair through `placed_window` before calling `signal_kmer_inputs`: `place_window` centre-crops when the requested width exceeds `spec.signal_len`, and the raw pair only equals the placed window when it doesn't — rnabioco/escapepod-rs#388).
 - `features.rs` — `span_stats` + `SpanConfig` (fill/bounds/median named per call).
-- `lstm.rs` — `LstmWeights::from_onnx`, `run_scalar`/`run_avx2`/`run_*_batch::<N>`, `LstmBackend::best_for`, `tanh_slice`.
+- `lstm.rs` — `LstmWeights::from_onnx`, `run_batch` (the one `(backend, N)` dispatch; safe, checks the kernels' preconditions), kernels `run_scalar`/`run_avx2`/`run_*_batch::<N>`, `LstmBackend::{best_for, max_batch}`, `tanh_slice`.
 - `mapping.rs` — `seq_to_signal_from_moves`, `ref_to_signal`. `seq_encoding.rs` — `base_to_int`, `KmerContext`, `encode_signal_kmer[_into]`, `encode_signal_kmer_batch[_into]` (`SignalKmerBatch`, CSR-packed, rayon).
 - `stats.rs` — `median_via_select`, `median_and_mad[_with_scratch]`: every median/MAD routes here.
 
@@ -27,7 +27,7 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 - GPU-only (`cfg(feature = "gpu")`): `tests/gpu_{dtw,llr_detect,svb16}.rs`, `benches/hot_paths_gpu.rs`.
 
 ## Invariants and traps
-- LSTM kernels are `#[inline(never)]`; dispatch keeps two *separate* lone-read arms, never an or-pattern (AVX2 width-2 miscompiled once) → `lstm::tests::batched_matches_single_bit_for_bit` under every `ESCAPEPOD_LSTM_BACKEND` cap.
+- LSTM kernels are `#[inline(never)]`; `run_batch` keeps two *separate* lone-read arms, never an or-pattern (AVX2 width-2 miscompiled once) → `lstm::tests::batched_matches_single_bit_for_bit` (every backend, every width to `max_batch`, both `hs` layouts) under every `ESCAPEPOD_LSTM_BACKEND` cap. Callers go through `run_batch`, never a `match` of their own.
 - SIMD only via runtime `is_x86_feature_detected!`/`supported()`; a baseline bump SIGILLs rna/Alpine.
 - `run_avx2` ≡ `run_avx2_batch::<N>` ≡ `run_avx512_batch::<N>` bit-for-bit; scalar differs (Cephes exp, 1e-4) → `avx2_matches_scalar`.
 - DTW batch lanes bit-identical to scalar at every width/window/penalty → `test_dtw_batch_matches_scalar`, `test_dtw_distances_batch_windowed_matches_scalar`.
@@ -50,7 +50,6 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 | `ESCAPEPOD_BENCH_THREADS/SAMPLES` | `hot_paths` pool / sample count | rayon / criterion | bench only |
 
 ## Known debt
-- `(backend, N)` dispatch table written thrice: `lstm.rs:1088-1230`, `classify/fnn_lstm.rs:437-505`, `demux/crf/encoder_native.rs:385-552` → one `lstm::run_batch`.
 - `normalize.rs:101-170` `normalize_downscale_into` reachable only at factor 1 (`:217-221`) — fold into `downscale_normalize_into`.
 - `dp/fill.rs:437` `_weight`, `dp/mod.rs:42` `dwell_weight` dead in production; `DpContext` Option+unwrap → enum; `fill.rs:74-92` `dp_step` test-only.
 - `lstm.rs:593-607` unreachable tail (`h%8==0 ⇒ g%32==0`); `lstm.rs:394-502` `run_avx2` vs `::<1>` bench-gated (`charging`, `ESCAPEPOD_LSTM_BATCH=1`).

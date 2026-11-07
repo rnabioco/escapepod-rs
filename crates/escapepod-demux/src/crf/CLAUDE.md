@@ -9,7 +9,7 @@ Port of bonito's `CTC_CRF` (koi `ctc.{fwd,bwd}_scores_cu_sparse`). Encoder (nati
 - `avx2.rs` / `avx512.rs` — 8/16-wide mirrors; chosen by `Backend::best_for`.
 - `refchain.rs` — `RefChains::build`/`forward`: `log P(ref | signal)`. Always compiled.
 - `encoder.rs` — `CrfMetadata` (sidecar, window rules), `CrfEncoder`; entry `basecall_prepped*`.
-- `encoder_native.rs` — `Recognized::from_proto` recognizer + `encode_*` over `escapepod_signal::lstm`.
+- `encoder_native.rs` — `Recognized::from_proto` recognizer + `encode_*` over `escapepod_signal::lstm::run_batch` (one call per layer per group).
 - `encoder_gpu.rs` — `CrfEncoderGpu`: ort CUDA, zero-copy, halve-on-OOM; entry `basecall_batch*`.
 - `lattice_gpu.rs` + `_kernel.rs` — batched CUDA decode + ref scan, NVRTC at load; entry `decode_*time_major`.
 - `barcode.rs` — `BarcodeRefs::match_sequence` (Myers bit-vector Levenshtein, DP fallback).
@@ -50,7 +50,6 @@ Encoder changes are held to `benchmarks/benchmark_demux_crf.sh` + `evaluate_demu
 | `ESCAPEPOD_CRF_GPU_WORKERS` | workers per device (read in CLI `run.rs`) | 2 | no / CHANGELOG |
 
 ## Known debt
-- `encoder_native.rs:375–553` — `(backend, n)` match duplicates `fnn_lstm::logits_batch`; moving to `escapepod_signal::lstm::run_batch`.
 - `encoder_native.rs:197–298` — `encode_into` is `encode_batch_into` at n=1; bit-identity already pinned.
 - `encoder_native.rs:1190–1201` + `encoder.rs:791–800` — `self_check` builds a tract plan `load` rebuilds.
 - `encoder_gpu.rs` — halve-on-OOM ×4 (521/782/856 + `lattice_gpu.rs:247`), row flatten ×2 (551/672), dims check ×2 (577/742), `basecall_batch*` loop ×2.

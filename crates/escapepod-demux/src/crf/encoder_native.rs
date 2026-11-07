@@ -236,52 +236,18 @@ impl Recognized {
         // use.
         let mut channel_major = cur;
         for (i, layer) in self.layers.iter().enumerate() {
-            match self.backend {
-                LstmBackend::Scalar => lstm::run_scalar(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    &channel_major,
-                    &mut xw,
-                    &mut hs,
-                    h,
-                    0,
-                    &mut gates,
-                ),
-                #[cfg(target_arch = "x86_64")]
-                // Safety: `with_backend`/`best_for` only select a backend
-                // this machine supports and whose width divides `h`.
-                LstmBackend::Avx2 => unsafe {
-                    lstm::run_avx2(
-                        &layer.weights,
-                        seq,
-                        layer.reverse,
-                        &channel_major,
-                        &mut xw,
-                        &mut hs,
-                        h,
-                        0,
-                        &mut gates,
-                    )
-                },
-                #[cfg(target_arch = "x86_64")]
-                // A lone read on the AVX-512 backend takes the AVX2 kernel,
-                // as `escapepod_classify::fnn_lstm` does — bit-identical, and
-                // the AVX2 kernel is faster per read at N = 1.
-                LstmBackend::Avx512 => unsafe {
-                    lstm::run_avx2(
-                        &layer.weights,
-                        seq,
-                        layer.reverse,
-                        &channel_major,
-                        &mut xw,
-                        &mut hs,
-                        h,
-                        0,
-                        &mut gates,
-                    )
-                },
-            }
+            lstm::run_batch(
+                self.backend,
+                &layer.weights,
+                seq,
+                layer.reverse,
+                &[channel_major.as_slice()],
+                &mut xw,
+                &mut hs,
+                h,
+                0,
+                &mut gates,
+            );
             if i + 1 < self.layers.len() {
                 // Layer l's time-major `[seq][H]` output becomes layer l+1's
                 // channel-major `[H][seq]` input. A `T x H` transpose (≤ 300 x
@@ -381,17 +347,10 @@ impl Recognized {
         self.backend.preferred_batch()
     }
 
-    /// One LSTM layer, `xs.len()` reads in lockstep — the same dispatch table
-    /// `escapepod_classify::fnn_lstm::NativeBiLstm::logits_batch` uses, at
-    /// this stack's widths (`preferred_batch()`, not `NativeBiLstm`'s, since
-    /// the two nets can pick different backends). `xw`/`hs`/`gates` must be
-    /// sized for exactly `xs.len()` reads — the caller slices its
-    /// `preferred_batch()`-sized scratch down to the group in use.
-    ///
-    /// A lone read on a vector backend takes the single-read kernel directly
-    /// (as `NativeBiLstm` does): neither `run_avx2_batch::<1>` nor
-    /// `run_avx512_batch::<1>` is instantiated, matching
-    /// `escapepod_signal::lstm`'s own tests.
+    /// One LSTM layer, `xs.len()` reads in lockstep (at most one kernel
+    /// group: `preferred_batch()` reads), through [`lstm::run_batch`] — the
+    /// `(backend, width)` dispatch `escapepod_classify::fnn_lstm` shares, at
+    /// this stack's widths (the two nets can pick different backends).
     fn run_layer(
         &self,
         layer: &Layer,
@@ -401,175 +360,18 @@ impl Recognized {
         hs: &mut [f32],
         gates: &mut [f32],
     ) {
-        let h = self.hidden;
-        match (self.backend, xs.len()) {
-            #[cfg(target_arch = "x86_64")]
-            // Safety: `with_backend`/`best_for` only select a backend this
-            // machine supports and whose width divides `h`; the buffers are
-            // sized by the caller for exactly `xs.len()` reads.
-            (LstmBackend::Avx512, 8) => unsafe {
-                lstm::run_avx512_batch::<8>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx512, 7) => unsafe {
-                lstm::run_avx512_batch::<7>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx512, 6) => unsafe {
-                lstm::run_avx512_batch::<6>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx512, 5) => unsafe {
-                lstm::run_avx512_batch::<5>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx512, 4) => unsafe {
-                lstm::run_avx512_batch::<4>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx512, 3) => unsafe {
-                lstm::run_avx512_batch::<3>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx512, 2) => unsafe {
-                lstm::run_avx512_batch::<2>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx2, 3) => unsafe {
-                lstm::run_avx2_batch::<3>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx2, 2) => unsafe {
-                lstm::run_avx2_batch::<2>(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs,
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            // A lone read on either wide backend takes the AVX2 single-read
-            // kernel — bit-identical to the batched entry points, and faster
-            // per read than the 16-wide kernel at N = 1 (see
-            // `escapepod_signal::lstm`). Two arms, not an or-pattern: the
-            // kernels are `#[inline(never)]` on evidence that an or-pattern
-            // over lone-read arms miscompiled once (see their doc comments).
-            (LstmBackend::Avx512, _) => unsafe {
-                lstm::run_avx2(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs[0],
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            (LstmBackend::Avx2, _) => unsafe {
-                lstm::run_avx2(
-                    &layer.weights,
-                    seq,
-                    layer.reverse,
-                    xs[0],
-                    xw,
-                    hs,
-                    h,
-                    0,
-                    gates,
-                )
-            },
-            (LstmBackend::Scalar, _) => {
-                lstm::run_scalar_batch(&layer.weights, seq, layer.reverse, xs, xw, hs, h, 0, gates)
-            }
-        }
+        lstm::run_batch(
+            self.backend,
+            &layer.weights,
+            seq,
+            layer.reverse,
+            xs,
+            xw,
+            hs,
+            self.hidden,
+            0,
+            gates,
+        );
     }
 
     /// [`Self::encode_batch_slices`] into one flat buffer: `out` is

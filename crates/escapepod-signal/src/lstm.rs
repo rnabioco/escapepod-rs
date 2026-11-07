@@ -23,6 +23,12 @@
 //!   contiguous, so the transpose happens once per layer boundary instead of
 //!   once per gate element).
 //!
+//! Both callers reach the kernels through [`run_batch`], which owns the one
+//! `(backend, group width)` → kernel table (single read and lockstep groups
+//! alike) and checks the preconditions the kernels' `unsafe` rests on; the
+//! kernels stay `pub` for the equivalence tests and probes that pin them one
+//! by one.
+//!
 //! For which layers reverse and why (bonito's "run backward without a
 //! backward LSTM" trick — reverse the sequence, run an ONNX-forward LSTM,
 //! reverse the output back), see `escapepod_demux::crf::encoder_native`.
@@ -175,14 +181,21 @@ impl LstmBackend {
         static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         let wanted =
             OVERRIDE.get_or_init(|| escapepod_pod5::env::positive_usize("ESCAPEPOD_LSTM_BATCH"));
-        let max = match self {
-            LstmBackend::Scalar => 1,
-            #[cfg(target_arch = "x86_64")]
-            LstmBackend::Avx2 => 3,
-            #[cfg(target_arch = "x86_64")]
-            LstmBackend::Avx512 => 8,
-        };
+        let max = self.max_batch().unwrap_or(1);
         wanted.map_or(max, |n| n.min(max))
+    }
+
+    /// The widest group one [`run_batch`] call takes on this backend: the
+    /// widest lockstep kernel it has. `None` for the scalar backend, which
+    /// batches by looping and has no register file to fill.
+    pub fn max_batch(self) -> Option<usize> {
+        match self {
+            LstmBackend::Scalar => None,
+            #[cfg(target_arch = "x86_64")]
+            LstmBackend::Avx2 => Some(3),
+            #[cfg(target_arch = "x86_64")]
+            LstmBackend::Avx512 => Some(8),
+        }
     }
 }
 
@@ -595,6 +608,139 @@ pub fn run_scalar_batch(
             hs_offset,
             &mut gates[..g],
         );
+    }
+}
+
+/// `xs.len()` reads through one direction (or one layer) in lockstep, on
+/// `backend` — the one place the `(backend, group width)` → kernel table
+/// lives. Every caller (`escapepod_classify::fnn_lstm`'s two directions,
+/// `escapepod_demux::crf::encoder_native`'s stacked layers, single read or
+/// batched) goes through here.
+///
+/// Arguments are the kernels' own: `x` per read channel-major `[n_in][seq]`;
+/// `xw` scratch of at least `xs.len() * seq * 4H`; `gates` scratch of at
+/// least `xs.len() * 4H`; read `r`'s `h_t` lands at `hs[r * seq * hs_stride +
+/// t * hs_stride + hs_offset ..][..H]`, so `hs` holds at least `xs.len() *
+/// seq * hs_stride`. Scratch past what the group uses is left alone.
+///
+/// A lone read on either vector backend takes [`run_avx2`] (eight
+/// accumulators over a 64-gate slice: faster per read than the 16-wide kernel
+/// at `N = 1`, and bit-identical to it), so neither `::<1>` batch kernel is
+/// instantiated. Groups of 2..=[`LstmBackend::max_batch`] take the lockstep
+/// kernels; the scalar backend loops over any width. Every vector output is
+/// bit-identical to [`run_avx2`] called once per read.
+///
+/// Safe: it checks what the kernels' `unsafe` rests on — the backend runs on
+/// this CPU, its width divides `H`, the group fits a kernel, and the buffers
+/// are as long as the kernels index — and panics otherwise. Those checks are
+/// a handful of compares per call, against a recurrence of `O(seq · H²)`.
+///
+/// `#[inline(always)]` so the table lands in each caller as the callers' own
+/// copies of it did before (#506), and the kernels are instantiated per
+/// caller crate as before; the kernels themselves stay `#[inline(never)]`.
+/// Measured on rna (Cascade Lake), any version of this refactor moved the
+/// AVX-512 CRF encode by ±3–4% per binary with byte-identical kernel code,
+/// and the gap closed under `-x86-branches-within-32B-boundaries` — code
+/// placement against the JCC erratum, not work. Judge a change here by
+/// end-to-end runs, not one microbench.
+///
+/// # Panics
+///
+/// On any violated precondition above, including a group wider than
+/// [`LstmBackend::max_batch`].
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn run_batch(
+    backend: LstmBackend,
+    w: &LstmWeights,
+    seq: usize,
+    reverse: bool,
+    xs: &[&[f32]],
+    xw: &mut [f32],
+    hs: &mut [f32],
+    hs_stride: usize,
+    hs_offset: usize,
+    gates: &mut [f32],
+) {
+    let n = xs.len();
+    if n == 0 {
+        return;
+    }
+    let (h, g) = (w.h, 4 * w.h);
+    assert!(backend.supported(), "{backend:?} is not supported here");
+    assert!(
+        h.is_multiple_of(backend.lanes()),
+        "{backend:?} needs H a multiple of {}, got {h}",
+        backend.lanes()
+    );
+    if let Some(max) = backend.max_batch() {
+        assert!(
+            n <= max,
+            "{backend:?} takes at most {max} reads per call, got {n}"
+        );
+    }
+    for x in xs {
+        assert_eq!(x.len(), w.n_in * seq, "x is [n_in][seq]");
+    }
+    assert!(hs_offset + h <= hs_stride, "h_t must fit its hs row");
+    let xw = &mut xw[..n * seq * g];
+    let hs = &mut hs[..n * seq * hs_stride];
+    let gates = &mut gates[..n * g];
+    // Two separate lone-read arms, never an or-pattern, and every kernel
+    // `#[inline(never)]`: see the note above `run_avx2`.
+    //
+    // Safety (every `unsafe` arm): `supported()` and the `lanes()` check above
+    // are the kernels' feature and width preconditions; `n` is the const `N`
+    // by the arm's own pattern; the buffers were sliced to exactly the length
+    // the kernels index.
+    match (backend, n) {
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 8) => unsafe {
+            run_avx512_batch::<8>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 7) => unsafe {
+            run_avx512_batch::<7>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 6) => unsafe {
+            run_avx512_batch::<6>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 5) => unsafe {
+            run_avx512_batch::<5>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 4) => unsafe {
+            run_avx512_batch::<4>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 3) => unsafe {
+            run_avx512_batch::<3>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, 2) => unsafe {
+            run_avx512_batch::<2>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx2, 3) => unsafe {
+            run_avx2_batch::<3>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx2, 2) => unsafe {
+            run_avx2_batch::<2>(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx512, _) => unsafe {
+            run_avx2(w, seq, reverse, xs[0], xw, hs, hs_stride, hs_offset, gates)
+        },
+        #[cfg(target_arch = "x86_64")]
+        (LstmBackend::Avx2, _) => unsafe {
+            run_avx2(w, seq, reverse, xs[0], xw, hs, hs_stride, hs_offset, gates)
+        },
+        (LstmBackend::Scalar, _) => {
+            run_scalar_batch(w, seq, reverse, xs, xw, hs, hs_stride, hs_offset, gates)
+        }
     }
 }
 
@@ -1280,194 +1426,111 @@ mod tests {
         }
     }
 
+    /// [`run_batch`] — the one dispatch every caller goes through — is
+    /// bit-identical to the single-read kernel called once per read, at every
+    /// group width a single call takes, on every backend the machine has (not
+    /// only the one the dispatch prefers: on an AVX-512 node the dispatch never
+    /// reaches the AVX2 batched kernels), both directions, and both output
+    /// layouts its callers use — the CRF's own `[seq][H]` buffer and the
+    /// bidirectional net's interleaved `[seq][2H]` one at offset `H`.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn batched_matches_single_bit_for_bit() {
         let (n_in, seq, h) = (4, 33, 96);
         let w = weights(n_in, h, 21);
         for backend in LstmBackend::available() {
-            for reverse in [false, true] {
-                // Every width the dispatch has an explicit arm for, on this
-                // backend — a caller batching past `preferred_batch()` opens
-                // a new group instead of asking one kernel call to cover it,
-                // so this only exercises widths a single call actually
-                // supports (`run_scalar_batch` is exempt below: it has no
-                // register-file limit, so it batches by looping).
-                for n_reads in 1..=backend.preferred_batch() {
-                    let inputs: Vec<Vec<f32>> = (1..=n_reads as u64)
-                        .map(|s| input(n_in, seq, 40 + s))
-                        .collect();
-                    let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
-                    let mut hs_single = vec![0.0f32; n_reads * seq * h];
-                    for (r, x) in inputs.iter().enumerate() {
-                        let mut xw = vec![0.0f32; seq * 4 * h];
-                        let mut gates = vec![0.0f32; 4 * h];
-                        let dst = &mut hs_single[r * seq * h..(r + 1) * seq * h];
-                        match backend {
-                            LstmBackend::Scalar => {
-                                run_scalar(&w, seq, reverse, x, &mut xw, dst, h, 0, &mut gates)
+            // `max_batch`, not `preferred_batch`: an `ESCAPEPOD_LSTM_BATCH`
+            // cap must not shrink what this pins. The scalar backend loops
+            // over any width; four covers it.
+            let widest = backend.max_batch().unwrap_or(4);
+            for (hs_stride, hs_offset) in [(h, 0), (2 * h, h)] {
+                for reverse in [false, true] {
+                    for n_reads in 1..=widest {
+                        let inputs: Vec<Vec<f32>> = (1..=n_reads as u64)
+                            .map(|s| input(n_in, seq, 40 + s))
+                            .collect();
+                        let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+                        let hs_len = seq * hs_stride;
+                        let mut hs_single = vec![0.0f32; n_reads * hs_len];
+                        for (r, x) in inputs.iter().enumerate() {
+                            let mut xw = vec![0.0f32; seq * 4 * h];
+                            let mut gates = vec![0.0f32; 4 * h];
+                            let dst = &mut hs_single[r * hs_len..(r + 1) * hs_len];
+                            match backend {
+                                LstmBackend::Scalar => run_scalar(
+                                    &w, seq, reverse, x, &mut xw, dst, hs_stride, hs_offset,
+                                    &mut gates,
+                                ),
+                                // Safety: `available()` only lists backends this
+                                // CPU runs; `h` is a multiple of 16. Two arms,
+                                // not an or-pattern (see the note on `run_avx2`).
+                                LstmBackend::Avx2 => unsafe {
+                                    run_avx2(
+                                        &w, seq, reverse, x, &mut xw, dst, hs_stride, hs_offset,
+                                        &mut gates,
+                                    )
+                                },
+                                LstmBackend::Avx512 => unsafe {
+                                    run_avx2(
+                                        &w, seq, reverse, x, &mut xw, dst, hs_stride, hs_offset,
+                                        &mut gates,
+                                    )
+                                },
                             }
-                            LstmBackend::Avx2 => unsafe {
-                                run_avx2(&w, seq, reverse, x, &mut xw, dst, h, 0, &mut gates)
-                            },
-                            LstmBackend::Avx512 => unsafe {
-                                run_avx2(&w, seq, reverse, x, &mut xw, dst, h, 0, &mut gates)
-                            },
                         }
-                    }
-                    let mut hs_batch = vec![0.0f32; n_reads * seq * h];
-                    let mut xw = vec![0.0f32; n_reads * seq * 4 * h];
-                    let mut gates = vec![0.0f32; n_reads * 4 * h];
-                    match (backend, n_reads) {
-                        (LstmBackend::Avx512, 8) => unsafe {
-                            run_avx512_batch::<8>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx512, 7) => unsafe {
-                            run_avx512_batch::<7>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx512, 6) => unsafe {
-                            run_avx512_batch::<6>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx512, 5) => unsafe {
-                            run_avx512_batch::<5>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx512, 4) => unsafe {
-                            run_avx512_batch::<4>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx512, 3) => unsafe {
-                            run_avx512_batch::<3>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx512, 2) => unsafe {
-                            run_avx512_batch::<2>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx2, 3) => unsafe {
-                            run_avx2_batch::<3>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx2, 2) => unsafe {
-                            run_avx2_batch::<2>(
-                                &w,
-                                seq,
-                                reverse,
-                                &refs,
-                                &mut xw,
-                                &mut hs_batch,
-                                h,
-                                0,
-                                &mut gates,
-                            )
-                        },
-                        (LstmBackend::Avx2, _) | (LstmBackend::Avx512, _) => unsafe {
-                            run_avx2(
-                                &w,
-                                seq,
-                                reverse,
-                                refs[0],
-                                &mut xw[..seq * 4 * h],
-                                &mut hs_batch[..seq * h],
-                                h,
-                                0,
-                                &mut gates[..4 * h],
-                            )
-                        },
-                        (LstmBackend::Scalar, _) => run_scalar_batch(
+                        // Scratch wider than the group, as callers hand it.
+                        let mut hs_batch = vec![0.0f32; (n_reads + 1) * hs_len];
+                        let mut xw = vec![0.0f32; (n_reads + 1) * seq * 4 * h];
+                        let mut gates = vec![0.0f32; (n_reads + 1) * 4 * h];
+                        run_batch(
+                            backend,
                             &w,
                             seq,
                             reverse,
                             &refs,
                             &mut xw,
                             &mut hs_batch,
-                            h,
-                            0,
+                            hs_stride,
+                            hs_offset,
                             &mut gates,
-                        ),
+                        );
+                        assert_eq!(
+                            hs_single.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            hs_batch[..n_reads * hs_len]
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            "{backend:?} stride={hs_stride} reverse={reverse} n_reads={n_reads}"
+                        );
                     }
-                    assert_eq!(
-                        hs_single.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        hs_batch.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        "{backend:?} reverse={reverse} n_reads={n_reads}"
-                    );
                 }
             }
+        }
+    }
+
+    /// A group wider than any kernel is refused, not silently scored as its
+    /// first read.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn run_batch_refuses_a_group_wider_than_its_kernels() {
+        let (n_in, seq, h) = (4, 9, 16);
+        let w = weights(n_in, h, 3);
+        for backend in LstmBackend::available() {
+            let Some(max) = backend.max_batch() else {
+                continue;
+            };
+            let n = max + 1;
+            let inputs: Vec<Vec<f32>> = (0..n as u64).map(|s| input(n_in, seq, s)).collect();
+            let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+            let r = std::panic::catch_unwind(|| {
+                let mut xw = vec![0.0f32; n * seq * 4 * h];
+                let mut hs = vec![0.0f32; n * seq * h];
+                let mut gates = vec![0.0f32; n * 4 * h];
+                run_batch(
+                    backend, &w, seq, false, &refs, &mut xw, &mut hs, h, 0, &mut gates,
+                );
+            });
+            assert!(r.is_err(), "{backend:?} accepted {n} reads");
         }
     }
 
