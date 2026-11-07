@@ -16,6 +16,10 @@ name = "classify"
 
 [[bench]]
 harness = false
+name = "gbm"
+
+[[bench]]
+harness = false
 name = "crf_decode"
 
 # The encoder half of the same path, against a real bundle named by
