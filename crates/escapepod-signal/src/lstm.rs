@@ -635,11 +635,21 @@ pub fn run_scalar_batch(
 /// are as long as the kernels index — and panics otherwise. Those checks are
 /// a handful of compares per call, against a recurrence of `O(seq · H²)`.
 ///
+/// `#[inline(always)]` so the table lands in each caller as the callers' own
+/// copies of it did before (#506), and the kernels are instantiated per
+/// caller crate as before; the kernels themselves stay `#[inline(never)]`.
+/// Measured on rna (Cascade Lake), any version of this refactor moved the
+/// AVX-512 CRF encode by ±3–4% per binary with byte-identical kernel code,
+/// and the gap closed under `-x86-branches-within-32B-boundaries` — code
+/// placement against the JCC erratum, not work. Judge a change here by
+/// end-to-end runs, not one microbench.
+///
 /// # Panics
 ///
 /// On any violated precondition above, including a group wider than
 /// [`LstmBackend::max_batch`].
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn run_batch(
     backend: LstmBackend,
     w: &LstmWeights,
