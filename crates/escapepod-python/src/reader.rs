@@ -8,14 +8,10 @@ use pyo3::prelude::*;
 use crate::error::to_py_err;
 use crate::read_data::{PyReadData, PyRunInfo};
 
-/// Convert raw ADC samples to picoamperes: `(adc + offset) * scale`.
-///
-/// Uses `mul_add` so LLVM can emit FMA on AVX2+ and keep the loop tight.
+/// Convert raw ADC samples to picoamperes: `(adc + offset) * scale`, through
+/// the workspace's one definition, [`escapepod_signal::calibrate_pa`].
 pub(crate) fn adc_to_pa(raw: &[i16], offset: f32, scale: f32) -> Vec<f32> {
-    let bias = offset * scale;
-    raw.iter()
-        .map(|&adc| f32::from(adc).mul_add(scale, bias))
-        .collect()
+    escapepod_signal::calibrate_pa_slice(raw, offset, scale)
 }
 
 /// Reader for POD5 files.
