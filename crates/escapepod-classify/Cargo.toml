@@ -25,7 +25,7 @@ flate2 = "1"
 # cl-tagged output BAM stays in the CLI.
 noodles-bam = "0.96"
 noodles-bgzf = "0.52"
-noodles-sam = "0.91"
+noodles-sam = "0.93"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -49,7 +49,7 @@ noodles-bam = { version = "0.96", optional = true }
 noodles-bgzf = { version = "0.52", optional = true }
 noodles-core = { version = "0.21", optional = true }
 noodles-csi = { version = "0.62", optional = true }
-noodles-sam = { version = "0.91", optional = true }
+noodles-sam = { version = "0.93", optional = true }
 owo-colors = { version = "4", optional = true }
 parquet = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
