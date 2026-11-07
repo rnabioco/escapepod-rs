@@ -359,10 +359,11 @@ fn prod(shape: [usize; 2]) -> usize {
 /// Shared by [`crate::waveform_net_gpu::WaveformNetGpu`]: a tract-cuda plan's
 /// batch is fixed at compile time, so a shorter group of chunks is padded
 /// rather than rebuilding the plan. Padding with zero rows is safe only
-/// because the GPU loader unconditionally applies
-/// [`escapepod_demux::onnx_rewrite::expand_instance_norm`] first — with it, a
-/// zero row's own normalisation cannot perturb any real row's, since each row
-/// only reduces over its own axis. Pure and tract-independent so it is
+/// because a zero row's own normalisation cannot perturb any real row's: each
+/// row only reduces over its own axis (tract 0.23.8, pinned by
+/// `onnx_rewrite::tests::batched`; older tract reduced over the batch and
+/// needed [`escapepod_demux::onnx_rewrite::expand_instance_norm`], which the
+/// GPU loader still applies). Pure and tract-independent so it is
 /// testable without the `cuda` feature.
 #[cfg(test)]
 pub(crate) fn pack_batch(

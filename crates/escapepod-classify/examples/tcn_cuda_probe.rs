@@ -57,7 +57,15 @@
 //! is the one way this differs from every other GPU path in the workspace:
 //! cudarc's driver API and `ort` dlopen a prebuilt library and are done.
 //!
-//! # Batching this graph through tract is not sound without `--fix-norm`
+//! # Batching this graph through older tract was not sound without `--fix-norm`
+//!
+//! **Status: the finding below was made on a tract older than 0.23.8.** As of
+//! tract-onnx 0.23.8 (the locked version) `InstanceNormalization` reduces over
+//! `2..rank`, so a read's logit no longer depends on its batch with or without
+//! `--fix-norm`; `onnx_rewrite::tests::batched::instance_norm_is_per_read_in_a_batch`
+//! fails if a bump brings the leak back. The speed and host-node numbers below
+//! were measured on that older tract and have NOT been re-measured on 0.23.8;
+//! re-run `--dump` to see whether `--fix-norm` still buys device residency.
 //!
 //! The first thing this probe measured was a speedup. The second thing it
 //! measured is that the speedup was on a different function, and that is the
@@ -79,7 +87,7 @@
 //! `Reduce<Sum>` in the same normalisations *are* split and do stay on the
 //! device, which is why the count is 29 and not 60.
 //!
-//! But those two axes include the **batch**. This probe feeds read 0 the same
+//! But those two axes (in the older tract) included the **batch**. This probe feeds read 0 the same
 //! input at every batch size (one RNG stream per input role) precisely so that
 //! its logit can be compared down the sweep, and it moves:
 //!
@@ -93,7 +101,7 @@
 //!
 //! Every read is normalised against every other read it was batched with. That
 //! is not a tolerance question and it is not fixable with a bigger epsilon —
-//! it is a different function, and the sign flips. Nothing shipped is affected:
+//! it was a different function, and the sign flipped. Nothing shipped was affected:
 //! `WaveformNet::load` pins the batch to 1, where reducing over an axis of
 //! length 1 is a no-op and tract's lowering is exactly the spec.
 //!

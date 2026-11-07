@@ -16,15 +16,19 @@
 //! Two facts from the probe are load-bearing here and are not optional
 //! levers:
 //!
-//! 1. **`expand_instance_norm` is mandatory, not a performance choice.**
-//!    tract's ONNX lowering reduces `InstanceNormalization` over the batch
-//!    axis as well as the spatial one; at batch > 1 that makes every read's
-//!    logit depend on which reads it shared a batch with (the probe's read-0
-//!    logit moved +1.47 -> +0.26 -> -0.28 across batch sizes before the
-//!    rewrite). It is applied unconditionally below, with no env gate — unlike
-//!    the CPU loader's hoist lever, there is no batch-1 case here where it
-//!    would be a no-op, and the ~5% cost the CPU module doc measures for it
-//!    was measured on the CPU path only; this loader never builds one.
+//! 1. **`expand_instance_norm` is applied for device residency; it is no
+//!    longer needed for correctness on tract 0.23.8.** An older tract reduced
+//!    `InstanceNormalization` over the batch axis as well as the spatial one,
+//!    so at batch > 1 a read's logit depended on its batch (the probe's read-0
+//!    logit moved +1.47 -> +0.26 -> -0.28 before the rewrite). 0.23.8 reduces
+//!    over `2..rank` and is per-read either way
+//!    (`onnx_rewrite::tests::batched::instance_norm_is_per_read_in_a_batch`
+//!    fails if that regresses). The residency benefit (29 host
+//!    `Reduce<MeanOfSquares>`, 62 syncs -> 4, 11.1x a core at batch 128) was
+//!    measured on the older tract and has NOT been re-measured on 0.23.8. It
+//!    is applied unconditionally below, with no env gate, and the ~5% cost
+//!    the CPU module doc measures for it was measured on the CPU path only;
+//!    this loader never builds one.
 //! 2. **`hoist_conv_padding` moves cuDNN onto a different, less accurate
 //!    algorithm here**, unlike on the CPU where the same rewrite is
 //!    bit-identical. The probe measured max |dlogit| jump from 3.1e-5 to
@@ -247,7 +251,7 @@ impl WaveformNetGpu {
             .proto_model_for_path(path)
             .map_err(|e| anyhow!("cannot read the waveform model {}: {e}", path.display()))?;
 
-        // Mandatory — see the module doc's point 1. Not conditioned on
+        // Kept for device residency — see the module doc's point 1. Not conditioned on
         // `batch`: even a `WaveformNetGpu` loaded at batch 1 goes through
         // this same code path, so there is no size at which skipping it would
         // be safe *and* save anything (a batch-1 GPU plan is not what this
