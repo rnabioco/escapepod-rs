@@ -41,7 +41,7 @@ Wrap in `srun -p rna -c 32 --mem=32G pixi run …` (root "Build baseline and SLU
 - `valid_len` clamp in `decode_adapter_end` is the #187 fix (272 boundaries past read end) — load-bearing, not inert; `decode_never_returns_a_boundary_past_the_read`.
 - Decode argmaxes 550 of 1500 outputs (`max_obs_adapter`=6500): 0.41% of true ends unreachable, by design.
 - Zero-input load probe rejects `[_,≠2,_]`; without it every read gets `adapter_end=0`.
-- `expand_instance_norm` off on CPU batch-1 (tract's lowering is the spec there); mandatory above batch 1.
+- `expand_instance_norm` off on CPU batch-1; no longer needed for batch correctness on tract 0.23.8 (older tract reduced over the batch axis; pinned by `onnx_rewrite::tests::batched`), kept on the GPU path for device residency (unmeasured on 0.23.8).
 - `require_cuda_ep()` only under `--device gpu`; otherwise ort silently commits to CPU — same symptom as missing libcudnn.
 - `GbmPredictor::predict` is live: `<8` tail, CLI per-read fallback, classify's batch-1 scorer.
 - `demux run` refuses `AnyModel::WarpDemux`; `demux classify` serves it.

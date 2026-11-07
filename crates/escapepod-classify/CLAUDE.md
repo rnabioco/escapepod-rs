@@ -21,7 +21,7 @@ Cluster/build/profiling policy: root `CLAUDE.md` ("Build Commands", "Build basel
 | | `gbm` | `feature_model` | `waveform_model` |
 |---|---|---|---|
 | input | columns per `features.order` | same, folded `[channel, offset]` + mask channels | 3 tensors via `signal::chunk` |
-| scorer | trees, `NaN` native | native `signal::lstm`; `ESCAPEPOD_FNN_TRACT` = way back | tract batch 1 (`expand_instance_norm` off) / tract-cuda batched (on) |
+| scorer | trees, `NaN` native | native `signal::lstm`; `ESCAPEPOD_FNN_TRACT` = way back | tract batch 1 (`expand_instance_norm` off) / tract-cuda batched (on, for device residency) |
 | anchor / reference | motif +3 / basecalled query | same | motif **+2** / read's **`MD` tag**, never FASTA |
 | frame | voted per run | voted | declared; `--orientation` ignored |
 
@@ -80,6 +80,6 @@ cargo run -p escapepod-classify --example verify_feature_model --features fnn-on
 - Do not read a rule from a flag or default the bundle can declare — a wrong guess scores, it does not error.
 - Do not slice the waveform reference from the FASTA — one `N` blanks nine k-mers (#306).
 - Do not vote the waveform frame or apply Platt/`abstain` silently — bundle decisions.
-- Do not batch the waveform graph without `expand_instance_norm` — tract reduces over the batch axis.
+- Batching the waveform graph is per-read-correct on tract 0.23.8 even without `expand_instance_norm` (older tract reduced over the batch axis) → `onnx_rewrite::tests::batched`; the GPU path keeps the rewrite for device residency (unmeasured on 0.23.8).
 - Do not inline the LSTM kernels or test one backend only — a miscompile hid that way.
 - Do not scan the reads table or read in BAM order — right calls, 60× slower, invisible without a stopwatch.

@@ -13,10 +13,13 @@
 //! with the input fact pinned, classifications identical.
 //!
 //! [`expand_instance_norm`] is about *which axes* tract reduces over in an
-//! `InstanceNormalization` — every axis but the channel, batch included. At
-//! batch 1, which is what every tract graph in `escpod` is pinned to, that is
-//! the spec. Above batch 1 it is a different function, and it is also what
-//! stops a graph from running entirely on a GPU.
+//! `InstanceNormalization`. Older tract reduced over every axis but the
+//! channel, batch included: the spec at batch 1 (which every tract graph in
+//! `escpod` is pinned to), a different function above it, and what stopped a
+//! graph from running entirely on a GPU. tract-onnx 0.23.8 reduces over
+//! `2..rank`, so the batch leak is gone (pinned by
+//! `tests::batched::instance_norm_is_per_read_in_a_batch`); the GPU-residency
+//! benefit has not been re-measured on 0.23.8.
 
 use std::collections::HashMap;
 use tract_onnx::pb;
@@ -192,8 +195,16 @@ fn hoistable_pads(
 ///
 /// # Why this exists
 ///
-/// tract lowers `InstanceNormalization` by reducing over **every axis but the
-/// channel** (`tract-onnx/src/ops/nn/instance_norm.rs`):
+/// **Status: tract <= the version where this was seen (older than 0.23.8).**
+/// As of tract-onnx 0.23.8 (the locked version) the lowering reduces over
+/// `2..rank` and a read's output no longer depends on its batch, with or
+/// without this rewrite; `tests::batched::instance_norm_is_per_read_in_a_batch`
+/// fails if a tract bump brings the leak back. What follows is the older
+/// behaviour, kept as the finding; the residency benefit below was measured
+/// on that older tract and is **not re-measured on 0.23.8**.
+///
+/// The older tract lowered `InstanceNormalization` by reducing over **every
+/// axis but the channel** (`tract-onnx/src/ops/nn/instance_norm.rs`):
 ///
 /// ```text
 /// let axes: Vec<_> = (0..rank as i64).filter(|&axis| axis != 1).collect();
