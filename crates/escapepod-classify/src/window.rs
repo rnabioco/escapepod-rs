@@ -35,53 +35,7 @@
 
 use crate::anchor::JunctionCoords;
 
-/// Where the window is anchored inside the junction base's own signal span.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BaseJustify {
-    /// The base's first sample. Cheapest, and rate-dependent: the window
-    /// reaches a different number of bases on a fast read than a slow one.
-    Start,
-    /// The base's midpoint.
-    Center,
-    /// The base's last sample, i.e. the boundary with the next base.
-    End,
-}
-
-impl BaseJustify {
-    /// Stable lowercase name, the spelling callers pass as a string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Center => "center",
-            Self::End => "end",
-        }
-    }
-
-    /// How far into a junction base of `dwell` samples this justification
-    /// puts the anchor.
-    fn shift(self, dwell: i64) -> i64 {
-        match self {
-            Self::Start => 0,
-            Self::Center => dwell / 2,
-            Self::End => dwell,
-        }
-    }
-}
-
-impl std::str::FromStr for BaseJustify {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "start" => Ok(Self::Start),
-            "center" => Ok(Self::Center),
-            "end" => Ok(Self::End),
-            other => Err(format!(
-                "base_justify must be start|center|end, got {other:?}"
-            )),
-        }
-    }
-}
+pub use escapepod_signal::chunk::BaseJustify;
 
 /// The `left + right` sample window around this read's junction.
 ///
@@ -112,7 +66,7 @@ pub fn signal_window(
 ) -> Option<Vec<f32>> {
     debug_assert!(left >= 0 && right > 0, "left >= 0 and right > 0 required");
 
-    let anchor = coords.junction_sig + justify.shift(coords.junction_dwell.max(0));
+    let anchor = coords.junction_sig + justify.focus(0, coords.junction_dwell.max(0));
     let (lo, hi) = (anchor - left, anchor + right);
     let (src_lo, src_hi) = (lo.max(0), hi.min(sig_pa.len() as i64));
     if src_hi - src_lo < right {

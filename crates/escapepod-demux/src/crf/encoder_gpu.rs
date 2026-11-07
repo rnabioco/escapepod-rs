@@ -308,13 +308,8 @@ impl CrfEncoderGpu {
         // goes to the device too unless it cannot. `ESCAPEPOD_CRF_GPU_DECODE=0`
         // forces the CPU decode, which is what A/B measurements and any future
         // bisect want.
-        // `ESCAPEPOD_CRF_GPU_DECODE`/`ZEROCOPY` default to *on* and treat `=0`
-        // as the opt-out — the opposite polarity from `flag()`'s fixed
-        // off-when-unset contract, so they keep this parse (root CLAUDE.md's
-        // env-switch table; documented exception).
-        #[allow(clippy::disallowed_methods)]
         let (lattice, decode_fallback) =
-            if std::env::var("ESCAPEPOD_CRF_GPU_DECODE").as_deref() == Ok("0") {
+            if !escapepod_pod5::env::flag_default_on("ESCAPEPOD_CRF_GPU_DECODE") {
                 (
                     None,
                     Some("disabled by ESCAPEPOD_CRF_GPU_DECODE=0".to_string()),
@@ -335,10 +330,8 @@ impl CrfEncoderGpu {
         // have to reach the host anyway. Note this is a *request*: `lattice` only
         // proves the CUDA driver and NVRTC work, which says nothing about whether
         // onnxruntime registered its CUDA EP. The probe below settles that.
-        // Same documented exception as `ESCAPEPOD_CRF_GPU_DECODE` above.
-        #[allow(clippy::disallowed_methods)]
         let zero_copy =
-            lattice.is_some() && std::env::var("ESCAPEPOD_CRF_GPU_ZEROCOPY").as_deref() != Ok("0");
+            lattice.is_some() && escapepod_pod5::env::flag_default_on("ESCAPEPOD_CRF_GPU_ZEROCOPY");
 
         let mut encoder = Self {
             session: Mutex::new(session),

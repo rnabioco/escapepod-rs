@@ -285,11 +285,15 @@ is `None` when unset, and also warns once and returns `None` on a value that
 does not parse or is `0`. A knob where `0` *means* something (a threshold
 where `0` is "never" — `ESCAPEPOD_AUTOINDEX_MAX=0` skips index warm-up) goes
 through `usize_allow_zero` instead: same contract, but `0` is `Some(0)`
-rather than a rejected typo (#421). **Setting one of these to `0`/`false` now turns it
+rather than a rejected typo (#421). A switch that defaults to *on*
+(`ESCAPEPOD_CRF_GPU_DECODE`, `ESCAPEPOD_CRF_GPU_ZEROCOPY`) goes through
+`flag_default_on`: on when unset/empty, off for `0|false|no|off`, garbage warns
+once and keeps the default. **Setting one of these to `0`/`false` now turns it
 off** — a hand-rolled `var_os(..).is_some()` check used to treat `=0` as "set",
 hence on, the opposite of every place that documents `=1` to enable something.
 Backend-name caps (`*_BACKEND`) and path variables (`*_CACHE`) are a different
-shape and keep their own parse.
+shape and keep their own parse (cache dirs share `escapepod_cli::util::cache_dir`);
+`POD5_DISABLE_MMAP_OPEN` remains the documented exception.
 
 ### Use this, not your own
 
@@ -300,7 +304,7 @@ rest are conventions with no lint behind them yet.
 | Need | Use |
 |---|---|
 | Reference FASTA (gzip, duplicate names refused) | `escapepod_signal::fasta::read_fasta` (gzip is the caller's: wrap in `MultiGzDecoder`) |
-| `ESCAPEPOD_*` switches/knobs | `escapepod_pod5::env::{flag, positive_usize, usize_allow_zero}` (see above) |
+| `ESCAPEPOD_*` switches/knobs | `escapepod_pod5::env::{flag, flag_default_on, positive_usize, usize_allow_zero}` (see above) |
 | Gzip input, possibly multi-member/bgzipped | `flate2::read::MultiGzDecoder`, never `GzDecoder` |
 | BGZF reader worker count | `noodles_bgzf::io::MultithreadedReader::with_worker_count`, sized from the rayon pool — `::new` is one worker |
 | `@PG` `CL` on a written BAM | the real argv, as `classify.rs` does — not a hand-rebuilt command line |
