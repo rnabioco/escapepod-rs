@@ -343,83 +343,7 @@ impl NativeBiLstm {
             while done < xs.len() {
                 let n = (xs.len() - done).min(batch);
                 let group = &xs[done..done + n];
-                match (self.backend, n) {
-                    #[cfg(target_arch = "x86_64")]
-                    // Safety: as for `run_both_avx2` — buffer sizes are
-                    // checked above and `preferred_batch` sized the scratch;
-                    // the features are guaranteed by the dispatch. The
-                    // 16-wide kernel takes every width up to eight, a lone
-                    // read included.
-                    (Backend::Avx512, 8) => unsafe {
-                        self.run_both_avx512_batch::<8>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx512, 7) => unsafe {
-                        self.run_both_avx512_batch::<7>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx512, 6) => unsafe {
-                        self.run_both_avx512_batch::<6>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx512, 5) => unsafe {
-                        self.run_both_avx512_batch::<5>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx512, 4) => unsafe {
-                        self.run_both_avx512_batch::<4>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx512, 3) => unsafe {
-                        self.run_both_avx512_batch::<3>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx512, 2) => unsafe {
-                        self.run_both_avx512_batch::<2>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx2, 3) => unsafe {
-                        self.run_both_avx2_batch::<3>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx2, 2) => unsafe {
-                        self.run_both_avx2_batch::<2>(group, xw, hs, gates)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    // A lone read on either wide backend takes the AVX2
-                    // single-read kernel: eight accumulators over a 64-gate
-                    // slice, against two per 32-gate slice through the
-                    // 16-wide kernel at `N = 1` (208 against 168 µs/read).
-                    // Every AVX-512F machine has AVX2 + FMA, and the two are
-                    // bit-identical. Two arms, not an or-pattern: see the
-                    // `#[inline(never)]` on the kernels.
-                    (Backend::Avx512, _) => unsafe {
-                        self.run_both_avx2(
-                            group[0],
-                            &mut xw[..xw_len],
-                            &mut hs[..hs_len],
-                            &mut gates[..g],
-                        )
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (Backend::Avx2, _) => unsafe {
-                        self.run_both_avx2(
-                            group[0],
-                            &mut xw[..xw_len],
-                            &mut hs[..hs_len],
-                            &mut gates[..g],
-                        )
-                    },
-                    (Backend::Scalar, _) => {
-                        for (r, x) in group.iter().enumerate() {
-                            let (xw_r, hs_r) = (
-                                &mut xw[r * xw_len..(r + 1) * xw_len],
-                                &mut hs[r * hs_len..(r + 1) * hs_len],
-                            );
-                            self.run_both_scalar(x, xw_r, hs_r, &mut gates[..g]);
-                        }
-                    }
-                }
+                self.run_both(group, xw, hs, gates);
                 for r in 0..n {
                     let o = &mut out[(done + r) * self.n_cls..(done + r + 1) * self.n_cls];
                     self.readout(&hs[r * hs_len..(r + 1) * hs_len], o);
@@ -453,113 +377,47 @@ impl NativeBiLstm {
             s.resize(xw_len + hs_len + g, 0.0);
             let (xw, rest) = s.split_at_mut(xw_len);
             let (hs, gates) = rest.split_at_mut(hs_len);
-            match self.backend {
-                Backend::Scalar => self.run_both_scalar(x, xw, hs, gates),
-                #[cfg(target_arch = "x86_64")]
-                // Safety: `best_for` / `with_backend` only select this when
-                // the CPU has AVX2 + FMA and `h` is a multiple of 8.
-                Backend::Avx2 => unsafe { self.run_both_avx2(x, xw, hs, gates) },
-                #[cfg(target_arch = "x86_64")]
-                // A lone read takes the AVX2 kernel on an AVX-512 machine
-                // too (see `logits_batch`); it is bit-identical.
-                Backend::Avx512 => unsafe { self.run_both_avx2(x, xw, hs, gates) },
-            }
+            self.run_both(&[x], xw, hs, gates);
             self.readout(hs, out);
         });
         Ok(())
     }
 
-    /// Both directions, scalar reference kernel, into one interleaved
-    /// `[seq][2H]` buffer — `xw` is `[2][seq][4H]`, sliced per direction here
-    /// since the shared kernel no longer knows about a direction count.
-    fn run_both_scalar(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
+    /// Both directions of `xs.len()` reads (at most one kernel group) into
+    /// one interleaved `[read][seq][2H]` buffer — forward at offset 0, reverse
+    /// at offset `H` — through [`lstm::run_batch`], which owns the
+    /// `(backend, width)` dispatch. `xw` is `[2][n][seq][4H]`, split per
+    /// direction here since the shared kernel knows nothing of a direction
+    /// count; `gates` is shared, the two directions running one after the
+    /// other.
+    fn run_both(&self, xs: &[&[f32]], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
         let (seq, g, h) = (self.seq, 4 * self.h, self.h);
-        for d in 0..2 {
-            let xwd = &mut xw[d * seq * g..(d + 1) * seq * g];
-            lstm::run_scalar(
-                &self.weights[d],
-                seq,
-                d == 1,
-                x,
-                xwd,
-                hs,
-                2 * h,
-                d * h,
-                gates,
-            );
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    /// # Safety
-    ///
-    /// As [`escapepod_signal::lstm::run_avx2`]: the caller must have AVX2 +
-    /// FMA and `self.h` a multiple of 8 (guaranteed by `Backend::best_for` /
-    /// `with_backend`).
-    unsafe fn run_both_avx2(&self, x: &[f32], xw: &mut [f32], hs: &mut [f32], gates: &mut [f32]) {
-        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
-        for d in 0..2 {
-            let xwd = &mut xw[d * seq * g..(d + 1) * seq * g];
-            // Safety: forwarded from the caller.
-            unsafe {
-                lstm::run_avx2(
-                    &self.weights[d],
-                    seq,
-                    d == 1,
-                    x,
-                    xwd,
-                    hs,
-                    2 * h,
-                    d * h,
-                    gates,
-                );
-            }
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    /// # Safety
-    ///
-    /// As [`escapepod_signal::lstm::run_avx2_batch`]; additionally
-    /// `xs.len() == N`.
-    unsafe fn run_both_avx2_batch<const N: usize>(
-        &self,
-        xs: &[&[f32]],
-        xw: &mut [f32],
-        hs: &mut [f32],
-        gates: &mut [f32],
-    ) {
-        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
-        let per_dir = N * seq * g;
+        let per_dir = xs.len() * seq * g;
         let (xw0, xw1) = xw[..2 * per_dir].split_at_mut(per_dir);
-        // Safety: forwarded from the caller; `xw` was sized for at least
-        // `preferred_batch()` reads by `logits_batch`.
-        unsafe {
-            lstm::run_avx2_batch::<N>(&self.weights[0], seq, false, xs, xw0, hs, 2 * h, 0, gates);
-            lstm::run_avx2_batch::<N>(&self.weights[1], seq, true, xs, xw1, hs, 2 * h, h, gates);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    /// # Safety
-    ///
-    /// As [`escapepod_signal::lstm::run_avx512_batch`]; additionally
-    /// `xs.len() == N`.
-    unsafe fn run_both_avx512_batch<const N: usize>(
-        &self,
-        xs: &[&[f32]],
-        xw: &mut [f32],
-        hs: &mut [f32],
-        gates: &mut [f32],
-    ) {
-        let (seq, g, h) = (self.seq, 4 * self.h, self.h);
-        let per_dir = N * seq * g;
-        let (xw0, xw1) = xw[..2 * per_dir].split_at_mut(per_dir);
-        // Safety: forwarded from the caller.
-        unsafe {
-            lstm::run_avx512_batch::<N>(&self.weights[0], seq, false, xs, xw0, hs, 2 * h, 0, gates);
-            lstm::run_avx512_batch::<N>(&self.weights[1], seq, true, xs, xw1, hs, 2 * h, h, gates);
-        }
+        lstm::run_batch(
+            self.backend,
+            &self.weights[0],
+            seq,
+            false,
+            xs,
+            xw0,
+            hs,
+            2 * h,
+            0,
+            gates,
+        );
+        lstm::run_batch(
+            self.backend,
+            &self.weights[1],
+            seq,
+            true,
+            xs,
+            xw1,
+            hs,
+            2 * h,
+            h,
+            gates,
+        );
     }
 
     /// Mean and max over time of `[seq][2H]`, in the graph's concat order,
