@@ -1,0 +1,92 @@
+name: GPU tests (simulated H100)
+
+# Optional, non-required check. The hosted runners have no GPU, so ci.yml only
+# clippies the `gpu` feature and the GPU-vs-CPU parity tests stay `#[ignore]`d.
+# This runs them on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behaviour or timing, so it complements runs on a real GPU
+# node and does not replace them.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      # The kernels and the CPU references the tests compare them with.
+      - 'crates/escapepod-signal/src/**'
+      - 'crates/escapepod-pod5/src/compression/**'
+      - 'crates/escapepod-demux/src/**'
+      - 'crates/escapepod-signal/tests/gpu_*.rs'
+      - 'crates/escapepod-demux/tests/gpu_*.rs'
+      - 'crates/escapepod-demux/tests/fixtures/crf_golden.json'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - '.github/workflows/gpu-sim.yml'
+
+concurrency:
+  group: gpu-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 3
+  # `gpu` plus the experimental prep kernels, so all six cudarc test files
+  # build. crf_gpu_parity is left out: it needs a CRF model bundle and a
+  # CUDA-enabled onnxruntime.
+  FEATURES: >-
+    escapepod-signal/gpu-prep-experimental
+    escapepod-demux/gpu
+    escapepod-demux/gpu-prep-experimental
+  TESTS: >-
+    --test gpu_dtw --test gpu_llr_detect --test gpu_svb16
+    --test gpu_crf_lattice --test gpu_fingerprint --test gpu_svm_batch
+
+jobs:
+  gpu-sim:
+    name: GPU parity tests on a simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      # The toolkit supplies libnvrtc, which cudarc dlopens to compile the
+      # kernels at run time.
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@68edfd58c091361dd6baf060b63de412e544d858 # v0.1.7
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      - name: Build the test binaries
+        run: |
+          # shellcheck disable=SC2086
+          cargo test --release -p escapepod-signal -p escapepod-demux \
+            --features "$FEATURES" --no-run $TESTS
+
+      # A test without a usable device prints "skipping" and returns, which
+      # counts as a pass. --nocapture makes that message visible, and the job
+      # fails if it appears. libnvrtc is put on the loader path by hand.
+      - name: Run the GPU parity tests
+        run: |
+          export LD_LIBRARY_PATH="/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PATH="/usr/local/cuda-13.0/bin:$PATH"
+          set -o pipefail
+          # shellcheck disable=SC2086
+          vgpu run cargo test --release --no-fail-fast -p escapepod-signal -p escapepod-demux \
+            --features "$FEATURES" $TESTS -- --ignored --nocapture 2>&1 | tee gpu-tests.log
+          if grep -i 'skipping' gpu-tests.log; then
+            echo "::error::a GPU test skipped: no usable CUDA device under the simulator"
+            exit 1
+          fi
+          if ! grep -q 'test result: ok' gpu-tests.log || grep -E 'test result: .* 0 passed' gpu-tests.log; then
+            echo "::error::a GPU test binary ran no tests"
+            exit 1
+          fi
