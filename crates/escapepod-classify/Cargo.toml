@@ -24,7 +24,7 @@ flate2 = "1"
 # BAM reading for the pipeline (record types + the scan loop); writing the
 # cl-tagged output BAM stays in the CLI.
 noodles-bam = "0.98"
-noodles-bgzf = "0.52"
+noodles-bgzf = "0.53"
 noodles-sam = "0.93"
 rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
